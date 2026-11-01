@@ -34,6 +34,8 @@
 // Liveness: only a genuine `validateForPayouts` or prologue verdict rejects
 // a proposal. `Alive` and `checkDup` need no execution, so a pre-pass over
 // the whole payset still judges them when the evaluation reaches no verdict.
+// The block's own txid / lease duplicates (go's `cow.checkDup`) need not even
+// the ledger, so they are judged in every no-verdict case (issue #2129).
 // Anything that merely prevents the check from running (ledger busy or not
 // yet at the previous round, no scratch rollback available, a payset
 // transaction not evaluable here) is waited out within a small bounded
@@ -62,6 +64,7 @@ use algo_agreement::{AgreementError, BlockValidator, ValidatedBlock};
 use algo_types::{Block, Round};
 use tracing::warn;
 
+use crate::check_dup::Prepass;
 use crate::locked_base::LockedBase;
 use crate::proposal_eval::evaluate_proposal_check;
 use crate::shadow_execute::ProposalCheck;
@@ -83,6 +86,26 @@ static FALLBACKS: AtomicU64 = AtomicU64::new(0);
 /// fallback is the operator-facing signal.
 pub fn payout_check_fallbacks() -> u64 {
     FALLBACKS.load(Ordering::Relaxed)
+}
+
+/// The block validator the participating node hands to agreement: the
+/// stateless [`algo_agreement::BlockValidatorBridge`]
+/// (`algo_validate::validate_block`) wrapped in [`PayoutCheckingValidator`]
+/// over the committed ledger. This is the one production assembly
+/// (`participate.rs`), a function so a test can exercise exactly what the node
+/// runs: the stateless validation has no lease check of its own (go has none,
+/// issue #2129), so an in-block lease or txid conflict is rejected here, by
+/// go's `checkDup` (issue #2127, PR #2128), before the node votes.
+pub fn agreement_block_validator(
+    genesis_id: String,
+    genesis_hash: [u8; 32],
+    prev_timestamp: Option<i64>,
+    ledger: Arc<Mutex<SqliteLedger>>,
+) -> PayoutCheckingValidator<algo_agreement::BlockValidatorBridge> {
+    PayoutCheckingValidator::new(
+        algo_agreement::BlockValidatorBridge::new(genesis_id, genesis_hash, prev_timestamp),
+        ledger,
+    )
 }
 
 /// Wraps a stateless [`BlockValidator`] with go's `validateForPayouts`
@@ -178,16 +201,70 @@ impl<V: BlockValidator> PayoutCheckingValidator<V> {
 
     /// [`crate::check_dup::prologue_prepass`] against the ledger, when it is
     /// free right now and at the proposal's parent round. Never waits: the
-    /// budget is spent, so a busy (or poisoned) ledger is no verdict. The
-    /// pre-pass runs no AVM (txid hashing and txtail reads), so holding the
-    /// mutex for it is short.
-    fn prologue_prepass(&self, block: &Block) -> Option<String> {
-        let ledger = self.ledger.try_lock().ok()?;
-        if ledger.current_round().0.checked_add(1) != Some(block.round.0) {
-            return None;
+    /// budget is spent, so a busy (or poisoned) ledger is
+    /// [`Prepass::CouldNotRun`]. The pre-pass runs no AVM (txid hashing and
+    /// txtail reads), so holding the mutex for it is short.
+    fn prologue_prepass(&self, block: &Block) -> Prepass {
+        let ledger = match self.ledger.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Prepass::CouldNotRun("ledger busy".into()),
+            Err(TryLockError::Poisoned(_)) => {
+                return Prepass::CouldNotRun("ledger lock poisoned".into())
+            }
+        };
+        let current = ledger.current_round().0;
+        if current.checked_add(1) != Some(block.round.0) {
+            return Prepass::CouldNotRun(format!(
+                "ledger at round {current} is not the parent of round {}",
+                block.round.0
+            ));
         }
         crate::check_dup::prologue_prepass(&*ledger, block)
     }
+
+    /// The last resort before accepting on the stateless verdict: the
+    /// ledger-backed pre-pass, and only when it could not run, the block-only
+    /// one (the ledger-backed pre-pass already scans the block's own
+    /// duplicates). `Some`: go's rejection. When neither could run the accept
+    /// is logged at `warn` (rate-limited) with both reasons.
+    fn last_resort_prepass(&self, block: &Block) -> Option<String> {
+        let ledger_reason = match self.prologue_prepass(block) {
+            Prepass::Violation(message) => return Some(message),
+            Prepass::Clean => return None,
+            Prepass::CouldNotRun(reason) => reason,
+        };
+        match crate::check_dup::block_dups_prepass(block) {
+            Prepass::Violation(message) => Some(message),
+            Prepass::Clean => None,
+            Prepass::CouldNotRun(reason) => {
+                warn_prepass_unavailable(block.round.0, &ledger_reason, &reason);
+                None
+            }
+        }
+    }
+}
+
+/// Minimum spacing of the "no pre-pass could run" warning (a peer can make
+/// every proposal unevaluable).
+const PREPASS_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+static LAST_PREPASS_WARN: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn warn_prepass_unavailable(round: u64, ledger_reason: &str, block_reason: &str) {
+    let now = Instant::now();
+    let Ok(mut last) = LAST_PREPASS_WARN.lock() else {
+        return;
+    };
+    if last.is_some_and(|at| now.duration_since(at) < PREPASS_WARN_INTERVAL) {
+        return;
+    }
+    *last = Some(now);
+    warn!(
+        round,
+        %ledger_reason,
+        %block_reason,
+        "no prologue pre-pass could run for the proposal (go's Alive / checkDup are not judged); accepting on the stateless verdict"
+    );
 }
 
 impl<V: BlockValidator> BlockValidator for PayoutCheckingValidator<V> {
@@ -209,7 +286,11 @@ impl<V: BlockValidator> BlockValidator for PayoutCheckingValidator<V> {
                     // over the whole payset need no execution, so they still
                     // reach a verdict if the ledger is free now, without
                     // waiting for it.
-                    if let Some(violation) = self.prologue_prepass(block) {
+                    // When the ledger itself is unavailable (busy, behind,
+                    // poisoned) the block's own duplicates (a txid or a
+                    // (sender, lease) repeated in the block, in a group or
+                    // across groups) still need no ledger (issue #2129).
+                    if let Some(violation) = self.last_resort_prepass(block) {
                         tracing::debug!(
                             round = block.round.0,
                             %violation,

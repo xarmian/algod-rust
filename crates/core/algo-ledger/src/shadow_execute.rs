@@ -978,7 +978,10 @@ pub fn scratch_proposal_check<L: LedgerStore>(store: &mut L, block: &Block) -> P
     {
         return check;
     }
-    with_prologue_prepass(check, crate::check_dup::prologue_prepass(&*store, block))
+    with_prologue_prepass(
+        check,
+        crate::check_dup::prologue_prepass(&*store, block).violation(),
+    )
 }
 
 /// A proposal check that reached no verdict, settled by

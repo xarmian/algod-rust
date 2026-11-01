@@ -256,7 +256,8 @@ pub fn prologue_prepass<B: OverlayBase + ?Sized>(base: &B, block: &Block) -> Opt
     if base.base_is_stale() || block.round.0 != overlay.base_round().0 + 1 {
         return None;
     }
-    let verdict = crate::check_dup::prologue_prepass(&OverlayStore::new(base, &mut overlay), block);
+    let verdict = crate::check_dup::prologue_prepass(&OverlayStore::new(base, &mut overlay), block)
+        .violation();
     (!base.base_is_stale()).then_some(verdict).flatten()
 }
 

@@ -110,12 +110,46 @@ impl BlockDups {
 
     /// Record a transaction that was evaluated successfully (go `addTx`).
     pub fn record(&mut self, txn: &Transaction, txid: Digest) {
+        let undo = self.insert(txn, txid);
+        self.journal.push(undo);
+    }
+
+    /// [`Self::record`] without the undo log, for a caller that never rolls
+    /// back (the execution-free pre-pass, [`block_dups_prepass`]).
+    fn insert(&mut self, txn: &Transaction, txid: Digest) -> DupUndo {
         let txid = self.txids.insert(txid).then_some(txid);
         let lease = (txn.lease != [0u8; 32]).then(|| {
             let key = (txn.sender, txn.lease);
             (key, self.leases.insert(key, txn.last_valid.0))
         });
-        self.journal.push(DupUndo { txid, lease });
+        DupUndo { txid, lease }
+    }
+
+    /// The block half of go `roundCowState.checkDup` for `txn` evaluated in
+    /// `round`: a txid, then a lease, an earlier transaction of this block
+    /// already holds. Returns whether `txn` is subject to the lease checks
+    /// (the protocol supports leases and the lease is set), so the ledger half
+    /// gates on the same flag.
+    fn check(
+        &self,
+        consensus: &ConsensusParams,
+        txn: &Transaction,
+        txid: Digest,
+        round: u64,
+    ) -> Result<bool, AlgoError> {
+        if self.txids.contains(&txid) {
+            return Err(transaction_in_ledger_error(txid, true));
+        }
+        let leased = consensus.support_transaction_leases && txn.lease != [0u8; 32];
+        if leased
+            && self
+                .leases
+                .get(&(txn.sender, txn.lease))
+                .is_some_and(|&expires| round <= expires)
+        {
+            return Err(lease_in_ledger_error(txid, &txn.sender, &txn.lease, true));
+        }
+        Ok(leased)
     }
 
     /// A point [`Self::rollback_to`] can return to.
@@ -269,18 +303,7 @@ pub fn check_dup<L: LedgerStore + ?Sized>(
     block: &BlockDups,
     ledger: &mut LedgerDups,
 ) -> Result<(), AlgoError> {
-    if block.txids.contains(&txid) {
-        return Err(transaction_in_ledger_error(txid, true));
-    }
-    let leased = consensus.support_transaction_leases && txn.lease != [0u8; 32];
-    if leased
-        && block
-            .leases
-            .get(&(txn.sender, txn.lease))
-            .is_some_and(|&expires| ledger.round <= expires)
-    {
-        return Err(lease_in_ledger_error(txid, &txn.sender, &txn.lease, true));
-    }
+    let leased = block.check(consensus, txn, txid, ledger.round)?;
     // go's block cow: a lease an earlier group of the same pending block
     // holds (the pool's overlay) is an in-block conflict.
     if leased && store.pending_block_lease(&txn.sender, &txn.lease, ledger.round) {
@@ -431,6 +454,29 @@ pub fn alive(
     .map_err(|message| typed(message, RejectClass::Alive))
 }
 
+/// What a pre-pass over a proposal's payset found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Prepass {
+    /// The first transaction go's prologue rejects, with go's text.
+    Violation(String),
+    /// Every transaction passed the checks the pre-pass runs.
+    Clean,
+    /// The pre-pass could not judge the block (the reason): unlike
+    /// [`Self::Clean`], this says nothing about the block.
+    CouldNotRun(String),
+}
+
+impl Prepass {
+    /// The rejection text, if the pre-pass found one.
+    #[must_use]
+    pub fn violation(self) -> Option<String> {
+        match self {
+            Self::Violation(message) => Some(message),
+            Self::Clean | Self::CouldNotRun(_) => None,
+        }
+    }
+}
+
 /// go's `Alive` then `checkDup` over the WHOLE payset of `block` (stripped
 /// form) against `store` at `block.round - 1`, without executing anything:
 /// the first failing transaction in payset order, with go's text.
@@ -440,26 +486,75 @@ pub fn alive(
 /// failure here means go's `Ledger.Validate` rejects the block whatever the
 /// payset's execution would do. The proposal check falls back on it when the
 /// execution could not reach a verdict (a transaction not evaluable here,
-/// the ledger busy throughout the budget). `None`: every transaction passes,
-/// or the block's protocol is unknown or its payset is not in valid stripped
-/// form (an evaluation error, not a `checkDup` verdict).
-pub fn prologue_prepass<L: LedgerStore + ?Sized>(
-    store: &L,
-    block: &algo_types::Block,
-) -> Option<String> {
-    let consensus = algo_types::consensus::consensus_params_for_version(&block.current_protocol)?;
+/// the ledger busy throughout the budget). [`Prepass::CouldNotRun`]: the
+/// block's protocol is unknown or its payset is not in valid stripped form
+/// (an evaluation error, not a `checkDup` verdict).
+pub fn prologue_prepass<L: LedgerStore + ?Sized>(store: &L, block: &algo_types::Block) -> Prepass {
+    let Some(consensus) =
+        algo_types::consensus::consensus_params_for_version(&block.current_protocol)
+    else {
+        return Prepass::CouldNotRun(format!("unknown protocol {:?}", block.current_protocol));
+    };
     let rule = GenesisRestoreRule::for_params(&consensus, block);
-    rule.check_payset(&block.payset).ok()?;
+    if let Err(e) = rule.check_payset(&block.payset) {
+        return Prepass::CouldNotRun(format!(
+            "payset not in stripped form (transaction {}): {:?}",
+            e.0, e.1
+        ));
+    }
     let mut check = BlockCheckDup::new(
         block.round.0,
         algo_codec::block_txids_with_rule(block, &rule),
     );
     for (index, stx) in block.payset.iter().enumerate() {
-        if check.check(store, &consensus, &rule, stx, index).is_err() {
-            return check.violation().map(|(_, m)| m.to_owned());
+        if let Err(e) = check.check(store, &consensus, &rule, stx, index) {
+            return match check.violation() {
+                Some((_, message)) => Prepass::Violation(message.to_owned()),
+                None => Prepass::CouldNotRun(format!("checkDup failed to run: {e}")),
+            };
         }
     }
-    None
+    Prepass::Clean
+}
+
+/// The part of [`prologue_prepass`] that needs no ledger: go's `Alive`, then
+/// the block half of `checkDup` (a txid or a lease an earlier transaction of
+/// the SAME block holds, wherever its group is), over the whole payset, in
+/// payset order, with go's text. Issue #2129: the proposal check's last
+/// resort when the ledger-backed pre-pass could not run (the ledger busy
+/// throughout the budget, behind the proposal, or poisoned), so a block that
+/// repeats a (sender, lease) or a txid, inside a group or across groups, is
+/// still rejected before the vote. A conflict with the committed ledger
+/// needs the ledger and is not judged here ([`Prepass::Clean`] only means no
+/// in-block duplicate). [`Prepass::CouldNotRun`]: the block's protocol is
+/// unknown or its payset not in valid stripped form.
+pub fn block_dups_prepass(block: &algo_types::Block) -> Prepass {
+    let Some(consensus) =
+        algo_types::consensus::consensus_params_for_version(&block.current_protocol)
+    else {
+        return Prepass::CouldNotRun(format!("unknown protocol {:?}", block.current_protocol));
+    };
+    let rule = GenesisRestoreRule::for_params(&consensus, block);
+    if let Err(e) = rule.check_payset(&block.payset) {
+        return Prepass::CouldNotRun(format!(
+            "payset not in stripped form (transaction {}): {:?}",
+            e.0, e.1
+        ));
+    }
+    let txids = algo_codec::block_txids_with_rule(block, &rule);
+    if txids.len() != block.payset.len() {
+        return Prepass::CouldNotRun("payset txids do not match the payset".into());
+    }
+    let mut dups = BlockDups::new();
+    for (stx, &txid) in block.payset.iter().zip(&txids) {
+        let verdict = alive(block.round, &consensus, &rule, stx)
+            .and_then(|()| dups.check(&consensus, &stx.txn, txid, block.round.0));
+        if let Err(e) = verdict {
+            return Prepass::Violation(e.to_string());
+        }
+        dups.insert(&stx.txn, txid);
+    }
+    Prepass::Clean
 }
 
 #[cfg(test)]

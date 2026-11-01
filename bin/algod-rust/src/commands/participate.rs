@@ -783,12 +783,10 @@ impl ParticipateAgreementControl {
         // repeated txids and live-lease conflicts are judged before this
         // node votes (go `Ledger.Validate`).
         let block_validator: Arc<PayoutCheckingValidator<BlockValidatorBridge>> =
-            Arc::new(PayoutCheckingValidator::new(
-                BlockValidatorBridge::new(
-                    self.resolved_genesis_id.clone(),
-                    self.genesis_hash,
-                    prev_timestamp,
-                ),
+            Arc::new(algo_ledger::agreement_block_validator(
+                self.resolved_genesis_id.clone(),
+                self.genesis_hash,
+                prev_timestamp,
                 self.ledger.clone(),
             ));
 

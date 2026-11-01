@@ -20,8 +20,7 @@
 
 use algo_codec::decode_block_response;
 use algo_validate::{
-    validate_genesis_consistency, validate_lease_constraints, validate_transaction_group,
-    validate_transaction_rules,
+    validate_genesis_consistency, validate_transaction_group, validate_transaction_rules,
 };
 use std::path::PathBuf;
 
@@ -106,10 +105,6 @@ macro_rules! rules_test {
             validate_transaction_group(&txns)
                 .unwrap_or_else(|e| panic!("group validation failed for block {}: {e}", $round));
 
-            // Validate lease constraints.
-            validate_lease_constraints(&txns)
-                .unwrap_or_else(|e| panic!("lease validation failed for block {}: {e}", $round));
-
             // Validate genesis consistency.
             validate_genesis_consistency(&txns, &br.block.genesis_id, &br.block.genesis_hash)
                 .unwrap_or_else(|e| panic!("genesis consistency failed for block {}: {e}", $round));
@@ -146,9 +141,6 @@ fn rules_validate_all_blocks() {
 
         validate_transaction_group(&txns)
             .unwrap_or_else(|e| panic!("group validation failed for block {round}: {e}"));
-
-        validate_lease_constraints(&txns)
-            .unwrap_or_else(|e| panic!("lease validation failed for block {round}: {e}"));
 
         validate_genesis_consistency(&txns, &br.block.genesis_id, &br.block.genesis_hash)
             .unwrap_or_else(|e| panic!("genesis consistency failed for block {round}: {e}"));
