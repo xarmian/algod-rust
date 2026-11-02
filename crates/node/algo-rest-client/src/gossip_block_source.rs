@@ -425,6 +425,13 @@ impl GossipBlockSource {
                     // the observed download duration back into the ranker
                     // so a consistently fast peer is preferred next time.
                     let elapsed = started.elapsed();
+                    debug!(
+                        round = %round,
+                        peer = peer.get_address(),
+                        peers = self.peers.len(),
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        "WS block fetched"
+                    );
                     let mut selector = self
                         .peer_selector
                         .lock()
