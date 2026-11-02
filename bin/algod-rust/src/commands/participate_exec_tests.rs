@@ -2951,8 +2951,9 @@ fn wellformed_rows() -> Vec<WellFormedRow> {
 
 /// go wraps a not-well-formed transaction of the REST path as `transaction
 /// <%+v of its SignedTxn> invalid : <reason>`. The struct dump is go's own
-/// formatting of its in-memory type, so for those rows the reason after
-/// ` invalid : ` is what is compared; every other error is compared in full.
+/// formatting of its in-memory type (the oracle stores the reason only), so
+/// the reason after ` invalid : ` is what is compared; every other error is
+/// compared in full.
 fn verify_tail(text: &str) -> &str {
     match (text.starts_with("transaction "), text.find(" invalid : ")) {
         (true, Some(at)) => &text[at + " invalid : ".len()..],

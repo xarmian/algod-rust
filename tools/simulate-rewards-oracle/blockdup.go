@@ -42,6 +42,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/algorand/go-algorand/agreement"
 	"github.com/algorand/go-algorand/config"
@@ -101,10 +102,12 @@ type blockDupFixture struct {
 // evaluator on the pool header: the gossip test stage
 // (`TestTransactionGroup`) and the REST path (`verify.TxnGroup`).
 type blockDupWFRow struct {
-	Name        string   `json:"name"`
-	Group       []string `json:"group"`
-	TestError   string   `json:"test_error"`
-	VerifyError string   `json:"verify_error"`
+	Name      string   `json:"name"`
+	Group     []string `json:"group"`
+	TestError string   `json:"test_error"`
+	// VerifyError is go's `verify.TxnGroup` error; a `transaction <dump>
+	// invalid : ` frame is reduced to the reason after it.
+	VerifyError string `json:"verify_error"`
 }
 
 // blockDupOrderScenario is one pool-admission verdict: `Pre` groups are
@@ -690,6 +693,16 @@ func blockDupOracle() {
 		}
 		_, verr := verify.TxnGroup(ws.group, &poolHdr, nil, l)
 		row.VerifyError = errText(verr)
+		// go wraps a not-well-formed (or unsigned) member as `transaction
+		// <%+v of the SignedTxn> invalid : <reason>`. The dump is go's own
+		// struct formatting (it prints pointer addresses, so it is not even
+		// reproducible between runs); keep the reason, which is what
+		// algod-rust reproduces.
+		if strings.HasPrefix(row.VerifyError, "transaction ") {
+			if at := strings.Index(row.VerifyError, " invalid : "); at >= 0 {
+				row.VerifyError = row.VerifyError[at+len(" invalid : "):]
+			}
+		}
 		f.WellFormed = append(f.WellFormed, row)
 	}
 
