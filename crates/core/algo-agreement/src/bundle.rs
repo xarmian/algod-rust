@@ -28,10 +28,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use algo_consensus_crypto::OneTimeSignature;
-use algo_types::{Address, Round};
+use algo_types::{Address, ConsensusParams, Round};
 
-use crate::credential::UnauthenticatedCredential;
-use crate::ledger_reader::{membership_from_ledger, LedgerError, LedgerReader};
+use crate::credential::{Membership, UnauthenticatedCredential};
+use crate::ledger_reader::{LedgerError, LedgerReader, OnlineAccountData};
+use crate::lookback::{balance_round, params_round, seed_round};
+use crate::seed::Seed;
+use crate::selector::Selector;
 use crate::step::{Period, Step, DOWN, PROPOSE};
 use crate::vote::{ProposalValue, RawVote, UnauthenticatedVote, Vote, VoteVerifyParams};
 
@@ -258,27 +261,36 @@ impl UnauthenticatedBundle {
             }
         }
 
-        // Step 4: verify each vote
-        let mut verified_votes = Vec::with_capacity(self.votes.len());
-        let mut total_weight: u64 = 0;
-
+        // Step 4: verify each vote (equivocation votes after the plain
+        // votes, as in go). The ledger lookups run in order on this thread;
+        // the signature, VRF and sortition checks, which are pure and take
+        // ~90% of the time, run in parallel (go's `AsyncVoteVerifier` does
+        // the same). The result is exactly the sequential one: the first
+        // failing item in bundle order wins (see `verify_items`).
+        let mut cache = MembershipCache::new(l, self.round, self.period, self.step);
+        let mut items = Vec::with_capacity(self.votes.len() + self.equivocation_votes.len());
         for (i, auth) in self.votes.iter().enumerate() {
-            let vote = self.verify_single_vote(l, auth, i)?;
-            total_weight += vote.cred.weight;
-            verified_votes.push(vote);
+            let item = self.prepare_single_vote(&mut cache, auth, i);
+            let stop = item.is_err();
+            items.push(item);
+            if stop {
+                break;
+            }
         }
-
-        // Equivocation votes: verify each proposal separately
-        for (i, auth) in self.equivocation_votes.iter().enumerate() {
-            let idx = self.votes.len() + i;
-            // Verify both signatures of the equivocation vote.
-            // Each one is effectively a vote for a different proposal.
-            // For simplicity and correctness we verify the first proposal's vote
-            // (credential verification only needs to happen once since both are
-            // from the same sender in the same round/period/step).
-            let vote = self.verify_equivocation_vote(l, auth, idx)?;
+        if items.iter().all(Result::is_ok) {
+            for (i, auth) in self.equivocation_votes.iter().enumerate() {
+                let item = self.prepare_equivocation_vote(&mut cache, auth, self.votes.len() + i);
+                let stop = item.is_err();
+                items.push(item);
+                if stop {
+                    break;
+                }
+            }
+        }
+        let verified_votes = verify_items(items)?;
+        let mut total_weight: u64 = 0;
+        for vote in &verified_votes {
             total_weight += vote.cred.weight;
-            verified_votes.push(vote);
         }
 
         // Step 5: check quorum
@@ -296,13 +308,15 @@ impl UnauthenticatedBundle {
         })
     }
 
-    /// Verify a single vote authenticator from the bundle.
-    fn verify_single_vote(
+    /// Look up the membership for a plain vote and assemble its
+    /// verification work, or the lookup failure the sequential code
+    /// reported at this index.
+    fn prepare_single_vote(
         &self,
-        l: &dyn LedgerReader,
+        cache: &mut MembershipCache<'_>,
         auth: &VoteAuthenticator,
         index: usize,
-    ) -> Result<Vote, BundleError> {
+    ) -> Result<VoteWork, BundleError> {
         // Reconstruct the full UnauthenticatedVote
         let uv = UnauthenticatedVote {
             raw_vote: RawVote {
@@ -316,115 +330,212 @@ impl UnauthenticatedBundle {
             sig: auth.sig.clone(),
         };
 
-        // Look up membership from ledger
         let (membership, record, proto) =
-            membership_from_ledger(l, &auth.sender, self.round, self.period, self.step).map_err(
-                |e| BundleError::VoteVerificationFailed {
+            cache
+                .membership(&auth.sender)
+                .map_err(|e| BundleError::VoteVerificationFailed {
                     index,
                     detail: format!("could not get membership: {e}"),
-                },
-            )?;
+                })?;
 
-        let params = VoteVerifyParams {
-            membership,
-            vote_id: record.vote_id,
-            vote_first_valid: record.vote_first_valid,
-            vote_last_valid: record.vote_last_valid,
-            vote_key_dilution: record.vote_key_dilution,
-            consensus_params: proto,
-        };
-
-        uv.verify(&params)
-            .map_err(|e| BundleError::VoteVerificationFailed {
-                index,
-                detail: e.to_string(),
-            })
+        Ok(VoteWork {
+            index,
+            first: uv,
+            second: None,
+            params: VoteVerifyParams {
+                membership,
+                vote_id: record.vote_id,
+                vote_first_valid: record.vote_first_valid,
+                vote_last_valid: record.vote_last_valid,
+                vote_key_dilution: record.vote_key_dilution,
+                consensus_params: proto,
+            },
+        })
     }
 
-    /// Verify an equivocation vote authenticator.
+    /// Assemble the verification work of an equivocation vote.
     ///
     /// In Go, equivocation votes prove that a sender voted for two different
     /// proposals. For bundle verification, we verify the credential once and
     /// verify both OTS signatures against the two different proposals.
-    fn verify_equivocation_vote(
+    fn prepare_equivocation_vote(
         &self,
-        l: &dyn LedgerReader,
+        cache: &mut MembershipCache<'_>,
         auth: &EquivocationVoteAuthenticator,
         index: usize,
-    ) -> Result<Vote, BundleError> {
+    ) -> Result<VoteWork, BundleError> {
         // Reject if both proposals are identical — that's not real equivocation.
         // Mirrors Go's unauthenticatedEquivocationVote.verify() check.
         if auth.proposals[0] == auth.proposals[1] {
             return Err(BundleError::IdenticalEquivocationProposals);
         }
 
-        // Verify the first proposal's vote (this checks credential + first OTS)
-        let uv1 = UnauthenticatedVote {
+        let vote_for = |i: usize| UnauthenticatedVote {
             raw_vote: RawVote {
                 sender: auth.sender,
                 round: self.round,
                 period: self.period,
                 step: self.step,
-                proposal: auth.proposals[0],
+                proposal: auth.proposals[i],
             },
             cred: auth.cred.clone(),
-            sig: auth.sigs[0].clone(),
+            sig: auth.sigs[i].clone(),
         };
 
         let (membership, record, proto) =
-            membership_from_ledger(l, &auth.sender, self.round, self.period, self.step).map_err(
-                |e| BundleError::VoteVerificationFailed {
+            cache
+                .membership(&auth.sender)
+                .map_err(|e| BundleError::VoteVerificationFailed {
                     index,
                     detail: format!("could not get membership for equivocation vote: {e}"),
-                },
-            )?;
+                })?;
 
-        let params = VoteVerifyParams {
-            membership: membership.clone(),
-            vote_id: record.vote_id,
-            vote_first_valid: record.vote_first_valid,
-            vote_last_valid: record.vote_last_valid,
-            vote_key_dilution: record.vote_key_dilution,
-            consensus_params: proto.clone(),
-        };
+        Ok(VoteWork {
+            index,
+            first: vote_for(0),
+            second: Some(vote_for(1)),
+            params: VoteVerifyParams {
+                membership,
+                vote_id: record.vote_id,
+                vote_first_valid: record.vote_first_valid,
+                vote_last_valid: record.vote_last_valid,
+                vote_key_dilution: record.vote_key_dilution,
+                consensus_params: proto,
+            },
+        })
+    }
+}
 
-        let vote1 = uv1
-            .verify(&params)
-            .map_err(|e| BundleError::VoteVerificationFailed {
-                index,
-                detail: format!("equivocation vote first proposal failed: {e}"),
-            })?;
+/// One vote's pure verification work (everything the ledger had to supply
+/// is already in `params`). `second` is the equivocation vote's second
+/// proposal; a plain vote has none.
+struct VoteWork {
+    index: usize,
+    first: UnauthenticatedVote,
+    second: Option<UnauthenticatedVote>,
+    params: VoteVerifyParams,
+}
 
-        // Verify the second proposal's OTS signature
-        let uv2 = UnauthenticatedVote {
-            raw_vote: RawVote {
-                sender: auth.sender,
-                round: self.round,
+impl VoteWork {
+    /// Verify the vote (credential and first signature, then the second
+    /// signature of an equivocation pair) with the sequential code's exact
+    /// errors. The returned vote is the first one: an equivocation's weight
+    /// counts once.
+    fn verify(&self) -> Result<Vote, BundleError> {
+        let index = self.index;
+        match &self.second {
+            None => {
+                self.first
+                    .verify(&self.params)
+                    .map_err(|e| BundleError::VoteVerificationFailed {
+                        index,
+                        detail: e.to_string(),
+                    })
+            }
+            Some(second) => {
+                let vote1 = self.first.verify(&self.params).map_err(|e| {
+                    BundleError::VoteVerificationFailed {
+                        index,
+                        detail: format!("equivocation vote first proposal failed: {e}"),
+                    }
+                })?;
+                second
+                    .verify(&self.params)
+                    .map_err(|e| BundleError::VoteVerificationFailed {
+                        index,
+                        detail: format!("equivocation vote second proposal failed: {e}"),
+                    })?;
+                Ok(vote1)
+            }
+        }
+    }
+}
+
+/// Verify the prepared items and return the verified votes in bundle
+/// order, or the error of the **first** failing item in that order, which
+/// is what the original one-by-one loop returned. Items are verified in
+/// parallel when there is more than one; every item is verified to
+/// completion, so the reported error never depends on thread timing.
+fn verify_items(items: Vec<Result<VoteWork, BundleError>>) -> Result<Vec<Vote>, BundleError> {
+    use rayon::prelude::*;
+    let results: Vec<Result<Vote, BundleError>> = if items.len() > 1 {
+        items
+            .into_par_iter()
+            .map(|item| item.and_then(|w| w.verify()))
+            .collect()
+    } else {
+        items
+            .into_iter()
+            .map(|item| item.and_then(|w| w.verify()))
+            .collect()
+    };
+    results.into_iter().collect()
+}
+
+/// The ledger inputs of `membership_from_ledger` that do not depend on the
+/// voter (consensus params, circulation, seed), fetched at most once per
+/// bundle. The per-vote call order (params, account, circulation, seed) and
+/// the error each step produces are those of `membership_from_ledger`; the
+/// ledger is read at fixed lookback rounds, so a repeated call returns the
+/// same result.
+struct MembershipCache<'a> {
+    l: &'a dyn LedgerReader,
+    round: Round,
+    period: Period,
+    step: Step,
+    params: Option<Result<(ConsensusParams, Round, Round), LedgerError>>,
+    circulation: Option<Result<u64, LedgerError>>,
+    seed: Option<Result<Seed, LedgerError>>,
+}
+
+impl<'a> MembershipCache<'a> {
+    fn new(l: &'a dyn LedgerReader, round: Round, period: Period, step: Step) -> Self {
+        Self {
+            l,
+            round,
+            period,
+            step,
+            params: None,
+            circulation: None,
+            seed: None,
+        }
+    }
+
+    fn membership(
+        &mut self,
+        addr: &Address,
+    ) -> Result<(Membership, OnlineAccountData, ConsensusParams), LedgerError> {
+        let (l, round) = (self.l, self.round);
+        let (cparams, bal_round, seed_rnd) = self
+            .params
+            .get_or_insert_with(|| {
+                let cparams = l.consensus_params(params_round(round))?;
+                let bal = balance_round(round, &cparams);
+                let seed = seed_round(round, &cparams);
+                Ok((cparams, bal, seed))
+            })
+            .clone()?;
+
+        let record = l.lookup_agreement(bal_round, addr)?;
+        let total = self
+            .circulation
+            .get_or_insert_with(|| l.circulation(bal_round, round))
+            .clone()?;
+        let seed = self.seed.get_or_insert_with(|| l.seed(seed_rnd)).clone()?;
+
+        let membership = Membership {
+            address: *addr,
+            selection_id: record.selection_id,
+            balance: record.micro_algos,
+            total_money: total,
+            selector: Selector {
+                seed,
+                round,
                 period: self.period,
                 step: self.step,
-                proposal: auth.proposals[1],
             },
-            cred: auth.cred.clone(),
-            sig: auth.sigs[1].clone(),
         };
-
-        let params2 = VoteVerifyParams {
-            membership,
-            vote_id: record.vote_id,
-            vote_first_valid: record.vote_first_valid,
-            vote_last_valid: record.vote_last_valid,
-            vote_key_dilution: record.vote_key_dilution,
-            consensus_params: proto,
-        };
-
-        uv2.verify(&params2)
-            .map_err(|e| BundleError::VoteVerificationFailed {
-                index,
-                detail: format!("equivocation vote second proposal failed: {e}"),
-            })?;
-
-        // Return the first vote (weight counts once for equivocation)
-        Ok(vote1)
+        Ok((membership, record, cparams))
     }
 }
 

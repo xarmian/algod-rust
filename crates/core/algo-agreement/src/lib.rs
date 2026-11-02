@@ -27,6 +27,8 @@ pub mod actions;
 pub mod block_factory_bridge;
 pub mod block_validator_bridge;
 mod bundle;
+#[cfg(any(test, feature = "test-support"))]
+mod bundle_reference;
 mod certificate;
 pub mod clock;
 pub mod codec;
