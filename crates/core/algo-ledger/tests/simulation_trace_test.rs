@@ -909,7 +909,7 @@ fn simulation_signature_failure_takes_precedence_over_underpaid_group_fee() {
         .failure_message
         .as_deref()
         .expect("failure message expected");
-    assert!(msg.contains("no signature"), "unexpected message: {msg}");
+    assert!(msg.contains("has no sig"), "unexpected message: {msg}");
 }
 
 /// Ordering vs go-algorand: a LogicSig that rejects transaction 0 fails in

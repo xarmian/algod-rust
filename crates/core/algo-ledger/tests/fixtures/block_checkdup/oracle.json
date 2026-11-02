@@ -95,6 +95,1052 @@
       "add_error": ""
     }
   ],
+  "wellformed": [
+    {
+      "name": "wf_invalid_range",
+      "group": [
+        "gqNzaWfEQC5P77cRUWU7twSSTxzKquD/0LnsP1VaVmF9pcCP96Y1SuRdcbQCbw2hwkLbCfsJS8VYdN46rDxbo96RXIyJ6gajdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnbNAfSjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNAZCkbm90ZcQId2YtcmFuZ2WjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWjcGF5"
+      ],
+      "test_error": "transaction 5V33CKYZDSOJHB5HG2JOFQKGSXX54335TC3LGW3A5UZTIPRDZK7A: malformed: transaction invalid range (500--400)",
+      "verify_error": "transaction invalid range (500--400)"
+    },
+    {
+      "name": "wf_window_excessive",
+      "group": [
+        "gqNzaWfEQL6nitgNyN0NDewOZDuffKynO05i5mD+pIcKr3uBfKiVL15OacDlTIlJQjZyDBc+dhxAU/qkKma0Et+VqLYKGAOjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zgABhqCkbm90ZcQJd2Ytd2luZG93o3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "transaction FX3JQVY6DONXT2QOIVBHYLF4W53JNZTSPEDDKZWGP3NVRBTXQR5Q: malformed: transaction window size excessive (1--100000)",
+      "verify_error": "transaction window size excessive (1--100000)"
+    },
+    {
+      "name": "wf_note_too_big",
+      "group": [
+        "gqNzaWfEQAT4/G39XvwZrGemXVl6Ws0i4RhOx7lLT3W/dRDz8P0mgWjlAW5UOxPBHRsUBDm/O+T47wzO+8DOaGp1rz2REwujdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXFEAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaNwYXk="
+      ],
+      "test_error": "transaction LGKRWXAHDKC7QDUJIRECDOEDPB4YBC234BLUKA6ERZKPZH7TKNDA: malformed: transaction note too big: 4097 \u003e 4096",
+      "verify_error": "transaction note too big: 4097 \u003e 4096"
+    },
+    {
+      "name": "wf_rewards_pool_sender",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQIZmiTvkN1S7ctMUF/Gr9SjQH3h6InMhnIeFiDELcLZvqwxdOa1GCEt+N5Me5dgAuA/5jPnRCW9VXLDQ6Hr3hgOjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEB3dmLXBvb2yjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIO7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7upHR5cGWjcGF5"
+      ],
+      "test_error": "transaction 4NVHDXZYY74JMVCU4DWJSCJRW2XJMM3LK4OEWS3ERVQ274G2JZ4A: malformed: transaction from incentive pool is invalid",
+      "verify_error": "transaction from incentive pool is invalid"
+    },
+    {
+      "name": "wf_zero_sender_payment",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQEouP/JnNJ8zitrX6QLdLpOeVBOuhPTtZq4LWrS0h6tPv+ZN+TRWhxzOyNovaO9+UzIRFITKrVpLxJd6Lk3TFACjdHhuiaNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEC3dmLXplcm8tcGF5o3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwukdHlwZaNwYXk="
+      ],
+      "test_error": "transaction NZDF524YQOVD5XQYFFNMAGNDLHFS72WDPTXR5H7KYOFLCVJOZ5JA: malformed: transaction cannot close account to its sender AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ",
+      "verify_error": "transaction cannot close account to its sender AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ"
+    },
+    {
+      "name": "wf_zero_sender_axfer",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQFTgWbqelR1cB/pFvM+Opmrh9L/MPH527gmDQEeBQ6j95t7nAsYWSR3jhJXZxLTUEKKutFAN7bLWmVcFIgNAaQijdHhuiKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEDXdmLXplcm8tYXhmZXKkdHlwZaVheGZlcqR4YWlkAQ=="
+      ],
+      "test_error": "transaction NRNP347HPQ2PX2QQWWWDYQRP7C2HXKTBWOLZTTNNAL2FB5LDEE7A: malformed: transaction cannot have zero sender",
+      "verify_error": "transaction cannot have zero sender"
+    },
+    {
+      "name": "wf_zero_fee_is_well_formed",
+      "group": [
+        "gqNzaWfEQGQ++FfIGx/c/CwDG9gblazyHG193kCM2TEA4jnGEyLYTV3euPHH24WHTfxGgB3ySoKDEMhRfnxcUTSX9FtgaAejdHhuiaNhbXTOAA9CQKJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQHd2YtZmVlMKNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": ""
+    },
+    {
+      "name": "wf_iso_pay_with_keyreg_fields",
+      "group": [
+        "gqNzaWfEQPjqcxu2PGSNcNV0DcF3fGgRiq4Tkp8T2OBvNjbDmVOqKfLDF05DfcEJoq/7PGSNr7IN8Sl8cr3qXZsxMxE5FwmjdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEGXdmLXBheV93aXRoX2tleXJlZ19maWVsZHOjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWjcGF5pnZvdGVrZAE="
+      ],
+      "test_error": "transaction HRZGZJPJ5QDRJIN6EDF3SVKVJI5K7JLZ5WGYQZ4YKXLSL22MS3IQ: malformed: transaction of type pay has non-zero fields for type keyreg",
+      "verify_error": "transaction of type pay has non-zero fields for type keyreg"
+    },
+    {
+      "name": "wf_iso_pay_with_acfg_fields",
+      "group": [
+        "gqNzaWfEQMd4Cvc1AXwHVrTw4iyi1AaFeZ3FQRzcixtr4p8TjK8yzFGFWyiU4aBzk7dSsaLAf0tNu7h88CEOFnLmP+CnewejdHhui6NhbXTOAA9CQKRjYWlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEF3dmLXBheV93aXRoX2FjZmdfZmllbGRzo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "transaction DWPKS3RRNXT4EMHE2TKLIV3WEZ4MQTHAYVGIEPDRRFQKJOMGE7WQ: malformed: transaction of type pay has non-zero fields for type acfg",
+      "verify_error": "transaction of type pay has non-zero fields for type acfg"
+    },
+    {
+      "name": "wf_iso_pay_with_axfer_fields",
+      "group": [
+        "gqNzaWfEQJveyXB12DPD8DFvN37QlmtXH876xfnMh/VM5nAgeFnFVAG1kzD9PQ4ennUeyYAqF+tUEPc+57i7rm852vZfcQejdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEGHdmLXBheV93aXRoX2F4ZmVyX2ZpZWxkc6NyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaNwYXmkeGFpZAE="
+      ],
+      "test_error": "transaction 3LSTFEHVCDAADEZIABCTR576MU6OZPU2HUIX5GJS4MCVMQ3YIKXA: malformed: transaction of type pay has non-zero fields for type axfer",
+      "verify_error": "transaction of type pay has non-zero fields for type axfer"
+    },
+    {
+      "name": "wf_iso_pay_with_afrz_fields",
+      "group": [
+        "gqNzaWfEQIlHIZijiFLVHWQHcxhz2Z0YWudMzV3jmDWt1SHhYKYE8BkZnx4oH8LQYXKQro9RhsAKF36VBAYqVAyG9VtavgajdHhui6NhbXTOAA9CQKRmYWlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEF3dmLXBheV93aXRoX2FmcnpfZmllbGRzo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "transaction OFGPBLSVV277N4S2R5IFXEDEMUIP6AOIGZI7P2XZ5BFJLJBVDPAA: malformed: transaction of type pay has non-zero fields for type afrz",
+      "verify_error": "transaction of type pay has non-zero fields for type afrz"
+    },
+    {
+      "name": "wf_iso_pay_with_appl_fields",
+      "group": [
+        "gqNzaWfEQOsDhzuFx3NSN2wD3xtb9I6PUfQCo8U++PIXwB06/x4r6TIYnZrPyLuQiJkG9i9hxACcL3sb04tL8M5Ql15y0w+jdHhui6NhbXTOAA9CQKRhcGlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEF3dmLXBheV93aXRoX2FwcGxfZmllbGRzo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "transaction P523EP4IAL66TPJ6NMR64SI2ZCA6TMWMRJKM4B33P3DIYDYTZTPA: malformed: transaction of type pay has non-zero fields for type appl",
+      "verify_error": "transaction of type pay has non-zero fields for type appl"
+    },
+    {
+      "name": "wf_iso_pay_with_stpf_fields",
+      "group": [
+        "gqNzaWfEQOE+QxuZQTqBBeK2+XN/9k51tSNzZf5gCB5QN4xMqjNQ/cgtCDTkMinrrs7ezgpgw1NFuIgKClXAiGW8dYjPzgOjdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEF3dmLXBheV93aXRoX3N0cGZfZmllbGRzo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaZzcHR5cGUBpHR5cGWjcGF5"
+      ],
+      "test_error": "transaction KEEXG42O6VXPO7Z5IAHGKOZGSA7AOMPQNP55EQ74ORQCSTOZOMZA: malformed: transaction of type pay has non-zero fields for type stpf",
+      "verify_error": "transaction of type pay has non-zero fields for type stpf"
+    },
+    {
+      "name": "wf_iso_pay_with_hb_fields",
+      "group": [
+        "gqNzaWfEQP6tUDRF+MrYF6tmZG/Yexpr8TKviYiQm3+5OxEn4/x3LWMsYfBX8qdtgRSp7iniuClsRBYdaQVMEUsGZYahBQCjdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomhigaJrZAGibHbNA+ikbm90ZcQVd2YtcGF5X3dpdGhfaGJfZmllbGRzo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "transaction FT75DSCPUL2KYQLSRTSEYQXOGRZDCUU2EMGK77GNY7VMBRYDML2Q: malformed: transaction of type pay has non-zero fields for type hb",
+      "verify_error": "transaction of type pay has non-zero fields for type hb"
+    },
+    {
+      "name": "wf_iso_acfg_with_pay_fields",
+      "group": [
+        "gqNzaWfEQHfiZJTA7VrjUUY0SGBdWJdf34m0+OVtXRei+BDShtoJTEbcR2QFc7yMgpASEwYcXo0dvks40iXpOBGi9PU9OgqjdHhuiaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEFHdmLWlzby1hY2ZnLXdpdGgtcGF5o3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpGFjZmc="
+      ],
+      "test_error": "transaction IM5VS5RBNOCSDT6M4DAXMJ6VHGG4E7L76QS2FXSIMQN7BXXDG65Q: malformed: transaction of type acfg has non-zero fields for type pay",
+      "verify_error": "transaction of type acfg has non-zero fields for type pay"
+    },
+    {
+      "name": "wf_iso_appl_with_axfer_fields",
+      "group": [
+        "gqNzaWfEQDO6u76PcnQdxCeda0gK3utfpjuSliMjiBcKe/bXrDPMANiKmY42Su4/5HDN9V+feDuXoX28mdVia/Qi1DR8ggSjdHhuiqRhcGlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEFndmLWlzby1hcHBsLXdpdGgtYXhmZXKjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpGFwcGykeGFpZAE="
+      ],
+      "test_error": "transaction LD5PFZ3KTG5PDEGA5GQJHOI66LKN65D2JCMLDSRXG7XPQW57D7RA: malformed: transaction of type appl has non-zero fields for type axfer",
+      "verify_error": "transaction of type appl has non-zero fields for type axfer"
+    },
+    {
+      "name": "wf_pay_close_to_sender",
+      "group": [
+        "gqNzaWfEQN43pKGspACU97CWUAwtr1Z80uhktcUHhv+APXZWwM08bNmOr9vhHmeJvbKR2S5ic4xhUXA5ezy6wLH/72XhDwGjdHhui6NhbXTOAA9CQKVjbG9zZcQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxA13Zi1jbG9zZS1zZWxmo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "transaction Q3YT2KO76Y2LR2XG7DZMIA33JWD4MHJ3AVJJRLSC6IVDWJ36LMTA: malformed: transaction cannot close account to its sender XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI",
+      "verify_error": "transaction cannot close account to its sender XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI"
+    },
+    {
+      "name": "wf_pay_fee_sink_sender",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQMdTLc+2dgrc16t+c44V1ZL8eKycYwsEuBtq1sGWiJsEgKtMAiRBdsSopyyrzTjFOq4gjU9qWV+xfezchyhrrgCjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEB3dmLXNpbmujcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIP7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+pHR5cGWjcGF5"
+      ],
+      "test_error": "transaction IDFYF4OAFTSMWITHIT347ZE2REB2WR3KEH374WG7YFGJ3Q47O6OQ: malformed: cannot spend from fee sink address 737P57X6737P57X6737P57X6737P57X6737P57X6737P57X6737JO4454Y",
+      "verify_error": "cannot spend from fee sink address 737P57X6737P57X6737P57X6737P57X6737P57X6737P57X6737JO4454Y"
+    },
+    {
+      "name": "wf_pay_fee_sink_to_pool",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQMmQIAGMtIzMRx4+TUFv/HWO6Z0wA13Vc+fSruyYVbyGXl8BEqTqhecnEiw73hnL62SDAWvcF1e4V4sgy9ZhhwijdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEDHdmLXNpbmstcG9vbKNyY3bEIO7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7uo3NuZMQg/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v6kdHlwZaNwYXk="
+      ],
+      "test_error": "transaction RLWCGQWNA5ETR7JFTLCXO4HZJR3YRCLZNK6MH4GOIL7XPEI633IA: malformed: cannot spend from fee sink address 737P57X6737P57X6737P57X6737P57X6737P57X6737P57X6737JO4454Y",
+      "verify_error": "cannot spend from fee sink address 737P57X6737P57X6737P57X6737P57X6737P57X6737P57X6737JO4454Y"
+    },
+    {
+      "name": "wf_pay_fee_sink_close",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQALdP4qA2MAtIJLL9LzDIhIKDmmsPMkDTdicLe2yl4PFsgGg3wbuHJgfbXO6OhNyzj+IZul46ZSOrVKpxgVoVAOjdHhui6NhbXTOAA9CQKVjbG9zZcQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxA13Zi1zaW5rLWNsb3Nlo3JjdsQg7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u6jc25kxCD+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/qR0eXBlo3BheQ=="
+      ],
+      "test_error": "transaction 7FIMH4576XQJYZPK3ZGLWNMFTFH6HL6YSHJ63WGVAYHY5RSJWG4Q: malformed: cannot spend from fee sink address 737P57X6737P57X6737P57X6737P57X6737P57X6737P57X6737JO4454Y",
+      "verify_error": "cannot spend from fee sink address 737P57X6737P57X6737P57X6737P57X6737P57X6737P57X6737JO4454Y"
+    },
+    {
+      "name": "wf_keyreg_fee_sink",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQChqp0z+tb0RMvUwkUPgef0hUdrc4eY6cjl4DY2L3s7mBELHBbsPBB8Lfe4jSG6qESFc1nBnSVy2L3Yz2OlBywKjdHhujqNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECndmLWtyLXNpbmumc2Vsa2V5xCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQqNzbmTEIP7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+p3NwcmZrZXnEQENDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0OkdHlwZaZrZXlyZWendm90ZWZzdAGmdm90ZWtkAad2b3Rla2V5xCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQqd2b3RlbHN0Cg=="
+      ],
+      "test_error": "transaction XZ6WW55TAAK23JUS2XDAQBJRMYHWZ323TDDJYWJROHBTI5KRF4TQ: malformed: cannot register participation key for fee sink's address 737P57X6737P57X6737P57X6737P57X6737P57X6737P57X6737JO4454Y",
+      "verify_error": "cannot register participation key for fee sink's address 737P57X6737P57X6737P57X6737P57X6737P57X6737P57X6737JO4454Y"
+    },
+    {
+      "name": "wf_keyreg_first_after_last",
+      "group": [
+        "gqNzaWfEQFD0JLmbH+OW9/Mhl6DolkcvKFvanYgdVfA+NASf3YDnGQCKTSGF87bYSojX6ShLshtlQUab9KVA+bdT5n8itg+jdHhujqNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEC3dmLWtyLW9yZGVypnNlbGtlecQgQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkKjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpadzcHJma2V5xEBDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDpHR5cGWma2V5cmVnp3ZvdGVmc3QKpnZvdGVrZAGndm90ZWtlecQgQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkKndm90ZWxzdAU="
+      ],
+      "test_error": "transaction GHZCOLPOP7VXSQCRCWC7SVOA3A6CN325EGMKV4D5J5L3HRDJVLOQ: malformed: transaction first voting round need to be less than its last voting round",
+      "verify_error": "transaction first voting round need to be less than its last voting round"
+    },
+    {
+      "name": "wf_keyreg_votekey_only",
+      "group": [
+        "gqNzaWfEQEDTkypRqVeufstQ767+gX6Nx1q7nVYogXk8jpWOP29TQPvg4RMscZd44oY2veShUN//aCET5qWeDdyOCI8xogujdHhuiaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEDXdmLWtyLXZvdGVrZXmjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpmtleXJlZ6d2b3Rla2V5xCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg=="
+      ],
+      "test_error": "transaction NU2RCE7AKXOZQEIU2DYKS4IXOPENPBMJBJQOLOSZHWDB25UZPBIQ: malformed: the following transaction fields need to be clear/set together : votekey, selkey, votekd",
+      "verify_error": "the following transaction fields need to be clear/set together : votekey, selkey, votekd"
+    },
+    {
+      "name": "wf_keyreg_keys_without_dilution",
+      "group": [
+        "gqNzaWfEQOx2sSyaV71MriDTTY18w9Aeen50YzYY4EjoH7ZJa7EONDHk/a/NKc/HyReVwlA4bxSoRGRtWNeyiAPSD9Wejw6jdHhujaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECndmLWtyLW5va2Smc2Vsa2V5xCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQqNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlp3NwcmZrZXnEQENDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0OkdHlwZaZrZXlyZWendm90ZWZzdAGndm90ZWtlecQgQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkKndm90ZWxzdAo="
+      ],
+      "test_error": "transaction SJ67K4AZ4JZCDMNZTMSFROYQPSUQL2CD3FE6Q3N4Q7GPYNYYBVRQ: malformed: the following transaction fields need to be clear/set together : votekey, selkey, votekd",
+      "verify_error": "the following transaction fields need to be clear/set together : votekey, selkey, votekd"
+    },
+    {
+      "name": "wf_keyreg_offline_with_rounds",
+      "group": [
+        "gqNzaWfEQMeMz0MHRS0fJWrrsMirO3whb6Gyy/ybzC9Zq+YMS+IZi6tB8jINAorXzsAHdQNY7YRhk9L1wC4dmS32jl2pWgSjdHhuiaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEEHdmLWtyLW9mZi1yb3VuZHOjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpmtleXJlZ6d2b3RlbHN0BQ=="
+      ],
+      "test_error": "transaction KVCXN33UIJY3KHLXH3AF74N3JRXEECVHJN4VQMQ3RXLRRNCJH2UA: malformed: on going offline key registration transaction, the vote first and vote last fields should not be set",
+      "verify_error": "on going offline key registration transaction, the vote first and vote last fields should not be set"
+    },
+    {
+      "name": "wf_keyreg_offline_with_first_round_only",
+      "group": [
+        "gqNzaWfEQIB3qjvYZw3wos5dzNk8cMBv+AKLlnHsU1QlLIbYLo2OprYZ21rUbsXtlJneEwVNCd05doTjaNwPxqJ17u32EgKjdHhuiaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXED3dmLWtyLW9mZi1maXJzdKNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWma2V5cmVnp3ZvdGVmc3QB"
+      ],
+      "test_error": "transaction IF7ILOHIHL36PQFWHIVZNDOT3XOY5MVHMI32BORR2ZOOPK4RQNQQ: malformed: transaction first voting round need to be less than its last voting round",
+      "verify_error": "transaction first voting round need to be less than its last voting round"
+    },
+    {
+      "name": "wf_keyreg_online_vote_last_zero",
+      "group": [
+        "gqNzaWfEQE2gPzJryXAviIw9JvshfS9/AwCCd3i83oPj1i2PZAr6RO9dXUWVECSmDMqZ+RKakg85xeMGvmcNGXNz953sbAijdHhujKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEC3dmLWtyLWxhc3QwpnNlbGtlecQgQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkKjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpadzcHJma2V5xEBDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDpHR5cGWma2V5cmVnpnZvdGVrZAGndm90ZWtlecQgQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI="
+      ],
+      "test_error": "transaction 5PFLLXWHPZ7IFM3C7VRDQ6NXOT7MDNSR3TASJZBKLSTQCXTRYHPQ: malformed: transaction tries to register keys to go online, but vote last is set to zero",
+      "verify_error": "transaction tries to register keys to go online, but vote last is set to zero"
+    },
+    {
+      "name": "wf_keyreg_first_beyond_last_valid",
+      "group": [
+        "gqNzaWfEQB50Z7HdDurKJaPxjshHO7IZgXOmp98jJfd1SpgHFl8Va38hG/LQBuzHGecwoLehg9toqRlM87nAFViIsJtt5AujdHhujqNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEDHdmLWtyLWJleW9uZKZzZWxrZXnEIEJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWnc3ByZmtlecRAQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ6R0eXBlpmtleXJlZ6d2b3RlZnN0zQfQpnZvdGVrZAGndm90ZWtlecQgQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkKndm90ZWxzdM0LuA=="
+      ],
+      "test_error": "transaction XH6H3U4LWA6NLH4VE6GQ4FHH5TODMU6ZF3XP7KFVYAPC577ZS5IQ: malformed: transaction tries to register keys to go online, but first voting round is beyond the round after last valid round",
+      "verify_error": "transaction tries to register keys to go online, but first voting round is beyond the round after last valid round"
+    },
+    {
+      "name": "wf_keyreg_nonpart_with_keys",
+      "group": [
+        "gqNzaWfEQNFMt6LmJRjmCT6TWGhOb5V/aEvLfxMVKtd6aT6uCYt9VHEPyMlATuVmXoEioZ1rnjZRWdbzg434BqgCgYJVMwujdHhuj6NmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPop25vbnBhcnTDpG5vdGXEEndmLWtyLW5vbnBhcnQta2V5c6ZzZWxrZXnEIEJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWnc3ByZmtlecRAQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ6R0eXBlpmtleXJlZ6d2b3RlZnN0AaZ2b3Rla2QBp3ZvdGVrZXnEIEJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCp3ZvdGVsc3QK"
+      ],
+      "test_error": "transaction DBXRORGN3Z7ENLIHW4OTXWB3JPLVPRWH4P26LLTWZ7QBICXJUNHQ: malformed: transaction tries to register keys to go online, but nonparticipatory flag is set",
+      "verify_error": "transaction tries to register keys to go online, but nonparticipatory flag is set"
+    },
+    {
+      "name": "wf_keyreg_nonpart_with_sprf",
+      "group": [
+        "gqNzaWfEQA1WfDhCPu8Eo6Ghymp903/mdLZX37ZI2aDz5H3Dq0AB1XIdYpPgWoRJlwDf5ZwmF1W18sZJyKhAV8Q1l1DD0gqjdHhuiqNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPop25vbnBhcnTDpG5vdGXEEndmLWtyLW5vbnBhcnQtc3ByZqNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlp3NwcmZrZXnEQENDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0OkdHlwZaZrZXlyZWc="
+      ],
+      "test_error": "transaction V3546NGEKLIECQB5FVQFCH4KIOBB2PS4NWLIXN6NJMS3VNZBFP6Q: malformed: non participation keyreg transactions should contain empty stateProofPK",
+      "verify_error": "non participation keyreg transactions should contain empty stateProofPK"
+    },
+    {
+      "name": "wf_keyreg_offline_with_sprf",
+      "group": [
+        "gqNzaWfEQBVfgFbFZit4XW8DA/VBh+aPv7KmACR6Yv0gDUQo+hl3ko4p9rDoYvwOI67pP9xnDnwCBkA7zetaXWMKNT2n9w6jdHhuiaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEDndmLWtyLW9mZi1zcHJmo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWnc3ByZmtlecRAQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ6R0eXBlpmtleXJlZw=="
+      ],
+      "test_error": "transaction EIY5RZO5MLNUUS7XGLMMSQRO5IHL3U3FCGCJRP6CVFW2JPZAG2PQ: malformed: offline keyreg transactions should contain empty stateProofPK",
+      "verify_error": "offline keyreg transactions should contain empty stateProofPK"
+    },
+    {
+      "name": "wf_keyreg_online_empty_sprf",
+      "group": [
+        "gqNzaWfEQO5T36kVFvZdGD8/tVnt2YJMqPoKSreVKdYrTRA+ALefY9emgzJsYezTF8YJ+d6RPwT8IQMV+R5qHMfbNfhp7wejdHhujaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEEHdmLWtyLWVtcHR5LXNwcmamc2Vsa2V5xCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQqNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWma2V5cmVnp3ZvdGVmc3QBpnZvdGVrZAGndm90ZWtlecQgQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkKndm90ZWxzdAo="
+      ],
+      "test_error": "transaction 7CDMQRLWV64HYSNC3GFHUYMS4W5OCIFXX7EQ2QFJ4R26NBKO2PBA: malformed: online keyreg transaction cannot have empty field StateProofPK",
+      "verify_error": "online keyreg transaction cannot have empty field StateProofPK"
+    },
+    {
+      "name": "wf_keyreg_validity_too_long",
+      "group": [
+        "gqNzaWfEQEz7oWbhsEwOKWSH6ycKF9+W/mx/O0CV7mJD3jR1dk1BQbrqeuzbNpvyzRqbCa39IorUWw6Kwuk5OPGTUY055QijdHhujqNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECndmLWtyLWxvbmemc2Vsa2V5xCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQqNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlp3NwcmZrZXnEQENDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0OkdHlwZaZrZXlyZWendm90ZWZzdAGmdm90ZWtkAad2b3Rla2V5xCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQqd2b3RlbHN0zgEAAAE="
+      ],
+      "test_error": "transaction HTKOQ2433LKDQ66KZI3C6Y5FHLI4ZOOLZCUHEABXDJRDCVIKRXKQ: malformed: validity period for keyreg transaction is too long",
+      "verify_error": "validity period for keyreg transaction is too long"
+    },
+    {
+      "name": "wf_keyreg_order_fee_sink_before_rounds",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQH3/bTzPtry3Q6/hbTeHAbyxoaiUfSNhx69/c31upu5M9rEwRYUIO6u5nSVfBYa2VQU3f13lXb9mXlcOC1oiwACjdHhuiqNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECndmLWtyLW9yZDGjc25kxCD+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/qR0eXBlpmtleXJlZ6d2b3RlZnN0Cqd2b3RlbHN0BQ=="
+      ],
+      "test_error": "transaction 2KJDETCFEPHF7CJY44RXJBXIK6CACCPFOEL2OYXBUSSTZ5DE6WSQ: malformed: cannot register participation key for fee sink's address 737P57X6737P57X6737P57X6737P57X6737P57X6737P57X6737JO4454Y",
+      "verify_error": "cannot register participation key for fee sink's address 737P57X6737P57X6737P57X6737P57X6737P57X6737P57X6737JO4454Y"
+    },
+    {
+      "name": "wf_keyreg_order_rounds_before_coherence",
+      "group": [
+        "gqNzaWfEQB3dvWDtnmuxD6F8a/GyIqauel6fVnWF73aJxSmAVCxCCompCg1TKOGJ5QnnDeXQmac3jU95mQOhNdm7XeWeJQqjdHhui6NmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECndmLWtyLW9yZDKjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpmtleXJlZ6d2b3RlZnN0Cqd2b3Rla2V5xCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQqd2b3RlbHN0BQ=="
+      ],
+      "test_error": "transaction MV255APMNIGLPK2O5FYNE2RWE4UMZ3J6I354OZV4NDRJMG2PZCQQ: malformed: transaction first voting round need to be less than its last voting round",
+      "verify_error": "transaction first voting round need to be less than its last voting round"
+    },
+    {
+      "name": "wf_keyreg_order_coherence_before_nonpart",
+      "group": [
+        "gqNzaWfEQKn08uaG86zJ5JNvnu42k/ehnJR9UiY6LPrR/5KKabD3FiLEiyxuz6+x2Mjln7rG5baIUI/vnPxYzMoImKzacwejdHhuiqNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPop25vbnBhcnTDpG5vdGXECndmLWtyLW9yZDOjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpmtleXJlZ6d2b3Rla2V5xCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg=="
+      ],
+      "test_error": "transaction YWWYD7Q534VEBAKP52WSZEUI5ANBHRLST6NJVRCKA5YCBTVBRO3A: malformed: the following transaction fields need to be clear/set together : votekey, selkey, votekd",
+      "verify_error": "the following transaction fields need to be clear/set together : votekey, selkey, votekd"
+    },
+    {
+      "name": "wf_acfg_name_too_big",
+      "group": [
+        "gqNzaWfEQJ/LcZhle92PGxHPlzFEsnGIlVrQw0Z9uKawtXCwY0TStbspFVRLOPNUYiZTLxchwMIF6WvvX+trASsHaXYQ3wKjdHhuiaRhcGFygqJhbtkhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhoXQBo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQKd2YtYWMtbmFtZaNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYWNmZw=="
+      ],
+      "test_error": "transaction 4TGRPVURBHOXRA7ILFJ6PGZHCMRQPFMEEJLFSZQ6SITVGMQEP3FA: malformed: transaction asset name too big: 33 \u003e 32",
+      "verify_error": "transaction asset name too big: 33 \u003e 32"
+    },
+    {
+      "name": "wf_acfg_unit_name_too_big",
+      "group": [
+        "gqNzaWfEQP181RP9FadK7OqWP5h8I+nMCs80x0HDfq2vU2ILpgdFL9EZ9hRjRfShbO99ZbQstvNXi5ovHLaeKm2r2QcfgwKjdHhuiaRhcGFygqF0AaJ1bqlhYWFhYWFhYWGjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxAp3Zi1hYy11bml0o3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhY2Zn"
+      ],
+      "test_error": "transaction XWE2DEEXYVWDS4GAVSAFV4XJZRJMG5K6NUXOVG6D5MSRVTDWOFVQ: malformed: transaction asset unit name too big: 9 \u003e 8",
+      "verify_error": "transaction asset unit name too big: 9 \u003e 8"
+    },
+    {
+      "name": "wf_acfg_url_too_big",
+      "group": [
+        "gqNzaWfEQO+ijKsaVuqLxlV36HIqsm7ubHdIi+Ep0LaSl7s+Nptpjm0w6ih84emTb3BYXyHxXncBUPTLGSMRNH4+sKQt+QqjdHhuiaRhcGFygqJhddlhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYaF0AaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECXdmLWFjLXVybKNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYWNmZw=="
+      ],
+      "test_error": "transaction RBVT3HOGSUCBPBTL7RYARGP34HUHQCNMRR3PX3QKHBFAOGOOAAPA: malformed: transaction asset url too big: 97 \u003e 96",
+      "verify_error": "transaction asset url too big: 97 \u003e 96"
+    },
+    {
+      "name": "wf_acfg_decimals_too_high",
+      "group": [
+        "gqNzaWfEQGSsv0XEdJLmCk45bcybrWTtBi86T8flhFMVeXgvvWaqfYyYwmgHtQQteEasQlgjBKR4aoULND+hBY08AapPzgmjdHhuiaRhcGFygqJkYxShdAGjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxAl3Zi1hYy1kZWOjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpGFjZmc="
+      ],
+      "test_error": "transaction GK32U2PCXMPLD3TPYFZJEA63UAZSAWZHTX2NEVKFUKP5Z5EG7VPA: malformed: transaction asset decimals is too high (max is 19)",
+      "verify_error": "transaction asset decimals is too high (max is 19)"
+    },
+    {
+      "name": "wf_acfg_order_name_before_unit",
+      "group": [
+        "gqNzaWfEQLJ+agc+NsovrAX1QiXKG8kJzjIlSUPlRYcRpew2Ff2byZQhxDqplnAJhd2d82ebWKP2ZM/n201TFFS3C8il3gqjdHhuiaRhcGFyg6JhbtkhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhoXQBonVuqWFhYWFhYWFhYaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECXdmLWFjLW9yZKNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYWNmZw=="
+      ],
+      "test_error": "transaction JWGXYFJ7GP7DE6H7PZCWJDWKFGAURUWJHEXICJVIK7BUBDDMBEFA: malformed: transaction asset name too big: 33 \u003e 32",
+      "verify_error": "transaction asset name too big: 33 \u003e 32"
+    },
+    {
+      "name": "wf_acfg_order_unit_before_decimals",
+      "group": [
+        "gqNzaWfEQHvR7aeYsnm20gWI11Y90gEJPGY7uHpVC4hy0EJJeAHrTaeYly6YuMeFz+B2AoO64kL5ruJcxidT0XfyBqjqlA2jdHhuiaRhcGFyg6JkYxShdAGidW6pYWFhYWFhYWFho2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQKd2YtYWMtb3JkMqNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYWNmZw=="
+      ],
+      "test_error": "transaction 4AE3MYPSUFTXGWNGK3ZMEKVSFIGLKO2IX6NFWMNLYQ3M2ZVIAMGQ: malformed: transaction asset unit name too big: 9 \u003e 8",
+      "verify_error": "transaction asset unit name too big: 9 \u003e 8"
+    },
+    {
+      "name": "wf_axfer_asset_id_zero",
+      "group": [
+        "gqNzaWfEQIcH5xFarUVgJEdXrrUbyujTXcABd4/8dUqyOwazkX55+gb/tAj2zgt3UQQcH7Wk9RF78aoZrthgxteiN2qPDwyjdHhuiaRhYW10AaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECndmLWF4LXplcm+jc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpWF4ZmVy"
+      ],
+      "test_error": "transaction 22MN526FYS4Y5HBKSQRMUZOZ3ROG65XV5SEQEQS4KRWD5CQKWDAA: malformed: asset ID cannot be zero",
+      "verify_error": "asset ID cannot be zero"
+    },
+    {
+      "name": "wf_axfer_close_by_clawback",
+      "group": [
+        "gqNzaWfEQJ9bvVJhAkaE8bf4tbMs3kJCebzPUBuibM2uXCfnGALQGF2HRtiW4L/Mts5o+7zHcLj/5CpjERfpmDO1N0ztYQijdHhui6ZhY2xvc2XEIO7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7upGFzbmTEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQKd2YtYXgtY2xhd6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWlYXhmZXKkeGFpZAE="
+      ],
+      "test_error": "transaction 6WDF6XD4EJ27EQRPA4IQNDCVFJ5QH4DEE3MQSWE6FZHZ227TQ65A: malformed: cannot close asset by clawback",
+      "verify_error": "cannot close asset by clawback"
+    },
+    {
+      "name": "wf_axfer_order_asset_id_before_clawback",
+      "group": [
+        "gqNzaWfEQKIoKjxtnQsm4N/AWMc3QpA0hBhUhNXLwyfJECOG0i0VCiP8diLYtF9b/YsVyWAX3CmXLu6tigHVJtNT9kp+LgWjdHhui6RhYW10AaZhY2xvc2XEIO7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7upGFzbmTEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQJd2YtYXgtb3Jko3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaVheGZlcg=="
+      ],
+      "test_error": "transaction D5TQPY5X76OAQJZGZREB4JWIQSPQ37RLLAHMN6EJ3BODD6KQ6YQQ: malformed: asset ID cannot be zero",
+      "verify_error": "asset ID cannot be zero"
+    },
+    {
+      "name": "wf_afrz_asset_id_zero",
+      "group": [
+        "gqNzaWfEQKKuspZPkRpfeYugF3V/hj8Rtdxu7zAON4mPSwyOM+GuMZIpqZWxXZiDvnAX2SlCtdnVnOt36z4MQs76HlBktAmjdHhuiaRmYWRkxCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECndmLWFmLXplcm+jc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpGFmcno="
+      ],
+      "test_error": "transaction KDFQNYBSFEJTKJ2WX3FR6PPFLAXOYQUHXGCYBZK6LIB4ILIDXR6A: malformed: asset ID cannot be zero",
+      "verify_error": "asset ID cannot be zero"
+    },
+    {
+      "name": "wf_afrz_account_empty",
+      "group": [
+        "gqNzaWfEQDcSGWF53HF5UrqFYcjhzc4lWz31GF3sRDGb234S3XqvRa1ogwjKmP6RTt/fIRILhLCuUmcvvktpXxz7sCWZtwqjdHhuiaRmYWlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECndmLWFmLWFjY3Sjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpGFmcno="
+      ],
+      "test_error": "transaction K467JO2A3OW77MAIACUOMMOAEZ3TU7ET5FYQRWFCYWLNZY75R5CA: malformed: freeze account cannot be empty",
+      "verify_error": "freeze account cannot be empty"
+    },
+    {
+      "name": "wf_afrz_order_asset_id_before_account",
+      "group": [
+        "gqNzaWfEQPVUwl7JixK+yp3bIj2l7aX+qd2oY0qT7KoM0LnknarLls4OinbGtZrllCTsPs3degC6W3r2ga2hw2lXCZeU3QSjdHhuiKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECXdmLWFmLW9yZKNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYWZyeg=="
+      ],
+      "test_error": "transaction GLVE34KAUKA5XBBFWDDYN73QRDKIKHBOQV4B2TAG2NQ3H7U3MB2Q: malformed: asset ID cannot be zero",
+      "verify_error": "asset ID cannot be zero"
+    },
+    {
+      "name": "wf_appl_invalid_on_completion",
+      "group": [
+        "gqNzaWfEQJT0Z+WH8kDCM5MBOmVsQ4R10BllwmLlDr1BRU59UxpE32cgzvAxLpOI5PgP31vPh3JnNgARs4fpVZi9fyJ3dAWjdHhuiqRhcGFuCaRhcGlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECHdmLWFwLW9jo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhcHBs"
+      ],
+      "test_error": "transaction CY4BWGJYDDUGTCDOY3CWHKSI2ZDBY3SVPDULTCHF4SE54CTCF5UA: malformed: invalid application OnCompletion (9)",
+      "verify_error": "invalid application OnCompletion (9)"
+    },
+    {
+      "name": "wf_appl_reject_version_on_create",
+      "group": [
+        "gqNzaWfEQBFADesydlz7czyJfQukSj2BdritMUGi7lxIN6tFR6LXMcJUIkG/Ri6ceFMHCK9IR3UFAcxUpW07MoPmWKvRzQijdHhui6RhcGFwxAMIgQGkYXBydgGkYXBzdcQDCIEBo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQId2YtYXAtcnajc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpGFwcGw="
+      ],
+      "test_error": "transaction ULKR5QXA2P4C7CCLJ4Q2EBEV66FYGJRHVJSZMRUWQ2T526WJ3NRQ: malformed: tx.RejectVersion cannot be set during creation",
+      "verify_error": "tx.RejectVersion cannot be set during creation"
+    },
+    {
+      "name": "wf_appl_programs_on_call",
+      "group": [
+        "gqNzaWfEQE/qVURygm54H1Kzu5tVfvEab0zWaOKrofJ/iyqA0ktNUI0mDD/OXc/NnmVdRdhLrYHp/EhwHPs8A1lmEiKQFQOjdHhuiqRhcGFwxAMIgQGkYXBpZAGjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxAp3Zi1hcC1wcm9no3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhcHBs"
+      ],
+      "test_error": "transaction Q5WG4J7ZZVIIN64E3GKOESLD33HEUNF2TYEPUTSDMGITD3CT6CCA: malformed: programs may only be specified during application creation or update",
+      "verify_error": "programs may only be specified during application creation or update"
+    },
+    {
+      "name": "wf_appl_create_without_programs",
+      "group": [
+        "gqNzaWfEQENF169Ko8L+w3QQtQLcE7AVNAB8FEPizRpnNtyKfUNrEFABsjz2/Ijc3DaTBRVs2h84frkME8MUy+Dq3Vnp8wKjdHhuiKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEDHdmLWFwLW5vcHJvZ6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYXBwbA=="
+      ],
+      "test_error": "transaction QIDNX4XVRTF7HTWOOGVCIUEBKGSVPKWJFM4KJVH3L3PXFM6GPALA: malformed: bad ApprovalProgram: invalid program (empty)",
+      "verify_error": "bad ApprovalProgram: invalid program (empty)"
+    },
+    {
+      "name": "wf_appl_create_without_clear_program",
+      "group": [
+        "gqNzaWfEQOZtJVjn5lR6ZklPFO8i8h1L2qzPYkRX8rEZN+9A80D3eyhMkfZZyXTRBXljzZyKdYNapoIxC6/dHaPQN7xiKQCjdHhuiaRhcGFwxAMIgQGjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxA13Zi1hcC1ub2NsZWFyo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhcHBs"
+      ],
+      "test_error": "transaction ISZLCLRIVH34WGR3NGSTPG7AVEIVC4UNPCUMOZSOUHK5C7ZTRVRA: malformed: bad ClearStateProgram: invalid program (empty)",
+      "verify_error": "bad ClearStateProgram: invalid program (empty)"
+    },
+    {
+      "name": "wf_appl_program_version_mismatch",
+      "group": [
+        "gqNzaWfEQH+1WHhyU7hC6KxDKTWFTj+pb4OEU335781mKkVh5iAFdn9prAk11qXjlrTX1SwZLnRkKZGyDT4+JlG9nLp76QajdHhuiqRhcGFwxAMIgQGkYXBzdcQDB4EBo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQJd2YtYXAtdmVyo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhcHBs"
+      ],
+      "test_error": "transaction SWJLBCIOR5VI2PHNTIRWMPDG6QL4K4MNP2PSER23BTCPFVCUAV4Q: malformed: program version mismatch: 8 != 7",
+      "verify_error": "program version mismatch: 8 != 7"
+    },
+    {
+      "name": "wf_appl_extra_pages_over_max",
+      "group": [
+        "gqNzaWfEQPoQtcD1ut/QXVf9E9cXhKETVjx95AtHSCkDC2xaFMVKBBefZzhCeEaVeluHR8MESlmxYA21PQW2T8KZgzuAYw+jdHhui6RhcGFwxAMIgQGkYXBlcAikYXBzdcQDCIEBo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQJd2YtYXAtZXBwo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhcHBs"
+      ],
+      "test_error": "transaction NOER4RUGP2QDIR65CUBBZL7HFQNOVOMTAWIYSQB7UPWGBU3G6MXA: malformed: tx.ExtraProgramPages exceeds MaxAbsoluteExtraProgramPages = 7",
+      "verify_error": "tx.ExtraProgramPages exceeds MaxAbsoluteExtraProgramPages = 7"
+    },
+    {
+      "name": "wf_appl_local_schema_on_call",
+      "group": [
+        "gqNzaWfEQBEakha9Js1h3L9rTJ8MZnoivSH7pCzmGw5KK5FLAWdlLncvHDfJInwsv11oxBvZ/LKhp5PCH2k/qCTZeZs4jwKjdHhuiqRhcGlkAaRhcGxzgqNuYnMCo251aQGjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxAh3Zi1hcC1sc6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYXBwbA=="
+      ],
+      "test_error": "transaction 3VCTQSV3ZUNQKQEJ7MJKKNLAH5EZJS3EQK2WPBSXXLQK4EF7XLDA: malformed: inappropriate non-zero tx.LocalStateSchema ({NumUint:1 NumByteSlice:2})",
+      "verify_error": "inappropriate non-zero tx.LocalStateSchema ({NumUint:1 NumByteSlice:2})"
+    },
+    {
+      "name": "wf_appl_global_schema_on_call",
+      "group": [
+        "gqNzaWfEQOjXH0RIU1rIwhe950Tc8sHJ6fODPrW1x6/su9WJtrmjI3v8vrDsA5h10KCEAD6+Uz2ThEo/inqEcAsh/exKKQujdHhuiqRhcGdzgqNuYnMEo251aQOkYXBpZAGjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxAh3Zi1hcC1nc6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYXBwbA=="
+      ],
+      "test_error": "transaction UTLNSNQPFPHLZ4RE5LVR57AQNZ5QG4TX2RT7OWCLXFLECTT4IQ5Q: malformed: inappropriate non-zero tx.GlobalStateSchema ({NumUint:3 NumByteSlice:4})",
+      "verify_error": "inappropriate non-zero tx.GlobalStateSchema ({NumUint:3 NumByteSlice:4})"
+    },
+    {
+      "name": "wf_appl_extra_pages_on_call",
+      "group": [
+        "gqNzaWfEQNxy/XxOvbd2EJQz0QQVSD3Uxitz/f4idDJ6ToGG5lAJ2LMJZ0cXU1SmLTvl0Wd7ntU+s/FeajSZRBw8/7PGYg+jdHhuiqRhcGVwAaRhcGlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECndmLWFwLWVwcGOjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpGFwcGw="
+      ],
+      "test_error": "transaction KWDWXGTWJNB6ALA7MTCX6IBTX3WBNMOFUHZIGZ23JYK642KUKSMQ: malformed: inappropriate non-zero tx.ExtraProgramPages (1)",
+      "verify_error": "inappropriate non-zero tx.ExtraProgramPages (1)"
+    },
+    {
+      "name": "wf_appl_approval_too_long",
+      "group": [
+        "gqNzaWfEQOmoJYnAz1Wut5x19CIkWGlPR+Ding4AEjY0+ah6yzmSG3PQtHiDCmn7JS79q0T+hIS6Z3LJheD41F86toaDgwCjdHhuiqRhcGFwxQgDCIEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACkYXBzdcQDCIEBo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQKd2YtYXAtbG9uZ6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYXBwbA=="
+      ],
+      "test_error": "transaction MMFFCC72JCT2VQASOBMEM3ETJ4DCATZSW336OGDM5LJ7ZIMGGG2A: malformed: approval program too long. (2051 \u003e 2048)",
+      "verify_error": "approval program too long. (2051 \u003e 2048)"
+    },
+    {
+      "name": "wf_appl_clear_too_long",
+      "group": [
+        "gqNzaWfEQKTrNozjHFzosHFjsI7gPrQHglgBvMX72JXmclt5J9nJTq8zbYjUq8PS+rwbHxCphLcvDxFmmyp0lor0VzCAIQ+jdHhuiqRhcGFwxAMIgQGkYXBzdcUIAwiBAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQLd2YtYXAtY2xvbmejc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpGFwcGw="
+      ],
+      "test_error": "transaction YED5ERKXQNBNAPH3PEY5PMAT53HCSJE3GI5H322AXMXBCVKNR3SQ: malformed: clear state program too long. (2051 \u003e 2048)",
+      "verify_error": "clear state program too long. (2051 \u003e 2048)"
+    },
+    {
+      "name": "wf_appl_programs_total_too_long",
+      "group": [
+        "gqNzaWfEQJD2atPkCmEOnL4dPdvmr85B+wsYEe9dctRJ0TciXSZ3gzzcWrMeN3yXCLcuuhzBoqxeTZWsvTK1jXrbCzw+UgGjdHhuiqRhcGFwxQgACIEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACkYXBzdcQECIEBAKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECXdmLWFwLXRvdKNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYXBwbA=="
+      ],
+      "test_error": "transaction 2Q6N47W4B6NTARASYANOXKZRHEYWHKYXKLQWX4BT67QR6RITICNQ: malformed: app programs too long. (2048 + 4 \u003e 2048)",
+      "verify_error": "app programs too long. (2048 + 4 \u003e 2048)"
+    },
+    {
+      "name": "wf_appl_too_many_args",
+      "group": [
+        "gqNzaWfEQF7lsNvz9qfGJmQahgTZO3Yny2YWdW4nnHFyigsKKad/zhKq3qpiRmPIjZ7HvCs1YeZ0FWq+A0jzU8aPsqECYQ2jdHhuiqRhcGFh3AARwMDAwMDAwMDAwMDAwMDAwMCkYXBpZAGjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxAp3Zi1hcC1hcmdzo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhcHBs"
+      ],
+      "test_error": "transaction J6SBLMWDIYUCBNSM3SMRFK33V6FWW6ZCU6VDBLL73Q7QQVHDJFGA: malformed: tx.ApplicationArgs has too many arguments. 17 \u003e 16",
+      "verify_error": "tx.ApplicationArgs has too many arguments. 17 \u003e 16"
+    },
+    {
+      "name": "wf_appl_arg_too_long",
+      "group": [
+        "gqNzaWfEQIGvMHExOx8RMPSoJolaW2Aw17nPC1G76sI0jKut/2bh2Rb46JSyZNnwxloemliwnorYrkgWcKbA9DukzVxGXwqjdHhuiqRhcGFhkcUQAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAApGFwaWQBo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQJd2YtYXAtYXJno3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhcHBs"
+      ],
+      "test_error": "transaction J3Y4UAOYTGMVLROI3DRFCJZ7LDNZBFZJZDJL5DCLCHGHZ2ZGPR4Q: malformed: tx.ApplicationArgs[0] length is too long. 4097 \u003e 4096",
+      "verify_error": "tx.ApplicationArgs[0] length is too long. 4097 \u003e 4096"
+    },
+    {
+      "name": "wf_appl_args_total_too_long",
+      "group": [
+        "gqNzaWfEQGs4Zkdf7AmgFBH+5g3l416xfMagP1RGGvIK5BX4dSoVZx+/kIcVLZoDSH6jxwG93yEawUVYkTDKDLnIJhY12AGjdHhuiqRhcGFhlcUQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADFEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAxRAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMUQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADEAQCkYXBpZAGjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxAp3Zi1hcC1hcmd0o3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhcHBs"
+      ],
+      "test_error": "transaction S2QEJB6JI27OU2MJEJCTNWBXTKJLZGYMYYZ5AXP32ZVK6LERQPFA: malformed: tx.ApplicationArgs total length is too long. 16385 \u003e 16384",
+      "verify_error": "tx.ApplicationArgs total length is too long. 16385 \u003e 16384"
+    },
+    {
+      "name": "wf_appl_too_many_accounts",
+      "group": [
+        "gqNzaWfEQKwhffpXtciXbEpB7YydaDpRzpdXdcT5dUb1ty6HKYMFTVw8H2eKaco0NJQcjSHgVteDc1kiqEP18rt/sdzePQKjdHhuiqRhcGF0mcQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAxCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAxCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAxCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKRhcGlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECXdmLWFwLWFjY6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYXBwbA=="
+      ],
+      "test_error": "transaction KVSITHKQS53ZCOAKVEBMWV2NDYSNHHRICHCZYN67XETIOGHGY72A: malformed: tx.Accounts too long, max number of accounts is 8",
+      "verify_error": "tx.Accounts too long, max number of accounts is 8"
+    },
+    {
+      "name": "wf_appl_too_many_foreign_apps",
+      "group": [
+        "gqNzaWfEQO2GCrBdceMOHobmI+M++3dsFFLTQMtrtCeCWKViItkQi5JHTkKgFA6avwk3PWb+FiGsCNOCIDSy73XQTHnl0gyjdHhuiqRhcGZhmQAAAAAAAAAAAKRhcGlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECndmLWFwLWZhcHCjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpGFwcGw="
+      ],
+      "test_error": "transaction 4NPTLOCBHS3UEFFK5ZAVKSGTYANAWSNL2XM5LVGVWUW55EYHUKLA: malformed: tx.ForeignApps too long, max number of foreign apps is 8",
+      "verify_error": "tx.ForeignApps too long, max number of foreign apps is 8"
+    },
+    {
+      "name": "wf_appl_too_many_foreign_assets",
+      "group": [
+        "gqNzaWfEQPo8AYVa2SkKbQS49bxZL4dxMAIU877P/3woQkWg/GzhhSb4yONH1VFRzuXGo9xAq2KxymjX3FmC4eNe+afpjwajdHhuiqRhcGFzmQAAAAAAAAAAAKRhcGlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECndmLWFwLWZhc2Gjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpGFwcGw="
+      ],
+      "test_error": "transaction 7ZIOG3TWJICWKO6FEEO3RMDPSIKUWP4QSSGLVZHYBHXNQTL5ZX2Q: malformed: tx.ForeignAssets too long, max number of foreign assets is 8",
+      "verify_error": "tx.ForeignAssets too long, max number of foreign assets is 8"
+    },
+    {
+      "name": "wf_appl_too_many_boxes",
+      "group": [
+        "gqNzaWfEQMXwRI/N+a5CCTVotsIWEBrZyRujuNofQF03OULwf0P8+F693Mfz9LoxGPdDiMx5k4/lnmyQqgTzJ9qTq47JSwyjdHhuiqRhcGJ4mYCAgICAgICAgKRhcGlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECXdmLWFwLWJveKNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYXBwbA=="
+      ],
+      "test_error": "transaction QH7LL3KEK6WNPW7B7VXJIOBWIJC6MYJQTKQNYIS5YTNFHUNHECEA: malformed: tx.Boxes too long, max number of box references is 8",
+      "verify_error": "tx.Boxes too long, max number of box references is 8"
+    },
+    {
+      "name": "wf_appl_total_references_over_max",
+      "group": [
+        "gqNzaWfEQAGWp1K/yhFgSuHtH0FbZvwfFlDA6SQyUAwBuwx3b0FL7efStvzcFj++w8fTYHxlxTfaAs0/K0tzkhOKYKE8JQqjdHhui6RhcGF0mMQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAxCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAxCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAApGFwZmGRAKRhcGlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECndmLWFwLXJlZnOjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpGFwcGw="
+      ],
+      "test_error": "transaction GBG3YCXJAMW3DUTWDJL3AUKFBLPZGVNVLQT7TB3NGSINB5EFYFPA: malformed: tx references exceed MaxAppTotalTxnReferences = 8",
+      "verify_error": "tx references exceed MaxAppTotalTxnReferences = 8"
+    },
+    {
+      "name": "wf_appl_box_index_over_foreign_apps",
+      "group": [
+        "gqNzaWfEQLeb8a2jmoGlAgTf6DFf5wjSpaB86XFvmC2WBZ0yXcOIs1hznmSzhLjyTCnOI31AsWK9x2aFoAaWQwftg8C+mQWjdHhuiqRhcGJ4kYKhaQGhbsQBa6RhcGlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECndmLWFwLWJpZHijc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpGFwcGw="
+      ],
+      "test_error": "transaction KGDTDSK2RIDAIYL663CA6YR2MTIPSEUNBPRXUPVCSWPNOMDZONHA: malformed: tx.Boxes[0].Index is 1. Exceeds len(tx.ForeignApps)",
+      "verify_error": "tx.Boxes[0].Index is 1. Exceeds len(tx.ForeignApps)"
+    },
+    {
+      "name": "wf_appl_box_name_too_long",
+      "group": [
+        "gqNzaWfEQNFnwHeoUe/M/nJ677Gk/PzxywIVc1tvXWF8T6RVBcOPPm7YZXUh17rMLVNpQEkItffzHe+4Orwe6xFChkFSVg6jdHhuiqRhcGJ4kYGhbsRBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACkYXBpZAGjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxAt3Zi1hcC1ibmFtZaNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYXBwbA=="
+      ],
+      "test_error": "transaction IE2EJDDM5O5RVE3OC6EQBQ5EBHOMVY2VMCJN3AXNTNHHVL6D7IRQ: malformed: tx.Boxes[0].Name too long, max len 64 bytes",
+      "verify_error": "tx.Boxes[0].Name too long, max len 64 bytes"
+    },
+    {
+      "name": "wf_appl_local_schema_too_large",
+      "group": [
+        "gqNzaWfEQDAopf12vVMJgbChfshDsTWx0arcAyF0J0ohi4vgQo0LUA17lvwU8ZJq+Tj3zhqHNeDdogwfQVgm0Zdt7IboRQyjdHhui6RhcGFwxAMIgQGkYXBsc4GjbnVpEaRhcHN1xAMIgQGjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxAl3Zi1hcC1sc2yjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpGFwcGw="
+      ],
+      "test_error": "transaction SSC53BVFAKBOCNIJPDCF2FQEAJ2ZYTQJH6UHLIQLZ336233KPCBA: malformed: tx.LocalStateSchema is too large. 17 \u003e 16",
+      "verify_error": "tx.LocalStateSchema is too large. 17 \u003e 16"
+    },
+    {
+      "name": "wf_appl_global_schema_too_large",
+      "group": [
+        "gqNzaWfEQHE1bHp6jOWtsoPC3buydtfamKbkITA9WhhC+rGCL51PzuGytnlz7d78NONL6Rkw/X+bOlAhQgJFDg+liSn1aAujdHhui6RhcGFwxAMIgQGkYXBnc4GjbnVpQaRhcHN1xAMIgQGjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxAl3Zi1hcC1nc2yjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpGFwcGw="
+      ],
+      "test_error": "transaction KS6Q3PLQKZBVC5YL3BNLEAXWJS6HHMO7N3IWII3D63YU7MUUDCNA: malformed: tx.GlobalStateSchema is too large. 65 \u003e 64",
+      "verify_error": "tx.GlobalStateSchema is too large. 65 \u003e 64"
+    },
+    {
+      "name": "wf_appl_access_too_long",
+      "group": [
+        "gqNzaWfEQLKrrKVf1fpv4kwyqWUHTfp1WzSSlfPHMKFWq0kazcS9Dus6SdlP53EYKikn+jaORYGSdLA+9VRJTsFQ7i6whwCjdHhuiqJhbNwAEYCAgICAgICAgICAgICAgICApGFwaWQBo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQJd2YtYXAtYWNso3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhcHBs"
+      ],
+      "test_error": "transaction BGEQ2C6A5GMZCFD3WL5T3B73ESNOEA4VE5MHMCIH4O6HL3FZZK4Q: malformed: tx.Access too long, max number of references is 16",
+      "verify_error": "tx.Access too long, max number of references is 16"
+    },
+    {
+      "name": "wf_appl_access_with_accounts",
+      "group": [
+        "gqNzaWfEQH4ZknQnd0N8vQPlxWByrm6oKg1VEz870z96K+e+lhLNSUm0VsGtW6QZ/jJiLMP54rEAwK/H7RxR1GIXExGbTgijdHhui6JhbJGBoWTEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLpGFwYXSRxCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6RhcGlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECXdmLWFwLWFjYaNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYXBwbA=="
+      ],
+      "test_error": "transaction K4RBHPVZFXCNMEB2FXD3Z3HJ4JZDGIBO56UPBSQQIVRUNQPUQJJQ: malformed: tx.Accounts can't be used when tx.Access is used",
+      "verify_error": "tx.Accounts can't be used when tx.Access is used"
+    },
+    {
+      "name": "wf_appl_access_with_foreign_apps",
+      "group": [
+        "gqNzaWfEQDtAx+HFXStOyrCzaCQjn4AO4+Ts5aBAfMWz6L9Uc9a8al2hk9pmaCsLEpM+QvjxSMoB7KElFJwk44gpt6rAtgmjdHhui6JhbJGBoWTEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLpGFwZmGRBaRhcGlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECXdmLWFwLWFjZqNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYXBwbA=="
+      ],
+      "test_error": "transaction E766TFFWZBN3YRWUH3VOOUWICJ4TZ2PYV5Z4SBODSYTLKL2EZ3HQ: malformed: tx.ForeignApps can't be used when tx.Access is used",
+      "verify_error": "tx.ForeignApps can't be used when tx.Access is used"
+    },
+    {
+      "name": "wf_appl_access_with_foreign_assets",
+      "group": [
+        "gqNzaWfEQLW1p/WOZA5ns41yVQVwfcJTJar0T4/C+GVUAcsk/CndFOYN9bZyNFfNzFKJbKjkGeqfyGmNKkejELKcHFHqNQCjdHhui6JhbJGBoWTEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLpGFwYXORBaRhcGlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECXdmLWFwLWFjc6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYXBwbA=="
+      ],
+      "test_error": "transaction LTBRM6TLB4HMXWPIONHHPTAKVTABXX3FFG2AFAPKV6LMFQBE2BXQ: malformed: tx.ForeignAssets can't be used when tx.Access is used",
+      "verify_error": "tx.ForeignAssets can't be used when tx.Access is used"
+    },
+    {
+      "name": "wf_appl_access_with_boxes",
+      "group": [
+        "gqNzaWfEQNwKTR2kGq8Dq5QlTRgmMsuOLcTU/H+ddakWEAF+duIM1ZJBUadme6+2gKYeEt6rpofCTgkgFEjcyPEGEmPQowKjdHhui6JhbJGBoWTEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLpGFwYniRgaFuxAFrpGFwaWQBo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQJd2YtYXAtYWNio3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhcHBs"
+      ],
+      "test_error": "transaction MXVC4O7BS6Y5OC7PNCA77LDFXLCSLGITYFQ5GHY3VOF6K3LIR7JQ: malformed: tx.Boxes can't be used when tx.Access is used",
+      "verify_error": "tx.Boxes can't be used when tx.Access is used"
+    },
+    {
+      "name": "wf_appl_access_multiple_types",
+      "group": [
+        "gqNzaWfEQEOWl0+WxGclZYC1xfywitgaP1keTNlpAPsfM7yD7DZWiOfHRUlKcrDTmlCPcI5JvLsjM5q+4/KvN3tkWmMI0g6jdHhuiqJhbJGCoWTEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLoXMHpGFwaWQBo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQJd2YtYXAtYWNto3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhcHBs"
+      ],
+      "test_error": "transaction 7AVFKOEOTAUQXT52MIPNQOMH3SLLMZ4FI6QUFXHHQZE7U4NKELEQ: malformed: tx.Access element has fields from multiple types",
+      "verify_error": "tx.Access element has fields from multiple types"
+    },
+    {
+      "name": "wf_appl_access_holding_outside",
+      "group": [
+        "gqNzaWfEQOysOsGqjY4PezL49xJFWyrY66rfBTKF1mkr3D4Y1DEBsiTG6MQzByGRVcvPZFUL0GWdabUS7mrEhzVQ34fkogKjdHhuiqJhbJGBoWiBoXMFpGFwaWQBo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQJd2YtYXAtYWNoo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhcHBs"
+      ],
+      "test_error": "transaction 2H3N27HCEBMOXAAKQ2GCNWP3FLGVNNLS2RXZ2PXR5D6TSMTFEF5A: malformed: holding Asset reference 5 outside tx.Access",
+      "verify_error": "holding Asset reference 5 outside tx.Access"
+    },
+    {
+      "name": "wf_appl_access_locals_zero_app_on_create",
+      "group": [
+        "gqNzaWfEQMgvafWDBqLUX1L/GfcDBP7EtTqYr8sUWrzjzQG2Kl7qVgYDKN/bxUP5i9RsaUpXfpdijOm+7RX61pDYXzlpKASjdHhui6JhbJKBoWyBoWQBgaFkxCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6RhcGFwxAMIgQGkYXBzdcQDCIEBo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQJd2YtYXAtYWN6o3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhcHBs"
+      ],
+      "test_error": "transaction IRYCHD26QHY3LNTPFBO6DMDPSJRUGM5VGU5IGK5QOAOCIRQK7MOA: malformed: 0 App in LocalsRef during app create is not allowed or necessary",
+      "verify_error": "0 App in LocalsRef during app create is not allowed or necessary"
+    },
+    {
+      "name": "wf_appl_access_box_name_too_long",
+      "group": [
+        "gqNzaWfEQK6rKYb5vQCBN/WRKx99f5V5Pdz1SwSDdhqm1PogVVf7QesHoyiSAdekpwAhR4g+N/5owo7TePK4sSsktzNp/AOjdHhuiqJhbJGBoWKBoW7EQQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAApGFwaWQBo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQJd2YtYXAtYWNuo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhcHBs"
+      ],
+      "test_error": "transaction N3YXK5KGRYWKM7OEPS4KUECY6UE7EX532AK4VSOJGOM5TNZO7K6A: malformed: tx.Access box Name too long, max len 64 bytes",
+      "verify_error": "tx.Access box Name too long, max len 64 bytes"
+    },
+    {
+      "name": "wf_appl_order_on_completion_before_programs",
+      "group": [
+        "gqNzaWfEQBwsyqimvg2ONBqSoyXE9gwhnF5AX3XNFBSjFhKLTvJFTEX+SwqKvvRmQyIN1GEuuplzTOPiFOCkjBt8Di1zMQWjdHhui6RhcGFuCaRhcGFwxAMIgQGkYXBpZAGjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxAh3Zi1hcC1vMaNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYXBwbA=="
+      ],
+      "test_error": "transaction 7JGIYORKXCYU6RQEORI35AM3TF6GYDT277IHKL4XBOCVGXP7SSJQ: malformed: invalid application OnCompletion (9)",
+      "verify_error": "invalid application OnCompletion (9)"
+    },
+    {
+      "name": "wf_appl_order_programs_before_extra_pages",
+      "group": [
+        "gqNzaWfEQHEscgwPM81MYRh3cLydOirhbpYQEaKjrZobsNB7F0/RFmUqJ+mEAsmth2pY781+RU5n4B5OPWxcxrbi9XUMoAGjdHhui6RhcGFwxAMIgQGkYXBlcAikYXBpZAGjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxAh3Zi1hcC1vMqNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYXBwbA=="
+      ],
+      "test_error": "transaction GU5GZ3A7NDB73ZATMRG5MTXXOIVDROAWAFQT2QJDJEAIKBHTI5FA: malformed: programs may only be specified during application creation or update",
+      "verify_error": "programs may only be specified during application creation or update"
+    },
+    {
+      "name": "wf_appl_order_local_schema_before_global",
+      "group": [
+        "gqNzaWfEQF7oIvOC+YNr7FCUSoI4Ls6d2asitBbmzITKDH8HYQLgEVIu1q1CiPRgZV1BAFA9Kh22LviRUGwJ9YCUhKYvywujdHhui6RhcGdzgaNudWkBpGFwaWQBpGFwbHOBo251aQGjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxAh3Zi1hcC1vM6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYXBwbA=="
+      ],
+      "test_error": "transaction VCL2FPM75JSP6KDDHXWAJFRIUL6IHSI7XCVX2IZ2RMA34T6EAESA: malformed: inappropriate non-zero tx.LocalStateSchema ({NumUint:1 NumByteSlice:0})",
+      "verify_error": "inappropriate non-zero tx.LocalStateSchema ({NumUint:1 NumByteSlice:0})"
+    },
+    {
+      "name": "wf_appl_order_args_before_references",
+      "group": [
+        "gqNzaWfEQIMflmDEUSpbAN7IVZkBf/UxM0yfP4vBD6WGwaXAuELJWK298huqRVVCKta7lFp/lejnlI0HBRrxhIuO0f1K9QWjdHhui6RhcGFh3AARwMDAwMDAwMDAwMDAwMDAwMCkYXBhdJnEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAxCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAxCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAxCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACkYXBpZAGjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxAh3Zi1hcC1vNKNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYXBwbA=="
+      ],
+      "test_error": "transaction ZPYANUIL5UPNMGALFUHMQ5W54GZTI7SE6X5P65NREZU43JCGEGKA: malformed: tx.ApplicationArgs has too many arguments. 17 \u003e 16",
+      "verify_error": "tx.ApplicationArgs has too many arguments. 17 \u003e 16"
+    },
+    {
+      "name": "wf_appl_order_accounts_before_foreign_apps",
+      "group": [
+        "gqNzaWfEQO1d6LvA6EisOZtreOwyCVK9TOc75AtmzcuXAnOdGYQWnwecax7xMmvYKF6HjrgcsZqVWYayW1F+Ccv+4+bZLAmjdHhui6RhcGF0mcQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAxCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAxCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAxCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKRhcGZhmQAAAAAAAAAAAKRhcGlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECHdmLWFwLW81o3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhcHBs"
+      ],
+      "test_error": "transaction 54LKEPYECZT7F4SLD6VJV556AW4IEEBNWKZV7RP5TVLOBXLESIMQ: malformed: tx.Accounts too long, max number of accounts is 8",
+      "verify_error": "tx.Accounts too long, max number of accounts is 8"
+    },
+    {
+      "name": "wf_appl_order_references_before_box_index",
+      "group": [
+        "gqNzaWfEQBCL6pw1xyyrkKrbs2GqXVF8UMRglYmqa/K85Jq97ic9a5952B85W8uXZIXwEMtcPHbP0u3mvzlv8Yfn+QLMjwSjdHhui6RhcGF0mcQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAxCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAxCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAxCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKRhcGJ4kYKhaQmhbsQBa6RhcGlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECHdmLWFwLW82o3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhcHBs"
+      ],
+      "test_error": "transaction XMMCUIQKFAZN3R54GWDP45BVASI6WEIZZHFK5QA7GKR3EECUT6PA: malformed: tx.Accounts too long, max number of accounts is 8",
+      "verify_error": "tx.Accounts too long, max number of accounts is 8"
+    },
+    {
+      "name": "wf_stpf_bad_sender",
+      "group": [
+        "gqNzaWfEQD2PIkN9xd9H1rvW1krCdi5u0FfmuyNFni/mB19W7a7BF80WTVfABC3nluWs2Xn4PRaNB7BlROgkpuptMTlCjw+jdHhuhqJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpHN0cGY="
+      ],
+      "test_error": "transaction C6BOXULFADQCUGGCAAYHS57UCSVX33KPQ6RXZKBIORTVIVSRFUXQ: malformed: sender must be the state-proof sender",
+      "verify_error": "sender must be the state-proof sender"
+    },
+    {
+      "name": "wf_stpf_fee_not_zero",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQMJbXit6P/62f13b/aXqjq6omDHSNx2lyiR8pW9zJQDGqol8KPQ2jH7Hs19RXQiXJGVyVTk3yl6LWH56iotN2QqjdHhuh6NmZWUBomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KNzbmTEILs8UmKp1cdNICfjp+rk1v9wz2xM5MXgV8Ee05uVNEIFpHR5cGWkc3RwZg=="
+      ],
+      "test_error": "transaction H3CO4AKMZ2V7UWFWU4T2AMO52XJ5RLVOFL4RNUUD33VKAU5LJ3SQ: malformed: fee must be zero in state-proof transaction",
+      "verify_error": "fee must be zero in state-proof transaction"
+    },
+    {
+      "name": "wf_stpf_note_not_empty",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQH/vHH1BP7PfYH8pz2Q9rnzIwLhKc9ketH4MhwlcYDKaTiQbz1ZcLMJO8l5LRNgit3ufmrYq7OP4YDwzU8B84AejdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQBbqNzbmTEILs8UmKp1cdNICfjp+rk1v9wz2xM5MXgV8Ee05uVNEIFpHR5cGWkc3RwZg=="
+      ],
+      "test_error": "transaction Z3H4QQJDGENWMVEBA7HU2SME2PL6MHGKHLUZ24WQ6QW7EHHFPLSQ: malformed: note must be empty in state-proof transaction",
+      "verify_error": "note must be empty in state-proof transaction"
+    },
+    {
+      "name": "wf_stpf_group_not_zero",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQHY4TSrACHkBvo2Ag8gl7Md7fPzeUAmD+gtOhdH1XILonW76rwMLQzWdgwK0IkTkAG60Ge1dMEkAF871AEYuRwejdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGjZ3JwxCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQqJsds0D6KNzbmTEILs8UmKp1cdNICfjp+rk1v9wz2xM5MXgV8Ee05uVNEIFpHR5cGWkc3RwZg=="
+      ],
+      "test_error": "transaction YCDLZKBCBW7URXKFVPGDFVHAHLTX52MIX24BAAUNVEJWIN2GZVTA: malformed: group must be zero in state-proof transaction",
+      "verify_error": "group must be zero in state-proof transaction"
+    },
+    {
+      "name": "wf_stpf_rekey_not_zero",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQO0x6363VbGzdSuf2b8+HYcpylYG2oyznr2QeNRZLJ/jMDbDXe37wlxMGT3I8/7dVHVMVpRmUh4eOeViaH2BAgqjdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ilcmVrZXnEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQguzxSYqnVx00gJ+On6uTW/3DPbEzkxeBXwR7Tm5U0QgWkdHlwZaRzdHBm"
+      ],
+      "test_error": "transaction D4AHX3PRSZIFMOQ3RPYMEQ7GYAJTDAP256UNODIJQ3QCGZPZJCCQ: malformed: rekey must be zero in state-proof transaction",
+      "verify_error": "rekey must be zero in state-proof transaction"
+    },
+    {
+      "name": "wf_stpf_lease_not_zero",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQPdpW6hzsmrV9EPNxCasx1qdExVf2O/t6KNE8j3+uVSdOlIqtSh2dVVh39bhj9ch1wOKllSFqhpcU9wSydfXrwGjdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+iibHjEIEJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCo3NuZMQguzxSYqnVx00gJ+On6uTW/3DPbEzkxeBXwR7Tm5U0QgWkdHlwZaRzdHBm"
+      ],
+      "test_error": "transaction TNORZXRMYFEP3IK4YTKUPI3CZSXVG3WDI5JRV3YSYG6WHFTGIGMA: malformed: lease must be zero in state-proof transaction",
+      "verify_error": "lease must be zero in state-proof transaction"
+    },
+    {
+      "name": "wf_stpf_order_sender_before_fee",
+      "group": [
+        "gqNzaWfEQI/uf5JkN7bAlJhErG7/2U7YbtUDLGAg2RbKOz/0h33vE3sY1MpigtlMNEZiLzNnKCH3PsTHAGqqToYvLVJeigajdHhuh6NmZWUBomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkc3RwZg=="
+      ],
+      "test_error": "transaction OOHJ54CGQGQN7Q7QME6APRMTYB2LDZ5HTHKLRV47CRPK32WM22DQ: malformed: sender must be the state-proof sender",
+      "verify_error": "sender must be the state-proof sender"
+    },
+    {
+      "name": "wf_stpf_order_fee_before_note",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQHry54N5dp5j2bIlMKZrc6kY8zx/qqREvhoYTUYMgUKeJhes74dIUTua1hRJLTKtdyIkIrHwb+Y5Rav8zChAcQGjdHhuiKNmZWUBomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxAFuo3NuZMQguzxSYqnVx00gJ+On6uTW/3DPbEzkxeBXwR7Tm5U0QgWkdHlwZaRzdHBm"
+      ],
+      "test_error": "transaction UF57EPYIRJIRACR37R4HVR3BXF2FI5AFRN3GG6FYD76GVLSKZIUQ: malformed: fee must be zero in state-proof transaction",
+      "verify_error": "fee must be zero in state-proof transaction"
+    },
+    {
+      "name": "wf_stpf_order_note_before_group",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQFlXidiQq4Cc94ECyhY1+MuBDg5KSCptihwRv/WPpl98zHwgDOi6EDkna/qhXqqxAQkq8NPaasq4k5c9XWcv5AOjdHhuiKJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGjZ3JwxCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQqJsds0D6KRub3RlxAFuo3NuZMQguzxSYqnVx00gJ+On6uTW/3DPbEzkxeBXwR7Tm5U0QgWkdHlwZaRzdHBm"
+      ],
+      "test_error": "transaction 5YSZ4OJYFISKDWP5BANOWTNWWOPOEBJTMTOK4AE2P2WN7KU3LIFQ: malformed: note must be empty in state-proof transaction",
+      "verify_error": "note must be empty in state-proof transaction"
+    },
+    {
+      "name": "wf_hb_proof_empty",
+      "group": [
+        "gqNzaWfEQN28sYK1ASko5vmJeoMHGwoiBcFNSAncmFL3tXW2aApxkB65GQ1sOCaR+CEb2d0zCy2gn5/YT1rMbUIMiEIwwAujdHhuiaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomhihKFhxCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6JrZAGic2TEIAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAo3ZpZMQgAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACibHbNA+ikbm90ZcQLd2YtaGItcHJvb2ajc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlomhi"
+      ],
+      "test_error": "transaction BJYFBFOBCTS7LK4HLLT4HJ7AR6A2JM7NLIPPSEDQ6G3KZU7DWTQA: malformed: tx.HbProof is empty",
+      "verify_error": "tx.HbProof is empty"
+    },
+    {
+      "name": "wf_hb_proof_only_pk2",
+      "group": [
+        "gqNzaWfEQE3H577h5GXFvtT4gq9qDTJ0tUVc3wd/FqDqFgElFsHzPR0aH0RsnEw7BbzxXA3p0wQg9x/EHB04gTx6wCydaQ6jdHhuiaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomhihKFhxCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6JrZAGjcHJmgaJwMsQgAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACjdmlkxCABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKJsds0D6KRub3RlxAl3Zi1oYi1wazKjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlomhi"
+      ],
+      "test_error": "transaction HGIKTGWIXMYWLLQSF7JTA327OD2YRJF5IRYQGBA6FQZGQH4UYTJQ: malformed: tx.HbSeed is empty",
+      "verify_error": "tx.HbSeed is empty"
+    },
+    {
+      "name": "wf_hb_seed_empty",
+      "group": [
+        "gqNzaWfEQPf0v53kDvsCz/vf6RkAlPVoEYTCv4+APvKWQppU9y/hfm7JSBaf1MWrtH0eGhJOfdjTe4f+TmerGXOKj7Z3xg+jdHhuiaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomhihKFhxCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6JrZAGjcHJmgaFzxEABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAo3ZpZMQgAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACibHbNA+ikbm90ZcQKd2YtaGItc2VlZKNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWiaGI="
+      ],
+      "test_error": "transaction 4VKYTPOL4VV3QCTAIED3NYYHIJL373VABWKVWKVVFZH35STOTOHA: malformed: tx.HbSeed is empty",
+      "verify_error": "tx.HbSeed is empty"
+    },
+    {
+      "name": "wf_hb_vote_id_empty",
+      "group": [
+        "gqNzaWfEQF5bbdX5k9bwqVbBCTHdOYYPphpHFSxMtpyIBEeT+ZVxai6ujWmH66IicUMOkPwg9bsskbPhZbMeQ1rTqW62wQajdHhuiaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomhihKFhxCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6JrZAGjcHJmgaFzxEABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAonNkxCABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKJsds0D6KRub3RlxAl3Zi1oYi12aWSjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlomhi"
+      ],
+      "test_error": "transaction KV6DNYNEXUFCXWIHYBLZIFKD7ZJEOR7MZKJ7BHVER74YL3NZXVDA: malformed: tx.HbVoteID is empty",
+      "verify_error": "tx.HbVoteID is empty"
+    },
+    {
+      "name": "wf_hb_key_dilution_zero",
+      "group": [
+        "gqNzaWfEQH7irVVatJa6jB3O8OsgxdoEHBDKdAO94li2INv64fq9B9lzKiLL9M/3MyfC0vk/lGlH10d9chXbF6X3k7BXVA2jdHhuiaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomhihKFhxCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NwcmaBoXPEQAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACic2TEIAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAo3ZpZMQgAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACibHbNA+ikbm90ZcQId2YtaGIta2Sjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlomhi"
+      ],
+      "test_error": "transaction ERPWBYV7JIUSV4OLRGKAPR44O4KE2MWBN3MMM5XBF6BUUVTSLLEQ: malformed: tx.HbKeyDilution is zero",
+      "verify_error": "tx.HbKeyDilution is zero"
+    },
+    {
+      "name": "wf_hb_discounted_with_note",
+      "group": [
+        "gqNzaWfEQDJg+tPxfYCoCRiKPvX06dTlcZeKPRMZMV1WrO1h8HXfvCra/pRDsZMAM0eXE7R3j4RbQGZTGZpFMviAWCMp6gCjdHhuiaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomhihqFhxCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6Fjw6JrZAGjcHJmgaFzxEABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAonNkxCABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKN2aWTEIAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAomx2zQPopG5vdGXEC3dmLWhiLWRub3Rlo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaJoYg=="
+      ],
+      "test_error": "transaction BPPSS4IPVDGDLNCXSVG3TXBBRQIUNT4YQDN5XMWF4GQOPUE4BBHQ: malformed: tx.Note is set in discounted heartbeat",
+      "verify_error": "tx.Note is set in discounted heartbeat"
+    },
+    {
+      "name": "wf_hb_discounted_with_lease",
+      "group": [
+        "gqNzaWfEQK6EeMlZqorsjjMe67VXElu5buy3bArHCvkD5T6R3SSH0DTp+js1lL9GTr2X0qcRcnSRNQmTAspN0qwYFoWPgQ2jdHhuiaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomhihqFhxCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6Fjw6JrZAGjcHJmgaFzxEABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAonNkxCABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKN2aWTEIAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAomx2zQPoomx4xCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQqNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWiaGI="
+      ],
+      "test_error": "transaction GQUP25RWVICBUNBR64EG5FRR7ILUJOHLUMD5SBH2VLUEGHY7PTAA: malformed: tx.Lease is set in discounted heartbeat",
+      "verify_error": "tx.Lease is set in discounted heartbeat"
+    },
+    {
+      "name": "wf_hb_discounted_with_rekey",
+      "group": [
+        "gqNzaWfEQNwOFXWC7njUuqiqyH8NIJIdXGh1e55Lgvg6+dbWvyr9VLnRlq2BgqrUvVSWhYhQVJZ6EIA2hfh7vaDgXHMh1QGjdHhuiaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomhihqFhxCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6Fjw6JrZAGjcHJmgaFzxEABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAonNkxCABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKN2aWTEIAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAomx2zQPopXJla2V5xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWiaGI="
+      ],
+      "test_error": "transaction SX2WIAJ7TGJNXUASHEC6ISHMMTFVALCNN66NYA2PMGGM5AJ3HZKQ: malformed: tx.RekeyTo is set in discounted heartbeat",
+      "verify_error": "tx.RekeyTo is set in discounted heartbeat"
+    },
+    {
+      "name": "wf_hb_order_note_before_proof",
+      "group": [
+        "gqNzaWfEQNLbWFVJrBbOrzdqebEZNJtWvrHtHpKFqzS+A8yQxslAe5KajTJfy/RvDmWZX5oTOu4OMq7soin6W2Fcad/U7gmjdHhuiaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomhihaFhxCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6Fjw6JrZAGic2TEIAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAo3ZpZMQgAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACibHbNA+ikbm90ZcQId2YtaGItbzGjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlomhi"
+      ],
+      "test_error": "transaction UY24VL3RW2MCTYTDG5HJMZUNJUYDKO72CEI6M4PPRID6CJ2BJXIQ: malformed: tx.Note is set in discounted heartbeat",
+      "verify_error": "tx.Note is set in discounted heartbeat"
+    },
+    {
+      "name": "wf_hb_order_proof_before_seed",
+      "group": [
+        "gqNzaWfEQAhQVN13Wa7ECjNVPw5jP66ZvmSI4iAJOA+4zV6ppCvTItKhO7I/HifUk8rVL/fBhOioDkNm5EmxQ4Be0Pzi5wSjdHhuiaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomhig6FhxCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6JrZAGjdmlkxCABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKJsds0D6KRub3RlxAh3Zi1oYi1vMqNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWiaGI="
+      ],
+      "test_error": "transaction C44MKEB62ZJUKVXZZ2LMUDHPKJBW5FS6STP3UXQKBA7H4X4I5HOQ: malformed: tx.HbProof is empty",
+      "verify_error": "tx.HbProof is empty"
+    },
+    {
+      "name": "wf_hb_no_heartbeat_fields",
+      "group": [
+        "gqNzaWfEQNwLaVr2R7sEPubihqV4BbgZlc1M3vKp+MA7Vym7u2QXOJiRSokPJzl425O2VDVeFdF1RlTKt8t0yivffYDWgQejdHhuiKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEDndmLWhiLW5vZmllbGRzo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaJoYg=="
+      ],
+      "test_error": "transaction LLAKXKJUACIQAZKSDOFEW57QDSHGUXDY2LMWCFT52S3WTLB3DREA: malformed: heartbeat transaction has no heartbeat fields",
+      "verify_error": "heartbeat transaction has no heartbeat fields"
+    },
+    {
+      "name": "wf_unknown_tx_type",
+      "group": [
+        "gqNzaWfEQIIMPIbj6jkuuAHyqZYRWhQa2UxZ11iqC+VdOuYVcaaziAJcYJAG6tARLV6UICFyYtqtdV3N6oeCuC71YekZkgujdHhuiKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXED3dmLXVua25vd24tdHlwZaNzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWjeHl6"
+      ],
+      "test_error": "transaction JN52VZSFKJTKWJNAUBJKFBHG77NMNVNXUUQZIUQJUYSTTSYGOK2Q: malformed: unknown tx type xyz",
+      "verify_error": "unknown tx type xyz"
+    },
+    {
+      "name": "wf_order_type_rule_before_window",
+      "group": [
+        "gqNzaWfEQAeo6nEdV0RznZrkx74hMbt9obZavt4NaK1t5Ar3wy9YoL6fIcgZ99GcCvYmyzok6KmVFgGs4w4I7pfT0Sp8EQujdHhui6NhbXTOAA9CQKVjbG9zZcQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds4AAYagpG5vdGXEEXdmLW8tY2xvc2Utd2luZG93o3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "transaction YTGLRWAH2KWOUQIG44455IQAU33EIHLVFQ77T6WSWVZT6N7NSXWA: malformed: transaction cannot close account to its sender XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI",
+      "verify_error": "transaction cannot close account to its sender XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI"
+    },
+    {
+      "name": "wf_order_isolation_before_range",
+      "group": [
+        "gqNzaWfEQPlDXZFlxNRlMJ/s7x9nNVs/O2DXXoa41D+dmscDjf05ILDqGU1yX/xf2Hlxek0zPCLMy1TxM8QM+JWLdOeV9QijdHhui6NhbXTOAA9CQKRjYWlkAaNmZWXNA+iiZnbNAfSjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNAZCkbm90ZcQOd2Ytby1pc28tcmFuZ2WjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWjcGF5"
+      ],
+      "test_error": "transaction SHDNFDTQG7ITCTGICGBS4GAQVSDKPHCYAITXNQ2NREF7L6KGUTXQ: malformed: transaction of type pay has non-zero fields for type acfg",
+      "verify_error": "transaction of type pay has non-zero fields for type acfg"
+    },
+    {
+      "name": "wf_order_type_rule_before_isolation",
+      "group": [
+        "gqNzaWfEQDdrchEEhZNxahyUT4WAa9p1oZyl+61Pu7s4O5AQhtaW9QbzbJIW2SItnCQqIrZnndUwJgUHi7i6ztNx685GQgGjdHhujKNhbXTOAA9CQKRjYWlkAaVjbG9zZcQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxA13Zi1vLXR5cGUtaXNvo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "transaction LP3B2LBE6QFS6KBPCNS74VLUQF6DB6DO5DT6HUTAMKKO5THZVABA: malformed: transaction cannot close account to its sender XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI",
+      "verify_error": "transaction cannot close account to its sender XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI"
+    },
+    {
+      "name": "wf_order_range_before_note",
+      "group": [
+        "gqNzaWfEQFijBLIG8wQexVvymxmyCF3rjSUDnaAHC/GKPX/lpwHeYOiF/H5m1XJUdDyPlkKJUuQXlfr6xzpyTMX4NPW5vg+jdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnbNAfSjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNAZCkbm90ZcUQAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "transaction RBYTQDTK4BNHQDPZ4PBHEYDCQWTRTCYYML5WP7HAQJREUNRHR22Q: malformed: transaction invalid range (500--400)",
+      "verify_error": "transaction invalid range (500--400)"
+    },
+    {
+      "name": "wf_order_window_before_note",
+      "group": [
+        "gqNzaWfEQN4ZpFyI9A+bL4qak7TbV/Zyd6LowQ83HmzGm2hKyU1/GR0Go9NcrlImwxYECylw9xg3lVmwo3+RU+ZLD7CfVA+jdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zgABhqCkbm90ZcUQAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "transaction V5QJA2YZ2DWU25OJWCKGGDLLDP6KH2RQHH5QJXJNRLQGQGL46G7A: malformed: transaction window size excessive (1--100000)",
+      "verify_error": "transaction window size excessive (1--100000)"
+    },
+    {
+      "name": "wf_order_note_before_pool_sender",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQBCnSTH3o2htrl9iWKLm1dRrtGLDTuGTdKUqbTn4MkDgJDNfzNkiXaK/syBeu+IO8w9d2n9GslFQ/Tmnur1OzwujdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXFEAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQg7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u6kdHlwZaNwYXk="
+      ],
+      "test_error": "transaction E3LKGL3GI35WYB6DN6PNB64QXMAUOZXFT3N64P5LSYHFR5TR2WJQ: malformed: transaction note too big: 4097 \u003e 4096",
+      "verify_error": "transaction note too big: 4097 \u003e 4096"
+    },
+    {
+      "name": "wf_order_note_before_zero_sender",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQKCfnS5bFTnnkuYQaC6Gqa7tW0BvaVu6QMqFTGlUQ7yDSNbQbG7RH1CgwE/4ivJFhATSkBYNcWq9QWdiXnTJ7wOjdHhuiKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXFEAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKR0eXBlpWF4ZmVypHhhaWQB"
+      ],
+      "test_error": "transaction AC6RBSBZ2SPNDNN766WLV5DYZY4GIKVJQJVMZBEAHGZMR5GI445A: malformed: transaction note too big: 4097 \u003e 4096",
+      "verify_error": "transaction note too big: 4097 \u003e 4096"
+    },
+    {
+      "name": "wf_order_application_rule_before_window",
+      "group": [
+        "gqNzaWfEQPVoDQpgTRLoDCBZ0USSki+kBWAesm9ebY2smN+GiapWS5XWvzuV9vRdeDZx89mPkqMv10PBrWvxGD0d2eiplgajdHhuiqRhcGFuCaRhcGlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zgABhqCkbm90ZcQQd2Ytby1hcHBsLXdpbmRvd6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkYXBwbA=="
+      ],
+      "test_error": "transaction UGVM7W5N4NEMNT2KOFYFIQWPXNMSONQJ6OQC3NB5HVMDGM2M74AQ: malformed: invalid application OnCompletion (9)",
+      "verify_error": "invalid application OnCompletion (9)"
+    },
+    {
+      "name": "wf_order_state_proof_rule_before_window",
+      "group": [
+        "gqNzaWfEQJDrYWjTB5ajzydv4zxLQkzsy7vxsNOXepebbI7YCy8Xm/UWs3w0l21lpQdQj0ipAYXcMT9pUESi888+DgFGAAajdHhuiKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zgABhqCkbm90ZcQQd2Ytby1zcHJmLXdpbmRvd6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWkc3RwZg=="
+      ],
+      "test_error": "transaction JNX3IIESML2WRTLAEFUZFZF5TE54AO266F55QSSUSRTQ4D432KQA: malformed: sender must be the state-proof sender",
+      "verify_error": "sender must be the state-proof sender"
+    },
+    {
+      "name": "wf_order_missing_heartbeat_fields_before_window",
+      "group": [
+        "gqNzaWfEQFgyb+KhmiXK9t90SkpQ3r/2v79vW7hBJIjerZqYUNeUqktO/9ovMwvPv09G/LMXClpBMA9t5/p7GKICAHK/DwCjdHhuiKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zgABhqCkbm90ZcQOd2Ytby1oYi13aW5kb3ejc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlomhi"
+      ],
+      "test_error": "transaction F5DL77KD7GLAF3B5UFKXONOBE74FOURN5ONAQSIIQ6I6AXZFK3IQ: malformed: heartbeat transaction has no heartbeat fields",
+      "verify_error": "heartbeat transaction has no heartbeat fields"
+    },
+    {
+      "name": "wf_order_unknown_type_before_window",
+      "group": [
+        "gqNzaWfEQBC51F8cb2On9jeJbHhswPLy1DwCeFMspkE/fP6DtlN5qwycmZ6MFKdEQ2pDJuKlgj/vToJBUWVC+osRCuSFgAujdHhuiKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zgABhqCkbm90ZcQTd2Ytby11bmtub3duLXdpbmRvd6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWjeHl6"
+      ],
+      "test_error": "transaction GXGLUDTNNCUHQGJR6BPJCPDAQA7QRQU26LRGHZUZMK7TUIJWIFKA: malformed: unknown tx type xyz",
+      "verify_error": "unknown tx type xyz"
+    },
+    {
+      "name": "wf_order_asset_rule_before_window",
+      "group": [
+        "gqNzaWfEQBkla7cxF6FghMQfEYs7agWJc2GOZQJtE6c94zWEd756HIIxPktWvpxyzdLk4JiVydUPeu1nbb79HhmJgRcB0AajdHhuiaRhcGFygqJhbtkhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhoXQBo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbOAAGGoKRub3RlxBB3Zi1vLWFjZmctd2luZG93o3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhY2Zn"
+      ],
+      "test_error": "transaction DPE6PYJV2AQ2WI55GOU4BEMB74BHVCFUI6NACCQYHCKW6HUNKJ6A: malformed: transaction asset name too big: 33 \u003e 32",
+      "verify_error": "transaction asset name too big: 33 \u003e 32"
+    },
+    {
+      "name": "wf_order_keyreg_rule_before_window",
+      "group": [
+        "gqNzaWfEQLBuYP2tDge3IuOJbHrdpxb2YOAoaLrohpUmZW5+JnvMf5rbJpwoBwguBgrcB+yZvGCK6L0cOzUBHa6LiF8DOwOjdHhuiaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zgABhqCkbm90ZcQOd2Ytby1rci13aW5kb3ejc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpmtleXJlZ6d2b3Rla2V5xCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg=="
+      ],
+      "test_error": "transaction PSQOFNOEJBXFNFISNWTBAYWTCQW32UQLHQO3LCTB4VBWDWV6IOXQ: malformed: the following transaction fields need to be clear/set together : votekey, selkey, votekd",
+      "verify_error": "the following transaction fields need to be clear/set together : votekey, selkey, votekd"
+    },
+    {
+      "name": "group_gossip_dup_then_inconsistent_group",
+      "group": [
+        "gqNzaWfEQLapnc3Z2AwWFLnbYbWy6YxobUpIE5eia9tFy/Jab9LLuKj+TYDZKIMlsbPbTapOj+wIXnYMPB2MIgXlkd/3/wyjdHhujKNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQghDNQmk7Gd+TPMMHMsvUMJVq/At7jQjDWyl2y8gnJAmWibHbNA+iibHjEIBERERERERERERERERERERERERERERERERERERERERERpG5vdGXEDmctbGVkZ2VyLWxlYXNlo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ==",
+        "gqNzaWfEQKv9yHqPcBd1IGjDLTjGviGEqj3cMfWkQILIiyR4Qtl3LrjKy57/SKCWXUzINKLXB1T3l0IXaxq+SdL1/TRpnwWjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECGctcGFpci1io3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "transaction UH2AKTB4BLA5EM5Y26N5VM7MBUDU7NWNJVX4ALE3B66QWR6REINQ using an overlapping lease (sender, lease):(XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI, CEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEI7JH2AYM)",
+      "verify_error": "transactionGroup: inconsistent group values: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA != QQZVBGSOYZ36JTZQYHGLF5IMEVNL6AW64NBDBVWKLWZPECOJAJSQ"
+    },
+    {
+      "name": "group_gossip_inconsistent_group_only",
+      "group": [
+        "gqNzaWfEQB9a6P3hRQFU7yWNgcDqPBY4qG84T59ybILRK73xoApJkTS7aqm6NPQomM1eGT6m5C25+xSmcL1iGDgC30+N+wOjdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgUgcRQBw4ZUw2QaA2sDv0z1Qj9TBCLcKeL4/16j6pRyaibHbNA+ikbm90ZcQJZy1jbGVhbi1ho3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ==",
+        "gqNzaWfEQMOk1YfiBnAThokeNLRHXT1IorQRxLmoOdmqAPETnk8ZwswftNnvVrKWTAIO8zSZDSv7PqWz9vfYAYwfHsg+ggCjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECWctY2xlYW4tYqNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaNwYXk="
+      ],
+      "test_error": "transactionGroup: inconsistent group values: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA != KIDRCQA4HBSUYNSBUA3LAO7UZ5KCH5JQIIW4FHRPR726UPVJI4TA",
+      "verify_error": "transactionGroup: inconsistent group values: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA != KIDRCQA4HBSUYNSBUA3LAO7UZ5KCH5JQIIW4FHRPR726UPVJI4TA"
+    },
+    {
+      "name": "group_gossip_zero_group_in_group",
+      "group": [
+        "gqNzaWfEQFtKLZW2nhF03zF73F3v9iGzcBOx7Wh19HEwz45yfG/eqXFGab9H0KIUOKCmZJxhMUJkJQPYJcrJ29VDA/ZmKgmjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECGctemVyby1ho3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ==",
+        "gqNzaWfEQM8I2lCJaeYVIKfk71LdkvdTLP1HhJ88gpPF8XTGrOIwWq0k5zD1hkTCav7xVQj2hEkhKMtSDck2BRH77vF7LQCjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECGctemVyby1io3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "transactionGroup: [0] had zero Group but was submitted in a group of 2",
+      "verify_error": "transactionGroup: [0] had zero Group but was submitted in a group of 2"
+    },
+    {
+      "name": "group_gossip_incomplete_group",
+      "group": [
+        "gqNzaWfEQB9a6P3hRQFU7yWNgcDqPBY4qG84T59ybILRK73xoApJkTS7aqm6NPQomM1eGT6m5C25+xSmcL1iGDgC30+N+wOjdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgUgcRQBw4ZUw2QaA2sDv0z1Qj9TBCLcKeL4/16j6pRyaibHbNA+ikbm90ZcQJZy1jbGVhbi1ho3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "transactionGroup: incomplete group: KIDRCQA4HBSUYNSBUA3LAO7UZ5KCH5JQIIW4FHRPR726UPVJI4TA != 3ETG4OTYTJ4XNTTQL6OVAI4ZJY2XT36VPIA63XYO4LDSAHLZDUOA ({{} [QMGNNV7ZJNRXFZ5ZRUEXWEIQFLR6ZFAEJXV7SWHQFTKMBB36JAWQ]})",
+      "verify_error": "transactionGroup: incomplete group: KIDRCQA4HBSUYNSBUA3LAO7UZ5KCH5JQIIW4FHRPR726UPVJI4TA != 3ETG4OTYTJ4XNTTQL6OVAI4ZJY2XT36VPIA63XYO4LDSAHLZDUOA ({{} [QMGNNV7ZJNRXFZ5ZRUEXWEIQFLR6ZFAEJXV7SWHQFTKMBB36JAWQ]})"
+    },
+    {
+      "name": "group_gossip_bogus_group_id",
+      "group": [
+        "gqNzaWfEQNlsUFS4IcvyRJqoEhb/Yd8AXGifaXTqNgI58nVPmQZCnhvcyV2TlMEo/PxQ+Z+0Gf4h6Ku6KDijSAGCfnxn4AmjdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6uibHbNA+ikbm90ZcQJZy1ib2d1cy1ho3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ==",
+        "gqNzaWfEQP4gDojV3ftb5erq7XrcdvJ+1iEIlGiEWiHTQP/L/rnbK/yy5pQvXLzvS73xz5JyHHhAVVvF1slpoGteB1cGmgWjdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6uibHbNA+ikbm90ZcQJZy1ib2d1cy1io3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "transactionGroup: incomplete group: VOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOVQ != IBYSFRHI6OBW6DFGCQSKKXL3D2HPUKILKUP3TQ3OVTRXH6536LOQ ({{} [EOF2WP5IQTSYE45MCCID5TABEO2MIRSVTK27JRROMS3TE7WSLY2A EVCYK3OVMAGKPFNLBWOO76OWJ3L4YBRVZMMLYH2RNZF5UBLISKWA]})",
+      "verify_error": "transactionGroup: incomplete group: VOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOVQ != IBYSFRHI6OBW6DFGCQSKKXL3D2HPUKILKUP3TQ3OVTRXH6536LOQ ({{} [EOF2WP5IQTSYE45MCCID5TABEO2MIRSVTK27JRROMS3TE7WSLY2A EVCYK3OVMAGKPFNLBWOO76OWJ3L4YBRVZMMLYH2RNZF5UBLISKWA]})"
+    },
+    {
+      "name": "verify_bad_signature",
+      "group": [
+        "gqNzaWfEQI3Gomvb4zHjdm+VzKw70K+GAHC5n/oHFMRSKWvhrTrHl67GkMFAfIkFg7C8jrebqN4smoT9oL12d92WTLlhzAWjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECndmLWJhZC1zaWejcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "At least one signature didn't pass verification"
+    },
+    {
+      "name": "verify_no_signature",
+      "group": [
+        "gaN0eG6Ko2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQJd2Ytbm8tc2lno3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "signedtxn has no sig"
+    },
+    {
+      "name": "verify_two_signature_types",
+      "group": [
+        "g6Rtc2lng6ZzdWJzaWeRgaJwa8QgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWjdGhyAaF2AaNzaWfEQNpf+QhcrF1j7i7t9yYMB7/ZqTIlIBu/ixOvd/JRKLBMkEB70z9jTj9LivIXUxh/cd8fjft75UFibOz7yIeKRgSjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEC3dmLXR3by1zaWdzo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "signedtxn should have only one type of signature"
+    }
+  ],
   "pool_order": [
     {
       "name": "auth_then_dup",
@@ -418,8 +1464,7 @@
       ],
       "test_error": "transaction 24IUZGEM6KEMKQLZIAYLOQG3PNHCCKGSWIU3JLFGUAXCMTX3WNYQ: malformed: transaction window size excessive (1--100000)",
       "add_error": "transaction 24IUZGEM6KEMKQLZIAYLOQG3PNHCCKGSWIU3JLFGUAXCMTX3WNYQ: malformed: transaction window size excessive (1--100000)",
-      "skip_apply": true,
-      "test_compare": "frame"
+      "skip_apply": true
     },
     {
       "name": "gossip_dup_then_malformed",
@@ -430,8 +1475,7 @@
       ],
       "test_error": "transaction XPI7FXLAITSFUNKVWERL7ZQEJ3ARTNWF4EORGQPVNDLVUQL5CVPA: malformed: transaction window size excessive (1--100000)",
       "add_error": "transaction XPI7FXLAITSFUNKVWERL7ZQEJ3ARTNWF4EORGQPVNDLVUQL5CVPA: malformed: transaction window size excessive (1--100000)",
-      "skip_apply": true,
-      "test_compare": "frame"
+      "skip_apply": true
     },
     {
       "name": "gossip_group_too_large",

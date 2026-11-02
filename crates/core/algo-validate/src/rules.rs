@@ -96,48 +96,64 @@ pub fn validate_transaction_rules(
 
 /// Version-aware transaction well-formedness check.
 ///
-/// Mirrors go-algorand's `Transaction.WellFormed()` plus the fee/round/note/
-/// lease/group checks from the outer validation layer. When `spec` is
-/// provided, also checks for zero sender and rewards-pool sender.
+/// Mirrors go-algorand's `Transaction.WellFormed()`
+/// (`data/transactions/transaction.go`) rule for rule, in go's order and with
+/// go's error texts (issue #2193): the first rule that fails is the one go
+/// reports for a transaction with several problems. When `spec` is provided,
+/// the rewards-pool sender and the fee-sink rules of the payment and keyreg
+/// types apply, as go always has its special addresses.
 ///
-/// # Checks performed
+/// # Order (go's)
 ///
-/// 1. Sender must not be zero (Go: `tx.Sender.IsZero()`)
-/// 2. Sender must not be the rewards pool (Go: `tx.Sender == spec.RewardsPool`)
-/// 3. Fee minimum (unless fee pooling or state proof or free heartbeat)
-/// 4. Round window (last_valid >= first_valid, window <= max_txn_life)
-/// 5. Note size limit
-/// 6. Lease format (empty or 32 bytes; rejected if leases not supported)
-/// 7. Group format (empty or 32 bytes; rejected if groups not supported)
-/// 8. Rekey-to rejected if rekeying not supported
-/// 9. Heartbeat-specific well-formedness (free heartbeat restrictions)
+/// 1. The type's own rules (`PaymentTxnFields.wellFormed`, keyreg, asset,
+///    application, state proof and heartbeat `wellFormed`, each behind its
+///    protocol gate; an unknown type is `unknown tx type`).
+/// 2. The cross-type field rule (`nonZeroFields`).
+/// 3. The common rules: valid range, window, note size, rewards-pool sender,
+///    zero sender, lease, group and rekey support.
+///
+/// Then, NOT part of go's `WellFormed` (go judges fees for the whole group,
+/// later): the per-transaction minimum fee, unless `allow_fee_pooling`.
 pub fn validate_transaction_wellformed(
     txn: &Transaction,
     allow_fee_pooling: bool,
     params: &ConsensusParams,
     spec: Option<&SpecialAddresses>,
 ) -> Result<(), AlgoError> {
-    // ── Sender checks (Go: WellFormed in transaction.go) ──────────
-    // Order matches Go: rewards-pool check first, then zero-sender.
-    // Go checks `tx.Sender == spec.RewardsPool` unconditionally (no
-    // zero-guard on the pool address).
-    if let Some(sp) = spec {
-        if txn.sender == sp.rewards_pool {
-            return Err(AlgoError::Validation {
-                message: "transaction from incentive pool is invalid".to_string(),
-            });
-        }
-    }
+    wellformed_inner(txn, allow_fee_pooling, params, spec, false)
+}
 
-    // Zero sender is always invalid.
-    if txn.sender.is_zero() {
-        return Err(AlgoError::Validation {
-            message: "transaction cannot have zero sender".to_string(),
-        });
-    }
+/// [`validate_transaction_wellformed`] for the submission paths (REST and
+/// gossip admission), which also reject an unknown transaction type with go's
+/// `unknown tx type <type>` (the `default` case of `WellFormed`'s type
+/// switch). The block-validation and simulation paths reject an unknown type
+/// earlier and differently, in [`crate::checks::check_txn_group`], and keep
+/// calling [`validate_transaction_wellformed`] unchanged (issue #2193).
+pub fn validate_transaction_wellformed_for_admission(
+    txn: &Transaction,
+    allow_fee_pooling: bool,
+    params: &ConsensusParams,
+    spec: Option<&SpecialAddresses>,
+) -> Result<(), AlgoError> {
+    wellformed_inner(txn, allow_fee_pooling, params, spec, true)
+}
 
+fn wellformed_inner(
+    txn: &Transaction,
+    allow_fee_pooling: bool,
+    params: &ConsensusParams,
+    spec: Option<&SpecialAddresses>,
+    reject_unknown_type: bool,
+) -> Result<(), AlgoError> {
     // ── Heartbeat-specific checks (Go: HeartbeatTxnFields.wellFormed) ──
     if txn.txn_type == "hb" {
+        // Go: `if !proto.Heartbeat { return fmt.Errorf("heartbeat transaction
+        // not supported") }`, before the fields are looked at.
+        if !params.enable_heartbeat {
+            return Err(AlgoError::Validation {
+                message: "heartbeat transaction not supported".to_string(),
+            });
+        }
         if let Some(ref hb) = txn.heartbeat {
             // `kind` mirrors go's local `kind` variable: how (if at all) this
             // heartbeat is claiming the challenge fee discount -- used only to
@@ -209,11 +225,16 @@ pub fn validate_transaction_wellformed(
             // three-level ed25519 ephemeral key tree is done separately via
             // `verify_heartbeat_proof()` in signature.rs (called from
             // `stxnCoreChecks` equivalent).
+            // Go: `hb.HbProof == crypto.HeartbeatProof{}` -- every one of the
+            // proof's five fields.
             if hb.proof.is_none()
-                || hb
-                    .proof
-                    .as_ref()
-                    .is_some_and(|p| p.sig == [0u8; 64] && p.pk == [0u8; 32])
+                || hb.proof.as_ref().is_some_and(|p| {
+                    p.sig == [0u8; 64]
+                        && p.pk == [0u8; 32]
+                        && p.pk2 == [0u8; 32]
+                        && p.pk1_sig == [0u8; 64]
+                        && p.pk2_sig == [0u8; 64]
+                })
             {
                 return Err(AlgoError::Validation {
                     message: "tx.HbProof is empty".to_string(),
@@ -234,139 +255,13 @@ pub fn validate_transaction_wellformed(
                     message: "tx.HbKeyDilution is zero".to_string(),
                 });
             }
-        } else if !params.enable_heartbeat {
-            return Err(AlgoError::Validation {
-                message: "heartbeat transaction not supported".to_string(),
-            });
         } else {
-            // heartbeat is None but heartbeats are enabled — Go's
-            // tx.HeartbeatTxnFields.wellFormed() would fail on zero fields.
+            // Go: `if tx.HeartbeatTxnFields == nil { return
+            // fmt.Errorf("heartbeat transaction has no heartbeat fields") }`.
             return Err(AlgoError::Validation {
-                message: "heartbeat transaction missing HeartbeatTxnFields".to_string(),
+                message: "heartbeat transaction has no heartbeat fields".to_string(),
             });
         }
-    }
-
-    // ── Fee check ─────────────────────────────────────────────────
-    // When `allow_fee_pooling` is true (caller signals txn is in a group),
-    // the per-txn minimum is skipped — group-level validation handles it.
-    // Ungrouped txns must always individually meet the minimum, regardless
-    // of whether the protocol version enables fee pooling (Go checks this
-    // in TxnGroup for both pooled and non-pooled modes).
-    //
-    // No separate exemption is needed here for state proofs or free/cheap/
-    // discounted heartbeats: `fee::required_fee_for_txn` (via `txn_fee_factor`)
-    // already computes a required fee of `0` for those cases (state proofs
-    // unconditionally; heartbeats via the same discount rules enforced above),
-    // so the generic comparison below naturally passes them. Special-casing
-    // heartbeats here as well (as prior code did, via an `is_free_heartbeat`-
-    // style flag keyed only on "fee < min_txn_fee && ungrouped") would
-    // incorrectly exempt a post-v42 heartbeat that merely underpays *without*
-    // requesting the explicit discount from ever having its fee checked.
-    if !allow_fee_pooling {
-        // Usage-based required fee (Go: `ledger/eval.CheckGroupFees`, applied
-        // here to a singleton "group" of one). For an ordinary transaction
-        // with no oversized/billable features this is exactly
-        // `params.min_txn_fee`, so the check and its wording are unchanged
-        // from the flat comparison for every transaction that isn't using
-        // v42+ size pricing. A transaction with billable oversized fields
-        // (large note/app-args/app-programs) requires more than the flat
-        // minimum, mirroring go's `feeFactor`/`FeeForUsage`.
-        let (required_fee, overflow) = crate::fee::required_fee_for_txn(txn, params);
-        if overflow {
-            return Err(AlgoError::Validation {
-                message: "transaction required fee overflow".to_string(),
-            });
-        }
-        if txn.fee < required_fee {
-            return Err(AlgoError::Validation {
-                message: format!(
-                    "transaction fee {} is below minimum {}",
-                    txn.fee, required_fee
-                ),
-            });
-        }
-    }
-
-    // Last valid must be >= first valid.
-    if txn.last_valid < txn.first_valid {
-        return Err(AlgoError::Validation {
-            message: format!(
-                "last valid round {} is before first valid round {}",
-                txn.last_valid, txn.first_valid
-            ),
-        });
-    }
-
-    // Round window must not exceed max_txn_life.
-    let window = txn.last_valid.0 - txn.first_valid.0;
-    if window > params.max_txn_life {
-        return Err(AlgoError::Validation {
-            message: format!(
-                "transaction validity window {} exceeds maximum {}",
-                window, params.max_txn_life
-            ),
-        });
-    }
-
-    // Note must not exceed the hard MaxAbsoluteTxnNoteBytes cap (Go:
-    // `len(tx.Note) > proto.MaxAbsoluteTxnNoteBytes`, unconditional at every
-    // protocol version). Bytes between the old free/soft cap
-    // (max_txn_note_bytes) and this hard cap are well-formed but billable via
-    // `fee::header_fee_contribution` (v42+ size pricing).
-    let max_note_bytes = crate::fee::effective_max_note_bytes(params);
-    if txn.note.len() > max_note_bytes {
-        return Err(AlgoError::Validation {
-            message: format!(
-                "transaction note too big: {} > {}",
-                txn.note.len(),
-                max_note_bytes
-            ),
-        });
-    }
-
-    // Lease must be empty or exactly 32 bytes.
-    // If leases are not supported, any non-empty lease is rejected.
-    if txn.lease != [0u8; 32] {
-        if !params.support_transaction_leases {
-            return Err(AlgoError::Validation {
-                message: "transaction tried to acquire lease but protocol does not support transaction leases".to_string(),
-            });
-        }
-        if txn.lease.len() != MAX_LEASE_SIZE {
-            return Err(AlgoError::Validation {
-                message: format!(
-                    "lease must be empty or exactly {} bytes, got {}",
-                    MAX_LEASE_SIZE,
-                    txn.lease.len()
-                ),
-            });
-        }
-    }
-
-    // Group must be empty or exactly 32 bytes.
-    // If groups are not supported, any non-empty group is rejected.
-    if txn.group != [0u8; 32] {
-        if !params.support_tx_groups {
-            return Err(AlgoError::Validation {
-                message: "transaction has group but groups not yet enabled".to_string(),
-            });
-        }
-        if txn.group.len() != 32 {
-            return Err(AlgoError::Validation {
-                message: format!(
-                    "group field must be empty or exactly 32 bytes, got {}",
-                    txn.group.len()
-                ),
-            });
-        }
-    }
-
-    // Rekey-to is rejected if rekeying is not supported.
-    if !params.support_rekeying && txn.rekey_to.as_ref().is_some_and(|a| !a.is_zero()) {
-        return Err(AlgoError::Validation {
-            message: "transaction has RekeyTo set but rekeying not yet enabled".to_string(),
-        });
     }
 
     // ── Application-call schema/size well-formedness ────────────────
@@ -720,6 +615,19 @@ pub fn validate_transaction_wellformed(
         }
     }
 
+    // Go: the type switch's `default` case (see
+    // `validate_transaction_wellformed_for_admission`).
+    if reject_unknown_type
+        && !matches!(
+            txn.txn_type.as_str(),
+            "pay" | "keyreg" | "acfg" | "axfer" | "afrz" | "appl" | "stpf" | "hb"
+        )
+    {
+        return Err(AlgoError::Validation {
+            message: format!("unknown tx type {}", txn.txn_type.as_str()),
+        });
+    }
+
     // ── Cross-field type isolation (Go: transaction.go's `WellFormed`,
     // `nonZeroFields` map) ──────────────────────────────────────────
     // A transaction whose canonical wire encoding is a flat struct (mirroring
@@ -727,6 +635,119 @@ pub fn validate_transaction_wellformed(
     // fields belonging to a *different* declared type than `txn.txn_type`.
     // Go rejects this outright; issue #1273.
     check_txn_type_field_isolation(txn)?;
+
+    // ── The common rules: the tail of go's `Transaction.WellFormed`, in its
+    // order, after the type's own rules and the cross-type field rule ──
+    if txn.last_valid < txn.first_valid {
+        return Err(AlgoError::Validation {
+            message: format!(
+                "transaction invalid range ({}--{})",
+                txn.first_valid, txn.last_valid
+            ),
+        });
+    }
+    if txn.last_valid.0 - txn.first_valid.0 > params.max_txn_life {
+        return Err(AlgoError::Validation {
+            message: format!(
+                "transaction window size excessive ({}--{})",
+                txn.first_valid, txn.last_valid
+            ),
+        });
+    }
+
+    // Note must not exceed the hard MaxAbsoluteTxnNoteBytes cap (Go:
+    // `len(tx.Note) > proto.MaxAbsoluteTxnNoteBytes`, unconditional at every
+    // protocol version). Bytes between the old free/soft cap
+    // (max_txn_note_bytes) and this hard cap are well-formed but billable via
+    // `fee::header_fee_contribution` (v42+ size pricing).
+    let max_note_bytes = crate::fee::effective_max_note_bytes(params);
+    if txn.note.len() > max_note_bytes {
+        return Err(AlgoError::Validation {
+            message: format!(
+                "transaction note too big: {} > {}",
+                txn.note.len(),
+                max_note_bytes
+            ),
+        });
+    }
+
+    // Go checks `tx.Sender == spec.RewardsPool` unconditionally (no zero-guard
+    // on the pool address), then the zero sender.
+    if let Some(sp) = spec {
+        if txn.sender == sp.rewards_pool {
+            return Err(AlgoError::Validation {
+                message: "transaction from incentive pool is invalid".to_string(),
+            });
+        }
+    }
+    if txn.sender.is_zero() {
+        return Err(AlgoError::Validation {
+            message: "transaction cannot have zero sender".to_string(),
+        });
+    }
+
+    if !params.support_transaction_leases && txn.lease != [0u8; 32] {
+        // Go prints the lease with `%v` of a `[32]byte`: space-separated
+        // decimal bytes in brackets.
+        let lease: Vec<String> = txn.lease.iter().map(ToString::to_string).collect();
+        return Err(AlgoError::Validation {
+            message: format!(
+                "transaction tried to acquire lease [{}] but protocol does not support transaction leases",
+                lease.join(" ")
+            ),
+        });
+    }
+    if !params.support_tx_groups && txn.group != [0u8; 32] {
+        return Err(AlgoError::Validation {
+            message: "transaction has group but groups not yet enabled".to_string(),
+        });
+    }
+    if !params.support_rekeying && txn.rekey_to.as_ref().is_some_and(|a| !a.is_zero()) {
+        return Err(AlgoError::Validation {
+            message: "transaction has RekeyTo set but rekeying not yet enabled".to_string(),
+        });
+    }
+
+    // ── Fee check ─────────────────────────────────────────────────
+    // When `allow_fee_pooling` is true (caller signals txn is in a group),
+    // the per-txn minimum is skipped — group-level validation handles it.
+    // Ungrouped txns must always individually meet the minimum, regardless
+    // of whether the protocol version enables fee pooling (Go checks this
+    // in TxnGroup for both pooled and non-pooled modes).
+    //
+    // No separate exemption is needed here for state proofs or free/cheap/
+    // discounted heartbeats: `fee::required_fee_for_txn` (via `txn_fee_factor`)
+    // already computes a required fee of `0` for those cases (state proofs
+    // unconditionally; heartbeats via the same discount rules enforced above),
+    // so the generic comparison below naturally passes them. Special-casing
+    // heartbeats here as well (as prior code did, via an `is_free_heartbeat`-
+    // style flag keyed only on "fee < min_txn_fee && ungrouped") would
+    // incorrectly exempt a post-v42 heartbeat that merely underpays *without*
+    // requesting the explicit discount from ever having its fee checked.
+    if !allow_fee_pooling {
+        // Usage-based required fee (Go: `ledger/eval.CheckGroupFees`, applied
+        // here to a singleton "group" of one). For an ordinary transaction
+        // with no oversized/billable features this is exactly
+        // `params.min_txn_fee`, so the check and its wording are unchanged
+        // from the flat comparison for every transaction that isn't using
+        // v42+ size pricing. A transaction with billable oversized fields
+        // (large note/app-args/app-programs) requires more than the flat
+        // minimum, mirroring go's `feeFactor`/`FeeForUsage`.
+        let (required_fee, overflow) = crate::fee::required_fee_for_txn(txn, params);
+        if overflow {
+            return Err(AlgoError::Validation {
+                message: "transaction required fee overflow".to_string(),
+            });
+        }
+        if txn.fee < required_fee {
+            return Err(AlgoError::Validation {
+                message: format!(
+                    "transaction fee {} is below minimum {}",
+                    txn.fee, required_fee
+                ),
+            });
+        }
+    }
 
     Ok(())
 }
@@ -876,11 +897,17 @@ fn parse_program_version(bytecode: &[u8]) -> Result<u64, AlgoError> {
 /// checking against existing on-chain `AppParams`, which `wellFormed` never
 /// has), so only the version-parse and version-match portions apply here.
 fn check_contract_versions(approval: &[u8], clear: &[u8]) -> Result<(), AlgoError> {
+    // go: `fmt.Errorf("bad ApprovalProgram: %v", err)` of a plain
+    // `errors.New`, so the reason is bare (no `validation error:` prefix).
+    let reason = |e: AlgoError| match e {
+        AlgoError::Validation { message } => message,
+        other => other.to_string(),
+    };
     let av = parse_program_version(approval).map_err(|e| AlgoError::Validation {
-        message: format!("bad ApprovalProgram: {e}"),
+        message: format!("bad ApprovalProgram: {}", reason(e)),
     })?;
     let cv = parse_program_version(clear).map_err(|e| AlgoError::Validation {
-        message: format!("bad ClearStateProgram: {e}"),
+        message: format!("bad ClearStateProgram: {}", reason(e)),
     })?;
     if (av >= SYNC_PROGRAMS_VERSION || cv >= SYNC_PROGRAMS_VERSION) && av != cv {
         return Err(AlgoError::Validation {
@@ -888,6 +915,13 @@ fn check_contract_versions(approval: &[u8], clear: &[u8]) -> Result<(), AlgoErro
         });
     }
     Ok(())
+}
+
+/// go's `%v` of a `basics.StateSchema`, as its `wellFormed` errors print it:
+/// `{NumUint:1 NumByteSlice:2}`.
+fn schema_text(schema: Option<&algo_types::StateSchema>) -> String {
+    let (uints, byte_slices) = schema.map_or((0, 0), |s| (s.num_uint, s.num_byte_slice));
+    format!("{{NumUint:{uints} NumByteSlice:{byte_slices}}}")
 }
 
 /// Mirrors go-algorand's `ApplicationCallTxnFields.UpdatingSizes()`
@@ -1197,8 +1231,8 @@ fn validate_application_call_wellformed(
         if local_schema_nonempty {
             return Err(AlgoError::Validation {
                 message: format!(
-                    "inappropriate non-zero tx.LocalStateSchema ({:?})",
-                    txn.local_state_schema
+                    "inappropriate non-zero tx.LocalStateSchema ({})",
+                    schema_text(txn.local_state_schema.as_ref())
                 ),
             });
         }
@@ -1214,8 +1248,8 @@ fn validate_application_call_wellformed(
             if global_schema_nonempty {
                 return Err(AlgoError::Validation {
                     message: format!(
-                        "inappropriate non-zero tx.GlobalStateSchema ({:?})",
-                        txn.global_state_schema
+                        "inappropriate non-zero tx.GlobalStateSchema ({})",
+                        schema_text(txn.global_state_schema.as_ref())
                     ),
                 });
             }
@@ -1655,10 +1689,7 @@ pub fn validate_transaction_group(txns: &[SignedTransaction]) -> Result<(), Algo
 pub fn validate_transaction_group_strict(txns: &[SignedTransaction]) -> Result<(), AlgoError> {
     if txns.len() > MAX_GROUP_SIZE {
         return Err(AlgoError::Validation {
-            message: format!(
-                "transaction group has {} members, maximum is {MAX_GROUP_SIZE}",
-                txns.len()
-            ),
+            message: format!("group size {} exceeds maximum {MAX_GROUP_SIZE}", txns.len()),
         });
     }
     let Some(first) = txns.first() else {
@@ -1762,28 +1793,20 @@ fn validate_transaction_group_inner(
 
         if size > MAX_GROUP_SIZE {
             return Err(AlgoError::Validation {
-                message: format!(
-                    "transaction group has {size} members, maximum is {MAX_GROUP_SIZE}"
-                ),
+                message: format!("group size {size} exceeds maximum {MAX_GROUP_SIZE}"),
             });
         }
 
-        // Compute and verify the group ID.
-        let txn_refs: Vec<Transaction> = group_members.iter().map(|s| s.txn.clone()).collect();
-        let computed = compute_group_id(&txn_refs);
-
-        let grp = &group_members[0].txn.group;
-        if grp.as_ref() != computed.as_bytes().as_slice() {
-            return Err(AlgoError::Validation {
-                message: format!(
-                    "group ID mismatch: stored {} != computed {}",
-                    hex::encode(grp.as_ref()),
-                    hex::encode(computed.as_bytes())
-                ),
-            });
+        // Verify the group ID commits to exactly these members, with go's
+        // `checkTxnGroupID` text (every member here carries the same,
+        // non-zero group ID: the group was collected by it).
+        let mut ids = GroupIdChecker::new(&group_members[0].txn, size);
+        for (index, stx) in group_members.iter().enumerate() {
+            ids.check_member(index, &stx.txn)
+                .map_err(|message| AlgoError::Validation { message })?;
         }
-
-        Ok(())
+        ids.finish()
+            .map_err(|message| AlgoError::Validation { message })
     })
 }
 
@@ -1971,7 +1994,10 @@ mod tests {
         txn.last_valid = Round(2001);
         let err = validate_transaction_rules(&txn, false).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("exceeds maximum"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("transaction window size excessive (1000--2001)"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
@@ -1982,7 +2008,7 @@ mod tests {
         let err = validate_transaction_rules(&txn, false).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("before first valid"),
+            msg.contains("transaction invalid range (2000--1000)"),
             "unexpected error: {msg}"
         );
     }
@@ -2197,12 +2223,28 @@ mod tests {
     #[test]
     fn test_zero_sender_rejected() {
         let mut txn = make_valid_txn();
+        // go's payment rule (`header.Sender == payment.CloseRemainderTo`) runs
+        // before the common zero-sender rule, and a zero sender equals the
+        // zero close-to address: a payment is "closing to its sender".
         txn.sender = Address::ZERO;
         let err = validate_transaction_rules(&txn, false).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("zero sender"),
-            "expected zero sender rejection, got: {msg}"
+            msg.contains("cannot close account to its sender"),
+            "expected go's payment rule first, got: {msg}"
+        );
+        // Any other type reaches the common zero-sender rule.
+        let mut axfer = make_valid_txn();
+        axfer.txn_type = "axfer".into();
+        axfer.receiver = Address::ZERO;
+        axfer.amount = 0;
+        axfer.xaid = 1;
+        axfer.sender = Address::ZERO;
+        let err = validate_transaction_rules(&axfer, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("transaction cannot have zero sender"),
+            "expected zero sender rejection, got: {err}"
         );
     }
 
@@ -2222,6 +2264,135 @@ mod tests {
         assert!(
             msg.contains("incentive pool"),
             "expected rewards pool rejection, got: {msg}"
+        );
+    }
+
+    // ── Issue #2193: go's WellFormed texts for the rules the go oracle's
+    // protocol cannot reach (every one of them is enabled there). Each text is
+    // the `fmt.Errorf` literal of `data/transactions/transaction.go`. ──
+
+    fn wf_text(txn: &Transaction, params: &ConsensusParams) -> String {
+        match validate_transaction_wellformed(txn, true, params, None) {
+            Err(AlgoError::Validation { message }) => message,
+            other => panic!("expected a well-formedness rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wellformed_protocol_gates_read_like_go() {
+        let p = ConsensusParams {
+            asset: false,
+            application: false,
+            state_proof_interval: 0,
+            enable_heartbeat: false,
+            ..ConsensusParams::default()
+        };
+        for (ty, want) in [
+            ("acfg", "asset transaction not supported"),
+            ("axfer", "asset transaction not supported"),
+            ("afrz", "asset transaction not supported"),
+            ("appl", "application transaction not supported"),
+            ("stpf", "state proofs not supported"),
+            ("hb", "heartbeat transaction not supported"),
+        ] {
+            let mut txn = make_valid_txn();
+            txn.txn_type = ty.into();
+            assert_eq!(wf_text(&txn, &p), want, "type {ty}");
+        }
+    }
+
+    #[test]
+    fn wellformed_heartbeat_without_fields_reads_like_go() {
+        let mut txn = make_valid_txn();
+        txn.txn_type = "hb".into();
+        assert_eq!(
+            wf_text(&txn, &ConsensusParams::default()),
+            "heartbeat transaction has no heartbeat fields"
+        );
+    }
+
+    #[test]
+    fn wellformed_unknown_type_reads_like_go() {
+        let mut txn = make_valid_txn();
+        txn.txn_type = "xyz".into();
+        let params = ConsensusParams::default();
+        // The submission paths reject it with go's text; block validation and
+        // simulation reject it earlier, in `check_txn_group`, and are
+        // unchanged.
+        match validate_transaction_wellformed_for_admission(&txn, true, &params, None) {
+            Err(AlgoError::Validation { message }) => {
+                assert_eq!(message, "unknown tx type xyz")
+            }
+            other => panic!("expected the unknown-type rejection, got {other:?}"),
+        }
+        assert!(validate_transaction_wellformed(&txn, true, &params, None).is_ok());
+    }
+
+    #[test]
+    fn wellformed_unsupported_lease_group_rekey_read_like_go() {
+        let p = ConsensusParams {
+            support_transaction_leases: false,
+            support_tx_groups: false,
+            support_rekeying: false,
+            ..ConsensusParams::default()
+        };
+        let mut txn = make_valid_txn();
+        // go prints the lease with `%v` of a `[32]byte`.
+        txn.lease = [7u8; 32];
+        txn.group = [9u8; 32];
+        txn.rekey_to = Some(Address([3u8; 32]));
+        let sevens = vec!["7"; 32].join(" ");
+        assert_eq!(
+            wf_text(&txn, &p),
+            format!(
+                "transaction tried to acquire lease [{sevens}] but protocol does not support transaction leases"
+            )
+        );
+        // The rules run in go's order: lease, then group, then rekey.
+        txn.lease = [0u8; 32];
+        assert_eq!(
+            wf_text(&txn, &p),
+            "transaction has group but groups not yet enabled"
+        );
+        txn.group = [0u8; 32];
+        assert_eq!(
+            wf_text(&txn, &p),
+            "transaction has RekeyTo set but rekeying not yet enabled"
+        );
+    }
+
+    #[test]
+    fn wellformed_state_schema_texts_read_like_go() {
+        let mut txn = make_valid_txn();
+        txn.txn_type = "appl".into();
+        txn.application_id = 5;
+        txn.local_state_schema = Some(algo_types::StateSchema {
+            num_uint: 1,
+            num_byte_slice: 2,
+        });
+        assert_eq!(
+            wf_text(&txn, &ConsensusParams::default()),
+            "inappropriate non-zero tx.LocalStateSchema ({NumUint:1 NumByteSlice:2})"
+        );
+    }
+
+    #[test]
+    fn wellformed_fee_is_not_a_wellformed_rule() {
+        // go's `WellFormed` has no fee rule: with fee pooling allowed a zero
+        // fee is well formed, and the standalone minimum comes after every
+        // go rule (here: after the window rule, which a bad window reports).
+        let mut txn = make_valid_txn();
+        txn.fee = 0;
+        assert!(
+            validate_transaction_wellformed(&txn, true, &ConsensusParams::default(), None).is_ok()
+        );
+        txn.first_valid = Round(500);
+        txn.last_valid = Round(400);
+        let err = validate_transaction_wellformed(&txn, false, &ConsensusParams::default(), None)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "validation error: transaction invalid range (500--400)"
         );
     }
 
@@ -2765,8 +2936,8 @@ mod tests {
         let err = validate_transaction_group(&signed).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("mismatch"),
-            "expected group ID mismatch error, got: {msg}"
+            msg.contains("validation error: transactionGroup: incomplete group: "),
+            "expected go's incomplete-group error, got: {msg}"
         );
     }
 
@@ -2892,8 +3063,9 @@ mod tests {
         let wrong_order = vec![wrap_signed(s2.clone()), wrap_signed(s1.clone())];
         let err = validate_transaction_group(&wrong_order).unwrap_err();
         assert!(
-            err.to_string().contains("mismatch"),
-            "expected group ID mismatch for the wrong member order, got: {err}"
+            err.to_string()
+                .contains("validation error: transactionGroup: incomplete group: "),
+            "expected go's incomplete-group error for the wrong member order, got: {err}"
         );
 
         // The correct order still succeeds (mirrors go's subsequent

@@ -1861,7 +1861,7 @@ fn default_signature_check() {
         .failure_message
         .as_ref()
         .expect("missing signature must fail the group");
-    assert!(msg.contains("no signature"), "unexpected message: {msg}");
+    assert!(msg.contains("has no sig"), "unexpected message: {msg}");
     assert_eq!(group.failed_at, Some(vec![0]));
 
     // A real signature must succeed.
@@ -2407,7 +2407,7 @@ fn pre_v42_orphan_lsig_with_sig_succeeds_without_sig_fails_no_signature() {
         Ok(r) => r.txn_groups[0].failure_message.clone().unwrap_or_default(),
         Err(e) => format!("{e:?}"),
     };
-    assert!(msg.contains("no signature"), "unexpected: {msg}");
+    assert!(msg.contains("has no sig"), "unexpected: {msg}");
     assert!(
         !msg.contains("LogicSig fields without LogicSig program"),
         "{msg}"

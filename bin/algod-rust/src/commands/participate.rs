@@ -2030,11 +2030,30 @@ impl SimpleBlockEvaluator {
         // a singleton included, after the signatures and the validity window.
         // Passing `allow_fee_pooling = true` skips the legacy per-transaction
         // minimum, which fired first and with other wording (issue #1976).
+        //
+        // go's `verify.TxnGroup` reports the first not-well-formed member as
+        // `transaction <%+v of the SignedTxn> invalid : <reason>` (a dump of
+        // go's own struct, not reproduced here: the reason is what follows
+        // the frame), bare, before the pool is involved (issue #2193).
+        let verify = |e: algo_error::AlgoError| match e {
+            algo_error::AlgoError::Validation { message } => algo_error::AlgoError::Rejected {
+                source: None,
+                message,
+                class: algo_error::RejectClass::Verify,
+            },
+            other => other,
+        };
         for stx in txgroup {
-            algo_validate::validate_transaction_wellformed(
+            // go passes its special addresses here; this path does not (the
+            // evaluator's own tests spend from the fee sink through it), so
+            // the rewards-pool and fee-sink rules are not applied on the REST
+            // path: a deliberate non-change of accept/reject, tracked in
+            // issue #2198 (the oracle rows for those rules skip this path).
+            algo_validate::validate_transaction_wellformed_for_admission(
                 &stx.txn, true, params,
                 None, // SpecialAddresses not available without ledger lookup
-            )?;
+            )
+            .map_err(verify)?;
         }
 
         // 3. Group ID consistency. This is fresh-submission (pool-admission)
@@ -2044,7 +2063,7 @@ impl SimpleBlockEvaluator {
         // submitted alongside it) is rejected, matching go-algorand's
         // `TxnGroup`/`TxnGroupWithTracer` (`data/transactions/verify/txn.go`)
         // and its `TestGroupTransactions` (see issue #1034).
-        algo_validate::validate_transaction_group_strict(txgroup)?;
+        algo_validate::validate_transaction_group_strict(txgroup).map_err(verify)?;
 
         // 5. Signature verification, over the group AS SUBMITTED (go's
         // `verify.TxnGroup`). Restoring genesis fields first, as the block
@@ -2064,6 +2083,16 @@ impl SimpleBlockEvaluator {
         // recorded so a later sighting can skip it too. Mirrors go's
         // `verify.TxnGroup` using the node's shared cache rather than a bare
         // signature check.
+        // go returns the signature-format and logic-sig verdicts of
+        // `verify.TxnGroup` bare, like its well-formedness ones; only the batch
+        // verifier's failure keeps its own mapping in the pool (issue #1969).
+        let verify_sig = |e: algo_error::AlgoError| {
+            if e.is_batch_sig_failure() {
+                e
+            } else {
+                verify(e)
+            }
+        };
         if let Some(cache) = &self.verified_txn_cache {
             let context = algo_validate::VerificationContext {
                 spec_addrs: algo_validate::SpecialAddresses {
@@ -2072,13 +2101,14 @@ impl SimpleBlockEvaluator {
                 },
                 consensus_version: self.hdr.current_protocol.clone(),
             };
-            algo_validate::verify_transaction_group_cached(txgroup, &context, params, cache)?;
+            algo_validate::verify_transaction_group_cached(txgroup, &context, params, cache)
+                .map_err(verify_sig)?;
         } else {
             // Group-level LogicSig size check (go: `txnGroupBatchPrep` ->
             // `logicSigGroupSizeCheck`). The cached branch above performs it
             // inside `verify_transaction_group_cached`; this uncached branch
             // must do it itself, before any signature work (issue #2054).
-            algo_validate::logic_sig_group_size_check(txgroup, params)?;
+            algo_validate::logic_sig_group_size_check(txgroup, params).map_err(verify_sig)?;
 
             // Create a per-group LogicSig budget for logicsig evaluation.
             let mut lsig_budget = GroupBudget::for_logicsig(txgroup.len());
@@ -2090,7 +2120,8 @@ impl SimpleBlockEvaluator {
                     intra_group_idx,
                     &mut lsig_budget,
                     params,
-                )?;
+                )
+                .map_err(verify_sig)?;
             }
         }
 
@@ -2177,24 +2208,27 @@ impl SimpleBlockEvaluator {
             rewards_pool: self.hdr.rewards_pool,
         };
         for stx in txgroup {
-            algo_validate::validate_transaction_wellformed(&stx.txn, true, params, Some(&specials))
-                .map_err(|e| {
-                    // go's `TxnNotWellFormedError`. The reason is this crate's own
-                    // text for it (go's wording differs, #2193; only the frame is
-                    // pinned against go).
-                    let reason = match e {
-                        algo_error::AlgoError::Validation { message } => message,
-                        other => other.to_string(),
-                    };
-                    rejected(
-                        algo_error::RejectClass::NotWell,
-                        format!(
-                            "transaction {}: malformed: {}",
-                            algo_types::Digest(txid_of(stx)),
-                            reason
-                        ),
-                    )
-                })?;
+            algo_validate::validate_transaction_wellformed_for_admission(
+                &stx.txn,
+                true,
+                params,
+                Some(&specials),
+            )
+            .map_err(|e| {
+                // go's `TxnNotWellFormedError`.
+                let reason = match e {
+                    algo_error::AlgoError::Validation { message } => message,
+                    other => other.to_string(),
+                };
+                rejected(
+                    algo_error::RejectClass::NotWell,
+                    format!(
+                        "transaction {}: malformed: {}",
+                        algo_types::Digest(txid_of(stx)),
+                        reason
+                    ),
+                )
+            })?;
         }
 
         // `checkDup`'s ledger half for members `from..`, read under one
@@ -11586,7 +11620,7 @@ mod tests {
 
         let err = eval.transaction_group(&[stx]).unwrap_err();
         assert!(
-            err.to_string().contains("no signature"),
+            err.to_string().contains("has no sig"),
             "expected no-signature error, got: {err}"
         );
     }
