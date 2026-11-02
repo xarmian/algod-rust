@@ -3369,8 +3369,27 @@ impl SqliteLedger {
     ///
     /// Returns `None` for in-memory databases (which cannot share state
     /// across connections).
+    ///
+    /// Issue #2166: before opening it, the tracker WAL is checkpointed
+    /// (PASSIVE). The pool follower replaces its snapshot after every block
+    /// -- drop the old one, open the next -- so a snapshot is alive across
+    /// every commit and the writer never sees a moment with no WAL reader.
+    /// SQLite can only restart (reuse) the WAL from its start when every
+    /// frame is backfilled and no reader holds a WAL read mark, so the WAL
+    /// then grew with every block (~80 KB each). Backfilling here, in the
+    /// gap between the old snapshot's drop and the new one's first read,
+    /// makes the new snapshot read straight from the database file (read
+    /// mark 0), which does not stop the next commit from restarting the WAL.
     pub fn open_read_snapshot(&self) -> Option<ReadSnapshot> {
         let prefix = self.db_prefix.as_ref()?;
+        if !self.in_block {
+            // DIVERGENCE DIV-008: go has no long-lived read snapshot; this
+            // keeps ours from pinning the WAL. Best effort: BUSY (another
+            // reader) just leaves the backfill to the commit-time checkpoint.
+            if let Err(e) = self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)") {
+                tracing::debug!("read snapshot: pre-open WAL checkpoint failed: {e}");
+            }
+        }
         let tracker_path = tracker_path_for_prefix(prefix);
         let conn = match Connection::open_with_flags(
             &tracker_path,
