@@ -22,109 +22,37 @@
 //! `UnauthenticatedBundle::verify` (issue #2145), used by the differential
 //! tests that pin the parallel implementation to the old behaviour.
 
-use std::collections::HashSet;
-
 use crate::bundle::{
     Bundle, BundleError, EquivocationVoteAuthenticator, UnauthenticatedBundle, VoteAuthenticator,
 };
 use crate::ledger_reader::{membership_from_ledger, LedgerReader};
-use crate::step::PROPOSE;
 use crate::vote::{RawVote, UnauthenticatedVote, Vote, VoteVerifyParams};
 
 impl UnauthenticatedBundle {
     /// Reference (pre-#2145) implementation of [`UnauthenticatedBundle::verify`]:
-    /// strictly sequential, one membership lookup per vote. Kept verbatim
-    /// so differential tests can pin that the parallel path accepts and
-    /// rejects exactly the same bundles with the same error.
-    ///
-    /// Mirrors Go's `unauthenticatedBundle.verify()`.
-    ///
-    /// Steps:
-    /// 1. Well-formedness (step bound check), as defense in depth
-    /// 2. Reject propose step
-    /// 3. Check bundle is not too large
-    /// 4. Check for duplicate voters
-    /// 5. For each vote: reconstruct the UnauthenticatedVote, look up
-    ///    membership from the ledger, and verify credential + OTS
-    /// 6. Sum weights and check quorum
+    /// strictly sequential, one membership lookup and one verification per
+    /// vote, stopping at the first failure. The vote loop is the original
+    /// code; the checks around it are shared with `verify`
+    /// (`verify_preconditions`, `finish`). Differential tests pin that
+    /// `verify` accepts and rejects exactly the same bundles with the same
+    /// error.
     #[doc(hidden)]
     pub fn verify_reference_sequential(&self, l: &dyn LedgerReader) -> Result<Bundle, BundleError> {
-        self.well_formed()?;
+        let proto = self.verify_preconditions(l)?;
 
-        // Step 1: reject propose step
-        if self.step == PROPOSE {
-            return Err(BundleError::ProposeStep);
-        }
-
-        // Get consensus params for threshold check
-        let params_rnd = crate::lookback::params_round(self.round);
-        let proto = l
-            .consensus_params(params_rnd)
-            .map_err(|e| BundleError::ConsensusParamsError(e.to_string()))?;
-
-        let threshold = self.step.committee_threshold(&proto);
-        let num_votes = self.votes.len() as u64;
-        let num_eq_votes = self.equivocation_votes.len() as u64;
-
-        // Step 2: check bundle size
-        if num_votes > threshold || num_eq_votes > threshold || num_votes + num_eq_votes > threshold
-        {
-            return Err(BundleError::TooLarge {
-                num_votes,
-                num_equivocation_votes: num_eq_votes,
-                threshold,
-            });
-        }
-
-        // Step 3: check for duplicate voters
-        let mut voters = HashSet::new();
-        for auth in &self.votes {
-            if !voters.insert(auth.sender) {
-                return Err(BundleError::DuplicateVoter(auth.sender));
-            }
-        }
-        for auth in &self.equivocation_votes {
-            if !voters.insert(auth.sender) {
-                return Err(BundleError::DuplicateVoter(auth.sender));
-            }
-        }
-
-        // Step 4: verify each vote
+        // The original loop: one lookup and one verification per vote, in
+        // order, stopping at the first failure.
         let mut verified_votes = Vec::with_capacity(self.votes.len());
-        let mut total_weight: u64 = 0;
-
         for (i, auth) in self.votes.iter().enumerate() {
-            let vote = self.reference_verify_single_vote(l, auth, i)?;
-            total_weight += vote.cred.weight;
-            verified_votes.push(vote);
+            verified_votes.push(self.reference_verify_single_vote(l, auth, i)?);
         }
-
         // Equivocation votes: verify each proposal separately
         for (i, auth) in self.equivocation_votes.iter().enumerate() {
             let idx = self.votes.len() + i;
-            // Verify both signatures of the equivocation vote.
-            // Each one is effectively a vote for a different proposal.
-            // For simplicity and correctness we verify the first proposal's vote
-            // (credential verification only needs to happen once since both are
-            // from the same sender in the same round/period/step).
-            let vote = self.reference_verify_equivocation_vote(l, auth, idx)?;
-            total_weight += vote.cred.weight;
-            verified_votes.push(vote);
+            verified_votes.push(self.reference_verify_equivocation_vote(l, auth, idx)?);
         }
 
-        // Step 5: check quorum
-        if !self.step.reaches_quorum(&proto, total_weight) {
-            return Err(BundleError::InsufficientQuorum {
-                weight: total_weight,
-                threshold: self.step.committee_threshold(&proto),
-            });
-        }
-
-        Ok(Bundle {
-            u: self.clone(),
-            votes: verified_votes,
-            total_weight,
-        })
+        self.finish(&proto, verified_votes)
     }
 
     /// Verify a single vote authenticator from the bundle.

@@ -66,6 +66,9 @@ pub mod vote_aggregator;
 pub mod vote_auxiliary;
 pub mod vote_tracker;
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use bundle::VOTE_VERIFY_RUNS;
 pub use bundle::{
     Bundle, BundleError, EquivocationVoteAuthenticator, UnauthenticatedBundle, VoteAuthenticator,
 };

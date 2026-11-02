@@ -46,6 +46,8 @@ pub struct TestLedger {
     pub fail_lookup: HashSet<Address>,
     pub fail_circulation: bool,
     pub fail_seed: bool,
+    /// Every `lookup_agreement` call, in order.
+    pub lookups: std::sync::Mutex<Vec<Address>>,
 }
 
 impl LedgerReader for TestLedger {
@@ -60,6 +62,7 @@ impl LedgerReader for TestLedger {
         _round: Round,
         addr: &Address,
     ) -> Result<OnlineAccountData, LedgerError> {
+        self.lookups.lock().unwrap().push(*addr);
         if self.fail_lookup.contains(addr) {
             return Err(LedgerError::Other("lookup failed".into()));
         }
@@ -163,6 +166,7 @@ pub fn ledger(voters: &[Voter]) -> TestLedger {
         fail_lookup: HashSet::new(),
         fail_circulation: false,
         fail_seed: false,
+        lookups: std::sync::Mutex::new(Vec::new()),
     }
 }
 

@@ -472,6 +472,16 @@ pub struct VoteVerifyParams {
     pub consensus_params: ConsensusParams,
 }
 
+/// Borrowed form of [`VoteVerifyParams`] (same fields, same meaning).
+pub(crate) struct VoteVerifyView<'a> {
+    pub(crate) membership: &'a Membership,
+    pub(crate) vote_id: &'a [u8; 32],
+    pub(crate) vote_first_valid: Round,
+    pub(crate) vote_last_valid: Round,
+    pub(crate) vote_key_dilution: u64,
+    pub(crate) consensus_params: &'a ConsensusParams,
+}
+
 impl UnauthenticatedVote {
     /// Stateless well-formedness check on a vote received from the network.
     ///
@@ -498,6 +508,20 @@ impl UnauthenticatedVote {
     ///
     /// On success, returns a `Vote` with the verified credential.
     pub fn verify(&self, params: &VoteVerifyParams) -> Result<Vote, VoteError> {
+        self.verify_view(&VoteVerifyView {
+            membership: &params.membership,
+            vote_id: &params.vote_id,
+            vote_first_valid: params.vote_first_valid,
+            vote_last_valid: params.vote_last_valid,
+            vote_key_dilution: params.vote_key_dilution,
+            consensus_params: &params.consensus_params,
+        })
+    }
+
+    /// [`Self::verify`] over borrowed parameters, so a bundle can verify many
+    /// votes against one shared copy of the consensus parameters instead of
+    /// cloning them per vote (issue #2145).
+    pub(crate) fn verify_view(&self, params: &VoteVerifyView<'_>) -> Result<Vote, VoteError> {
         self.well_formed()?;
         let rv = &self.raw_vote;
 
@@ -554,20 +578,15 @@ impl UnauthenticatedVote {
         // Verify OTS signature on hash_obj(raw_vote)
         // OTS signs the domain-separated message: hash_id || canonical_encode(raw_vote)
         let msg = [RawVote::hash_id(), rv.to_be_hashed().as_slice()].concat();
-        if !verify_one_time_signature(
-            &self.sig,
-            &params.vote_id,
-            eph_id.batch,
-            eph_id.offset,
-            &msg,
-        ) {
+        if !verify_one_time_signature(&self.sig, params.vote_id, eph_id.batch, eph_id.offset, &msg)
+        {
             return Err(VoteError::OtsVerificationFailed);
         }
 
         // Verify credential
         let cred = self
             .cred
-            .verify(&params.consensus_params, &params.membership)
+            .verify(params.consensus_params, params.membership)
             .map_err(|e| VoteError::CredentialVerificationFailed(e.to_string()))?;
 
         Ok(Vote {
