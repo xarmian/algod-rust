@@ -59,6 +59,7 @@ consensus-compatible. It exists for three readers:
 | DIV-005 | `algokey keyreg` and the `--network` presets accept `voimain` (Voi mainnet) and `aramidmain` (Aramid mainnet), networks absent from go-algorand's `validNetworks` map | network presets / algokey genesis-hash table | landed | 2026-10-25 | none (additive preset; the four go networks resolve exactly as before) | `crates/core/algo-types/src/networks.rs`, `bin/algod-rust/src/commands/network_common.rs` | `cmd/algokey/keyreg.go` (`validNetworks`) | genesis-hash pin tests (`networks_parity`, `genesis_test::test_voimain_genesis_hash_matches_fixture`) against the live Voi `/genesis` and `/versions` (epic #2068, #2069, #2070) |
 | DIV-006 | A network preset's bundled `consensus.json` (aramidmain) contributes only protocol versions the binary does not already define; go loads every entry of a `consensus.json` wholesale | `--network aramidmain` consensus table | landed | 2026-10-25 | none (the aramidmain chain only ever uses `aramidmain-v1.0/1..3`, which are loaded exactly as go loads them; the file's stale copies of `future`/`v7`..`v12`/spec-URL protocols are never used by that chain) | `crates/core/algo-types/src/consensus.rs` (`preload_consensus_protocols_with_bundle`), `bin/algod-rust/src/commands/network_common.rs` | `config/config.go` (`PreloadConfigurableConsensusProtocols`), `config/consensus.go` (`ConsensusProtocols.Merge`) | `aramidmain_consensus_test.rs` (`custom_protocols_merge_like_go`, `bundle_adds_only_unknown_protocols`, `data_dir_file_overrides_bundle`) and the live aramidmain catchup + follow (#2070) |
 | DIV-007 | `simulate` serves only `Request.Round` = the latest round; an earlier round is rejected with go's `round %d before dbRound %d` (dbRound = latest), where go serves any round back to its tracker `dbRound` | simulate (`POST /v2/transactions/simulate` with `round`) | landed | 2026-10-31 | none (affects only whether a simulate request with a past round is served; no block, state or consensus path) | `crates/core/algo-ledger/src/simulation/mod.rs` (`Simulator::simulate`) | `ledger/simulation/simulator.go` (`Simulate`, `simulatorLedger.start`), `ledger/acctupdates.go` (`RoundOffsetError`) | `simulation_gaps_test.rs` (`start_round_selection`, `simulate_at_a_past_round_is_rejected_not_evaluated_on_latest_state`, `simulate_round_before_db_round_is_rejected`); the latest-round path stays proven by the #2118 go oracle (`simulation_rewards_oracle_test.rs`) |
+| DIV-008 | The ledger checkpoints the tracker WAL (PASSIVE, `main` only) every time it opens a `ReadSnapshot`, under the ledger lock; go has no long-lived read snapshot | ledger SQLite WAL maintenance (pool evaluator snapshot) | landed | 2026-11-02 | none (a checkpoint only copies committed pages from the WAL into the database file; durability settings unchanged) | `crates/core/algo-ledger/src/sqlite.rs` (`SqliteLedger::open_read_snapshot`, `checkpoint_tracker_wal_for_snapshot`), `crates/core/algo-ledger/src/follow_timing.rs` (metrics) | `util/db/dbutil.go` (`_journal_mode=wal`, default `wal_autocheckpoint`) | `wal_overlapping_reader_test.rs` (WAL bound, foreign-reader limit, 40 randomized kills, cost benchmark), live betanet follow, replay-corpus final-state equality (#2166) |
 
 ## Entries
 
@@ -351,3 +352,79 @@ from `ledger/acctupdates.go`.
 the store can serve historical state, and drop the error-text suffix.
 
 **How go-algorand could port it.** Not applicable (go already serves history).
+
+### DIV-008 — checkpoint the tracker WAL before opening a read snapshot
+
+**Status:** landed (#2166).
+
+**What go-algorand does.** `util/db/dbutil.go` opens the ledger databases with
+`_journal_mode=wal` and leaves `wal_autocheckpoint` at SQLite's default: after
+a commit that leaves the WAL at 1000 frames or more, SQLite runs a PASSIVE
+checkpoint on the committing connection. go's readers are short transactions
+(`Rdb.Atomic` / `Handle` calls), so there is almost always a moment with no
+reader and the WAL restarts from its start.
+
+**What algod-rust does instead.** The transaction pool's block evaluator keeps
+a `ReadSnapshot` (one SQLite read transaction on its own connection, for
+point-in-time account lookups) alive between blocks, and after each committed
+block drops it and opens the next (`TransactionPool::on_new_block`). A snapshot
+is therefore alive across every commit. SQLite restarts a WAL only when every
+frame is backfilled and no reader holds a WAL read mark, so the WAL was never
+restarted and grew with every block while the node followed the chain (about
+80 KB a block on betanet: 1.28 GB after a 15 minute catchup against go's
+126 MB). `SqliteLedger::open_read_snapshot` now runs
+`PRAGMA main.wal_checkpoint(PASSIVE)` on the ledger connection first, in the
+gap between the old snapshot's drop and the new one's first read. The new
+snapshot then starts with every frame backfilled, reads straight from the
+database file (WAL read mark 0), and does not stop the next commit from
+restarting the WAL. Only the tracker file is checkpointed (`main.`): the
+attached block archive is neither copied nor fsynced. Calling it inside a
+`begin_block`..`commit_block` span skips the checkpoint (contract: call
+between blocks).
+
+**Cost.** The checkpoint runs under the ledger mutex, once per snapshot open
+(once per block on the follow path; the pool is paused during catchup). With
+nothing to backfill a PASSIVE checkpoint does no I/O. Measured with the
+`#[ignore]`d `bench_snapshot_checkpoint_cost` (release build, Windows NVMe,
+300 blocks, per block): with `synchronous=FULL` the snapshot open went from
+0.15 ms to 1.56 ms and the commit from 0.76 ms to 1.19 ms; with
+`synchronous=NORMAL` 0.24 ms to 2.17 ms and 0.12 ms to 0.57 ms. That is about
+2 ms of extra lock-hold time per block against a 2.8 s round, and it is
+visible as `algod_rust_follow_block_snapshot_wal_checkpoint_seconds`. Running the
+checkpoint with a lower `synchronous` would not save the fsync (a checkpoint
+syncs the WAL and the database file under both NORMAL and FULL) and is not
+done.
+
+**Best effort.** Any other long-lived reader of the tracker file still pins the
+WAL: the lazy trie loader's connection, a catchpoint export snapshot (#2206),
+an external tool. The checkpoint then reports busy or partial, counted in
+`algod_rust_follow_block_snapshot_wal_checkpoint_partial_total` and logged (warning,
+at most once a minute). `a_foreign_long_lived_reader_still_pins_the_wal` pins
+this limit (the WAL grows to MB while such a reader lives and is reclaimed when
+it is released).
+
+**What is identical.** Database contents, schema, journal mode, `synchronous`,
+commit semantics and what every reader sees: a checkpoint copies committed
+pages into the database file and changes no logical state. The snapshot is the
+same point-in-time view as before.
+
+**How parity is proven.** Nothing consensus-visible changes. Measured WAL:
+ledger-level replay of the pool's handover (`wal_overlapping_reader_test`)
+leaves a tracker WAL of 0.23 MB with the fix against 2.7 MB after 200 blocks
+(99 MB after 6000) without it; native betanet follow (12 minutes after a
+catchpoint catchup): tracker WAL 0.7 MB flat with the fix (the block
+archive's own WAL stays at its normal ~4 MB autocheckpoint cycle), against
++0.8 MB per 25 s (tracker WAL 15.1 MB and rising) without it. Durability: 40 randomized hard kills of a
+ledger process that commits with snapshot handovers (so kills land inside
+commits and checkpoints) reopen with every reported round and pass
+`PRAGMA integrity_check` on both files (a kill between the tracker and block
+archive commits is a separate, older problem, #2209). The replay-corpus tier
+(small, testnet-prefix50, testnet-head) ends on the same final state as
+`corpus.json`.
+
+**How to switch back.** Delete `checkpoint_tracker_wal_for_snapshot` and its
+call in `open_read_snapshot`.
+
+**How go-algorand could port it.** go has no such long-lived snapshot; the
+lesson applies to any reader that is replaced rather than released between
+commits: checkpoint in the gap between the two.
