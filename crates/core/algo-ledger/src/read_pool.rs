@@ -39,9 +39,9 @@
 //!   commit one after the other (see the split-commit note on
 //!   [`crate::SqliteLedger::open_split`]), so a reader can observe the
 //!   tracker at round `N` while the block row for `N` is not visible yet.
-//!   A *found* row at or below the committed tracker round is served (its
-//!   block commit finished); a row above it (the archive commits a block
-//!   BEFORE its tracker transaction, DIV-009) reads as a miss. A *miss*
+//!   A *found* row is served (its block commit finished), except the one
+//!   block whose archive row is committed but whose tracker transaction is
+//!   not yet (DIV-009, `LedgerReadPool::in_flight`). A *miss*
 //!   is never trusted when the committed tracker round says the row should
 //!   exist (`round <= committed`): it is reported as
 //!   [`PoolRead::Fallback`] and the caller takes the locked path, which is
@@ -79,17 +79,6 @@ use crate::sqlite::{
 };
 use crate::store_trait::{BoxPage, LedgerStore};
 
-/// Sub-select for the committed tracker round, appended to the pool's block-row
-/// reads (DIV-009): the block archive may be one block AHEAD of the tracker
-/// (the archive row is committed before the block's tracker transaction), and
-/// the pool serves committed state only, so such a row reads as a miss beyond
-/// the committed round (`NotFound`), exactly as before the archive-first order.
-macro_rules! committed_round_sql {
-    () => {
-        "coalesce((SELECT rnd FROM acctrounds WHERE id = 'acctbase'), -1)"
-    };
-}
-
 /// Idle connections kept for reuse; bursts above this open (and later close)
 /// extra connections rather than queueing.
 const MAX_IDLE_CONNECTIONS: usize = 4;
@@ -113,6 +102,10 @@ pub struct LedgerReadPool {
     tracker_path: PathBuf,
     block_path: PathBuf,
     idle: Mutex<Vec<Connection>>,
+    /// DIVERGENCE DIV-009: `round + 1` of a block whose archive row is
+    /// committed but whose tracker transaction is not yet (0 = none), set by
+    /// the writer around that window. See [`Self::in_flight`].
+    archive_inflight: Arc<std::sync::atomic::AtomicU64>,
     /// Rewards levels of recently read committed headers, shared by the
     /// `lookup_agreement` reward fold (round `r - lookback`) and the account
     /// lookups (the tip), so neither evicts the other. Only committed rounds
@@ -176,11 +169,16 @@ impl std::fmt::Debug for LedgerReadPool {
 }
 
 impl LedgerReadPool {
-    pub(crate) fn new(tracker_path: PathBuf, block_path: PathBuf) -> Self {
+    pub(crate) fn new(
+        tracker_path: PathBuf,
+        block_path: PathBuf,
+        archive_inflight: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
         Self {
             tracker_path,
             block_path,
             idle: Mutex::new(Vec::new()),
+            archive_inflight,
             rewards_cache: RewardsLevels::default(),
             #[cfg(test)]
             header_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -250,6 +248,27 @@ impl LedgerReadPool {
         })
     }
 
+    /// DIVERGENCE DIV-009: whether a block row just read for `round` is the
+    /// block the writer has committed to the archive but not yet to the
+    /// tracker. The pool serves committed state only, so such a row reads as a
+    /// miss beyond the committed round, exactly as when the row was written in
+    /// the tracker's own transaction. Correctness: the writer stores the flag
+    /// BEFORE its archive commit and clears it AFTER the tracker commit, so a
+    /// reader that saw the row either sees the flag (and then compares with
+    /// the committed round, read after the row) or the flag was already
+    /// cleared, i.e. the tracker had committed. Rows above the tracker that
+    /// are not in flight (written ahead by sync) are served as before.
+    fn in_flight(&self, round: u64) -> bool {
+        if self
+            .archive_inflight
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != round + 1
+        {
+            return false;
+        }
+        !matches!(self.committed_round(), Ok(Some(c)) if round <= c)
+    }
+
     /// Resolve a block-row read: a hit is served; a miss is only trusted
     /// beyond the committed round (module docs).
     fn block_row<T>(
@@ -265,6 +284,7 @@ impl LedgerReadPool {
                 .map(|o| o.flatten())
         });
         match hit {
+            Ok(Some(_)) if self.in_flight(round) => PoolRead::NotFound,
             Ok(Some(v)) => PoolRead::Found(v),
             Ok(None) => match self.committed_round() {
                 // Read after the miss: if the tracker had committed this
@@ -284,10 +304,7 @@ impl LedgerReadPool {
     pub fn block_data(&self, round: u64) -> PoolRead<Vec<u8>> {
         self.block_row(
             round,
-            concat!(
-                "SELECT blkdata FROM blockdb.blocks WHERE rnd = ?1 AND rnd <= ",
-                committed_round_sql!()
-            ),
+            "SELECT blkdata FROM blockdb.blocks WHERE rnd = ?1",
             |row| row.get::<_, Vec<u8>>(0).map(Some),
         )
     }
@@ -296,10 +313,7 @@ impl LedgerReadPool {
     pub fn block_header_data(&self, round: u64) -> PoolRead<Vec<u8>> {
         self.block_row(
             round,
-            concat!(
-                "SELECT hdrdata FROM blockdb.blocks WHERE rnd = ?1 AND rnd <= ",
-                committed_round_sql!()
-            ),
+            "SELECT hdrdata FROM blockdb.blocks WHERE rnd = ?1",
             |row| row.get::<_, Vec<u8>>(0).map(Some),
         )
     }
@@ -308,10 +322,7 @@ impl LedgerReadPool {
     pub fn block_proto(&self, round: u64) -> PoolRead<String> {
         self.block_row(
             round,
-            concat!(
-                "SELECT proto FROM blockdb.blocks WHERE rnd = ?1 AND rnd <= ",
-                committed_round_sql!()
-            ),
+            "SELECT proto FROM blockdb.blocks WHERE rnd = ?1",
             |row| row.get::<_, String>(0).map(Some),
         )
     }
@@ -322,16 +333,14 @@ impl LedgerReadPool {
     /// `Found(Option<..>)` only for rows that exist.
     pub fn block_cert(&self, round: u64) -> PoolRead<Option<Vec<u8>>> {
         let hit = self.with_conn(|c| {
-            c.prepare_cached(concat!(
-                "SELECT certdata FROM blockdb.blocks WHERE rnd = ?1 AND rnd <= ",
-                committed_round_sql!()
-            ))?
-            .query_row(params![round as i64], |row| {
-                row.get::<_, Option<Vec<u8>>>(0)
-            })
-            .optional()
+            c.prepare_cached("SELECT certdata FROM blockdb.blocks WHERE rnd = ?1")?
+                .query_row(params![round as i64], |row| {
+                    row.get::<_, Option<Vec<u8>>>(0)
+                })
+                .optional()
         });
         match hit {
+            Ok(Some(_)) if self.in_flight(round) => PoolRead::NotFound,
             Ok(Some(cert)) => PoolRead::Found(cert),
             Ok(None) => match self.committed_round() {
                 Ok(Some(c)) if round <= c => PoolRead::Fallback,

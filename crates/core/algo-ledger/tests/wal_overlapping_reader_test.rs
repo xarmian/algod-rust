@@ -281,6 +281,8 @@ fn copy_of_live_files_without_shm_reopens_with_every_committed_round() {
 
 const CHILD_ENV: &str = "WAL_KILL_CHILD_DIR";
 const TARGET_ENV: &str = "WAL_KILL_CHILD_TARGET";
+const FAILPOINT_ENV: &str = "WAL_KILL_FAILPOINT";
+const LATE_PUT_ENV: &str = "WAL_KILL_LATE_PUT";
 
 fn test_header(round: u64) -> Vec<u8> {
     let hdr = algo_types::BlockHeader {
@@ -302,18 +304,33 @@ fn test_cert(round: u64) -> Vec<u8> {
 /// One block the way the follower commits it: archive rows first inside the
 /// span (`put_block`, `put_block_cert`), then the state change, then commit.
 fn commit_block_round(ledger: &mut SqliteLedger, round: u64) {
+    commit_block_round_ordered(ledger, round, true);
+}
+
+/// `archive_first = false` writes the state change BEFORE the block rows, the
+/// order `apply_block` (sync, replay, catchup) uses: its own `put_block` runs
+/// after tracker rows are already written in the span.
+fn commit_block_round_ordered(ledger: &mut SqliteLedger, round: u64, archive_first: bool) {
+    let set_state = |ledger: &mut SqliteLedger| {
+        ledger.set_account(
+            &Address([7u8; 32]),
+            algo_types::AccountData {
+                micro_algos: round * 1000,
+                ..Default::default()
+            },
+        );
+    };
     ledger.begin_block().unwrap();
+    if !archive_first {
+        set_state(ledger);
+    }
     ledger
         .put_block(round, "test", &test_header(round), &test_block(round))
         .unwrap();
     ledger.put_block_cert(round, &test_cert(round)).unwrap();
-    ledger.set_account(
-        &Address([7u8; 32]),
-        algo_types::AccountData {
-            micro_algos: round * 1000,
-            ..Default::default()
-        },
-    );
+    if archive_first {
+        set_state(ledger);
+    }
     ledger.set_current_round(Round(round));
     ledger.commit_block().unwrap();
 }
@@ -334,13 +351,18 @@ fn wal_kill_child() {
         .unwrap_or(u64::MAX);
     let prefix = PathBuf::from(dir).join("ledger");
     let mut ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+    if let Ok(spec) = std::env::var(FAILPOINT_ENV) {
+        let (name, after) = spec.split_once(':').unwrap();
+        ledger.set_failpoint(name, after.parse().unwrap());
+    }
+    let archive_first = std::env::var(LATE_PUT_ENV).is_err();
     let probe_addr = Address([7u8; 32]);
     let mut round = ledger.last_committed_round().unwrap().unwrap_or(0);
     let mut snapshot = None;
     let stdout = std::io::stdout();
     while round < target {
         round += 1;
-        commit_block_round(&mut ledger, round);
+        commit_block_round_ordered(&mut ledger, round, archive_first);
         {
             let mut out = stdout.lock();
             writeln!(out, "R {round}").unwrap();
@@ -365,6 +387,7 @@ fn spawn_child(
     dir: &Path,
     target: Option<u64>,
     failpoint: Option<(&str, u64)>,
+    late_put: bool,
 ) -> std::process::Child {
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     cmd.args([
@@ -380,8 +403,10 @@ fn spawn_child(
         cmd.env(TARGET_ENV, t.to_string());
     }
     if let Some((name, after)) = failpoint {
-        cmd.env("ALGOD_LEDGER_FAILPOINT", name)
-            .env("ALGOD_LEDGER_FAILPOINT_AFTER", after.to_string());
+        cmd.env(FAILPOINT_ENV, format!("{name}:{after}"));
+    }
+    if late_put {
+        cmd.env(LATE_PUT_ENV, "1");
     }
     cmd.spawn().unwrap()
 }
@@ -486,6 +511,9 @@ fn reference_digest(last: u64) -> StateDigest {
 /// at a named step of the Nth block commit; the reopened ledger must hold every
 /// reported round, never have the tracker ahead of the archive, and after the
 /// follower resumes, finish with exactly the state of an uninterrupted run.
+/// Run for both write orders: the block rows first (the follower) and AFTER the
+/// state change (`apply_block`: sync, replay, catchup), since the archive
+/// ordering lives in `commit_block`, not in the caller.
 #[test]
 fn every_commit_step_crash_reopens_and_resumes_to_the_uninterrupted_state() {
     if std::env::var(CHILD_ENV).is_ok() {
@@ -493,79 +521,187 @@ fn every_commit_step_crash_reopens_and_resumes_to_the_uninterrupted_state() {
     }
     const FINAL: u64 = 30;
     let reference = reference_digest(FINAL);
-    // after_archive_commit: the block row is durable, the tracker has not
-    // committed (the window of #2209, now archive-ahead). before_tracker_commit:
-    // the same window from the tracker's side. after_tracker_commit: all done.
-    for point in [
-        "after_archive_commit",
-        "before_tracker_commit",
-        "after_tracker_commit",
-    ] {
-        // `after_archive_commit` is reached twice per block (block row, then
-        // certificate row), the other points once.
-        for after in [0u64, 1, 2, 7, 11] {
-            let what = format!("failpoint {point} after {after}");
-            let dir = tempfile::tempdir().unwrap();
-            let prefix = dir.path().join("ledger");
-            let mut child = spawn_child(dir.path(), Some(FINAL), Some((point, after)));
-            let reader = reported_rounds(&mut child);
-            let status = child.wait().unwrap();
-            let reported = reader.join().unwrap();
-            assert!(!status.success(), "{what}: the failpoint did not fire");
+    // before_archive_commit: nothing of the block is durable. after_archive_commit:
+    // the block row is durable, the tracker has not committed (the window of
+    // #2209, now archive-ahead). after_tracker_commit: all done.
+    for late_put in [false, true] {
+        for point in [
+            "before_archive_commit",
+            "after_archive_commit",
+            "after_tracker_commit",
+        ] {
+            for after in [0u64, 1, 2, 7, 11] {
+                let what = format!("failpoint {point} after {after} (late put: {late_put})");
+                let dir = tempfile::tempdir().unwrap();
+                let prefix = dir.path().join("ledger");
+                let mut child =
+                    spawn_child(dir.path(), Some(FINAL), Some((point, after)), late_put);
+                let reader = reported_rounds(&mut child);
+                let status = child.wait().unwrap();
+                let reported = reader.join().unwrap();
+                assert!(!status.success(), "{what}: the failpoint did not fire");
 
-            let (acct, bmax) = raw_rounds(&prefix);
-            match point {
-                // The archive is durable one block ahead of the tracker.
-                "after_archive_commit" | "before_tracker_commit" => {
-                    assert!(bmax >= acct, "{what}: acct {acct} blocks {bmax}")
+                let (acct, bmax) = raw_rounds(&prefix);
+                match point {
+                    // The archive is durable one block ahead of the tracker.
+                    "after_archive_commit" => {
+                        assert_eq!(bmax, acct + 1, "{what}: acct {acct} blocks {bmax}")
+                    }
+                    _ => assert_eq!(acct, bmax, "{what}"),
                 }
-                _ => assert_eq!(acct, bmax, "{what}"),
-            }
-            drop(assert_reopens(&prefix, reported, &what));
+                drop(assert_reopens(&prefix, reported, &what));
 
-            // The follower resumes (re-commits whatever the crash left over).
-            let mut resume = spawn_child(dir.path(), Some(FINAL), None);
-            let reader = reported_rounds(&mut resume);
-            assert!(resume.wait().unwrap().success(), "{what}: resume failed");
-            reader.join().unwrap();
-            let ledger = assert_reopens(&prefix, FINAL, &format!("{what}, after resume"));
-            assert_eq!(state_digest(&ledger, FINAL), reference, "{what}");
+                // The follower resumes (re-commits whatever the crash left over).
+                let mut resume = spawn_child(dir.path(), Some(FINAL), None, late_put);
+                let reader = reported_rounds(&mut resume);
+                assert!(resume.wait().unwrap().success(), "{what}: resume failed");
+                reader.join().unwrap();
+                let ledger = assert_reopens(&prefix, FINAL, &format!("{what}, after resume"));
+                assert_eq!(state_digest(&ledger, FINAL), reference, "{what}");
+            }
         }
     }
 }
 
-/// An aborted block leaves no archive row behind (the row was committed ahead
-/// of the tracker transaction and is removed again), while a row that already
-/// existed -- a block written ahead by sync -- stays.
+/// A block that does not commit changes nothing in the block archive: its
+/// buffered rows are dropped, and a row (and certificate) that already
+/// existed -- a block written ahead by sync -- is untouched, not overwritten.
 #[test]
-fn rolled_back_block_does_not_keep_its_archive_row() {
+fn rolled_back_block_leaves_the_archive_untouched() {
     let dir = tempfile::tempdir().unwrap();
-    let mut ledger = SqliteLedger::open_with_prefix(&dir.path().join("ledger")).unwrap();
+    let prefix = dir.path().join("ledger");
+    let mut ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
     commit_block_round(&mut ledger, 1);
+    let archive = |r: u64| (ledger_blocks(&prefix, r), ledger_cert(&prefix, r));
 
+    // A new round: nothing reaches the file, in the span or after the abort.
     ledger.begin_block().unwrap();
     ledger
         .put_block(2, "test", &test_header(2), &test_block(2))
         .unwrap();
     ledger.put_block_cert(2, &test_cert(2)).unwrap();
+    assert_eq!(
+        ledger.get_block_data(2).unwrap().as_deref(),
+        Some(test_block(2).as_slice()),
+        "the span reads its own buffered block"
+    );
+    assert_eq!(archive(2), (None, None), "not archived before commit");
     ledger.rollback_block().unwrap();
     assert!(ledger.get_block_data(2).unwrap().is_none());
+    assert_eq!(archive(2), (None, None));
     assert_eq!(ledger.last_committed_round().unwrap(), Some(1));
 
-    // A pre-existing row (sync wrote it ahead) survives an aborted re-commit.
+    // A pre-existing row and certificate (sync wrote them ahead) are untouched
+    // by an aborted re-commit with different bytes.
     ledger
         .put_block(2, "test", &test_header(2), &test_block(2))
         .unwrap();
+    ledger.put_block_cert(2, &test_cert(2)).unwrap();
+    ledger.begin_block().unwrap();
+    ledger
+        .put_block(2, "test", &test_header(2), b"other body")
+        .unwrap();
+    ledger.put_block_cert(2, b"other cert").unwrap();
+    ledger.rollback_block().unwrap();
+    assert_eq!(
+        archive(2),
+        (Some(test_block(2)), Some(test_cert(2))),
+        "an aborted block must not overwrite an archived row"
+    );
+    // A cert-only update of an archived row is aborted just the same.
+    ledger.begin_block().unwrap();
+    ledger.put_block_cert(2, b"other cert").unwrap();
+    ledger.rollback_block().unwrap();
+    assert_eq!(archive(2).1, Some(test_cert(2)));
+
+    // And the ledger carries on: the row written ahead is committed over.
+    commit_block_round(&mut ledger, 2);
+    assert_eq!(ledger.last_committed_round().unwrap(), Some(2));
+    assert_eq!(archive(2), (Some(test_block(2)), Some(test_cert(2))));
+}
+
+/// What another connection (a crash-recovery view of the file) sees.
+fn ledger_blocks(prefix: &Path, round: u64) -> Option<Vec<u8>> {
+    use algo_ledger::block_path_for_prefix;
+    Connection::open(block_path_for_prefix(prefix))
+        .unwrap()
+        .query_row(
+            "SELECT blkdata FROM blocks WHERE rnd = ?1",
+            [round as i64],
+            |r| r.get(0),
+        )
+        .ok()
+}
+
+fn ledger_cert(prefix: &Path, round: u64) -> Option<Vec<u8>> {
+    use algo_ledger::block_path_for_prefix;
+    Connection::open(block_path_for_prefix(prefix))
+        .unwrap()
+        .query_row(
+            "SELECT certdata FROM blocks WHERE rnd = ?1",
+            [round as i64],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten()
+}
+
+/// A block whose round the sync path already wrote ahead of the tracker (row
+/// and certificate in the archive, tracker behind) commits over it.
+#[test]
+fn a_block_written_ahead_by_sync_is_committed_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = dir.path().join("ledger");
+    let mut ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+    commit_block_round(&mut ledger, 1);
+    ledger
+        .put_block(2, "test", &test_header(2), &test_block(2))
+        .unwrap();
+    ledger.put_block_cert(2, &test_cert(2)).unwrap();
+    assert_eq!(raw_rounds(&prefix), (1, 2));
+    drop(ledger);
+    let mut ledger = assert_reopens(&prefix, 1, "written ahead");
+    commit_block_round_ordered(&mut ledger, 2, false);
+    commit_block_round(&mut ledger, 3);
+    assert_eq!(state_digest(&ledger, 3), reference_digest(3));
+}
+
+/// A savepoint (`snapshot` / `restore_snapshot`, as group rollback uses) open
+/// inside a block span survives the commit: the archive write must not end
+/// the span's transaction.
+#[test]
+fn savepoint_inside_a_block_span_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = dir.path().join("ledger");
+    let mut ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+    commit_block_round(&mut ledger, 1);
     ledger.begin_block().unwrap();
     ledger
         .put_block(2, "test", &test_header(2), &test_block(2))
         .unwrap();
-    ledger.rollback_block().unwrap();
-    assert!(ledger.get_block_data(2).unwrap().is_some());
-
-    // And the ledger carries on.
-    commit_block_round(&mut ledger, 2);
-    assert_eq!(ledger.last_committed_round().unwrap(), Some(2));
+    let snap = ledger.snapshot(&[Address([7u8; 32])]);
+    ledger.set_account(
+        &Address([7u8; 32]),
+        algo_types::AccountData {
+            micro_algos: 1,
+            ..Default::default()
+        },
+    );
+    ledger.restore_snapshot(snap); // a rolled-back group
+    ledger.put_block_cert(2, &test_cert(2)).unwrap();
+    let snap = ledger.snapshot(&[Address([7u8; 32])]);
+    ledger.set_account(
+        &Address([7u8; 32]),
+        algo_types::AccountData {
+            micro_algos: 2000,
+            ..Default::default()
+        },
+    );
+    ledger.set_current_round(Round(2));
+    drop(snap); // a group that kept its changes
+    ledger.commit_block().unwrap();
+    assert_eq!(state_digest(&ledger, 2), reference_digest(2));
+    drop(assert_reopens(&prefix, 2, "savepoint span"));
 }
 
 /// Kill a ledger process (hard kill, no cleanup) at pseudo-random points while
@@ -597,7 +733,7 @@ fn kill_mid_commit_recovers_every_reported_round() {
         } else {
             0
         };
-        let mut child = spawn_child(dir.path(), None, None);
+        let mut child = spawn_child(dir.path(), None, None, kill % 2 == 1);
         let reader = reported_rounds(&mut child);
         // xorshift: 250..750 ms of child life (open + a few dozen rounds).
         seed ^= seed << 13;
@@ -694,16 +830,15 @@ fn bench_snapshot_checkpoint_cost() {
     }
 }
 
-/// Per-block commit cost of the archive-first order (DIV-009) against the
-/// previous single-transaction order, in the same process on the same files:
-/// "joined" writes the state change before `put_block`, which makes the span
-/// dirty so the block rows are committed together with the tracker rows as
-/// before. `cargo test -p algo-ledger --release --test wal_overlapping_reader_test
-/// -- --ignored --nocapture bench_block_commit`.
+/// Per-block commit cost (`begin_block` .. `commit_block`, including the block
+/// and certificate writes) of the deferred archive commit (DIV-009). Run the
+/// same test on the previous commit for the baseline: `cargo test -p algo-ledger
+/// --release --test wal_overlapping_reader_test -- --ignored --nocapture
+/// bench_block_commit`.
 #[test]
 #[ignore = "benchmark: prints timings, asserts nothing"]
 fn bench_block_commit_archive_first() {
-    fn run(sync: i64, archive_first: bool) -> Duration {
+    fn run(sync: i64) -> Duration {
         let dir = tempfile::tempdir().unwrap();
         let mut ledger = SqliteLedger::open_with_prefix(&dir.path().join("ledger")).unwrap();
         ledger.set_synchronous_mode(sync).unwrap();
@@ -713,20 +848,17 @@ fn bench_block_commit_archive_first() {
         for round in 1..=rounds {
             let t = Instant::now();
             ledger.begin_block().unwrap();
-            let acct = || algo_types::AccountData {
-                micro_algos: round * 1000,
-                ..Default::default()
-            };
-            if !archive_first {
-                ledger.set_account(&Address([7u8; 32]), acct());
-            }
             ledger
                 .put_block(round, "test", &test_header(round), &blk)
                 .unwrap();
             ledger.put_block_cert(round, &test_cert(round)).unwrap();
-            if archive_first {
-                ledger.set_account(&Address([7u8; 32]), acct());
-            }
+            ledger.set_account(
+                &Address([7u8; 32]),
+                algo_types::AccountData {
+                    micro_algos: round * 1000,
+                    ..Default::default()
+                },
+            );
             ledger.set_current_round(Round(round));
             ledger.commit_block().unwrap();
             total += t.elapsed();
@@ -734,10 +866,8 @@ fn bench_block_commit_archive_first() {
         total / rounds as u32
     }
     for sync in [2, 1] {
-        for _ in 0..2 {
-            let joined = run(sync, false);
-            let first = run(sync, true);
-            println!("synchronous={sync}: block commit joined={joined:?} archive-first={first:?}");
+        for _ in 0..3 {
+            println!("synchronous={sync}: block commit {:?}", run(sync));
         }
     }
 }
