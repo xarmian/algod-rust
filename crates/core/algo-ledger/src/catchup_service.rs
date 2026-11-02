@@ -359,6 +359,58 @@ enum PeriodicTick {
 /// A `sync_now` caller waiting for the answer of the pass that serves it.
 type SyncWaiter = crossbeam_channel::Sender<SyncExitReason>;
 
+/// Retry timing of a pass's fetch workers (see
+/// [`CatchupService::fetch_round_with_retries`]). Production uses
+/// [`FetchPolicy::default`]; tests shorten it.
+#[derive(Debug, Clone)]
+struct FetchPolicy {
+    /// go's `errNoBlockForRoundThreshold`.
+    no_block_threshold: u32,
+    /// Pause between attempts after a transport error / timeout.
+    retry_backoff: Duration,
+    /// Pause between "no block" answers: go's `followLatestBackoff`.
+    no_block_backoff: Duration,
+    /// Consecutive transport failures of one round after which the worker
+    /// gives up and the pass ends, so the service loop regains control.
+    wall_bound: Duration,
+}
+
+impl Default for FetchPolicy {
+    fn default() -> Self {
+        Self {
+            no_block_threshold: 5,
+            retry_backoff: Duration::from_millis(100),
+            no_block_backoff: Duration::from_millis(100),
+            wall_bound: Duration::from_secs(30),
+        }
+    }
+}
+
+/// State shared by one pass's fetch workers and its apply loop.
+struct PassCtx {
+    policy: FetchPolicy,
+    /// Rounds `> window_limit` are not fetched: set to `U` when round `U`
+    /// turned out to need an unsupported protocol (the apply loop stops there).
+    window_limit: AtomicU64,
+    /// A worker has seen the network tip (a "no block" answer or a final
+    /// fetch failure): the pass is in its tip-probe / exit phase and no
+    /// longer takes `sync_now` requests.
+    tip_seen: AtomicBool,
+    /// Rounds currently probing the tip; only the lowest keeps retrying.
+    probing: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+}
+
+impl PassCtx {
+    fn new(policy: FetchPolicy) -> Self {
+        Self {
+            policy,
+            window_limit: AtomicU64::new(u64::MAX),
+            tip_seen: AtomicBool::new(false),
+            probing: std::sync::Mutex::new(Default::default()),
+        }
+    }
+}
+
 impl CatchupService {
     /// Run one periodic pass for the service thread: answer every `sync_now`
     /// waiter (the one that triggered it and any that arrived meanwhile) with
@@ -381,14 +433,23 @@ impl CatchupService {
             Some(trigger_rx),
             &mut waiters,
         );
-        // A request that slipped in after the pass's last poll is served too.
-        while let Ok(w) = trigger_rx.try_recv() {
-            waiters.push(w);
-        }
         for w in waiters {
             let _ = w.send(reason);
         }
+        // A request that arrived once the pass was at the tip stays queued:
+        // the service loop runs ONE fresh pass for it. When the service is
+        // stopping there is no further pass, so answer it now.
+        if reason == SyncExitReason::Stopping {
+            Self::answer_stopping(trigger_rx);
+        }
         reason
+    }
+
+    /// Answer every queued `sync_now` request with `Stopping`.
+    fn answer_stopping(trigger_rx: &Receiver<SyncWaiter>) {
+        while let Ok(w) = trigger_rx.try_recv() {
+            let _ = w.send(SyncExitReason::Stopping);
+        }
     }
 
     /// Whether the certificate-driven path must skip its fetch: the ledger
@@ -619,6 +680,7 @@ impl CatchupService {
             // must end the loop here, never be re-awaited (that would hang
             // `stop()`'s join forever).
             info!("catchup service exiting");
+            Self::answer_stopping(&trigger_rx);
             return;
         }
 
@@ -757,6 +819,7 @@ impl CatchupService {
             drop(sel);
         }
 
+        Self::answer_stopping(&trigger_rx);
         info!("catchup service exiting");
     }
 
@@ -911,6 +974,7 @@ impl CatchupService {
             parallel_blocks,
             triggers,
             waiters,
+            FetchPolicy::default(),
         );
 
         // Mirrors Go's `s.syncStartNS.Store(0)` at the end of `sync()`
@@ -959,12 +1023,21 @@ impl CatchupService {
     /// fetch already in flight) and waits for the reply.
     ///
     /// Contract (issue #2165): a pass is one continuous pipeline that runs
-    /// until the network tip, not a bounded batch. A `sync_now` that arrives
-    /// while a pass is running is coalesced into it: the apply loop notices
-    /// the request within one fetch-wait tick (100 ms) and the caller gets
-    /// that pass's [`SyncExitReason`] when the pass ends (the tip, a failure,
-    /// or a stop request), with no second pass run for it. So the call
-    /// blocks for as long as the catch-up it asked for takes, exactly like
+    /// until the network tip, not a bounded batch. What a `sync_now` gets
+    /// depends on when it arrives:
+    ///
+    /// - while the service is idle: it starts a pass and gets its result;
+    /// - while a pass is still making progress (no worker has seen the tip, a
+    ///   fetch failure or a stop yet): it is coalesced into that pass. The
+    ///   apply loop notices it within one fetch-wait tick (100 ms) and the
+    ///   caller gets that pass's [`SyncExitReason`] when it ends;
+    /// - once the pass has entered its tip-probe / exit phase (a worker got a
+    ///   "no block" answer or gave up on a round): it is NOT answered with
+    ///   that stale result. It stays queued and the service runs exactly one
+    ///   fresh pass for it after the current one, so blocks that appeared
+    ///   meanwhile are picked up.
+    ///
+    /// The call blocks for as long as the catch-up it asked for takes, like
     /// go's `sync()`. It returns [`SyncExitReason::Stopping`] if the service
     /// is stopped meanwhile.
     pub fn sync_now(&self) -> SyncExitReason {
@@ -996,52 +1069,90 @@ impl CatchupService {
             parallel_blocks,
             None,
             &mut Vec::new(),
+            FetchPolicy::default(),
         )
     }
 
     /// Fetch one round for the pass's worker, retrying like go's
-    /// `fetchAndWrite`: up to [`Self::FETCH_RETRY_LIMIT`] attempts, giving up
-    /// early once peers have said "no such block" more than
-    /// [`Self::NO_BLOCK_THRESHOLD`] times (`errNoBlockForRoundThreshold`, the
-    /// tip) and at once when there are no peers (`errCatchupNoPeer`). The
-    /// fetcher rotates peers inside each attempt. A transient error therefore
-    /// no longer ends the whole pass.
+    /// `fetchAndWrite`: up to [`Self::CATCHUP_RETRY_LIMIT`] attempts (go's
+    /// `catchupRetryLimit`), giving up early once peers have said "no such
+    /// block" more than `no_block_threshold` times
+    /// (`errNoBlockForRoundThreshold`, the tip) and at once when there are no
+    /// peers (`errCatchupNoPeer`). The fetcher rotates peers inside each
+    /// attempt. A transient error therefore no longer ends the whole pass.
+    ///
+    /// Beyond go's count bound this is also bounded by wall time
+    /// (`wall_bound` of consecutive transport failures), so one persistently
+    /// failing round cannot keep the single service thread inside a pass for
+    /// minutes (500 attempts of timeout + backoff).
+    ///
+    /// Tip probing: go sleeps `followLatestBackoff` (100 ms) between
+    /// "no block" answers, and so does this. Only the lowest round that has
+    /// seen a "no block" keeps probing; a worker for a higher round gives up
+    /// at once (it cannot succeed before the lower one), so a window of N
+    /// workers sends about `N + threshold` requests at the tip, not
+    /// `N * threshold`.
     fn fetch_round_with_retries(
         fetcher: &dyn BlockFetcher,
         round: Round,
         stop: &AtomicBool,
+        ctx: &PassCtx,
     ) -> Result<FetchedBlockCert, FetchError> {
+        struct ProbeGuard<'a>(&'a PassCtx, u64);
+        impl Drop for ProbeGuard<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut set) = self.0.probing.lock() {
+                    set.remove(&self.1);
+                }
+            }
+        }
+        let _guard = ProbeGuard(ctx, round.0);
+        let policy = &ctx.policy;
         let mut no_block = 0u32;
         let mut last = FetchError::Timeout;
-        for _ in 0..Self::FETCH_RETRY_LIMIT {
-            if stop.load(Ordering::SeqCst) {
+        let mut failing_since: Option<std::time::Instant> = None;
+        for _ in 0..Self::CATCHUP_RETRY_LIMIT {
+            // Stopped, or past an unsupported round the apply loop will stop at.
+            if stop.load(Ordering::SeqCst) || round.0 > ctx.window_limit.load(Ordering::SeqCst) {
                 return Err(FetchError::NetworkError("catchup pass stopping".into()));
             }
             match fetcher.fetch_block(round) {
                 Ok(b) => return Ok(b),
                 Err(FetchError::NoPeersAvailable) => return Err(FetchError::NoPeersAvailable),
                 Err(e @ FetchError::NoBlockForRound { .. }) => {
+                    ctx.tip_seen.store(true, Ordering::SeqCst);
                     no_block += 1;
-                    if no_block > Self::NO_BLOCK_THRESHOLD {
+                    if no_block > policy.no_block_threshold {
+                        return Err(e);
+                    }
+                    let lowest = |ctx: &PassCtx| {
+                        ctx.probing.lock().map_or(true, |mut set| {
+                            set.insert(round.0);
+                            set.iter().next() == Some(&round.0)
+                        })
+                    };
+                    if !lowest(ctx) {
+                        return Err(e);
+                    }
+                    thread::sleep(policy.no_block_backoff);
+                    // A lower round may have started probing meanwhile.
+                    if !lowest(ctx) {
                         return Err(e);
                     }
                     last = e;
                 }
                 Err(e) => {
                     last = e;
-                    thread::sleep(Self::FETCH_RETRY_BACKOFF);
+                    let since = *failing_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= policy.wall_bound {
+                        return Err(last);
+                    }
+                    thread::sleep(policy.retry_backoff);
                 }
             }
         }
         Err(last)
     }
-
-    /// go's `catchupRetryLimit` (`catchup/service.go`).
-    const FETCH_RETRY_LIMIT: u32 = 500;
-    /// go's `errNoBlockForRoundThreshold`.
-    const NO_BLOCK_THRESHOLD: u32 = 5;
-    /// Pause between attempts after a transport error / timeout.
-    const FETCH_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
     /// [`Self::sync_pass_inner`] plus the live service's `sync_now`
     /// coalescing: requests arriving on `triggers` during the pass are pushed
@@ -1053,6 +1164,7 @@ impl CatchupService {
         parallel_blocks: u64,
         triggers: Option<&Receiver<SyncWaiter>>,
         waiters: &mut Vec<SyncWaiter>,
+        policy: FetchPolicy,
     ) -> SyncExitReason {
         let mut exit_reason = SyncExitReason::Done;
         let start_round = ledger.next_round();
@@ -1064,6 +1176,7 @@ impl CatchupService {
         // unsupported round, or the main thread's validation loop below.
         let next_to_fetch = Arc::new(AtomicU64::new(start_round.0));
         let stop = Arc::new(AtomicBool::new(false));
+        let ctx = Arc::new(PassCtx::new(policy));
         // go's `pipelinedFetch` is a sliding window: it only issues a fetch
         // for rounds `firstRound .. firstRound+limitedParallelRequests`, and
         // the window moves up by one each time the first round is written.
@@ -1086,6 +1199,7 @@ impl CatchupService {
         for _ in 0..parallel_blocks {
             let next_to_fetch = Arc::clone(&next_to_fetch);
             let stop = Arc::clone(&stop);
+            let ctx = Arc::clone(&ctx);
             let tx = result_tx.clone();
             let permits = permit_rx.clone();
             let ledger = Arc::clone(ledger);
@@ -1106,6 +1220,11 @@ impl CatchupService {
                         return;
                     }
                     let round = next_to_fetch.fetch_add(1, Ordering::SeqCst);
+                    // Past an unsupported round the apply loop stops at: the
+                    // result could never be used.
+                    if round > ctx.window_limit.load(Ordering::SeqCst) {
+                        return;
+                    }
                     let r = Round(round);
                     // A panic inside the fetcher must still produce a result
                     // for the claimed round, or the apply loop would wait for
@@ -1118,6 +1237,7 @@ impl CatchupService {
                             fetcher.as_ref(),
                             r,
                             &stop,
+                            &ctx,
                         )))
                     }))
                     .unwrap_or_else(|_| {
@@ -1126,6 +1246,13 @@ impl CatchupService {
                         )))))
                     });
                     let unsupported = matches!(outcome, FetchOutcome::Unsupported);
+                    if unsupported {
+                        // Workers fetching or retrying later rounds stop now.
+                        ctx.window_limit.fetch_min(round, Ordering::SeqCst);
+                    }
+                    if matches!(&outcome, FetchOutcome::Fetch(r) if r.is_err()) {
+                        ctx.tip_seen.store(true, Ordering::SeqCst);
+                    }
                     if tx.send((round, outcome)).is_err() || unsupported {
                         return;
                     }
@@ -1150,24 +1277,25 @@ impl CatchupService {
         let mut buffer: BTreeMap<u64, FetchOutcome> = BTreeMap::new();
         let mut next_apply = start_round.0;
         let mut fetched = 0u64;
-        // Once `true`, the main loop below only drains the channel (never
-        // applies anything more). This is essential, not just tidy: a
-        // worker can be parked mid-`send` on the bounded channel when the
-        // stop condition is discovered, and it only re-checks `stop` after
-        // that `send` unblocks — so this thread must keep receiving (even
-        // if it throws every further message away) until every worker's
-        // sender clone drops and the channel closes, or `join` below would
-        // deadlock waiting on a worker that is waiting on us.
+        // Once `true`, the main loop below applies nothing more and only
+        // waits for the workers to finish, discarding their results. The
+        // loop ends when the result channel closes, i.e. when every worker's
+        // sender clone has dropped (workers exit on `stop`, on the permit
+        // channel closing, or after reporting `Unsupported`).
         let mut stopped = false;
         let recv_started = std::time::Instant::now();
         let mut first_result_logged = false;
 
         loop {
-            // A `sync_now` that arrives while this pass runs is answered by
-            // this pass (see `sync_now`): collect it, reply when it ends.
+            // A `sync_now` that arrives while this pass is still making
+            // progress is answered by this pass (see `sync_now`): collect it,
+            // reply when it ends. Once a worker has seen the tip (or the pass
+            // is stopping) a request is left queued for a fresh pass.
             if let Some(t) = triggers {
-                while let Ok(w) = t.try_recv() {
-                    waiters.push(w);
+                if !stopped && !ctx.tip_seen.load(Ordering::SeqCst) {
+                    while let Ok(w) = t.try_recv() {
+                        waiters.push(w);
+                    }
                 }
             }
             let (round, outcome) = match result_rx.recv_timeout(Duration::from_millis(100)) {
@@ -1393,11 +1521,10 @@ impl CatchupService {
             }
         }
 
-        // The channel only closes once every worker's sender clone has
-        // dropped, i.e. once every worker has returned — so by the time
-        // `result_rx.iter()` above ends, every worker has already noticed
-        // `stop` (or run out of rounds) and these `join`s return immediately.
-        // `stop` is set defensively.
+        // The result channel only closes once every worker's sender clone has
+        // dropped, i.e. once every worker has returned — so by the time the
+        // loop above ends, these `join`s return immediately. `stop` is set
+        // defensively.
         stop.store(true, Ordering::SeqCst);
         drop(permit_tx);
         for w in workers {
@@ -2266,10 +2393,10 @@ mod tests {
         let mut svc = CatchupService::start(rx, ledger_dyn, fetcher_dyn);
 
         // Let the startup `sync_pass` (unconditional, mirrors go running one
-        // `sync()` immediately) settle before measuring — it fails
-        // immediately (round 1 > up_to 0) and is unrelated to the periodic
-        // hysteresis under test here.
-        thread::sleep(Duration::from_millis(300));
+        // `sync()` immediately) settle before measuring — it ends after its
+        // tip probe (round 1 > up_to 0: six "no block" answers 100 ms apart)
+        // and is unrelated to the periodic hysteresis under test here.
+        thread::sleep(Duration::from_millis(1_200));
         let baseline_calls = fetcher.calls.load(Ordering::SeqCst);
 
         // Simulate a live-but-slower agreement service: one committed round
@@ -2573,8 +2700,8 @@ mod tests {
         // must not add one. `start_with_parallelism(.., 1)`'s single
         // periodic-sync worker can race one extra (wasted, discarded)
         // speculative fetch ahead of the main thread noticing the startup
-        // probe should stop (issue #753's rendezvous-channel pipelining —
-        // see `sync_pass`'s worker-loop doc comment), so this allows a
+        // probe should stop (a worker claims its next round of the
+        // fetch window before the main thread notices), so this allows a
         // small, explicitly-bounded slack rather than an exact count.
         assert!(
             fetcher.fetch_count() <= 4,
@@ -2781,8 +2908,9 @@ mod tests {
 
         // Roughly two fetches: the startup periodic probe plus one
         // certificate-driven fetch, no retries for a valid block — plus a
-        // small bounded slack for `start_with_parallelism(.., 1)`'s
-        // rendezvous-pipelined periodic worker (see
+        // small bounded slack for the periodic pass of
+        // `start_with_parallelism(.., 1)`, whose single fetch-window slot
+        // may hold one more in-flight fetch (see
         // `skips_already_committed_round`'s comment on the same bound).
         assert!(
             fetcher.fetch_count() <= 4,
@@ -3824,40 +3952,6 @@ mod tests {
         finishes_within(Duration::from_secs(15), move || svc.stop());
     }
 
-    /// `sync_now` during a running pass is coalesced into it: it returns
-    /// with that pass's result once the ledger reached the tip, not stuck
-    /// behind the queue.
-    #[test]
-    fn sync_now_during_a_long_pass_is_answered_by_that_pass() {
-        let (_tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
-        let (ledger, ledger_dyn) = permissive_ledger();
-        let open = Arc::new(AtomicBool::new(true));
-        let fetcher: Arc<dyn BlockFetcher> = Arc::new(GatedFetcher {
-            open,
-            delay: Duration::from_millis(5),
-        });
-        // Rounds beyond 300 do not exist: wrap in a bounded view.
-        struct UpTo(Arc<dyn BlockFetcher>, u64);
-        impl BlockFetcher for UpTo {
-            fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
-                if round.0 > self.1 {
-                    return Err(FetchError::NoBlockForRound { round });
-                }
-                self.0.fetch_block(round)
-            }
-        }
-        let fetcher: Arc<dyn BlockFetcher> = Arc::new(UpTo(fetcher, 300));
-        let mut svc = CatchupService::start_with_parallelism(rx, ledger_dyn, fetcher, 4);
-        // The startup pass is mid-flight now.
-        let reason = finishes_within(Duration::from_secs(20), move || {
-            let r = svc.sync_now();
-            svc.stop();
-            r
-        });
-        assert_ne!(reason, SyncExitReason::Stopping);
-        assert_eq!(ledger.next_round(), Round(301));
-    }
-
     /// A transient fetch failure of one round is retried in the pass (go's
     /// `fetchAndWrite` loop) instead of ending the pass and idling for
     /// several seconds.
@@ -4019,6 +4113,331 @@ mod tests {
         shutdown_tx.send(()).unwrap();
         let exit = finishes_within(Duration::from_secs(10), move || handle.join().unwrap());
         assert_eq!(exit, SyncExitReason::Stopping);
+    }
+
+    /// Run a sync pass with an explicit retry policy.
+    fn sync_range_with_policy(
+        ledger: &Arc<dyn CatchupLedger>,
+        fetcher: &Arc<dyn BlockFetcher>,
+        parallel_blocks: u64,
+        policy: FetchPolicy,
+    ) -> SyncExitReason {
+        let shutdown_rx = never_shutdown();
+        CatchupService::sync_pass_core(
+            ledger,
+            fetcher,
+            &shutdown_rx,
+            parallel_blocks,
+            None,
+            &mut Vec::new(),
+            policy,
+        )
+    }
+
+    /// Serves rounds `1..=up_to`; `gate_round` blocks (once) until released.
+    struct GateAtFetcher {
+        up_to: u64,
+        gate_round: u64,
+        reached: crossbeam_channel::Sender<()>,
+        release: Receiver<()>,
+    }
+
+    impl BlockFetcher for GateAtFetcher {
+        fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
+            if round.0 > self.up_to {
+                return Err(FetchError::NoBlockForRound { round });
+            }
+            if round.0 == self.gate_round {
+                let _ = self.reached.send(());
+                let _ = self.release.recv();
+            }
+            Ok(FetchedBlockCert {
+                block: make_valid_empty_block(round.0),
+                cert: Some(make_cert(round.0)),
+                raw_payset_blobs: None,
+            })
+        }
+    }
+
+    /// Deterministic: a `sync_now` that arrives while the pass is still
+    /// applying blocks (the cursor is held at a gated round, no worker has
+    /// seen the tip) is consumed by that pass and answered with its result.
+    #[test]
+    fn sync_now_during_a_progressing_pass_is_coalesced_deterministically() {
+        let (ledger, ledger_dyn) = permissive_ledger();
+        let (reached_tx, reached_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded();
+        let fetcher: Arc<dyn BlockFetcher> = Arc::new(GateAtFetcher {
+            up_to: 60,
+            gate_round: 30,
+            reached: reached_tx,
+            release: release_rx,
+        });
+        let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
+        let (trigger_tx, trigger_rx) = crossbeam_channel::unbounded::<SyncWaiter>();
+        let syncing = Arc::new(AtomicI64::new(0));
+        let pass = thread::spawn(move || {
+            CatchupService::run_pass(
+                &ledger_dyn,
+                &fetcher,
+                &shutdown_rx,
+                &trigger_rx,
+                &syncing,
+                4,
+                Vec::new(),
+            )
+        });
+        reached_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        trigger_tx.send(reply_tx).unwrap();
+        // The apply loop (held at round 30) takes the request on its next tick.
+        poll_until(
+            || trigger_tx.is_empty(),
+            Duration::from_millis(10),
+            Duration::from_secs(10),
+            "the running pass should have taken the sync_now request",
+        );
+        release_tx.send(()).unwrap();
+        let reason = finishes_within(Duration::from_secs(20), move || pass.join().unwrap());
+        assert_eq!(reason, SyncExitReason::NoBlock);
+        assert_eq!(
+            reply_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            SyncExitReason::NoBlock,
+            "answered by the pass it was coalesced into"
+        );
+        assert_eq!(ledger.next_round(), Round(61));
+        assert!(trigger_tx.is_empty(), "no second pass was queued for it");
+    }
+
+    /// A peer that lacks round 11 for its first six answers (one tip probe),
+    /// then has rounds 11..=20.
+    struct LateBlocksFetcher {
+        probes_of_11: AtomicU64,
+        second_probe: crossbeam_channel::Sender<()>,
+    }
+
+    impl BlockFetcher for LateBlocksFetcher {
+        fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
+            let have = if round.0 == 11 {
+                let n = self.probes_of_11.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 2 {
+                    let _ = self.second_probe.send(());
+                }
+                n >= 7
+            } else {
+                round.0 <= 20
+            };
+            if !have {
+                return Err(FetchError::NoBlockForRound { round });
+            }
+            Ok(FetchedBlockCert {
+                block: make_valid_empty_block(round.0),
+                cert: Some(make_cert(round.0)),
+                raw_payset_blobs: None,
+            })
+        }
+    }
+
+    /// A `sync_now` issued during the tip probe is not answered with the
+    /// stale tip result: one fresh pass runs for it and picks up the blocks
+    /// that became available since.
+    #[test]
+    fn sync_now_during_the_tip_probe_triggers_a_fresh_pass() {
+        let (ledger, ledger_dyn) = permissive_ledger();
+        let (probe_tx, probe_rx) = crossbeam_channel::unbounded();
+        let fetcher = Arc::new(LateBlocksFetcher {
+            probes_of_11: AtomicU64::new(0),
+            second_probe: probe_tx,
+        });
+        let fetcher_dyn: Arc<dyn BlockFetcher> = fetcher.clone();
+        let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
+        let (trigger_tx, trigger_rx) = crossbeam_channel::unbounded::<SyncWaiter>();
+        let syncing = Arc::new(AtomicI64::new(0));
+        // One fetch slot: the only tip prober is the worker for round 11.
+        let handle = thread::spawn(move || {
+            CatchupService::run_loop(shutdown_rx, trigger_rx, ledger_dyn, fetcher_dyn, syncing, 1)
+        });
+        // The startup pass applied 1..=10 and is probing round 11 (2nd probe).
+        probe_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(ledger.next_round(), Round(11));
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        trigger_tx.send(reply_tx).unwrap();
+        let reason = reply_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert_eq!(reason, SyncExitReason::NoBlock);
+        assert_eq!(
+            ledger.next_round(),
+            Round(21),
+            "the answer must come from a fresh pass that saw the new blocks"
+        );
+        shutdown_tx.send(()).unwrap();
+        finishes_within(Duration::from_secs(10), move || handle.join().unwrap());
+    }
+
+    /// Counts requests for rounds beyond `up_to` (the tip probe traffic).
+    struct TipProbeCountingFetcher {
+        up_to: u64,
+        beyond: AtomicU64,
+    }
+
+    impl BlockFetcher for TipProbeCountingFetcher {
+        fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
+            if round.0 > self.up_to {
+                self.beyond.fetch_add(1, Ordering::SeqCst);
+                return Err(FetchError::NoBlockForRound { round });
+            }
+            thread::sleep(Duration::from_millis(1));
+            Ok(FetchedBlockCert {
+                block: make_valid_empty_block(round.0),
+                cert: Some(make_cert(round.0)),
+                raw_payset_blobs: None,
+            })
+        }
+    }
+
+    /// At the tip only the lowest missing round keeps probing, with go's
+    /// 100 ms pause: about `window + threshold` requests, not
+    /// `window * (threshold + 1)`.
+    #[test]
+    fn the_tip_probe_is_not_multiplied_by_the_window() {
+        let (ledger, ledger_dyn) = permissive_ledger();
+        let fetcher = Arc::new(TipProbeCountingFetcher {
+            up_to: 20,
+            beyond: AtomicU64::new(0),
+        });
+        let fetcher_dyn: Arc<dyn BlockFetcher> = fetcher.clone();
+        let started = std::time::Instant::now();
+        let exit = finishes_within(Duration::from_secs(30), move || {
+            sync_range_with_policy(&ledger_dyn, &fetcher_dyn, 8, FetchPolicy::default())
+        });
+        assert_eq!(exit, SyncExitReason::NoBlock);
+        assert_eq!(ledger.next_round(), Round(21));
+        let beyond = fetcher.beyond.load(Ordering::SeqCst);
+        // 8 workers each ask once; the lowest asks `threshold + 1` times.
+        assert!(
+            beyond <= 8 + 6 + 4,
+            "{beyond} tip probe requests for a window of 8 (unmultiplied would be 48)"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(400),
+            "the probe must pause between attempts like go's followLatestBackoff"
+        );
+    }
+
+    /// A round that fails persistently ends the pass within the wall-time
+    /// bound instead of after 500 attempts.
+    #[test]
+    fn a_persistently_failing_round_ends_the_pass_within_the_wall_bound() {
+        struct SlowFailing {
+            calls: AtomicU64,
+        }
+        impl BlockFetcher for SlowFailing {
+            fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
+                if round.0 >= 3 {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(20));
+                    return Err(FetchError::Timeout);
+                }
+                Ok(FetchedBlockCert {
+                    block: make_valid_empty_block(round.0),
+                    cert: Some(make_cert(round.0)),
+                    raw_payset_blobs: None,
+                })
+            }
+        }
+        let (ledger, ledger_dyn) = permissive_ledger();
+        let fetcher = Arc::new(SlowFailing {
+            calls: AtomicU64::new(0),
+        });
+        let fetcher_dyn: Arc<dyn BlockFetcher> = fetcher.clone();
+        let policy = FetchPolicy {
+            retry_backoff: Duration::from_millis(10),
+            wall_bound: Duration::from_millis(300),
+            ..FetchPolicy::default()
+        };
+        let started = std::time::Instant::now();
+        let exit = finishes_within(Duration::from_secs(10), move || {
+            sync_range_with_policy(&ledger_dyn, &fetcher_dyn, 4, policy)
+        });
+        assert_eq!(exit, SyncExitReason::NoBlock);
+        assert_eq!(ledger.next_round(), Round(3));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // 4 workers x ~300 ms / 30 ms per attempt; nowhere near 4 x 500.
+        assert!(fetcher.calls.load(Ordering::SeqCst) < 100);
+    }
+
+    /// Only round `bad` needs an unsupported protocol (non-monotone, unlike
+    /// [`SwitchingCatchupLedger`]).
+    struct OneUnsupportedRound {
+        inner: PermissiveCatchupLedger,
+        bad: u64,
+    }
+
+    impl CatchupLedger for OneUnsupportedRound {
+        fn next_round(&self) -> Round {
+            self.inner.next_round()
+        }
+        fn ensure_block(&self, block: &Block, cert: &Certificate) {
+            self.inner.ensure_block(block, cert)
+        }
+        fn authenticate_block(&self, _block: &Block, _cert: &Certificate) -> Result<(), String> {
+            Ok(())
+        }
+        fn round_is_not_supported(&self, round: Round) -> bool {
+            round.0 == self.bad
+        }
+    }
+
+    /// Once round U is reported unsupported, window workers stop fetching and
+    /// retrying later rounds even though the apply cursor is still behind U.
+    #[test]
+    fn workers_stop_fetching_past_an_unsupported_round() {
+        struct SlowFirstFailingLater {
+            beyond: AtomicU64,
+            bad: u64,
+        }
+        impl BlockFetcher for SlowFirstFailingLater {
+            fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
+                if round.0 > self.bad {
+                    self.beyond.fetch_add(1, Ordering::SeqCst);
+                    return Err(FetchError::NetworkError("down".into()));
+                }
+                if round.0 == 1 {
+                    // Holds the apply cursor behind U while later workers run.
+                    thread::sleep(Duration::from_millis(800));
+                }
+                Ok(FetchedBlockCert {
+                    block: make_valid_empty_block(round.0),
+                    cert: Some(make_cert(round.0)),
+                    raw_payset_blobs: None,
+                })
+            }
+        }
+        let ledger = Arc::new(OneUnsupportedRound {
+            inner: PermissiveCatchupLedger {
+                inner: MockCatchupLedger::new(Round(0)),
+            },
+            bad: 3,
+        });
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher = Arc::new(SlowFirstFailingLater {
+            beyond: AtomicU64::new(0),
+            bad: 3,
+        });
+        let fetcher_dyn: Arc<dyn BlockFetcher> = fetcher.clone();
+        let policy = FetchPolicy {
+            retry_backoff: Duration::from_millis(5),
+            ..FetchPolicy::default()
+        };
+        let exit = finishes_within(Duration::from_secs(20), move || {
+            sync_range_with_policy(&ledger_dyn, &fetcher_dyn, 8, policy)
+        });
+        assert_eq!(exit, SyncExitReason::Unsupported);
+        assert_eq!(ledger.next_round(), Round(3));
+        // 8 workers hold rounds 1..=8; rounds 4..=8 are past U. Each may have
+        // tried once before U was reported, none may retry (800 ms / 5 ms
+        // would otherwise give ~150 attempts each).
+        let beyond = fetcher.beyond.load(Ordering::SeqCst);
+        assert!(beyond <= 8, "{beyond} fetches beyond the unsupported round");
     }
 
     /// Row 1: same scenario, but driven through a live [`CatchupService`]'s
