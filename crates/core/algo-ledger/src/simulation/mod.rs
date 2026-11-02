@@ -1044,6 +1044,14 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                         Some(&gi),
                         Some(&mut tracer),
                     )
+                    // go's `BlockEvaluator.transaction` frames a min-balance
+                    // failure `transaction <txid>: ` and simulate reports it
+                    // as is (`EvalFailureError`).
+                    .map_err(|e| {
+                        algo_error::frame_min_balance(e, || {
+                            algo_codec::compute_txn_id(&eval_group[i].txn).to_string()
+                        })
+                    })
                 }
             };
             // Per-transaction app budget consumed = the sum of every approval /

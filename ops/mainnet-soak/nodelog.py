@@ -259,7 +259,7 @@ GOSSIP_NOISE_RE = re.compile(
     r"|PoolSolicitedTxHandler|TxSyncer|TxTagHandler|TransactionPool"
 )
 BALANCE_RE = re.compile(
-    r"below minimum balance|below min \d+ \(\d+ assets\)|insufficient balance", re.IGNORECASE
+    r"below min \d+ \(\d+ assets\)|insufficient balance", re.IGNORECASE
 )
 NO_ADVANCE_RE = re.compile(r"ensure_block.*did not advance|did not advance.*ensure_block")
 

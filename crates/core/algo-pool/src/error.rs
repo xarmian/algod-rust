@@ -342,6 +342,8 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
             algo_error::RejectClass::TxidInLedger { in_block: false } => PoolErrorTag::TxId,
             algo_error::RejectClass::LeaseInLedger { in_block: true } => PoolErrorTag::LeaseEval,
             algo_error::RejectClass::LeaseInLedger { in_block: false } => PoolErrorTag::Lease,
+            // go `ClassifyTxPoolError` on the typed `MinBalanceError`.
+            algo_error::RejectClass::MinBalance => PoolErrorTag::MinBalance,
             algo_error::RejectClass::Alive | algo_error::RejectClass::Other => {
                 classify_evaluator_message(message)
             }
@@ -702,6 +704,39 @@ mod tests {
         assert_eq!(
             classify_pool_error(&rej(algo_error::RejectClass::TealErr)),
             PoolErrorTag::TealErr
+        );
+    }
+
+    /// go tags a `MinBalanceError` `min_balance` by type; the text shape is
+    /// only the fallback for an error that reaches the pool as a string.
+    #[test]
+    fn min_balance_is_tagged_by_class_and_by_go_text() {
+        let rej = |class, message: &str| PoolError::TxnRejected {
+            message: message.into(),
+            class,
+            detail: None,
+        };
+        // typed: the text does not matter
+        assert_eq!(
+            classify_pool_error(&rej(algo_error::RejectClass::MinBalance, "anything")),
+            PoolErrorTag::MinBalance
+        );
+        // untyped: go's text, framed and with a suffix
+        let text = "transaction X: account A balance 50 below min 100000 (0 assets), more";
+        assert_eq!(
+            classify_pool_error(&rej(algo_error::RejectClass::Other, text)),
+            PoolErrorTag::MinBalance
+        );
+        assert_eq!(
+            classify_pool_error(&PoolError::Evaluator(text.into())),
+            PoolErrorTag::MinBalance
+        );
+        // the old algod-rust wording is no longer special
+        assert_eq!(
+            classify_pool_error(&PoolError::Evaluator(
+                "account A balance 5 below minimum balance 100000".into()
+            )),
+            PoolErrorTag::EvalGeneric
         );
     }
 }

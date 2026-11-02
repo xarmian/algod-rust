@@ -735,6 +735,15 @@ class ScanLogTest(unittest.TestCase):
         line = L("01:00:00.000000", "WARN", "algo_ledger::shadow_execute: shadow_execute_mismatch round=7 diffs=1 [execute_error execute=below minimum balance]")
         self.assertEqual(self._hard([line]), {"shadow_execute_mismatch": 1})
 
+    def test_shadow_mismatch_with_go_min_balance_text_counts_once(self):
+        line = L("01:00:00.000000", "WARN", "algo_ledger::shadow_execute: shadow_execute_mismatch round=7 diffs=1 [execute_error execute=account X balance 5 below min 100000 (0 assets)]")
+        self.assertEqual(self._hard([line]), {"shadow_execute_mismatch": 1})
+
+    def test_legacy_below_minimum_balance_wording_is_not_flagged(self):
+        # nothing emits `below minimum balance` any more (issue #2186)
+        line = L("01:00:00.000000", "WARN", "algo_ledger::sync: unrelated: below minimum balance 100000")
+        self.assertEqual(self._hard([line]), {})
+
     def test_shadow_rate_limited_summary_is_not_a_hard_mismatch(self):
         line = L("01:00:00.000000", "WARN", "algo_ledger::shadow_execute: shadow_execute_mismatch kind=rate_limited suppressed_lines=12")
         scan = nodelog.scan_lines([line])
