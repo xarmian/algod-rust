@@ -7188,13 +7188,18 @@ impl SqliteLedger {
             let _ = writer.execute_batch("ROLLBACK");
             return Err(fail("write", e));
         }
-        writer.execute_batch("COMMIT").map_err(|e| {
-            let _ = writer.execute_batch("ROLLBACK");
-            fail("commit", e)
-        })?;
+        // Published BEFORE the commit makes the rows visible to other
+        // connections (the read pool hides this block until the tracker
+        // commits too; see `LedgerReadPool::in_flight`).
         if let Some(round) = self.pending_archive.rows.keys().next_back() {
             self.archive_inflight
                 .store(*round as u64 + 1, std::sync::atomic::Ordering::SeqCst);
+        }
+        if let Err(e) = writer.execute_batch("COMMIT") {
+            let _ = writer.execute_batch("ROLLBACK");
+            self.archive_inflight
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            return Err(fail("commit", e));
         }
         self.pending_archive.clear();
         self.failpoint("after_archive_commit");
