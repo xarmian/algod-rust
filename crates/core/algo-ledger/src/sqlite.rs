@@ -445,6 +445,32 @@ pub fn open_ledger_connection_with_sync_mode(
     Ok(conn)
 }
 
+/// Rate-limited (once a minute) warning for a snapshot-time WAL checkpoint
+/// that could not backfill: the #2166 bound only holds while no other reader
+/// pins the tracker WAL.
+fn warn_wal_checkpoint_partial(busy: i64, log: i64, ckpt: i64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_WARN_SECS: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_WARN_SECS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 60
+        && LAST_WARN_SECS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        tracing::warn!(
+            busy,
+            log,
+            ckpt,
+            "tracker WAL checkpoint before a read snapshot was incomplete: another reader \
+             holds the WAL, so it can grow until that reader is released"
+        );
+    }
+}
+
 /// Return `true` if a ledger database pair (tracker file) already exists at
 /// the given prefix-or-path. Mirrors the "does the on-disk DB exist?" check
 /// callers used to perform against a single-file `ledger.sqlite`.
@@ -3370,7 +3396,8 @@ impl SqliteLedger {
     /// Returns `None` for in-memory databases (which cannot share state
     /// across connections).
     ///
-    /// Issue #2166: before opening it, the tracker WAL is checkpointed
+    /// **Contract: call outside `begin_block`..`commit_block`.** Issue #2166:
+    /// before opening the snapshot, the *tracker* WAL is checkpointed
     /// (PASSIVE). The pool follower replaces its snapshot after every block
     /// -- drop the old one, open the next -- so a snapshot is alive across
     /// every commit and the writer never sees a moment with no WAL reader.
@@ -3380,15 +3407,23 @@ impl SqliteLedger {
     /// gap between the old snapshot's drop and the new one's first read,
     /// makes the new snapshot read straight from the database file (read
     /// mark 0), which does not stop the next commit from restarting the WAL.
+    /// Inside a block span the checkpoint is skipped (counted in
+    /// `algod_rust_follow_block_snapshot_wal_checkpoint_skipped_in_block_total`).
+    ///
+    /// Best effort: any other long-lived reader of the tracker file (the lazy
+    /// trie loader, a catchpoint export snapshot, an external tool) still
+    /// pins the WAL and the checkpoint then reports busy/partial (counted in
+    /// `..._snapshot_wal_checkpoint_partial_total`). The checkpoint only
+    /// touches the tracker file; the block archive is not checkpointed.
     pub fn open_read_snapshot(&self) -> Option<ReadSnapshot> {
         let prefix = self.db_prefix.as_ref()?;
-        if !self.in_block {
-            // DIVERGENCE DIV-008: go has no long-lived read snapshot; this
-            // keeps ours from pinning the WAL. Best effort: BUSY (another
-            // reader) just leaves the backfill to the commit-time checkpoint.
-            if let Err(e) = self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)") {
-                tracing::debug!("read snapshot: pre-open WAL checkpoint failed: {e}");
-            }
+        if self.in_block {
+            crate::follow_timing::follow_timing()
+                .snapshot_checkpoint_skipped_in_block
+                .inc();
+            tracing::debug!("read snapshot opened inside a block span: WAL checkpoint skipped");
+        } else {
+            self.checkpoint_tracker_wal_for_snapshot();
         }
         let tracker_path = tracker_path_for_prefix(prefix);
         let conn = match Connection::open_with_flags(
@@ -3409,6 +3444,46 @@ impl SqliteLedger {
             return None;
         }
         Some(ReadSnapshot { conn })
+    }
+
+    /// DIVERGENCE DIV-008: go has no long-lived read snapshot; this keeps ours
+    /// from pinning the tracker WAL. `main.` limits the checkpoint to the
+    /// tracker file (the attached `blockdb` is not copied or fsynced). A
+    /// PASSIVE checkpoint with nothing to backfill does no I/O, so repeated
+    /// opens within one block cost one cheap call.
+    fn checkpoint_tracker_wal_for_snapshot(&self) {
+        let timing = crate::follow_timing::follow_timing();
+        let started = Instant::now();
+        // The pragma reports BUSY as a row (busy, log frames, checkpointed
+        // frames), not as an error.
+        let row = self
+            .conn
+            .query_row("PRAGMA main.wal_checkpoint(PASSIVE)", [], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            });
+        timing.snapshot_checkpoint.observe(started.elapsed());
+        match row {
+            Ok((busy, log, ckpt)) => {
+                if busy != 0 || ckpt < log {
+                    timing.snapshot_checkpoint_partial.inc();
+                    tracing::debug!(
+                        busy,
+                        log,
+                        ckpt,
+                        "read snapshot: tracker WAL checkpoint incomplete (another reader pins it)"
+                    );
+                    warn_wal_checkpoint_partial(busy, log, ckpt);
+                }
+            }
+            Err(e) => {
+                timing.snapshot_checkpoint_partial.inc();
+                tracing::debug!("read snapshot: pre-open WAL checkpoint failed: {e}");
+            }
+        }
     }
 
     /// Root hash of the in-memory Merkle trie, `None` when the trie is not

@@ -107,6 +107,14 @@ pub struct FollowTiming {
     pub commit_failed: FixedHistogram,
     /// WAL checkpoint time.
     pub wal_checkpoint: FixedHistogram,
+    /// Time of the tracker WAL checkpoint `open_read_snapshot` runs under the
+    /// ledger lock (#2166).
+    pub snapshot_checkpoint: FixedHistogram,
+    /// Snapshot-time checkpoints that were busy or left frames un-backfilled
+    /// (another reader pins the WAL; the #2166 bound does not hold then).
+    pub snapshot_checkpoint_partial: FixedCounter,
+    /// Snapshots opened inside a block span, where the checkpoint is skipped.
+    pub snapshot_checkpoint_skipped_in_block: FixedCounter,
     /// The successful `ensure_block` attempt (lock wait + commit).
     pub ensure_block: FixedHistogram,
     /// Total time of `ensure_block` calls that returned without committing
@@ -154,6 +162,18 @@ static FOLLOW_TIMING: FollowTiming = FollowTiming {
         "algod_rust_follow_block_wal_checkpoint_seconds",
         "Wall time of each SQLite WAL checkpoint run on the committing thread.",
     ),
+    snapshot_checkpoint: FixedHistogram::new(
+        "algod_rust_follow_block_snapshot_wal_checkpoint_seconds",
+        "Wall time of the tracker WAL checkpoint run under the ledger lock each time a read snapshot is opened (issue #2166).",
+    ),
+    snapshot_checkpoint_partial: FixedCounter::new(
+        "algod_rust_follow_block_snapshot_wal_checkpoint_partial_total",
+        "Snapshot-time tracker WAL checkpoints that were busy or left frames un-backfilled because another reader pins the WAL.",
+    ),
+    snapshot_checkpoint_skipped_in_block: FixedCounter::new(
+        "algod_rust_follow_block_snapshot_wal_checkpoint_skipped_in_block_total",
+        "Read snapshots opened inside a begin_block..commit_block span, where the WAL checkpoint is skipped (call-contract violation).",
+    ),
     ensure_block: FixedHistogram::new(
         "algod_rust_follow_block_ensure_block_seconds",
         "Successful ensure_block attempt per committed block: ledger lock wait plus commit, excluding earlier failed attempts and retry sleeps.",
@@ -193,6 +213,10 @@ pub fn follow_timing_prometheus_text() -> String {
     t.commit.write_prometheus(&mut out);
     t.commit_failed.write_prometheus(&mut out);
     t.wal_checkpoint.write_prometheus(&mut out);
+    t.snapshot_checkpoint.write_prometheus(&mut out);
+    t.snapshot_checkpoint_partial.write_prometheus(&mut out);
+    t.snapshot_checkpoint_skipped_in_block
+        .write_prometheus(&mut out);
     t.ensure_block.write_prometheus(&mut out);
     t.ensure_block_failed.write_prometheus(&mut out);
     t.ensure_block_retries.write_prometheus(&mut out);
@@ -614,6 +638,9 @@ mod tests {
         t.commit.observe(Duration::from_millis(1200));
         t.commit_failed.observe(Duration::from_millis(5));
         t.wal_checkpoint.observe(Duration::from_millis(80));
+        t.snapshot_checkpoint.observe(Duration::from_millis(2));
+        t.snapshot_checkpoint_partial.inc();
+        t.snapshot_checkpoint_skipped_in_block.inc();
         t.ensure_block.observe(Duration::from_millis(40));
         t.apply_failed.observe(Duration::from_millis(3));
         t.ensure_block_failed.observe(Duration::from_millis(3));
@@ -668,6 +695,7 @@ mod tests {
             "commit",
             "commit_failed",
             "wal_checkpoint",
+            "snapshot_wal_checkpoint",
             "ensure_block",
             "ensure_block_failed",
         ] {
@@ -687,6 +715,8 @@ mod tests {
             "algod_rust_follow_block_ensure_block_retries_total",
             "algod_rust_follow_block_ensure_block_already_committed_total",
             "algod_rust_follow_block_ensure_block_skipped_ahead_total",
+            "algod_rust_follow_block_snapshot_wal_checkpoint_partial_total",
+            "algod_rust_follow_block_snapshot_wal_checkpoint_skipped_in_block_total",
         ] {
             assert!(families[c][0].1 >= 1.0, "{c}");
         }
