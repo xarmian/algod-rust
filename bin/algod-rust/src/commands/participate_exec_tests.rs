@@ -2917,7 +2917,11 @@ struct WellFormedRow {
     /// `Err` when the Rust decoder refuses go's encoding of the group.
     group: Result<Vec<SignedTransaction>, String>,
     test_error: String,
+    /// go's `verify.TxnGroup` error, its `transaction <dump> invalid : `
+    /// frame (if any) reduced to the reason.
     verify_error: String,
+    /// go's error carried that frame.
+    verify_framed: bool,
 }
 
 fn wellformed_rows() -> Vec<WellFormedRow> {
@@ -2945,19 +2949,34 @@ fn wellformed_rows() -> Vec<WellFormedRow> {
                 .collect(),
             test_error: text(&r["test_error"]),
             verify_error: text(&r["verify_error"]),
+            verify_framed: r["verify_framed"].as_bool().unwrap_or(false),
         })
         .collect()
 }
 
-/// go wraps a not-well-formed transaction of the REST path as `transaction
-/// <%+v of its SignedTxn> invalid : <reason>`. The struct dump is go's own
-/// formatting of its in-memory type (the oracle stores the reason only), so
-/// the reason after ` invalid : ` is what is compared; every other error is
-/// compared in full.
-fn verify_tail(text: &str) -> &str {
-    match (text.starts_with("transaction "), text.find(" invalid : ")) {
-        (true, Some(at)) => &text[at + " invalid : ".len()..],
-        _ => text,
+/// A REST-path error as a client sees it: the evaluator's typed, bare
+/// verify-class rejection (with the pool tag its failure gets), the batch
+/// signature failure, or an error that is neither (never what go sends).
+fn rest_error_text(e: &algo_error::AlgoError) -> (String, Option<algo_error::VerifyKind>) {
+    match e {
+        algo_error::AlgoError::Rejected {
+            message,
+            class: algo_error::RejectClass::Verify(kind),
+            ..
+        } => (message.clone(), Some(*kind)),
+        e if e.is_batch_sig_failure() => (algo_error::BATCH_HAS_FAILED_SIGS.to_string(), None),
+        e => (format!("not a verify-class rejection: {e}"), None),
+    }
+}
+
+/// Splits go's `transaction <dump> invalid : <reason>` into (framed, reason).
+/// go's dump is its own `%+v` struct formatting (the Rust frame prints an
+/// abbreviated one with the same `transaction {` prefix and ` invalid : `
+/// infix), so the SHAPE of the frame is compared and then the reason.
+fn split_frame(text: &str) -> (bool, &str) {
+    match (text.starts_with("transaction {"), text.find("} invalid : ")) {
+        (true, Some(at)) => (true, &text[at + "} invalid : ".len()..]),
+        _ => (false, text),
     }
 }
 
@@ -2990,37 +3009,99 @@ fn wellformed_and_group_error_texts_match_go() {
                 row.name, row.test_error, test
             ));
         }
-        // The REST path is only compared where go's verify.TxnGroup rejects:
-        // go does not look at the window, duplicates or fees there. The rules
-        // that need the special addresses (rewards-pool sender, fee-sink
-        // payment and keyreg) are not applied on the REST path today
-        // (`validate_group_stateless_inner` passes none; issue #2198), so
-        // those rows are compared on the test stage only.
+        // The REST path's stateless half (`validate_group_stateless_inner`:
+        // go's `verify.TxnGroup`) is compared for EVERY row: where go
+        // rejects, Rust must reject with go's reason, the same frame shape and
+        // the pool tag the same failure gets on the gossip test stage; where go
+        // accepts, Rust must accept (the window, duplicates and fees are not
+        // `verify.TxnGroup`'s). The rules that need the special addresses
+        // (rewards-pool sender, fee-sink payment and keyreg) are not applied
+        // on the REST path today (the path passes none; issue #2198), so those
+        // rows are compared on the test stage only.
         let needs_specials = row.name.contains("fee_sink") || row.name == "wf_rewards_pool_sender";
-        if row.verify_error.is_empty() || needs_specials {
+        if needs_specials {
             continue;
         }
-        let mut eval = order_evaluator(&ledger);
-        // What a client sees: the pool returns a verify-class rejection and the
-        // batch signature failure bare, as go's `verify.TxnGroup` does; any other
-        // error would carry the pool's frames.
-        let add = match eval.transaction_group(group).err() {
-            Some(algo_error::AlgoError::Rejected {
-                message,
-                class: algo_error::RejectClass::Verify,
-                ..
-            }) => message,
-            Some(e) if e.is_batch_sig_failure() => algo_error::BATCH_HAS_FAILED_SIGS.to_string(),
-            Some(e) => format!("not a verify-class rejection: {e}"),
-            None => String::new(),
-        };
-        if verify_tail(&add) != verify_tail(&row.verify_error) {
-            mismatches.push(format!(
-                "{} (REST path)\n  go:   {:?}\n  rust: {:?}",
+        let eval = order_evaluator(&ledger);
+        match (
+            eval.validate_group_stateless_inner(group),
+            row.verify_error.as_str(),
+        ) {
+            (Ok(_), "") => {}
+            (Ok(_), want) => mismatches.push(format!(
+                "{} (REST path)\n  go rejects: {:?}\n  rust accepts",
+                row.name, want
+            )),
+            (Err(e), "") => mismatches.push(format!(
+                "{} (REST path)\n  go accepts\n  rust rejects: {:?}",
                 row.name,
-                verify_tail(&row.verify_error),
-                verify_tail(&add)
-            ));
+                e.to_string()
+            )),
+            (Err(e), want) => {
+                let (text, kind) = rest_error_text(&e);
+                let (rust_framed, rust_reason) = split_frame(&text);
+                // A LogicSig that ERRORS: go prints the AVM's own error and the
+                // program counter of its `EvalError` (`err=/ 0. Details:
+                // pc=5`, a byte offset); the AVM's wording (`/ division by
+                // zero` here) and its `pc` (an instruction index here) are the
+                // AVM's, so for this one row only the part before `err=` is
+                // compared (tracked in a separate AVM-parity issue).
+                let avm_err = |t: &str| -> String {
+                    match t.find("err=") {
+                        Some(a) => format!("{}<avm error and pc>", &t[..a + 4]),
+                        None => t.to_string(),
+                    }
+                };
+                let (rust_reason, want) = if row.name == "verify_logicsig_errors" {
+                    (avm_err(rust_reason), avm_err(want))
+                } else {
+                    (rust_reason.to_string(), want.to_string())
+                };
+                if rust_reason != want || rust_framed != row.verify_framed {
+                    mismatches.push(format!(
+                        "{} (REST path)\n  go:   {:?} (framed: {})\n  rust: {:?} (framed: {})",
+                        row.name, want, row.verify_framed, rust_reason, rust_framed
+                    ));
+                }
+                // The pool tag follows the failure's kind, as on gossip.
+                let want_kind = if row.name.starts_with("wf_") {
+                    Some(algo_error::VerifyKind::NotWell)
+                } else if row.name.starts_with("group_") {
+                    Some(algo_error::VerifyKind::GroupId)
+                } else if row.name.starts_with("verify_") {
+                    Some(algo_error::VerifyKind::Other)
+                } else {
+                    None
+                };
+                if want_kind.is_some() && kind != want_kind && kind.is_some() {
+                    mismatches.push(format!(
+                        "{} (REST path) tag kind {:?}, want {:?}",
+                        row.name, kind, want_kind
+                    ));
+                }
+                if let (Some(kind), algo_error::AlgoError::Rejected { class, message, .. }) =
+                    (kind, &e)
+                {
+                    let tag =
+                        algo_pool::error::classify_pool_error(&algo_pool::PoolError::TxnRejected {
+                            message: message.clone(),
+                            class: *class,
+                            detail: None,
+                        });
+                    let want_tag = match kind {
+                        algo_error::VerifyKind::NotWell => algo_pool::error::PoolErrorTag::NotWell,
+                        algo_error::VerifyKind::GroupId => algo_pool::error::PoolErrorTag::GroupId,
+                        algo_error::VerifyKind::TooLarge => {
+                            algo_pool::error::PoolErrorTag::TooLarge
+                        }
+                        algo_error::VerifyKind::Other => {
+                            algo_pool::error::PoolErrorTag::EvalGeneric
+                        }
+                    };
+                    assert_eq!(tag, want_tag, "{}", row.name);
+                    assert!(!text.contains("TransactionPool"), "{}: {text}", row.name);
+                }
+            }
         }
     }
     assert!(
@@ -3090,6 +3171,57 @@ fn pool_reports_the_first_failing_member_with_its_own_tag() {
         )),
         "{err}"
     );
+}
+
+/// Issue #2193: the REST path's `verify.TxnGroup` verdicts reach the client
+/// bare (no `TransactionPool.Remember` / `ingest` frame) and carry the pool
+/// tag the same failure gets on the gossip test stage: too large, group ID,
+/// not well formed. A not-well-formed member is framed as go frames it
+/// (`transaction {..} invalid : <reason>`).
+#[test]
+fn rest_verify_failures_are_bare_and_tagged_like_gossip() {
+    use algo_pool::error::{classify_pool_error, PoolErrorTag};
+    let a = key(1);
+    let b = key(2);
+    let (_ledger, pool) = fixture(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))], &[]);
+
+    // One more member than MaxTxGroupSize.
+    let members: Vec<Transaction> = (0..17).map(|i| pay_txn(&a, b.0, 1, i)).collect();
+    let err = pool
+        .remember(signed_group(members, &a))
+        .expect_err("too large");
+    assert_eq!(err.to_string(), "group size 17 exceeds maximum 16");
+    assert_eq!(classify_pool_error(&err), PoolErrorTag::TooLarge);
+
+    // A group ID the members do not hash to.
+    let mut members = vec![pay_txn(&a, b.0, 1, 1), pay_txn(&a, b.0, 1, 2)];
+    for m in &mut members {
+        m.group = [7u8; 32];
+    }
+    let group: Vec<SignedTransaction> = members.into_iter().map(|t| sign(t, &a.1)).collect();
+    let err = pool.remember(group).expect_err("bogus group id");
+    assert!(
+        err.to_string()
+            .starts_with("transactionGroup: incomplete group: "),
+        "{err}"
+    );
+    assert_eq!(classify_pool_error(&err), PoolErrorTag::GroupId);
+
+    // A member that is not well formed: framed, bare, tagged not_well.
+    let mut long = pay_txn(&a, b.0, 1, 3);
+    long.last_valid = Round(100_000);
+    let err = pool
+        .remember(vec![sign(long, &a.1)])
+        .expect_err("not well formed");
+    let text = err.to_string();
+    assert!(text.starts_with("transaction {"), "{text}");
+    assert!(
+        text.ends_with("} invalid : transaction window size excessive (1--100000)")
+            || text.contains(" invalid : transaction window size excessive ("),
+        "{text}"
+    );
+    assert!(!text.contains("TransactionPool"), "{text}");
+    assert_eq!(classify_pool_error(&err), PoolErrorTag::NotWell);
 }
 
 /// An application call that go's apply rejects on member 0 beats a precheck

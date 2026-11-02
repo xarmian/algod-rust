@@ -301,12 +301,27 @@ pub enum RejectClass {
     /// go `ledgercore.TxnNotWellFormedError` from `TestTransactionGroup`
     /// (`transaction <txid>: malformed: ...`), whose pool tag is `not_well`.
     NotWell,
-    /// go `verify.TxnGroup`'s verdict on a submitted group (a transaction that
-    /// is not well formed, an inconsistent group ID): go runs it in
+    /// go `verify.TxnGroup`'s verdict on a submitted group: go runs it in
     /// `node.broadcastSignedTxGroup` before the pool sees the group and returns
-    /// its error as is, so it carries no pool frame (issue #2193). Tagged as a
-    /// generic evaluator rejection, as such errors always were.
-    Verify,
+    /// its error as is, so the pool prints it bare, without its
+    /// `TransactionPool.Remember` / `ingest` frames (issue #2193). The
+    /// [`VerifyKind`] is the pool tag the same failure gets on the gossip
+    /// test stage.
+    Verify(VerifyKind),
+}
+
+/// What a [`RejectClass::Verify`] verdict is, for the pool's error tag
+/// (issue #2193).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyKind {
+    /// A transaction that is not well formed (`not_well`).
+    NotWell,
+    /// An inconsistent, empty or incomplete group ID (`groupid`).
+    GroupId,
+    /// More members than `MaxTxGroupSize` (`too_large`).
+    TooLarge,
+    /// A signature-format or LogicSig verdict (a generic evaluator rejection).
+    Other,
 }
 
 pub type Result<T> = std::result::Result<T, AlgoError>;

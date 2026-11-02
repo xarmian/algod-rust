@@ -1566,7 +1566,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 let is_format_failure = matches!(e, AlgoError::AvmLogicSig { .. })
                     || message.contains("signedtxn has no sig")
                     || message.contains("signedtxn should have only one type of signature")
-                    || message.contains("LogicSig program rejected the transaction")
+                    || message.contains(": rejected by logic")
                     || message.contains("LogicSig program error:");
                 if is_format_failure {
                     return Ok(CheckOutcome::RecoverableFailure {

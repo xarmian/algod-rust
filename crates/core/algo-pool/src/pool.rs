@@ -875,7 +875,7 @@ impl TransactionPool {
                 e,
                 PoolError::SignatureBatchFailed
                     | PoolError::TxnRejected {
-                        class: algo_error::RejectClass::Verify,
+                        class: algo_error::RejectClass::Verify(_),
                         ..
                     }
             ) {
@@ -937,7 +937,7 @@ impl TransactionPool {
                         | algo_error::RejectClass::GroupId
                         | algo_error::RejectClass::TooLarge
                         | algo_error::RejectClass::NotWell
-                        | algo_error::RejectClass::Verify
+                        | algo_error::RejectClass::Verify(_)
                         | algo_error::RejectClass::TealReject
                         | algo_error::RejectClass::TealErr
                         | algo_error::RejectClass::MinBalance

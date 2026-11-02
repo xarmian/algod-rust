@@ -42,6 +42,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/algorand/go-algorand/agreement"
@@ -52,6 +53,7 @@ import (
 	"github.com/algorand/go-algorand/data/bookkeeping"
 	"github.com/algorand/go-algorand/data/committee"
 	"github.com/algorand/go-algorand/data/transactions"
+	"github.com/algorand/go-algorand/data/transactions/logic"
 	"github.com/algorand/go-algorand/data/transactions/verify"
 	"github.com/algorand/go-algorand/ledger"
 	"github.com/algorand/go-algorand/ledger/eval"
@@ -91,6 +93,9 @@ type blockDupFixture struct {
 	// they run in), plus the group-error and signature texts of the REST
 	// path; see wellformed.go.
 	WellFormed []blockDupWFRow `json:"wellformed"`
+	// Issue #2193: `Transaction.WellFormed` itself, per consensus version
+	// (the protocol gates the ledger's own protocol cannot reach).
+	WellFormedProto []blockDupWFProtoRow `json:"wellformed_proto"`
 	// Issue #2130: the pool evaluator's per-transaction order
 	// (`Alive` -> `checkDup` -> authorizer -> apply) on groups whose members
 	// fail at different stages.
@@ -108,6 +113,19 @@ type blockDupWFRow struct {
 	// VerifyError is go's `verify.TxnGroup` error; a `transaction <dump>
 	// invalid : ` frame is reduced to the reason after it.
 	VerifyError string `json:"verify_error"`
+	// VerifyFramed: go's error carried the `transaction <dump> invalid : `
+	// frame (a not-well-formed or unsigned member, a failed signature or
+	// LogicSig of one member); group-level errors are returned bare.
+	VerifyFramed bool `json:"verify_framed,omitempty"`
+}
+
+// blockDupWFProtoRow is `Transaction.WellFormed(spec, proto)` of one
+// consensus version on one transaction (one base64 msgpack `SignedTxn`).
+type blockDupWFProtoRow struct {
+	Name     string `json:"name"`
+	Protocol string `json:"protocol"`
+	Txn      string `json:"txn"`
+	Error    string `json:"error"`
 }
 
 // blockDupOrderScenario is one pool-admission verdict: `Pre` groups are
@@ -679,7 +697,21 @@ func blockDupOracle() {
 	noSig.Sig = crypto.Signature{}
 	twoSigs := pay("wf-two-sigs", [32]byte{})
 	twoSigs.Msig = crypto.MultisigSig{Version: 1, Threshold: 1, Subsigs: []crypto.MultisigSubsig{{Key: crypto.PublicKey(sender)}}}
+	// A LogicSig-only (escrow) payment whose program rejects, and one whose
+	// program errors: go's `verify.TxnGroup` evaluates the program.
+	lsigRow := func(name, src string) orderSpec {
+		ops, err := logic.AssembleString(src)
+		must(err)
+		t := payTxn("wf-"+name, [32]byte{})
+		t.Sender = basics.Address(logic.HashProgram(ops.Program))
+		return orderSpec{name: name, group: one(transactions.SignedTxn{
+			Txn:  t,
+			Lsig: transactions.LogicSig{Logic: ops.Program},
+		})}
+	}
 	wfSpecs = append(wfSpecs,
+		lsigRow("verify_logicsig_rejects", "#pragma version 8\nint 0"),
+		lsigRow("verify_logicsig_errors", "#pragma version 8\nint 1\nint 0\n/"),
 		orderSpec{name: "verify_bad_signature", group: one(badSig(pay("wf-bad-sig", [32]byte{})))},
 		orderSpec{name: "verify_no_signature", group: one(noSig)},
 		orderSpec{name: "verify_two_signature_types", group: one(twoSigs)},
@@ -701,9 +733,37 @@ func blockDupOracle() {
 		if strings.HasPrefix(row.VerifyError, "transaction ") {
 			if at := strings.Index(row.VerifyError, " invalid : "); at >= 0 {
 				row.VerifyError = row.VerifyError[at+len(" invalid : "):]
+				row.VerifyFramed = true
 			}
 		}
 		f.WellFormed = append(f.WellFormed, row)
+	}
+
+	// Issue #2193: WellFormed per consensus version, on a heartbeat with valid
+	// fields (the protocol gate), a heartbeat whose proof sets only a later
+	// field, and a plain payment as control.
+	{
+		var versions []string
+		for v := range config.Consensus {
+			versions = append(versions, string(v))
+		}
+		sort.Strings(versions)
+		protoRows := heartbeatProtoRows(wfEnv{
+			params: params, sender: sender, receiver: acctB, sink: sink, pool: pool,
+			genesisHash: genesisHash,
+			sign:        func(t transactions.Transaction) transactions.SignedTxn { return t.Sign(secrets) },
+		})
+		specAddrs := transactions.SpecialAddresses{FeeSink: sink, RewardsPool: pool}
+		for _, v := range versions {
+			for _, r := range protoRows {
+				f.WellFormedProto = append(f.WellFormedProto, blockDupWFProtoRow{
+					Name:     r.name,
+					Protocol: v,
+					Txn:      b64(protocol.Encode(&r.tx)),
+					Error:    errText(r.tx.Txn.WellFormed(specAddrs, config.Consensus[protocol.ConsensusVersion(v)])),
+				})
+			}
+		}
 	}
 
 	path := filepath.Join("..", "..", "crates", "core", "algo-ledger", "tests", "fixtures", "block_checkdup", "oracle.json")

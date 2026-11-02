@@ -32,6 +32,8 @@ tokio-util = { workspace = true }
 [dev-dependencies]
 algo-codec.workspace = true
 rmpv.workspace = true
+serde_json.workspace = true
+data-encoding.workspace = true
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]

@@ -64,6 +64,44 @@ type wfEnv struct {
 	sign        func(transactions.Transaction) transactions.SignedTxn
 }
 
+// heartbeatProtoRows are the transactions `WellFormed` is run on for every
+// consensus version: a heartbeat with valid fields, a heartbeat whose proof
+// sets only a later field (not "empty" for go), and a payment as control.
+func heartbeatProtoRows(e wfEnv) []wfRow {
+	header := func(note string) transactions.Header {
+		return transactions.Header{
+			Sender:      e.sender,
+			Fee:         basics.MicroAlgos{Raw: e.params.MinTxnFee},
+			FirstValid:  1,
+			LastValid:   1000,
+			GenesisID:   blockDupGenesisID,
+			GenesisHash: e.genesisHash,
+		}
+	}
+	hb := func(name string, f func(*transactions.HeartbeatTxnFields)) wfRow {
+		t := transactions.Transaction{Type: protocol.HeartbeatTx, Header: header(name)}
+		h := &transactions.HeartbeatTxnFields{HbAddress: e.receiver}
+		h.HbProof.Sig[0] = 1
+		h.HbSeed[0] = 1
+		h.HbVoteID[0] = 1
+		h.HbKeyDilution = 1
+		f(h)
+		t.HeartbeatTxnFields = h
+		return wfRow{name: name, tx: e.sign(t)}
+	}
+	pay := transactions.Transaction{Type: protocol.PaymentTx, Header: header("pay")}
+	pay.Receiver = e.receiver
+	pay.Amount = basics.MicroAlgos{Raw: 1}
+	return []wfRow{
+		hb("proto_hb_valid_fields", func(*transactions.HeartbeatTxnFields) {}),
+		hb("proto_hb_proof_only_pk2", func(h *transactions.HeartbeatTxnFields) {
+			h.HbProof = crypto.HeartbeatProof{}
+			h.HbProof.PK2[0] = 1
+		}),
+		{name: "proto_pay_control", tx: e.sign(pay)},
+	}
+}
+
 func wellFormedRows(e wfEnv) []wfRow {
 	p := e.params
 	var rows []wfRow

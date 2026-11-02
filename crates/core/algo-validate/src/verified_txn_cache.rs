@@ -858,7 +858,7 @@ mod tests {
     /// (1) a broken multisig subsig byte fails signature verification and
     /// the group is never cached, and (2) a correct signature but a
     /// tampered logic argument fails program evaluation (`"rejected by
-    /// logic"` in go, `"LogicSig program rejected the transaction"` here)
+    /// logic"` in go, `"transaction <txid>: rejected by logic"` here)
     /// -- also never cached. A subsequent verification with everything
     /// restored succeeds and the group becomes cache-covered.
     #[test]
@@ -995,7 +995,7 @@ mod tests {
         let err = verify_transaction_group_cached(&logic_fail_group, &context, &params, &cache)
             .expect_err("a tampered logic argument must be rejected by the LogicSig program");
         assert!(
-            err.to_string().contains("rejected the transaction"),
+            err.to_string().contains(": rejected by logic"),
             "expected a LogicSig-program-rejection error, got: {err}"
         );
         let unverified = cache

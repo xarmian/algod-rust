@@ -895,8 +895,12 @@ pub fn verify_logicsig_with_tracer(
     };
 
     if !pass {
+        // go's `logicSigVerify`: `transaction <txid>: rejected by logic`.
         return Err(AlgoError::Validation {
-            message: "LogicSig program rejected the transaction".into(),
+            message: format!(
+                "transaction {}: rejected by logic",
+                algo_codec::compute_txn_id(&group[group_index].txn)
+            ),
         });
     }
 

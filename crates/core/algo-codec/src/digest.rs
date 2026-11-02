@@ -25,8 +25,8 @@ use algo_types::{Block, BlockHeader, Digest, Transaction};
 
 use crate::canonical::{
     canonical_encode_block_header, canonical_encode_block_header_from_block,
-    canonical_encode_transaction, canonical_encode_transaction_with_genesis,
-    canonical_encode_tx_group,
+    canonical_encode_transaction, canonical_encode_transaction_ungrouped,
+    canonical_encode_transaction_with_genesis, canonical_encode_tx_group,
 };
 
 /// Domain separation prefix for transaction hashing.
@@ -58,6 +58,13 @@ pub fn compute_txn_id_with_genesis(
     genesis_hash: &[u8; 32],
 ) -> Digest {
     let canonical = canonical_encode_transaction_with_genesis(tx, genesis_id, genesis_hash);
+    hash_with_prefix(TX_HASH_PREFIX, &canonical)
+}
+
+/// [`compute_txn_id`] of `tx` with its group ID zeroed, without cloning it:
+/// the member hash of go's `checkTxnGroupID` (issue #2193).
+pub fn compute_txn_id_without_group(tx: &Transaction) -> Digest {
+    let canonical = canonical_encode_transaction_ungrouped(tx);
     hash_with_prefix(TX_HASH_PREFIX, &canonical)
 }
 

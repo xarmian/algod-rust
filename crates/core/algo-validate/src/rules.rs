@@ -114,37 +114,50 @@ pub fn validate_transaction_rules(
 ///
 /// Then, NOT part of go's `WellFormed` (go judges fees for the whole group,
 /// later): the per-transaction minimum fee, unless `allow_fee_pooling`.
+///
+/// This is [`WellFormedMode::Block`]: the entry point of block validation
+/// (`block.rs`), simulation and [`validate_transaction_rules`]. The two
+/// submission paths (REST and gossip admission, `participate.rs`) call
+/// [`validate_transaction_wellformed_in_mode`] with
+/// [`WellFormedMode::Admission`]; `wellformed_callers_pass_the_intended_mode`
+/// pins the production call sites.
 pub fn validate_transaction_wellformed(
     txn: &Transaction,
     allow_fee_pooling: bool,
     params: &ConsensusParams,
     spec: Option<&SpecialAddresses>,
 ) -> Result<(), AlgoError> {
-    wellformed_inner(txn, allow_fee_pooling, params, spec, false)
+    validate_transaction_wellformed_in_mode(
+        txn,
+        allow_fee_pooling,
+        params,
+        spec,
+        WellFormedMode::Block,
+    )
 }
 
-/// [`validate_transaction_wellformed`] for the submission paths (REST and
-/// gossip admission), which also reject an unknown transaction type with go's
-/// `unknown tx type <type>` (the `default` case of `WellFormed`'s type
-/// switch). The block-validation and simulation paths reject an unknown type
-/// earlier and differently, in [`crate::checks::check_txn_group`], and keep
-/// calling [`validate_transaction_wellformed`] unchanged (issue #2193).
-pub fn validate_transaction_wellformed_for_admission(
+/// Which caller class a well-formedness check serves (issue #2193).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WellFormedMode {
+    /// Block validation and simulation: an unknown transaction type is
+    /// rejected earlier and differently, in [`crate::checks::check_txn_group`].
+    Block,
+    /// The submission paths (REST and gossip admission), which also reject an
+    /// unknown transaction type with go's `unknown tx type <type>` (the
+    /// `default` case of `WellFormed`'s type switch). Admission only ever
+    /// rejects MORE than [`WellFormedMode::Block`], and only for that case.
+    Admission,
+}
+
+/// [`validate_transaction_wellformed`] with an explicit [`WellFormedMode`].
+pub fn validate_transaction_wellformed_in_mode(
     txn: &Transaction,
     allow_fee_pooling: bool,
     params: &ConsensusParams,
     spec: Option<&SpecialAddresses>,
+    mode: WellFormedMode,
 ) -> Result<(), AlgoError> {
-    wellformed_inner(txn, allow_fee_pooling, params, spec, true)
-}
-
-fn wellformed_inner(
-    txn: &Transaction,
-    allow_fee_pooling: bool,
-    params: &ConsensusParams,
-    spec: Option<&SpecialAddresses>,
-    reject_unknown_type: bool,
-) -> Result<(), AlgoError> {
+    let reject_unknown_type = mode == WellFormedMode::Admission;
     // ── Heartbeat-specific checks (Go: HeartbeatTxnFields.wellFormed) ──
     if txn.txn_type == "hb" {
         // Go: `if !proto.Heartbeat { return fmt.Errorf("heartbeat transaction
@@ -179,7 +192,9 @@ fn wellformed_inner(
                         message: "tx.HbChallengeDiscount set before it is allowed".to_string(),
                     });
                 }
-                if params.enable_heartbeat && txn.group == [0u8; 32] {
+                // (`params.enable_heartbeat` holds here: a disabled protocol
+                // returned at the top of this branch.)
+                if txn.group == [0u8; 32] {
                     // Fee a normal (non-discounted) heartbeat owes, computed
                     // the same way as a top-level group of one: no cost
                     // multiplier, no prior residue (go: `header.FeeContribution
@@ -1579,14 +1594,19 @@ pub fn has_heartbeat(version: &str) -> bool {
 }
 
 /// Returns `true` if the given transaction is a free/cheap/discounted
-/// heartbeat that is exempt from fee checks (v40+).
+/// heartbeat that is exempt from fee checks (v40+). Always `false` for a
+/// protocol without heartbeats: go rejects an `hb` there outright
+/// (`validate_transaction_wellformed`: `heartbeat transaction not supported`).
 ///
 /// Mirrors the same version-gated discount rule as `txn_fee_factor`'s
 /// heartbeat branch and `validate_transaction_wellformed`'s `kind`
 /// derivation: post-v42 (`txn_size_pricing_enabled`) the discount is claimed
 /// explicitly via `hb_challenge_discount` (grouping no longer matters);
 /// pre-v42 it is inferred from an underpaying ungrouped (singleton)
-/// heartbeat.
+/// heartbeat, whose fee is below the minimum fee (before size pricing the
+/// fee factor of a heartbeat is exactly the base fee, so this is the same
+/// comparison `validate_transaction_wellformed` makes with the usage-based
+/// required fee).
 pub fn is_free_heartbeat(txn: &Transaction, params: &ConsensusParams) -> bool {
     if txn.txn_type != "hb" || !params.enable_heartbeat {
         return false;
@@ -1739,9 +1759,10 @@ impl GroupIdChecker {
             ));
         }
         if txn.group != [0u8; 32] {
-            let mut ungrouped = txn.clone();
-            ungrouped.group = [0u8; 32];
-            self.hashes.push(algo_codec::compute_txn_id(&ungrouped));
+            // go: `current := *tx; current.Group = Digest{}; current.ID()`,
+            // here without copying the transaction (issue #2193).
+            self.hashes
+                .push(algo_codec::compute_txn_id_without_group(txn));
         } else if self.size > 1 {
             return Err(format!(
                 "transactionGroup: [{index}] had zero Group but was submitted in a group of {}",
@@ -1939,6 +1960,9 @@ pub fn validate_genesis_consistency(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod old_reference;
 
 #[cfg(test)]
 mod tests {
@@ -2319,7 +2343,13 @@ mod tests {
         // The submission paths reject it with go's text; block validation and
         // simulation reject it earlier, in `check_txn_group`, and are
         // unchanged.
-        match validate_transaction_wellformed_for_admission(&txn, true, &params, None) {
+        match validate_transaction_wellformed_in_mode(
+            &txn,
+            true,
+            &params,
+            None,
+            WellFormedMode::Admission,
+        ) {
             Err(AlgoError::Validation { message }) => {
                 assert_eq!(message, "unknown tx type xyz")
             }

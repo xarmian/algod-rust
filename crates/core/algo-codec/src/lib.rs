@@ -44,6 +44,7 @@ pub use canonical::{
 pub use digest::{
     compute_block_digest, compute_block_header_digest, compute_block_header_digest_512,
     compute_group_id, compute_group_id_from_hashes, compute_txn_id, compute_txn_id_with_genesis,
+    compute_txn_id_without_group,
 };
 
 use algo_error::{AlgoError, Result};
