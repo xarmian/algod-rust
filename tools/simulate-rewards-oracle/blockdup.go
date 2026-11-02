@@ -101,6 +101,14 @@ type blockDupOrderScenario struct {
 	Group     []string   `json:"group"`
 	TestError string     `json:"test_error"`
 	AddError  string     `json:"add_error"`
+	// Issue #2184: only the verdict of go's TEST stage is meaningful (go's
+	// gossip handler runs it before any signature check; its apply stage orders
+	// the group checks differently from the verifying admission path).
+	SkipApply bool `json:"skip_apply,omitempty"`
+	// "frame": the test error is compared up to and including
+	// "transaction <txid>: malformed: " (the reason after it is
+	// `WellFormed`'s own wording, tracked in #2193). Empty: compared in full.
+	TestCompare string `json:"test_compare,omitempty"`
 }
 
 type blockDupPoolScenario struct {
@@ -464,7 +472,7 @@ func blockDupOracle() {
 	}
 	one := func(s transactions.SignedTxn) []transactions.SignedTxn { return []transactions.SignedTxn{s} }
 	pending := pay("order-pending", leaseP)
-	for _, os := range []orderSpec{
+	orderSpecs := []orderSpec{
 		// member 0 fails the authorizer; member 1 repeats member 0 (a dup).
 		{"auth_then_dup", nil, signAll(wrongAuth, badAuthT, badAuthT)},
 		// member 0 overspends; member 1 repeats member 0.
@@ -518,7 +526,98 @@ func blockDupOracle() {
 		{"positive_amount_to_low_account", nil, one(good(toLow(payTxn("order-pos-low", [32]byte{}), 1)))},
 		// control: a clean group.
 		{"clean_group", nil, signAll(good, payTxn("order-clean-a", leaseQ), payTxn("order-clean-b", [32]byte{}))},
-	} {
+	}
+
+	// Issue #2184: the gossip test stage. go's `txHandler.checkAlreadyCommitted`
+	// calls `txPool.Test` (`TestTransactionGroup`) BEFORE any signature check,
+	// so a group with several problems is reported for the first one in
+	// Test's order: the group size, every member's well-formedness, then per
+	// member `Alive` + `checkDup` + that member's group-ID consistency, then
+	// the group's completeness. Only `test_error` is meaningful for these
+	// rows: go's REST path (`verify.TxnGroup` first) and its apply stage order
+	// the same checks differently.
+	badSig := func(s transactions.SignedTxn) transactions.SignedTxn {
+		s.Sig[0] ^= 0x01
+		return s
+	}
+	// A validity window longer than MaxTxnLife is not well formed.
+	tooLong := func(t transactions.Transaction) transactions.Transaction {
+		return withValidity(t, 1, 100_000)
+	}
+	fromSender := func(t transactions.Transaction, from basics.Address) transactions.Transaction {
+		t.Sender = from
+		return t
+	}
+	withGroup := func(s transactions.SignedTxn, g crypto.Digest) transactions.SignedTxn {
+		t := s.Txn
+		t.Group = g
+		return t.Sign(secrets)
+	}
+	var bogusGroup crypto.Digest
+	for i := range bogusGroup {
+		bogusGroup[i] = 0xAB
+	}
+	var seventeen []transactions.Transaction
+	for i := 0; i < 17; i++ {
+		seventeen = append(seventeen, payTxn(fmt.Sprintf("order-big-%d", i), [32]byte{}))
+	}
+	pairLease := signAll(good, payTxn("g-ledger-lease", lease), payTxn("g-pair-b", [32]byte{}))
+	pairExpired := signAll(good,
+		withValidity(payTxn("g-expired", [32]byte{}), 1, 1), payTxn("g-pair-c", [32]byte{}))
+	pairClean := signAll(good, payTxn("g-clean-a", [32]byte{}), payTxn("g-clean-b", [32]byte{}))
+	gossip := []orderSpec{
+		// a replayed transaction with a corrupted signature: Test never
+		// looks at the signature, so it is the duplicate that is reported.
+		{"gossip_badsig_dup", nil, one(badSig(committed))},
+		// a corrupted signature alone: Test passes (verification comes later).
+		{"gossip_badsig_alone", nil, one(badSig(pay("g-bad-sig", [32]byte{})))},
+		// member 0 reuses a live ledger lease; member 1 lost its group.
+		{"gossip_dup_then_inconsistent_group", nil,
+			[]transactions.SignedTxn{pairLease[0], good(payTxn("g-pair-b", [32]byte{}))}},
+		// member 0 is expired; member 1 lost its group.
+		{"gossip_expired_then_inconsistent_group", nil,
+			[]transactions.SignedTxn{pairExpired[0], good(payTxn("g-pair-c", [32]byte{}))}},
+		// no transaction fails Alive/checkDup; member 1 lost its group.
+		{"gossip_inconsistent_group_only", nil,
+			[]transactions.SignedTxn{pairClean[0], good(payTxn("g-clean-b", [32]byte{}))}},
+		// member 1 both reuses a live ledger lease and lost its group: its
+		// testTransaction runs before its group check.
+		{"gossip_member1_dup_and_inconsistent", nil,
+			[]transactions.SignedTxn{pairClean[0], good(payTxn("g-ledger-lease-2", lease))}},
+		// two ungrouped transactions submitted together.
+		{"gossip_zero_group_in_group", nil,
+			[]transactions.SignedTxn{good(payTxn("g-zero-a", [32]byte{})), good(payTxn("g-zero-b", [32]byte{}))}},
+		// only the first member of a two-member group.
+		{"gossip_incomplete_group", nil, one(pairClean[0])},
+		// only the first member of a group, and it reuses a live ledger lease.
+		{"gossip_dup_then_incomplete_group", nil, one(pairLease[0])},
+		// a group ID no member set hashes to.
+		{"gossip_bogus_group_id", nil, []transactions.SignedTxn{
+			withGroup(good(payTxn("g-bogus-a", [32]byte{})), bogusGroup),
+			withGroup(good(payTxn("g-bogus-b", [32]byte{})), bogusGroup)}},
+		// member 0 is not well formed.
+		{"gossip_malformed_member", nil, one(good(tooLong(payTxn("g-long", [32]byte{}))))},
+		// member 0 reuses a live ledger lease; member 1 is not well formed:
+		// WellFormed runs for every member before any testTransaction.
+		{"gossip_dup_then_malformed", nil, []transactions.SignedTxn{
+			pairLease[0], good(tooLong(payTxn("g-long-2", [32]byte{})))}},
+		// one more than MaxTxGroupSize.
+		{"gossip_group_too_large", nil, signAll(good, seventeen...)},
+		// WellFormed gets the evaluator's special addresses: a sender that is
+		// the rewards pool is not well formed ...
+		{"gossip_rewards_pool_sender", nil, one(good(fromSender(payTxn("g-pool-sender", [32]byte{}), pool)))},
+		// ... while the fee sink may send.
+		{"gossip_fee_sink_sender", nil, one(good(fromSender(payTxn("g-sink-sender", [32]byte{}), sink)))},
+	}
+	orderSpecs = append(orderSpecs, gossip...)
+	gossipRows := map[string]bool{}
+	for _, g := range gossip {
+		gossipRows[g.name] = true
+	}
+	// Only the frame of a not-well-formed verdict is compared (see
+	// blockDupOrderScenario.TestCompare).
+	frameRows := map[string]bool{"gossip_malformed_member": true, "gossip_dup_then_malformed": true}
+	for _, os := range orderSpecs {
 		pev, err := l.StartEvaluator(poolHdr, 0, 0, nil)
 		must(err)
 		enc := func(g []transactions.SignedTxn) []string {
@@ -528,7 +627,10 @@ func blockDupOracle() {
 			}
 			return out
 		}
-		sc := blockDupOrderScenario{Name: os.name, Group: enc(os.group)}
+		sc := blockDupOrderScenario{Name: os.name, Group: enc(os.group), SkipApply: gossipRows[os.name]}
+		if frameRows[os.name] {
+			sc.TestCompare = "frame"
+		}
 		for _, pre := range os.pre {
 			var ad []transactions.SignedTxnWithAD
 			for i := range pre {

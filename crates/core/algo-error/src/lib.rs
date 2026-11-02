@@ -291,6 +291,16 @@ pub enum RejectClass {
     /// go `ledgercore.MinBalanceError` from `checkMinBalance` (an account left
     /// below its minimum balance). go's pool tags it `min_balance`.
     MinBalance,
+    /// go `ledgercore.TxGroupMalformedError` from `TestTransactionGroup`
+    /// (inconsistent, empty or incomplete group ID), whose pool tag is
+    /// `groupid`.
+    GroupId,
+    /// go `TxGroupMalformedError` with `TxGroupMalformedErrorReasonExceedMaxSize`
+    /// (more members than `MaxTxGroupSize`), whose pool tag is `too_large`.
+    TooLarge,
+    /// go `ledgercore.TxnNotWellFormedError` from `TestTransactionGroup`
+    /// (`transaction <txid>: malformed: ...`), whose pool tag is `not_well`.
+    NotWell,
 }
 
 pub type Result<T> = std::result::Result<T, AlgoError>;

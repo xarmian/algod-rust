@@ -344,6 +344,11 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
             algo_error::RejectClass::LeaseInLedger { in_block: false } => PoolErrorTag::Lease,
             // go `ClassifyTxPoolError` on the typed `MinBalanceError`.
             algo_error::RejectClass::MinBalance => PoolErrorTag::MinBalance,
+            // go `ClassifyTxPoolError` on `TxGroupMalformedError` (every reason
+            // but `ExceedMaxSize` is `groupid`) and `TxnNotWellFormedError`.
+            algo_error::RejectClass::GroupId => PoolErrorTag::GroupId,
+            algo_error::RejectClass::TooLarge => PoolErrorTag::TooLarge,
+            algo_error::RejectClass::NotWell => PoolErrorTag::NotWell,
             algo_error::RejectClass::Alive | algo_error::RejectClass::Other => {
                 classify_evaluator_message(message)
             }
@@ -384,6 +389,16 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
 fn classify_evaluator_message(msg: &str) -> PoolErrorTag {
     if let Some(tag) = classify_txn_dead(msg) {
         tag
+    } else if msg.starts_with("transactionGroup: ") {
+        // FALLBACK for a text-only evaluator (the typed path is
+        // `RejectClass::GroupId`): go `TxGroupMalformedError`.
+        PoolErrorTag::GroupId
+    } else if msg.starts_with("group size ") && msg.contains(" exceeds maximum ") {
+        // FALLBACK, as above: `RejectClass::TooLarge`.
+        PoolErrorTag::TooLarge
+    } else if msg.starts_with("transaction ") && msg.contains(": malformed: ") {
+        // FALLBACK, as above: `RejectClass::NotWell`.
+        PoolErrorTag::NotWell
     } else if msg.starts_with("txgroup with ") || msg == "txgroup required fee overflow" {
         // go: `TxGroupMalformedError` with `TxGroupErrorReasonInvalidFee`. Coupled
         // to `algo_validate::fee::check_submitted_group_fees`, whose test
@@ -738,5 +753,51 @@ mod tests {
             )),
             PoolErrorTag::EvalGeneric
         );
+    }
+
+    /// Issue #2184: the `TestTransactionGroup` errors are tagged by class, so
+    /// rewording the text does not change the tag; the text shape is only the
+    /// fallback for an evaluator that reports a plain string.
+    #[test]
+    fn test_stage_group_errors_are_tagged_by_class_not_text() {
+        use algo_error::RejectClass;
+        let rej = |class, message: &str| PoolError::TxnRejected {
+            message: message.into(),
+            class,
+            detail: None,
+        };
+        for (class, tag) in [
+            (RejectClass::GroupId, PoolErrorTag::GroupId),
+            (RejectClass::TooLarge, PoolErrorTag::TooLarge),
+            (RejectClass::NotWell, PoolErrorTag::NotWell),
+        ] {
+            assert_eq!(classify_pool_error(&rej(class, "reworded entirely")), tag);
+        }
+        // the class wins over a text that looks like another tag
+        assert_eq!(
+            classify_pool_error(&rej(
+                RejectClass::GroupId,
+                "group size 17 exceeds maximum 16"
+            )),
+            PoolErrorTag::GroupId
+        );
+        // untyped: go's text is the fallback
+        for (text, tag) in [
+            (
+                "transactionGroup: [0] had zero Group but was submitted in a group of 2",
+                PoolErrorTag::GroupId,
+            ),
+            ("group size 17 exceeds maximum 16", PoolErrorTag::TooLarge),
+            (
+                "transaction X: malformed: whatever the reason",
+                PoolErrorTag::NotWell,
+            ),
+        ] {
+            assert_eq!(
+                classify_pool_error(&PoolError::Evaluator(text.into())),
+                tag,
+                "{text}"
+            );
+        }
     }
 }

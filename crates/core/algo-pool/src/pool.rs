@@ -894,7 +894,10 @@ impl TransactionPool {
     /// Validate a transaction group without storing it.
     ///
     /// Mirrors `Test()` in go-algorand: checks capacity, then uses the
-    /// evaluator's `test_transaction_group` for validation.
+    /// evaluator's `test_transaction_group` (go's `TestTransactionGroup`:
+    /// group size, well-formedness, per member `Alive` + `checkDup` + group
+    /// consistency). It verifies NO signature and checks NO fee, as go's
+    /// gossip handler calls it before verifying anything (issue #2184).
     pub fn test(&self, tx_group: &[SignedTransaction]) -> Result<(), PoolError> {
         // Same in-block-only flag rejection as `remember` (issue #1727).
         algo_types::genesis_restore::reject_in_block_flags(tx_group)?;
@@ -910,17 +913,29 @@ impl TransactionPool {
             evaluator
                 .test_transaction_group(tx_group)
                 .map_err(|e| match &e {
-                    _ if e.is_batch_sig_failure() => PoolError::SignatureBatchFailed,
-                    // go's `Test` returns the typed `checkDup` error as is
-                    // (`TransactionInLedgerError`, `LeaseInLedgerError`):
-                    // keep its class, so the tag is go's `txid` / `lease`
-                    // (or `*_eval` for the pending block), not a text guess.
-                    AlgoError::Rejected {
-                        class:
-                            algo_error::RejectClass::TxidInLedger { .. }
-                            | algo_error::RejectClass::LeaseInLedger { .. },
-                        ..
-                    } => pool_error_from_evaluator(&e),
+                    // go's `Test` returns the evaluator's typed error as is,
+                    // with no pool frame, and the pool tags it by type. The
+                    // test stage (`TestTransactionGroup`) produces exactly
+                    // these classes; it checks no signature, so there is no
+                    // batch-verification failure to map. The match has no
+                    // wildcard over the class on purpose: a class added to
+                    // `RejectClass` must be decided here. Any other class a
+                    // future evaluator reports is still a typed
+                    // `TxnRejected` (never silently admitted).
+                    AlgoError::Rejected { class, .. } => match class {
+                        algo_error::RejectClass::Alive
+                        | algo_error::RejectClass::TxidInLedger { .. }
+                        | algo_error::RejectClass::LeaseInLedger { .. }
+                        | algo_error::RejectClass::GroupId
+                        | algo_error::RejectClass::TooLarge
+                        | algo_error::RejectClass::NotWell
+                        | algo_error::RejectClass::TealReject
+                        | algo_error::RejectClass::TealErr
+                        | algo_error::RejectClass::MinBalance
+                        | algo_error::RejectClass::Other => pool_error_from_evaluator(&e),
+                    },
+                    // Not a verdict on the group (for example a poisoned
+                    // ledger lock): a plain evaluator failure.
                     _ => PoolError::Evaluator(e.to_string()),
                 })?;
             Ok(())
