@@ -1951,6 +1951,66 @@ impl SimpleBlockEvaluator {
         )
     }
 
+    /// go's `verify.TxnGroup` verdict as the pool must print it: bare (no
+    /// `TransactionPool.Remember` / `ingest` frame), typed so the pool tags it
+    /// as the same failure is tagged on the gossip test stage (issue #2193).
+    /// A failure of one member (`member`) is framed as go frames it,
+    /// `transaction <dump of the SignedTxn> invalid : <reason>`; go's dump is
+    /// its own `%+v` struct formatting (it even prints pointer addresses), so
+    /// this prints an abbreviated one -- `{Txn:{Type:.. Sender:..} TxID:..}` --
+    /// that keeps the `transaction {` prefix and the ` invalid : ` infix a
+    /// client may match on. A group-level failure (`member` is `None`) is bare.
+    fn verify_rejection(
+        kind: algo_error::VerifyKind,
+        member: Option<&algo_types::SignedTransaction>,
+        e: algo_error::AlgoError,
+    ) -> algo_error::AlgoError {
+        let reason = match &e {
+            algo_error::AlgoError::Validation { message } => message.clone(),
+            // go's `logicSigVerify`: `transaction <txid>: %w` of the program's
+            // `EvalError` (`rejected by logic err=<err>. Details: pc=<pc>`).
+            // The AVM's own error wording (`<err>`) is not this issue's.
+            algo_error::AlgoError::AvmLogicSig {
+                message,
+                pc,
+                group_index,
+                app_index: None,
+                ..
+            } => format!(
+                "transaction {}: rejected by logic err={}. Details: pc={pc}",
+                member
+                    .map(|stx| algo_codec::compute_txn_id(&stx.txn).to_string())
+                    .unwrap_or_else(|| format!("#{group_index}")),
+                message.strip_prefix("AVM: ").unwrap_or(message),
+            ),
+            other => other.to_string(),
+        };
+        let message = match member {
+            Some(stx) => format!(
+                "transaction {{Txn:{{Type:{} Sender:{}}} TxID:{}}} invalid : {reason}",
+                stx.txn.txn_type.as_str(),
+                stx.txn.sender,
+                algo_codec::compute_txn_id(&stx.txn),
+            ),
+            None => reason,
+        };
+        match e {
+            // Keep the structured AVM diagnostics (`avm_eval_detail` walks
+            // the source chain).
+            e @ algo_error::AlgoError::AvmLogicSig { .. } => algo_error::AlgoError::Rejected {
+                source: Some(Box::new(e)),
+                message,
+                class: algo_error::RejectClass::Verify(kind),
+            },
+            algo_error::AlgoError::Validation { .. } => algo_error::AlgoError::Rejected {
+                source: None,
+                message,
+                class: algo_error::RejectClass::Verify(kind),
+            },
+            other => other,
+        }
+    }
+
     /// The verifying (REST-path) stateless half of admission: no-in-block-flag
     /// guard, well-formedness, strict group ID, then signatures (go's
     /// `verify.TxnGroup` order, issue #1976). It does NOT check the validity
@@ -2030,11 +2090,24 @@ impl SimpleBlockEvaluator {
         // a singleton included, after the signatures and the validity window.
         // Passing `allow_fee_pooling = true` skips the legacy per-transaction
         // minimum, which fired first and with other wording (issue #1976).
+        //
+        // go's `verify.TxnGroup` reports the first not-well-formed member as
+        // `transaction <%+v of the SignedTxn> invalid : <reason>`, bare, before
+        // the pool is involved (issue #2193): see `verify_rejection`.
         for stx in txgroup {
-            algo_validate::validate_transaction_wellformed(
-                &stx.txn, true, params,
+            // go passes its special addresses here; this path does not (the
+            // evaluator's own tests spend from the fee sink through it), so
+            // the rewards-pool and fee-sink rules are not applied on the REST
+            // path: a deliberate non-change of accept/reject, tracked in
+            // issue #2198 (the oracle rows for those rules skip this path).
+            algo_validate::validate_transaction_wellformed_in_mode(
+                &stx.txn,
+                true,
+                params,
                 None, // SpecialAddresses not available without ledger lookup
-            )?;
+                algo_validate::WellFormedMode::Admission,
+            )
+            .map_err(|e| Self::verify_rejection(algo_error::VerifyKind::NotWell, Some(stx), e))?;
         }
 
         // 3. Group ID consistency. This is fresh-submission (pool-admission)
@@ -2044,7 +2117,14 @@ impl SimpleBlockEvaluator {
         // submitted alongside it) is rejected, matching go-algorand's
         // `TxnGroup`/`TxnGroupWithTracer` (`data/transactions/verify/txn.go`)
         // and its `TestGroupTransactions` (see issue #1034).
-        algo_validate::validate_transaction_group_strict(txgroup)?;
+        algo_validate::validate_transaction_group_strict(txgroup).map_err(|e| {
+            let kind = if e.to_string().contains("validation error: group size ") {
+                algo_error::VerifyKind::TooLarge
+            } else {
+                algo_error::VerifyKind::GroupId
+            };
+            Self::verify_rejection(kind, None, e)
+        })?;
 
         // 5. Signature verification, over the group AS SUBMITTED (go's
         // `verify.TxnGroup`). Restoring genesis fields first, as the block
@@ -2064,6 +2144,39 @@ impl SimpleBlockEvaluator {
         // recorded so a later sighting can skip it too. Mirrors go's
         // `verify.TxnGroup` using the node's shared cache rather than a bare
         // signature check.
+        //
+        // go's group-level LogicSig size check (`txnGroupBatchPrep` ->
+        // `logicSigGroupSizeCheck`) comes first and is returned bare; the
+        // cached verification below repeats it (cheap, O(group)) so a cache
+        // hit can never skip it (issue #2054), and so every error it can
+        // return after this point belongs to one member.
+        algo_validate::logic_sig_group_size_check(txgroup, params)
+            .map_err(|e| Self::verify_rejection(algo_error::VerifyKind::Other, None, e))?;
+        // go returns each member's signature-format and LogicSig verdict
+        // (`stxnCoreChecks`) behind the same `transaction ... invalid : ` frame
+        // as well-formedness, and the batch verifier's failure bare; the
+        // batch failure keeps its own mapping in the pool (issue #1969).
+        let verify_member_signatures = || -> Result<(), algo_error::AlgoError> {
+            // Create a per-group LogicSig budget for logicsig evaluation.
+            let mut lsig_budget = GroupBudget::for_logicsig(txgroup.len());
+            for (intra_group_idx, stx) in txgroup.iter().enumerate() {
+                verify_transaction_signature(
+                    stx,
+                    txgroup,
+                    intra_group_idx,
+                    &mut lsig_budget,
+                    params,
+                )
+                .map_err(|e| {
+                    if e.is_batch_sig_failure() {
+                        e
+                    } else {
+                        Self::verify_rejection(algo_error::VerifyKind::Other, Some(stx), e)
+                    }
+                })?;
+            }
+            Ok(())
+        };
         if let Some(cache) = &self.verified_txn_cache {
             let context = algo_validate::VerificationContext {
                 spec_addrs: algo_validate::SpecialAddresses {
@@ -2072,26 +2185,21 @@ impl SimpleBlockEvaluator {
                 },
                 consensus_version: self.hdr.current_protocol.clone(),
             };
-            algo_validate::verify_transaction_group_cached(txgroup, &context, params, cache)?;
-        } else {
-            // Group-level LogicSig size check (go: `txnGroupBatchPrep` ->
-            // `logicSigGroupSizeCheck`). The cached branch above performs it
-            // inside `verify_transaction_group_cached`; this uncached branch
-            // must do it itself, before any signature work (issue #2054).
-            algo_validate::logic_sig_group_size_check(txgroup, params)?;
-
-            // Create a per-group LogicSig budget for logicsig evaluation.
-            let mut lsig_budget = GroupBudget::for_logicsig(txgroup.len());
-
-            for (intra_group_idx, stx) in txgroup.iter().enumerate() {
-                verify_transaction_signature(
-                    stx,
-                    txgroup,
-                    intra_group_idx,
-                    &mut lsig_budget,
-                    params,
-                )?;
+            if let Err(e) =
+                algo_validate::verify_transaction_group_cached(txgroup, &context, params, cache)
+            {
+                if e.is_batch_sig_failure() {
+                    return Err(e);
+                }
+                // The cached verification does not say which member failed:
+                // find it by verifying the members one by one (the error
+                // path only), so the error is framed like go's.
+                return Err(verify_member_signatures().err().unwrap_or_else(|| {
+                    Self::verify_rejection(algo_error::VerifyKind::Other, None, e)
+                }));
             }
+        } else {
+            verify_member_signatures()?;
         }
 
         // 6. (moved) The validity window and the genesis ID / hash checks are
@@ -2177,24 +2285,28 @@ impl SimpleBlockEvaluator {
             rewards_pool: self.hdr.rewards_pool,
         };
         for stx in txgroup {
-            algo_validate::validate_transaction_wellformed(&stx.txn, true, params, Some(&specials))
-                .map_err(|e| {
-                    // go's `TxnNotWellFormedError`. The reason is this crate's own
-                    // text for it (go's wording differs, #2193; only the frame is
-                    // pinned against go).
-                    let reason = match e {
-                        algo_error::AlgoError::Validation { message } => message,
-                        other => other.to_string(),
-                    };
-                    rejected(
-                        algo_error::RejectClass::NotWell,
-                        format!(
-                            "transaction {}: malformed: {}",
-                            algo_types::Digest(txid_of(stx)),
-                            reason
-                        ),
-                    )
-                })?;
+            algo_validate::validate_transaction_wellformed_in_mode(
+                &stx.txn,
+                true,
+                params,
+                Some(&specials),
+                algo_validate::WellFormedMode::Admission,
+            )
+            .map_err(|e| {
+                // go's `TxnNotWellFormedError`.
+                let reason = match e {
+                    algo_error::AlgoError::Validation { message } => message,
+                    other => other.to_string(),
+                };
+                rejected(
+                    algo_error::RejectClass::NotWell,
+                    format!(
+                        "transaction {}: malformed: {}",
+                        algo_types::Digest(txid_of(stx)),
+                        reason
+                    ),
+                )
+            })?;
         }
 
         // `checkDup`'s ledger half for members `from..`, read under one
@@ -11586,7 +11698,7 @@ mod tests {
 
         let err = eval.transaction_group(&[stx]).unwrap_err();
         assert!(
-            err.to_string().contains("no signature"),
+            err.to_string().contains("has no sig"),
             "expected no-signature error, got: {err}"
         );
     }

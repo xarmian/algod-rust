@@ -459,6 +459,22 @@ pub fn canonical_encode_transaction_with_genesis(
     genesis_id: &str,
     genesis_hash: &[u8; 32],
 ) -> Vec<u8> {
+    canonical_encode_transaction_inner(tx, genesis_id, genesis_hash, &tx.group)
+}
+
+/// [`canonical_encode_transaction`] as if the transaction's group ID were
+/// zero (go's `current.Group = crypto.Digest{}` before `current.ID()` in
+/// `checkTxnGroupID`), WITHOUT cloning it (issue #2193).
+pub fn canonical_encode_transaction_ungrouped(tx: &Transaction) -> Vec<u8> {
+    canonical_encode_transaction_inner(tx, &tx.genesis_id, &tx.genesis_hash, &[0u8; 32])
+}
+
+fn canonical_encode_transaction_inner(
+    tx: &Transaction,
+    genesis_id: &str,
+    genesis_hash: &[u8; 32],
+    group: &[u8; 32],
+) -> Vec<u8> {
     let mut m = CanonicalMap::new();
 
     // All fields go into the SAME map so they sort correctly in a single
@@ -537,7 +553,7 @@ pub fn canonical_encode_transaction_with_genesis(
     m.add_u64("fv", tx.first_valid.0);
     m.add_string("gen", genesis_id);
     m.add_bytes("gh", genesis_hash);
-    m.add_bytes("grp", &tx.group);
+    m.add_bytes("grp", group);
     if let Some(ref hb) = tx.heartbeat {
         m.add_map("hb", canonical_encode_heartbeat(hb));
     }
@@ -2892,6 +2908,30 @@ mod tests {
             load: 0,
             congestion_tax: 0,
             payset,
+        }
+    }
+
+    #[test]
+    fn compute_txn_id_without_group_matches_clone_based_id() {
+        for group in [[0u8; 32], [1u8; 32], [0xFFu8; 32]] {
+            for txn_type in ["pay", "appl", "axfer", "hb"] {
+                let base = Transaction {
+                    txn_type: txn_type.into(),
+                    fee: 1000,
+                    amount: 5,
+                    group,
+                    genesis_id: "gid".into(),
+                    genesis_hash: [3u8; 32],
+                    approval_program: Some(vec![1, 2, 3].into()),
+                    ..Default::default()
+                };
+                let mut cloned = base.clone();
+                cloned.group = [0u8; 32];
+                assert_eq!(
+                    crate::compute_txn_id_without_group(&base),
+                    crate::compute_txn_id(&cloned)
+                );
+            }
         }
     }
 

@@ -42,6 +42,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/algorand/go-algorand/agreement"
 	"github.com/algorand/go-algorand/config"
@@ -51,6 +53,8 @@ import (
 	"github.com/algorand/go-algorand/data/bookkeeping"
 	"github.com/algorand/go-algorand/data/committee"
 	"github.com/algorand/go-algorand/data/transactions"
+	"github.com/algorand/go-algorand/data/transactions/logic"
+	"github.com/algorand/go-algorand/data/transactions/verify"
 	"github.com/algorand/go-algorand/ledger"
 	"github.com/algorand/go-algorand/ledger/eval"
 	"github.com/algorand/go-algorand/ledger/ledgercore"
@@ -85,10 +89,43 @@ type blockDupFixture struct {
 	// data/pools runs it on its Generate+Validate block evaluator: the
 	// per-transaction `TestTransactionGroup`, then `TransactionGroup`.
 	Pool []blockDupPoolScenario `json:"pool"`
+	// Issue #2193: one row per `Transaction.WellFormed` rule (and the order
+	// they run in), plus the group-error and signature texts of the REST
+	// path; see wellformed.go.
+	WellFormed []blockDupWFRow `json:"wellformed"`
+	// Issue #2193: `Transaction.WellFormed` itself, per consensus version
+	// (the protocol gates the ledger's own protocol cannot reach).
+	WellFormedProto []blockDupWFProtoRow `json:"wellformed_proto"`
 	// Issue #2130: the pool evaluator's per-transaction order
 	// (`Alive` -> `checkDup` -> authorizer -> apply) on groups whose members
 	// fail at different stages.
 	PoolOrder []blockDupOrderScenario `json:"pool_order"`
+}
+
+// blockDupWFRow is one issue #2193 row: a group (base64 msgpack
+// `SignedTxn`s) and go's two verdicts on it, from a fresh Generate+Validate
+// evaluator on the pool header: the gossip test stage
+// (`TestTransactionGroup`) and the REST path (`verify.TxnGroup`).
+type blockDupWFRow struct {
+	Name      string   `json:"name"`
+	Group     []string `json:"group"`
+	TestError string   `json:"test_error"`
+	// VerifyError is go's `verify.TxnGroup` error; a `transaction <dump>
+	// invalid : ` frame is reduced to the reason after it.
+	VerifyError string `json:"verify_error"`
+	// VerifyFramed: go's error carried the `transaction <dump> invalid : `
+	// frame (a not-well-formed or unsigned member, a failed signature or
+	// LogicSig of one member); group-level errors are returned bare.
+	VerifyFramed bool `json:"verify_framed,omitempty"`
+}
+
+// blockDupWFProtoRow is `Transaction.WellFormed(spec, proto)` of one
+// consensus version on one transaction (one base64 msgpack `SignedTxn`).
+type blockDupWFProtoRow struct {
+	Name     string `json:"name"`
+	Protocol string `json:"protocol"`
+	Txn      string `json:"txn"`
+	Error    string `json:"error"`
 }
 
 // blockDupOrderScenario is one pool-admission verdict: `Pre` groups are
@@ -105,10 +142,6 @@ type blockDupOrderScenario struct {
 	// gossip handler runs it before any signature check; its apply stage orders
 	// the group checks differently from the verifying admission path).
 	SkipApply bool `json:"skip_apply,omitempty"`
-	// "frame": the test error is compared up to and including
-	// "transaction <txid>: malformed: " (the reason after it is
-	// `WellFormed`'s own wording, tracked in #2193). Empty: compared in full.
-	TestCompare string `json:"test_compare,omitempty"`
 }
 
 type blockDupPoolScenario struct {
@@ -614,9 +647,6 @@ func blockDupOracle() {
 	for _, g := range gossip {
 		gossipRows[g.name] = true
 	}
-	// Only the frame of a not-well-formed verdict is compared (see
-	// blockDupOrderScenario.TestCompare).
-	frameRows := map[string]bool{"gossip_malformed_member": true, "gossip_dup_then_malformed": true}
 	for _, os := range orderSpecs {
 		pev, err := l.StartEvaluator(poolHdr, 0, 0, nil)
 		must(err)
@@ -628,9 +658,6 @@ func blockDupOracle() {
 			return out
 		}
 		sc := blockDupOrderScenario{Name: os.name, Group: enc(os.group), SkipApply: gossipRows[os.name]}
-		if frameRows[os.name] {
-			sc.TestCompare = "frame"
-		}
 		for _, pre := range os.pre {
 			var ad []transactions.SignedTxnWithAD
 			for i := range pre {
@@ -646,6 +673,97 @@ func blockDupOracle() {
 		}
 		sc.AddError = errText(pev.TransactionGroup(ad...))
 		f.PoolOrder = append(f.PoolOrder, sc)
+	}
+
+	// Issue #2193: the WellFormed table and the REST path's group/signature
+	// errors. Each row is one group run through go's gossip test stage and
+	// through `verify.TxnGroup`.
+	wfSpecs := []orderSpec{}
+	for _, r := range wellFormedRows(wfEnv{
+		params: params, sender: sender, receiver: acctB, sink: sink, pool: pool,
+		genesisHash: genesisHash,
+		sign:        func(t transactions.Transaction) transactions.SignedTxn { return t.Sign(secrets) },
+	}) {
+		wfSpecs = append(wfSpecs, orderSpec{name: r.name, group: one(r.tx)})
+	}
+	for _, g := range gossip {
+		switch g.name {
+		case "gossip_dup_then_inconsistent_group", "gossip_inconsistent_group_only",
+			"gossip_zero_group_in_group", "gossip_incomplete_group", "gossip_bogus_group_id":
+			wfSpecs = append(wfSpecs, orderSpec{name: "group_" + g.name, group: g.group})
+		}
+	}
+	noSig := pay("wf-no-sig", [32]byte{})
+	noSig.Sig = crypto.Signature{}
+	twoSigs := pay("wf-two-sigs", [32]byte{})
+	twoSigs.Msig = crypto.MultisigSig{Version: 1, Threshold: 1, Subsigs: []crypto.MultisigSubsig{{Key: crypto.PublicKey(sender)}}}
+	// A LogicSig-only (escrow) payment whose program rejects, and one whose
+	// program errors: go's `verify.TxnGroup` evaluates the program.
+	lsigRow := func(name, src string) orderSpec {
+		ops, err := logic.AssembleString(src)
+		must(err)
+		t := payTxn("wf-"+name, [32]byte{})
+		t.Sender = basics.Address(logic.HashProgram(ops.Program))
+		return orderSpec{name: name, group: one(transactions.SignedTxn{
+			Txn:  t,
+			Lsig: transactions.LogicSig{Logic: ops.Program},
+		})}
+	}
+	wfSpecs = append(wfSpecs,
+		lsigRow("verify_logicsig_rejects", "#pragma version 8\nint 0"),
+		lsigRow("verify_logicsig_errors", "#pragma version 8\nint 1\nint 0\n/"),
+		orderSpec{name: "verify_bad_signature", group: one(badSig(pay("wf-bad-sig", [32]byte{})))},
+		orderSpec{name: "verify_no_signature", group: one(noSig)},
+		orderSpec{name: "verify_two_signature_types", group: one(twoSigs)},
+	)
+	for _, ws := range wfSpecs {
+		pev, err := l.StartEvaluator(poolHdr, 0, 0, nil)
+		must(err)
+		row := blockDupWFRow{Name: ws.name, TestError: errText(pev.TestTransactionGroup(ws.group))}
+		for i := range ws.group {
+			row.Group = append(row.Group, b64(protocol.Encode(&ws.group[i])))
+		}
+		_, verr := verify.TxnGroup(ws.group, &poolHdr, nil, l)
+		row.VerifyError = errText(verr)
+		// go wraps a not-well-formed (or unsigned) member as `transaction
+		// <%+v of the SignedTxn> invalid : <reason>`. The dump is go's own
+		// struct formatting (it prints pointer addresses, so it is not even
+		// reproducible between runs); keep the reason, which is what
+		// algod-rust reproduces.
+		if strings.HasPrefix(row.VerifyError, "transaction ") {
+			if at := strings.Index(row.VerifyError, " invalid : "); at >= 0 {
+				row.VerifyError = row.VerifyError[at+len(" invalid : "):]
+				row.VerifyFramed = true
+			}
+		}
+		f.WellFormed = append(f.WellFormed, row)
+	}
+
+	// Issue #2193: WellFormed per consensus version, on a heartbeat with valid
+	// fields (the protocol gate), a heartbeat whose proof sets only a later
+	// field, and a plain payment as control.
+	{
+		var versions []string
+		for v := range config.Consensus {
+			versions = append(versions, string(v))
+		}
+		sort.Strings(versions)
+		protoRows := heartbeatProtoRows(wfEnv{
+			params: params, sender: sender, receiver: acctB, sink: sink, pool: pool,
+			genesisHash: genesisHash,
+			sign:        func(t transactions.Transaction) transactions.SignedTxn { return t.Sign(secrets) },
+		})
+		specAddrs := transactions.SpecialAddresses{FeeSink: sink, RewardsPool: pool}
+		for _, v := range versions {
+			for _, r := range protoRows {
+				f.WellFormedProto = append(f.WellFormedProto, blockDupWFProtoRow{
+					Name:     r.name,
+					Protocol: v,
+					Txn:      b64(protocol.Encode(&r.tx)),
+					Error:    errText(r.tx.Txn.WellFormed(specAddrs, config.Consensus[protocol.ConsensusVersion(v)])),
+				})
+			}
+		}
 	}
 
 	path := filepath.Join("..", "..", "crates", "core", "algo-ledger", "tests", "fixtures", "block_checkdup", "oracle.json")

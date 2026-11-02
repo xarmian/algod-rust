@@ -349,6 +349,14 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
             algo_error::RejectClass::GroupId => PoolErrorTag::GroupId,
             algo_error::RejectClass::TooLarge => PoolErrorTag::TooLarge,
             algo_error::RejectClass::NotWell => PoolErrorTag::NotWell,
+            // go's `verify.TxnGroup` runs before the pool (its error is bare);
+            // the tag is the one the same failure gets on the gossip test stage.
+            algo_error::RejectClass::Verify(kind) => match kind {
+                algo_error::VerifyKind::NotWell => PoolErrorTag::NotWell,
+                algo_error::VerifyKind::GroupId => PoolErrorTag::GroupId,
+                algo_error::VerifyKind::TooLarge => PoolErrorTag::TooLarge,
+                algo_error::VerifyKind::Other => PoolErrorTag::EvalGeneric,
+            },
             algo_error::RejectClass::Alive | algo_error::RejectClass::Other => {
                 classify_evaluator_message(message)
             }

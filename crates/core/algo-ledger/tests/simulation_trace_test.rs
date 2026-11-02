@@ -909,7 +909,7 @@ fn simulation_signature_failure_takes_precedence_over_underpaid_group_fee() {
         .failure_message
         .as_deref()
         .expect("failure message expected");
-    assert!(msg.contains("no signature"), "unexpected message: {msg}");
+    assert!(msg.contains("has no sig"), "unexpected message: {msg}");
 }
 
 /// Ordering vs go-algorand: a LogicSig that rejects transaction 0 fails in
@@ -953,7 +953,7 @@ fn simulation_logicsig_rejection_takes_precedence_over_underpaid_group_fee() {
     let group = &result.txn_groups[0];
     let msg = group.failure_message.as_deref().expect("failure expected");
     assert!(
-        msg.contains("LogicSig program rejected") && !msg.contains("fees is less than"),
+        msg.contains(": rejected by logic") && !msg.contains("fees is less than"),
         "unexpected message: {msg}"
     );
     assert_eq!(group.failed_at, Some(vec![0]));

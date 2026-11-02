@@ -1564,10 +1564,9 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 // `"LogicSig program error:"` message substring below and
                 // is matched on the error variant instead.
                 let is_format_failure = matches!(e, AlgoError::AvmLogicSig { .. })
-                    || message
-                        .contains("transaction has no signature (no sig, msig, lsig, or pqsig)")
-                    || message.contains("signedtxn should have only one type of signature, found")
-                    || message.contains("LogicSig program rejected the transaction")
+                    || message.contains("signedtxn has no sig")
+                    || message.contains("signedtxn should have only one type of signature")
+                    || message.contains(": rejected by logic")
                     || message.contains("LogicSig program error:");
                 if is_format_failure {
                     return Ok(CheckOutcome::RecoverableFailure {

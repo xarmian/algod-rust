@@ -900,13 +900,13 @@ fn decoded_lsig_without_l_is_rejected_by_group_and_signature_checks() {
     let mut budget = GroupBudget::for_logicsig(1);
     let err = verify_transaction_signature(&group[0], &group, 0, &mut budget, &v41)
         .expect_err("per-transaction check must reject a programless LogicSig");
-    assert!(err.to_string().contains("no signature"), "{err}");
+    assert!(err.to_string().contains("has no sig"), "{err}");
     // The per-transaction path is independent of the group check, so it
     // rejects the same way under v42 when called directly.
     let mut budget = GroupBudget::for_logicsig(1);
     let err = verify_transaction_signature(&group[0], &group, 0, &mut budget, &v42())
         .expect_err("per-transaction check must reject a programless LogicSig at v42");
-    assert!(err.to_string().contains("no signature"), "{err}");
+    assert!(err.to_string().contains("has no sig"), "{err}");
 
     // Pool/gossip admission, pre-pricing (v41): no group-level orphan
     // rejection exists, so the per-transaction check is what rejects.
@@ -917,7 +917,7 @@ fn decoded_lsig_without_l_is_rejected_by_group_and_signature_checks() {
     };
     let err = algo_validate::verify_transaction_group_cached(&group, &ctx41, &v41, &cache41)
         .expect_err("pre-pricing pool admission must reject an orphan LogicSig");
-    assert!(err.to_string().contains("no signature"), "{err}");
+    assert!(err.to_string().contains("has no sig"), "{err}");
 
     // Pool/gossip admission, size pricing (v42).
     let cache = algo_validate::VerifiedTransactionCache::new(10);
