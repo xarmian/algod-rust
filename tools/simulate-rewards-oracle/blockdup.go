@@ -101,6 +101,14 @@ type blockDupOrderScenario struct {
 	Group     []string   `json:"group"`
 	TestError string     `json:"test_error"`
 	AddError  string     `json:"add_error"`
+	// Issue #2184: only the verdict of go's TEST stage is meaningful (go's
+	// gossip handler runs it before any signature check; its apply stage orders
+	// the group checks differently from the verifying admission path).
+	SkipApply bool `json:"skip_apply,omitempty"`
+	// "frame": the test error is compared up to and including
+	// "transaction <txid>: malformed: " (the reason after it is
+	// `WellFormed`'s own wording, tracked in #2193). Empty: compared in full.
+	TestCompare string `json:"test_compare,omitempty"`
 }
 
 type blockDupPoolScenario struct {
@@ -536,6 +544,10 @@ func blockDupOracle() {
 	tooLong := func(t transactions.Transaction) transactions.Transaction {
 		return withValidity(t, 1, 100_000)
 	}
+	fromSender := func(t transactions.Transaction, from basics.Address) transactions.Transaction {
+		t.Sender = from
+		return t
+	}
 	withGroup := func(s transactions.SignedTxn, g crypto.Digest) transactions.SignedTxn {
 		t := s.Txn
 		t.Group = g
@@ -553,7 +565,7 @@ func blockDupOracle() {
 	pairExpired := signAll(good,
 		withValidity(payTxn("g-expired", [32]byte{}), 1, 1), payTxn("g-pair-c", [32]byte{}))
 	pairClean := signAll(good, payTxn("g-clean-a", [32]byte{}), payTxn("g-clean-b", [32]byte{}))
-	orderSpecs = append(orderSpecs, []orderSpec{
+	gossip := []orderSpec{
 		// a replayed transaction with a corrupted signature: Test never
 		// looks at the signature, so it is the duplicate that is reported.
 		{"gossip_badsig_dup", nil, one(badSig(committed))},
@@ -591,7 +603,20 @@ func blockDupOracle() {
 			pairLease[0], good(tooLong(payTxn("g-long-2", [32]byte{})))}},
 		// one more than MaxTxGroupSize.
 		{"gossip_group_too_large", nil, signAll(good, seventeen...)},
-	}...)
+		// WellFormed gets the evaluator's special addresses: a sender that is
+		// the rewards pool is not well formed ...
+		{"gossip_rewards_pool_sender", nil, one(good(fromSender(payTxn("g-pool-sender", [32]byte{}), pool)))},
+		// ... while the fee sink may send.
+		{"gossip_fee_sink_sender", nil, one(good(fromSender(payTxn("g-sink-sender", [32]byte{}), sink)))},
+	}
+	orderSpecs = append(orderSpecs, gossip...)
+	gossipRows := map[string]bool{}
+	for _, g := range gossip {
+		gossipRows[g.name] = true
+	}
+	// Only the frame of a not-well-formed verdict is compared (see
+	// blockDupOrderScenario.TestCompare).
+	frameRows := map[string]bool{"gossip_malformed_member": true, "gossip_dup_then_malformed": true}
 	for _, os := range orderSpecs {
 		pev, err := l.StartEvaluator(poolHdr, 0, 0, nil)
 		must(err)
@@ -602,7 +627,10 @@ func blockDupOracle() {
 			}
 			return out
 		}
-		sc := blockDupOrderScenario{Name: os.name, Group: enc(os.group)}
+		sc := blockDupOrderScenario{Name: os.name, Group: enc(os.group), SkipApply: gossipRows[os.name]}
+		if frameRows[os.name] {
+			sc.TestCompare = "frame"
+		}
 		for _, pre := range os.pre {
 			var ad []transactions.SignedTxnWithAD
 			for i := range pre {

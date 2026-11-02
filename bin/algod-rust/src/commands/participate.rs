@@ -2119,10 +2119,14 @@ impl SimpleBlockEvaluator {
 
     /// go's `BlockEvaluator.TestTransactionGroup`, for `test_transaction_group`
     /// (it takes `&self`), in go's order and with go's errors (issue #2184):
-    /// the group size, then every member's well-formedness, then, per member
-    /// in group order, `Alive` and `checkDup` against the unmodified state (go's
+    /// the group size, then every member's well-formedness (with the
+    /// evaluator's special addresses), then, per member in group order,
+    /// `Alive` and `checkDup` against the unmodified state (go's
     /// `testTransaction`; the pool's pending block counts, a sibling does not)
     /// and that member's group-ID consistency, then the group's completeness.
+    /// Evaluation stops at the first failing member, as go's does: nothing
+    /// after it is hashed or looked up, and the ledger is read (once, for the
+    /// members from the first one that gets as far as `checkDup`) only then.
     ///
     /// It checks NO signature and NO fee: go's gossip handler calls this
     /// (`txHandler.checkAlreadyCommitted` -> `txPool.Test`) before it verifies
@@ -2131,131 +2135,99 @@ impl SimpleBlockEvaluator {
     /// in this order. Signatures are verified afterwards by the handler's
     /// batch verifier, and again, with the group's fees, by
     /// `transaction_group` (go's `verify.TxnGroup` / `Remember`). Nothing is
-    /// recorded.
+    /// recorded. In-block-only fields are rejected by the callers' decode
+    /// boundary (`TransactionPool::test`).
+    ///
+    /// Every txid here (the `malformed` message and `checkDup`) is the one the
+    /// block carries: the transaction with its genesis fields restored. The
+    /// group-ID hashes are the one exception: they are over the group as
+    /// submitted, which is what the submitter's group ID commits to
+    /// ([`algo_validate::GroupIdChecker`], shared with the verifying path).
     fn validate_group_stateless(
         &self,
         txgroup: &[algo_types::SignedTransaction],
     ) -> Result<(), algo_error::AlgoError> {
         // go: "Nothing to do if there are no transactions".
-        if txgroup.is_empty() {
+        let Some(first) = txgroup.first() else {
             return Ok(());
-        }
-        // Fail closed on in-block-only fields, as every ingress boundary does.
-        algo_types::genesis_restore::reject_in_block_flags(txgroup).map_err(|e| {
-            algo_error::AlgoError::Validation {
-                message: e.to_string(),
-            }
-        })?;
-        let rejected = |message: String| algo_error::AlgoError::Rejected {
-            source: None,
-            message,
-            class: algo_error::RejectClass::Other,
         };
-        let max = self.consensus_params.max_tx_group_size;
+        let rejected =
+            |class: algo_error::RejectClass, message: String| algo_error::AlgoError::Rejected {
+                source: None,
+                message,
+                class,
+            };
+        let params = &self.consensus_params;
+        let max = params.max_tx_group_size;
         if txgroup.len() > max {
-            return Err(rejected(format!(
-                "group size {} exceeds maximum {}",
-                txgroup.len(),
-                max
-            )));
+            return Err(rejected(
+                algo_error::RejectClass::TooLarge,
+                format!("group size {} exceeds maximum {}", txgroup.len(), max),
+            ));
         }
+        // The txid of the transaction as the block carries it, hashed with the
+        // header's genesis fields as overrides: no clone of the transaction.
+        let rule = self.genesis_rule();
+        let txid_of = |stx: &algo_types::SignedTransaction| -> [u8; 32] {
+            let (genesis_id, genesis_hash) = rule.restored_genesis(stx);
+            algo_codec::compute_txn_id_with_genesis(&stx.txn, genesis_id, genesis_hash).0
+        };
+        let specials = algo_validate::SpecialAddresses {
+            fee_sink: self.hdr.fee_sink,
+            rewards_pool: self.hdr.rewards_pool,
+        };
         for stx in txgroup {
-            algo_validate::validate_transaction_wellformed(
-                &stx.txn,
-                true,
-                &self.consensus_params,
-                None, // SpecialAddresses not available without ledger lookup
-            )
-            .map_err(|e| {
-                // go's `TxnNotWellFormedError`. The reason is this crate's own
-                // text for it (go's wording differs; #2184 pins only the frame).
-                let reason = match e {
-                    algo_error::AlgoError::Validation { message } => message,
-                    other => other.to_string(),
-                };
-                rejected(format!(
-                    "transaction {}: malformed: {}",
-                    algo_types::Digest(compute_txid(&stx.txn)),
-                    reason
-                ))
-            })?;
+            algo_validate::validate_transaction_wellformed(&stx.txn, true, params, Some(&specials))
+                .map_err(|e| {
+                    // go's `TxnNotWellFormedError`. The reason is this crate's own
+                    // text for it (go's wording differs, #2193; only the frame is
+                    // pinned against go).
+                    let reason = match e {
+                        algo_error::AlgoError::Validation { message } => message,
+                        other => other.to_string(),
+                    };
+                    rejected(
+                        algo_error::RejectClass::NotWell,
+                        format!(
+                            "transaction {}: malformed: {}",
+                            algo_types::Digest(txid_of(stx)),
+                            reason
+                        ),
+                    )
+                })?;
         }
 
-        // The txids `checkDup` looks for are over the group with its genesis
-        // fields restored (what the block carries); the group-ID hashes are
-        // over the group as submitted (what the submitter signed).
-        let restored: Vec<algo_types::SignedTransaction> = txgroup
-            .iter()
-            .cloned()
-            .map(|mut stx| {
-                self.restore_genesis_fields(&mut stx);
-                stx
-            })
-            .collect();
-        let txids: Vec<[u8; 32]> = restored.iter().map(|r| compute_txid(&r.txn)).collect();
-        let ledger = self.ledger_dups(&restored, &txids)?;
-        let first_group = txgroup[0].txn.group;
-        let mut hashes: Vec<algo_types::Digest> = Vec::new();
-        for (member, (stx, restored)) in txgroup.iter().zip(&restored).enumerate() {
+        // `checkDup`'s ledger half for members `from..`, read under one
+        // acquisition of the ledger mutex, only once a member passed `Alive`.
+        struct Lookups {
+            from: usize,
+            txids: Vec<[u8; 32]>,
+            found: Vec<Option<LedgerDup>>,
+        }
+        let mut lookups: Option<Lookups> = None;
+        let mut ids = algo_validate::GroupIdChecker::new(&first.txn, txgroup.len());
+        for (member, stx) in txgroup.iter().enumerate() {
             self.alive_member(stx)?;
-            self.check_dup_member(restored, &txids[member], None, ledger[member])?;
-            if stx.txn.group != first_group {
-                return Err(rejected(format!(
-                    "transactionGroup: inconsistent group values: {} != {}",
-                    algo_types::Digest(stx.txn.group),
-                    algo_types::Digest(first_group)
-                )));
+            if lookups.is_none() {
+                let txids: Vec<[u8; 32]> = txgroup[member..].iter().map(&txid_of).collect();
+                let found = self.ledger_dups(&txgroup[member..], &txids)?;
+                lookups = Some(Lookups {
+                    from: member,
+                    txids,
+                    found,
+                });
             }
-            if stx.txn.group != [0u8; 32] {
-                let mut ungrouped = stx.txn.clone();
-                ungrouped.group = [0u8; 32];
-                hashes.push(algo_types::Digest(compute_txid(&ungrouped)));
-            } else if txgroup.len() > 1 {
-                return Err(rejected(format!(
-                    "transactionGroup: [{}] had zero Group but was submitted in a group of {}",
-                    member,
-                    txgroup.len()
-                )));
-            }
+            let Some(l) = &lookups else {
+                continue; // unreachable: set just above
+            };
+            let at = member - l.from;
+            self.check_dup_member(stx, &l.txids[at], None, l.found[at])?;
+            ids.check_member(member, &stx.txn)
+                .map_err(|message| rejected(algo_error::RejectClass::GroupId, message))?;
         }
-        if !hashes.is_empty() {
-            let computed = algo_codec::compute_group_id_from_hashes(&hashes);
-            if first_group != computed.0 {
-                // go prints the `TxGroup` struct with `%v`: the embedded
-                // domain-separator struct is `{}`, then the hashes.
-                let listed: Vec<String> = hashes.iter().map(|h| h.to_string()).collect();
-                return Err(rejected(format!(
-                    "transactionGroup: incomplete group: {} != {} ({{{{}} [{}]}})",
-                    algo_types::Digest(first_group),
-                    computed,
-                    listed.join(" ")
-                )));
-            }
-        }
+        ids.finish()
+            .map_err(|message| rejected(algo_error::RejectClass::GroupId, message))
         // No fee check, as go's `TestTransactionGroup`.
-        Ok(())
-    }
-
-    /// The verifying admission order, as go's REST path runs it
-    /// (`verify.TxnGroup`, then `Remember`'s per-member `Alive` + `checkDup`,
-    /// then the group fees), without applying anything. The gossip path uses
-    /// `validate_group_stateless` first; this is what `transaction_group`'s
-    /// precheck does before its balance and authorizer checks. Kept so the
-    /// tests of that ordering (signatures, then window, then fees) stay
-    /// direct, one evaluator call each.
-    #[cfg(test)]
-    fn verify_then_test_group(
-        &self,
-        txgroup: &[algo_types::SignedTransaction],
-    ) -> Result<(), algo_error::AlgoError> {
-        let restored = self.validate_group_stateless_inner(txgroup)?;
-        let txids: Vec<[u8; 32]> = restored.iter().map(|r| compute_txid(&r.txn)).collect();
-        let ledger = self.ledger_dups(&restored, &txids)?;
-        for (member, (stx, restored)) in txgroup.iter().zip(&restored).enumerate() {
-            self.alive_member(stx)?;
-            self.check_dup_member(restored, &txids[member], None, ledger[member])?;
-        }
-        self.check_group_fees(txgroup)
     }
 
     /// go's `BlockHeader.Alive` for one transaction, as the validating
@@ -10794,13 +10766,13 @@ mod tests {
         let params = v41_params();
         let (sender, key) = test_keypair(20);
         let (receiver, _) = test_keypair(21);
-        let eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
 
         let mut stx = make_signed_pay(&key, &sender, &receiver, 1000, 1000, 100);
         // Corrupt signature
         stx.sig[0] ^= 0xFF;
 
-        let err = eval.verify_then_test_group(&[stx]).unwrap_err();
+        let err = eval.transaction_group(&[stx]).unwrap_err();
         assert!(
             err.to_string().contains("signature"),
             "expected signature error, got: {err}"
@@ -11054,6 +11026,228 @@ mod tests {
         assert_eq!(unverified(&fresh), 0, "the verifying stage caches it");
     }
 
+    /// Poison the ledger mutex, so any attempt to read the ledger fails with
+    /// `checkDup: the ledger lock is poisoned`: a counting hook that needs no
+    /// production code. A test stage that returns another verdict never looked.
+    fn poison_ledger(ledger: &Arc<Mutex<SqliteLedger>>) {
+        let ledger = ledger.clone();
+        let panicked = std::thread::spawn(move || {
+            let _held = ledger.lock().expect("lock");
+            panic!("poison the ledger lock on purpose");
+        })
+        .join();
+        assert!(panicked.is_err());
+    }
+
+    /// Issue #2184 review: go stops at the first failing member. A group whose
+    /// first member is expired is reported for it without any ledger read (a
+    /// poisoned ledger is never touched), and a group whose first member
+    /// passes `Alive` does read it.
+    #[test]
+    fn gossip_test_stage_stops_at_the_first_failing_member_without_ledger_reads() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(44);
+        let (receiver, _) = test_keypair(45);
+        let eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+        poison_ledger(&ledger);
+
+        let expired = windowed_pay(&key, sender, receiver, 1, 50);
+        let fine = windowed_pay(&key, sender, receiver, 100, 900);
+        let err = eval
+            .test_transaction_group(&[expired.clone(), fine.clone()])
+            .expect_err("expired first member");
+        assert_eq!(err.to_string(), "txn dead: round 100 outside of 1--50");
+
+        // a passing first member DOES look (and the poisoned lock is the verdict)
+        let err = eval
+            .test_transaction_group(&[fine, expired])
+            .expect_err("poisoned ledger");
+        assert!(err.to_string().contains("poisoned"), "{err}");
+    }
+
+    /// Issue #2184 review: the production test stage keeps the shared parts of
+    /// go's order and texts (the window, genesis and size errors), looks at no
+    /// signature (a bad signature next to a window problem is the window
+    /// problem, the reverse of the verifying stage) and no fee.
+    #[test]
+    fn gossip_test_stage_reports_window_genesis_and_size_like_go() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(46);
+        let (receiver, _) = test_keypair(47);
+        let eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+
+        let early = windowed_pay(&key, sender, receiver, 500, 900);
+        let err = eval.test_transaction_group(&[early]).unwrap_err();
+        assert_eq!(err.to_string(), "txn dead: round 100 outside of 500--900");
+        assert!(matches!(
+            err,
+            algo_error::AlgoError::Rejected {
+                class: algo_error::RejectClass::Alive,
+                ..
+            }
+        ));
+
+        let mut wrong = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
+        wrong.txn.genesis_hash = [3u8; 32];
+        wrong.sig = sign_txn(&wrong.txn, &key);
+        let err = eval.test_transaction_group(&[wrong]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "tx.GenesisHash <{}> does not match expected <{}>",
+                algo_types::Digest([3u8; 32]),
+                algo_types::Digest([0xAA; 32])
+            )
+        );
+        let mut wrong = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
+        wrong.txn.genesis_id = "other-net".to_string();
+        let err = eval.test_transaction_group(&[wrong]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "tx.GenesisID <other-net> does not match expected <test-v1>"
+        );
+
+        // a bad signature and a window problem: the window (go's Test runs
+        // before any signature check)
+        let mut both = windowed_pay(&key, sender, receiver, 500, 900);
+        both.sig = [7u8; 64];
+        let err = eval.test_transaction_group(&[both]).unwrap_err();
+        assert!(err.to_string().starts_with("txn dead:"), "{err}");
+
+        // a bad signature alone and a low fee alone pass go's Test
+        let mut bad_sig = windowed_pay(&key, sender, receiver, 100, 900);
+        bad_sig.sig = [7u8; 64];
+        eval.test_transaction_group(&[bad_sig])
+            .expect("no signature is checked");
+        let low_fee = pay_with_fee_and_window(&key, sender, receiver, 1, 1, 1000);
+        eval.test_transaction_group(&[low_fee])
+            .expect("no fee is checked");
+
+        // more members than MaxTxGroupSize
+        let members: Vec<SignedTransaction> = (0..17u64)
+            .map(|n| {
+                let mut stx = windowed_pay(&key, sender, receiver, 100, 900);
+                stx.txn.amount = n;
+                stx
+            })
+            .collect();
+        let err = eval.test_transaction_group(&members).unwrap_err();
+        assert_eq!(err.to_string(), "group size 17 exceeds maximum 16");
+        assert!(matches!(
+            err,
+            algo_error::AlgoError::Rejected {
+                class: algo_error::RejectClass::TooLarge,
+                ..
+            }
+        ));
+    }
+
+    /// Issue #2184 review: the test stage and the verifying stage share go's
+    /// group-ID rules ([`algo_validate::GroupIdChecker`]) and so read alike
+    /// for every group-ID failure.
+    #[test]
+    fn both_admission_stages_report_group_id_errors_with_the_same_text() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(48);
+        let (receiver, _) = test_keypair(49);
+        let eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+        let member = |amount: u64, group: [u8; 32]| {
+            let mut stx = windowed_pay(&key, sender, receiver, 100, 900);
+            stx.txn.amount = amount;
+            stx.txn.group = group;
+            stx.sig = sign_txn(&stx.txn, &key);
+            stx
+        };
+        let txns: Vec<Transaction> = (1..=2).map(|a| member(a, [0u8; 32]).txn).collect();
+        let gid = algo_validate::compute_group_id(&txns).0;
+        let (m1, m2) = (member(1, gid), member(2, gid));
+        let groups: Vec<(&str, Vec<SignedTransaction>)> = vec![
+            ("incomplete", vec![m1.clone()]),
+            ("bogus", vec![member(1, [0xAB; 32]), member(2, [0xAB; 32])]),
+            ("inconsistent", vec![m1.clone(), member(2, [0u8; 32])]),
+            (
+                "zero in a group",
+                vec![member(1, [0u8; 32]), member(2, [0u8; 32])],
+            ),
+        ];
+        for (name, group) in groups {
+            let test = eval.test_transaction_group(&group).unwrap_err();
+            let verifying = match eval.validate_group_stateless_inner(&group).unwrap_err() {
+                algo_error::AlgoError::Validation { message } => message,
+                other => other.to_string(),
+            };
+            assert!(
+                test.to_string().starts_with("transactionGroup: "),
+                "{name}: {test}"
+            );
+            assert_eq!(test.to_string(), verifying, "{name}");
+        }
+        // and a complete group passes both
+        eval.test_transaction_group(&[m1.clone(), m2.clone()])
+            .expect("complete group");
+        eval.validate_group_stateless_inner(&[m1, m2])
+            .expect("complete group verifies");
+    }
+
+    /// Issue #2184 review: one txid, the one the block carries (genesis fields
+    /// restored), in every message of the test stage. A submission signed with
+    /// an empty genesis hash has it restored from the header (the protocol
+    /// requires it), so the txid the `malformed` message names is the restored
+    /// one, not the one hashed over the submitted bytes; the duplicate message
+    /// is built by the same function.
+    #[test]
+    fn gossip_test_stage_names_the_restored_txid_in_every_message() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        assert!(params.require_genesis_hash);
+        let (sender, key) = test_keypair(50);
+        let (receiver, _) = test_keypair(51);
+        let mut eval = make_evaluator(
+            &ledger,
+            &params,
+            100,
+            &[(sender, 10_000_000), (receiver, 100_000)],
+        );
+
+        // not well formed AND stripped of its genesis hash
+        let mut stripped = make_signed_pay(&key, &sender, &receiver, 1000, 1000, 100);
+        stripped.txn.last_valid = Round(100_000);
+        stripped.txn.genesis_hash = [0u8; 32];
+        stripped.sig = sign_txn(&stripped.txn, &key);
+        let submitted = compute_txid(&stripped.txn);
+        let mut restored = stripped.clone();
+        eval.restore_genesis_fields(&mut restored);
+        let restored_id = compute_txid(&restored.txn);
+        assert_ne!(
+            submitted, restored_id,
+            "the genesis hash is part of the txid"
+        );
+        let err = eval.test_transaction_group(&[stripped]).unwrap_err();
+        assert_eq!(
+            err.to_string().split(": malformed: ").next(),
+            Some(format!("transaction {}", algo_types::Digest(restored_id)).as_str()),
+            "{err}"
+        );
+
+        // a duplicate names the txid the overlay holds (the same function)
+        let stx = make_signed_pay(&key, &sender, &receiver, 1000, 1000, 100);
+        eval.transaction_group(std::slice::from_ref(&stx))
+            .expect("admit");
+        let err = eval
+            .test_transaction_group(std::slice::from_ref(&stx))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "transaction already in ledger: {}",
+                algo_types::Digest(compute_txid(&stx.txn))
+            )
+        );
+    }
+
     /// A validly signed payment with the given validity window.
     fn windowed_pay(
         key: &SigningKey,
@@ -11097,7 +11291,7 @@ mod tests {
         let eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
 
         let early = windowed_pay(&key, sender, receiver, 500, 900);
-        let err = eval.verify_then_test_group(&[early]).unwrap_err();
+        let err = eval.test_transaction_group(&[early]).unwrap_err();
         assert_eq!(err.to_string(), "txn dead: round 100 outside of 500--900");
         assert!(
             matches!(err, algo_error::AlgoError::Rejected { .. }),
@@ -11105,7 +11299,7 @@ mod tests {
         );
 
         let expired = windowed_pay(&key, sender, receiver, 1, 50);
-        let err = eval.verify_then_test_group(&[expired]).unwrap_err();
+        let err = eval.test_transaction_group(&[expired]).unwrap_err();
         assert_eq!(err.to_string(), "txn dead: round 100 outside of 1--50");
     }
 
@@ -11118,16 +11312,16 @@ mod tests {
         let params = v41_params();
         let (sender, key) = test_keypair(62);
         let (receiver, _) = test_keypair(63);
-        let eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
 
         let mut both = windowed_pay(&key, sender, receiver, 500, 900);
         both.sig = [7u8; 64]; // does not verify
-        let err = eval.verify_then_test_group(&[both]).unwrap_err();
+        let err = eval.transaction_group(&[both]).unwrap_err();
         assert!(err.is_batch_sig_failure(), "{err}");
 
         // window-only problem still gets the window error
         let only_window = windowed_pay(&key, sender, receiver, 500, 900);
-        let err = eval.verify_then_test_group(&[only_window]).unwrap_err();
+        let err = eval.transaction_group(&[only_window]).unwrap_err();
         assert!(err.to_string().starts_with("txn dead:"), "{err}");
     }
 
@@ -11158,11 +11352,11 @@ mod tests {
         let params = v41_params();
         let (sender, key) = test_keypair(64);
         let (receiver, _) = test_keypair(65);
-        let eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
 
         // low fee, valid window: go's group-fee text, typed so the pool prints it bare
         let low = pay_with_fee_and_window(&key, sender, receiver, 1, 1, 1000);
-        let err = eval.verify_then_test_group(&[low]).unwrap_err();
+        let err = eval.transaction_group(&[low]).unwrap_err();
         assert_eq!(
             err.to_string(),
             "txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)"
@@ -11175,7 +11369,7 @@ mod tests {
         // low fee and out of window (early or expired): the window wins
         for (fv, lv) in [(500, 900), (1, 50)] {
             let low = pay_with_fee_and_window(&key, sender, receiver, 1, fv, lv);
-            let err = eval.verify_then_test_group(&[low]).unwrap_err();
+            let err = eval.transaction_group(&[low]).unwrap_err();
             assert!(
                 err.to_string().starts_with("txn dead:"),
                 "{fv}--{lv}: {err}"
@@ -11185,12 +11379,14 @@ mod tests {
         // low fee and a bad signature: the signature wins
         let mut bad = pay_with_fee_and_window(&key, sender, receiver, 1, 1, 1000);
         bad.sig = [7u8; 64];
-        let err = eval.verify_then_test_group(&[bad]).unwrap_err();
+        let err = eval.transaction_group(&[bad]).unwrap_err();
         assert!(err.is_batch_sig_failure(), "{err}");
 
         // a fee-only problem stays a fee error, and a sufficient fee passes
-        let ok = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
-        assert!(eval.verify_then_test_group(&[ok]).is_ok());
+        let mut ok = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
+        ok.txn.amount = 200_000; // a new account must end above the minimum balance
+        ok.sig = sign_txn(&ok.txn, &key);
+        assert!(eval.transaction_group(&[ok]).is_ok());
     }
 
     /// Issue #1976: after the validity window go's `BlockHeader.Alive` checks
@@ -11204,13 +11400,13 @@ mod tests {
         let params = v41_params();
         let (sender, key) = test_keypair(66);
         let (receiver, _) = test_keypair(67);
-        let eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
 
         // wrong genesis hash (the fixture's header hash is [0xAA; 32])
         let mut wrong = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
         wrong.txn.genesis_hash = [3u8; 32];
         wrong.sig = sign_txn(&wrong.txn, &key);
-        let err = eval.verify_then_test_group(&[wrong]).unwrap_err();
+        let err = eval.transaction_group(&[wrong]).unwrap_err();
         assert_eq!(
             err.to_string(),
             format!(
@@ -11228,7 +11424,7 @@ mod tests {
         let mut wrong = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
         wrong.txn.genesis_id = "other-net".to_string();
         wrong.sig = sign_txn(&wrong.txn, &key);
-        let err = eval.verify_then_test_group(&[wrong]).unwrap_err();
+        let err = eval.transaction_group(&[wrong]).unwrap_err();
         assert_eq!(
             err.to_string(),
             "tx.GenesisID <other-net> does not match expected <test-v1>"
@@ -11239,28 +11435,29 @@ mod tests {
         bad_sig.txn.genesis_hash = [3u8; 32];
         bad_sig.sig = [7u8; 64];
         assert!(eval
-            .verify_then_test_group(&[bad_sig])
+            .transaction_group(&[bad_sig])
             .unwrap_err()
             .is_batch_sig_failure());
 
         let mut dead = pay_with_fee_and_window(&key, sender, receiver, 1, 500, 900);
         dead.txn.genesis_hash = [3u8; 32];
         dead.sig = sign_txn(&dead.txn, &key);
-        let err = eval.verify_then_test_group(&[dead]).unwrap_err();
+        let err = eval.transaction_group(&[dead]).unwrap_err();
         assert!(err.to_string().starts_with("txn dead:"), "{err}");
 
         let mut low_fee = pay_with_fee_and_window(&key, sender, receiver, 1, 1, 1000);
         low_fee.txn.genesis_hash = [3u8; 32];
         low_fee.sig = sign_txn(&low_fee.txn, &key);
-        let err = eval.verify_then_test_group(&[low_fee]).unwrap_err();
+        let err = eval.transaction_group(&[low_fee]).unwrap_err();
         assert!(err.to_string().starts_with("tx.GenesisHash <"), "{err}");
 
         // an omitted genesis ID (the hash present and right) is accepted: go
         // verifies the signature over the transaction as submitted
         let mut omitted = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
         omitted.txn.genesis_id = String::new();
+        omitted.txn.amount = 200_000; // a new account must end above the minimum balance
         omitted.sig = sign_txn(&omitted.txn, &key);
-        eval.verify_then_test_group(&[omitted])
+        eval.transaction_group(&[omitted])
             .expect("a transaction signed without a genesis ID is accepted");
     }
 
@@ -11290,7 +11487,7 @@ mod tests {
             let mut no_hash = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
             no_hash.txn.genesis_hash = [0u8; 32];
             no_hash.sig = sign_txn(&no_hash.txn, &key);
-            let err = eval.verify_then_test_group(&[no_hash.clone()]).unwrap_err();
+            let err = eval.transaction_group(&[no_hash.clone()]).unwrap_err();
             assert_eq!(
                 err.to_string(),
                 "required tx.GenesisHash is missing",
@@ -11300,7 +11497,7 @@ mod tests {
             // a genuinely bad signature on the same transaction is still reported first
             no_hash.sig = [7u8; 64];
             assert!(
-                eval.verify_then_test_group(&[no_hash])
+                eval.transaction_group(&[no_hash])
                     .unwrap_err()
                     .is_batch_sig_failure(),
                 "cache={with_cache}"
@@ -11368,7 +11565,7 @@ mod tests {
         let params = v41_params();
         let (sender, _key) = test_keypair(30);
         let (receiver, _) = test_keypair(31);
-        let eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
 
         let stx = SignedTransaction {
             txn: Transaction {
@@ -11387,7 +11584,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = eval.verify_then_test_group(&[stx]).unwrap_err();
+        let err = eval.transaction_group(&[stx]).unwrap_err();
         assert!(
             err.to_string().contains("no signature"),
             "expected no-signature error, got: {err}"
@@ -11496,8 +11693,13 @@ mod tests {
         let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
 
         // Build a single transaction and submit it twice in the same group.
-        // Both copies are identical so they have the same txid.
-        let stx = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
+        // Both copies are identical so they have the same txid. (A real group:
+        // go rejects ungrouped transactions submitted together before any
+        // duplicate is looked for.)
+        let mut stx = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
+        stx.txn.group =
+            algo_validate::rules::compute_group_id(&[stx.txn.clone(), stx.txn.clone()]).0;
+        stx.sig = sign_txn(&stx.txn, &key);
         let err = eval.transaction_group(&[stx.clone(), stx]).unwrap_err();
         assert!(
             err.to_string().contains("transaction already in ledger"),
@@ -11525,6 +11727,10 @@ mod tests {
         let mut stx2 = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
         stx2.txn.lease = lease;
         stx2.txn.note = ByteBuf::from(vec![0x02]);
+        let gid = algo_validate::rules::compute_group_id(&[stx1.txn.clone(), stx2.txn.clone()]).0;
+        stx1.txn.group = gid;
+        stx2.txn.group = gid;
+        stx1.sig = sign_txn(&stx1.txn, &key);
         stx2.sig = sign_txn(&stx2.txn, &key);
 
         let err = eval.transaction_group(&[stx1, stx2]).unwrap_err();
@@ -12057,7 +12263,7 @@ mod tests {
                     .contains(&format!("txn 0: Unknown field: {field}")),
                 "{err}"
             );
-            assert!(eval.test_transaction_group(&[stx]).is_err());
+            assert!(eval.validate_group_stateless_inner(&[stx]).is_err());
             assert_eq!(eval.pay_set_size(), 0, "never reaches a proposal");
         }
         // The same txn without flags is fine and proposes a valid block.
@@ -12094,7 +12300,7 @@ mod tests {
         stx.txn.genesis_id = String::new();
         stx.has_genesis_id = true;
         assert!(eval
-            .test_transaction_group(std::slice::from_ref(&stx))
+            .validate_group_stateless_inner(std::slice::from_ref(&stx))
             .is_err());
         assert!(eval.transaction_group(&[stx]).is_err());
         assert_eq!(eval.pay_set_size(), 0, "must never reach a proposal");
@@ -12414,8 +12620,9 @@ mod tests {
             .transaction_group(&[stx_a])
             .expect_err("a lone member of a real 2-member atomic group must be rejected");
         assert!(
-            err.to_string().contains("mismatch"),
-            "expected a group-ID mismatch rejection, got: {err}"
+            err.to_string()
+                .contains("transactionGroup: incomplete group: "),
+            "expected go's incomplete-group rejection, got: {err}"
         );
     }
 

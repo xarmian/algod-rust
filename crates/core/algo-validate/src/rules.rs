@@ -1645,8 +1645,101 @@ pub fn validate_transaction_group(txns: &[SignedTransaction]) -> Result<(), Algo
 /// multi-member atomic group alone must be rejected (go-algorand's
 /// `TestGroupTransactions`), because the hash recomputed over the submitted
 /// slice alone will not match the stamped multi-element group ID.
+///
+/// The group-ID rules are go's `checkTxnGroupID` (`data/transactions/checks.go`,
+/// reached from `verify.TxnGroup` through `CheckTxnGroup`), with go's texts,
+/// via [`GroupIdChecker`], which the gossip test stage
+/// (`TestTransactionGroup`) shares (issue #2184): the whole submitted slice is
+/// the group, so one member with another member's group ID, or an ungrouped
+/// member submitted next to others, is rejected like go does.
 pub fn validate_transaction_group_strict(txns: &[SignedTransaction]) -> Result<(), AlgoError> {
-    validate_transaction_group_inner(txns, true)
+    if txns.len() > MAX_GROUP_SIZE {
+        return Err(AlgoError::Validation {
+            message: format!(
+                "transaction group has {} members, maximum is {MAX_GROUP_SIZE}",
+                txns.len()
+            ),
+        });
+    }
+    let Some(first) = txns.first() else {
+        return Ok(());
+    };
+    let mut ids = GroupIdChecker::new(&first.txn, txns.len());
+    for (index, stx) in txns.iter().enumerate() {
+        ids.check_member(index, &stx.txn)
+            .map_err(|message| AlgoError::Validation { message })?;
+    }
+    ids.finish()
+        .map_err(|message| AlgoError::Validation { message })
+}
+
+/// go's group-ID consistency rules (`checkTxnGroupID` in
+/// `data/transactions/checks.go`, and the same per-member checks inside
+/// `BlockEvaluator.TestTransactionGroup`), one member at a time so a caller
+/// can interleave its own per-member checks the way go's test stage does.
+/// Errors are go's `TxGroupMalformedError` texts, verbatim.
+///
+/// The hashes are over the transactions AS SUBMITTED (what the submitter
+/// signed the group ID over), whatever genesis fields a caller restores for
+/// its txids.
+pub struct GroupIdChecker {
+    size: usize,
+    group_id: [u8; 32],
+    hashes: Vec<Digest>,
+}
+
+impl GroupIdChecker {
+    /// `first` is the group's first transaction, `size` the member count.
+    pub fn new(first: &Transaction, size: usize) -> Self {
+        Self {
+            size,
+            group_id: first.group,
+            hashes: Vec::new(),
+        }
+    }
+
+    /// Check member `index` (in group order) against the first member's group.
+    pub fn check_member(&mut self, index: usize, txn: &Transaction) -> Result<(), String> {
+        if txn.group != self.group_id {
+            return Err(format!(
+                "transactionGroup: inconsistent group values: {} != {}",
+                Digest(txn.group),
+                Digest(self.group_id)
+            ));
+        }
+        if txn.group != [0u8; 32] {
+            let mut ungrouped = txn.clone();
+            ungrouped.group = [0u8; 32];
+            self.hashes.push(algo_codec::compute_txn_id(&ungrouped));
+        } else if self.size > 1 {
+            return Err(format!(
+                "transactionGroup: [{index}] had zero Group but was submitted in a group of {}",
+                self.size
+            ));
+        }
+        Ok(())
+    }
+
+    /// After every member passed: a non-zero group ID must be the hash of
+    /// exactly these members (go: "incomplete group").
+    pub fn finish(self) -> Result<(), String> {
+        if self.hashes.is_empty() {
+            return Ok(());
+        }
+        let computed = algo_codec::compute_group_id_from_hashes(&self.hashes);
+        if self.group_id == computed.0 {
+            return Ok(());
+        }
+        // go prints the `TxGroup` struct with `%v`: the embedded
+        // domain-separator struct is `{}`, then the hashes.
+        let listed: Vec<String> = self.hashes.iter().map(ToString::to_string).collect();
+        Err(format!(
+            "transactionGroup: incomplete group: {} != {} ({{{{}} [{}]}})",
+            Digest(self.group_id),
+            computed,
+            listed.join(" ")
+        ))
+    }
 }
 
 fn validate_transaction_group_inner(
@@ -2619,12 +2712,12 @@ mod tests {
         // Lenient (block-replay) mode still accepts it unchanged.
         assert!(validate_transaction_group(&signed).is_ok());
 
-        // Strict (pool-admission) mode must reject it as a group-ID mismatch.
+        // Strict (pool-admission) mode must reject it, with go's text.
         let err = validate_transaction_group_strict(&signed).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("mismatch"),
-            "expected group ID mismatch error, got: {msg}"
+            msg.contains("transactionGroup: incomplete group: "),
+            "expected go's incomplete-group error, got: {msg}"
         );
     }
 

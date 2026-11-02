@@ -2769,6 +2769,14 @@ struct OrderScenario {
     group: Vec<SignedTransaction>,
     test_error: String,
     add_error: String,
+    /// Issue #2184: go's apply verdict is not that of any admission path the
+    /// evaluator's apply stage models (go's gossip handler runs the test
+    /// stage before any signature check, its REST path verifies first), so
+    /// only the test stage is compared.
+    skip_apply: bool,
+    /// `"frame"`: the test error is compared up to `transaction <txid>:
+    /// malformed: ` only (the reason is `WellFormed`'s own wording, #2193).
+    frame_only: bool,
 }
 
 fn oracle_b64(s: &str) -> Vec<u8> {
@@ -2839,6 +2847,8 @@ fn order_oracle() -> (Arc<Mutex<SqliteLedger>>, Vec<OrderScenario>) {
             group: txns(&s["group"]),
             test_error: text(&s["test_error"]),
             add_error: text(&s["add_error"]),
+            skip_apply: s["skip_apply"].as_bool().unwrap_or(false),
+            frame_only: s["test_compare"].as_str() == Some("frame"),
         })
         .collect();
     (Arc::new(Mutex::new(l)), scenarios)
@@ -2879,12 +2889,9 @@ fn pool_evaluator_matches_go_per_transaction_order() {
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
-        // go's `TxnNotWellFormedError` frame (`transaction <txid>: malformed: `)
-        // is compared; the reason after it is `WellFormed`'s own wording per
-        // rule, which this crate words differently (tracked separately).
-        let frame = |text: &str| match text.find(": malformed: ") {
-            Some(at) => text[..at + ": malformed: ".len()].to_string(),
-            None => text.to_string(),
+        let frame = |text: &str| match (sc.frame_only, text.find(": malformed: ")) {
+            (true, Some(at)) => text[..at + ": malformed: ".len()].to_string(),
+            _ => text.to_string(),
         };
         if frame(&test) != frame(&sc.test_error) {
             mismatches.push(format!(
@@ -2892,13 +2899,7 @@ fn pool_evaluator_matches_go_per_transaction_order() {
                 sc.name, sc.test_error, test
             ));
         }
-        // The `gossip_*` rows (issue #2184) pin go's TEST stage only: go's
-        // gossip handler runs it before any signature check, while go's REST
-        // path verifies first (`verify.TxnGroup`) and its apply stage orders
-        // the group checks differently, so go's apply verdict on these rows is
-        // not the verdict of any admission path this evaluator's apply stage
-        // models.
-        if add != sc.add_error && !sc.name.starts_with("gossip_") {
+        if add != sc.add_error && !sc.skip_apply {
             mismatches.push(format!(
                 "{} (apply stage)\n  go:   {:?}\n  rust: {:?}",
                 sc.name, sc.add_error, add
