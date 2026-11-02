@@ -39,7 +39,9 @@
 //!   commit one after the other (see the split-commit note on
 //!   [`crate::SqliteLedger::open_split`]), so a reader can observe the
 //!   tracker at round `N` while the block row for `N` is not visible yet.
-//!   A *found* row is always served (its block commit finished). A *miss*
+//!   A *found* row at or below the committed tracker round is served (its
+//!   block commit finished); a row above it (the archive commits a block
+//!   BEFORE its tracker transaction, DIV-009) reads as a miss. A *miss*
 //!   is never trusted when the committed tracker round says the row should
 //!   exist (`round <= committed`): it is reported as
 //!   [`PoolRead::Fallback`] and the caller takes the locked path, which is
@@ -76,6 +78,17 @@ use crate::sqlite::{
     SqliteLedger, CTYPE_APP, CTYPE_ASSET,
 };
 use crate::store_trait::{BoxPage, LedgerStore};
+
+/// Sub-select for the committed tracker round, appended to the pool's block-row
+/// reads (DIV-009): the block archive may be one block AHEAD of the tracker
+/// (the archive row is committed before the block's tracker transaction), and
+/// the pool serves committed state only, so such a row reads as a miss beyond
+/// the committed round (`NotFound`), exactly as before the archive-first order.
+macro_rules! committed_round_sql {
+    () => {
+        "coalesce((SELECT rnd FROM acctrounds WHERE id = 'acctbase'), -1)"
+    };
+}
 
 /// Idle connections kept for reuse; bursts above this open (and later close)
 /// extra connections rather than queueing.
@@ -271,7 +284,10 @@ impl LedgerReadPool {
     pub fn block_data(&self, round: u64) -> PoolRead<Vec<u8>> {
         self.block_row(
             round,
-            "SELECT blkdata FROM blockdb.blocks WHERE rnd = ?1",
+            concat!(
+                "SELECT blkdata FROM blockdb.blocks WHERE rnd = ?1 AND rnd <= ",
+                committed_round_sql!()
+            ),
             |row| row.get::<_, Vec<u8>>(0).map(Some),
         )
     }
@@ -280,7 +296,10 @@ impl LedgerReadPool {
     pub fn block_header_data(&self, round: u64) -> PoolRead<Vec<u8>> {
         self.block_row(
             round,
-            "SELECT hdrdata FROM blockdb.blocks WHERE rnd = ?1",
+            concat!(
+                "SELECT hdrdata FROM blockdb.blocks WHERE rnd = ?1 AND rnd <= ",
+                committed_round_sql!()
+            ),
             |row| row.get::<_, Vec<u8>>(0).map(Some),
         )
     }
@@ -289,7 +308,10 @@ impl LedgerReadPool {
     pub fn block_proto(&self, round: u64) -> PoolRead<String> {
         self.block_row(
             round,
-            "SELECT proto FROM blockdb.blocks WHERE rnd = ?1",
+            concat!(
+                "SELECT proto FROM blockdb.blocks WHERE rnd = ?1 AND rnd <= ",
+                committed_round_sql!()
+            ),
             |row| row.get::<_, String>(0).map(Some),
         )
     }
@@ -300,11 +322,14 @@ impl LedgerReadPool {
     /// `Found(Option<..>)` only for rows that exist.
     pub fn block_cert(&self, round: u64) -> PoolRead<Option<Vec<u8>>> {
         let hit = self.with_conn(|c| {
-            c.prepare_cached("SELECT certdata FROM blockdb.blocks WHERE rnd = ?1")?
-                .query_row(params![round as i64], |row| {
-                    row.get::<_, Option<Vec<u8>>>(0)
-                })
-                .optional()
+            c.prepare_cached(concat!(
+                "SELECT certdata FROM blockdb.blocks WHERE rnd = ?1 AND rnd <= ",
+                committed_round_sql!()
+            ))?
+            .query_row(params![round as i64], |row| {
+                row.get::<_, Option<Vec<u8>>>(0)
+            })
+            .optional()
         });
         match hit {
             Ok(Some(cert)) => PoolRead::Found(cert),

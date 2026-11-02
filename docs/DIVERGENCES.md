@@ -60,6 +60,7 @@ consensus-compatible. It exists for three readers:
 | DIV-006 | A network preset's bundled `consensus.json` (aramidmain) contributes only protocol versions the binary does not already define; go loads every entry of a `consensus.json` wholesale | `--network aramidmain` consensus table | landed | 2026-10-25 | none (the aramidmain chain only ever uses `aramidmain-v1.0/1..3`, which are loaded exactly as go loads them; the file's stale copies of `future`/`v7`..`v12`/spec-URL protocols are never used by that chain) | `crates/core/algo-types/src/consensus.rs` (`preload_consensus_protocols_with_bundle`), `bin/algod-rust/src/commands/network_common.rs` | `config/config.go` (`PreloadConfigurableConsensusProtocols`), `config/consensus.go` (`ConsensusProtocols.Merge`) | `aramidmain_consensus_test.rs` (`custom_protocols_merge_like_go`, `bundle_adds_only_unknown_protocols`, `data_dir_file_overrides_bundle`) and the live aramidmain catchup + follow (#2070) |
 | DIV-007 | `simulate` serves only `Request.Round` = the latest round; an earlier round is rejected with go's `round %d before dbRound %d` (dbRound = latest), where go serves any round back to its tracker `dbRound` | simulate (`POST /v2/transactions/simulate` with `round`) | landed | 2026-10-31 | none (affects only whether a simulate request with a past round is served; no block, state or consensus path) | `crates/core/algo-ledger/src/simulation/mod.rs` (`Simulator::simulate`) | `ledger/simulation/simulator.go` (`Simulate`, `simulatorLedger.start`), `ledger/acctupdates.go` (`RoundOffsetError`) | `simulation_gaps_test.rs` (`start_round_selection`, `simulate_at_a_past_round_is_rejected_not_evaluated_on_latest_state`, `simulate_round_before_db_round_is_rejected`); the latest-round path stays proven by the #2118 go oracle (`simulation_rewards_oracle_test.rs`) |
 | DIV-008 | The ledger checkpoints the tracker WAL (PASSIVE, `main` only) every time it opens a `ReadSnapshot`, under the ledger lock; go has no long-lived read snapshot | ledger SQLite WAL maintenance (pool evaluator snapshot) | landed | 2026-11-02 | none (a checkpoint only copies committed pages from the WAL into the database file; durability settings unchanged) | `crates/core/algo-ledger/src/sqlite.rs` (`SqliteLedger::open_read_snapshot`, `checkpoint_tracker_wal_for_snapshot`), `crates/core/algo-ledger/src/follow_timing.rs` (metrics) | `util/db/dbutil.go` (`_journal_mode=wal`, default `wal_autocheckpoint`) | `wal_overlapping_reader_test.rs` (WAL bound, foreign-reader limit, 40 randomized kills, cost benchmark), live betanet follow, replay-corpus final-state equality (#2166) |
+| DIV-009 | The block archive row of a block is committed on its own, before the tracker transaction of that block (go: blockdb commit, then trackers lag); a ledger crash leaves the archive at most one block ahead of the tracker | ledger SQLite commit order (`put_block` / `put_block_cert` inside a block span) | landed | 2026-11-02 | none (same files, schema and rows; the archive row becomes durable earlier, durability settings unchanged) | `crates/core/algo-ledger/src/sqlite.rs` (`SqliteLedger::put_block`, `put_block_cert`, `in_archive_first_commit`, `abort_block_state`, `open_split` note) | `ledger/ledger.go` (`AddValidatedBlock`: `blockQ.putBlock` before `trackers.newBlock`), `ledger/tracker.go` (`loadFromDisk`) | `wal_overlapping_reader_test.rs` (failpoint crash at every commit step, randomized hard kills, rollback test, cost benchmark) (#2209) |
 
 ## Entries
 
@@ -418,7 +419,7 @@ archive's own WAL stays at its normal ~4 MB autocheckpoint cycle), against
 ledger process that commits with snapshot handovers (so kills land inside
 commits and checkpoints) reopen with every reported round and pass
 `PRAGMA integrity_check` on both files (a kill between the tracker and block
-archive commits is a separate, older problem, #2209). The replay-corpus tier
+archive commits was a separate, older problem, fixed by DIV-009, #2209). The replay-corpus tier
 (small, testnet-prefix50, testnet-head) ends on the same final state as
 `corpus.json`.
 
@@ -428,3 +429,71 @@ call in `open_read_snapshot`.
 **How go-algorand could port it.** go has no such long-lived snapshot; the
 lesson applies to any reader that is replaced rather than released between
 commits: checkpoint in the gap between the two.
+
+### DIV-009 — commit the block archive row before the block's tracker transaction
+
+**Status:** landed (#2209).
+
+**What go-algorand does.** The block is written to the block database first
+(`Ledger.AddValidatedBlock`: `l.blockQ.putBlock(blk, cert)`, which waits for the
+blockdb commit) and only then handed to the trackers (`l.trackers.newBlock`).
+The tracker database commits later in the background, so the tracker is always
+behind or level with blockdb (`dbRound` plus in-memory deltas); at startup
+`trackerRegistry.loadFromDisk` replays the missing blocks forward. A crash at
+any point leaves trackers <= blocks.
+
+**What algod-rust did.** `SqliteLedger` keeps the tracker as the `main` schema
+and attaches the block file as `blockdb`; `begin_block` opens one
+`BEGIN IMMEDIATE` over both, and the follower wrote the block row
+(`put_block`, `put_block_cert`) inside it. SQLite commits the databases of one
+transaction file by file in attach order (tracker first), and in WAL mode that
+is not atomic across files, so the block row became durable after the tracker
+commit that depends on it. A hard kill between the two left the tracker one
+round ahead of the archive, and `SqliteLedger::open` refused the ledger
+(`ledger inconsistency: acctrounds.acctbase reports round N already committed,
+but blockdb.blocks has no row for it`): 2 of 40 randomized kills in the #2166
+kill test.
+
+**What algod-rust does instead.** While nothing has been written in the block
+span yet (`conn.total_changes()` equals its value at `begin_block`, which holds
+for the follower: block rows are its first writes), `put_block` and
+`put_block_cert` end the still empty span transaction, write the archive row as
+its own durable transaction, and begin the span again
+(`SqliteLedger::in_archive_first_commit`). The archive commit is therefore
+strictly before the tracker commit, as in go, and a crash leaves the archive at
+most one block ahead of the tracker (`CrossFileState::Consistent`), a state the
+node already handles (sync stores blocks ahead of applying them): the follower
+commits that block again, `put_block` being an upsert. If the block does not
+commit (rollback, failed COMMIT), `abort_block_state` deletes the archive rows
+the block newly created, so the archive does not keep a block the tracker never
+applied (a crash in that window leaves the same one-block-ahead state). A write
+made after tracker rows were already written in the span (genesis seeding at
+round 0, the header `flush_chain_state` synthesizes for a block without
+`put_block`) is still committed together with the tracker, as before; the
+open-time guard from #1633 stays for the one case it protects (tracker at a
+non-zero round, archive without its row).
+
+**Cost.** One extra commit per block. Measured with the `#[ignore]`d
+`bench_block_commit_archive_first` (release build, Windows NVMe, 400 blocks of a
+60 KB body, whole `begin_block`..`commit_block`): `synchronous=FULL` (the
+default) 0.95-1.00 ms before, 1.28-1.30 ms after (+0.3 ms, the second WAL
+fsync is now a separate commit); `synchronous=NORMAL` 0.40-0.44 ms before,
+0.43-0.46 ms after (no measurable change). About 0.3 ms per block against a
+2.8 s round.
+
+**What is identical.** Files, schema, rows, journal mode, `synchronous`, what
+every reader sees after a block commits, and what a ledger contains after a
+clean run.
+
+**How parity is proven.** Nothing consensus-visible changes. Failpoint crashes
+at `after_archive_commit`, `before_tracker_commit` and `after_tracker_commit`
+(five block offsets each) and hundreds of randomized process kills reopen,
+never have the tracker ahead of the archive, keep every reported round with its
+block and certificate, pass `PRAGMA integrity_check`, and after the follower
+resumes end on the state (account, rounds, every block and certificate) of an
+uninterrupted run over the same blocks (`wal_overlapping_reader_test`).
+
+**How to switch back.** Make `span_is_clean` return false; every write is then
+committed with the tracker as before (and the kill window returns).
+
+**How go-algorand could port it.** go already has this order; nothing to port.
