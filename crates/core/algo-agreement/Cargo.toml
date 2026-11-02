@@ -27,6 +27,7 @@ rand_chacha = "0.10"
 serde_json.workspace = true
 sha2.workspace = true
 tracing-subscriber.workspace = true
+criterion.workspace = true
 
 [dependencies]
 algo-codec.workspace = true
@@ -45,4 +46,22 @@ sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 crossbeam-channel.workspace = true
+rayon.workspace = true
 zstd.workspace = true
+
+[[bench]]
+name = "bundle_verify"
+harness = false
+required-features = ["test-support"]
+
+[[test]]
+name = "bundle_verify_equivalence"
+required-features = ["test-support"]
+
+[[test]]
+name = "bundle_verify_cancellation"
+required-features = ["test-support"]
+
+[[test]]
+name = "bundle_verify_memory"
+required-features = ["test-support"]

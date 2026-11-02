@@ -27,6 +27,8 @@ pub mod actions;
 pub mod block_factory_bridge;
 pub mod block_validator_bridge;
 mod bundle;
+#[cfg(any(test, feature = "test-support"))]
+mod bundle_reference;
 mod certificate;
 pub mod clock;
 pub mod codec;
@@ -64,6 +66,9 @@ pub mod vote_aggregator;
 pub mod vote_auxiliary;
 pub mod vote_tracker;
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use bundle::VOTE_VERIFY_RUNS;
 pub use bundle::{
     Bundle, BundleError, EquivocationVoteAuthenticator, UnauthenticatedBundle, VoteAuthenticator,
 };

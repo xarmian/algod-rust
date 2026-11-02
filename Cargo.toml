@@ -173,6 +173,7 @@ url = "2"
 hickory-resolver = { version = "0.26", features = ["dnssec-ring", "tokio"] }
 regex = "1"
 crossbeam-channel = "0.5"
+rayon = "1.12"
 
 # TLS
 tokio-rustls = "0.26"

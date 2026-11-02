@@ -26,14 +26,19 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use algo_consensus_crypto::OneTimeSignature;
-use algo_types::{Address, Round};
+use algo_types::{Address, ConsensusParams, Round};
 
-use crate::credential::UnauthenticatedCredential;
-use crate::ledger_reader::{membership_from_ledger, LedgerError, LedgerReader};
+use crate::credential::{Membership, UnauthenticatedCredential};
+use crate::ledger_reader::{LedgerError, LedgerReader, OnlineAccountData};
+use crate::lookback::{balance_round, params_round, seed_round};
+use crate::seed::Seed;
+use crate::selector::Selector;
 use crate::step::{Period, Step, DOWN, PROPOSE};
-use crate::vote::{ProposalValue, RawVote, UnauthenticatedVote, Vote, VoteVerifyParams};
+use crate::vote::{ProposalValue, RawVote, UnauthenticatedVote, Vote, VoteVerifyView};
 
 // ── VoteAuthenticator ───────────────────────────────────────────────────────
 
@@ -210,14 +215,49 @@ impl UnauthenticatedBundle {
     /// Mirrors Go's `unauthenticatedBundle.verify()`.
     ///
     /// Steps:
-    /// 1. Well-formedness (step bound check), as defense in depth
-    /// 2. Reject propose step
-    /// 3. Check bundle is not too large
-    /// 4. Check for duplicate voters
-    /// 5. For each vote: reconstruct the UnauthenticatedVote, look up
-    ///    membership from the ledger, and verify credential + OTS
-    /// 6. Sum weights and check quorum
+    /// 1. Well-formedness, propose-step, size and duplicate-voter checks
+    ///    ([`Self::verify_preconditions`])
+    /// 2. For each vote, plain votes first and then equivocation votes, in
+    ///    bundle order: reconstruct the vote, look up its membership from the
+    ///    ledger, and verify credential + one-time signature
+    /// 3. Sum weights and check quorum ([`Self::finish`])
+    ///
+    /// Step 2 looks the memberships up in order on the calling thread and runs
+    /// the pure signature, VRF and sortition checks (~90% of the time) on a
+    /// bounded pool, a wave of votes at a time, like go's `AsyncVoteVerifier`.
+    /// The result is exactly that of one-by-one verification: the error of
+    /// the first failing vote in bundle order (`verify_in_waves`). A bundle
+    /// that fails stops after at most one wave: later waves, and the
+    /// equivocation votes once a plain vote has failed, are never looked up
+    /// or verified.
+    ///
+    /// This blocks the calling thread until the votes are verified. Its only
+    /// caller is the catchup service (`CatchupLedger::authenticate_block`),
+    /// which runs on dedicated threads, never on an async worker; an async
+    /// caller would have to use `spawn_blocking`.
     pub fn verify(&self, l: &dyn LedgerReader) -> Result<Bundle, BundleError> {
+        let proto = self.verify_preconditions(l)?;
+
+        let mut cache = MembershipCache::new(l, self.round, self.period, self.step);
+        let n_votes = self.votes.len();
+        let mut verified = Vec::with_capacity(n_votes + self.equivocation_votes.len());
+        verify_in_waves(self.votes.len(), &mut verified, |i| {
+            self.prepare_single_vote(&mut cache, &self.votes[i], i)
+        })?;
+        verify_in_waves(self.equivocation_votes.len(), &mut verified, |i| {
+            self.prepare_equivocation_vote(&mut cache, &self.equivocation_votes[i], n_votes + i)
+        })?;
+
+        self.finish(&proto, verified)
+    }
+
+    /// The checks before any vote is looked at: well-formedness, the propose
+    /// step, the bundle size and duplicate voters. Returns the consensus
+    /// parameters used for the thresholds.
+    pub(crate) fn verify_preconditions(
+        &self,
+        l: &dyn LedgerReader,
+    ) -> Result<ConsensusParams, BundleError> {
         self.well_formed()?;
 
         // Step 1: reject propose step
@@ -257,35 +297,28 @@ impl UnauthenticatedBundle {
                 return Err(BundleError::DuplicateVoter(auth.sender));
             }
         }
+        Ok(proto)
+    }
 
-        // Step 4: verify each vote
-        let mut verified_votes = Vec::with_capacity(self.votes.len());
-        let mut total_weight: u64 = 0;
-
-        for (i, auth) in self.votes.iter().enumerate() {
-            let vote = self.verify_single_vote(l, auth, i)?;
-            total_weight += vote.cred.weight;
-            verified_votes.push(vote);
-        }
-
-        // Equivocation votes: verify each proposal separately
-        for (i, auth) in self.equivocation_votes.iter().enumerate() {
-            let idx = self.votes.len() + i;
-            // Verify both signatures of the equivocation vote.
-            // Each one is effectively a vote for a different proposal.
-            // For simplicity and correctness we verify the first proposal's vote
-            // (credential verification only needs to happen once since both are
-            // from the same sender in the same round/period/step).
-            let vote = self.verify_equivocation_vote(l, auth, idx)?;
-            total_weight += vote.cred.weight;
-            verified_votes.push(vote);
-        }
+    /// Sum the verified votes' weights and check quorum.
+    ///
+    /// The sum wraps like go's plain `uint64` addition
+    /// (`agreement/bundle.go`, `weight += res.v.Cred.Weight`): no panic on
+    /// peer-supplied weights, same value as go.
+    pub(crate) fn finish(
+        &self,
+        proto: &ConsensusParams,
+        verified_votes: Vec<Vote>,
+    ) -> Result<Bundle, BundleError> {
+        let total_weight = verified_votes
+            .iter()
+            .fold(0u64, |sum, v| sum.wrapping_add(v.cred.weight));
 
         // Step 5: check quorum
-        if !self.step.reaches_quorum(&proto, total_weight) {
+        if !self.step.reaches_quorum(proto, total_weight) {
             return Err(BundleError::InsufficientQuorum {
                 weight: total_weight,
-                threshold: self.step.committee_threshold(&proto),
+                threshold: self.step.committee_threshold(proto),
             });
         }
 
@@ -296,13 +329,15 @@ impl UnauthenticatedBundle {
         })
     }
 
-    /// Verify a single vote authenticator from the bundle.
-    fn verify_single_vote(
+    /// Look up the membership for a plain vote and assemble its
+    /// verification work, or the lookup failure the sequential code
+    /// reported at this index.
+    fn prepare_single_vote(
         &self,
-        l: &dyn LedgerReader,
+        cache: &mut MembershipCache<'_>,
         auth: &VoteAuthenticator,
         index: usize,
-    ) -> Result<Vote, BundleError> {
+    ) -> Result<VoteWork, BundleError> {
         // Reconstruct the full UnauthenticatedVote
         let uv = UnauthenticatedVote {
             raw_vote: RawVote {
@@ -316,115 +351,303 @@ impl UnauthenticatedBundle {
             sig: auth.sig.clone(),
         };
 
-        // Look up membership from ledger
         let (membership, record, proto) =
-            membership_from_ledger(l, &auth.sender, self.round, self.period, self.step).map_err(
-                |e| BundleError::VoteVerificationFailed {
+            cache
+                .membership(&auth.sender)
+                .map_err(|e| BundleError::VoteVerificationFailed {
                     index,
                     detail: format!("could not get membership: {e}"),
-                },
-            )?;
+                })?;
 
-        let params = VoteVerifyParams {
+        Ok(VoteWork {
+            index,
+            first: uv,
+            second: None,
             membership,
-            vote_id: record.vote_id,
-            vote_first_valid: record.vote_first_valid,
-            vote_last_valid: record.vote_last_valid,
-            vote_key_dilution: record.vote_key_dilution,
+            record,
             consensus_params: proto,
-        };
-
-        uv.verify(&params)
-            .map_err(|e| BundleError::VoteVerificationFailed {
-                index,
-                detail: e.to_string(),
-            })
+        })
     }
 
-    /// Verify an equivocation vote authenticator.
+    /// Assemble the verification work of an equivocation vote.
     ///
     /// In Go, equivocation votes prove that a sender voted for two different
     /// proposals. For bundle verification, we verify the credential once and
     /// verify both OTS signatures against the two different proposals.
-    fn verify_equivocation_vote(
+    fn prepare_equivocation_vote(
         &self,
-        l: &dyn LedgerReader,
+        cache: &mut MembershipCache<'_>,
         auth: &EquivocationVoteAuthenticator,
         index: usize,
-    ) -> Result<Vote, BundleError> {
+    ) -> Result<VoteWork, BundleError> {
         // Reject if both proposals are identical — that's not real equivocation.
         // Mirrors Go's unauthenticatedEquivocationVote.verify() check.
         if auth.proposals[0] == auth.proposals[1] {
             return Err(BundleError::IdenticalEquivocationProposals);
         }
 
-        // Verify the first proposal's vote (this checks credential + first OTS)
-        let uv1 = UnauthenticatedVote {
+        let vote_for = |i: usize| UnauthenticatedVote {
             raw_vote: RawVote {
                 sender: auth.sender,
                 round: self.round,
                 period: self.period,
                 step: self.step,
-                proposal: auth.proposals[0],
+                proposal: auth.proposals[i],
             },
             cred: auth.cred.clone(),
-            sig: auth.sigs[0].clone(),
+            sig: auth.sigs[i].clone(),
         };
 
         let (membership, record, proto) =
-            membership_from_ledger(l, &auth.sender, self.round, self.period, self.step).map_err(
-                |e| BundleError::VoteVerificationFailed {
+            cache
+                .membership(&auth.sender)
+                .map_err(|e| BundleError::VoteVerificationFailed {
                     index,
                     detail: format!("could not get membership for equivocation vote: {e}"),
-                },
-            )?;
+                })?;
 
-        let params = VoteVerifyParams {
-            membership: membership.clone(),
-            vote_id: record.vote_id,
-            vote_first_valid: record.vote_first_valid,
-            vote_last_valid: record.vote_last_valid,
-            vote_key_dilution: record.vote_key_dilution,
-            consensus_params: proto.clone(),
+        Ok(VoteWork {
+            index,
+            first: vote_for(0),
+            second: Some(vote_for(1)),
+            membership,
+            record,
+            consensus_params: proto,
+        })
+    }
+}
+
+/// Number of per-vote verifications `UnauthenticatedBundle::verify` has run
+/// (test builds only): lets tests pin that an invalid bundle stops early.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub static VOTE_VERIFY_RUNS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// One vote's pure verification work (everything the ledger had to supply
+/// is already in it). `second` is the equivocation vote's second proposal;
+/// a plain vote has none.
+struct VoteWork {
+    index: usize,
+    first: UnauthenticatedVote,
+    second: Option<UnauthenticatedVote>,
+    membership: Membership,
+    record: OnlineAccountData,
+    /// Shared by every vote of the bundle.
+    consensus_params: Arc<ConsensusParams>,
+}
+
+impl VoteWork {
+    /// Verify the vote (credential and first signature, then the second
+    /// signature of an equivocation pair) with the sequential code's exact
+    /// errors. The returned vote is the first one: an equivocation's weight
+    /// counts once.
+    fn verify(&self) -> Result<Vote, BundleError> {
+        #[cfg(any(test, feature = "test-support"))]
+        VOTE_VERIFY_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let index = self.index;
+        let view = VoteVerifyView {
+            membership: &self.membership,
+            vote_id: &self.record.vote_id,
+            vote_first_valid: self.record.vote_first_valid,
+            vote_last_valid: self.record.vote_last_valid,
+            vote_key_dilution: self.record.vote_key_dilution,
+            consensus_params: &self.consensus_params,
         };
+        let vote1 = self.first.verify_view(&view).map_err(|e| {
+            let detail = if self.second.is_some() {
+                format!("equivocation vote first proposal failed: {e}")
+            } else {
+                e.to_string()
+            };
+            BundleError::VoteVerificationFailed { index, detail }
+        })?;
+        if let Some(second) = &self.second {
+            second
+                .verify_view(&view)
+                .map_err(|e| BundleError::VoteVerificationFailed {
+                    index,
+                    detail: format!("equivocation vote second proposal failed: {e}"),
+                })?;
+        }
+        Ok(vote1)
+    }
+}
 
-        let vote1 = uv1
-            .verify(&params)
-            .map_err(|e| BundleError::VoteVerificationFailed {
-                index,
-                detail: format!("equivocation vote first proposal failed: {e}"),
-            })?;
+/// Environment variable overriding the size of the vote-verification pool.
+pub const VERIFY_THREADS_ENV: &str = "ALGOD_VOTE_VERIFY_THREADS";
 
-        // Verify the second proposal's OTS signature
-        let uv2 = UnauthenticatedVote {
-            raw_vote: RawVote {
-                sender: auth.sender,
-                round: self.round,
+/// Default pool size cap. On a 24-thread WSL2 host a 25-vote certificate
+/// verified fastest on ~8 threads (1.15 ms vs 1.65 ms on 24: more wake-ups
+/// and idle workers for no more work), so the default is
+/// `min(available_parallelism, 8)`.
+const DEFAULT_MAX_VERIFY_THREADS: usize = 8;
+
+fn verify_threads() -> usize {
+    std::env::var(VERIFY_THREADS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .min(DEFAULT_MAX_VERIFY_THREADS)
+        })
+}
+
+/// The dedicated, lazily created vote-verification pool. Separate from
+/// rayon's global pool so that verification neither competes with other
+/// rayon users nor is starved by them. `None` if the OS refused the
+/// threads: verification then runs on the calling thread.
+fn verifier_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(verify_threads())
+            .thread_name(|i| format!("bundle-verify-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+/// Votes prepared (looked up) and verified per wave: two per worker, so the
+/// workers stay busy through a wave while an invalid bundle costs at most
+/// one wave of verification.
+fn wave_size() -> usize {
+    2 * verify_threads()
+}
+
+/// Prepare and verify `n` votes in order, appending the verified votes to
+/// `out`; fails with the error of the **first** failing vote in order (a
+/// lookup failure counts at its position), which is what verifying one by
+/// one returned. `prepare(i)` does the ledger lookups of vote `i`.
+///
+/// Votes go in waves; within a wave they are verified in parallel, and a
+/// vote whose position is above an already failed one is skipped, since it
+/// can no longer change the answer (every vote below the lowest failure
+/// still runs to completion, so the answer never depends on timing).
+fn verify_in_waves(
+    n: usize,
+    out: &mut Vec<Vote>,
+    mut prepare: impl FnMut(usize) -> Result<VoteWork, BundleError>,
+) -> Result<(), BundleError> {
+    use rayon::prelude::*;
+
+    let wave = wave_size();
+    let mut next = 0;
+    while next < n {
+        let end = (next + wave).min(n);
+        let mut work = Vec::with_capacity(end - next);
+        let mut lookup_error = None;
+        for i in next..end {
+            match prepare(i) {
+                Ok(w) => work.push(w),
+                Err(e) => {
+                    lookup_error = Some(e);
+                    break;
+                }
+            }
+        }
+
+        let lowest_failed = AtomicUsize::new(usize::MAX);
+        let run = |(pos, w): (usize, &VoteWork)| {
+            if pos > lowest_failed.load(Ordering::Relaxed) {
+                return None;
+            }
+            let res = w.verify();
+            if res.is_err() {
+                lowest_failed.fetch_min(pos, Ordering::Relaxed);
+            }
+            Some(res)
+        };
+        let results: Vec<Option<Result<Vote, BundleError>>> = match verifier_pool() {
+            Some(pool) => pool.install(|| work.par_iter().enumerate().map(run).collect()),
+            None => work.iter().enumerate().map(run).collect(),
+        };
+        for res in results {
+            // `None` only follows a failed position, which returns first.
+            match res {
+                Some(Ok(vote)) => out.push(vote),
+                Some(Err(e)) => return Err(e),
+                None => unreachable!("a skipped vote follows a failed one"),
+            }
+        }
+        if let Some(e) = lookup_error {
+            return Err(e);
+        }
+        next = end;
+    }
+    Ok(())
+}
+
+/// Consensus params with the balance and seed rounds derived from them.
+type CachedParams = Result<(Arc<ConsensusParams>, Round, Round), LedgerError>;
+
+/// The ledger inputs of `membership_from_ledger` that do not depend on the
+/// voter (consensus params, circulation, seed), fetched at most once per
+/// bundle. The per-vote call order (params, account, circulation, seed) and
+/// the error each step produces are those of `membership_from_ledger`; the
+/// ledger is read at fixed lookback rounds, so a repeated call returns the
+/// same result.
+struct MembershipCache<'a> {
+    l: &'a dyn LedgerReader,
+    round: Round,
+    period: Period,
+    step: Step,
+    params: Option<CachedParams>,
+    circulation: Option<Result<u64, LedgerError>>,
+    seed: Option<Result<Seed, LedgerError>>,
+}
+
+impl<'a> MembershipCache<'a> {
+    fn new(l: &'a dyn LedgerReader, round: Round, period: Period, step: Step) -> Self {
+        Self {
+            l,
+            round,
+            period,
+            step,
+            params: None,
+            circulation: None,
+            seed: None,
+        }
+    }
+
+    fn membership(
+        &mut self,
+        addr: &Address,
+    ) -> Result<(Membership, OnlineAccountData, Arc<ConsensusParams>), LedgerError> {
+        let (l, round) = (self.l, self.round);
+        let (cparams, bal_round, seed_rnd) = self
+            .params
+            .get_or_insert_with(|| {
+                let cparams = l.consensus_params(params_round(round))?;
+                let bal = balance_round(round, &cparams);
+                let seed = seed_round(round, &cparams);
+                Ok((Arc::new(cparams), bal, seed))
+            })
+            .clone()?;
+
+        let record = l.lookup_agreement(bal_round, addr)?;
+        let total = self
+            .circulation
+            .get_or_insert_with(|| l.circulation(bal_round, round))
+            .clone()?;
+        let seed = self.seed.get_or_insert_with(|| l.seed(seed_rnd)).clone()?;
+
+        let membership = Membership {
+            address: *addr,
+            selection_id: record.selection_id,
+            balance: record.micro_algos,
+            total_money: total,
+            selector: Selector {
+                seed,
+                round,
                 period: self.period,
                 step: self.step,
-                proposal: auth.proposals[1],
             },
-            cred: auth.cred.clone(),
-            sig: auth.sigs[1].clone(),
         };
-
-        let params2 = VoteVerifyParams {
-            membership,
-            vote_id: record.vote_id,
-            vote_first_valid: record.vote_first_valid,
-            vote_last_valid: record.vote_last_valid,
-            vote_key_dilution: record.vote_key_dilution,
-            consensus_params: proto,
-        };
-
-        uv2.verify(&params2)
-            .map_err(|e| BundleError::VoteVerificationFailed {
-                index,
-                detail: format!("equivocation vote second proposal failed: {e}"),
-            })?;
-
-        // Return the first vote (weight counts once for equivocation)
-        Ok(vote1)
+        Ok((membership, record, cparams))
     }
 }
 
@@ -1053,5 +1276,55 @@ mod tests {
             pk1_sig: [0u8; 64],
             pk2_sig: [0u8; 64],
         }
+    }
+
+    /// Peer-supplied weights are summed with go's plain `uint64` wrapping
+    /// addition (`agreement/bundle.go`): a huge weight must neither panic
+    /// (debug builds) nor saturate to a different sum than go computes.
+    #[test]
+    fn finish_sums_weights_with_go_wrapping_semantics() {
+        use crate::credential::{Credential, HashableCredential};
+        use std::time::Duration;
+
+        let vote = |weight: u64| Vote {
+            raw_vote: RawVote {
+                sender: Address([1u8; 32]),
+                round: Round(100),
+                period: Period(0),
+                step: CERT,
+                proposal: BOTTOM,
+            },
+            cred: Credential {
+                weight,
+                vrf_out: Digest([0u8; 32]),
+                domain_separation_enabled: false,
+                hashable: HashableCredential::default(),
+                proof: [0u8; 80],
+            },
+            sig: make_zero_sig(),
+            validated_at: Duration::ZERO,
+        };
+        let b = UnauthenticatedBundle {
+            round: Round(100),
+            period: Period(0),
+            step: CERT,
+            proposal: BOTTOM,
+            votes: vec![],
+            equivocation_votes: vec![],
+        };
+        let proto = v41_params();
+
+        // u64::MAX + 1000 wraps to 999: below the cert threshold, so go
+        // reports 999 as the weight seen.
+        match b.finish(&proto, vec![vote(u64::MAX), vote(1000)]) {
+            Err(BundleError::InsufficientQuorum { weight, .. }) => assert_eq!(weight, 999),
+            other => panic!("expected InsufficientQuorum, got {other:?}"),
+        }
+        // u64::MAX + threshold + 1 wraps to exactly the threshold: quorum.
+        let t = CERT.committee_threshold(&proto);
+        let ok = b
+            .finish(&proto, vec![vote(u64::MAX), vote(t + 1)])
+            .expect("wrapped sum equals the threshold");
+        assert_eq!(ok.total_weight, t);
     }
 }
