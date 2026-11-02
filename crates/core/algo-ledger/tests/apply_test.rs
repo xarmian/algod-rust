@@ -2164,10 +2164,9 @@ fn test_min_balance_enforcement_with_assets() {
     let result = apply_transaction(&mut state, &stx, &ctx, 0);
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("below minimum balance"),
-        "expected min-balance error, got: {}",
+    assert_eq!(
         err_msg,
+        format!("account {sender} balance 198000 below min 200000 (1 assets)")
     );
 
     // A smaller payment that keeps sender above min balance should succeed.

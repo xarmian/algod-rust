@@ -252,13 +252,15 @@ def parse_phase_file(path: str) -> dict:
 
 # Log sources that emit routine mainnet gossip rejections (user transactions
 # that are expired, unsupported, underfunded, ...). Their messages routinely
-# contain "below minimum balance" / "insufficient balance" and are NOT a
+# contain "below min <m> (<k> assets)" / "insufficient balance" and are NOT a
 # block-apply problem.
 GOSSIP_NOISE_RE = re.compile(
     r"algo_network::tx_tag_handler|algo_network::tx_syncer|algo_network::tx_sync_pool_adapter"
     r"|PoolSolicitedTxHandler|TxSyncer|TxTagHandler|TransactionPool"
 )
-BALANCE_RE = re.compile(r"below minimum balance|insufficient balance", re.IGNORECASE)
+BALANCE_RE = re.compile(
+    r"below min \d+ \(\d+ assets\)|insufficient balance", re.IGNORECASE
+)
 NO_ADVANCE_RE = re.compile(r"ensure_block.*did not advance|did not advance.*ensure_block")
 
 # (key, regex, minimum count for the job to fail, description)
@@ -281,7 +283,7 @@ SHADOW_NOTHING_VERIFIED_RE = re.compile(
 )
 # Special hard rule needing the noise exclusion (handled in scan_line).
 BALANCE_KEY = "block_apply_balance_error"
-BALANCE_DESC = "block apply hit 'below minimum balance' / 'insufficient balance' outside the gossip tx handlers"
+BALANCE_DESC = "block apply hit 'below min <m> (<k> assets)' / 'insufficient balance' outside the gossip tx handlers"
 
 WARN_RULES = [
     ("invariant_check_warning", re.compile(r"invariant check: warning"), "post-catchup ledger invariant validation warning"),

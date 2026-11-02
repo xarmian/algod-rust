@@ -1808,6 +1808,32 @@ impl GroupCells {
     }
 }
 
+/// go's `BlockEvaluator.transaction` frames a `checkMinBalance` failure
+/// `transaction <txid>: ` (`ledger/eval/eval.go`). The top-level apply returns
+/// it typed and unframed ([`algo_error::min_balance_rejected`]); the group
+/// loops, which know the member's txid, frame it here. `idx` is the member's
+/// position in the block (the `checkDup` txid list).
+fn frame_apply_error(
+    err: AlgoError,
+    ctx: &ApplyContext,
+    genesis_rule: &algo_types::genesis_restore::GenesisRestoreRule<'_>,
+    stx: &SignedTransaction,
+    idx: usize,
+) -> AlgoError {
+    algo_error::frame_min_balance(err, || {
+        let hashed = ctx
+            .checkdup
+            .as_ref()
+            .and_then(|c| c.borrow().txids().get(idx).copied());
+        hashed
+            .unwrap_or_else(|| {
+                let (genesis_id, genesis_hash) = genesis_rule.restored_genesis(stx);
+                algo_codec::compute_txn_id_with_genesis(&stx.txn, genesis_id, genesis_hash)
+            })
+            .to_string()
+    })
+}
+
 /// Apply one atomic group; on failure everything in [`GroupCells`] is restored.
 #[allow(clippy::too_many_arguments)]
 fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
@@ -1909,6 +1935,7 @@ fn apply_group_transactions_inner<S: crate::store_trait::LedgerStore>(
                 Some(&gi),
                 tracer_ref,
             )
+            .map_err(|e| frame_apply_error(e, ctx, genesis_rule, stx, *global_txn_idx))
             .inspect_err(|_| {
                 *failed_txn = Some(*global_txn_idx);
             })?;
@@ -1916,9 +1943,11 @@ fn apply_group_transactions_inner<S: crate::store_trait::LedgerStore>(
                 out.push(ad);
             }
         } else {
-            let ad = apply_transaction(store, stx, ctx, 0).inspect_err(|_| {
-                *failed_txn = Some(*global_txn_idx);
-            })?;
+            let ad = apply_transaction(store, stx, ctx, 0)
+                .map_err(|e| frame_apply_error(e, ctx, genesis_rule, stx, *global_txn_idx))
+                .inspect_err(|_| {
+                    *failed_txn = Some(*global_txn_idx);
+                })?;
             if let Some(out) = apply_data_out.as_deref_mut() {
                 out.push(ad);
             }
@@ -5269,14 +5298,31 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                     if account == algo_types::AccountData::default() {
                         continue;
                     }
+                    // go's `checkMinBalance` covers `cow.modifiedAccounts()`, and
+                    // `Move` writes an account only when `!amt.IsZero() ||
+                    // RewardUnits > 0 || !UnfundedSenders`: a zero-amount payment
+                    // does not modify a receiver (below its minimum or not).
+                    if txn.txn_type == "pay"
+                        && txn.amount == 0
+                        && *addr == txn.receiver
+                        && *addr != txn.sender
+                        && *addr != txn.close_remainder_to
+                        && ctx.consensus.unfunded_senders
+                        && account.micro_algos / ctx.consensus.reward_unit.max(1) == 0
+                    {
+                        continue;
+                    }
                     let min_bal = store.min_balance_with_state(addr, &account);
                     if account.micro_algos < min_bal {
-                        return Err(AlgoError::Ledger {
-                            message: format!(
-                                "account {} balance {} below minimum balance {}",
-                                addr, account.micro_algos, min_bal,
-                            ),
-                        });
+                        // go `ledgercore.MinBalanceError`, typed so the pool
+                        // tags it from the class; the group loops frame it
+                        // `transaction <txid>: ` like `BlockEvaluator.transaction`.
+                        return Err(algo_error::min_balance_rejected(
+                            addr,
+                            account.micro_algos,
+                            min_bal,
+                            account.total_assets_opted_in,
+                        ));
                     }
                     // go-algorand's `BlockEvaluator.checkMinBalance`
                     // (`ledger/eval/eval.go`): "Check if we have exceeded the
@@ -12848,9 +12894,9 @@ mod tests {
         let txn_pre = pay_txn(sender, Address::default(), 0, 0);
         let err = apply_transaction(&mut store_pre, &txn_pre, &ctx_pre, 0)
             .expect_err("pre-v34 must reject a zero-balance sender (min balance violation)");
-        assert!(
-            format!("{err}").contains("below minimum balance"),
-            "unexpected error: {err}"
+        assert_eq!(
+            err.to_string(),
+            format!("account {sender} balance 0 below min 100000 (0 assets)")
         );
 
         // ── v34+: the write is skipped -- the sender stays fully
@@ -12873,7 +12919,7 @@ mod tests {
     /// `!amt.IsZero() || rewardUnits > 0 || !UnfundedSenders`; writing the
     /// rewards-bookkeeping update instead made the empty receiver non-default
     /// (`rewards_base` = current level) and tripped the min-balance check
-    /// ("balance 0 below minimum balance 100000").
+    /// ("balance 0 below min 100000 (0 assets)").
     #[test]
     fn unfunded_senders_zero_amount_payment_leaves_empty_receiver_unwritten() {
         let sender = Address([7u8; 32]);
@@ -13159,7 +13205,18 @@ mod tests {
         let mut top = make_state_with_accounts(&[(sender, 150_000), (fee_sink, 0)], fee_sink);
         let err = apply_transaction(&mut top, &txn, &ctx, 0)
             .expect_err("top-level payment below min balance must be rejected");
-        assert!(format!("{err}").contains("below minimum balance"), "{err}");
+        // go `MinBalanceError`, typed; the group loops add the txid frame
+        assert_eq!(
+            err.to_string(),
+            format!("account {sender} balance 50000 below min 100000 (0 assets)")
+        );
+        assert!(matches!(
+            err,
+            AlgoError::Rejected {
+                class: algo_error::RejectClass::MinBalance,
+                ..
+            }
+        ));
 
         let mut inner = make_state_with_accounts(&[(sender, 150_000), (fee_sink, 0)], fee_sink);
         apply_transaction(&mut inner, &txn, &ctx, 1)
@@ -13185,7 +13242,18 @@ mod tests {
         let mut top = make_state_with_accounts(&[(sender, 150_000), (fee_sink, 0)], fee_sink);
         let err = apply_transaction(&mut top, &txn, &ctx, 0)
             .expect_err("top-level payment below min balance must be rejected");
-        assert!(format!("{err}").contains("below minimum balance"), "{err}");
+        // go `MinBalanceError`, typed; the group loops add the txid frame
+        assert_eq!(
+            err.to_string(),
+            format!("account {sender} balance 50000 below min 100000 (0 assets)")
+        );
+        assert!(matches!(
+            err,
+            AlgoError::Rejected {
+                class: algo_error::RejectClass::MinBalance,
+                ..
+            }
+        ));
 
         let mut inner = make_state_with_accounts(&[(sender, 150_000), (fee_sink, 0)], fee_sink);
         apply_transaction(&mut inner, &txn, &ctx, 1)
@@ -14150,10 +14218,17 @@ return
         call.txn.sender = creator;
         call.txn.fee = 2_000;
         call.txn.application_id = app_id;
+        let call_txid = algo_codec::compute_txn_id(&call.txn);
         let err =
             apply_block_with_delta_mode(&mut state, &mk_block(3, vec![call]), ApplyMode::Execute)
                 .expect_err("inner pay leaving the app account below its minimum must be rejected");
-        assert!(format!("{err}").contains("below minimum balance"), "{err}");
+        // go frames `checkMinBalance`'s error `transaction <txid>: `
+        assert!(
+            err.to_string().ends_with(&format!(
+                "transaction {call_txid}: account {app_addr} balance 50000 below min 100000 (0 assets)"
+            )),
+            "{err}"
+        );
     }
 
     /// Issue #1660 regression (live mainnet block 65589704, replayed from

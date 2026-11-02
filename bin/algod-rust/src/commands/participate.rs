@@ -1706,8 +1706,10 @@ struct SimpleBlockEvaluator {
 ///   (`data/transactions/logic/eval.go`), `logic eval error: <err>.
 ///   Details: app=<id>, pc=<pc>`.
 ///
-/// Overspend / min-balance texts keep their algod-rust wording (go prints a
-/// full `AccountData` dump there), only the category prefix is removed.
+/// A typed [`algo_error::AlgoError::Rejected`] (go's `MinBalanceError`, from the
+/// apply) keeps its text and class. The overspend text is built apart by
+/// `algo_validate::overspend::overspend_message` (go prints a full
+/// `AccountData` dump there); only the category prefix is removed here.
 fn pool_reason(e: &algo_error::AlgoError) -> (String, algo_error::RejectClass) {
     let pc = e.avm_eval_detail().map(|d| d.pc).unwrap_or(0);
     reason_of(e, pc)
@@ -1738,6 +1740,7 @@ fn reason_of(e: &algo_error::AlgoError, pc: usize) -> (String, algo_error::Rejec
                 RejectClass::TealErr,
             )
         }
+        AlgoError::Rejected { message, class, .. } => (message.clone(), *class),
         AlgoError::AvmLogicSig {
             source, message, ..
         } => match source.downcast_ref::<AlgoError>() {
@@ -2301,6 +2304,7 @@ impl SimpleBlockEvaluator {
                 Box::new(GroupReject {
                     error,
                     member: None,
+                    after_apply: false,
                     txids: Vec::new(),
                 })
             })?;
@@ -2362,6 +2366,7 @@ impl SimpleBlockEvaluator {
             Box::new(GroupReject {
                 error,
                 member: None,
+                after_apply: false,
                 txids: Vec::new(),
             })
         })?;
@@ -2374,6 +2379,7 @@ impl SimpleBlockEvaluator {
                 Box::new(GroupReject {
                     error,
                     member: Some(member),
+                    after_apply: false,
                     txids: txids.clone(),
                 })
             };
@@ -2482,6 +2488,7 @@ impl SimpleBlockEvaluator {
             Box::new(GroupReject {
                 error,
                 member: None,
+                after_apply: false,
                 txids: Vec::new(),
             })
         })?;
@@ -2570,6 +2577,11 @@ enum Reconciled {
 struct GroupReject {
     error: algo_error::AlgoError,
     member: Option<usize>,
+    /// The failing check is one go runs AFTER the member's apply
+    /// (`checkMinBalance`), so a failure of that very member's real apply, or
+    /// of an earlier member's, ranks first (the other per-member checks run
+    /// before the apply: only an EARLIER member's apply failure ranks first).
+    after_apply: bool,
     /// The txids of the whole group (over the restored members), hashed once;
     /// empty for a failure of the stateless checks.
     txids: Vec<algo_types::Digest>,
@@ -3037,7 +3049,7 @@ impl SimpleBlockEvaluator {
         txgroup: &[algo_types::SignedTransaction],
         reject: GroupReject,
     ) -> Result<Vec<algo_types::Digest>, algo_error::AlgoError> {
-        let Some(member) = reject.member.filter(|m| *m > 0) else {
+        let Some(member) = reject.member.filter(|m| reject.after_apply || *m > 0) else {
             return Err(reject.error);
         };
         // Nothing to ask of an evaluator without a usable real apply.
@@ -3060,7 +3072,11 @@ impl SimpleBlockEvaluator {
             })
             .collect();
         match self.reconcile_group(&stibs, reject.txids.clone()) {
-            Reconciled::FailedAt(index, error) if index < member => Err(error),
+            Reconciled::FailedAt(index, error)
+                if index < member || (reject.after_apply && index == member) =>
+            {
+                Err(error)
+            }
             Reconciled::Accepted => {
                 note_precheck_over_reject();
                 Ok(reject.txids)
@@ -3472,7 +3488,11 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         //
         // All mutations use the `_tracked` variants so the checkpoint
         // records what to undo on rollback.
-        for (stx, txid) in txgroup.iter().zip(&txids) {
+        // The first member that leaves an account below its minimum balance
+        // (go runs `checkMinBalance` AFTER each member's apply, so which error
+        // the group reports is settled against the real apply below).
+        let mut min_balance_violation: Option<(usize, algo_error::AlgoError)> = None;
+        for (member, (stx, txid)) in txgroup.iter().zip(&txids).enumerate() {
             let txid = txid.0;
             // Record the transaction ID `validate_group` checked: computed
             // over the restored copy, i.e. what the block's STIB form
@@ -3756,85 +3776,125 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                     // no resource count changes.
                 }
             }
+
+            // ── Min-balance check after this member's apply ──────────
+            // go's `BlockEvaluator.transaction` runs `checkMinBalance(cow)`
+            // after EACH transaction, over the accounts that transaction
+            // MODIFIED (`cow.modifiedAccounts()`; `ledger/eval/eval.go`).
+            // A closed account (zero) is allowed (`data.IsZero()`); FeeSink,
+            // RewardsPool and StateProofSender are exempt. Only the first
+            // violation is kept: it is reported behind go's `transaction
+            // <txid>: ` frame, after the group's real apply had its say.
+            if min_balance_violation.is_none() {
+                // go's `Move` writes an account only when `!amt.IsZero() ||
+                // RewardUnits > 0 || !UnfundedSenders`, so a zero-amount
+                // payment leaves a receiver below its minimum untouched.
+                let unfunded = self.consensus_params.unfunded_senders;
+                let reward_unit = self.consensus_params.reward_unit.max(1);
+                let is_pay = stx.txn.txn_type == TxnType::Pay;
+                let sender_modified = !is_pay
+                    || stx.txn.fee > 0
+                    || stx.txn.amount > 0
+                    || !stx.txn.close_remainder_to.is_zero()
+                    || !unfunded
+                    || sender_balance >= reward_unit;
+                let mut modified: [Option<Address>; 3] = [None; 3];
+                if sender_modified {
+                    modified[0] = Some(stx.txn.sender);
+                }
+                if is_pay {
+                    let receiver = stx.txn.receiver;
+                    if !receiver.is_zero() {
+                        let moved = stx.txn.amount > 0
+                            || !unfunded
+                            || self.try_effective_balance(&receiver)? >= reward_unit;
+                        if moved {
+                            modified[1] = Some(receiver);
+                        }
+                    }
+                    if !stx.txn.close_remainder_to.is_zero() {
+                        modified[2] = Some(stx.txn.close_remainder_to);
+                    }
+                }
+                for addr in modified.iter().flatten() {
+                    if *addr == self.hdr.fee_sink
+                        || *addr == self.hdr.rewards_pool
+                        || *addr == Address::STATE_PROOF_SENDER
+                    {
+                        continue;
+                    }
+                    let balance = self.try_effective_balance(addr)?;
+                    if balance == 0 {
+                        continue;
+                    }
+                    // The effective min balance from the account's resource
+                    // counts (assets, apps, schema, boxes).
+                    let acct_data = self.get_account_data(addr);
+                    let (min_bal, total_assets) = match &acct_data {
+                        Some(acct) => (
+                            effective_min_balance(acct, &self.consensus_params),
+                            acct.total_assets_opted_in,
+                        ),
+                        // Unknown account with non-zero balance: use base min.
+                        None => (self.consensus_params.min_balance, 0),
+                    };
+                    let max_min = self.consensus_params.maximum_minimum_balance;
+                    let error = if balance < min_bal {
+                        // go `ledgercore.MinBalanceError`
+                        algo_error::min_balance_rejected(addr, balance, min_bal, total_assets)
+                    } else if max_min > 0 && min_bal > max_min {
+                        // `MaximumMinimumBalance` is 0 (no limit) from v32+.
+                        algo_error::AlgoError::Rejected {
+                            source: None,
+                            message: format!(
+                                "account {} would use too much space after this transaction. \
+                                 Minimum balance requirements would be {} (greater than max {})",
+                                addr, min_bal, max_min,
+                            ),
+                            class: algo_error::RejectClass::Other,
+                        }
+                    } else {
+                        continue;
+                    };
+                    min_balance_violation = Some((member, error));
+                    break;
+                }
+            }
         }
 
-        // ── Min-balance check after apply ────────────────────────────
-        // After tentatively applying all balance mutations for this
-        // group, verify that no affected account has dropped below the
-        // effective minimum balance. Mirrors Go's `checkMinBalance(cow)`
-        // which calls `dataNew.MinBalance(&eval.proto)` accounting for
-        // assets, apps, schema, boxes, and extra app pages.
-        //
-        // Accounts at exactly zero are allowed — this represents a
-        // closed/deleted account, matching Go's `data.IsZero()` check.
-
-        // Collect addresses modified in this group for the check.
-        let mut modified_addrs: HashSet<Address> = HashSet::new();
-        for stx in txgroup {
-            modified_addrs.insert(stx.txn.sender);
-            // Only payment transactions modify receiver/close-to balances.
-            if stx.txn.txn_type == TxnType::Pay {
-                if !stx.txn.receiver.is_zero() {
-                    modified_addrs.insert(stx.txn.receiver);
-                }
-                if !stx.txn.close_remainder_to.is_zero() {
-                    modified_addrs.insert(stx.txn.close_remainder_to);
-                }
-            }
-        }
-
-        for addr in &modified_addrs {
-            // Skip FeeSink, RewardsPool, and StateProofSender from
-            // min-balance checks, matching Go's checkMinBalance
-            // (eval.go:1113-1119).
-            if *addr == self.hdr.fee_sink
-                || *addr == self.hdr.rewards_pool
-                || *addr == Address::STATE_PROOF_SENDER
-            {
-                continue;
-            }
-
-            let balance = self.try_effective_balance(addr)?;
-            // A zero balance is valid (account closed/deleted), matching
-            // Go's `if data.IsZero() { continue }` in checkMinBalance.
-            if balance == 0 {
-                continue;
-            }
-            // Compute the effective min balance from the account's
-            // resource counts (assets, apps, schema, boxes).
-            let acct_data = self.get_account_data(addr);
-            let min_bal = match &acct_data {
-                Some(acct) => effective_min_balance(acct, &self.consensus_params),
-                // Unknown account with non-zero balance: use base min.
-                None => self.consensus_params.min_balance,
+        if let Some((member, error)) = min_balance_violation {
+            // go's `transaction <txid>: %w` frame.
+            let txid = txids[member].to_string();
+            let error = match error {
+                algo_error::AlgoError::Rejected {
+                    message,
+                    class,
+                    source,
+                } => algo_error::AlgoError::Rejected {
+                    message: format!("transaction {txid}: {message}"),
+                    class,
+                    source,
+                },
+                other => other,
             };
-            if balance < min_bal {
-                // Min-balance violation — rollback overlay and fees.
+            // go applies each member fully (programs included) BEFORE its
+            // `checkMinBalance`: an earlier member's apply failure, or this
+            // member's own, is what go reports. Settle it with a dry run of
+            // the real apply, like every other precheck failure.
+            let reject = GroupReject {
+                error,
+                member: Some(member),
+                after_apply: true,
+                txids: txids.clone(),
+            };
+            if let Err(error) = self.resolve_precheck_rejection(txgroup, reject) {
+                // Rollback overlay and fees (go's child cow is dropped).
                 self.overlay.restore(checkpoint);
                 self.fees_collected = fees_collected_checkpoint;
-                return Err(algo_error::AlgoError::Validation {
-                    message: format!(
-                        "account {} balance {} below minimum {} after transaction group",
-                        addr, balance, min_bal,
-                    ),
-                });
+                return Err(error);
             }
-            // Check MaximumMinimumBalance: if the effective min exceeds
-            // this threshold, the transaction is rejected. Mirrors Go's
-            // checkMinBalance (eval.go:1146-1149). The field is 0 (no
-            // limit) from v32+, but earlier versions enforce it.
-            let max_min = self.consensus_params.maximum_minimum_balance;
-            if max_min > 0 && min_bal > max_min {
-                self.overlay.restore(checkpoint);
-                self.fees_collected = fees_collected_checkpoint;
-                return Err(algo_error::AlgoError::Validation {
-                    message: format!(
-                        "account {} would use too much space after this transaction. \
-                         Minimum balance requirements would be {} (greater than max {})",
-                        addr, min_bal, max_min,
-                    ),
-                });
-            }
+            // `Ok`: the real apply accepts the group (the cheap overlay does
+            // not model what made it dip), so it is admitted as go admits it.
         }
 
         // ── Real apply against the pending state (issue #1776) ───────
@@ -11315,11 +11375,22 @@ mod tests {
         let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 51_000)]);
 
         let stx = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
+        let txid = algo_codec::compute_txn_id(&stx.txn);
         let err = eval.transaction_group(&[stx]).unwrap_err();
-        assert!(
-            err.to_string().contains("below minimum") || err.to_string().contains("min"),
-            "expected min-balance error, got: {err}"
+        // go: `ledgercore.MinBalanceError` behind the `transaction <txid>:` frame
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "transaction {txid}: account {sender} balance 50000 below min 100000 (0 assets)"
+            )
         );
+        assert!(matches!(
+            err,
+            algo_error::AlgoError::Rejected {
+                class: algo_error::RejectClass::MinBalance,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -11447,10 +11518,13 @@ mod tests {
             sig: sig2,
             ..Default::default()
         };
+        let txid2 = algo_codec::compute_txn_id(&stx2.txn);
         let err = eval.transaction_group(&[stx2]).unwrap_err();
-        assert!(
-            err.to_string().contains("below minimum"),
-            "expected min-balance error, got: {err}"
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "transaction {txid2}: account {sender} balance 99000 below min 100000 (0 assets)"
+            )
         );
 
         // After rollback, sender balance should still be 199_000 (from group 1)
@@ -12335,10 +12409,13 @@ mod tests {
         // effective min balance = 100_000 + 3*100_000 = 400_000
         // 300_000 < 400_000 -> should be rejected
         let stx = make_signed_pay(&key, &sender, &receiver, 199_000, 1000, 100);
+        let txid = algo_codec::compute_txn_id(&stx.txn);
         let err = eval.transaction_group(&[stx]).unwrap_err();
-        assert!(
-            err.to_string().contains("below minimum"),
-            "expected min-balance error for account with assets, got: {err}"
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "transaction {txid}: account {sender} balance 300000 below min 400000 (3 assets)"
+            )
         );
     }
 
@@ -13950,10 +14027,14 @@ mod tests {
             ..Default::default()
         };
 
+        let txid = algo_codec::compute_txn_id(&stx.txn);
         let err = eval.transaction_group(&[stx]).unwrap_err();
-        assert!(
-            err.to_string().contains("below minimum"),
-            "acfg create should be rejected when balance < new min: {err}"
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "transaction {txid}: account {sender} balance 149000 below min 200000 (1 assets)"
+            ),
+            "acfg create is rejected when balance < new min"
         );
     }
 
@@ -14042,10 +14123,14 @@ mod tests {
             ..Default::default()
         };
 
+        let txid = algo_codec::compute_txn_id(&stx.txn);
         let err = eval.transaction_group(&[stx]).unwrap_err();
-        assert!(
-            err.to_string().contains("below minimum"),
-            "appl opt-in should be rejected when balance < new min: {err}"
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "transaction {txid}: account {sender} balance 149000 below min 200000 (0 assets)"
+            ),
+            "appl opt-in is rejected when balance < new min"
         );
     }
 

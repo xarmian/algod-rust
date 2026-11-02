@@ -700,7 +700,7 @@ class PhaseLogTest(unittest.TestCase):
 
 
 NOISE_LINES = [
-    L("01:00:00.000000", "WARN", "algo_network::tx_tag_handler: TxTagHandler: pool rejected inbound TX group sender=r-1 error=TransactionPool.Remember: validation error: account X balance 5 below minimum balance 100000"),
+    L("01:00:00.000000", "WARN", "algo_network::tx_tag_handler: TxTagHandler: pool rejected inbound TX group sender=r-1 error=TransactionPool.Remember: validation error: account X balance 5 below min 100000 (0 assets)"),
     L("01:00:00.000000", "WARN", "algo_network::tx_syncer: TxSyncer sync round failed error=handler rejected transaction group: insufficient balance"),
     L("01:00:00.000000", "WARN", "algo_network::tx_sync_pool_adapter: PoolSolicitedTxHandler: pool rejected pulled TX group error=TransactionPool.ingest: insufficient balance"),
     L("01:00:00.000000", "ERROR", "hickory_proto::dnssec::dnssec_dns_handle: exceeded max validation depth"),
@@ -726,7 +726,7 @@ class ScanLogTest(unittest.TestCase):
             "invariant_check_error": L("01:00:00.000000", "ERROR", "algo_ledger::sync: invariant check: error name=x detail=y"),
             "resource_temporarily_unavailable": L("01:00:00.000000", "ERROR", "io: Resource temporarily unavailable (os error 11)"),
             "shadow_execute_mismatch": L("01:00:00.000000", "WARN", "algo_ledger::shadow_execute: shadow_execute_mismatch round=7 diffs=1 [account txn=0 field=micro_algos replay=1 execute=2]"),
-            "block_apply_balance_error": L("01:00:00.000000", "WARN", "algo_ledger::apply: account Z balance 3 below minimum balance 100000 while applying block 9"),
+            "block_apply_balance_error": L("01:00:00.000000", "WARN", "algo_ledger::apply: account Z balance 3 below min 100000 (0 assets) while applying block 9"),
         }
         for key, line in cases.items():
             self.assertEqual(self._hard([line]), {key: 1}, key)
@@ -734,6 +734,15 @@ class ScanLogTest(unittest.TestCase):
     def test_shadow_mismatch_with_balance_text_counts_once(self):
         line = L("01:00:00.000000", "WARN", "algo_ledger::shadow_execute: shadow_execute_mismatch round=7 diffs=1 [execute_error execute=below minimum balance]")
         self.assertEqual(self._hard([line]), {"shadow_execute_mismatch": 1})
+
+    def test_shadow_mismatch_with_go_min_balance_text_counts_once(self):
+        line = L("01:00:00.000000", "WARN", "algo_ledger::shadow_execute: shadow_execute_mismatch round=7 diffs=1 [execute_error execute=account X balance 5 below min 100000 (0 assets)]")
+        self.assertEqual(self._hard([line]), {"shadow_execute_mismatch": 1})
+
+    def test_legacy_below_minimum_balance_wording_is_not_flagged(self):
+        # nothing emits `below minimum balance` any more (issue #2186)
+        line = L("01:00:00.000000", "WARN", "algo_ledger::sync: unrelated: below minimum balance 100000")
+        self.assertEqual(self._hard([line]), {})
 
     def test_shadow_rate_limited_summary_is_not_a_hard_mismatch(self):
         line = L("01:00:00.000000", "WARN", "algo_ledger::shadow_execute: shadow_execute_mismatch kind=rate_limited suppressed_lines=12")

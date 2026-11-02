@@ -21,6 +21,13 @@
       "rewarded_micro_algos": 0
     },
     {
+      "addr": "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+      "status": "Offline",
+      "micro_algos": 50000,
+      "rewards_base": 0,
+      "rewarded_micro_algos": 0
+    },
+    {
       "addr": "7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u4=",
       "status": "Not Participating",
       "micro_algos": 100000,
@@ -258,6 +265,34 @@
       ],
       "test_error": "",
       "add_error": "transaction YR34TLZ7WOWMNFVOTBQH2HHKXHXKDCLULSLPWIAXVJER7R6FUFOA: account XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI balance 50 below min 100000 (0 assets)"
+    },
+    {
+      "name": "app_fail_then_min_balance",
+      "pre": null,
+      "group": [
+        "gqNzaWfEQMIDyDE1POofI3L5n5d9B0y8U0+eMPxbLi5okGiSldNa7Vy61zsWNu+fogqUfOJlW5MVCpQsbJOGQxPoefzTYQejdHhuiqRhcGlkzgABhp+jZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaNncnDEIHXxl33S7rpgbeaYt1t1j7ao2apRjhlmtTyQa3BNRD9Comx2zQPopG5vdGXEDW9yZGVyLWJhZC1hcHCjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlpGFwcGw=",
+        "gqNzaWfEQIUsKfGEGXSXs9Xd57D2gOsNhwKSX1QUothRIfxlDmLihCXUpkS+5F/xcu6rXwcT2Lw7o7yNYwgMdnkPoBilswujdHhui6NhbXTOO3w1rqNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgdfGXfdLuumBt5pi3W3WPtqjZqlGOGWa1PJBrcE1EP0KibHbNA+ikbm90ZcQbb3JkZXItbWluLWJhbGFuY2UtYWZ0ZXItYXBwo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "add_error": "transaction BLVNRL2U5PA3VPD66PIYAA5CFK32PU7YMPRNA4ZQTB2GRVZDKB5Q: only ClearState is supported for an application (99999) that does not exist"
+    },
+    {
+      "name": "zero_amount_to_low_account",
+      "pre": null,
+      "group": [
+        "gqNzaWfEQFA0QyaEny7CceDivS//almyzUMQWdGEFnIgBpaq87zoet8qm6VBt8oETK8DAGYTUSbmopog9/OHxIhpmMTARQWjdHhuiaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEDm9yZGVyLXplcm8tbG93o3JjdsQgWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlqjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "add_error": ""
+    },
+    {
+      "name": "positive_amount_to_low_account",
+      "pre": null,
+      "group": [
+        "gqNzaWfEQF6nm4Rkbs5Rjksp/uT6aSwoyt6UGVaWfBp8CSHYc4UbFoxVC/42VuodrG3vV6tFDzvbXLlp3g2PwBqTInFO9AyjdHhuiqNhbXQBo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQNb3JkZXItcG9zLWxvd6NyY3bEIFpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpao3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "add_error": "transaction MDZS2T6EO54WEWDDCBCQNTLY6AGHSVKDRBRAIFBFGB33WBHMGVUA: account LJNFUWS2LJNFUWS2LJNFUWS2LJNFUWS2LJNFUWS2LJNFUWS2LJNHLPZS7M balance 50001 below min 100000 (0 assets)"
     },
     {
       "name": "clean_group",

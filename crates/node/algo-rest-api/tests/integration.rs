@@ -7386,7 +7386,7 @@ async fn raw_transaction_receiver_below_min_balance_returns_400() {
     let mut node = MockNode::synced();
     let empty_receiver = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ";
     node.broadcast_result = Some(format!(
-        "account {empty_receiver} balance 1 below minimum balance 100000"
+        "account {empty_receiver} balance 1 below min 100000 (0 assets)"
     ));
     let server = TestServer::start(node).await;
 
@@ -7410,7 +7410,7 @@ async fn raw_transaction_receiver_below_min_balance_returns_400() {
         json["message"]
             .as_str()
             .unwrap()
-            .contains("below minimum balance"),
+            .contains(" below min 100000 (0 assets)"),
         "error should mention the receiver's minimum-balance shortfall, got: {}",
         json["message"]
     );

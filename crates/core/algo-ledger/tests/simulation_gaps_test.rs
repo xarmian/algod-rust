@@ -3813,3 +3813,48 @@ fn simulate_pre_v42_pooled_size_rejected_and_pooled_args_accepted() {
         );
     }
 }
+
+/// Issue #2186: go's simulate reports a minimum-balance failure as the
+/// evaluator's `transaction <txid>: account <addr> balance <n> below min <m>
+/// (<k> assets)` (`BlockEvaluator.transaction` frames `checkMinBalance`'s
+/// error; `EvalFailureError` carries it as is).
+#[test]
+fn simulate_min_balance_failure_is_framed_with_the_txid() {
+    let sender = Address([0xAB; 32]);
+    let receiver = Address([0xAC; 32]);
+    let mut state = base_state();
+    fund(&mut state, sender, 150_000);
+    // The receiver ends at exactly the minimum; the sender at 49_000.
+    let pay = Transaction {
+        txn_type: "pay".into(),
+        sender,
+        receiver,
+        amount: 100_000,
+        fee: 1000,
+        first_valid: 0.into(),
+        last_valid: 1000.into(),
+        genesis_hash: TEST_GENESIS_HASH,
+        ..Default::default()
+    };
+    let txid = algo_codec::compute_txn_id(&pay).to_string();
+    let request = SimulationRequest {
+        txn_groups: vec![vec![SignedTransaction {
+            txn: pay,
+            ..Default::default()
+        }]],
+        allow_empty_signatures: true,
+        ..Default::default()
+    };
+    let result = simulate(&mut state, request).expect("simulate returns a result");
+    let group = &result.txn_groups[0];
+    assert_eq!(
+        group.failure_message.as_deref(),
+        Some(
+            format!(
+                "transaction {txid}: account {sender} balance 49000 below min 100000 (0 assets)"
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(group.failed_at, Some(vec![0]));
+}

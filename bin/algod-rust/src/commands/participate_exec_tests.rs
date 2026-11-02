@@ -2885,19 +2885,6 @@ fn pool_evaluator_matches_go_per_transaction_order() {
                 sc.name, sc.test_error, test
             ));
         }
-        // Known text gap, tracked separately: go's `MinBalanceError` reads
-        // `account <addr> balance <n> below min <m> (<k> assets)`, the Rust
-        // apply's `... below minimum balance <m>`. The scenario still pins WHICH
-        // member and stage fails: the same account and balance, and go's txid
-        // when go names one.
-        if sc.name.starts_with("min_balance_") {
-            let go_txid = sc.add_error.split(": ").next().unwrap_or_default();
-            if sc.name.ends_with("_then_dup") {
-                assert!(add.starts_with(go_txid), "{}: {add}", sc.name);
-            }
-            assert!(add.contains("balance 50 below min"), "{}: {add}", sc.name);
-            continue;
-        }
         if add != sc.add_error {
             mismatches.push(format!(
                 "{} (apply stage)\n  go:   {:?}\n  rust: {:?}",

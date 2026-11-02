@@ -126,11 +126,16 @@ func blockDupOracle() {
 	}
 	secrets := crypto.GenerateSignatureSecrets(seed)
 	sender := basics.Address(secrets.SignatureVerifier)
+	// An account that sits above zero but below its minimum balance
+	// (issue #2186): go's `checkMinBalance` only covers the accounts a
+	// transaction actually modified, so a zero-amount payment to it passes.
+	acctLow := addr(0x5A)
 	accts := map[basics.Address]basics.AccountData{
-		sender: {Status: basics.Offline, MicroAlgos: basics.MicroAlgos{Raw: 1_000_000_000}},
-		acctB:  {Status: basics.Offline, MicroAlgos: basics.MicroAlgos{Raw: 1_000_000_000}},
-		pool:   {Status: basics.NotParticipating, MicroAlgos: basics.MicroAlgos{Raw: params.MinBalance}},
-		sink:   {Status: basics.NotParticipating, MicroAlgos: basics.MicroAlgos{Raw: 1_000_000}},
+		sender:  {Status: basics.Offline, MicroAlgos: basics.MicroAlgos{Raw: 1_000_000_000}},
+		acctB:   {Status: basics.Offline, MicroAlgos: basics.MicroAlgos{Raw: 1_000_000_000}},
+		acctLow: {Status: basics.Offline, MicroAlgos: basics.MicroAlgos{Raw: 50_000}},
+		pool:    {Status: basics.NotParticipating, MicroAlgos: basics.MicroAlgos{Raw: params.MinBalance}},
+		sink:    {Status: basics.NotParticipating, MicroAlgos: basics.MicroAlgos{Raw: 1_000_000}},
 	}
 	genesisHash := crypto.Hash([]byte(blockDupGenesisID))
 	gb := bookkeeping.MakeTimestampedGenesisBalances(accts, sink, pool, 0)
@@ -221,7 +226,7 @@ func blockDupOracle() {
 		RewardsPool: b64(pool[:]),
 		Block1:      b64(protocol.Encode(&blk1)),
 	}
-	for _, a := range []basics.Address{sender, acctB, pool, sink} {
+	for _, a := range []basics.Address{sender, acctB, acctLow, pool, sink} {
 		ad := accts[a]
 		f.Accounts = append(f.Accounts, account{
 			Addr:       b64(a[:]),
@@ -428,6 +433,30 @@ func blockDupOracle() {
 	}
 	// Leaves 50 microAlgos: below the minimum balance.
 	minBalT := withAmount(payTxn("order-min-balance", [32]byte{}), 997_998_000-1000-50)
+	// Issue #2186: a failing application call (the app does not exist), then
+	// a payment that leaves the sender below the minimum balance. go applies
+	// member 0 fully first, so member 0's error is the group's.
+	badAppT := transactions.Transaction{
+		Type: protocol.ApplicationCallTx,
+		Header: transactions.Header{
+			Sender:      sender,
+			Fee:         basics.MicroAlgos{Raw: params.MinTxnFee},
+			FirstValid:  1,
+			LastValid:   1000,
+			Note:        []byte("order-bad-app"),
+			GenesisID:   blockDupGenesisID,
+			GenesisHash: genesisHash,
+		},
+		ApplicationCallTxnFields: transactions.ApplicationCallTxnFields{
+			ApplicationID: 99999,
+		},
+	}
+	minBalAfterAppT := withAmount(payTxn("order-min-balance-after-app", [32]byte{}), 997_998_000-2*1000-50)
+	toLow := func(t transactions.Transaction, amount uint64) transactions.Transaction {
+		t.Receiver = acctLow
+		t.Amount = basics.MicroAlgos{Raw: amount}
+		return t
+	}
 	type orderSpec struct {
 		name  string
 		pre   [][]transactions.SignedTxn
@@ -479,6 +508,14 @@ func blockDupOracle() {
 		{"min_balance_member0", nil, one(good(minBalT))},
 		// ... and member 1 repeats it: member 0's apply failure ranks first.
 		{"min_balance_then_dup", nil, signAll(good, minBalT, minBalT)},
+		// member 0 is an application call that fails; member 1 would leave
+		// the sender below the minimum balance: member 0's error ranks first.
+		{"app_fail_then_min_balance", nil, signAll(good, badAppT, minBalAfterAppT)},
+		// a zero-amount payment to an account below its minimum balance does
+		// not modify it, so go accepts ...
+		{"zero_amount_to_low_account", nil, one(good(toLow(payTxn("order-zero-low", [32]byte{}), 0)))},
+		// ... while any positive amount modifies it and go rejects it.
+		{"positive_amount_to_low_account", nil, one(good(toLow(payTxn("order-pos-low", [32]byte{}), 1)))},
 		// control: a clean group.
 		{"clean_group", nil, signAll(good, payTxn("order-clean-a", leaseQ), payTxn("order-clean-b", [32]byte{}))},
 	} {

@@ -188,6 +188,85 @@ pub enum AlgoError {
     Network { message: String },
 }
 
+/// go `ledgercore.MinBalanceError.Error`
+/// (`ledger/ledgercore/error.go`): `account <addr> balance <n> below min <m>
+/// (<k> assets)`. `assets` is the account's `TotalAssets`. The one place the
+/// text is built, so the apply, the pool evaluator and the pool's tagging
+/// ([`is_min_balance_error_text`]) cannot drift apart.
+pub fn min_balance_error_text(
+    account: impl std::fmt::Display,
+    balance: u64,
+    min_balance: u64,
+    assets: u64,
+) -> String {
+    format!("account {account} balance {balance} below min {min_balance} ({assets} assets)")
+}
+
+/// Whether `msg` carries a [`min_balance_error_text`], anywhere in it (go's
+/// `errors.As` finds a `MinBalanceError` anywhere in the wrapped chain, e.g.
+/// behind a `transaction <txid>: ` frame, with anything after it). The typed
+/// [`RejectClass::MinBalance`] is what the evaluators report; this reads the
+/// go shape for errors that reach the pool only as text.
+pub fn is_min_balance_error_text(msg: &str) -> bool {
+    // `<digits>` at the start of `s`, then the rest.
+    fn number(s: &str) -> Option<&str> {
+        let end = s.bytes().take_while(u8::is_ascii_digit).count();
+        (end > 0).then(|| &s[end..])
+    }
+    msg.match_indices("account ").any(|(i, token)| {
+        let rest = &msg[i + token.len()..];
+        // `<addr> balance <n> below min <m> (<k> assets)`
+        let Some((addr, rest)) = rest.split_once(' ') else {
+            return false;
+        };
+        !addr.is_empty()
+            && rest
+                .strip_prefix("balance ")
+                .and_then(number)
+                .and_then(|r| r.strip_prefix(" below min "))
+                .and_then(number)
+                .and_then(|r| r.strip_prefix(" ("))
+                .and_then(number)
+                .is_some_and(|r| r.starts_with(" assets)"))
+    })
+}
+
+/// go's `ledgercore.MinBalanceError` as a typed rejection, without go's
+/// `transaction <txid>: ` frame (the caller that knows the txid adds it with
+/// [`frame_min_balance`]).
+pub fn min_balance_rejected(
+    account: impl std::fmt::Display,
+    balance: u64,
+    min_balance: u64,
+    assets: u64,
+) -> AlgoError {
+    AlgoError::Rejected {
+        source: None,
+        message: min_balance_error_text(account, balance, min_balance, assets),
+        class: RejectClass::MinBalance,
+    }
+}
+
+/// go's `BlockEvaluator.transaction` wraps a `checkMinBalance` failure
+/// `transaction <txid>: %w` (`ledger/eval/eval.go`). Frames an unframed
+/// [`RejectClass::MinBalance`] rejection that way, keeping its class; any
+/// other error (and an already framed one) is returned unchanged. `txid` is
+/// only evaluated for the failure.
+pub fn frame_min_balance(err: AlgoError, txid: impl FnOnce() -> String) -> AlgoError {
+    match err {
+        AlgoError::Rejected {
+            source,
+            message,
+            class: RejectClass::MinBalance,
+        } if !message.starts_with("transaction ") => AlgoError::Rejected {
+            source,
+            message: format!("transaction {}: {message}", txid()),
+            class: RejectClass::MinBalance,
+        },
+        other => other,
+    }
+}
+
 /// Pool error-tag family of an [`AlgoError::Rejected`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectClass {
@@ -209,6 +288,9 @@ pub enum RejectClass {
     /// go returns bare, with no `transaction <txid>:` frame. go's pool tags
     /// it from the error (`txn_dead` / `txn_early`, else `eval`).
     Alive,
+    /// go `ledgercore.MinBalanceError` from `checkMinBalance` (an account left
+    /// below its minimum balance). go's pool tags it `min_balance`.
+    MinBalance,
 }
 
 pub type Result<T> = std::result::Result<T, AlgoError>;
@@ -296,5 +378,59 @@ mod tests {
         ] {
             assert!(!other.is_batch_sig_failure(), "{other}");
         }
+    }
+
+    /// go `MinBalanceError.Error` text, byte for byte, and its recognition.
+    #[test]
+    fn min_balance_text_is_gos_and_recognised() {
+        let t = min_balance_error_text("ADDR", 50, 100000, 0);
+        assert_eq!(t, "account ADDR balance 50 below min 100000 (0 assets)");
+        assert!(is_min_balance_error_text(&t));
+        assert!(is_min_balance_error_text(&format!("transaction TXID: {t}")));
+        // a suffix after the shape, and an earlier `account ` token, still count
+        assert!(is_min_balance_error_text(&format!("{t}, then more")));
+        assert!(is_min_balance_error_text(&format!(
+            "account recovery failed: transaction TXID: {t}"
+        )));
+        for other in [
+            "transaction fee 1 is below minimum 1000",
+            "account A balance 5 below minimum balance 100000",
+            "account A balance x below min 1 (0 assets)",
+            "account A balance 5 below min 1 (0 asset)",
+            "account  balance 5 below min 1 (0 assets)",
+            "balance 5 below min 1 (0 assets)",
+        ] {
+            assert!(!is_min_balance_error_text(other), "{other}");
+        }
+    }
+
+    /// The typed rejection carries go's text and class, and is framed with the
+    /// txid exactly once, only for a min-balance rejection.
+    #[test]
+    fn min_balance_rejection_is_typed_and_framed_once() {
+        let e = min_balance_rejected("ADDR", 50, 100000, 2);
+        let framed = frame_min_balance(e, || "TXID".to_string());
+        match &framed {
+            AlgoError::Rejected { message, class, .. } => {
+                assert_eq!(
+                    message,
+                    "transaction TXID: account ADDR balance 50 below min 100000 (2 assets)"
+                );
+                assert_eq!(*class, RejectClass::MinBalance);
+            }
+            other => panic!("not a rejection: {other:?}"),
+        }
+        let again = frame_min_balance(framed, || unreachable!("already framed"));
+        assert_eq!(
+            again.to_string(),
+            "transaction TXID: account ADDR balance 50 below min 100000 (2 assets)"
+        );
+        let other = frame_min_balance(
+            AlgoError::Ledger {
+                message: "x".into(),
+            },
+            || unreachable!("not a min-balance rejection"),
+        );
+        assert_eq!(other.to_string(), "ledger error: x");
     }
 }
