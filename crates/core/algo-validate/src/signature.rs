@@ -1180,12 +1180,12 @@ pub fn verify_transaction_signature_with_tracer(
             return Ok(());
         }
         return Err(AlgoError::Validation {
-            message: "transaction has no signature (no sig, msig, lsig, or pqsig)".into(),
+            message: "signedtxn has no sig".into(),
         });
     }
     if count != 1 {
         return Err(AlgoError::Validation {
-            message: format!("signedtxn should have only one type of signature, found {count}"),
+            message: "signedtxn should have only one type of signature".into(),
         });
     }
 
@@ -1832,7 +1832,7 @@ mod tests {
         };
 
         let err = verify_sig(&stx).unwrap_err();
-        assert!(err.to_string().contains("no signature"));
+        assert!(err.to_string().contains("has no sig"));
     }
 
     /// Issue #814 live-verification fix: a genuine zero-signature state-proof
@@ -1894,7 +1894,7 @@ mod tests {
         };
 
         let err = verify_sig(&stx).unwrap_err();
-        assert!(err.to_string().contains("no signature"));
+        assert!(err.to_string().contains("has no sig"));
     }
 
     /// Nor does the exemption widen to non-stpf transaction types from the
@@ -1922,7 +1922,7 @@ mod tests {
         };
 
         let err = verify_sig(&stx).unwrap_err();
-        assert!(err.to_string().contains("no signature"));
+        assert!(err.to_string().contains("has no sig"));
     }
 
     #[test]
@@ -4342,7 +4342,7 @@ mod tests {
         let err = verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus)
             .expect_err("a blank pqsig must not count as a signature category");
         assert!(
-            err.to_string().contains("no signature"),
+            err.to_string().contains("has no sig"),
             "expected a no-signature error, got: {err}"
         );
     }

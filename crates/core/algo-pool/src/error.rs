@@ -349,6 +349,10 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
             algo_error::RejectClass::GroupId => PoolErrorTag::GroupId,
             algo_error::RejectClass::TooLarge => PoolErrorTag::TooLarge,
             algo_error::RejectClass::NotWell => PoolErrorTag::NotWell,
+            // go's `verify.TxnGroup` runs before the pool and is not tagged
+            // by `ClassifyTxPoolError`; the tag is what these errors had as
+            // untyped evaluator failures.
+            algo_error::RejectClass::Verify => PoolErrorTag::EvalGeneric,
             algo_error::RejectClass::Alive | algo_error::RejectClass::Other => {
                 classify_evaluator_message(message)
             }

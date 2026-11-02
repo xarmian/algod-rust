@@ -48,6 +48,7 @@ pub use rules::{
     max_txn_bytes_per_block, validate_genesis_consistency, validate_group_fees,
     validate_group_fees_with_params, validate_protocol_version, validate_transaction_group,
     validate_transaction_group_strict, validate_transaction_rules, validate_transaction_wellformed,
+    validate_transaction_wellformed_for_admission,
     GroupIdChecker,
     ConsensusParams, SpecialAddresses, KNOWN_PROTOCOL_VERSIONS, MAX_GROUP_SIZE, MAX_LEASE_SIZE,
     MAX_NOTE_SIZE, MAX_TIMESTAMP_INCREMENT, MAX_TXN_BYTES_PER_BLOCK_V32,

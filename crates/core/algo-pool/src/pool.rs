@@ -868,9 +868,17 @@ impl TransactionPool {
         // evaluator validation, store.
         let result = self.ingest(&tx_group, &mut guard);
         if let Err(e) = result {
-            // go's signature check runs before `Remember` and its error is
-            // returned unwrapped (issue #1969).
-            if matches!(e, PoolError::SignatureBatchFailed) {
+            // go's `verify.TxnGroup` (signatures, well-formedness, group ID)
+            // runs before `Remember` and its error is returned unwrapped
+            // (issues #1969, #2193).
+            if matches!(
+                e,
+                PoolError::SignatureBatchFailed
+                    | PoolError::TxnRejected {
+                        class: algo_error::RejectClass::Verify,
+                        ..
+                    }
+            ) {
                 return Err(e);
             }
             return Err(PoolError::Remember(Box::new(e)));
@@ -929,6 +937,7 @@ impl TransactionPool {
                         | algo_error::RejectClass::GroupId
                         | algo_error::RejectClass::TooLarge
                         | algo_error::RejectClass::NotWell
+                        | algo_error::RejectClass::Verify
                         | algo_error::RejectClass::TealReject
                         | algo_error::RejectClass::TealErr
                         | algo_error::RejectClass::MinBalance

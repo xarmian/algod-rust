@@ -2774,9 +2774,6 @@ struct OrderScenario {
     /// stage before any signature check, its REST path verifies first), so
     /// only the test stage is compared.
     skip_apply: bool,
-    /// `"frame"`: the test error is compared up to `transaction <txid>:
-    /// malformed: ` only (the reason is `WellFormed`'s own wording, #2193).
-    frame_only: bool,
 }
 
 fn oracle_b64(s: &str) -> Vec<u8> {
@@ -2848,7 +2845,6 @@ fn order_oracle() -> (Arc<Mutex<SqliteLedger>>, Vec<OrderScenario>) {
             test_error: text(&s["test_error"]),
             add_error: text(&s["add_error"]),
             skip_apply: s["skip_apply"].as_bool().unwrap_or(false),
-            frame_only: s["test_compare"].as_str() == Some("frame"),
         })
         .collect();
     (Arc::new(Mutex::new(l)), scenarios)
@@ -2889,11 +2885,7 @@ fn pool_evaluator_matches_go_per_transaction_order() {
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
-        let frame = |text: &str| match (sc.frame_only, text.find(": malformed: ")) {
-            (true, Some(at)) => text[..at + ": malformed: ".len()].to_string(),
-            _ => text.to_string(),
-        };
-        if frame(&test) != frame(&sc.test_error) {
+        if test != sc.test_error {
             mismatches.push(format!(
                 "{} (test stage)\n  go:   {:?}\n  rust: {:?}",
                 sc.name, sc.test_error, test
@@ -2911,6 +2903,147 @@ fn pool_evaluator_matches_go_per_transaction_order() {
         "{} verdict(s) differ from go:\n{}",
         mismatches.len(),
         mismatches.join("\n")
+    );
+}
+
+// ---- #2193: WellFormed and verify.TxnGroup texts, against the go oracle ----
+
+/// One `wellformed` row of `block_checkdup/oracle.json` (`wellformed.go`,
+/// `blockdup.go` in `tools/simulate-rewards-oracle`): a group and go's two
+/// verdicts on it, `TestTransactionGroup` (gossip test stage) and
+/// `verify.TxnGroup` (REST path).
+struct WellFormedRow {
+    name: String,
+    /// `Err` when the Rust decoder refuses go's encoding of the group.
+    group: Result<Vec<SignedTransaction>, String>,
+    test_error: String,
+    verify_error: String,
+}
+
+fn wellformed_rows() -> Vec<WellFormedRow> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/core/algo-ledger/tests/fixtures/block_checkdup/oracle.json");
+    let raw = std::fs::read_to_string(&path).expect("read the go oracle fixture");
+    let o: serde_json::Value = serde_json::from_str(&raw).expect("parse the go oracle fixture");
+    let text = |v: &serde_json::Value| v.as_str().expect("string").to_string();
+    o["wellformed"]
+        .as_array()
+        .expect("wellformed rows")
+        .iter()
+        .map(|r| WellFormedRow {
+            name: text(&r["name"]),
+            group: r["group"]
+                .as_array()
+                .expect("group")
+                .iter()
+                .map(|t| {
+                    let mut one = algo_codec::decode_signed_txn_stream(&oracle_b64(&text(t)))
+                        .map_err(|e| e.to_string())?;
+                    assert_eq!(one.len(), 1);
+                    Ok(one.remove(0))
+                })
+                .collect(),
+            test_error: text(&r["test_error"]),
+            verify_error: text(&r["verify_error"]),
+        })
+        .collect()
+}
+
+/// go wraps a not-well-formed transaction of the REST path as `transaction
+/// <%+v of its SignedTxn> invalid : <reason>`. The struct dump is go's own
+/// formatting of its in-memory type, so for those rows the reason after
+/// ` invalid : ` is what is compared; every other error is compared in full.
+fn verify_tail(text: &str) -> &str {
+    match (text.starts_with("transaction "), text.find(" invalid : ")) {
+        (true, Some(at)) => &text[at + " invalid : ".len()..],
+        _ => text,
+    }
+}
+
+/// Every `Transaction.WellFormed` rule, and the order the rules run in, as go
+/// words and orders them: the gossip test stage's error is go's in full
+/// (`transaction <txid>: malformed: <reason>`), and the REST path's error is
+/// go's `verify.TxnGroup` text (group errors and signature errors in full, a
+/// not-well-formed transaction by its reason).
+#[test]
+fn wellformed_and_group_error_texts_match_go() {
+    let (ledger, _) = order_oracle();
+    let rows = wellformed_rows();
+    assert!(rows.len() > 100, "the oracle has the WellFormed table");
+    let mut mismatches = Vec::new();
+    let mut undecodable = Vec::new();
+    for row in &rows {
+        let Ok(group) = &row.group else {
+            undecodable.push(row.name.as_str());
+            continue;
+        };
+        let eval = order_evaluator(&ledger);
+        let test = eval
+            .test_transaction_group(group)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        if test != row.test_error {
+            mismatches.push(format!(
+                "{} (test stage)\n  go:   {:?}\n  rust: {:?}",
+                row.name, row.test_error, test
+            ));
+        }
+        // The REST path is only compared where go's verify.TxnGroup rejects:
+        // go does not look at the window, duplicates or fees there. The rules
+        // that need the special addresses (rewards-pool sender, fee-sink
+        // payment and keyreg) are not applied on the REST path today
+        // (`validate_group_stateless_inner` passes none; issue #2198), so
+        // those rows are compared on the test stage only.
+        let needs_specials = row.name.contains("fee_sink") || row.name == "wf_rewards_pool_sender";
+        if row.verify_error.is_empty() || needs_specials {
+            continue;
+        }
+        let mut eval = order_evaluator(&ledger);
+        // What a client sees: the pool returns a verify-class rejection and the
+        // batch signature failure bare, as go's `verify.TxnGroup` does; any other
+        // error would carry the pool's frames.
+        let add = match eval.transaction_group(group).err() {
+            Some(algo_error::AlgoError::Rejected {
+                message,
+                class: algo_error::RejectClass::Verify,
+                ..
+            }) => message,
+            Some(e) if e.is_batch_sig_failure() => algo_error::BATCH_HAS_FAILED_SIGS.to_string(),
+            Some(e) => format!("not a verify-class rejection: {e}"),
+            None => String::new(),
+        };
+        if verify_tail(&add) != verify_tail(&row.verify_error) {
+            mismatches.push(format!(
+                "{} (REST path)\n  go:   {:?}\n  rust: {:?}",
+                row.name,
+                verify_tail(&row.verify_error),
+                verify_tail(&add)
+            ));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} verdict(s) differ from go:\n{}",
+        mismatches.len(),
+        mismatches.join("\n")
+    );
+    // Rows the Rust decoder refuses are not judged by the evaluator at all;
+    // none may be skipped silently. go encodes a zero sender as an absent
+    // `snd` key and decodes it, so its `WellFormed` is what rejects the
+    // transaction ("transaction cannot have zero sender"); the Rust decoder
+    // rejects the missing key earlier, with its own text. Both reject, so
+    // accept/reject is the same; the rule itself is pinned by
+    // `rules::tests::test_zero_sender_rejected` and the order rows that do
+    // not need an absent sender.
+    assert_eq!(
+        undecodable,
+        [
+            "wf_zero_sender_payment",
+            "wf_zero_sender_axfer",
+            "wf_order_note_before_zero_sender"
+        ],
+        "rows go encodes and the Rust decoder refuses"
     );
 }
 
