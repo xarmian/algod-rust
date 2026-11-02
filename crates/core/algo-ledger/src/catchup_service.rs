@@ -3874,11 +3874,11 @@ mod tests {
                 }
                 if round.0 == 5 {
                     self.calls_for_5.fetch_add(1, Ordering::SeqCst);
-                    if self
-                        .failures_left
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                        .is_ok()
-                    {
+                    // Round 5 has one fetcher call at a time (window order),
+                    // so a plain check-then-decrement is race-free here.
+                    let left = self.failures_left.load(Ordering::SeqCst);
+                    if left > 0 {
+                        self.failures_left.store(left - 1, Ordering::SeqCst);
                         return Err(FetchError::NetworkError("transient".into()));
                     }
                 }
