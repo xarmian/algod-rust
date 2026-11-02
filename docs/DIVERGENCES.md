@@ -412,8 +412,9 @@ same point-in-time view as before.
 ledger-level replay of the pool's handover (`wal_overlapping_reader_test`)
 leaves a tracker WAL of 0.23 MB with the fix against 2.7 MB after 200 blocks
 (99 MB after 6000) without it; native betanet follow (12 minutes after a
-catchpoint catchup): 0.9 MB flat with the fix, against +0.8 MB per 25 s
-(15.1 MB and rising) without it. Durability: 40 randomized hard kills of a
+catchpoint catchup): tracker WAL 0.7 MB flat with the fix (the block
+archive's own WAL stays at its normal ~4 MB autocheckpoint cycle), against
++0.8 MB per 25 s (tracker WAL 15.1 MB and rising) without it. Durability: 40 randomized hard kills of a
 ledger process that commits with snapshot handovers (so kills land inside
 commits and checkpoints) reopen with every reported round and pass
 `PRAGMA integrity_check` on both files (a kill between the tracker and block
