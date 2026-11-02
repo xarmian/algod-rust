@@ -911,16 +911,13 @@ impl TransactionPool {
                 .test_transaction_group(tx_group)
                 .map_err(|e| match &e {
                     _ if e.is_batch_sig_failure() => PoolError::SignatureBatchFailed,
-                    // go's `Test` returns the typed `checkDup` error as is
-                    // (`TransactionInLedgerError`, `LeaseInLedgerError`):
-                    // keep its class, so the tag is go's `txid` / `lease`
+                    // go's `Test` returns the evaluator's typed error as is,
+                    // with no pool frame (`TransactionInLedgerError`,
+                    // `LeaseInLedgerError`, `TxnDeadError`, and the
+                    // `TestTransactionGroup` group errors): keep its class
+                    // and its bare text, so the tag is go's `txid` / `lease`
                     // (or `*_eval` for the pending block), not a text guess.
-                    AlgoError::Rejected {
-                        class:
-                            algo_error::RejectClass::TxidInLedger { .. }
-                            | algo_error::RejectClass::LeaseInLedger { .. },
-                        ..
-                    } => pool_error_from_evaluator(&e),
+                    AlgoError::Rejected { .. } => pool_error_from_evaluator(&e),
                     _ => PoolError::Evaluator(e.to_string()),
                 })?;
             Ok(())

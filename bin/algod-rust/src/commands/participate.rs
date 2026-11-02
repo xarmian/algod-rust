@@ -1951,11 +1951,13 @@ impl SimpleBlockEvaluator {
         )
     }
 
-    /// The stateless half of both admission stages: no-in-block-flag guard,
-    /// well-formedness, strict group ID, then signatures (go's order, issue
-    /// #1976). It does NOT check the validity window or any duplicate: `Alive`
-    /// and `checkDup` are go's per-transaction checks and run, member by
-    /// member, in the callers (`validate_group_stateless`, `validate_group`).
+    /// The verifying (REST-path) stateless half of admission: no-in-block-flag
+    /// guard, well-formedness, strict group ID, then signatures (go's
+    /// `verify.TxnGroup` order, issue #1976). It does NOT check the validity
+    /// window or any duplicate: `Alive` and `checkDup` are go's per-transaction
+    /// checks and run, member by member, in `validate_group`. The gossip test
+    /// stage (`validate_group_stateless`) does not call it: go runs
+    /// `TestTransactionGroup` before any signature check (issue #2184).
     /// Returns the group with genesis fields restored, so the callers hash the
     /// txids and run the per-member checks without cloning the group again.
     /// Reads no ledger state, so it never takes the ledger mutex.
@@ -2055,8 +2057,8 @@ impl SimpleBlockEvaluator {
         // accepted transaction the submitted and restored forms are identical.
         // Issue #1017: consult the shared `VerifiedTransactionCache` when one
         // is available -- this is the gossip/mempool-admission call site
-        // (`TransactionPool::remember` -> `BlockEvaluator::test_transaction_group`
-        // -> here): a transaction group already verified once (e.g. an
+        // (`TransactionPool::remember` -> `BlockEvaluator::transaction_group`
+        // -> `validate_group` -> here): a transaction group already verified once (e.g. an
         // earlier gossip sighting, or inclusion in a previous block) skips
         // real signature verification, and a freshly-verified group is
         // recorded so a later sighting can skip it too. Mirrors go's
@@ -2115,12 +2117,134 @@ impl SimpleBlockEvaluator {
         Ok(restored)
     }
 
-    /// go's `TestTransactionGroup`, for `test_transaction_group` (it takes
-    /// `&self`): the stateless checks, then, per transaction in group order,
-    /// `Alive` and `checkDup` against the unmodified state (go's
-    /// `testTransaction`; the pool's pending block counts, a sibling does
-    /// not), then the group fees. Nothing is recorded.
+    /// go's `BlockEvaluator.TestTransactionGroup`, for `test_transaction_group`
+    /// (it takes `&self`), in go's order and with go's errors (issue #2184):
+    /// the group size, then every member's well-formedness, then, per member
+    /// in group order, `Alive` and `checkDup` against the unmodified state (go's
+    /// `testTransaction`; the pool's pending block counts, a sibling does not)
+    /// and that member's group-ID consistency, then the group's completeness.
+    ///
+    /// It checks NO signature and NO fee: go's gossip handler calls this
+    /// (`txHandler.checkAlreadyCommitted` -> `txPool.Test`) before it verifies
+    /// anything, so a duplicate is dropped without the cost of a signature
+    /// check, and a group with several problems is reported for the first one
+    /// in this order. Signatures are verified afterwards by the handler's
+    /// batch verifier, and again, with the group's fees, by
+    /// `transaction_group` (go's `verify.TxnGroup` / `Remember`). Nothing is
+    /// recorded.
     fn validate_group_stateless(
+        &self,
+        txgroup: &[algo_types::SignedTransaction],
+    ) -> Result<(), algo_error::AlgoError> {
+        // go: "Nothing to do if there are no transactions".
+        if txgroup.is_empty() {
+            return Ok(());
+        }
+        // Fail closed on in-block-only fields, as every ingress boundary does.
+        algo_types::genesis_restore::reject_in_block_flags(txgroup).map_err(|e| {
+            algo_error::AlgoError::Validation {
+                message: e.to_string(),
+            }
+        })?;
+        let rejected = |message: String| algo_error::AlgoError::Rejected {
+            source: None,
+            message,
+            class: algo_error::RejectClass::Other,
+        };
+        let max = self.consensus_params.max_tx_group_size;
+        if txgroup.len() > max {
+            return Err(rejected(format!(
+                "group size {} exceeds maximum {}",
+                txgroup.len(),
+                max
+            )));
+        }
+        for stx in txgroup {
+            algo_validate::validate_transaction_wellformed(
+                &stx.txn,
+                true,
+                &self.consensus_params,
+                None, // SpecialAddresses not available without ledger lookup
+            )
+            .map_err(|e| {
+                // go's `TxnNotWellFormedError`. The reason is this crate's own
+                // text for it (go's wording differs; #2184 pins only the frame).
+                let reason = match e {
+                    algo_error::AlgoError::Validation { message } => message,
+                    other => other.to_string(),
+                };
+                rejected(format!(
+                    "transaction {}: malformed: {}",
+                    algo_types::Digest(compute_txid(&stx.txn)),
+                    reason
+                ))
+            })?;
+        }
+
+        // The txids `checkDup` looks for are over the group with its genesis
+        // fields restored (what the block carries); the group-ID hashes are
+        // over the group as submitted (what the submitter signed).
+        let restored: Vec<algo_types::SignedTransaction> = txgroup
+            .iter()
+            .cloned()
+            .map(|mut stx| {
+                self.restore_genesis_fields(&mut stx);
+                stx
+            })
+            .collect();
+        let txids: Vec<[u8; 32]> = restored.iter().map(|r| compute_txid(&r.txn)).collect();
+        let ledger = self.ledger_dups(&restored, &txids)?;
+        let first_group = txgroup[0].txn.group;
+        let mut hashes: Vec<algo_types::Digest> = Vec::new();
+        for (member, (stx, restored)) in txgroup.iter().zip(&restored).enumerate() {
+            self.alive_member(stx)?;
+            self.check_dup_member(restored, &txids[member], None, ledger[member])?;
+            if stx.txn.group != first_group {
+                return Err(rejected(format!(
+                    "transactionGroup: inconsistent group values: {} != {}",
+                    algo_types::Digest(stx.txn.group),
+                    algo_types::Digest(first_group)
+                )));
+            }
+            if stx.txn.group != [0u8; 32] {
+                let mut ungrouped = stx.txn.clone();
+                ungrouped.group = [0u8; 32];
+                hashes.push(algo_types::Digest(compute_txid(&ungrouped)));
+            } else if txgroup.len() > 1 {
+                return Err(rejected(format!(
+                    "transactionGroup: [{}] had zero Group but was submitted in a group of {}",
+                    member,
+                    txgroup.len()
+                )));
+            }
+        }
+        if !hashes.is_empty() {
+            let computed = algo_codec::compute_group_id_from_hashes(&hashes);
+            if first_group != computed.0 {
+                // go prints the `TxGroup` struct with `%v`: the embedded
+                // domain-separator struct is `{}`, then the hashes.
+                let listed: Vec<String> = hashes.iter().map(|h| h.to_string()).collect();
+                return Err(rejected(format!(
+                    "transactionGroup: incomplete group: {} != {} ({{{{}} [{}]}})",
+                    algo_types::Digest(first_group),
+                    computed,
+                    listed.join(" ")
+                )));
+            }
+        }
+        // No fee check, as go's `TestTransactionGroup`.
+        Ok(())
+    }
+
+    /// The verifying admission order, as go's REST path runs it
+    /// (`verify.TxnGroup`, then `Remember`'s per-member `Alive` + `checkDup`,
+    /// then the group fees), without applying anything. The gossip path uses
+    /// `validate_group_stateless` first; this is what `transaction_group`'s
+    /// precheck does before its balance and authorizer checks. Kept so the
+    /// tests of that ordering (signatures, then window, then fees) stay
+    /// direct, one evaluator call each.
+    #[cfg(test)]
+    fn verify_then_test_group(
         &self,
         txgroup: &[algo_types::SignedTransaction],
     ) -> Result<(), algo_error::AlgoError> {
@@ -3373,12 +3497,15 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         &self,
         txgroup: &[algo_types::SignedTransaction],
     ) -> Result<(), algo_error::AlgoError> {
-        // go's `TestTransactionGroup`: the stateless checks (well-formedness,
-        // group ID, signatures), then per member `Alive` and `checkDup` against
-        // the unmodified state, which includes the pending block (the overlay)
-        // and the LEDGER (its lease table and txtail, read live), and the group
-        // fees. It mutates nothing. The balance, authorizer and apply checks run
-        // in `transaction_group` when the group is actually admitted.
+        // go's `TestTransactionGroup` (issue #2184): the group size and every
+        // member's well-formedness, then per member `Alive` and `checkDup`
+        // against the unmodified state, which includes the pending block (the
+        // overlay) and the LEDGER (its lease table and txtail, read live), and
+        // that member's group-ID consistency. No signature and no fee is
+        // checked: the gossip handler calls this before verifying anything.
+        // It mutates nothing. The signatures, group fees, balance, authorizer
+        // and apply checks run in `transaction_group` when the group is
+        // actually admitted.
         //
         // LOCK ORDER: this takes the ledger mutex (once per group). Never call
         // it, or `transaction_group`, while holding the ledger mutex.
@@ -10673,7 +10800,7 @@ mod tests {
         // Corrupt signature
         stx.sig[0] ^= 0xFF;
 
-        let err = eval.test_transaction_group(&[stx]).unwrap_err();
+        let err = eval.verify_then_test_group(&[stx]).unwrap_err();
         assert!(
             err.to_string().contains("signature"),
             "expected signature error, got: {err}"
@@ -10727,7 +10854,7 @@ mod tests {
                     Some(Arc::new(algo_validate::VerifiedTransactionCache::new(100)));
             }
             let err = eval
-                .test_transaction_group(&[make_escrow_with_arg(1, 2000)])
+                .validate_group_stateless_inner(&[make_escrow_with_arg(1, 2000)])
                 .expect_err("2000 arg bytes exceed the 1000 byte pool");
             assert!(err.to_string().contains(want), "cached={cached}: {err}");
 
@@ -10736,7 +10863,7 @@ mod tests {
             orphan.lsig.as_mut().unwrap().logic = Default::default();
             orphan.txn.sender = Address([0x31; 32]);
             let err = eval
-                .test_transaction_group(&[orphan])
+                .validate_group_stateless_inner(&[orphan])
                 .expect_err("orphan LogicSig content must be rejected at v42");
             assert!(
                 err.to_string()
@@ -10756,7 +10883,7 @@ mod tests {
             // A fresh evaluator per iteration (above), a computed group id and
             // a sufficient fee make this group otherwise fully valid, so any
             // failure here is attributable.
-            if let Err(e) = eval.test_transaction_group(&group) {
+            if let Err(e) = eval.validate_group_stateless_inner(&group) {
                 assert!(
                     !e.to_string().contains("bytes of LogicSig"),
                     "cached={cached}: pooled args wrongly rejected by the size pool: {e}"
@@ -10777,10 +10904,10 @@ mod tests {
                 s.txn.group = gid;
             }
             eval41
-                .test_transaction_group(&group41)
+                .validate_group_stateless_inner(&group41)
                 .expect("pre-v42 pooled size fits 2 * 1000");
             let err = eval41
-                .test_transaction_group(&[make_escrow_with_arg(4, 1000)])
+                .validate_group_stateless_inner(&[make_escrow_with_arg(4, 1000)])
                 .expect_err("program+args exceed the 1000 byte pool");
             assert!(
                 err.to_string()
@@ -10818,7 +10945,7 @@ mod tests {
         let stx = make_signed_pay(&key, &sender, &receiver, 1000, 1000, 100);
 
         // First sighting: real verification runs and populates the cache.
-        eval.test_transaction_group(std::slice::from_ref(&stx))
+        eval.validate_group_stateless_inner(std::slice::from_ref(&stx))
             .expect("first sighting should verify for real and pass");
 
         // The exact same group (after genesis-field restoration, which is
@@ -10840,7 +10967,7 @@ mod tests {
         );
 
         // A second, IDENTICAL sighting takes the skip path and still passes.
-        eval.test_transaction_group(std::slice::from_ref(&stx))
+        eval.validate_group_stateless_inner(std::slice::from_ref(&stx))
             .expect("second identical sighting should hit the cache and pass");
 
         // A genuinely different signature over the same txn body is a
@@ -10848,12 +10975,83 @@ mod tests {
         // verification runs again and correctly rejects it.
         let mut mutated = stx;
         mutated.sig[0] ^= 0xFF;
-        let err = eval.test_transaction_group(&[mutated]).unwrap_err();
+        let err = eval.validate_group_stateless_inner(&[mutated]).unwrap_err();
         assert!(
             err.to_string().contains("signature"),
             "a genuinely different signature must still be verified for real and rejected, \
              got: {err}"
         );
+    }
+
+    /// Issue #2184: go's gossip handler runs the pool's `Test`
+    /// (`TestTransactionGroup`) BEFORE it verifies any signature
+    /// (`txHandler.checkAlreadyCommitted` -> `processDecoded`), so a duplicate
+    /// is dropped without paying for signature verification. Proven through
+    /// the verified-transaction cache: a group whose signatures were verified
+    /// is in it, and the duplicate's (valid) signature never gets there.
+    #[test]
+    fn gossip_test_stage_rejects_a_duplicate_without_verifying_signatures() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(42);
+        let (receiver, _) = test_keypair(43);
+        let mut eval = make_evaluator(
+            &ledger,
+            &params,
+            100,
+            &[(sender, 10_000_000), (receiver, 100_000)],
+        );
+        let stx = make_signed_pay(&key, &sender, &receiver, 1000, 1000, 100);
+        // The pending block now holds `stx` (its own verification used no cache).
+        eval.transaction_group(std::slice::from_ref(&stx))
+            .expect("admit the first sighting");
+
+        let cache = Arc::new(algo_validate::VerifiedTransactionCache::new(100));
+        eval.verified_txn_cache = Some(cache.clone());
+        let context = algo_validate::VerificationContext {
+            spec_addrs: algo_validate::SpecialAddresses {
+                fee_sink: eval.hdr.fee_sink,
+                rewards_pool: eval.hdr.rewards_pool,
+            },
+            consensus_version: eval.hdr.current_protocol.clone(),
+        };
+        let unverified = |s: &SignedTransaction| {
+            let mut restored = s.clone();
+            eval.restore_genesis_fields(&mut restored);
+            cache
+                .get_unverified_transaction_groups(std::slice::from_ref(&vec![restored]), &context)
+                .len()
+        };
+        let dup_text = format!(
+            "transaction already in ledger: {}",
+            algo_types::Digest(compute_txid(&stx.txn))
+        );
+
+        // The identical duplicate: rejected as one, signature never verified.
+        let err = eval.test_transaction_group(std::slice::from_ref(&stx));
+        assert_eq!(err.expect_err("duplicate").to_string(), dup_text);
+        assert_eq!(
+            unverified(&stx),
+            1,
+            "the duplicate's signature was verified"
+        );
+
+        // The same duplicate with a corrupted signature: still the duplicate
+        // (go never looks at the signature), not a signature failure.
+        let mut bad = stx.clone();
+        bad.sig[0] ^= 0xFF;
+        let err = eval.test_transaction_group(&[bad]);
+        assert_eq!(err.expect_err("duplicate").to_string(), dup_text);
+
+        // A fresh transaction passes the test stage WITHOUT being verified,
+        // and the verifying stage then does verify (and cache) it.
+        let fresh = make_signed_pay(&key, &sender, &receiver, 2000, 1000, 100);
+        eval.test_transaction_group(std::slice::from_ref(&fresh))
+            .expect("a fresh transaction passes go's Test");
+        assert_eq!(unverified(&fresh), 1, "the test stage verified a signature");
+        eval.validate_group_stateless_inner(std::slice::from_ref(&fresh))
+            .expect("verifies");
+        assert_eq!(unverified(&fresh), 0, "the verifying stage caches it");
     }
 
     /// A validly signed payment with the given validity window.
@@ -10899,7 +11097,7 @@ mod tests {
         let eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
 
         let early = windowed_pay(&key, sender, receiver, 500, 900);
-        let err = eval.test_transaction_group(&[early]).unwrap_err();
+        let err = eval.verify_then_test_group(&[early]).unwrap_err();
         assert_eq!(err.to_string(), "txn dead: round 100 outside of 500--900");
         assert!(
             matches!(err, algo_error::AlgoError::Rejected { .. }),
@@ -10907,7 +11105,7 @@ mod tests {
         );
 
         let expired = windowed_pay(&key, sender, receiver, 1, 50);
-        let err = eval.test_transaction_group(&[expired]).unwrap_err();
+        let err = eval.verify_then_test_group(&[expired]).unwrap_err();
         assert_eq!(err.to_string(), "txn dead: round 100 outside of 1--50");
     }
 
@@ -10924,12 +11122,12 @@ mod tests {
 
         let mut both = windowed_pay(&key, sender, receiver, 500, 900);
         both.sig = [7u8; 64]; // does not verify
-        let err = eval.test_transaction_group(&[both]).unwrap_err();
+        let err = eval.verify_then_test_group(&[both]).unwrap_err();
         assert!(err.is_batch_sig_failure(), "{err}");
 
         // window-only problem still gets the window error
         let only_window = windowed_pay(&key, sender, receiver, 500, 900);
-        let err = eval.test_transaction_group(&[only_window]).unwrap_err();
+        let err = eval.verify_then_test_group(&[only_window]).unwrap_err();
         assert!(err.to_string().starts_with("txn dead:"), "{err}");
     }
 
@@ -10964,7 +11162,7 @@ mod tests {
 
         // low fee, valid window: go's group-fee text, typed so the pool prints it bare
         let low = pay_with_fee_and_window(&key, sender, receiver, 1, 1, 1000);
-        let err = eval.test_transaction_group(&[low]).unwrap_err();
+        let err = eval.verify_then_test_group(&[low]).unwrap_err();
         assert_eq!(
             err.to_string(),
             "txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)"
@@ -10977,7 +11175,7 @@ mod tests {
         // low fee and out of window (early or expired): the window wins
         for (fv, lv) in [(500, 900), (1, 50)] {
             let low = pay_with_fee_and_window(&key, sender, receiver, 1, fv, lv);
-            let err = eval.test_transaction_group(&[low]).unwrap_err();
+            let err = eval.verify_then_test_group(&[low]).unwrap_err();
             assert!(
                 err.to_string().starts_with("txn dead:"),
                 "{fv}--{lv}: {err}"
@@ -10987,12 +11185,12 @@ mod tests {
         // low fee and a bad signature: the signature wins
         let mut bad = pay_with_fee_and_window(&key, sender, receiver, 1, 1, 1000);
         bad.sig = [7u8; 64];
-        let err = eval.test_transaction_group(&[bad]).unwrap_err();
+        let err = eval.verify_then_test_group(&[bad]).unwrap_err();
         assert!(err.is_batch_sig_failure(), "{err}");
 
         // a fee-only problem stays a fee error, and a sufficient fee passes
         let ok = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
-        assert!(eval.test_transaction_group(&[ok]).is_ok());
+        assert!(eval.verify_then_test_group(&[ok]).is_ok());
     }
 
     /// Issue #1976: after the validity window go's `BlockHeader.Alive` checks
@@ -11012,7 +11210,7 @@ mod tests {
         let mut wrong = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
         wrong.txn.genesis_hash = [3u8; 32];
         wrong.sig = sign_txn(&wrong.txn, &key);
-        let err = eval.test_transaction_group(&[wrong]).unwrap_err();
+        let err = eval.verify_then_test_group(&[wrong]).unwrap_err();
         assert_eq!(
             err.to_string(),
             format!(
@@ -11030,7 +11228,7 @@ mod tests {
         let mut wrong = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
         wrong.txn.genesis_id = "other-net".to_string();
         wrong.sig = sign_txn(&wrong.txn, &key);
-        let err = eval.test_transaction_group(&[wrong]).unwrap_err();
+        let err = eval.verify_then_test_group(&[wrong]).unwrap_err();
         assert_eq!(
             err.to_string(),
             "tx.GenesisID <other-net> does not match expected <test-v1>"
@@ -11041,20 +11239,20 @@ mod tests {
         bad_sig.txn.genesis_hash = [3u8; 32];
         bad_sig.sig = [7u8; 64];
         assert!(eval
-            .test_transaction_group(&[bad_sig])
+            .verify_then_test_group(&[bad_sig])
             .unwrap_err()
             .is_batch_sig_failure());
 
         let mut dead = pay_with_fee_and_window(&key, sender, receiver, 1, 500, 900);
         dead.txn.genesis_hash = [3u8; 32];
         dead.sig = sign_txn(&dead.txn, &key);
-        let err = eval.test_transaction_group(&[dead]).unwrap_err();
+        let err = eval.verify_then_test_group(&[dead]).unwrap_err();
         assert!(err.to_string().starts_with("txn dead:"), "{err}");
 
         let mut low_fee = pay_with_fee_and_window(&key, sender, receiver, 1, 1, 1000);
         low_fee.txn.genesis_hash = [3u8; 32];
         low_fee.sig = sign_txn(&low_fee.txn, &key);
-        let err = eval.test_transaction_group(&[low_fee]).unwrap_err();
+        let err = eval.verify_then_test_group(&[low_fee]).unwrap_err();
         assert!(err.to_string().starts_with("tx.GenesisHash <"), "{err}");
 
         // an omitted genesis ID (the hash present and right) is accepted: go
@@ -11062,7 +11260,7 @@ mod tests {
         let mut omitted = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
         omitted.txn.genesis_id = String::new();
         omitted.sig = sign_txn(&omitted.txn, &key);
-        eval.test_transaction_group(&[omitted])
+        eval.verify_then_test_group(&[omitted])
             .expect("a transaction signed without a genesis ID is accepted");
     }
 
@@ -11092,7 +11290,7 @@ mod tests {
             let mut no_hash = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
             no_hash.txn.genesis_hash = [0u8; 32];
             no_hash.sig = sign_txn(&no_hash.txn, &key);
-            let err = eval.test_transaction_group(&[no_hash.clone()]).unwrap_err();
+            let err = eval.verify_then_test_group(&[no_hash.clone()]).unwrap_err();
             assert_eq!(
                 err.to_string(),
                 "required tx.GenesisHash is missing",
@@ -11102,7 +11300,7 @@ mod tests {
             // a genuinely bad signature on the same transaction is still reported first
             no_hash.sig = [7u8; 64];
             assert!(
-                eval.test_transaction_group(&[no_hash])
+                eval.verify_then_test_group(&[no_hash])
                     .unwrap_err()
                     .is_batch_sig_failure(),
                 "cache={with_cache}"
@@ -11189,7 +11387,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = eval.test_transaction_group(&[stx]).unwrap_err();
+        let err = eval.verify_then_test_group(&[stx]).unwrap_err();
         assert!(
             err.to_string().contains("no signature"),
             "expected no-signature error, got: {err}"

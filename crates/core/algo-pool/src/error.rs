@@ -384,6 +384,17 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
 fn classify_evaluator_message(msg: &str) -> PoolErrorTag {
     if let Some(tag) = classify_txn_dead(msg) {
         tag
+    } else if msg.starts_with("transactionGroup: ") {
+        // go: `TxGroupMalformedError` (inconsistent / empty / incomplete group
+        // ID) from `TestTransactionGroup`; every reason but the two below tags
+        // `groupid`. Coupled to `SimpleBlockEvaluator::validate_group_stateless`.
+        PoolErrorTag::GroupId
+    } else if msg.starts_with("group size ") && msg.contains(" exceeds maximum ") {
+        // go: `TxGroupMalformedErrorReasonExceedMaxSize`.
+        PoolErrorTag::TooLarge
+    } else if msg.starts_with("transaction ") && msg.contains(": malformed: ") {
+        // go: `ledgercore.TxnNotWellFormedError`.
+        PoolErrorTag::NotWell
     } else if msg.starts_with("txgroup with ") || msg == "txgroup required fee overflow" {
         // go: `TxGroupMalformedError` with `TxGroupErrorReasonInvalidFee`. Coupled
         // to `algo_validate::fee::check_submitted_group_fees`, whose test
