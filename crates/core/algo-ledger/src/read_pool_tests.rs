@@ -1131,3 +1131,52 @@ fn try_get_account_reads_through_the_block_memo_but_never_caches_errors() {
     assert!(LedgerStore::get_account(&l, &addr(2)).is_none());
     l.rollback_block().unwrap();
 }
+
+/// DIV-009: every row of the in-flight range above the committed round is
+/// hidden (a span can archive several rounds, e.g. sync writing N+1 ahead with
+/// block N), rows outside it keep being served, and the marker's removal
+/// reveals them.
+#[test]
+fn hides_every_in_flight_round_above_the_committed_one() {
+    let (_d, mut l) = file_ledger();
+    let pool = l.read_pool().unwrap();
+    commit(&mut l, 1, 1, 100);
+    for r in 2..=4 {
+        l.put_block(r, "v41", &hdr(r), &blk(r)).unwrap(); // written ahead
+    }
+    pool.archive_inflight.set(2, 3);
+    assert_eq!(pool.block_data(1), PoolRead::Found(blk(1)));
+    assert_eq!(pool.block_data(2), PoolRead::NotFound);
+    assert_eq!(pool.block_data(3), PoolRead::NotFound);
+    assert_eq!(pool.block_data(4), PoolRead::Found(blk(4)), "not in flight");
+    assert_eq!(pool.block_cert(2), PoolRead::NotFound);
+    assert_eq!(pool.block_header_data(3), PoolRead::NotFound);
+    pool.archive_inflight.clear();
+    assert_eq!(pool.block_data(2), PoolRead::Found(blk(2)));
+    assert_eq!(pool.block_data(3), PoolRead::Found(blk(3)));
+    // In flight but the tracker has since committed the round: served.
+    commit(&mut l, 2, 1, 200);
+    pool.archive_inflight.set(2, 3);
+    assert_eq!(pool.block_data(2), PoolRead::Found(blk(2)));
+    assert_eq!(pool.block_data(3), PoolRead::NotFound);
+}
+
+/// When the marker matches but the committed round cannot be read, the pool
+/// does not guess: the locked path decides.
+#[test]
+fn an_unreadable_committed_round_falls_back_for_an_in_flight_row() {
+    let (_d, mut l) = file_ledger();
+    let pool = l.read_pool().unwrap();
+    commit(&mut l, 1, 1, 100);
+    l.put_block(2, "v41", &hdr(2), &blk(2)).unwrap();
+    l.put_block_cert(2, b"cert-2").unwrap();
+    pool.archive_inflight.set(2, 2);
+    pool.fail_committed_round
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(pool.block_data(2), PoolRead::Fallback);
+    pool.fail_committed_round
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(pool.block_cert(2), PoolRead::Fallback);
+    // Recovered: the row is hidden again, not guessed.
+    assert_eq!(pool.block_data(2), PoolRead::NotFound);
+}
