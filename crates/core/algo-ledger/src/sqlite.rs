@@ -9809,6 +9809,64 @@ impl LedgerStore for SqliteLedger {
     }
 }
 
+/// Shutdown wait for an in-flight automatic catchpoint export that does NOT
+/// hold the ledger mutex while it waits (issue #2138).
+///
+/// [`SqliteLedger::wait_for_pending_catchpoint_export_timeout`] needs
+/// `&mut self`, so a caller behind the node's `Mutex<SqliteLedger>` would hold
+/// that lock for the whole wait (up to the shutdown budget), and an abandoned
+/// wait would leave the lock held while the rest of the teardown runs. This
+/// takes the worker handle out under a short lock, polls `is_finished`
+/// without it, then re-locks only to record the label. Returns `true` when
+/// nothing was pending or the export finished within `timeout`. On a
+/// timeout the handle is put back (unless a newer export took the slot), so
+/// a later call can still observe it.
+pub fn wait_for_pending_catchpoint_export_off_lock(
+    ledger: &std::sync::Mutex<SqliteLedger>,
+    timeout: std::time::Duration,
+) -> bool {
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+    let handle = match ledger.lock() {
+        Ok(mut guard) => guard.catchpoint_worker.take(),
+        Err(poisoned) => poisoned.into_inner().catchpoint_worker.take(),
+    };
+    let Some(handle) = handle else {
+        return true;
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    while !handle.is_finished() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            tracing::warn!(
+                ?timeout,
+                "automatic catchpoint export still running at shutdown timeout; \
+                 exiting without waiting further (the in-progress file, if any, is \
+                 written atomically so it can never be observed half-written)"
+            );
+            let mut guard = match ledger.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if guard.catchpoint_worker.is_none() {
+                guard.catchpoint_worker = Some(handle);
+            }
+            return false;
+        }
+        std::thread::sleep(POLL_INTERVAL.min(left));
+    }
+    match handle.join() {
+        Ok(label) => {
+            let guard = match ledger.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.record_joined_catchpoint_label(label);
+        }
+        Err(e) => tracing::warn!("automatic catchpoint export thread panicked: {e:?}"),
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10029,6 +10087,63 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(1),
             "must not have blocked past the bounded timeout"
         );
+    }
+
+    // Issue #2138: the shutdown wait must not hold the ledger mutex.
+    #[test]
+    fn off_lock_wait_lets_other_threads_take_the_ledger_lock_while_pending() {
+        let ledger = std::sync::Arc::new(std::sync::Mutex::new(
+            SqliteLedger::open_in_memory().unwrap(),
+        ));
+        ledger.lock().unwrap().catchpoint_worker = Some(std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            Some("7#OFFLOCK".to_string())
+        }));
+        let waiter = {
+            let ledger = std::sync::Arc::clone(&ledger);
+            std::thread::spawn(move || {
+                wait_for_pending_catchpoint_export_off_lock(
+                    &ledger,
+                    std::time::Duration::from_secs(5),
+                )
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let t = std::time::Instant::now();
+        drop(ledger.lock().unwrap());
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(200),
+            "another step must take the ledger lock while the export wait is pending"
+        );
+        assert!(waiter.join().unwrap(), "the export finished within the wait");
+        assert_eq!(
+            ledger.lock().unwrap().last_catchpoint_label().unwrap(),
+            "7#OFFLOCK",
+            "the joined export's label is recorded"
+        );
+    }
+
+    #[test]
+    fn off_lock_wait_times_out_deterministically_and_keeps_the_handle() {
+        let ledger = std::sync::Mutex::new(SqliteLedger::open_in_memory().unwrap());
+        ledger.lock().unwrap().catchpoint_worker = Some(std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            None
+        }));
+        let t = std::time::Instant::now();
+        assert!(!wait_for_pending_catchpoint_export_off_lock(
+            &ledger,
+            std::time::Duration::from_millis(150)
+        ));
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+        assert!(
+            ledger.lock().unwrap().catchpoint_worker.is_some(),
+            "an abandoned wait leaves the export observable for a later call"
+        );
+        assert!(wait_for_pending_catchpoint_export_off_lock(
+            &SqliteLedger::open_in_memory().map(std::sync::Mutex::new).unwrap(),
+            std::time::Duration::from_millis(1)
+        ));
     }
 
     // ---------------------------------------------------------------------

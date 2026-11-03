@@ -274,34 +274,35 @@ pub trait CatchupRunner: Send + Sync {
 ///
 /// # Shutdown budget
 ///
-/// This covers only the waits the live catchup adds or affects, not a real
-/// bound on the whole shutdown: `participate`'s other teardown joins (pool
-/// follower, heartbeat, state-proof service, tx syncer, gossip stop) are
-/// unbounded today (issue #2138 tracks one overall shutdown deadline).
-/// `participate` runs these waits one after another:
+/// This step is one of the `participate` teardown's, all of which share ONE
+/// overall deadline (issue #2138): `shutdown::Teardown`, 7 s by default
+/// (`ALGOD_SHUTDOWN_DEADLINE_SECS`), plus 1 s allowed for the exit work after
+/// it and `main`'s 1 s runtime drop (`RUNTIME_SHUTDOWN_TIMEOUT`): 9 s worst
+/// case, inside `docker stop`'s default 10 s grace. The full per-step table is on
+/// `shutdown::participate_plan`; the parts that matter here:
 ///
-/// | step | bound |
+/// | step | cap |
 /// |---|---|
-/// | this catchup stop | 5 s |
-/// | the REST server drain (`REST_SHUTDOWN_HARD_CAP`) | 5 s |
-/// | an in-flight automatic catchpoint export (`CATCHPOINT_EXPORT_SHUTDOWN_TIMEOUT`) | 30 s |
-/// | `main`'s runtime drop (`RUNTIME_SHUTDOWN_TIMEOUT`) | 3 s |
+/// | this catchup stop | 5 s (or what is left of the deadline after the reserve below) |
+/// | agreement (critical), then the concurrent joins group (pool follower, state-proof service: critical) | 1.5 s + 0.5 s reserved against every earlier step |
+/// | REST drain (`REST_SHUTDOWN_HARD_CAP`) | 5 s, within the deadline |
+/// | automatic catchpoint export wait (`CATCHPOINT_EXPORT_SHUTDOWN_TIMEOUT`) | 30 s, within the deadline; skipped when none is left |
 ///
 /// - Normal case, the image smoke's included: well under a second. A
 ///   cancelled catchup returns at once, the REST drain is immediate, and no
 ///   export is pending (the export wait returns at once when none is).
 /// - A live catchup that does not stop in time (a phase that checks the
-///   token only between steps): 5 + 5 + 3 = 13 s, inside the smoke's 20 s
-///   `docker stop` limit. `participate` skips the export wait then (see
-///   [`LiveCatchupManager::shutdown`]), and the abandoned run's
-///   import/verify keeps running through the remaining teardown on its own
-///   database connection until `main`'s runtime drop ends the process: a
-///   crash as far as its sync state goes, which the next start resumes.
+///   token only between steps): 5 s, then the critical steps still get
+///   their reserved time, and the export wait is skipped (see
+///   [`LiveCatchupManager::shutdown`]). The abandoned run's import/verify
+///   keeps running through the remaining teardown on its own database
+///   connection until `main`'s runtime drop ends the process: a crash as
+///   far as its sync state goes, which the next start resumes.
 /// - A pending automatic export: only a node in normal sync runs one, so
-///   the catchup step is instant: at most 5 + 30 + 3 = 38 s. That pre-dates
-///   issue #2121 (issue #794) and lets the newest catchpoint land; its
-///   writes are atomic, so a container runtime that kills earlier leaves no
-///   corrupt file.
+///   the catchup step is instant. The export wait gets the rest of the
+///   deadline (at most 30 s, in practice a few seconds), so the newest
+///   catchpoint lands only if it finishes in time; its writes are atomic
+///   (issue #794), so an abandoned one leaves no corrupt file.
 pub const LIVE_CATCHUP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Clears [`LiveCatchupManager`]'s `running` entry for run `generation` when

@@ -26,26 +26,31 @@ mod falcon_backend;
 mod live_catchup;
 mod log_setup;
 mod node_interface_impl;
+mod shutdown;
 
 use clap::Parser;
 
 use cli::{AlgocfgAction, AlgocfgProfileAction, BenchAction, CatchpointAction, Cli, Commands};
 
 /// Upper bound on how long dropping the runtime waits for blocking work that
-/// is still running once a command returns (issue #2121). Commands stop
-/// their services in order before returning; this only keeps a straggler
-/// (a blocking phase that checks its cancellation token between steps) from
-/// holding the process past a container stop's grace period, which a plain
-/// `Runtime` drop would do (it waits for every blocking thread).
-/// See `live_catchup::LIVE_CATCHUP_SHUTDOWN_TIMEOUT` for the whole budget.
+/// is still running once a command returns (issues #2121, #2138): see
+/// `shutdown::RUNTIME_DROP_BOUND` and the exit budget there. Commands stop
+/// their services under one overall deadline (`shutdown::Teardown`, 7 s by
+/// default) before returning; this only keeps a straggler (a blocking phase
+/// that checks its cancellation token between steps) from holding the process
+/// past a container stop's grace period, which a plain `Runtime` drop would
+/// do (it waits for every blocking thread). The teardown's thread joins run
+/// on detached std threads, which never hold the runtime open, so only real
+/// `spawn_blocking` work can reach this bound.
 ///
-/// Trade-off: blocking work still running here (an automatic catchpoint
-/// export past its wait, a live catchup's import/verify that did not stop in
-/// time) is abandoned at process exit. Both are built to survive that (the
-/// export is atomic, the sync state is persisted per phase and resumed), but
-/// the work is redone on the next start. Issue #2142 asks whether
-/// `participate` should join such work explicitly instead.
-const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Trade-off (issue #2142): blocking work still running here is abandoned at
+/// process exit, and logged first (`shutdown::log_abandoned_at_exit`). The
+/// teardown waits for the known blocking work (catchpoint export, agreement,
+/// pool follower, ...) within the overall deadline, so only an overran step
+/// reaches this point; the automatic export is atomic and the sync state is
+/// persisted per phase and resumed, so the work is redone on the next start,
+/// not corrupted.
+const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = shutdown::RUNTIME_DROP_BOUND;
 
 fn main() -> anyhow::Result<std::process::ExitCode> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -57,7 +62,10 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         runtime.block_on(async_main())
     }));
+    shutdown::log_exit_timing("run returned");
+    shutdown::log_abandoned_at_exit();
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    shutdown::log_exit_timing("runtime dropped");
     match result {
         Ok(result) => result,
         Err(panic) => std::panic::resume_unwind(panic),
@@ -115,8 +123,21 @@ async fn async_main() -> anyhow::Result<std::process::ExitCode> {
                     return Ok(std::process::ExitCode::SUCCESS);
                 }
                 Ok(commands::algod::Outcome::Launch(plan)) => {
+                    // Before `algod.pid` exists: a SIGTERM from `goal node
+                    // stop` must never hit the default (kill) disposition
+                    // while the pid file is on disk (issue #2195). A request
+                    // during startup is not swallowed: if startup does not
+                    // reach its shutdown wait within `STARTUP_GRACE` the
+                    // process removes the pid file and exits 128 + signal.
+                    let shutdown_signal = shutdown::ShutdownSignal::install_global()?;
                     match commands::algod::InstanceGuard::acquire(&plan.data_dir) {
-                        Ok(guard) => _algod_instance = Some(guard),
+                        Ok(guard) => {
+                            let pid_path = guard.pid_path().to_path_buf();
+                            shutdown_signal.add_startup_cleanup(move || {
+                                let _ = std::fs::remove_file(pid_path);
+                            });
+                            _algod_instance = Some(guard);
+                        }
                         Err(message) => {
                             eprintln!("{message}");
                             return Ok(std::process::ExitCode::from(1));

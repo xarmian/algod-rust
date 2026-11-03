@@ -333,6 +333,13 @@ impl InstanceGuard {
     }
 }
 
+impl InstanceGuard {
+    /// The `algod.pid` this instance holds (for the startup-exit cleanup).
+    pub fn pid_path(&self) -> &Path {
+        &self.pid_path
+    }
+}
+
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.pid_path);

@@ -111,7 +111,8 @@ pub use read_pool::{LazyReadPool, LedgerReadPool, PoolRead, PoolReader, Resource
 pub use sqlite::{
     block_path_for_prefix, derive_ledger_prefix, ledger_exists, open_ledger_connection,
     open_ledger_connection_with_sync_mode, remove_ledger_files, tracker_path_for_prefix,
-    CrossFileState, ReadSnapshot, SqliteLedger, BLOCK_SUFFIX, TRACKER_SUFFIX,
+    wait_for_pending_catchpoint_export_off_lock, CrossFileState, ReadSnapshot, SqliteLedger,
+    BLOCK_SUFFIX, TRACKER_SUFFIX,
 };
 pub use state::{schema_min_balance, LedgerState, StateSnapshot};
 pub use stateproof_worker::{

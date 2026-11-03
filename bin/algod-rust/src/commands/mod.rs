@@ -52,19 +52,12 @@ pub mod validate;
 /// `algod.pid`), whereas the default SIGTERM disposition kills the process
 /// with no cleanup (issue #1990).
 pub async fn wait_for_shutdown_signal() -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut term = signal(SignalKind::terminate())?;
-        tokio::select! {
-            r = tokio::signal::ctrl_c() => r,
-            _ = term.recv() => Ok(()),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await
-    }
+    // One process-wide request that every waiter sees, even one made before
+    // this call (issues #2195, #2138): see `shutdown::ShutdownSignal`.
+    crate::shutdown::ShutdownSignal::install_global()?
+        .wait()
+        .await;
+    Ok(())
 }
 
 /// Resolve a network name to an (algod_url, algod_token, network_name) tuple.

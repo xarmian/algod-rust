@@ -144,6 +144,120 @@ fn algod_dash_d_starts_a_node_with_go_files_and_single_instance_guard() {
         !dir.join("algod.pid").exists(),
         "algod.pid must be removed on a SIGTERM shutdown"
     );
+    assert!(
+        node.0
+            .try_wait()
+            .expect("wait")
+            .is_some_and(|s| s.success()),
+        "a SIGTERM after startup is the normal bounded teardown: exit 0"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(9),
+        "the bounded teardown must beat docker stop's 10 s grace, took {:?}",
+        start.elapsed()
+    );
+}
+
+/// Issue #2195: SIGTERM arriving while the node is still starting (right after
+/// `algod.pid` is written, before the shutdown handler used to be installed)
+/// hit the default disposition, which kills the process without removing
+/// `algod.pid`. The signal must be held until the node can shut down cleanly.
+#[test]
+fn sigterm_right_after_algod_pid_appears_still_removes_it_and_exits_promptly() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_data_dir(dir);
+
+    let node = NodeGuard(
+        algod(dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn algod-rust algod"),
+    );
+    let pid = node.0.id();
+    // As soon as the pid file exists: the earliest a `goal node stop` can act.
+    let start = Instant::now();
+    while !dir.join("algod.pid").exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "algod.pid never appeared"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    sigterm(pid);
+    let mut node = node;
+    let sent = Instant::now();
+    let status = loop {
+        if let Some(status) = node.0.try_wait().expect("wait") {
+            break status;
+        }
+        assert!(
+            sent.elapsed() < Duration::from_secs(30),
+            "algod did not exit within 30s of an early SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        !dir.join("algod.pid").exists(),
+        "algod.pid must be removed even when SIGTERM arrives during startup (status {status:?})"
+    );
+    // Either startup reached its shutdown wait inside the grace (the normal
+    // bounded teardown, exit 0) or the startup watchdog cleaned up and exited
+    // with 128 + SIGTERM: both are a prompt, clean stop.
+    assert!(
+        status.success() || status.code() == Some(143),
+        "an early SIGTERM must stop the node cleanly (0 or 143), got {status:?}"
+    );
+}
+
+/// Issue #2138 (review): a SIGTERM during a STUCK startup must not be
+/// swallowed until SIGKILL. The test-only startup stall keeps `participate`
+/// from ever reaching its shutdown wait; the startup watchdog must remove
+/// `algod.pid` and exit 128 + SIGTERM within its grace.
+#[test]
+fn sigterm_during_a_stuck_startup_exits_143_within_the_grace_and_removes_the_pid() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_data_dir(dir);
+
+    let node = NodeGuard(
+        algod(dir)
+            .env("ALGOD_RUST_TEST_STARTUP_STALL_MS", "120000")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn algod-rust algod"),
+    );
+    let pid = node.0.id();
+    // Startup is well into its stall once the REST files exist.
+    wait_for(&dir.join("algod.net"), "algod.net");
+    assert_eq!(
+        wait_for(&dir.join("algod.pid"), "algod.pid"),
+        pid.to_string()
+    );
+    sigterm(pid);
+    let mut node = node;
+    let sent = Instant::now();
+    let status = loop {
+        if let Some(status) = node.0.try_wait().expect("wait") {
+            break status;
+        }
+        assert!(
+            sent.elapsed() < Duration::from_secs(8),
+            "a stuck startup must exit within the 2 s grace plus slack of SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        status.code(),
+        Some(143),
+        "exit status must be 128 + SIGTERM, got {status:?}"
+    );
+    assert!(
+        !dir.join("algod.pid").exists(),
+        "algod.pid must be removed by the startup-exit cleanup"
+    );
 }
 
 #[test]
