@@ -283,18 +283,17 @@ impl LedgerReadPool {
     /// initialised database).
     pub fn committed_round(&self) -> Result<Option<u64>, AlgoError> {
         #[cfg(test)]
-        if self
-            .fail_committed_round
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |n| n.checked_sub(1),
-            )
-            .is_ok()
         {
-            return Err(AlgoError::Ledger {
-                message: "injected committed_round failure".into(),
-            });
+            let pending = self
+                .fail_committed_round
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if pending > 0 {
+                self.fail_committed_round
+                    .store(pending - 1, std::sync::atomic::Ordering::SeqCst);
+                return Err(AlgoError::Ledger {
+                    message: "injected committed_round failure".into(),
+                });
+            }
         }
         self.with_conn(|c| {
             let rnd: Option<i64> = c
