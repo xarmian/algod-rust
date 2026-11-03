@@ -20,6 +20,7 @@
 
 mod catchpoint_download;
 mod client;
+mod download_writer;
 pub mod gossip_block_source;
 pub mod http_block_fetcher;
 pub mod http_over_stream;

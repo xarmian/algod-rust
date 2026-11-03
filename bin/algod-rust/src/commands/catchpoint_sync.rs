@@ -594,9 +594,12 @@ impl SyncBackend for AlgodSyncBackend {
         round: u64,
         dest_path: &std::path::Path,
     ) -> Result<(), AlgoError> {
-        self.runtime.block_on(
-            self.catchpoint_source
-                .download(genesis_id, round, dest_path, None),
+        download_and_join_writers(
+            &self.runtime,
+            &self.catchpoint_source,
+            genesis_id,
+            round,
+            dest_path,
         )
     }
 
@@ -637,14 +640,15 @@ impl SyncBackend for AlgodSyncBackend {
             return BatchFetch::complete(Vec::new());
         }
 
-        self.runtime.fetch_range(cancel, |cancel| async move {
+        let cancel = cancel.clone();
+        self.runtime.fetch_range(|backend_cancel| async move {
             // Rotate across the candidate peers like the single-block
             // path (issue #2095). Size the drain from the source's own
             // timeouts, not a separately constructed default (issue #1755).
             let drain = sync_tuning().drain_budget(self.blocks.worst_case_request_time());
             let source: Arc<dyn BlockSource> = Arc::clone(&self.blocks) as Arc<dyn BlockSource>;
             let fetcher = ParallelBlockFetcher::new(source, concurrency).with_drain_timeout(drain);
-            collect_block_range(&fetcher, start, end, &cancel).await
+            collect_block_range_until(&fetcher, start, end, &cancel, &backend_cancel).await
         })
     }
 }
@@ -677,40 +681,48 @@ impl BlockingRuntime {
         block_on_until_cancelled(&self.rt, &self.cancel, fut)
     }
 
-    /// Run a range fetch (`SyncBackend::fetch_block_range`, which carries
-    /// the caller's own token), ending it as soon as EITHER the caller's
-    /// token or the backend's fires (issue #2121). Both reach the fetch as
-    /// one combined token that `collect_block_range` observes itself, so the
-    /// prefix served before the cancellation is kept (issue #1725), rather
-    /// than the fetch being dropped with nothing to show.
-    fn fetch_range<F, Fut>(&self, cancel: &CancellationToken, fetch: F) -> BatchFetch
+    /// Run a range fetch (`SyncBackend::fetch_block_range`) to completion
+    /// from the (blocking) sync thread. `fetch` gets the backend's token and
+    /// races it, together with the caller's own, inside the fetch itself
+    /// ([`collect_block_range_until`]), so that whichever fires, the fetch
+    /// still returns the prefix served before it (issue #1725) instead of
+    /// being dropped with nothing to show (issue #2121). No combined token or
+    /// forwarding future is needed (issue #2144).
+    fn fetch_range<F, Fut>(&self, fetch: F) -> BatchFetch
     where
         F: FnOnce(CancellationToken) -> Fut,
         Fut: std::future::Future<Output = BatchFetch>,
     {
-        let combined = CancellationToken::new();
-        if cancel.is_cancelled() || self.cancel.is_cancelled() {
-            combined.cancel();
-        }
-        let backend = &self.cancel;
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(async {
-                let forward = async {
-                    tokio::select! {
-                        _ = backend.cancelled() => {}
-                        _ = cancel.cancelled() => {}
-                    }
-                    combined.cancel();
-                    // Then let the fetch observe it and finish with its prefix.
-                    std::future::pending::<BatchFetch>().await
-                };
-                tokio::select! {
-                    result = fetch(combined.clone()) => result,
-                    never = forward => never,
-                }
-            })
-        })
+        tokio::task::block_in_place(|| self.rt.block_on(fetch(self.cancel.clone())))
     }
+}
+
+/// How long to wait for the download's writer threads once the download has
+/// ended (issue #2139). One file operation is in flight at most, so this is
+/// only reached when the disk is stuck.
+const WRITER_JOIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `SyncBackend::download_catchpoint` for a [`RankedCatchpointSource`]: run
+/// the download, and, however it ended (done, failed, or dropped because the
+/// token fired), wait until its writer threads have exited before returning.
+/// The orchestrator deletes the catchpoint files right after a cancelled
+/// download returns, and no write or rename may land after that (issue
+/// #2139).
+fn download_and_join_writers(
+    runtime: &BlockingRuntime,
+    source: &RankedCatchpointSource,
+    genesis_id: &str,
+    round: u64,
+    dest_path: &std::path::Path,
+) -> Result<(), AlgoError> {
+    let result = runtime.block_on(source.download(genesis_id, round, dest_path, None));
+    if !source.wait_for_writers(WRITER_JOIN_BUDGET) {
+        warn!(
+            round,
+            "a catchpoint writer thread did not exit within {WRITER_JOIN_BUDGET:?};              a leftover file is removed by the next run's sweep"
+        );
+    }
+    result
 }
 
 /// Drive `fut` on `rt` from a blocking thread (the sync orchestrator's, or a
@@ -737,6 +749,17 @@ fn block_on_until_cancelled<T>(
             }
         })
     })
+}
+
+/// [`collect_block_range_until`] for a caller with only its own token.
+#[cfg(test)]
+async fn collect_block_range(
+    fetcher: &ParallelBlockFetcher,
+    start: u64,
+    end: u64,
+    cancel: &CancellationToken,
+) -> BatchFetch {
+    collect_block_range_until(fetcher, start, end, cancel, &CancellationToken::new()).await
 }
 
 /// Fetch the inclusive range `[start, end]` through `fetcher`.
@@ -768,11 +791,16 @@ fn block_on_until_cancelled<T>(
 ///
 /// An inverted range (`end < start`) is empty and `end == u64::MAX` is
 /// rejected (the half-open fetch range cannot express it).
-async fn collect_block_range(
+///
+/// `backend_cancel` is the sync backend's own token (a node shutdown or an
+/// abort): when it fires the call ends too, returning the prefix received so
+/// far exactly like a cancelled `cancel` (issue #2144).
+async fn collect_block_range_until(
     fetcher: &ParallelBlockFetcher,
     start: u64,
     end: u64,
     cancel: &CancellationToken,
+    backend_cancel: &CancellationToken,
 ) -> BatchFetch {
     if end < start {
         return BatchFetch::complete(Vec::new());
@@ -791,13 +819,24 @@ async fn collect_block_range(
     // fetch_range uses half-open [start, end), so add 1 to include `end`.
     let (mut rx, first_error) = fetcher.fetch_range_tracked(Round(start), Round(end + 1), child);
     let mut blocks = Vec::with_capacity(expected.min(4096) as usize);
-    while let Some((round, block_resp)) = rx.recv().await {
+    loop {
+        let next = tokio::select! {
+            // Biased toward blocks already received: they are part of the
+            // prefix even when the backend's token has fired too.
+            biased;
+            next = rx.recv() => next,
+            // Returning drops `_stop_fetcher`, which stops the fetch tasks.
+            _ = backend_cancel.cancelled() => None,
+        };
+        let Some((round, block_resp)) = next else {
+            break;
+        };
         blocks.push((round.0, block_resp.block));
     }
     if blocks.len() as u64 == expected {
         return BatchFetch::complete(blocks);
     }
-    if cancel.is_cancelled() {
+    if cancel.is_cancelled() || backend_cancel.is_cancelled() {
         return BatchFetch::cancelled(blocks, start, end);
     }
     let next_needed = start + blocks.len() as u64;
@@ -1255,9 +1294,12 @@ impl SyncBackend for GossipSyncBackend {
         dest_path: &std::path::Path,
     ) -> Result<(), AlgoError> {
         // Catchpoint download is always via REST/HTTP, ranked across peers.
-        self.runtime.block_on(
-            self.catchpoint_source
-                .download(genesis_id, round, dest_path, None),
+        download_and_join_writers(
+            &self.runtime,
+            &self.catchpoint_source,
+            genesis_id,
+            round,
+            dest_path,
         )
     }
 
@@ -1314,7 +1356,8 @@ impl SyncBackend for GossipSyncBackend {
         // For batch fetches, use the gossip source wrapped as a BlockSource
         // via ParallelBlockFetcher when gossip is available. Fall back to
         // REST-based parallel fetch when in HttpOnly mode.
-        self.runtime.fetch_range(cancel, |cancel| async move {
+        let cancel = cancel.clone();
+        self.runtime.fetch_range(|backend_cancel| async move {
             let source: Arc<dyn BlockSource> = match self.policy {
                 BlockSourcePolicy::HttpOnly => {
                     // Use HttpBlockFetcherSource to route through the
@@ -1341,7 +1384,7 @@ impl SyncBackend for GossipSyncBackend {
             };
             let fetcher = ParallelBlockFetcher::new(source, effective_concurrency)
                 .with_drain_timeout(sync_tuning().drain_budget(self.worst_case_round_time));
-            collect_block_range(&fetcher, start, end, &cancel).await
+            collect_block_range_until(&fetcher, start, end, &cancel, &backend_cancel).await
         })
     }
 }
@@ -2160,8 +2203,9 @@ mod tests {
                 to_fire.cancel();
             });
             let fetcher = ParallelBlockFetcher::new(Arc::new(StallingSource { serve_below: 4 }), 2);
-            let fetch = runtime.fetch_range(&caller, |cancel| async move {
-                collect_block_range(&fetcher, 1, 10, &cancel).await
+            let caller = caller.clone();
+            let fetch = runtime.fetch_range(|backend_cancel| async move {
+                collect_block_range_until(&fetcher, 1, 10, &caller, &backend_cancel).await
             });
             let rounds: Vec<u64> = fetch.blocks.iter().map(|(r, _)| *r).collect();
             assert_eq!(rounds, vec![1, 2, 3], "fire_backend = {fire_backend}");

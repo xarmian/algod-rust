@@ -64,6 +64,7 @@ use algo_network::peer_ranker::{
     PEER_RANK_NO_CATCHPOINT_FOR_ROUND,
 };
 
+use crate::download_writer::WriterTracker;
 use crate::http_over_stream::HttpPeerTransport;
 use crate::{CatchpointDownloadConfig, CatchpointDownloader, DownloadProgress};
 
@@ -115,6 +116,8 @@ pub struct RankedCatchpointSource {
     /// no way to know at transfer time whether the bytes it received will
     /// turn out to fail a much later, much more expensive integrity check.
     last_download_peer: StdMutex<Option<PeerSelectorPeer>>,
+    /// The writer threads of every candidate's downloader (issue #2139).
+    writers: Arc<WriterTracker>,
 }
 
 impl RankedCatchpointSource {
@@ -129,16 +132,16 @@ impl RankedCatchpointSource {
     ///
     /// Peer identity for ranking purposes is the base URL.
     pub fn new(peers: &[(String, String)], config: CatchpointDownloadConfig) -> Self {
+        let writers = Arc::new(WriterTracker::default());
         let mut downloaders = HashMap::with_capacity(peers.len());
         let mut urls = Vec::with_capacity(peers.len());
         for (url, token) in peers {
             downloaders.insert(
                 url.clone(),
-                Arc::new(CatchpointDownloader::with_config(
-                    url,
-                    token,
-                    config.clone(),
-                )),
+                Arc::new(
+                    CatchpointDownloader::with_config(url, token, config.clone())
+                        .with_writer_tracker(Arc::clone(&writers)),
+                ),
             );
             urls.push(url.clone());
         }
@@ -154,7 +157,18 @@ impl RankedCatchpointSource {
             config,
             ledger_download_retry_attempts: Self::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
             last_download_peer: StdMutex::new(None),
+            writers,
         }
+    }
+
+    /// Wait until no file operation of any download this source ran (or
+    /// started and had dropped) can still land: every writer thread has
+    /// exited. Blocking: call it from a thread that may block. False if
+    /// `timeout` passed first. An abort calls this after dropping the download
+    /// and before deleting the catchpoint files (issue #2139); see
+    /// [`CatchpointDownloader::wait_for_writers`].
+    pub fn wait_for_writers(&self, timeout: std::time::Duration) -> bool {
+        self.writers.wait_idle(timeout)
     }
 
     /// Override the pre-flight probe retry budget [`Self::check_ledger_download`]
@@ -182,11 +196,10 @@ impl RankedCatchpointSource {
     /// already is (this method's whole point: extending, not duplicating,
     /// #901's existing ranking wiring).
     pub fn push_p2p_peer(&self, peer_id: String, transport: Arc<dyn HttpPeerTransport>) {
-        let downloader = Arc::new(CatchpointDownloader::with_p2p_transport(
-            &peer_id,
-            transport,
-            self.config.clone(),
-        ));
+        let downloader = Arc::new(
+            CatchpointDownloader::with_p2p_transport(&peer_id, transport, self.config.clone())
+                .with_writer_tracker(Arc::clone(&self.writers)),
+        );
         self.downloaders
             .lock()
             .expect("downloaders map lock poisoned")
