@@ -429,6 +429,20 @@ impl<'a> CatchpointImporter<'a> {
         &self,
         header: &CatchpointFileHeader,
     ) -> Result<CutoverBackup, CatchpointError> {
+        self.atomic_cutover_with_hook(header, None)
+    }
+
+    /// [`Self::atomic_cutover`] that also runs `in_cutover` inside the cutover
+    /// transaction, after the live tables are replaced and just before the
+    /// commit (issue #2141). Whatever it writes through the connection it is
+    /// given commits with the cutover or not at all, so a caller's record of
+    /// "the ledger is cut over" can never disagree with the live tables. An
+    /// error from the hook rolls the whole cutover back.
+    pub fn atomic_cutover_with_hook(
+        &self,
+        header: &CatchpointFileHeader,
+        in_cutover: Option<CutoverHook<'_>>,
+    ) -> Result<CutoverBackup, CatchpointError> {
         let round = header.balances_round as i64;
         let totals = &header.totals;
         let mut backup = CutoverBackup::default();
@@ -670,6 +684,10 @@ impl<'a> CatchpointImporter<'a> {
             DROP TABLE IF EXISTS catchpoint_import_state;",
         )?;
 
+        if let Some(hook) = in_cutover {
+            hook(&tx)?;
+        }
+
         tx.commit().map_err(CatchpointError::SqliteError)?;
 
         tracing::info!(
@@ -716,6 +734,17 @@ impl<'a> CatchpointImporter<'a> {
     /// on-disk ledger pointed at a round the participation path never
     /// adopted.
     pub fn rollback_cutover(&self, backup: &CutoverBackup) -> Result<(), CatchpointError> {
+        self.rollback_cutover_with_hook(backup, None)
+    }
+
+    /// [`Self::rollback_cutover`] that also runs `in_rollback` inside the
+    /// rollback transaction (issue #2141), so the caller's marker is restored
+    /// to the pre-catchup value together with the tables.
+    pub fn rollback_cutover_with_hook(
+        &self,
+        backup: &CutoverBackup,
+        in_rollback: Option<CutoverHook<'_>>,
+    ) -> Result<(), CatchpointError> {
         let tx = self
             .conn
             .unchecked_transaction()
@@ -778,6 +807,10 @@ impl<'a> CatchpointImporter<'a> {
                 "INSERT OR REPLACE INTO catchpointstate(id, intval, strval) VALUES(?1, ?2, ?3)",
                 rusqlite::params![id, intval, strval],
             )?;
+        }
+
+        if let Some(hook) = in_rollback {
+            hook(&tx)?;
         }
 
         tx.commit().map_err(CatchpointError::SqliteError)?;
@@ -1130,7 +1163,24 @@ pub fn import_catchpoint_file_with_progress(
     conn: &Connection,
     path: &Path,
     reward_unit: u64,
+    on_progress: Option<&mut dyn FnMut(&ImportProgressUpdate)>,
+) -> Result<ImportResult, CatchpointError> {
+    import_catchpoint_file_with_cutover_hook(conn, path, reward_unit, on_progress, None)
+}
+
+/// A write that runs inside a cutover or rollback transaction (see
+/// [`CatchpointImporter::atomic_cutover_with_hook`]).
+pub type CutoverHook<'a> = &'a dyn Fn(&Connection) -> Result<(), CatchpointError>;
+
+/// [`import_catchpoint_file_with_progress`] whose atomic cutover also runs
+/// `in_cutover` inside its transaction (issue #2141): the hook's writes commit
+/// with the live-table replacement or not at all.
+pub fn import_catchpoint_file_with_cutover_hook(
+    conn: &Connection,
+    path: &Path,
+    reward_unit: u64,
     mut on_progress: Option<&mut dyn FnMut(&ImportProgressUpdate)>,
+    in_cutover: Option<CutoverHook<'_>>,
 ) -> Result<ImportResult, CatchpointError> {
     let start = Instant::now();
 
@@ -1287,7 +1337,7 @@ pub fn import_catchpoint_file_with_progress(
     // with no verification step of its own (e.g. this function's own
     // callers that treat import as complete on return) is expected to
     // finalize immediately — see [`ImportResult::cutover_backup`].
-    let cutover_backup = importer.atomic_cutover(&header)?;
+    let cutover_backup = importer.atomic_cutover_with_hook(&header, in_cutover)?;
 
     let duration = start.elapsed();
     tracing::info!(
