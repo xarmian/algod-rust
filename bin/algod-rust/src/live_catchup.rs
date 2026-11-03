@@ -275,16 +275,16 @@ pub trait CatchupRunner: Send + Sync {
 /// # Shutdown budget
 ///
 /// This step is one of the `participate` teardown's, all of which share ONE
-/// overall deadline (issue #2138): `shutdown::Teardown`, 8 s by default
-/// (`ALGOD_SHUTDOWN_DEADLINE_SECS`), with `main`'s runtime drop
-/// (`RUNTIME_SHUTDOWN_TIMEOUT`) 1 s on top, so 9 s worst case, inside
-/// `docker stop`'s default 10 s grace. The full per-step table is on
+/// overall deadline (issue #2138): `shutdown::Teardown`, 7 s by default
+/// (`ALGOD_SHUTDOWN_DEADLINE_SECS`), plus 1 s allowed for the exit work after
+/// it and `main`'s 1 s runtime drop (`RUNTIME_SHUTDOWN_TIMEOUT`): 9 s worst
+/// case, inside `docker stop`'s default 10 s grace. The full per-step table is on
 /// `shutdown::participate_plan`; the parts that matter here:
 ///
 /// | step | cap |
 /// |---|---|
 /// | this catchup stop | 5 s (or what is left of the deadline after the reserve below) |
-/// | agreement, pool follower, state-proof service (critical) | 1.5 + 0.5 + 0.5 s reserved against every earlier step |
+/// | agreement (critical), then the concurrent joins group (pool follower, state-proof service: critical) | 1.5 s + 0.5 s reserved against every earlier step |
 /// | REST drain (`REST_SHUTDOWN_HARD_CAP`) | 5 s, within the deadline |
 /// | automatic catchpoint export wait (`CATCHPOINT_EXPORT_SHUTDOWN_TIMEOUT`) | 30 s, within the deadline; skipped when none is left |
 ///
