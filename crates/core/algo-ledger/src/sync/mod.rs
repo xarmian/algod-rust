@@ -34,6 +34,9 @@
 pub(crate) mod lookback_prefetch;
 pub mod state_machine;
 
+#[cfg(test)]
+mod cutover_marker_tests;
+
 pub use state_machine::{SyncProgress, SyncState};
 
 use std::path::PathBuf;
@@ -45,8 +48,8 @@ use rusqlite::Connection;
 use tokio_util::sync::CancellationToken;
 
 use crate::catchpoint::{
-    import_catchpoint_file_with_progress, parse_catchpoint_label, validate_post_import,
-    verify_catchpoint, CatchpointError, CatchpointFileHeader, ImportProgressUpdate,
+    parse_catchpoint_label, validate_post_import, verify_catchpoint, CatchpointError,
+    CatchpointFileHeader, ImportProgressUpdate,
 };
 use crate::EvalDeltaStats;
 use crate::LedgerStore;
@@ -431,6 +434,10 @@ const SYNC_STATE_KEY: &str = "algod_rust_sync_state";
 const SYNC_CATCHPOINT_LABEL_KEY: &str = "algod_rust_sync_catchpoint_label";
 const SYNC_CATCHPOINT_ROUND_KEY: &str = "algod_rust_sync_catchpoint_round";
 const SYNC_CATCHPOINT_FILE_KEY: &str = "algod_rust_sync_catchpoint_file";
+/// 1 while the live tables hold the imported, not yet finished snapshot (the
+/// import's cutover replaced them), 0 while they do not. Written by the
+/// cutover's own transaction (issue #2141), so it cannot disagree with them.
+const SYNC_CUT_OVER_KEY: &str = "algod_rust_sync_cut_over";
 
 /// Persist the current sync state to `catchpointstate` with namespaced
 /// `algod_rust_sync_*` ids.
@@ -443,6 +450,61 @@ pub fn persist_sync_state(
     catchpoint_label: Option<&str>,
     catchpoint_round: Option<u64>,
     catchpoint_file: Option<&str>,
+) -> Result<(), AlgoError> {
+    persist_sync_state_with_cut_over(
+        conn,
+        state,
+        catchpoint_label,
+        catchpoint_round,
+        catchpoint_file,
+        None,
+    )
+}
+
+/// [`persist_sync_state`] that also records whether the live tables are the
+/// imported snapshot (`cut_over`, issue #2141). `None` records nothing: a
+/// reader then falls back to the state ordinal, as markers written before the
+/// flag existed require.
+///
+/// The marker rows are written under one savepoint, so they commit together
+/// with each other and, when `conn` is inside a transaction (the cutover's),
+/// with that transaction.
+pub fn persist_sync_state_with_cut_over(
+    conn: &Connection,
+    state: &SyncState,
+    catchpoint_label: Option<&str>,
+    catchpoint_round: Option<u64>,
+    catchpoint_file: Option<&str>,
+    cut_over: Option<bool>,
+) -> Result<(), AlgoError> {
+    let savepoint = |sql: &str| {
+        conn.execute_batch(sql).map_err(|e| AlgoError::Ledger {
+            message: format!("sync marker savepoint ({sql}): {e}"),
+        })
+    };
+    savepoint("SAVEPOINT sync_marker")?;
+    let written = write_sync_rows(
+        conn,
+        state,
+        catchpoint_label,
+        catchpoint_round,
+        catchpoint_file,
+        cut_over,
+    );
+    if written.is_err() {
+        savepoint("ROLLBACK TO sync_marker")?;
+    }
+    savepoint("RELEASE sync_marker")?;
+    written
+}
+
+fn write_sync_rows(
+    conn: &Connection,
+    state: &SyncState,
+    catchpoint_label: Option<&str>,
+    catchpoint_round: Option<u64>,
+    catchpoint_file: Option<&str>,
+    cut_over: Option<bool>,
 ) -> Result<(), AlgoError> {
     // `catchpointstate` is created by `SCHEMA_TRACKER_SQL`; ensure it
     // exists defensively in case a caller invokes this against a
@@ -474,6 +536,11 @@ pub fn persist_sync_state(
         set_sync_str(conn, SYNC_CATCHPOINT_FILE_KEY, file)?;
     } else {
         delete_sync_row(conn, SYNC_CATCHPOINT_FILE_KEY)?;
+    }
+    if let Some(cut_over) = cut_over {
+        set_sync_int(conn, SYNC_CUT_OVER_KEY, i64::from(cut_over))?;
+    } else {
+        delete_sync_row(conn, SYNC_CUT_OVER_KEY)?;
     }
 
     Ok(())
@@ -510,12 +577,14 @@ pub fn restore_sync_state(conn: &Connection) -> Result<Option<PersistedSyncState
     let catchpoint_label = get_sync_str(conn, SYNC_CATCHPOINT_LABEL_KEY)?;
     let catchpoint_round = get_sync_int(conn, SYNC_CATCHPOINT_ROUND_KEY)?.map(|v| v as u64);
     let catchpoint_file = get_sync_str(conn, SYNC_CATCHPOINT_FILE_KEY)?;
+    let cut_over = get_sync_int(conn, SYNC_CUT_OVER_KEY)?.map(|v| v != 0);
 
     Ok(Some(PersistedSyncState {
         state,
         catchpoint_label,
         catchpoint_round,
         catchpoint_file,
+        cut_over,
     }))
 }
 
@@ -539,6 +608,7 @@ pub fn clear_sync_state(conn: &Connection) -> Result<(), AlgoError> {
         SYNC_CATCHPOINT_LABEL_KEY,
         SYNC_CATCHPOINT_ROUND_KEY,
         SYNC_CATCHPOINT_FILE_KEY,
+        SYNC_CUT_OVER_KEY,
     ] {
         delete_sync_row(conn, key)?;
     }
@@ -557,6 +627,21 @@ pub struct PersistedSyncState {
     pub catchpoint_round: Option<u64>,
     /// Path to the downloaded catchpoint file.
     pub catchpoint_file: Option<String>,
+    /// Whether the live tables are the imported snapshot, as recorded by the
+    /// cutover's own transaction (issue #2141). `None` for a marker written
+    /// before the flag existed: those were written only after a cutover for
+    /// states from `ImportingLedger` on, so [`Self::is_cut_over`] falls back
+    /// to the state ordinal.
+    pub cut_over: Option<bool>,
+}
+
+impl PersistedSyncState {
+    /// Whether the live ledger holds the marker's (unverified or later)
+    /// snapshot.
+    pub fn is_cut_over(&self) -> bool {
+        self.cut_over
+            .unwrap_or_else(|| phase_ordinal(&self.state) >= 2)
+    }
 }
 
 fn delete_sync_row(conn: &Connection, key: &str) -> Result<(), AlgoError> {
@@ -628,6 +713,24 @@ fn get_sync_int(conn: &Connection, key: &str) -> Result<Option<i64>, AlgoError> 
 // SyncOrchestrator
 // ---------------------------------------------------------------------------
 
+/// Where [`SyncOrchestrator::set_import_failpoint`] makes the import phase
+/// fail or die (issue #2141). Test hook only, scoped to one orchestrator
+/// instance: nothing in a production path reads the environment or a global.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
+pub enum ImportFailpoint {
+    /// Error inside the cutover transaction, just before its commit: the
+    /// cutover (and any marker write riding with it) must roll back.
+    BeforeCutoverCommit,
+    /// Error right after the cutover transaction committed.
+    AfterCutoverCommit,
+    /// Hard-abort the process right after the cutover transaction committed
+    /// (no unwinding, no destructors: like `kill -9`).
+    AbortAfterCutoverCommit,
+    /// `initialize_meta_from_catchpoint` fails.
+    InitializeMetaFails,
+}
+
 /// Orchestrator that coordinates all phases of a catchpoint sync.
 ///
 /// Modeled after Go's `CatchpointCatchupService` in
@@ -649,7 +752,9 @@ pub struct SyncOrchestrator {
     catchpoint_download_path: Option<PathBuf>,
     /// The import's atomic cutover replaced the live tables (in this run, or
     /// in the earlier run this one resumed past the import). From then on an
-    /// abort can only undo it through `cutover_backup` (issue #2121).
+    /// abort can only undo it through `cutover_backup` (issue #2121). Mirrors
+    /// the marker's `cut_over` flag, which the cutover's own transaction (and
+    /// its rollback's) writes, so the two cannot disagree (issue #2141).
     ledger_cut_over: bool,
     /// `cutover_backup` holds the PRE-catchup ledger: the import cut over a
     /// ledger that had not been cut over before. False in a run resumed with
@@ -731,6 +836,9 @@ pub struct SyncOrchestrator {
     on_progress: Option<ProgressCallback>,
     /// Accumulated EvalDelta comparison stats (when compare_mode or avm_execute is enabled).
     eval_delta_stats: EvalDeltaStats,
+    /// Test hook (see [`ImportFailpoint`]).
+    #[cfg(any(test, feature = "test-hooks"))]
+    import_failpoint: Option<ImportFailpoint>,
 }
 
 impl SyncOrchestrator {
@@ -770,7 +878,28 @@ impl SyncOrchestrator {
             abort: CancellationToken::new(),
             on_progress: None,
             eval_delta_stats: EvalDeltaStats::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            import_failpoint: None,
         }
+    }
+
+    /// Make the import phase fail or die at `failpoint` (test hook, issue
+    /// #2141).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_import_failpoint(&mut self, failpoint: Option<ImportFailpoint>) {
+        self.import_failpoint = failpoint;
+    }
+
+    /// Whether the import failpoint `which` is armed.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn failpoint_is(&self, which: ImportFailpoint) -> bool {
+        self.import_failpoint == Some(which)
+    }
+
+    /// Production builds have no failpoints.
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    fn failpoint_is(&self, _which: ImportFailpoint) -> bool {
+        false
     }
 
     /// Set a cancellation token for graceful shutdown.
@@ -881,7 +1010,7 @@ impl SyncOrchestrator {
         // them. A rollback that really restored the pre-catchup ledger has
         // already cleared `ledger_cut_over`.
         let state = &self.marker_state_for(state);
-        if let Err(e) = persist_sync_state(
+        if let Err(e) = persist_sync_state_with_cut_over(
             conn,
             state,
             self.resolved_label.as_deref(),
@@ -890,6 +1019,7 @@ impl SyncOrchestrator {
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned())
                 .as_deref(),
+            Some(self.ledger_cut_over),
         ) {
             tracing::warn!(state = %state, error = %e, "failed to persist the sync state");
         }
@@ -1028,7 +1158,11 @@ impl SyncOrchestrator {
         }
         Ok(match phase_ordinal(&persisted.state) {
             0 | 1 => MarkerAction::StartOver { cut_over: false },
-            2 => MarkerAction::StartOver { cut_over: true },
+            // At the import state the recorded flag decides: a shutdown
+            // inside the import persists this state before any cutover.
+            2 => MarkerAction::StartOver {
+                cut_over: persisted.is_cut_over(),
+            },
             _ => MarkerAction::Reject,
         })
     }
@@ -1080,18 +1214,20 @@ impl SyncOrchestrator {
             "found a sync marker for a different catchpoint; starting a new catchup for \
              the requested one instead of resuming it"
         );
+        self.ledger_cut_over = cut_over;
         let next = if cut_over {
             let requested = self.config.catchpoint_label.clone();
             let round = requested
                 .as_deref()
                 .and_then(|l| parse_catchpoint_label(l.trim()).ok())
                 .map(|p| p.round);
-            persist_sync_state(
+            persist_sync_state_with_cut_over(
                 conn,
                 &SyncState::ImportingLedger,
                 requested.as_deref(),
                 round,
                 None,
+                Some(true),
             )?;
             SyncState::ImportingLedger
         } else {
@@ -1498,10 +1634,36 @@ impl SyncOrchestrator {
         // `catchpoint_total_kvs`/`catchpoint_processed_kvs` on every chunk —
         // mirrors go's `updateLedgerFetcherProgress` (issue #941).
         let reward_unit = crate::rewards::REWARD_UNITS;
+        // The resume marker is written INSIDE the cutover's transaction
+        // (issue #2141): "the live tables are replaced" and "the marker says
+        // so" commit together or not at all, so no crash or later failure can
+        // leave a cut-over ledger under a pre-cutover marker. It names the
+        // same label, round and file `persist_marker` would.
+        let marker_label = self.resolved_label.clone();
+        let marker_round = self.catchpoint_round;
+        let marker_file = file_path.to_string_lossy().into_owned();
+        let fail_before_commit = self.failpoint_is(ImportFailpoint::BeforeCutoverCommit);
+        let in_cutover = |tx: &Connection| -> Result<(), crate::catchpoint::CatchpointError> {
+            persist_sync_state_with_cut_over(
+                tx,
+                &SyncState::ImportingLedger,
+                marker_label.as_deref(),
+                marker_round,
+                Some(&marker_file),
+                Some(true),
+            )
+            .map_err(|e| crate::catchpoint::CatchpointError::CutoverError(e.to_string()))?;
+            if fail_before_commit {
+                return Err(crate::catchpoint::CatchpointError::CutoverError(
+                    "failpoint: before the cutover commit".to_string(),
+                ));
+            }
+            Ok(())
+        };
         let import_result = {
             let progress = &mut self.progress;
             let on_progress = &self.on_progress;
-            import_catchpoint_file_with_progress(
+            crate::catchpoint::import_catchpoint_file_with_cutover_hook(
                 &conn,
                 &file_path,
                 reward_unit,
@@ -1512,6 +1674,7 @@ impl SyncOrchestrator {
                     progress.catchpoint_processed_kvs = update.processed_kvs;
                     notify_progress_fields(progress, on_progress);
                 }),
+                Some(&in_cutover),
             )
             .map_err(|e| AlgoError::Ledger {
                 message: format!("catchpoint import failed: {e}"),
@@ -1526,6 +1689,15 @@ impl SyncOrchestrator {
         self.cutover_backup = Some(import_result.cutover_backup);
         self.cutover_backup_pre_catchup = !self.ledger_cut_over;
         self.ledger_cut_over = true;
+
+        if self.failpoint_is(ImportFailpoint::AbortAfterCutoverCommit) {
+            std::process::abort();
+        }
+        if self.failpoint_is(ImportFailpoint::AfterCutoverCommit) {
+            return Err(AlgoError::Ledger {
+                message: "failpoint: after the cutover commit".to_string(),
+            });
+        }
 
         tracing::info!(
             round,
@@ -1548,6 +1720,11 @@ impl SyncOrchestrator {
         }
         let txn_counter = derive_txn_counter(&conn);
 
+        if self.failpoint_is(ImportFailpoint::InitializeMetaFails) {
+            return Err(AlgoError::Ledger {
+                message: "failpoint: initialize_meta_from_catchpoint".to_string(),
+            });
+        }
         crate::sqlite::initialize_meta_from_catchpoint(
             &conn,
             round,
@@ -1577,8 +1754,7 @@ impl SyncOrchestrator {
         // "acctrounds mismatch". See `run_verify_ledger`'s own comment for
         // the full rationale.
 
-        // Persist state.
-        self.persist_marker(&conn, &SyncState::ImportingLedger);
+        // The `ImportingLedger` marker was committed with the cutover above.
 
         self.progress.phase_progress = 1.0;
         self.notify_progress();
@@ -1625,7 +1801,34 @@ impl SyncOrchestrator {
             String::new(),
             crate::rewards::REWARD_UNITS,
         );
-        if let Err(e) = importer.rollback_cutover(&backup) {
+        // The marker is restored INSIDE the rollback's transaction (issue
+        // #2141), exactly as the cutover wrote it inside its own. Pre-catchup
+        // again: back to "downloaded", so a resume (a verify-failure retry, or
+        // the next start) re-downloads and re-imports, and an abort before
+        // that re-import discards cleanly. Restored to an earlier unverified
+        // cutover: still cut over (issue #2121).
+        let pre_catchup = self.cutover_backup_pre_catchup;
+        let marker_state = if pre_catchup {
+            SyncState::DownloadingLedger
+        } else {
+            SyncState::ImportingLedger
+        };
+        let marker_file = self
+            .catchpoint_file_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        let restore_marker = |tx: &Connection| -> Result<(), crate::catchpoint::CatchpointError> {
+            persist_sync_state_with_cut_over(
+                tx,
+                &marker_state,
+                self.resolved_label.as_deref(),
+                self.catchpoint_round,
+                marker_file.as_deref(),
+                Some(!pre_catchup),
+            )
+            .map_err(|e| crate::catchpoint::CatchpointError::CutoverError(e.to_string()))
+        };
+        if let Err(e) = importer.rollback_cutover_with_hook(&backup, Some(&restore_marker)) {
             tracing::error!(
                 error = %e,
                 reason,
@@ -1636,7 +1839,6 @@ impl SyncOrchestrator {
         }
         // Restoring a backup of an earlier unverified cutover leaves the
         // ledger cut over (issue #2121).
-        let pre_catchup = self.cutover_backup_pre_catchup;
         self.ledger_cut_over = !pre_catchup;
 
         // The synthesized header row `initialize_meta_from_catchpoint` wrote
@@ -1688,18 +1890,6 @@ impl SyncOrchestrator {
             "catchpoint cutover rolled back ({reason})"
         );
 
-        // Issue #2121: make the resume marker match the restored ledger
-        // (`ImportingLedger` and later imply a cutover, see `run_phases`).
-        // Pre-catchup again: back to "downloaded", so a resume (a
-        // verify-failure retry, or the next start) re-downloads and
-        // re-imports, and an abort before that re-import discards cleanly.
-        // Restored to an earlier unverified cutover: still cut over.
-        let marker_state = if pre_catchup {
-            SyncState::DownloadingLedger
-        } else {
-            SyncState::ImportingLedger
-        };
-        self.persist_marker(conn, &marker_state);
         true
     }
 
@@ -3054,6 +3244,9 @@ impl SyncOrchestrator {
                         persisted_state = %persisted.state,
                         "found persisted sync state — will resume"
                     );
+                    // The cutover recorded this itself; a marker from before
+                    // the flag existed falls back to its state (issue #2141).
+                    self.ledger_cut_over = persisted.is_cut_over();
                     resume_state = persisted.state;
                     // Restore relevant fields.
                     if let Some(label) = persisted.catchpoint_label {
@@ -3444,12 +3637,11 @@ impl SyncOrchestrator {
         // so we skip phases whose transitions have already been completed.
         let resume_ord = phase_ordinal(&resume_state);
 
-        // Resumed at or past the import: an earlier process already cut over.
-        // The only `ImportingLedger` marker is the one `run_import_ledger`
-        // persists AFTER its cutover succeeded (the import phase has no
-        // cancellation point that persists one before it), so resuming at
-        // the import (ordinal 2, which re-runs it) is cut over too.
-        self.ledger_cut_over = resume_ord >= 2;
+        // `ledger_cut_over` is NOT derived from the resume state: `run` took
+        // it from the marker's cut-over flag, which the import's cutover
+        // transaction writes together with the live-table replacement
+        // (issue #2141), so it is true exactly when the live tables are the
+        // snapshot, whatever phase the marker names.
         // A `DownloadingLedger` marker that names a file that is still there
         // means the download COMPLETED (the file only appears at its final
         // path atomically, after the download): resume at the import instead
