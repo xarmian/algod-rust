@@ -3465,27 +3465,18 @@ fn a_stream_of_rejected_groups_does_not_poison_or_change_the_evaluator() {
 fn reconciliation_is_bounded_by_its_own_budget() {
     let a = key(1);
     let b = key(2);
-    let app_id = 903u64;
-    let (ledger, mut eval) = evaluator(&[(a.0, funded(5_000_000)), (b.0, funded(1_000_000))]);
-    put_app(
-        &ledger,
-        app_id,
-        a.0,
-        "#pragma version 8
-int 0
-",
+    let fresh = key(9);
+    let (_ledger, mut eval) = evaluator(&[(a.0, funded(5_000_000)), (b.0, funded(1_000_000))]);
+    // Member 0 pays a fresh account below the minimum balance (the precheck
+    // does not model it; go's apply fails there), member 1 overspends (which
+    // the precheck proves, no application call before it).
+    let group = signed_group(
+        vec![pay_txn(&a, fresh.0, 1, 8), pay_txn(&a, b.0, 900_000_000, 9)],
+        &a,
     );
-    let mut call = base_txn(a.0, TxnType::Appl);
-    call.application_id = app_id;
-    call.fee = 1_000;
-    let group = signed_group(vec![call, pay_txn(&a, b.0, 900_000_000, 9)], &a);
     // With budget left, member 0's apply failure outranks member 1's overspend.
     let err = eval.transaction_group(&group).expect_err("rejected");
-    assert!(
-        err.to_string()
-            .ends_with("transaction rejected by ApprovalProgram"),
-        "{err}"
-    );
+    assert!(!err.to_string().contains("overspend"), "{err}");
     assert!(eval.exec.as_ref().unwrap().reconcile_spent > Duration::ZERO);
     assert_eq!(
         eval.exec.as_ref().unwrap().spent,
@@ -3687,11 +3678,145 @@ fn an_inner_transaction_funding_a_later_member_is_admitted_like_go() {
     call.group = gid.0;
     pay_r.group = gid.0;
     let group = vec![sign(call, &s.1), sign(pay_r, &f.1)];
-    let before = PRECHECK_OVER_REJECTS.load(std::sync::atomic::Ordering::Relaxed);
+    // Issue #2187: the precheck defers its balance verdict after an
+    // application call, so the real apply admits the group with no
+    // over-rejection to reconcile.
     pool.remember(group.clone())
         .expect("go accepts it: the inner payment funds F");
     assert_eq!(pool.pending_tx_groups().len(), 1);
-    assert!(PRECHECK_OVER_REJECTS.load(std::sync::atomic::Ordering::Relaxed) > before);
+}
+
+/// Issue #2187: `[app call funds F, F pays R]` on an evaluator over a ledger
+/// where the app (and so F's funding inner payment) exists. Returns the
+/// evaluator and the group (F pays `amount` to R, so `amount` decides whether
+/// the real apply accepts it: F receives 3_000_000).
+fn inner_funded_group(amount: u64) -> (SimpleBlockEvaluator, Vec<SignedTransaction>) {
+    let s = key(3);
+    let f = key(7);
+    let r = key(4);
+    let app_id = 904u64;
+    let app_addr = Address(algo_ledger::avm_context::app_address(app_id));
+    let (ledger, eval) = evaluator(&[
+        (s.0, funded(5_000_000)),
+        (r.0, funded(1_000_000)),
+        (app_addr, funded(10_000_000)),
+    ]);
+    put_app(
+        &ledger,
+        app_id,
+        s.0,
+        concat!(
+            "#pragma version 8\n",
+            "itxn_begin\n",
+            "int pay\n",
+            "itxn_field TypeEnum\n",
+            "txn Accounts 1\n",
+            "itxn_field Receiver\n",
+            "int 3000000\n",
+            "itxn_field Amount\n",
+            "int 0\n",
+            "itxn_field Fee\n",
+            "itxn_submit\n",
+            "int 1\n",
+        ),
+    );
+    let mut call = base_txn(s.0, TxnType::Appl);
+    call.application_id = app_id;
+    call.fee = 2_000;
+    call.accounts = Some(vec![f.0]);
+    let mut pay_r = pay_txn(&f, r.0, amount, 5);
+    pay_r.fee = 1_000;
+    let gid = algo_codec::compute_group_id(&[call.clone(), pay_r.clone()]);
+    call.group = gid.0;
+    pay_r.group = gid.0;
+    (eval, vec![sign(call, &s.1), sign(pay_r, &f.1)])
+}
+
+/// Issue #2187: with no usable real apply (the evaluator gave up) go would
+/// still accept `[app call funds F, F pays R]`; the precheck defers its
+/// balance verdict on a member after an application call instead of refusing.
+#[test]
+fn an_inner_funded_group_is_admitted_when_the_evaluator_is_incomplete() {
+    let (mut eval, group) = inner_funded_group(1_000);
+    eval.exec.as_mut().unwrap().incomplete = true;
+    eval.transaction_group(&group)
+        .expect("admitted on the cheap checks, like go");
+}
+
+/// Issue #2187: same with the reconciliation budget spent (run count).
+#[test]
+fn an_inner_funded_group_is_admitted_when_the_reconciliation_budget_is_spent() {
+    let (mut eval, group) = inner_funded_group(1_000);
+    eval.exec.as_mut().unwrap().reconcile_runs = RECONCILE_MAX_RUNS;
+    eval.transaction_group(&group)
+        .expect("admitted without a dry run, like go");
+    assert_eq!(
+        eval.exec.as_ref().unwrap().reconcile_runs,
+        RECONCILE_MAX_RUNS,
+        "no dry run was needed"
+    );
+}
+
+/// Issue #2187: with the real apply available the deferred verdict is the
+/// real apply's: an overspend after the funding is rejected with go's text,
+/// and a fitting payment is admitted.
+#[test]
+fn the_real_apply_decides_an_inner_funded_group() {
+    let (mut eval, group) = inner_funded_group(900_000_000);
+    let err = eval
+        .transaction_group(&group)
+        .expect_err("F cannot pay 900 Algo");
+    let text = err.to_string();
+    // The real apply's text for the shortfall (not the precheck's).
+    assert!(text.contains("insufficient balance 2999000"), "{text}");
+    assert!(!eval.exec.as_ref().unwrap().incomplete);
+    let (mut eval, group) = inner_funded_group(1_000);
+    eval.transaction_group(&group)
+        .expect("funded by the inner payment");
+}
+
+/// Issue #2187: the deferral is only for members after an application call;
+/// a payment-only group the precheck can prove overspends stays refused with
+/// go's text, with or without a usable real apply.
+#[test]
+fn a_provable_overspend_stays_rejected_in_degraded_mode() {
+    let a = key(1);
+    let f = key(7);
+    let r = key(4);
+    for degraded in [false, true] {
+        let (_ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (r.0, funded(1_000_000))]);
+        if degraded {
+            eval.exec.as_mut().unwrap().incomplete = true;
+        }
+        // A pays F 1 Algo, F pays R 900 Algo: only payments, fully modelled.
+        let mut members = [
+            pay_txn(&a, f.0, 1_000_000, 1),
+            pay_txn(&f, r.0, 900_000_000, 2),
+        ];
+        let gid = algo_codec::compute_group_id(&members);
+        for m in members.iter_mut() {
+            m.group = gid.0;
+        }
+        let [m0, m1] = members;
+        let group = vec![sign(m0, &a.1), sign(m1, &f.1)];
+        let err = eval.transaction_group(&group).expect_err("overspend");
+        assert!(err.to_string().contains("overspend"), "{err}");
+    }
+}
+
+/// Issue #2187: a stream of groups whose balance verdict is deferred leaves a
+/// complete evaluator complete, charges no reconciliation run and no extra
+/// admission time for the rejected ones, and keeps admitting honest groups.
+#[test]
+fn a_stream_of_deferred_groups_does_not_poison_or_exhaust_the_evaluator() {
+    for round in 0..8u8 {
+        let (mut eval, group) = inner_funded_group(900_000_000 + u64::from(round));
+        eval.transaction_group(&group).expect_err("overspend");
+        let exec = eval.exec.as_ref().unwrap();
+        assert!(!exec.incomplete);
+        assert_eq!(exec.reconcile_runs, 0);
+        assert_eq!(exec.groups.len(), 0);
+    }
 }
 
 /// The count-based bound: with the run count spent the precheck's verdict

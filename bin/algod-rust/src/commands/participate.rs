@@ -2582,6 +2582,8 @@ impl SimpleBlockEvaluator {
         let mut in_group_auth: HashMap<Address, Address> = HashMap::new();
         let mut credits: HashMap<Address, u64> = HashMap::new();
         let mut spent: HashMap<Address, u64> = HashMap::new();
+        // An earlier member is an application call (issue #2187).
+        let mut earlier_app_call = false;
         for (member, (stx, restored_stx)) in txgroup.iter().zip(&restored).enumerate() {
             let fail = |error: algo_error::AlgoError| {
                 Box::new(GroupReject {
@@ -2631,7 +2633,15 @@ impl SimpleBlockEvaluator {
             let already_spent = spent.get(&sender).copied().unwrap_or(0);
             let required = already_spent.saturating_add(cost);
             let available = base.saturating_add(credited);
-            if available < required {
+            // Issue #2187: after an application call, an Algo credit to this
+            // sender (an inner payment, an inner close-out) is not modelled,
+            // so a shortfall here is no proof of go's overspend. The verdict
+            // is the real apply's (`exec_group`), which sees the inner
+            // transactions; with no usable real apply the group is admitted on
+            // the cheap checks, like every group of an incomplete evaluator,
+            // and `generate_block` stays authoritative. A shortfall that is
+            // provable (no earlier application call) is still refused.
+            if available < required && !earlier_app_call {
                 // go's `eval.transaction` moves the fee first, then the amount;
                 // each failing `Move` is a `ledgercore.OverspendError` carrying
                 // the sender as the cow state stood before THAT move.
@@ -2689,6 +2699,7 @@ impl SimpleBlockEvaluator {
             if stx.txn.lease != [0u8; 32] {
                 group_dups.leases.insert((sender, stx.txn.lease));
             }
+            earlier_app_call |= stx.txn.txn_type == TxnType::Appl;
         }
 
         // Group fees, after every transaction's own state checks (go).
