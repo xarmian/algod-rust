@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use algo_error::{AlgoError, Result};
 use algo_network::LEDGER_RESPONSE_CONTENT_TYPE;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tracing::{debug, info, warn};
 
 use crate::http_over_stream::{
@@ -184,6 +184,10 @@ pub struct CatchpointDownloader {
     /// peer identity (e.g. a libp2p `PeerId`'s string form) rather than a
     /// URL.
     p2p_transport: Option<Arc<dyn HttpPeerTransport>>,
+    /// Test hook: how long creating the temp file and the final rename stall
+    /// (issue #2139).
+    #[cfg(test)]
+    fs_delay: Duration,
 }
 
 impl CatchpointDownloader {
@@ -205,7 +209,43 @@ impl CatchpointDownloader {
             http,
             config,
             p2p_transport: None,
+            #[cfg(test)]
+            fs_delay: Duration::ZERO,
         }
+    }
+
+    /// Test hook (issue #2139): stall creating the temp file and the final
+    /// rename by `delay`, as a slow disk would.
+    #[cfg(test)]
+    fn with_fs_delay(mut self, delay: Duration) -> Self {
+        self.fs_delay = delay;
+        self
+    }
+
+    /// Create the download's temp file (see [`Self::commit_download`] for why
+    /// this is a synchronous `std::fs` step).
+    fn create_download_file(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        #[cfg(test)]
+        std::thread::sleep(self.fs_delay);
+        std::fs::File::create(path)
+    }
+
+    /// Move the finished temp file to its final path.
+    ///
+    /// Every filesystem step of a download is a plain synchronous `std::fs`
+    /// call made inside the download future's own poll, never a `tokio::fs`
+    /// call: `tokio::fs` runs each operation on a `spawn_blocking` thread,
+    /// which keeps running after the future awaiting it is dropped. A
+    /// catchup abort drops the download future and then deletes the catchpoint
+    /// file, so a still-queued write or rename could land after that cleanup
+    /// and resurrect the file (issue #2139). A synchronous step cannot be in
+    /// flight when its future is dropped, so by the time the future is gone
+    /// every file operation it made is complete. The steps are short page-cache
+    /// writes, a rename and an unlink.
+    fn commit_download(&self, tmp_path: &Path, dest_path: &Path) -> std::io::Result<()> {
+        #[cfg(test)]
+        std::thread::sleep(self.fs_delay);
+        std::fs::rename(tmp_path, dest_path)
     }
 
     /// Create a downloader that routes its HTTP requests over `transport`
@@ -230,6 +270,8 @@ impl CatchpointDownloader {
             http,
             config,
             p2p_transport: Some(transport),
+            #[cfg(test)]
+            fs_delay: Duration::ZERO,
         }
     }
 
@@ -286,7 +328,7 @@ impl CatchpointDownloader {
 
         // Ensure the parent directory exists (once, not per attempt).
         if let Some(parent) = dest_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            std::fs::create_dir_all(parent).map_err(|e| {
                 AlgoError::Io(std::io::Error::new(
                     e.kind(),
                     format!(
@@ -322,7 +364,7 @@ impl CatchpointDownloader {
 
             match result {
                 Ok(()) => {
-                    tokio::fs::rename(&tmp_path, dest_path).await.map_err(|e| {
+                    self.commit_download(&tmp_path, dest_path).map_err(|e| {
                         AlgoError::Io(std::io::Error::new(
                             e.kind(),
                             format!(
@@ -346,14 +388,14 @@ impl CatchpointDownloader {
                          aborting catchup"
                     );
                     // Best-effort cleanup of the partial temp file before retrying.
-                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    let _ = std::fs::remove_file(&tmp_path);
                     tokio::time::sleep(backoff).await;
                     backoff *= 2;
                 }
                 Err(e) => {
                     // Either a non-recoverable error (e.g. local disk I/O) or
                     // retries are exhausted — best-effort cleanup and give up.
-                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    let _ = std::fs::remove_file(&tmp_path);
                     return Err(e);
                 }
             }
@@ -374,9 +416,9 @@ impl CatchpointDownloader {
     where
         F: Fn(DownloadProgress),
     {
-        use tokio::io::AsyncWriteExt;
+        use std::io::Write;
 
-        let mut file = tokio::fs::File::create(path).await.map_err(|e| {
+        let mut file = self.create_download_file(path).map_err(|e| {
             AlgoError::Io(std::io::Error::new(
                 e.kind(),
                 format!("failed to create temp file {}: {e}", path.display()),
@@ -393,7 +435,7 @@ impl CatchpointDownloader {
             .read_chunk_with_stall_check(&mut response, stall_window, bytes_downloaded, path)
             .await?
         {
-            file.write_all(&chunk).await.map_err(|e| {
+            file.write_all(&chunk).map_err(|e| {
                 AlgoError::Io(std::io::Error::new(
                     e.kind(),
                     format!(
@@ -420,7 +462,7 @@ impl CatchpointDownloader {
             }
         }
 
-        file.flush().await.map_err(|e| {
+        file.flush().map_err(|e| {
             AlgoError::Io(std::io::Error::new(
                 e.kind(),
                 format!("failed to flush {}: {e}", path.display()),
@@ -649,7 +691,7 @@ impl CatchpointDownloader {
         F: Fn(DownloadProgress),
     {
         if let Some(parent) = dest_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            std::fs::create_dir_all(parent).map_err(|e| {
                 AlgoError::Io(std::io::Error::new(
                     e.kind(),
                     format!(
@@ -670,7 +712,7 @@ impl CatchpointDownloader {
 
             match result {
                 Ok(()) => {
-                    tokio::fs::rename(&tmp_path, dest_path).await.map_err(|e| {
+                    self.commit_download(&tmp_path, dest_path).map_err(|e| {
                         AlgoError::Io(std::io::Error::new(
                             e.kind(),
                             format!(
@@ -687,7 +729,7 @@ impl CatchpointDownloader {
                 // never worth retrying, mirroring `get_with_retry`'s
                 // immediate-return behavior for the same status.
                 Err(e @ AlgoError::NotFound(_)) => {
-                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    let _ = std::fs::remove_file(&tmp_path);
                     return Err(e);
                 }
                 Err(e) if attempt < self.config.max_retries => {
@@ -700,12 +742,12 @@ impl CatchpointDownloader {
                         "catchpoint download (P2P): transfer interrupted, retrying rather than \
                          aborting catchup"
                     );
-                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    let _ = std::fs::remove_file(&tmp_path);
                     tokio::time::sleep(backoff).await;
                     backoff *= 2;
                 }
                 Err(e) => {
-                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    let _ = std::fs::remove_file(&tmp_path);
                     return Err(e);
                 }
             }
@@ -775,7 +817,9 @@ impl CatchpointDownloader {
     where
         F: Fn(DownloadProgress),
     {
-        let mut file = tokio::fs::File::create(tmp_path).await.map_err(|e| {
+        use std::io::Write;
+
+        let mut file = self.create_download_file(tmp_path).map_err(|e| {
             AlgoError::Io(std::io::Error::new(
                 e.kind(),
                 format!("failed to create temp file {}: {e}", tmp_path.display()),
@@ -788,7 +832,7 @@ impl CatchpointDownloader {
         let report_every = self.config.chunk_size.max(1);
 
         if !prefetched_body.is_empty() {
-            write_download_chunk(&mut file, &prefetched_body, tmp_path).await?;
+            write_download_chunk(&mut file, &prefetched_body, tmp_path)?;
             bytes_downloaded += prefetched_body.len() as u64;
             bytes_since_progress += prefetched_body.len();
         }
@@ -850,7 +894,7 @@ impl CatchpointDownloader {
                 break;
             }
 
-            write_download_chunk(&mut file, &buf[..n], tmp_path).await?;
+            write_download_chunk(&mut file, &buf[..n], tmp_path)?;
             bytes_downloaded += n as u64;
             bytes_since_progress += n;
 
@@ -865,7 +909,7 @@ impl CatchpointDownloader {
             }
         }
 
-        file.flush().await.map_err(|e| {
+        file.flush().map_err(|e| {
             AlgoError::Io(std::io::Error::new(
                 e.kind(),
                 format!("failed to flush {}: {e}", tmp_path.display()),
@@ -1098,12 +1142,9 @@ fn validate_p2p_ledger_content_type(
 
 /// Write one chunk to the in-progress download's temp file, wrapping any
 /// I/O failure with enough context to diagnose which file/offset it hit.
-async fn write_download_chunk(
-    file: &mut tokio::fs::File,
-    chunk: &[u8],
-    tmp_path: &Path,
-) -> Result<()> {
-    file.write_all(chunk).await.map_err(|e| {
+fn write_download_chunk(file: &mut std::fs::File, chunk: &[u8], tmp_path: &Path) -> Result<()> {
+    use std::io::Write;
+    file.write_all(chunk).map_err(|e| {
         AlgoError::Io(std::io::Error::new(
             e.kind(),
             format!(
@@ -1291,6 +1332,45 @@ mod tests {
             attempts.load(Ordering::SeqCst)
         );
 
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// Issue #2139: a catchup abort drops the download future and then deletes
+    /// the catchpoint file and its `.tmp`. No filesystem step of the download
+    /// may complete after that, or the abort leaves a file behind.
+    #[tokio::test]
+    async fn a_dropped_download_leaves_no_file_operation_running_after_the_cleanup() {
+        const BODY: &[u8] = b"catchpoint-file-bytes-0123456789";
+        let (base_url, _) = spawn_flaky_catchpoint_server(0, BODY).await;
+        let dl = CatchpointDownloader::new(&base_url, "").with_fs_delay(Duration::from_millis(400));
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-catchpoint-abort-test-{}",
+            std::process::id()
+        ));
+        let dest = tmp_dir.join("catchpoint-7.tar.gz");
+        let tmp = dest.with_extension("tmp");
+
+        // The abort: the future is dropped while the slow disk still works.
+        let aborted = tokio::time::timeout(
+            Duration::from_millis(150),
+            dl.download::<fn(DownloadProgress)>("test-v1.0", 7, &dest, None),
+        )
+        .await;
+        // The abort's cleanup, right after the drop (a finished download is
+        // removed too, exactly like the orchestrator does).
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&dest);
+        // (Either outcome is fine: finished before the drop, or dropped.)
+        drop(aborted);
+
+        // Whatever was still queued has had time to land.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(!tmp.exists(), "a late write resurrected {}", tmp.display());
+        assert!(
+            !dest.exists(),
+            "a late rename resurrected {}",
+            dest.display()
+        );
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 

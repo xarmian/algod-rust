@@ -35,6 +35,8 @@ pub(crate) mod lookback_prefetch;
 pub mod state_machine;
 
 #[cfg(test)]
+mod catchpoint_file_cleanup_tests;
+#[cfg(test)]
 mod cutover_marker_tests;
 
 pub use state_machine::{SyncProgress, SyncState};
@@ -1078,6 +1080,14 @@ impl SyncOrchestrator {
         }
     }
 
+    /// The directory the catchpoint files live in: next to the ledger DB.
+    fn catchpoint_dir(&self) -> PathBuf {
+        match self.config.db_path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        }
+    }
+
     /// Persist the resume marker `state` with this run's label, round and
     /// catchpoint file (issue #2121: the one place that writes it). Best
     /// effort: a failure is logged.
@@ -1163,6 +1173,35 @@ impl SyncOrchestrator {
             );
             return cancelled_error();
         }
+        // The files this catchup may have left: those this run knows, and
+        // those its marker names, which a resumed run aborted before its
+        // download phase never loaded into memory (issue #2144). Read before
+        // the marker is cleared.
+        let mut files: Vec<PathBuf> = [
+            self.catchpoint_file_path.take(),
+            self.catchpoint_download_path.take(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let mut rounds: Vec<u64> = self.catchpoint_round.into_iter().collect();
+        if let Ok(Some(marker)) = restore_sync_state(&conn) {
+            files.extend(marker.catchpoint_file.map(PathBuf::from));
+            rounds.extend(marker.catchpoint_round);
+        }
+        rounds.extend(
+            self.config
+                .catchpoint_label
+                .as_deref()
+                .and_then(|l| parse_catchpoint_label(l.trim()).ok())
+                .map(|p| p.round),
+        );
+        let dir = self.catchpoint_dir();
+        files.extend(
+            rounds
+                .into_iter()
+                .map(|round| dir.join(format!("catchpoint-{round}.tar.gz"))),
+        );
         tracing::info!(
             state = %self.state,
             "catchpoint catchup aborted: discarding its resume marker and staging data"
@@ -1174,13 +1213,13 @@ impl SyncOrchestrator {
             tracing::warn!(error = %e, "aborted catchup: could not drop the staging tables");
         }
         drop(conn);
-        let files = [
-            self.catchpoint_file_path.take(),
-            self.catchpoint_download_path.take(),
-        ];
-        for path in files.into_iter().flatten() {
-            remove_catchpoint_file_and_tmp(&path, "aborted catchup");
+        // The download future is gone, so no file operation of it can land
+        // after these removals (issue #2139); the sweep also takes any
+        // catchpoint file no marker names any more.
+        for path in &files {
+            remove_catchpoint_file_and_tmp(path, &dir, "aborted catchup");
         }
+        sweep_orphan_catchpoint_files(&dir, None, "aborted catchup");
         AlgoError::Ledger {
             message: "catchpoint catchup aborted by user".to_string(),
         }
@@ -1322,45 +1361,18 @@ impl SyncOrchestrator {
             tracing::warn!(error = %e, "stale catchup: could not drop the staging tables");
         }
         // The stale catchpoint's file and the downloader's partial `.tmp`.
-        // Only files in the ledger directory with the downloader's own name
-        // are removed: the marker is data read from the database.
-        let dir = match self.config.db_path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-            _ => PathBuf::from("."),
-        };
+        // The marker is data read from the database: every removal goes
+        // through `remove_catchpoint_file_and_tmp`'s check (issue #2143).
+        let dir = self.catchpoint_dir();
         let mut stale: Vec<PathBuf> = Vec::new();
         if let Some(round) = persisted.catchpoint_round {
             stale.push(dir.join(format!("catchpoint-{round}.tar.gz")));
         }
         if let Some(file) = persisted.catchpoint_file.as_deref() {
-            let file = PathBuf::from(file);
-            let own_name = file
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("catchpoint-"));
-            let parent = match file.parent() {
-                Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-                _ => PathBuf::from("."),
-            };
-            let in_ledger_dir = matches!(
-                (parent.canonicalize(), dir.canonicalize()),
-                (Ok(a), Ok(b)) if a == b
-            );
-            if own_name && in_ledger_dir {
-                if !stale.contains(&file) {
-                    stale.push(file);
-                }
-            } else {
-                tracing::warn!(
-                    path = %file.display(),
-                    ledger_dir = %dir.display(),
-                    "stale catchup: the marker's catchpoint file is outside the ledger \
-                     directory (or not a catchpoint-* file); not removing it"
-                );
-            }
+            stale.push(PathBuf::from(file));
         }
         for path in stale {
-            remove_catchpoint_file_and_tmp(&path, "stale catchup");
+            remove_catchpoint_file_and_tmp(&path, &dir, "stale catchup");
         }
         Ok(next)
     }
@@ -2022,11 +2034,7 @@ impl SyncOrchestrator {
             // file, a transient IO or SQLite error, keeps naming it, so a
             // resume re-imports it instead of re-downloading gigabytes.)
             if let Some(path) = self.catchpoint_file_path.take() {
-                if let Err(e) = std::fs::remove_file(&path) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(error = %e, path = %path.display(), "could not remove the rejected catchpoint file");
-                    }
-                }
+                remove_catchpoint_file_and_tmp(&path, &self.catchpoint_dir(), "rejected snapshot");
             }
         }
         if self.cutover_backup.is_none() {
@@ -3372,10 +3380,30 @@ impl SyncOrchestrator {
                         self.catchpoint_round = Some(round);
                     }
                     if let Some(file) = persisted.catchpoint_file {
-                        self.catchpoint_file_path = Some(PathBuf::from(file));
+                        // The marker is data from the database: a path that
+                        // is not a catchpoint file of the ledger directory is
+                        // never used (import) or deleted (issue #2143); the
+                        // resume then downloads afresh.
+                        let file = PathBuf::from(file);
+                        match checked_catchpoint_path(&file, &self.catchpoint_dir()) {
+                            Ok(_) => self.catchpoint_file_path = Some(file),
+                            Err(why) => tracing::error!(
+                                path = %file.display(),
+                                why,
+                                "the resume marker names an unusable catchpoint file; ignoring it"
+                            ),
+                        }
                     }
                 }
             }
+            // Leftovers of an earlier run (a partial download, a file an
+            // abort could not remove) that the marker does not reference
+            // (issue #2139).
+            sweep_orphan_catchpoint_files(
+                &self.catchpoint_dir(),
+                self.catchpoint_file_path.as_deref(),
+                "run start",
+            );
         }
 
         // Issue #1625: `run_phases` (download -> import -> verify ->
@@ -3917,17 +3945,141 @@ fn persisted_marker_round(persisted: &PersistedSyncState) -> Option<u64> {
     })
 }
 
+/// Whether `name` is one the sync itself gives a catchpoint file
+/// (`catchpoint-<round>...`, issue #2143).
+fn is_catchpoint_file_name(name: &str) -> bool {
+    name.starts_with("catchpoint-")
+}
+
+/// Whether `name` is a download (`catchpoint-<round>.tar.gz`) or the
+/// downloader's partial `catchpoint-*.tmp`: the only files the startup sweep
+/// removes (issue #2139).
+fn is_sweepable_catchpoint_file_name(name: &str) -> bool {
+    is_catchpoint_file_name(name) && (name.ends_with(".tar.gz") || name.ends_with(".tmp"))
+}
+
+/// Check a catchpoint file path that came from data the node does not
+/// control (the resume marker): it must be named like a catchpoint file the
+/// sync creates and lie directly in `dir`, once both are canonicalized
+/// (`..` components and symlinked directories are resolved), and it must not
+/// itself be a symlink or a non-regular file. A file that does not exist is
+/// fine; its directory still has to resolve. Returns the canonical path, or
+/// why it was refused (issue #2143).
+fn checked_catchpoint_path(
+    path: &std::path::Path,
+    dir: &std::path::Path,
+) -> Result<PathBuf, &'static str> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| is_catchpoint_file_name(n))
+        .ok_or("not a catchpoint-* file name")?;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    let canonical_dir = dir
+        .canonicalize()
+        .map_err(|_| "the catchpoint directory cannot be resolved")?;
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|_| "the file's directory cannot be resolved")?;
+    if canonical_parent != canonical_dir {
+        return Err("outside the catchpoint directory");
+    }
+    let canonical = canonical_dir.join(name);
+    match std::fs::symlink_metadata(&canonical) {
+        Ok(meta) if !meta.file_type().is_file() => Err("not a regular file"),
+        _ => Ok(canonical),
+    }
+}
+
 /// Remove a catchpoint file and the downloader's partial `.tmp` next to it,
 /// logging (not failing) on errors other than "not found". `context` names
 /// the caller in the log.
-fn remove_catchpoint_file_and_tmp(path: &std::path::Path, context: &str) {
+///
+/// `path` may come from the resume marker, so it is checked first
+/// ([`checked_catchpoint_path`], issue #2143): a path outside `dir`, with
+/// another name, or a symlink is refused, logged as an error, and left alone.
+/// Every deletion of a catchpoint file goes through here. Returns false when
+/// something was refused.
+fn remove_catchpoint_file_and_tmp(
+    path: &std::path::Path,
+    dir: &std::path::Path,
+    context: &str,
+) -> bool {
+    let mut all_ok = true;
     for p in [path.with_extension("tmp"), path.to_path_buf()] {
-        if let Err(e) = std::fs::remove_file(&p) {
+        let checked = match checked_catchpoint_path(&p, dir) {
+            Ok(checked) => checked,
+            // Nothing there: nothing to check or remove.
+            Err(_) if !p.exists() => continue,
+            Err(why) => {
+                tracing::error!(
+                    path = %p.display(),
+                    dir = %dir.display(),
+                    context,
+                    why,
+                    "refusing to remove a path that is not a catchpoint file of the ledger directory"
+                );
+                all_ok = false;
+                continue;
+            }
+        };
+        if let Err(e) = std::fs::remove_file(&checked) {
             if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(error = %e, path = %p.display(), context, "could not remove a catchpoint file");
+                tracing::warn!(error = %e, path = %checked.display(), context, "could not remove a catchpoint file");
             }
         }
     }
+    all_ok
+}
+
+/// Remove the `catchpoint-*.tar.gz` and `catchpoint-*.tmp` files in `dir`
+/// that the current marker does not reference (`keep`, and its `.tmp`):
+/// leftovers of a partial download or of an abort that could not remove its
+/// file (issue #2139). Only plain files with the sync's own names are
+/// touched, and each removal is checked like every other
+/// ([`checked_catchpoint_path`]). Returns how many files were removed.
+fn sweep_orphan_catchpoint_files(
+    dir: &std::path::Path,
+    keep: Option<&std::path::Path>,
+    context: &str,
+) -> usize {
+    let keep_names: Vec<std::ffi::OsString> = keep
+        .into_iter()
+        .flat_map(|k| [k.to_path_buf(), k.with_extension("tmp")])
+        .filter_map(|k| k.file_name().map(|n| n.to_os_string()))
+        .collect();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(is_sweepable_catchpoint_file_name)
+            || keep_names.contains(&name)
+        {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(checked) = checked_catchpoint_path(&path, dir) else {
+            continue;
+        };
+        match std::fs::remove_file(&checked) {
+            Ok(()) => {
+                removed += 1;
+                tracing::info!(path = %path.display(), context, "removed an orphaned catchpoint file");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), context, "could not remove an orphaned catchpoint file");
+            }
+        }
+    }
+    removed
 }
 
 fn phase_ordinal(state: &SyncState) -> u8 {
