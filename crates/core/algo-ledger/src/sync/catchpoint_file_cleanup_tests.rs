@@ -359,10 +359,10 @@ fn an_abort_removes_the_file_its_marker_names_when_the_path_was_never_loaded() {
 #[test]
 fn an_abort_derives_the_file_from_the_round_of_the_requested_label() {
     let s = Scratch::new("abort-by-round");
-    let file = s.file(&s.dir, "catchpoint-5000.tar.gz");
-    let tmp = s.file(&s.dir, "catchpoint-5000.tar.tmp");
+    let file = s.file(&s.dir, &format!("catchpoint-{REQUESTED_ROUND}.tar.gz"));
+    let tmp = s.file(&s.dir, &format!("catchpoint-{REQUESTED_ROUND}.tar.tmp"));
     let mut orchestrator = s.orchestrator(
-        Some("5000#MFRGGZDFMY4TQ43ONRSGM5TFNQYTMZLMN5XGK3TWMVYGK4DBOJXXK3DFEBRW63DFOA"),
+        Some(REQUESTED_LABEL),
         StopAtLookbackBackend {
             cancel: CancellationToken::new(),
             abort: None,
@@ -372,18 +372,50 @@ fn an_abort_derives_the_file_from_the_round_of_the_requested_label() {
     assert!(!file.exists() && !tmp.exists());
 }
 
-/// Issue #2139: a run removes the `catchpoint-*.tar.gz` / `.tmp` files no
-/// marker references (a partial download, a file an abort could not remove),
-/// and leaves the file the marker names and unrelated files alone.
+/// A valid label for round 22507000, used as the requested catchpoint.
+const REQUESTED_LABEL: &str = "22507000#XJUJGKAUVK2LVO5OWR46UHSDXIZ52VO5BTLJQQHRFCWAXUAIKMOQ";
+const REQUESTED_ROUND: u64 = 22_507_000;
+
+/// Set `path`'s modification time to `hours` ago.
+fn age(path: &Path, hours: u64) {
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600))
+        .unwrap();
+}
+
+/// Run `orchestrator` (whose backend stops it) to its end and return.
+async fn run_to_the_stop(s: &Scratch, label: Option<&str>, marker: Option<(SyncState, &Path)>) {
+    let cancel = CancellationToken::new();
+    let mut orchestrator = s.orchestrator(
+        label,
+        StopAtLookbackBackend {
+            cancel: cancel.clone(),
+            abort: None,
+        },
+    );
+    orchestrator.set_cancel(cancel);
+    if let Some((state, file)) = marker {
+        persist_marker(&orchestrator, state, Some(file));
+    }
+    let _ = orchestrator.run().await;
+}
+
+/// Issue #2139 / #2144: the run-start sweep always removes a partial
+/// `catchpoint-*.tmp` (incomplete by construction) but leaves a complete
+/// `catchpoint-*.tar.gz` alone unless it is provably an orphan, and never
+/// touches the file the marker names or unrelated names.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_run_sweeps_orphaned_catchpoint_files_but_not_referenced_or_unrelated_ones() {
+async fn the_sweep_removes_partial_downloads_and_keeps_fresh_complete_ones() {
     let s = Scratch::new("sweep");
     let kept = s.file(&s.dir, "catchpoint-5000.tar.gz");
-    let orphans = [
-        s.file(&s.dir, "catchpoint-4000.tar.gz"),
+    let kept_tmp = s.file(&s.dir, "catchpoint-5000.tar.tmp");
+    let partials = [
         s.file(&s.dir, "catchpoint-4000.tar.tmp"),
         s.file(&s.dir, "catchpoint-3000.tmp"),
     ];
+    // A complete download whose marker write failed, or one an operator
+    // staged: fresh, so it may well be wanted.
+    let fresh_complete = s.file(&s.dir, "catchpoint-4000.tar.gz");
     let unrelated = [
         s.file(&s.dir, "notes.txt"),
         s.file(&s.dir, "other-4000.tar.gz"),
@@ -393,36 +425,85 @@ async fn a_run_sweeps_orphaned_catchpoint_files_but_not_referenced_or_unrelated_
     let subdir = s.dir.join("catchpoint-2000.tar.gz");
     std::fs::create_dir(&subdir).unwrap();
 
-    let cancel = CancellationToken::new();
-    let mut orchestrator = s.orchestrator(
-        None,
-        StopAtLookbackBackend {
-            cancel: cancel.clone(),
-            abort: None,
-        },
-    );
-    orchestrator.set_cancel(cancel);
-    persist_marker(&orchestrator, SyncState::DownloadingLookback, Some(&kept));
-    orchestrator
-        .run()
-        .await
-        .expect_err("the stopped run must not succeed");
+    run_to_the_stop(&s, None, Some((SyncState::DownloadingLookback, &kept))).await;
 
     assert!(kept.exists(), "the file the marker names must stay");
-    for orphan in &orphans {
-        assert!(!orphan.exists(), "{} was not swept", orphan.display());
+    assert!(!kept_tmp.exists(), "a .tmp is never complete");
+    for partial in &partials {
+        assert!(!partial.exists(), "{} was not swept", partial.display());
     }
+    assert!(
+        fresh_complete.exists(),
+        "a fresh complete download must not be swept"
+    );
     for other in &unrelated {
         assert!(other.exists(), "{} must not be swept", other.display());
     }
     assert!(subdir.is_dir(), "a directory must not be swept");
 }
 
-/// Issue #2139: with no marker at all, every orphan goes.
+/// Issue #2144: a complete file older than a day is an orphan, but not when
+/// it is the requested round's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_run_with_no_marker_sweeps_every_orphaned_catchpoint_file() {
+async fn the_sweep_removes_an_old_complete_file_but_not_the_requested_rounds() {
+    let s = Scratch::new("sweep-old");
+    let old_other = s.file(&s.dir, "catchpoint-4000.tar.gz");
+    age(&old_other, 25);
+    let old_requested = s.file(&s.dir, &format!("catchpoint-{REQUESTED_ROUND}.tar.gz"));
+    age(&old_requested, 25);
+    let young_other = s.file(&s.dir, "catchpoint-3000.tar.gz");
+    age(&young_other, 23);
+
+    run_to_the_stop(&s, Some(REQUESTED_LABEL), None).await;
+
+    assert!(!old_other.exists(), "an old complete orphan must go");
+    assert!(
+        old_requested.exists(),
+        "the requested round's file must stay, however old"
+    );
+    assert!(
+        young_other.exists(),
+        "a complete file under a day must stay"
+    );
+}
+
+/// Issue #2144: once a later catchup completed (a terminal marker for another
+/// round) and a catchpoint is requested, a complete file for yet another round
+/// is an orphan at once; the requested round's file is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sweep_removes_a_complete_file_of_an_earlier_round_after_a_completed_catchup() {
+    let s = Scratch::new("sweep-completed");
+    let earlier = s.file(&s.dir, "catchpoint-4000.tar.gz");
+    let requested = s.file(&s.dir, &format!("catchpoint-{REQUESTED_ROUND}.tar.gz"));
+    let done = s.file(&s.dir, "catchpoint-100.tar.gz");
+
+    run_to_the_stop(
+        &s,
+        Some(REQUESTED_LABEL),
+        Some((SyncState::Complete, &done)),
+    )
+    .await;
+
+    assert!(!earlier.exists(), "an earlier round's file must go");
+    assert!(requested.exists(), "the requested round's file must stay");
+}
+
+/// Issue #2144: with no catchpoint requested a terminal marker alone does not
+/// make a fresh complete file an orphan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sweep_keeps_a_fresh_complete_file_when_nothing_is_requested() {
+    let s = Scratch::new("sweep-none-requested");
+    let staged = s.file(&s.dir, "catchpoint-4000.tar.gz");
+    let done = s.file(&s.dir, "catchpoint-100.tar.gz");
+    run_to_the_stop(&s, None, Some((SyncState::Complete, &done))).await;
+    assert!(staged.exists());
+}
+
+/// Issue #2139: with no marker at all, partial downloads still go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_with_no_marker_sweeps_partial_downloads() {
     let s = Scratch::new("sweep-no-marker");
-    let orphan = s.file(&s.dir, "catchpoint-7000.tar.gz");
+    let orphan = s.file(&s.dir, "catchpoint-7000.tar.old.tmp");
     let tmp = s.file(&s.dir, "catchpoint-7000.tar.tmp");
     let cancel = CancellationToken::new();
     cancel.cancel();
@@ -460,4 +541,277 @@ async fn the_sweep_does_not_follow_a_symlink_out_of_the_directory() {
     orchestrator.set_cancel(cancel);
     let _ = orchestrator.run().await;
     assert!(target.exists(), "the sweep followed a symlink");
+}
+
+/// A backend whose download copies `source` to the destination, counting
+/// downloads, optionally leaving the downloader's partial `.tmp` behind.
+struct CopyingBackend {
+    source: PathBuf,
+    downloads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    leave_tmp: bool,
+    cancel: CancellationToken,
+}
+
+impl SyncBackend for CopyingBackend {
+    fn download_catchpoint(
+        &self,
+        _genesis_id: &str,
+        _round: u64,
+        dest_path: &Path,
+    ) -> Result<(), AlgoError> {
+        self.downloads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.leave_tmp {
+            std::fs::write(dest_path.with_extension("tmp"), b"partial").unwrap();
+        }
+        std::fs::copy(&self.source, dest_path)
+            .map(|_| ())
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("copy failed: {e}"),
+            })
+    }
+    fn fetch_block_raw(&self, _round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+        self.cancel.cancel();
+        Err(cancelled_error())
+    }
+    fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
+        unimplemented!("not exercised")
+    }
+    fn get_current_round(&self) -> Result<u64, AlgoError> {
+        unimplemented!("not exercised")
+    }
+    fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+        Ok(None)
+    }
+}
+
+/// Issue #2084 / #2143: a downloaded file whose own label differs from the
+/// requested one is rejected and deleted through the checked helper: the
+/// file AND the downloader's `.tmp` go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_label_mismatch_rejection_removes_the_file_and_its_tmp() {
+    use super::cutover_marker_tests::export_tiny_catchpoint_as;
+    let s = Scratch::new("label-mismatch");
+    let (served, _served_label) = export_tiny_catchpoint_as(&s.outside, "served.tar.gz", 7);
+    let (_, requested_label) = export_tiny_catchpoint_as(&s.outside, "other.tar.gz", 8);
+    let downloads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cancel = CancellationToken::new();
+    let mut orchestrator = s.orchestrator(
+        Some(&requested_label),
+        CopyingBackend {
+            source: served,
+            downloads: downloads.clone(),
+            leave_tmp: true,
+            cancel: cancel.clone(),
+        },
+    );
+    orchestrator.set_cancel(cancel);
+    let err = orchestrator
+        .run()
+        .await
+        .expect_err("a mismatching file must be rejected")
+        .to_string();
+    assert!(err.contains("mismatch"), "{err}");
+    let round = super::cutover_marker_tests::ROUND;
+    assert!(!s.dir.join(format!("catchpoint-{round}.tar.gz")).exists());
+    assert!(!s.dir.join(format!("catchpoint-{round}.tar.tmp")).exists());
+}
+
+/// Issue #2144: a complete download of the requested catchpoint already in
+/// the ledger directory (kept by the sweep) is reused, not downloaded again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_complete_download_of_the_requested_catchpoint_is_reused() {
+    use super::cutover_marker_tests::{export_tiny_catchpoint_as, ROUND};
+    let s = Scratch::new("reuse");
+    let name = format!("catchpoint-{ROUND}.tar.gz");
+    let (existing, label) = export_tiny_catchpoint_as(&s.dir, &name, 7);
+    let downloads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cancel = CancellationToken::new();
+    let mut orchestrator = s.orchestrator(
+        Some(&label),
+        CopyingBackend {
+            source: existing.clone(),
+            downloads: downloads.clone(),
+            leave_tmp: false,
+            cancel: cancel.clone(),
+        },
+    );
+    orchestrator.set_cancel(cancel);
+    let _ = orchestrator.run().await;
+    assert_eq!(
+        downloads.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the complete file in the ledger directory was downloaded again"
+    );
+    assert!(existing.exists());
+}
+
+/// Issue #2144: a complete file for the requested round that is NOT the
+/// requested catchpoint (another label) is not reused: it is downloaded
+/// afresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_complete_file_of_another_label_is_not_reused() {
+    use super::cutover_marker_tests::{export_tiny_catchpoint_as, ROUND};
+    let s = Scratch::new("no-reuse");
+    let name = format!("catchpoint-{ROUND}.tar.gz");
+    export_tiny_catchpoint_as(&s.dir, &name, 8);
+    let (served, label) = export_tiny_catchpoint_as(&s.outside, "served.tar.gz", 7);
+    let downloads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cancel = CancellationToken::new();
+    let mut orchestrator = s.orchestrator(
+        Some(&label),
+        CopyingBackend {
+            source: served,
+            downloads: downloads.clone(),
+            leave_tmp: false,
+            cancel: cancel.clone(),
+        },
+    );
+    orchestrator.set_cancel(cancel);
+    let _ = orchestrator.run().await;
+    assert_eq!(downloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// Resume a run over a marker naming `marker_path`; returns the file path the
+/// run loaded from it.
+async fn loaded_marker_path(s: &Scratch, marker_path: &Path) -> Option<PathBuf> {
+    let cancel = CancellationToken::new();
+    let mut orchestrator = s.orchestrator(
+        None,
+        StopAtLookbackBackend {
+            cancel: cancel.clone(),
+            abort: None,
+        },
+    );
+    orchestrator.set_cancel(cancel);
+    persist_marker(
+        &orchestrator,
+        SyncState::DownloadingLookback,
+        Some(marker_path),
+    );
+    let _ = orchestrator.run().await;
+    orchestrator.catchpoint_file_path.clone()
+}
+
+/// Issue #2144: a marker path that cannot be resolved as written (relative,
+/// after a restart with another working directory) still finds the intact
+/// file of that name in the ledger directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relative_marker_path_resumes_with_the_ledger_directory_file() {
+    let s = Scratch::new("resume-relative");
+    let file = s.file(&s.dir, "catchpoint-5000.tar.gz");
+    let loaded = loaded_marker_path(&s, Path::new("catchpoint-5000.tar.gz")).await;
+    assert_eq!(loaded.as_deref(), Some(file.as_path()));
+}
+
+/// Issue #2144: an absolute marker path from another directory resumes with
+/// the file of the same name in the ledger directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_marker_path_from_another_directory_resumes_with_the_ledger_directory_file() {
+    let s = Scratch::new("resume-moved");
+    let file = s.file(&s.dir, "catchpoint-5000.tar.gz");
+    let moved = s.outside.join("catchpoint-5000.tar.gz");
+    let loaded = loaded_marker_path(&s, &moved).await;
+    assert_eq!(loaded.as_deref(), Some(file.as_path()));
+    assert!(file.exists());
+}
+
+/// Issue #2144: a marker whose file is gone from the ledger directory loads
+/// nothing, so the run downloads afresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_marker_file_missing_from_the_ledger_directory_is_not_loaded() {
+    let s = Scratch::new("resume-missing");
+    let loaded = loaded_marker_path(&s, &s.dir.join("catchpoint-5000.tar.gz")).await;
+    assert_eq!(loaded, None);
+}
+
+/// Issue #2143: a dangling symlink (and a valid one) at a catchpoint name in
+/// the directory is removed as a link, never followed: an abort removes the
+/// link and leaves its target.
+#[cfg(unix)]
+#[test]
+fn an_abort_removes_symlinks_at_catchpoint_names_but_not_their_targets() {
+    let s = Scratch::new("abort-symlinks");
+    let target = s.file(&s.outside, "target.bin");
+    let valid = s.dir.join("catchpoint-5000.tar.gz");
+    std::os::unix::fs::symlink(&target, &valid).unwrap();
+    let dangling = s.dir.join("catchpoint-5000.tar.tmp");
+    std::os::unix::fs::symlink(s.outside.join("missing"), &dangling).unwrap();
+    let mut orchestrator = s.orchestrator(
+        None,
+        StopAtLookbackBackend {
+            cancel: CancellationToken::new(),
+            abort: None,
+        },
+    );
+    persist_marker(&orchestrator, SyncState::DownloadingLedger, Some(&valid));
+    orchestrator.stop_aborted_catchup();
+    assert!(
+        std::fs::symlink_metadata(&valid).is_err(),
+        "the valid link stays"
+    );
+    assert!(
+        std::fs::symlink_metadata(&dangling).is_err(),
+        "the dangling link stays"
+    );
+    assert!(target.exists(), "the link's target was removed");
+}
+
+/// Issue #2143: the sweep removes a dangling `.tmp` symlink as a link.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sweep_removes_a_dangling_tmp_symlink() {
+    let s = Scratch::new("sweep-dangling");
+    let dangling = s.dir.join("catchpoint-9.tmp");
+    std::os::unix::fs::symlink(s.outside.join("missing"), &dangling).unwrap();
+    run_to_the_stop(&s, None, None).await;
+    assert!(std::fs::symlink_metadata(&dangling).is_err());
+}
+
+/// Issue #2143: every deletion of a catchpoint file goes through the checked
+/// helper. The only raw `remove_file` in the sync code is the helper's own
+/// `unlink_catchpoint_file`.
+#[test]
+fn no_catchpoint_file_is_deleted_outside_the_checked_helper() {
+    fn production(source: &str) -> &str {
+        source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap()
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .unwrap()
+    }
+    let sources = [
+        (
+            "sync/lookback_prefetch.rs",
+            include_str!("lookback_prefetch.rs"),
+        ),
+        ("sync/state_machine.rs", include_str!("state_machine.rs")),
+        (
+            "catchpoint/importer.rs",
+            include_str!("../catchpoint/importer.rs"),
+        ),
+    ];
+    for (name, source) in sources {
+        assert!(
+            !production(source).contains("remove_file("),
+            "{name} deletes a file directly"
+        );
+    }
+    let production_mod = include_str!("mod.rs")
+        .split("\n#[cfg(test)]\nmod tests")
+        .next()
+        .unwrap();
+    let deletions = production_mod.matches("remove_file(").count();
+    assert_eq!(
+        deletions, 1,
+        "sync/mod.rs must delete catchpoint files only through unlink_catchpoint_file"
+    );
+    let at = production_mod.find("remove_file(").unwrap();
+    let fn_at = production_mod.find("fn unlink_catchpoint_file").unwrap();
+    assert!(
+        fn_at < at && at - fn_at < 300,
+        "the one deletion is the helper's"
+    );
 }

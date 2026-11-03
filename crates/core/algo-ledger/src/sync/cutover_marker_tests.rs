@@ -33,7 +33,7 @@ use crate::catchpoint::writer::{export_catchpoint_file, ExportOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const ROUND: u64 = 500;
+pub(super) const ROUND: u64 = 500;
 
 struct CopyBackend {
     source_file: PathBuf,
@@ -93,6 +93,12 @@ fn config(db_path: PathBuf, label: &str) -> SyncConfig {
 /// Export a tiny (empty-account) catchpoint file at `ROUND`; returns its
 /// path and label.
 fn export_tiny_catchpoint(dir: &Path) -> (PathBuf, String) {
+    export_tiny_catchpoint_as(dir, "source-catchpoint.tar.gz", 7)
+}
+
+/// [`export_tiny_catchpoint`] to `dir/name`, with the block header digest
+/// `digest` (so another digest gives another label for the same round).
+pub(super) fn export_tiny_catchpoint_as(dir: &Path, name: &str, digest: u8) -> (PathBuf, String) {
     let src = Connection::open_in_memory().unwrap();
     src.execute_batch(
         "CREATE TABLE accountbase (addrid INTEGER PRIMARY KEY NOT NULL, address BLOB NOT NULL, data BLOB, normalizedonlinebalance INTEGER);
@@ -105,14 +111,14 @@ fn export_tiny_catchpoint(dir: &Path) -> (PathBuf, String) {
         INSERT INTO accounttotals VALUES('', 0, 0, 0, 0, 0, 0, 0);",
     )
     .unwrap();
-    let path = dir.join("source-catchpoint.tar.gz");
+    let path = dir.join(name);
     let exported = export_catchpoint_file(
         &src,
         &path,
         &ExportOptions {
             balances_round: ROUND,
             blocks_round: ROUND,
-            block_header_digest: [7u8; 32],
+            block_header_digest: [digest; 32],
             ..Default::default()
         },
     )

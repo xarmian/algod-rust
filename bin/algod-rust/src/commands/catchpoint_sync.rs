@@ -594,9 +594,12 @@ impl SyncBackend for AlgodSyncBackend {
         round: u64,
         dest_path: &std::path::Path,
     ) -> Result<(), AlgoError> {
-        self.runtime.block_on(
-            self.catchpoint_source
-                .download(genesis_id, round, dest_path, None),
+        download_and_join_writers(
+            &self.runtime,
+            &self.catchpoint_source,
+            genesis_id,
+            round,
+            dest_path,
         )
     }
 
@@ -692,6 +695,34 @@ impl BlockingRuntime {
     {
         tokio::task::block_in_place(|| self.rt.block_on(fetch(self.cancel.clone())))
     }
+}
+
+/// How long to wait for the download's writer threads once the download has
+/// ended (issue #2139). One file operation is in flight at most, so this is
+/// only reached when the disk is stuck.
+const WRITER_JOIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `SyncBackend::download_catchpoint` for a [`RankedCatchpointSource`]: run
+/// the download, and, however it ended (done, failed, or dropped because the
+/// token fired), wait until its writer threads have exited before returning.
+/// The orchestrator deletes the catchpoint files right after a cancelled
+/// download returns, and no write or rename may land after that (issue
+/// #2139).
+fn download_and_join_writers(
+    runtime: &BlockingRuntime,
+    source: &RankedCatchpointSource,
+    genesis_id: &str,
+    round: u64,
+    dest_path: &std::path::Path,
+) -> Result<(), AlgoError> {
+    let result = runtime.block_on(source.download(genesis_id, round, dest_path, None));
+    if !source.wait_for_writers(WRITER_JOIN_BUDGET) {
+        warn!(
+            round,
+            "a catchpoint writer thread did not exit within {WRITER_JOIN_BUDGET:?};              a leftover file is removed by the next run's sweep"
+        );
+    }
+    result
 }
 
 /// Drive `fut` on `rt` from a blocking thread (the sync orchestrator's, or a
@@ -1263,9 +1294,12 @@ impl SyncBackend for GossipSyncBackend {
         dest_path: &std::path::Path,
     ) -> Result<(), AlgoError> {
         // Catchpoint download is always via REST/HTTP, ranked across peers.
-        self.runtime.block_on(
-            self.catchpoint_source
-                .download(genesis_id, round, dest_path, None),
+        download_and_join_writers(
+            &self.runtime,
+            &self.catchpoint_source,
+            genesis_id,
+            round,
+            dest_path,
         )
     }
 
