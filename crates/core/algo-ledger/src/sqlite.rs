@@ -2352,6 +2352,42 @@ pub struct SqliteLedger {
     /// aborted block's state is retained and the next `begin_block` /
     /// `commit_block` must complete the abort first.
     pub(crate) pending_abort: bool,
+    /// DIVERGENCE DIV-009: block archive writes of the open block span, held
+    /// in memory until `commit_block` writes them to the block file in one
+    /// durable transaction BEFORE the tracker transaction commits.
+    pending_archive: PendingArchive,
+    /// DIVERGENCE DIV-009: second connection to the block file that commits
+    /// the buffered archive rows while the main connection still holds the
+    /// block's tracker transaction open. Opened on first use.
+    archive_writer: Option<Connection>,
+    /// The `synchronous` level the archive writer was last configured with.
+    archive_writer_sync: i64,
+    /// Current `synchronous` level (shared by the main connection, both
+    /// schemas, and the archive writer).
+    synchronous_mode: std::sync::atomic::AtomicI64,
+    /// DIVERGENCE DIV-009: the rounds of blocks whose archive rows are
+    /// committed but whose tracker transaction is not yet. The read pool
+    /// treats such rows as not yet visible.
+    archive_inflight: std::sync::Arc<crate::read_pool::ArchiveInflight>,
+    /// DIVERGENCE DIV-009: the real file attached as `blockdb` (what the
+    /// archive writer opens); `None` for in-memory ledgers.
+    block_path: Option<std::path::PathBuf>,
+    /// DIVERGENCE DIV-009: rounds whose archive row the last archive commit
+    /// CREATED (no row existed); deleted again if the tracker commit fails.
+    archive_created: Vec<i64>,
+    /// DIVERGENCE DIV-009: created rows whose tracker commit failed and whose
+    /// delete failed too; retried at the next `begin_block` / archive commit,
+    /// and kept in the in-flight marker (hidden from the read pool) until gone.
+    orphan_rounds: Vec<i64>,
+    /// Test hook: fail the next N tracker COMMITs (after the archive commit).
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_tracker_commit: usize,
+    /// Test hook: fail the next N orphan-row deletes.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_orphan_delete: usize,
+    /// Test hook (see [`Self::set_failpoint`]).
+    #[cfg(any(test, feature = "test-hooks"))]
+    failpoint_cfg: Option<Failpoint>,
     /// Test-only: make the next N SQL ROLLBACKs fail while the transaction
     /// stays open (stands in for SQLITE_BUSY on ROLLBACK). The field exists
     /// only under `cfg(test)`, so the production struct layout is unchanged.
@@ -2766,17 +2802,23 @@ impl SqliteLedger {
         // connection. The block file is parameter-bound to avoid quoting
         // issues with paths that contain a quote character.
         //
-        // Cross-file commit semantics: SQLite uses a multi-database commit
-        // sequence for transactions that touch both schemas. In WAL mode the
-        // ordering is well-defined (each WAL is fsync'd in turn) but is NOT
-        // a true atomic commit across files — a crash mid-commit can leave
-        // the tracker and block schemas at adjacent rounds, with the tracker
-        // ahead by at most one. This mirrors go-algorand's behavior (the
-        // tracker and block DBs are also independent there) and is handled
-        // by the sync/replay startup paths, which resume from
-        // `last_committed_round()` and re-fetch any missing tail block. The
-        // caller MUST NOT assume that "tracker says round N" implies
-        // "blockdb contains round N's row".
+        // Cross-file commit semantics: SQLite commits a transaction that
+        // touches both schemas file by file in attach order (tracker `main`
+        // first, then `blockdb`), and in WAL mode that is NOT atomic across
+        // files, so a block row written inside the tracker's transaction
+        // became durable AFTER the tracker commit and a kill between the two
+        // left the tracker a round ahead of the archive (#2209). go never has
+        // that state: it commits the block to blockdb first and the trackers
+        // lag behind it (`ledger.go` AddValidatedBlock: `blockQ.putBlock`,
+        // then `trackers.newBlock`). DIVERGENCE DIV-009: inside a block span
+        // `put_block` / `put_block_cert` only buffer, and `commit_block`
+        // commits the buffered rows to the block file on a second connection
+        // BEFORE it commits the tracker transaction (`flush_pending_archive`),
+        // so a crash leaves the archive at most one block AHEAD of the
+        // tracker (`CrossFileState::Consistent`); the follower commits that
+        // block again (`put_block` is an upsert). The caller MUST NOT assume
+        // that "tracker says round N" implies "blockdb contains round N's row"
+        // for ledgers written by older builds.
         conn.execute_cached(
             "ATTACH DATABASE ?1 AS blockdb",
             params![block_path.to_string_lossy().as_ref()],
@@ -2793,9 +2835,14 @@ impl SqliteLedger {
         // [`Self::upgrade_legacy_online_history`] at startup and
         // `begin_block` runs it before the first block otherwise.
         let mut ledger = Self::init(conn, prefix)?;
+        // DIVERGENCE DIV-009: the archive writer must open the file that is
+        // attached as `blockdb`, which need not live next to the tracker (the
+        // block DB directory is configurable).
+        ledger.block_path = Some(attached_file(&ledger.conn, "blockdb")?);
         ledger.read_pool = Some(std::sync::Arc::new(crate::read_pool::LedgerReadPool::new(
             tracker_path.to_path_buf(),
             block_path.to_path_buf(),
+            std::sync::Arc::clone(&ledger.archive_inflight),
         )));
         Ok(ledger)
     }
@@ -3204,6 +3251,20 @@ impl SqliteLedger {
             lease_snapshot: None,
             chain_snapshot: None,
             pending_abort: false,
+            pending_archive: PendingArchive::default(),
+            archive_writer: None,
+            archive_writer_sync: DEFAULT_LEDGER_SYNCHRONOUS_MODE,
+            synchronous_mode: std::sync::atomic::AtomicI64::new(DEFAULT_LEDGER_SYNCHRONOUS_MODE),
+            archive_inflight: std::sync::Arc::new(crate::read_pool::ArchiveInflight::default()),
+            block_path: None,
+            archive_created: Vec::new(),
+            orphan_rounds: Vec::new(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_tracker_commit: 0,
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_orphan_delete: 0,
+            #[cfg(any(test, feature = "test-hooks"))]
+            failpoint_cfg: None,
             #[cfg(test)]
             fail_rollback_count: 0,
             current_round,
@@ -3750,11 +3811,28 @@ impl SqliteLedger {
         // Self-healing: finish an abort whose ROLLBACK failed earlier before
         // anything new starts (most callers ignore rollback_block's result).
         self.heal_pending_abort()?;
+        self.pending_archive.clear();
+        self.reconcile_orphans();
+        // DIVERGENCE DIV-009: the span's transaction takes the TRACKER write
+        // lock only (`BEGIN IMMEDIATE` would also lock the attached block
+        // file, and the archive writer commits to it before the tracker
+        // does). The no-op UPDATE is the first statement, so it takes the
+        // lock now (waiting on the busy handler, as `BEGIN IMMEDIATE` did)
+        // instead of at the first real write.
         self.conn
-            .execute_batch("BEGIN IMMEDIATE")
+            .execute_batch("BEGIN DEFERRED")
             .map_err(|e| AlgoError::Ledger {
                 message: format!("begin block error: {e}"),
             })?;
+        if let Err(e) = self
+            .conn
+            .execute_batch("UPDATE acctrounds SET rnd = rnd WHERE 0")
+        {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            return Err(AlgoError::Ledger {
+                message: format!("begin block error: {e}"),
+            });
+        }
         // A scratch-apply undo journal still open here is stale (its restore
         // never ran); close it so it cannot outlive the block boundary.
         self.lease_table.discard_undo();
@@ -3840,6 +3918,8 @@ impl SqliteLedger {
     /// time.
     pub fn set_synchronous_mode(&self, mode: i64) -> Result<(), AlgoError> {
         let mode = clamp_synchronous_mode(mode);
+        self.synchronous_mode
+            .store(mode, std::sync::atomic::Ordering::SeqCst);
         self.conn
             .execute_batch(&format!(
                 "PRAGMA synchronous={mode}; PRAGMA blockdb.synchronous={mode};"
@@ -4555,12 +4635,26 @@ impl SqliteLedger {
             }
         }
 
+        // DIVERGENCE DIV-009: the block archive becomes durable BEFORE the
+        // tracker transaction commits (go: blockdb first, trackers lag).
+        self.flush_pending_archive()?;
         let database_commit_start = log_acctupdates_stats.then(Instant::now);
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self.fail_tracker_commit > 0 {
+            self.fail_tracker_commit -= 1;
+            return Err(AlgoError::Ledger {
+                message: "commit block error: injected tracker commit failure".into(),
+            });
+        }
         self.conn
             .execute_batch("COMMIT")
             .map_err(|e| AlgoError::Ledger {
                 message: format!("commit block error: {e}"),
             })?;
+        // The block is committed in both files: nothing is in flight any more.
+        self.archive_created.clear();
+        self.refresh_inflight_marker();
+        self.failpoint("after_tracker_commit");
         if let Some(start) = database_commit_start {
             acctupdates_sample.database_commit_duration = start.elapsed();
         }
@@ -4778,16 +4872,13 @@ impl SqliteLedger {
     /// is a fast, always-populated indexed lookup, not a fallible
     /// best-effort read.
     fn block_header_digest_at_round(&self, round: u64) -> Result<[u8; 32], AlgoError> {
-        let hdrdata: Vec<u8> = self
-            .conn
-            .query_row_cached(
-                "SELECT hdrdata FROM blockdb.blocks WHERE rnd = ?1",
-                params![round as i64],
-                |row| row.get(0),
-            )
-            .map_err(|e| AlgoError::Ledger {
-                message: format!("automatic catchpoint: read block header at round {round}: {e}"),
-            })?;
+        // Through the span-aware getter (DIV-009): a span's own buffered
+        // header is not in the file yet.
+        let hdrdata: Vec<u8> =
+            self.get_block_header_data(round)?
+                .ok_or_else(|| AlgoError::Ledger {
+                    message: format!("automatic catchpoint: no block header at round {round}"),
+                })?;
         let header: BlockHeader =
             rmp_serde::from_slice(&hdrdata).map_err(|e| AlgoError::Ledger {
                 message: format!("automatic catchpoint: decode block header at round {round}: {e}"),
@@ -5169,6 +5260,11 @@ impl SqliteLedger {
             return false;
         }
         self.pending_abort = false;
+        // DIVERGENCE DIV-009: an aborted block's buffered archive rows are
+        // dropped. Rows it already committed to the archive (its tracker
+        // COMMIT failed afterwards) are removed again by `reconcile_orphans`.
+        self.pending_archive.clear();
+        self.reconcile_orphans();
         // Clear pre-mutation records -- they are for the aborted block.
         self.pre_mutations.clear();
         // Discard the aborted block's accumulated `accounttotals` delta
@@ -5235,6 +5331,11 @@ impl SqliteLedger {
         //
         // SQLite `MAX()` over an empty filtered result returns NULL,
         // so collect into Option<i64>.
+        // Reads the file only: a span's buffered rows (DIV-009) are not in it.
+        debug_assert!(
+            !self.in_block,
+            "max_block_round_in_blockdb inside a block span"
+        );
         let raw: Option<i64> = self
             .conn
             .query_row_cached(
@@ -5293,6 +5394,7 @@ impl SqliteLedger {
                 // a synthesized catchpoint-seed row (empty `blkdata`)
                 // is not a real archived block and must not satisfy
                 // the row-present check.
+                debug_assert!(!self.in_block, "reconcile_cross_file inside a block span");
                 let row_present: bool = self
                     .conn
                     .query_row_cached(
@@ -6287,7 +6389,7 @@ impl SqliteLedger {
     ///     lost as a warning but `commit_block` succeeded, this
     ///     restores the gap with the in-memory state we are about
     ///     to lose.
-    fn flush_chain_state(&self) -> Result<(), AlgoError> {
+    fn flush_chain_state(&mut self) -> Result<(), AlgoError> {
         self.conn
             .execute_cached(
                 "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', ?1)",
@@ -6317,16 +6419,38 @@ impl SqliteLedger {
         let hdrdata = rmp_serde::to_vec_named(&hdr).map_err(|e| AlgoError::Ledger {
             message: format!("encode synthesized flush header: {e}"),
         })?;
+        let protocol = self.protocol.clone();
+        self.insert_header_if_absent(self.current_round.0, &protocol, hdrdata)
+    }
+
+    /// `INSERT OR IGNORE` of a header-only block row (empty body). Inside a
+    /// block span it joins the buffered archive write like every other block
+    /// row (DIV-009).
+    fn insert_header_if_absent(
+        &mut self,
+        round: u64,
+        proto: &str,
+        hdrdata: Vec<u8>,
+    ) -> Result<(), AlgoError> {
+        let rnd = round as i64;
+        if self.in_block {
+            if matches!(self.pending_archive.row_state(rnd), Some(true)) {
+                return Ok(());
+            }
+            self.pending_archive.ops.push(ArchiveOp::Block {
+                round: rnd,
+                proto: proto.to_string(),
+                hdr: hdrdata,
+                blk: Vec::new(),
+                insert_ignore: true,
+            });
+            return Ok(());
+        }
         self.conn
             .execute_cached(
                 "INSERT OR IGNORE INTO blockdb.blocks (rnd, proto, hdrdata, blkdata) \
                  VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    self.current_round.0 as i64,
-                    self.protocol,
-                    hdrdata,
-                    &[] as &[u8]
-                ],
+                params![rnd, proto, hdrdata, &[] as &[u8]],
             )
             .map_err(|e| AlgoError::Ledger {
                 message: format!("synthesized header flush error: {e}"),
@@ -6921,7 +7045,461 @@ pub struct SqliteSnapshot {
     online_touched: std::collections::HashSet<Address>,
 }
 
+/// DIVERGENCE DIV-009: one block archive write buffered in a block span, in
+/// the order the caller issued it (a `forget_before` between two puts must
+/// keep its position).
+enum ArchiveOp {
+    /// `put_block`, or (`insert_ignore`) a synthesized header that must not
+    /// replace an existing row.
+    Block {
+        round: i64,
+        proto: String,
+        hdr: Vec<u8>,
+        blk: Vec<u8>,
+        insert_ignore: bool,
+    },
+    /// `put_block_cert`.
+    Cert { round: i64, cert: Vec<u8> },
+    /// The block part of `forget_before`: delete rows below `below`.
+    Prune { below: i64 },
+}
+
+/// Result of looking a round up in the buffer.
+enum Buffered<T> {
+    Hit(T),
+    /// A later `forget_before` in the span removed it.
+    Gone,
+    Miss,
+}
+
+/// DIVERGENCE DIV-009: block archive writes of the open block span.
+#[derive(Default)]
+struct PendingArchive {
+    ops: Vec<ArchiveOp>,
+}
+
+/// The block-table statements, built once per table name.
+struct ArchiveSql {
+    upsert: &'static str,
+    insert_ignore: &'static str,
+    cert: &'static str,
+    prune: &'static str,
+    delete_row: &'static str,
+    exists: &'static str,
+}
+
+macro_rules! archive_sql {
+    ($table:literal) => {
+        ArchiveSql {
+            upsert: concat!(
+                "INSERT INTO ",
+                $table,
+                " (rnd, proto, hdrdata, blkdata) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(rnd) DO UPDATE SET proto=excluded.proto, \
+                 hdrdata=excluded.hdrdata, blkdata=excluded.blkdata"
+            ),
+            insert_ignore: concat!(
+                "INSERT OR IGNORE INTO ",
+                $table,
+                " (rnd, proto, hdrdata, blkdata) VALUES (?1, ?2, ?3, ?4)"
+            ),
+            cert: concat!("UPDATE ", $table, " SET certdata = ?2 WHERE rnd = ?1"),
+            prune: concat!("DELETE FROM ", $table, " WHERE rnd < ?1"),
+            delete_row: concat!("DELETE FROM ", $table, " WHERE rnd = ?1"),
+            exists: concat!("SELECT EXISTS(SELECT 1 FROM ", $table, " WHERE rnd = ?1)"),
+        }
+    };
+}
+
+/// On the main connection (`blockdb` attached).
+const ARCHIVE_SQL_MAIN: ArchiveSql = archive_sql!("blockdb.blocks");
+/// On the archive writer (the block file is its `main`).
+const ARCHIVE_SQL_WRITER: ArchiveSql = archive_sql!("blocks");
+
+impl PendingArchive {
+    fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.ops.clear();
+    }
+
+    /// The newest buffered `put_block` for `round` as `(proto, header, body)`.
+    fn latest_block(&self, round: i64) -> Buffered<(&str, &[u8], &[u8])> {
+        for op in self.ops.iter().rev() {
+            match op {
+                ArchiveOp::Block {
+                    round: r,
+                    proto,
+                    hdr,
+                    blk,
+                    insert_ignore: false,
+                } if *r == round => return Buffered::Hit((proto, hdr, blk)),
+                ArchiveOp::Prune { below } if round < *below => return Buffered::Gone,
+                _ => {}
+            }
+        }
+        Buffered::Miss
+    }
+
+    /// The newest buffered certificate for `round`.
+    fn latest_cert(&self, round: i64) -> Buffered<&[u8]> {
+        for op in self.ops.iter().rev() {
+            match op {
+                ArchiveOp::Cert { round: r, cert } if *r == round => return Buffered::Hit(cert),
+                ArchiveOp::Prune { below } if round < *below => return Buffered::Gone,
+                _ => {}
+            }
+        }
+        Buffered::Miss
+    }
+
+    /// Whether the buffered ops alone decide that a row for `round` exists
+    /// (`Some(true)`), was removed (`Some(false)`) or say nothing (`None`).
+    fn row_state(&self, round: i64) -> Option<bool> {
+        let mut state = None;
+        for op in &self.ops {
+            match op {
+                ArchiveOp::Block { round: r, .. } if *r == round => state = Some(true),
+                ArchiveOp::Prune { below } if round < *below => state = Some(false),
+                _ => {}
+            }
+        }
+        state
+    }
+
+    /// Rounds of the buffered block rows.
+    fn block_rounds(&self) -> Vec<i64> {
+        let mut rounds: Vec<i64> = self
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                ArchiveOp::Block { round, .. } => Some(*round),
+                _ => None,
+            })
+            .collect();
+        rounds.sort_unstable();
+        rounds.dedup();
+        rounds
+    }
+
+    /// Apply the buffered writes, in the order they were issued, with the
+    /// statements `put_block`, `put_block_cert` and `forget_before` run
+    /// outside a span.
+    fn write_to(&self, conn: &Connection, sql: &ArchiveSql) -> rusqlite::Result<()> {
+        for op in &self.ops {
+            match op {
+                ArchiveOp::Block {
+                    round,
+                    proto,
+                    hdr,
+                    blk,
+                    insert_ignore,
+                } => {
+                    let text = if *insert_ignore {
+                        sql.insert_ignore
+                    } else {
+                        sql.upsert
+                    };
+                    conn.prepare_cached(text)?
+                        .execute(params![round, proto, hdr, blk])?;
+                }
+                ArchiveOp::Cert { round, cert } => {
+                    conn.prepare_cached(sql.cert)?
+                        .execute(params![round, cert])?;
+                }
+                ArchiveOp::Prune { below } => {
+                    conn.prepare_cached(sql.prune)?.execute(params![below])?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The file SQLite really has open as schema `schema` of `conn`.
+fn attached_file(conn: &Connection, schema: &str) -> Result<std::path::PathBuf, AlgoError> {
+    let file: String = conn
+        .query_row(
+            "SELECT file FROM pragma_database_list WHERE name = ?1",
+            params![schema],
+            |r| r.get(0),
+        )
+        .map_err(|e| AlgoError::Ledger {
+            message: format!("database_list for schema {schema}: {e}"),
+        })?;
+    Ok(std::path::PathBuf::from(file))
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// Test hook (see [`SqliteLedger::set_failpoint`]).
+#[cfg(any(test, feature = "test-hooks"))]
+struct Failpoint {
+    name: String,
+    after: u64,
+    hits: u64,
+}
+
 impl SqliteLedger {
+    /// Test hook: abort the process (no cleanup, like a SIGKILL) the
+    /// `after`-th (0 = first) time this ledger's commit path reaches the
+    /// failpoint `name`: `before_archive_commit`, `after_archive_commit`
+    /// (archive durable, tracker not yet) or `after_tracker_commit`. Scoped to
+    /// this instance; compiled out of builds without `test-hooks`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_failpoint(&mut self, name: &str, after: u64) {
+        self.failpoint_cfg = Some(Failpoint {
+            name: name.to_string(),
+            after,
+            hits: 0,
+        });
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn failpoint(&mut self, name: &str) {
+        if let Some(f) = self.failpoint_cfg.as_mut() {
+            if f.name == name {
+                if f.hits >= f.after {
+                    std::process::abort();
+                }
+                f.hits += 1;
+            }
+        }
+    }
+
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    #[inline(always)]
+    fn failpoint(&mut self, _name: &str) {}
+
+    /// The buffered `put_block` of `round` inside a block span.
+    fn buffered_block(&self, round: u64) -> Buffered<(&str, &[u8], &[u8])> {
+        if !self.in_block {
+            return Buffered::Miss;
+        }
+        self.pending_archive.latest_block(round as i64)
+    }
+
+    /// Open (once) the second connection to the file attached as `blockdb`,
+    /// and verify it really is that file.
+    fn ensure_archive_writer(&mut self) -> Result<(), AlgoError> {
+        let mode = self
+            .synchronous_mode
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if self.archive_writer.is_none() {
+            let path = self.block_path.clone().ok_or_else(|| AlgoError::Ledger {
+                message: "archive writer: ledger has no block file".into(),
+            })?;
+            let conn = Connection::open(&path).map_err(|e| AlgoError::Ledger {
+                message: format!("archive writer open {}: {e}", path.display()),
+            })?;
+            let writer_file = attached_file(&conn, "main")?;
+            let attached = attached_file(&self.conn, "blockdb")?;
+            if !same_file(&writer_file, &attached) {
+                return Err(AlgoError::Ledger {
+                    message: format!(
+                        "archive writer opened {} but the ledger attached {} as blockdb",
+                        writer_file.display(),
+                        attached.display()
+                    ),
+                });
+            }
+            conn.execute_batch(&format!("PRAGMA synchronous={mode};"))
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("archive writer configure: {e}"),
+                })?;
+            self.archive_writer_sync = mode;
+            self.archive_writer = Some(conn);
+        }
+        if self.archive_writer_sync != mode {
+            if let Some(w) = self.archive_writer.as_ref() {
+                w.execute_batch(&format!("PRAGMA synchronous={mode};"))
+                    .map_err(|e| AlgoError::Ledger {
+                        message: format!("archive writer configure: {e}"),
+                    })?;
+            }
+            self.archive_writer_sync = mode;
+        }
+        Ok(())
+    }
+
+    /// Publish the rounds the read pool must hide (orphans and the rows the
+    /// last archive commit created that the tracker has not committed), or
+    /// clear the marker when there are none.
+    fn refresh_inflight_marker(&self) {
+        let mut rounds = self.orphan_rounds.iter().chain(self.archive_created.iter());
+        let first = rounds.next().copied();
+        match first {
+            None => self.archive_inflight.clear(),
+            Some(f) => {
+                let (lo, hi) = rounds.fold((f, f), |(lo, hi), r| (lo.min(*r), hi.max(*r)));
+                self.archive_inflight.set(lo as u64, hi as u64);
+            }
+        }
+    }
+
+    /// DIVERGENCE DIV-009: remove the archive rows created for a block whose
+    /// tracker transaction did not commit (they would otherwise show an
+    /// unapplied block). A failed delete keeps the rounds in `orphan_rounds`
+    /// and in the in-flight marker (hidden from the read pool); it is retried
+    /// at the next `begin_block` and archive commit.
+    fn reconcile_orphans(&mut self) {
+        let mut rounds = std::mem::take(&mut self.orphan_rounds);
+        rounds.extend(std::mem::take(&mut self.archive_created));
+        if rounds.is_empty() {
+            self.refresh_inflight_marker();
+            return;
+        }
+        if let Err(e) = self.delete_archive_rows(&rounds) {
+            tracing::warn!(error = %e, ?rounds, "could not remove archive rows of an uncommitted block; they stay hidden and are retried");
+            self.orphan_rounds = rounds;
+        }
+        self.refresh_inflight_marker();
+    }
+
+    fn delete_archive_rows(&mut self, rounds: &[i64]) -> Result<(), AlgoError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self.fail_orphan_delete > 0 {
+            self.fail_orphan_delete -= 1;
+            return Err(AlgoError::Ledger {
+                message: "injected archive delete failure".into(),
+            });
+        }
+        let fail = |e: rusqlite::Error| AlgoError::Ledger {
+            message: format!("delete orphaned archive rows: {e}"),
+        };
+        if self.block_path.is_none() {
+            for r in rounds {
+                self.conn
+                    .execute(ARCHIVE_SQL_MAIN.delete_row, params![r])
+                    .map_err(fail)?;
+            }
+            return Ok(());
+        }
+        self.ensure_archive_writer()?;
+        let writer = self.archive_writer.as_ref().expect("opened above");
+        writer.execute_batch("BEGIN IMMEDIATE").map_err(fail)?;
+        for r in rounds {
+            if let Err(e) = writer.execute(ARCHIVE_SQL_WRITER.delete_row, params![r]) {
+                let _ = writer.execute_batch("ROLLBACK");
+                return Err(fail(e));
+            }
+        }
+        writer.execute_batch("COMMIT").map_err(|e| {
+            let _ = writer.execute_batch("ROLLBACK");
+            fail(e)
+        })
+    }
+
+    /// DIVERGENCE DIV-009: make the span's buffered block archive writes
+    /// durable in ONE transaction on the block file, before the caller
+    /// commits the tracker transaction.
+    ///
+    /// SQLite commits the databases of one transaction file by file in attach
+    /// order (tracker `main` first) and, in WAL mode, not atomically, so rows
+    /// written inside the tracker's transaction became durable after the
+    /// tracker commit that depends on them; a kill in between left the tracker
+    /// a round ahead of the archive and `open` refused the ledger (#2209). go
+    /// commits the block to blockdb first and the trackers lag behind it
+    /// (`ledger.go` AddValidatedBlock: `blockQ.putBlock`, then
+    /// `trackers.newBlock`). The block span's transaction takes the tracker
+    /// lock only, so a second connection can commit to the block file while it
+    /// is open; a crash then leaves the archive at most one block AHEAD of the
+    /// tracker, and the follower commits that block again (upsert).
+    ///
+    /// In-memory ledgers (no files, nothing to crash) and a span whose own
+    /// connection already wrote the block file (test fixtures) write through
+    /// the main connection, inside the tracker transaction.
+    fn flush_pending_archive(&mut self) -> Result<(), AlgoError> {
+        if self.pending_archive.is_empty() {
+            return Ok(());
+        }
+        let fail = |what: &str, e: rusqlite::Error| AlgoError::Ledger {
+            message: format!("commit block archive {what} error: {e}"),
+        };
+        let main_wrote_blocks = self.block_path.is_none()
+            || matches!(
+                self.conn.transaction_state(Some("blockdb")),
+                Ok(rusqlite::TransactionState::Write)
+            );
+        if main_wrote_blocks {
+            self.pending_archive
+                .write_to(&self.conn, &ARCHIVE_SQL_MAIN)
+                .map_err(|e| fail("write", e))?;
+            self.pending_archive.clear();
+            return Ok(());
+        }
+        self.reconcile_orphans();
+        self.failpoint("before_archive_commit");
+        self.ensure_archive_writer()?;
+        let writer = self.archive_writer.as_ref().expect("opened above");
+        writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| fail("begin", e))?;
+        // Rounds this commit creates (no row yet): removed again if the
+        // tracker commit fails.
+        let mut created = Vec::new();
+        let rounds = self.pending_archive.block_rounds();
+        for r in &rounds {
+            match writer
+                .prepare_cached(ARCHIVE_SQL_WRITER.exists)
+                .and_then(|mut s| s.query_row(params![r], |row| row.get::<_, bool>(0)))
+            {
+                Ok(false) => created.push(*r),
+                Ok(true) => {}
+                Err(e) => {
+                    let _ = writer.execute_batch("ROLLBACK");
+                    return Err(fail("probe", e));
+                }
+            }
+        }
+        if let Err(e) = self.pending_archive.write_to(writer, &ARCHIVE_SQL_WRITER) {
+            let _ = writer.execute_batch("ROLLBACK");
+            return Err(fail("write", e));
+        }
+        // Published BEFORE the commit makes the rows visible to other
+        // connections (the read pool hides these blocks until the tracker
+        // commits too; see `LedgerReadPool::in_flight`).
+        self.archive_created = created;
+        if let (Some(lo), Some(hi)) = (rounds.first(), rounds.last()) {
+            let (olo, ohi) = self
+                .orphan_rounds
+                .iter()
+                .fold((*lo, *hi), |(l, h), r| (l.min(*r), h.max(*r)));
+            self.archive_inflight.set(olo as u64, ohi as u64);
+        }
+        let writer = self.archive_writer.as_ref().expect("opened above");
+        if let Err(e) = writer.execute_batch("COMMIT") {
+            let _ = writer.execute_batch("ROLLBACK");
+            self.archive_created.clear();
+            self.refresh_inflight_marker();
+            return Err(fail("commit", e));
+        }
+        self.pending_archive.clear();
+        self.failpoint("after_archive_commit");
+        Ok(())
+    }
+
+    /// Test hook: fail the next `n` tracker COMMITs of `commit_block` (after
+    /// the archive commit), as a full disk or `SQLITE_BUSY` would.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn inject_tracker_commit_failures(&mut self, n: usize) {
+        self.fail_tracker_commit = n;
+    }
+
+    /// Test hook: fail the next `n` deletes of archive rows an uncommitted
+    /// block created.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn inject_orphan_delete_failures(&mut self, n: usize) {
+        self.fail_orphan_delete = n;
+    }
+
     /// The block-scoped read memo (issue #1757) is used only inside a block.
     fn cache_active(&self) -> bool {
         self.in_block && !self.pending_abort
@@ -8358,6 +8936,10 @@ impl LedgerStore for SqliteLedger {
             None
         }
         let mut h = std::collections::hash_map::DefaultHasher::new();
+        // The block archive writes of an open span are buffered (DIV-009), so
+        // the file rows above do not see them: fold their count in, a scratch
+        // pass must not add any.
+        self.pending_archive.ops.len().hash(&mut h);
         for (table, key, payload) in TABLES {
             let bounds: Result<(Option<i64>, Option<i64>), _> = self.conn.query_row(
                 &format!("SELECT MIN({key}), MAX({key}) FROM {table}"),
@@ -8571,6 +9153,17 @@ impl LedgerStore for SqliteLedger {
         blkdata: &[u8],
     ) -> Result<(), AlgoError> {
         let _st = crate::follow_timing::StateTimer::write();
+        if self.in_block {
+            // DIVERGENCE DIV-009: buffered; `commit_block` writes it.
+            self.pending_archive.ops.push(ArchiveOp::Block {
+                round: round as i64,
+                proto: proto.to_string(),
+                hdr: hdrdata.to_vec(),
+                blk: blkdata.to_vec(),
+                insert_ignore: false,
+            });
+            return Ok(());
+        }
         self.conn
             .execute_cached(
                 "INSERT INTO blockdb.blocks (rnd, proto, hdrdata, blkdata) VALUES (?1, ?2, ?3, ?4) \
@@ -8584,6 +9177,11 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn get_block_data(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+        match self.buffered_block(round) {
+            Buffered::Hit((_, _, blk)) => return Ok(Some(blk.to_vec())),
+            Buffered::Gone => return Ok(None),
+            Buffered::Miss => {}
+        }
         let _st = crate::follow_timing::StateTimer::read();
         self.conn
             .query_row_cached(
@@ -8598,6 +9196,11 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn get_block_header_data(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+        match self.buffered_block(round) {
+            Buffered::Hit((_, hdr, _)) => return Ok(Some(hdr.to_vec())),
+            Buffered::Gone => return Ok(None),
+            Buffered::Miss => {}
+        }
         let _st = crate::follow_timing::StateTimer::read();
         self.conn
             .query_row_cached(
@@ -8612,6 +9215,13 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn get_block_cert(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+        if self.in_block {
+            match self.pending_archive.latest_cert(round as i64) {
+                Buffered::Hit(cert) => return Ok(Some(cert.to_vec())),
+                Buffered::Gone => return Ok(None),
+                Buffered::Miss => {}
+            }
+        }
         let _st = crate::follow_timing::StateTimer::read();
         self.conn
             .query_row_cached(
@@ -8627,6 +9237,11 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn get_block_proto(&self, round: u64) -> Result<Option<String>, AlgoError> {
+        match self.buffered_block(round) {
+            Buffered::Hit((proto, _, _)) => return Ok(Some(proto.to_string())),
+            Buffered::Gone => return Ok(None),
+            Buffered::Miss => {}
+        }
         let _st = crate::follow_timing::StateTimer::read();
         self.conn
             .query_row_cached(
@@ -8642,6 +9257,31 @@ impl LedgerStore for SqliteLedger {
 
     fn put_block_cert(&mut self, round: u64, certdata: &[u8]) -> Result<(), AlgoError> {
         let _st = crate::follow_timing::StateTimer::write();
+        if self.in_block {
+            // DIVERGENCE DIV-009: buffered; `commit_block` writes it. The
+            // row must exist, buffered or already archived.
+            let exists = match self.pending_archive.row_state(round as i64) {
+                Some(state) => state,
+                None => self
+                    .conn
+                    .query_row_cached(ARCHIVE_SQL_MAIN.exists, params![round as i64], |r| {
+                        r.get::<_, bool>(0)
+                    })
+                    .map_err(|e| AlgoError::Ledger {
+                        message: format!("put_block_cert error: {e}"),
+                    })?,
+            };
+            if !exists {
+                return Err(AlgoError::Ledger {
+                    message: format!("put_block_cert: no block row for round {round}"),
+                });
+            }
+            self.pending_archive.ops.push(ArchiveOp::Cert {
+                round: round as i64,
+                cert: certdata.to_vec(),
+            });
+            return Ok(());
+        }
         let rows_affected = self
             .conn
             .execute_cached(
@@ -8711,14 +9351,21 @@ impl LedgerStore for SqliteLedger {
 
     fn forget_before(&mut self, round: u64) -> Result<(), AlgoError> {
         let _st = crate::follow_timing::StateTimer::write();
-        self.conn
-            .execute_cached(
-                "DELETE FROM blockdb.blocks WHERE rnd < ?1",
-                params![round as i64],
-            )
-            .map_err(|e| AlgoError::Ledger {
-                message: format!("forget_before blocks error: {e}"),
-            })?;
+        if self.in_block {
+            // DIVERGENCE DIV-009: part of the buffered archive write.
+            self.pending_archive.ops.push(ArchiveOp::Prune {
+                below: round as i64,
+            });
+        } else {
+            self.conn
+                .execute_cached(
+                    "DELETE FROM blockdb.blocks WHERE rnd < ?1",
+                    params![round as i64],
+                )
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("forget_before blocks error: {e}"),
+                })?;
+        }
         self.conn
             .execute_cached("DELETE FROM txtail WHERE rnd < ?1", params![round as i64])
             .map_err(|e| AlgoError::Ledger {
@@ -17301,6 +17948,17 @@ mod tests {
             lease_snapshot: _,
             chain_snapshot: _,
             pending_abort: _,
+            pending_archive: _,             // dropped by abort_block_state
+            archive_writer: _,              // connection, no chain state
+            archive_writer_sync: _,         // connection setting
+            synchronous_mode: _,            // connection setting
+            archive_inflight: _,            // read-pool visibility flag
+            block_path: _,                  // attached file
+            archive_created: _,             // reconciled by abort_block_state
+            orphan_rounds: _,               // reconciled by abort_block_state
+            fail_tracker_commit: _,         // test hook
+            fail_orphan_delete: _,          // test hook
+            failpoint_cfg: _,               // test hook
             fail_rollback_count: _,         // test-only injection flag
             current_round: _,               // ChainSnapshot
             earliest_round: _,              // not block-scoped (see above)
@@ -17339,5 +17997,49 @@ mod tests {
             retention: _,
             last_commit_wall_time: _,
         } = l;
+    }
+}
+
+#[cfg(test)]
+mod archive_buffer_tests {
+    //! DIV-009: readers of the block archive inside a block span see the
+    //! span's buffered writes.
+    use super::*;
+
+    fn header_bytes(round: u64) -> Vec<u8> {
+        let hdr = algo_types::BlockHeader {
+            round: Round(round),
+            current_protocol: "test".to_string(),
+            ..algo_types::BlockHeader::default()
+        };
+        rmp_serde::to_vec_named(&hdr).unwrap()
+    }
+
+    #[test]
+    fn header_digest_of_a_block_stored_in_the_open_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = SqliteLedger::open_with_prefix(&dir.path().join("ledger")).unwrap();
+        ledger.begin_block().unwrap();
+        ledger
+            .put_block(1, "test", &header_bytes(1), b"body")
+            .unwrap();
+        // The file has no row yet; the span's own header is still readable.
+        let digest = ledger.block_header_digest_at_round(1).unwrap();
+        ledger.set_current_round(Round(1));
+        ledger.commit_block().unwrap();
+        assert_eq!(ledger.block_header_digest_at_round(1).unwrap(), digest);
+    }
+
+    #[test]
+    fn scratch_fingerprint_sees_a_block_row_a_scratch_pass_buffers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = SqliteLedger::open_with_prefix(&dir.path().join("ledger")).unwrap();
+        ledger.begin_block().unwrap();
+        let before = ledger.tracker_rows_fingerprint();
+        ledger
+            .put_block(1, "test", &header_bytes(1), b"body")
+            .unwrap();
+        assert_ne!(before, ledger.tracker_rows_fingerprint());
+        ledger.rollback_block().unwrap();
     }
 }

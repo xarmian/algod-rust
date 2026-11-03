@@ -39,7 +39,9 @@
 //!   commit one after the other (see the split-commit note on
 //!   [`crate::SqliteLedger::open_split`]), so a reader can observe the
 //!   tracker at round `N` while the block row for `N` is not visible yet.
-//!   A *found* row is always served (its block commit finished). A *miss*
+//!   A *found* row is served (its block commit finished), except the one
+//!   block whose archive row is committed but whose tracker transaction is
+//!   not yet (DIV-009, `LedgerReadPool::in_flight`). A *miss*
 //!   is never trusted when the committed tracker round says the row should
 //!   exist (`round <= committed`): it is reported as
 //!   [`PoolRead::Fallback`] and the caller takes the locked path, which is
@@ -94,12 +96,57 @@ pub enum PoolRead<T> {
     Fallback,
 }
 
+/// DIVERGENCE DIV-009: the range of rounds whose archive rows are committed
+/// but whose tracker transaction is not yet, shared between the writer and
+/// the pool. Packed as `(lo + 1) << 32 | (hi + 1)` (0 = none); rounds are
+/// saturated at `u32::MAX - 1`.
+#[derive(Default)]
+pub(crate) struct ArchiveInflight(std::sync::atomic::AtomicU64);
+
+impl ArchiveInflight {
+    const CAP: u64 = u32::MAX as u64 - 1;
+
+    pub(crate) fn set(&self, lo: u64, hi: u64) {
+        let lo = lo.min(Self::CAP) + 1;
+        let hi = hi.min(Self::CAP) + 1;
+        self.0
+            .store((lo << 32) | hi, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn clear(&self) {
+        self.0.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn contains(&self, round: u64) -> bool {
+        let v = self.0.load(std::sync::atomic::Ordering::SeqCst);
+        if v == 0 {
+            return false;
+        }
+        let (lo, hi) = ((v >> 32) - 1, (v & 0xffff_ffff) - 1);
+        (lo..=hi).contains(&round.min(Self::CAP))
+    }
+}
+
+/// Answer of [`LedgerReadPool::in_flight`].
+enum InFlight {
+    No,
+    Hidden,
+    Unknown,
+}
+
 /// Read-only connection pool over a file-backed ledger's tracker + block
 /// files. See the module docs.
 pub struct LedgerReadPool {
     tracker_path: PathBuf,
     block_path: PathBuf,
     idle: Mutex<Vec<Connection>>,
+    /// DIVERGENCE DIV-009: the rounds whose archive rows are committed but
+    /// whose tracker transaction is not yet, set by the writer around that
+    /// window. See [`Self::in_flight`].
+    archive_inflight: Arc<ArchiveInflight>,
+    /// Test: make the next N `committed_round` reads fail.
+    #[cfg(test)]
+    pub(crate) fail_committed_round: std::sync::atomic::AtomicUsize,
     /// Rewards levels of recently read committed headers, shared by the
     /// `lookup_agreement` reward fold (round `r - lookback`) and the account
     /// lookups (the tip), so neither evicts the other. Only committed rounds
@@ -163,11 +210,18 @@ impl std::fmt::Debug for LedgerReadPool {
 }
 
 impl LedgerReadPool {
-    pub(crate) fn new(tracker_path: PathBuf, block_path: PathBuf) -> Self {
+    pub(crate) fn new(
+        tracker_path: PathBuf,
+        block_path: PathBuf,
+        archive_inflight: Arc<ArchiveInflight>,
+    ) -> Self {
         Self {
             tracker_path,
             block_path,
             idle: Mutex::new(Vec::new()),
+            archive_inflight,
+            #[cfg(test)]
+            fail_committed_round: std::sync::atomic::AtomicUsize::new(0),
             rewards_cache: RewardsLevels::default(),
             #[cfg(test)]
             header_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -228,6 +282,19 @@ impl LedgerReadPool {
     /// as [`SqliteLedger::last_committed_round`] (`None` on a never
     /// initialised database).
     pub fn committed_round(&self) -> Result<Option<u64>, AlgoError> {
+        #[cfg(test)]
+        {
+            let pending = self
+                .fail_committed_round
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if pending > 0 {
+                self.fail_committed_round
+                    .store(pending - 1, std::sync::atomic::Ordering::SeqCst);
+                return Err(AlgoError::Ledger {
+                    message: "injected committed_round failure".into(),
+                });
+            }
+        }
         self.with_conn(|c| {
             let rnd: Option<i64> = c
                 .prepare_cached("SELECT rnd FROM acctrounds WHERE id = 'acctbase'")?
@@ -235,6 +302,30 @@ impl LedgerReadPool {
                 .optional()?;
             Ok(rnd.map(|v| v.max(0) as u64))
         })
+    }
+
+    /// DIVERGENCE DIV-009: whether a block row just read for `round` belongs
+    /// to blocks the writer has committed to the archive but not yet to the
+    /// tracker. The pool serves committed state only, so such a row reads as a
+    /// miss beyond the committed round, exactly as when the rows were written
+    /// in the tracker's own transaction. Correctness: the writer publishes the
+    /// rounds BEFORE its archive commit and clears them AFTER the tracker
+    /// commit (or after deleting the rows when that commit fails), so a reader
+    /// that saw the row either sees the marker (and then compares with the
+    /// committed round, read after the row) or the marker was already cleared,
+    /// i.e. the tracker had committed. Rows above the tracker that are not in
+    /// flight (written ahead by sync) are served as before. When the committed
+    /// round cannot be read the answer is unknown and the caller falls back to
+    /// the locked path, which decides.
+    fn in_flight(&self, round: u64) -> InFlight {
+        if !self.archive_inflight.contains(round) {
+            return InFlight::No;
+        }
+        match self.committed_round() {
+            Ok(Some(c)) if round <= c => InFlight::No,
+            Ok(Some(_)) => InFlight::Hidden,
+            Ok(None) | Err(_) => InFlight::Unknown,
+        }
     }
 
     /// Resolve a block-row read: a hit is served; a miss is only trusted
@@ -252,7 +343,11 @@ impl LedgerReadPool {
                 .map(|o| o.flatten())
         });
         match hit {
-            Ok(Some(v)) => PoolRead::Found(v),
+            Ok(Some(v)) => match self.in_flight(round) {
+                InFlight::No => PoolRead::Found(v),
+                InFlight::Hidden => PoolRead::NotFound,
+                InFlight::Unknown => PoolRead::Fallback,
+            },
             Ok(None) => match self.committed_round() {
                 // Read after the miss: if the tracker had committed this
                 // round by now, the miss may be the cross-file gap.
@@ -307,7 +402,11 @@ impl LedgerReadPool {
                 .optional()
         });
         match hit {
-            Ok(Some(cert)) => PoolRead::Found(cert),
+            Ok(Some(cert)) => match self.in_flight(round) {
+                InFlight::No => PoolRead::Found(cert),
+                InFlight::Hidden => PoolRead::NotFound,
+                InFlight::Unknown => PoolRead::Fallback,
+            },
             Ok(None) => match self.committed_round() {
                 Ok(Some(c)) if round <= c => PoolRead::Fallback,
                 Ok(_) => PoolRead::NotFound,
