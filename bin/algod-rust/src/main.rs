@@ -26,26 +26,31 @@ mod falcon_backend;
 mod live_catchup;
 mod log_setup;
 mod node_interface_impl;
+mod shutdown;
 
 use clap::Parser;
 
 use cli::{AlgocfgAction, AlgocfgProfileAction, BenchAction, CatchpointAction, Cli, Commands};
 
 /// Upper bound on how long dropping the runtime waits for blocking work that
-/// is still running once a command returns (issue #2121). Commands stop
-/// their services in order before returning; this only keeps a straggler
-/// (a blocking phase that checks its cancellation token between steps) from
-/// holding the process past a container stop's grace period, which a plain
-/// `Runtime` drop would do (it waits for every blocking thread).
-/// See `live_catchup::LIVE_CATCHUP_SHUTDOWN_TIMEOUT` for the whole budget.
+/// is still running once a command returns (issues #2121, #2138). Commands
+/// stop their services under one overall deadline (`shutdown::Teardown`, 8 s
+/// by default) before returning; this only keeps a straggler (a step that
+/// overran and was abandoned, or a blocking phase that checks its
+/// cancellation token between steps) from holding the process past a
+/// container stop's grace period, which a plain `Runtime` drop would do (it
+/// waits for every blocking thread). 8 s + 1 s stays inside `docker stop`'s
+/// default 10 s. See `shutdown.rs` and `live_catchup::LIVE_CATCHUP_SHUTDOWN_TIMEOUT`
+/// for the whole budget.
 ///
-/// Trade-off: blocking work still running here (an automatic catchpoint
-/// export past its wait, a live catchup's import/verify that did not stop in
-/// time) is abandoned at process exit. Both are built to survive that (the
-/// export is atomic, the sync state is persisted per phase and resumed), but
-/// the work is redone on the next start. Issue #2142 asks whether
-/// `participate` should join such work explicitly instead.
-const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Trade-off (issue #2142): blocking work still running here is abandoned at
+/// process exit, and logged first (`shutdown::log_abandoned_at_exit`). The
+/// teardown joins the known blocking work (catchpoint export, agreement,
+/// pool follower, ...) within the overall deadline, so only an overran or
+/// skipped step reaches this point; the automatic export is atomic and the
+/// sync state is persisted per phase and resumed, so the work is redone on
+/// the next start, not corrupted.
+const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn main() -> anyhow::Result<std::process::ExitCode> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -57,6 +62,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         runtime.block_on(async_main())
     }));
+    shutdown::log_abandoned_at_exit();
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
     match result {
         Ok(result) => result,
@@ -115,6 +121,10 @@ async fn async_main() -> anyhow::Result<std::process::ExitCode> {
                     return Ok(std::process::ExitCode::SUCCESS);
                 }
                 Ok(commands::algod::Outcome::Launch(plan)) => {
+                    // Before `algod.pid` exists: a SIGTERM from `goal node
+                    // stop` must never hit the default (kill) disposition
+                    // while the pid file is on disk (issue #2195).
+                    commands::hold_sigterm_until_shutdown()?;
                     match commands::algod::InstanceGuard::acquire(&plan.data_dir) {
                         Ok(guard) => _algod_instance = Some(guard),
                         Err(message) => {

@@ -7849,6 +7849,23 @@ pub async fn run(
 
     info!("shutting down consensus participation...");
 
+    // Issue #2138: every step below draws on ONE overall deadline
+    // (`shutdown::DEFAULT_SHUTDOWN_DEADLINE`, 8 s, or
+    // `ALGOD_SHUTDOWN_DEADLINE_SECS`), so a wedged step cannot hold the process
+    // past a container stop's grace period. The step order, the per-step caps
+    // and which steps keep a reserved minimum are `shutdown::participate_plan`.
+    // A step that overruns is abandoned and logged; the process still exits
+    // because `run` returns (destructors run) and `main` then drops the
+    // runtime with a short bound.
+    let mut td = crate::shutdown::Teardown::new(
+        crate::shutdown::deadline_from(
+            std::env::var(crate::shutdown::SHUTDOWN_DEADLINE_SECS_ENV)
+                .ok()
+                .as_deref(),
+        ),
+        crate::shutdown::participate_plan(),
+    );
+
     // Cancel the shared token first so the REST server's graceful
     // shutdown begins unblocking in-flight requests while we tear
     // down agreement + gossip. The server's own draining uses axum's
@@ -7861,12 +7878,14 @@ pub async fn run(
     // service. Its block fetches run on this runtime, so one still retrying
     // when `main` returns panics registering timers on a runtime that is
     // being shut down, and keeps the process alive past `docker stop`.
-    // (Budget: `crate::live_catchup::LIVE_CATCHUP_SHUTDOWN_TIMEOUT`.)
+    // (Cap: `crate::live_catchup::LIVE_CATCHUP_SHUTDOWN_TIMEOUT`.)
     let catchup_stopped = match &catchup_manager {
-        Some(mgr) => {
-            mgr.shutdown(crate::live_catchup::LIVE_CATCHUP_SHUTDOWN_TIMEOUT)
-                .await
-        }
+        Some(mgr) => td
+            .run("live_catchup", |budget| {
+                mgr.shutdown(budget.min(crate::live_catchup::LIVE_CATCHUP_SHUTDOWN_TIMEOUT))
+            })
+            .await
+            .unwrap_or(false),
         None => true,
     };
 
@@ -7881,21 +7900,33 @@ pub async fn run(
     // does real work in the normal-operation case, where it stops the
     // agreement service and then the catchup service in go's order (and is a
     // no-op if a live catchup already paused it).
-    agreement_control.pause().await;
+    td.run("agreement", |_| agreement_control.pause()).await;
     pool_follower_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = pool_follower.join();
-    drop(participation_refresher);
+    td.run("pool_follower", |_| {
+        crate::shutdown::join_thread(pool_follower)
+    })
+    .await;
+    td.run("participation_refresher", |_| {
+        crate::shutdown::blocking(move || drop(participation_refresher))
+    })
+    .await;
     heartbeat_service_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = heartbeat_service_join.join();
+    td.run("heartbeat_service", |_| {
+        crate::shutdown::join_thread(heartbeat_service_join)
+    })
+    .await;
     if let Some((stateproof_service_stop, stateproof_service_join)) = stateproof_service_handle {
         stateproof_service_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = stateproof_service_join.join();
+        td.run("state_proof_service", |_| {
+            crate::shutdown::join_thread(stateproof_service_join)
+        })
+        .await;
     }
     // Stop the tx-sync pull loop before tearing down gossip — it samples
     // peers from `gossip_node`, so stopping it first avoids a
     // last-second round starting against a network that's mid-shutdown.
-    tx_syncer.stop().await;
-    gossip_node.stop().await;
+    td.run("tx_syncer", |_| tx_syncer.stop()).await;
+    td.run("gossip", |_| gossip_node.stop()).await;
 
     // Issue #1043: stop the shared `BatchVerifier` after both transports
     // have stopped dispatching gossip messages -- by this point nothing
@@ -7915,16 +7946,21 @@ pub async fn run(
     // stopped serving fresh data so the responses are stable. The
     // adapter's `wait_for_round` honours `shutdown_token` so
     // long-poll `wait-for-block-after` handlers return 408 promptly
-    // instead of hanging out their full 60s deadline; a hard-cap
-    // timeout is still applied as a defence-in-depth safety net in
-    // case a future handler forgets to honour the token.
+    // instead of hanging out their full 60s deadline; the plan's cap
+    // (`REST_SHUTDOWN_HARD_CAP`, 5 s) and the overall deadline are the
+    // defence-in-depth safety net in case a future handler forgets to.
     if let Some(join_handle) = rest_server_handle {
-        match tokio::time::timeout(REST_SHUTDOWN_HARD_CAP, join_handle).await {
-            Ok(Ok(())) => info!("REST API server stopped"),
-            Ok(Err(e)) => warn!(err = %e, "REST API server task terminated unexpectedly"),
-            Err(_) => warn!(
+        match td
+            .run("rest_server", |budget| {
+                tokio::time::timeout(budget.min(REST_SHUTDOWN_HARD_CAP), join_handle)
+            })
+            .await
+        {
+            Some(Ok(Ok(()))) => info!("REST API server stopped"),
+            Some(Ok(Err(e))) => warn!(err = %e, "REST API server task terminated unexpectedly"),
+            Some(Err(_)) | None => warn!(
                 cap = ?REST_SHUTDOWN_HARD_CAP,
-                "REST API server did not drain within the shutdown cap; abandoning the join handle"
+                "REST API server did not drain within its shutdown budget; abandoning the join handle"
             ),
         }
     }
@@ -7933,35 +7969,44 @@ pub async fn run(
     // catchpoint export (issue #770) is still writing. `export_catchpoint_file`
     // now writes atomically (temp file + rename), so abandoning the wait
     // can never leave a corrupt file at a previously-published path -- but
-    // waiting (briefly, bounded) still lets the newest catchpoint actually
-    // land instead of being silently dropped on every restart.
+    // waiting (bounded by what is left of the overall deadline, at most
+    // `CATCHPOINT_EXPORT_SHUTDOWN_TIMEOUT`) still lets the newest catchpoint
+    // actually land instead of being silently dropped on every restart.
     //
     // Issue #2121: skipped when a live catchpoint catchup is still running
     // (it did not stop within its shutdown timeout): that wait would overlap
-    // an import replacing the very ledger being exported, and add up to 30 s
-    // on top of the catchup's budget.
+    // an import replacing the very ledger being exported.
     if catchup_stopped {
-        let wait_result = tokio::task::spawn_blocking({
-            let ledger = Arc::clone(&ledger);
-            move || {
-                ledger
-                    .lock()
-                    .unwrap()
-                    .wait_for_pending_catchpoint_export_timeout(CATCHPOINT_EXPORT_SHUTDOWN_TIMEOUT)
+        let waited = td
+            .run("catchpoint_export", |budget| {
+                let ledger = Arc::clone(&ledger);
+                let timeout = budget.min(CATCHPOINT_EXPORT_SHUTDOWN_TIMEOUT);
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        ledger
+                            .lock()
+                            .unwrap()
+                            .wait_for_pending_catchpoint_export_timeout(timeout)
+                    })
+                    .await
+                }
+            })
+            .await;
+        match waited {
+            Some(Ok(true)) => {}
+            Some(Ok(false)) | None => {
+                warn!("shutting down with an automatic catchpoint export still in flight")
             }
-        })
-        .await;
-        match wait_result {
-            Ok(true) => {}
-            Ok(false) => warn!(
-                timeout = ?CATCHPOINT_EXPORT_SHUTDOWN_TIMEOUT,
-                "shutting down with an automatic catchpoint export still in flight"
-            ),
-            Err(e) => warn!(error = %e, "catchpoint-export shutdown wait task panicked"),
+            Some(Err(e)) => warn!(error = %e, "catchpoint-export shutdown wait task panicked"),
         }
     } else {
-        warn!("skipping the catchpoint-export shutdown wait: a live catchpoint catchup is still running");
+        td.skip(
+            "catchpoint_export",
+            "a live catchpoint catchup is still running",
+        );
     }
+
+    td.finish();
 
     info!("consensus participation stopped");
 

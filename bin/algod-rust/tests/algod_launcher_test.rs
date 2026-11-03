@@ -146,6 +146,56 @@ fn algod_dash_d_starts_a_node_with_go_files_and_single_instance_guard() {
     );
 }
 
+/// Issue #2195: SIGTERM arriving while the node is still starting (right after
+/// `algod.pid` is written, before the shutdown handler used to be installed)
+/// hit the default disposition, which kills the process without removing
+/// `algod.pid`. The signal must be held until the node can shut down cleanly.
+#[test]
+fn sigterm_right_after_algod_pid_appears_still_removes_it_and_exits_promptly() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_data_dir(dir);
+
+    let node = NodeGuard(
+        algod(dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn algod-rust algod"),
+    );
+    let pid = node.0.id();
+    // As soon as the pid file exists: the earliest a `goal node stop` can act.
+    let start = Instant::now();
+    while !dir.join("algod.pid").exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "algod.pid never appeared"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    sigterm(pid);
+    let mut node = node;
+    let sent = Instant::now();
+    let status = loop {
+        if let Some(status) = node.0.try_wait().expect("wait") {
+            break status;
+        }
+        assert!(
+            sent.elapsed() < Duration::from_secs(30),
+            "algod did not exit within 30s of an early SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        !dir.join("algod.pid").exists(),
+        "algod.pid must be removed even when SIGTERM arrives during startup (status {status:?})"
+    );
+    assert!(
+        status.success(),
+        "an early SIGTERM must still be a clean shutdown, got {status:?}"
+    );
+}
+
 #[test]
 fn algod_dash_g_prints_the_genesis_id_like_go() {
     let tmp = tempfile::tempdir().expect("tempdir");

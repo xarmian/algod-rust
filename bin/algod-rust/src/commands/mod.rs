@@ -46,6 +46,33 @@ pub mod sync;
 pub(crate) mod test_support;
 pub mod validate;
 
+/// SIGTERM stream registered before the node starts (see
+/// [`hold_sigterm_until_shutdown`]), handed to [`wait_for_shutdown_signal`].
+#[cfg(unix)]
+static EARLY_TERM: std::sync::Mutex<Option<tokio::signal::unix::Signal>> =
+    std::sync::Mutex::new(None);
+
+/// Register the SIGTERM handler now instead of at the shutdown wait (issue
+/// #2195). Until a handler exists SIGTERM has its default disposition, which
+/// kills the process on the spot: a `goal node stop` landing between the
+/// moment `algod -d` has written `algod.pid` and the moment `participate`
+/// reaches its shutdown wait left a stale `algod.pid` behind. With the stream
+/// registered, such a signal is held (tokio keeps it pending) and
+/// [`wait_for_shutdown_signal`] sees it as soon as startup is done, so the
+/// normal bounded teardown runs and the destructors remove the pid file.
+/// Must be called inside the runtime. No-op off unix.
+pub fn hold_sigterm_until_shutdown() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let term = signal(SignalKind::terminate())?;
+        if let Ok(mut g) = EARLY_TERM.lock() {
+            *g = Some(term);
+        }
+    }
+    Ok(())
+}
+
 /// Block until the process is asked to stop: Ctrl+C (SIGINT) or, on unix,
 /// SIGTERM. SIGTERM is what `docker stop`, systemd and `goal node stop` send;
 /// go's `algod` shuts down gracefully on it (closes its ledger, removes
@@ -55,7 +82,11 @@ pub async fn wait_for_shutdown_signal() -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        let mut term = signal(SignalKind::terminate())?;
+        let early = EARLY_TERM.lock().ok().and_then(|mut g| g.take());
+        let mut term = match early {
+            Some(term) => term,
+            None => signal(SignalKind::terminate())?,
+        };
         tokio::select! {
             r = tokio::signal::ctrl_c() => r,
             _ = term.recv() => Ok(()),
