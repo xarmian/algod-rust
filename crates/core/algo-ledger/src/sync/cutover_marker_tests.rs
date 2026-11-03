@@ -159,6 +159,24 @@ fn assert_marker_agrees_with_ledger(
         says_cut_over, live,
         "{what}: marker {marker:?} disagrees with the ledger (snapshot live: {live})"
     );
+    // The persisted flag itself (not just the state ordinal) must equal
+    // "the live tables are the snapshot", both as read back and as the raw row.
+    if let Some(m) = &marker {
+        assert_eq!(m.cut_over, Some(live), "{what}: flag of {m:?}");
+        assert_eq!(m.is_cut_over(), live, "{what}");
+    }
+    let raw: Option<i64> = conn
+        .query_row(
+            "SELECT intval FROM catchpointstate WHERE id = 'algod_rust_sync_cut_over'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    assert_eq!(
+        raw,
+        marker.as_ref().map(|_| i64::from(live)),
+        "{what}: raw cut-over flag row"
+    );
     live
 }
 
@@ -466,4 +484,183 @@ fn a_marker_without_the_flag_falls_back_to_its_state() {
     // The flag wins when recorded.
     assert!(!mk(SyncState::ImportingLedger, Some(false)).is_cut_over());
     assert!(mk(SyncState::DownloadingLedger, Some(true)).is_cut_over());
+}
+
+// ---- review follow-ups ---------------------------------------------------
+
+fn tokens_cancelled_orchestrator(o: &mut SyncOrchestrator) {
+    let token = CancellationToken::new();
+    token.cancel();
+    o.set_abort(token.clone());
+    o.set_cancel(token);
+}
+
+/// A flag left over from an earlier `run` on the same orchestrator must not
+/// leak into a run that finds no marker.
+#[test]
+fn a_second_run_on_the_same_orchestrator_does_not_inherit_the_cut_over_flag() {
+    let src = tempfile::tempdir().unwrap();
+    let (file, label) = export_tiny_catchpoint(src.path());
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("ledger");
+    let mut first = orchestrator(db.clone(), &label, &file);
+    first.run_download_ledger().unwrap();
+    first.run_import_ledger().unwrap();
+    drop(first);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    let mut o = orchestrator(db.clone(), &label, &file);
+    tokens_cancelled_orchestrator(&mut o);
+    rt.block_on(o.run()).unwrap_err();
+    assert!(o.ledger_cut_over(), "the marker says cut over");
+
+    // No marker any more (and nothing cut over): a fresh run on the same
+    // orchestrator is not cut over either, so its abort discards.
+    let conn = o.open_db().unwrap();
+    clear_sync_state(&conn).unwrap();
+    drop(conn);
+    let err = rt.block_on(o.run()).unwrap_err().to_string();
+    assert!(!o.ledger_cut_over(), "stale flag carried over");
+    assert!(err.contains("aborted by user"), "{err}");
+}
+
+/// A rollback whose marker write fails must not consume the backup: the
+/// snapshot is still live, the marker still says so, and a retry restores.
+#[test]
+fn a_failed_rollback_keeps_its_backup_and_a_retry_restores_the_ledger() {
+    let src = tempfile::tempdir().unwrap();
+    let (file, label) = export_tiny_catchpoint(src.path());
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("ledger");
+    let mut o = orchestrator(db.clone(), &label, &file);
+    o.run_download_ledger().unwrap();
+    o.run_import_ledger().unwrap();
+    let conn = o.open_db().unwrap();
+
+    o.set_import_failpoint(Some(ImportFailpoint::RollbackMarkerWriteFails));
+    assert!(!o.rollback_cutover_on_failure(&conn, "test"));
+    assert!(o.cutover_backup.is_some(), "the backup must survive");
+    assert!(o.ledger_cut_over());
+    drop(conn);
+    assert!(assert_marker_agrees_with_ledger(
+        &db,
+        &label,
+        &file,
+        "failed rollback"
+    ));
+
+    o.set_import_failpoint(None);
+    let conn = o.open_db().unwrap();
+    assert!(o.rollback_cutover_on_failure(&conn, "retry"));
+    drop(conn);
+    assert!(!assert_marker_agrees_with_ledger(
+        &db,
+        &label,
+        &file,
+        "retried rollback"
+    ));
+    assert!(!o.ledger_cut_over());
+}
+
+fn header_rows(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM blockdb.blocks", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// The process dies after the rollback committed but before the synthesized
+/// header rows were deleted: the next run removes them.
+#[test]
+fn header_rows_left_by_a_crash_after_the_rollback_are_cleaned_by_the_next_run() {
+    let src = tempfile::tempdir().unwrap();
+    let (file, label) = export_tiny_catchpoint(src.path());
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("ledger");
+    let mut o = orchestrator(db.clone(), &label, &file);
+    o.run_download_ledger().unwrap();
+    o.run_import_ledger().unwrap();
+    {
+        let conn = o.open_db().unwrap();
+        assert!(header_rows(&conn) > 0, "initialize_meta wrote a header row");
+    }
+    o.set_import_failpoint(Some(ImportFailpoint::CrashAfterRollbackCommit));
+    o.block_header_digest = Some([0xffu8; 32]);
+    assert!(o.run_verify_ledger().is_err());
+    drop(o);
+    {
+        let conn = orchestrator(db.clone(), &label, &file).open_db().unwrap();
+        assert!(!snapshot_is_live(&conn), "the rollback had committed");
+        assert!(header_rows(&conn) > 0, "the crash left the header row");
+    }
+
+    // Next run: a shutdown (not an abort), so the marker is kept.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    let mut next = orchestrator(db.clone(), &label, &file);
+    let token = CancellationToken::new();
+    token.cancel();
+    next.set_cancel(token);
+    rt.block_on(next.run()).unwrap_err();
+    let conn = next.open_db().unwrap();
+    assert_eq!(header_rows(&conn), 0, "orphan header rows must be removed");
+    let pending: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM catchpointstate WHERE id = 'algod_rust_sync_header_cleanup'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, 0, "the pending-cleanup record must be cleared");
+}
+
+/// A failed marker write must leave no dangling savepoint (it would hold the
+/// write lock on an autocommit connection), even if the savepoint rollback
+/// fails too.
+#[test]
+fn a_failed_marker_write_never_leaves_a_savepoint_open() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE catchpointstate (id TEXT PRIMARY KEY, intval INTEGER, strval TEXT);
+         CREATE TRIGGER boom BEFORE INSERT ON catchpointstate
+         BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+    )
+    .unwrap();
+    let err = persist_sync_state_with_cut_over(
+        &conn,
+        &SyncState::ImportingLedger,
+        Some("l"),
+        Some(1),
+        None,
+        Some(true),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("boom"), "{err}");
+    assert!(
+        conn.is_autocommit(),
+        "dangling savepoint after a failed write"
+    );
+    conn.execute_batch("DROP TRIGGER boom").unwrap();
+    persist_sync_state_with_cut_over(&conn, &SyncState::Idle, None, None, None, Some(false))
+        .unwrap();
+
+    // The savepoint rollback itself failing: the original error survives and
+    // the savepoint is still released.
+    conn.execute_batch("SAVEPOINT sync_marker").unwrap();
+    let err = end_marker_savepoint(
+        &conn,
+        Err(AlgoError::Ledger {
+            message: "original".to_string(),
+        }),
+        "ROLLBACK TO no_such_savepoint",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("original"), "{err}");
+    assert!(
+        conn.is_autocommit(),
+        "savepoint left open after a failed rollback"
+    );
 }

@@ -35,7 +35,8 @@ pub use auto::{catchpoint_filename, prune_catchpoint_files, AutoCatchpointConfig
 pub use fsutil::{is_empty, move_file};
 pub use importer::{
     import_catchpoint_file, import_catchpoint_file_with_cutover_hook,
-    import_catchpoint_file_with_progress, CatchpointImporter, CutoverBackup, CutoverHook, ImportProgressUpdate, ImportResult, ImportStats,
+    import_catchpoint_file_with_progress, CatchpointImporter, CutoverBackup, CutoverHook,
+    ImportProgressUpdate, ImportResult, ImportStats,
 };
 pub use parser::{CatchpointEntry, CatchpointReader, CatchpointReaderFile};
 pub use stream::{get_catchpoint_stream, make_catchpoint_file_path, CatchpointStream};

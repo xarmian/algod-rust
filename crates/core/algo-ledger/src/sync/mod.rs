@@ -438,6 +438,62 @@ const SYNC_CATCHPOINT_FILE_KEY: &str = "algod_rust_sync_catchpoint_file";
 /// import's cutover replaced them), 0 while they do not. Written by the
 /// cutover's own transaction (issue #2141), so it cannot disagree with them.
 const SYNC_CUT_OVER_KEY: &str = "algod_rust_sync_cut_over";
+/// `"<balances_round>,<catchpoint_round>"` (either part may be empty): the
+/// header rows in `blockdb.blocks` that a committed cutover rollback still has
+/// to delete. Written inside the rollback's transaction, removed once the
+/// rows are gone, so a crash in between is finished by the next run
+/// ([`cleanup_pending_header_rows`], issue #2141).
+const SYNC_HEADER_CLEANUP_KEY: &str = "algod_rust_sync_header_cleanup";
+
+/// Delete the catchup's synthesized header rows a committed rollback recorded
+/// in [`SYNC_HEADER_CLEANUP_KEY`], then clear the record. Idempotent: every
+/// step can be repeated after a crash or a failed delete (the record stays
+/// until the deletes succeed).
+fn cleanup_pending_header_rows(conn: &Connection) -> Result<(), AlgoError> {
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='catchpointstate'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| AlgoError::Ledger {
+            message: format!("check catchpointstate existence: {e}"),
+        })?;
+    if !table_exists {
+        return Ok(());
+    }
+    let Some(spec) = get_sync_str(conn, SYNC_HEADER_CLEANUP_KEY)? else {
+        return Ok(());
+    };
+    let mut parts = spec.split(',').map(|p| p.trim().parse::<i64>().ok());
+    let balances_round = parts.next().flatten();
+    let catchpoint_round = parts.next().flatten();
+    let delete_err = |e: rusqlite::Error| AlgoError::Ledger {
+        message: format!("remove catchup header rows: {e}"),
+    };
+    // The header row `initialize_meta_from_catchpoint` synthesized (an empty
+    // `blkdata`), never a real archived block.
+    if let Some(round) = balances_round {
+        conn.execute(
+            "DELETE FROM blockdb.blocks WHERE rnd = ?1 AND blkdata IS NOT NULL \
+             AND length(blkdata) = 0",
+            rusqlite::params![round],
+        )
+        .map_err(delete_err)?;
+    }
+    // The real catchpoint-round header stored for the early fast-forward
+    // (issue #1650): only while it is above the restored `acctbase`, where
+    // nothing the ledger really committed can be.
+    if let Some(round) = catchpoint_round {
+        conn.execute(
+            "DELETE FROM blockdb.blocks WHERE rnd = ?1 AND rnd > COALESCE( \
+             (SELECT rnd FROM acctrounds WHERE id = 'acctbase'), -1)",
+            rusqlite::params![round],
+        )
+        .map_err(delete_err)?;
+    }
+    delete_sync_row(conn, SYNC_HEADER_CLEANUP_KEY)
+}
 
 /// Persist the current sync state to `catchpointstate` with namespaced
 /// `algod_rust_sync_*` ids.
@@ -477,12 +533,7 @@ pub fn persist_sync_state_with_cut_over(
     catchpoint_file: Option<&str>,
     cut_over: Option<bool>,
 ) -> Result<(), AlgoError> {
-    let savepoint = |sql: &str| {
-        conn.execute_batch(sql).map_err(|e| AlgoError::Ledger {
-            message: format!("sync marker savepoint ({sql}): {e}"),
-        })
-    };
-    savepoint("SAVEPOINT sync_marker")?;
+    savepoint_sql(conn, "SAVEPOINT sync_marker")?;
     let written = write_sync_rows(
         conn,
         state,
@@ -491,11 +542,31 @@ pub fn persist_sync_state_with_cut_over(
         catchpoint_file,
         cut_over,
     );
+    end_marker_savepoint(conn, written, "ROLLBACK TO sync_marker")
+}
+
+fn savepoint_sql(conn: &Connection, sql: &str) -> Result<(), AlgoError> {
+    conn.execute_batch(sql).map_err(|e| AlgoError::Ledger {
+        message: format!("sync marker savepoint ({sql}): {e}"),
+    })
+}
+
+fn end_marker_savepoint(
+    conn: &Connection,
+    written: Result<(), AlgoError>,
+    rollback_sql: &str,
+) -> Result<(), AlgoError> {
     if written.is_err() {
-        savepoint("ROLLBACK TO sync_marker")?;
+        if let Err(e) = savepoint_sql(conn, rollback_sql) {
+            // Keep the write's own error; the release below still runs, or the
+            // open savepoint would hold the write lock on an autocommit
+            // connection.
+            tracing::warn!(error = %e, "could not roll back the failed sync marker write");
+        }
     }
-    savepoint("RELEASE sync_marker")?;
-    written
+    let released = savepoint_sql(conn, "RELEASE sync_marker");
+    written?;
+    released
 }
 
 fn write_sync_rows(
@@ -631,7 +702,13 @@ pub struct PersistedSyncState {
     /// cutover's own transaction (issue #2141). `None` for a marker written
     /// before the flag existed: those were written only after a cutover for
     /// states from `ImportingLedger` on, so [`Self::is_cut_over`] falls back
-    /// to the state ordinal.
+    /// to the state ordinal. Evidence: before #2136 the only
+    /// `ImportingLedger` write was `run_import_ledger`'s, after its cutover;
+    /// since #2136 `handle_cancellation` runs only from the download,
+    /// lookback and replay phases (never inside the import), and
+    /// `marker_state_for` only raises a state to `ImportingLedger` for a
+    /// ledger that is cut over. So an absent flag at `ImportingLedger` or
+    /// later always meant cut over.
     pub cut_over: Option<bool>,
 }
 
@@ -716,8 +793,8 @@ fn get_sync_int(conn: &Connection, key: &str) -> Result<Option<i64>, AlgoError> 
 /// Where [`SyncOrchestrator::set_import_failpoint`] makes the import phase
 /// fail or die (issue #2141). Test hook only, scoped to one orchestrator
 /// instance: nothing in a production path reads the environment or a global.
+#[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
 pub enum ImportFailpoint {
     /// Error inside the cutover transaction, just before its commit: the
     /// cutover (and any marker write riding with it) must roll back.
@@ -729,6 +806,12 @@ pub enum ImportFailpoint {
     AbortAfterCutoverCommit,
     /// `initialize_meta_from_catchpoint` fails.
     InitializeMetaFails,
+    /// The marker write inside the cutover ROLLBACK's transaction fails, so
+    /// the rollback cannot commit.
+    RollbackMarkerWriteFails,
+    /// The process "dies" right after the cutover rollback committed, before
+    /// the synthesized header rows are deleted (the rollback returns at once).
+    CrashAfterRollbackCommit,
 }
 
 /// Orchestrator that coordinates all phases of a catchpoint sync.
@@ -896,12 +979,6 @@ impl SyncOrchestrator {
         self.import_failpoint == Some(which)
     }
 
-    /// Production builds have no failpoints.
-    #[cfg(not(any(test, feature = "test-hooks")))]
-    fn failpoint_is(&self, _which: ImportFailpoint) -> bool {
-        false
-    }
-
     /// Set a cancellation token for graceful shutdown.
     ///
     /// When the token is cancelled, the orchestrator will finish the current
@@ -1042,6 +1119,13 @@ impl SyncOrchestrator {
     ///   would strand it unverified and without its lookback blocks. Keep
     ///   the marker instead, exactly like a node shutdown, so the next
     ///   catchup resumes and finishes it.
+    ///
+    /// Known limitation (kept from #2121, see #2181): the cutover backup is
+    /// held in memory only. After a process restart a resumed run has no
+    /// backup (`cutover_backup_pre_catchup` is false), so an abort or a failed
+    /// verification can only keep the unverified snapshot; the pre-catchup
+    /// ledger is not recoverable. Persisting the backup would make a safe
+    /// abort possible.
     ///
     /// Returns the error `run` reports.
     fn stop_aborted_catchup(&mut self) -> AlgoError {
@@ -1642,6 +1726,7 @@ impl SyncOrchestrator {
         let marker_label = self.resolved_label.clone();
         let marker_round = self.catchpoint_round;
         let marker_file = file_path.to_string_lossy().into_owned();
+        #[cfg(any(test, feature = "test-hooks"))]
         let fail_before_commit = self.failpoint_is(ImportFailpoint::BeforeCutoverCommit);
         let in_cutover = |tx: &Connection| -> Result<(), crate::catchpoint::CatchpointError> {
             persist_sync_state_with_cut_over(
@@ -1653,6 +1738,7 @@ impl SyncOrchestrator {
                 Some(true),
             )
             .map_err(|e| crate::catchpoint::CatchpointError::CutoverError(e.to_string()))?;
+            #[cfg(any(test, feature = "test-hooks"))]
             if fail_before_commit {
                 return Err(crate::catchpoint::CatchpointError::CutoverError(
                     "failpoint: before the cutover commit".to_string(),
@@ -1690,13 +1776,16 @@ impl SyncOrchestrator {
         self.cutover_backup_pre_catchup = !self.ledger_cut_over;
         self.ledger_cut_over = true;
 
-        if self.failpoint_is(ImportFailpoint::AbortAfterCutoverCommit) {
-            std::process::abort();
-        }
-        if self.failpoint_is(ImportFailpoint::AfterCutoverCommit) {
-            return Err(AlgoError::Ledger {
-                message: "failpoint: after the cutover commit".to_string(),
-            });
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            if self.failpoint_is(ImportFailpoint::AbortAfterCutoverCommit) {
+                std::process::abort();
+            }
+            if self.failpoint_is(ImportFailpoint::AfterCutoverCommit) {
+                return Err(AlgoError::Ledger {
+                    message: "failpoint: after the cutover commit".to_string(),
+                });
+            }
         }
 
         tracing::info!(
@@ -1720,6 +1809,7 @@ impl SyncOrchestrator {
         }
         let txn_counter = derive_txn_counter(&conn);
 
+        #[cfg(any(test, feature = "test-hooks"))]
         if self.failpoint_is(ImportFailpoint::InitializeMetaFails) {
             return Err(AlgoError::Ledger {
                 message: "failpoint: initialize_meta_from_catchpoint".to_string(),
@@ -1817,16 +1907,45 @@ impl SyncOrchestrator {
             .catchpoint_file_path
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned());
+        // The header rows to delete after the commit, recorded in it (see
+        // `SYNC_HEADER_CLEANUP_KEY`).
+        let cleanup_spec =
+            (self.balances_round.is_some() || self.catchpoint_round.is_some()).then(|| {
+                let catchpoint_round = self
+                    .catchpoint_round
+                    .filter(|r| Some(*r) != self.balances_round);
+                format!(
+                    "{},{}",
+                    self.balances_round
+                        .map(|r| r.to_string())
+                        .unwrap_or_default(),
+                    catchpoint_round.map(|r| r.to_string()).unwrap_or_default(),
+                )
+            });
+        #[cfg(any(test, feature = "test-hooks"))]
+        let fail_marker = self.failpoint_is(ImportFailpoint::RollbackMarkerWriteFails);
         let restore_marker = |tx: &Connection| -> Result<(), crate::catchpoint::CatchpointError> {
-            persist_sync_state_with_cut_over(
+            #[cfg(any(test, feature = "test-hooks"))]
+            if fail_marker {
+                return Err(crate::catchpoint::CatchpointError::CutoverError(
+                    "failpoint: the rollback's marker write".to_string(),
+                ));
+            }
+            let wrote = |r: Result<(), AlgoError>| {
+                r.map_err(|e| crate::catchpoint::CatchpointError::CutoverError(e.to_string()))
+            };
+            wrote(persist_sync_state_with_cut_over(
                 tx,
                 &marker_state,
                 self.resolved_label.as_deref(),
                 self.catchpoint_round,
                 marker_file.as_deref(),
                 Some(!pre_catchup),
-            )
-            .map_err(|e| crate::catchpoint::CatchpointError::CutoverError(e.to_string()))
+            ))?;
+            if let Some(spec) = &cleanup_spec {
+                wrote(set_sync_str(tx, SYNC_HEADER_CLEANUP_KEY, spec))?;
+            }
+            Ok(())
         };
         if let Err(e) = importer.rollback_cutover_with_hook(&backup, Some(&restore_marker)) {
             tracing::error!(
@@ -1835,49 +1954,35 @@ impl SyncOrchestrator {
                 "failed to roll back the catchpoint cutover ({reason}) — \
                  ledger may be left in an inconsistent state"
             );
+            // The rollback transaction did not commit: the snapshot is still
+            // live and the marker still says so. Keep the backup so a later
+            // attempt can retry it.
+            self.cutover_backup = Some(backup);
             return false;
         }
         // Restoring a backup of an earlier unverified cutover leaves the
         // ledger cut over (issue #2121).
         self.ledger_cut_over = !pre_catchup;
 
-        // The synthesized header row `initialize_meta_from_catchpoint` wrote
-        // is specific to this import attempt (its own `ON CONFLICT DO
-        // UPDATE` would otherwise have overwritten a real archived block
-        // only if one already existed at this exact round, which cannot
-        // happen for a genuine fast-forward catchup) — remove it so
-        // `max_block_round_in_blockdb()` agrees with the just-restored
-        // `acctrounds`.
-        if let Some(round) = self.balances_round {
-            if let Err(e) = conn.execute(
-                "DELETE FROM blockdb.blocks WHERE rnd = ?1 AND blkdata IS NOT NULL AND length(blkdata) = 0",
-                rusqlite::params![round as i64],
-            ) {
-                tracing::warn!(error = %e, round, "failed to remove synthesized block header row during cutover rollback");
-            }
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self.failpoint_is(ImportFailpoint::CrashAfterRollbackCommit) {
+            return true;
         }
 
-        // Issue #1650: `run_import_ledger` may also have stored the real
-        // catchpoint-round header block and fast-forwarded `acctrounds` to
-        // `catchpoint_round` immediately after cutover (see that function's
-        // "issue #1650" comment). `importer.rollback_cutover` above already
-        // restored `acctrounds` to its pre-catchup value, so remove that
-        // header row too — it would otherwise be an orphan the just-
-        // restored `acctrounds` no longer points at.
-        if let Some(catchpoint_round) = self.catchpoint_round {
-            if Some(catchpoint_round) != self.balances_round {
-                if let Err(e) = conn.execute(
-                    "DELETE FROM blockdb.blocks WHERE rnd = ?1",
-                    rusqlite::params![catchpoint_round as i64],
-                ) {
-                    tracing::warn!(
-                        error = %e,
-                        catchpoint_round,
-                        "failed to remove early-fast-forward catchpoint-round header row \
-                         during cutover rollback"
-                    );
-                }
-            }
+        // The synthesized header row `initialize_meta_from_catchpoint` wrote
+        // is specific to this import attempt, and so is the real
+        // catchpoint-round header the early fast-forward stored (issue #1650):
+        // remove them so `max_block_round_in_blockdb()` agrees with the
+        // just-restored `acctrounds`. They live in the other database file, so
+        // the deletes cannot ride in the rollback's transaction; the rollback
+        // recorded them in `SYNC_HEADER_CLEANUP_KEY` instead, and a failure or
+        // crash here is finished by the next run.
+        if let Err(e) = cleanup_pending_header_rows(conn) {
+            tracing::warn!(
+                error = %e,
+                "failed to remove the catchup header rows after the cutover rollback; \
+                 the next run retries"
+            );
         }
 
         tracing::warn!(
@@ -3225,9 +3330,20 @@ impl SyncOrchestrator {
             "starting catchpoint sync"
         );
 
+        // Whether the ledger is cut over comes from the marker found below
+        // (false when there is none, it is terminal, or it is unreadable),
+        // never from an earlier run on this orchestrator.
+        self.ledger_cut_over = false;
+        self.cutover_backup_pre_catchup = false;
+
         // Check for resumable state.
         let mut resume_state = SyncState::Idle;
         if let Ok(conn) = self.open_db() {
+            // Finish a cutover rollback that crashed before its header rows
+            // were deleted (issue #2141).
+            if let Err(e) = cleanup_pending_header_rows(&conn) {
+                tracing::warn!(error = %e, "could not remove leftover catchup header rows");
+            }
             if let Ok(Some(persisted)) = restore_sync_state(&conn) {
                 let action = if persisted.state.is_terminal() {
                     MarkerAction::Resume
