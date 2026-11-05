@@ -1413,6 +1413,24 @@
       "verify_error": "heartbeat transaction may not be grouped with an application call or asset creation"
     },
     {
+      "name": "verify_hb_valid_proof_with_a_bad_member_signature",
+      "group": [
+        "gqNzaWfEQPbaxSjjqMmYvLacKwBNSf07dsKgCLkTOxPuzjB/IPplvulEVbVt+YCJGp/k2NkKTg5SAbcZghVpxMWhK4xnMgajdHhuiaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomhihaFhxCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6JrZM0D6KNwcmaFoXDEINMs5/tqjzlDrQ/THTfjjlHSaw3glTQI7N5gU2qnTXfPo3Axc8RAhJT5s48nMGi5EEIi24dPvOmaCn/1mQM0wrbR5X+ZIvLEJj5fxgy9QGx05zhtmxXwhSzV3lEPc8zc7eSEIY63BKJwMsQga9F0zKuz928OrP1J4eNQtQzYFVJELWVpc7OGwONl8vejcDJzxEAzxr5v6B80nxtVqyAWdhNnXt83S49oovmt3jqTZXd+60dhKxVMxX6tGT8j8dcWhVy8/a5uuHxgmF+hkfywXLoHoXPEQHl0KH6cO8+sSPpkmh3PHwVLlaG+m7Rxa5kLRFfzkvcs6AxNrRPrrCuhtGaeYP4Zrkrp0pVDNqbACKvZ07m6pwOic2TEIFFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRo3ZpZMQgAOHlFiQohanywtLYlT5Vu+/Yld580oi+kjTLVrxrlU6ibHbNA+ikbm90ZcQGaGJwLW8xo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaJoYg=="
+      ],
+      "test_error": "",
+      "verify_error": "At least one signature didn't pass verification"
+    },
+    {
+      "name": "verify_hb_bad_proof_then_a_member_without_a_signature",
+      "group": [
+        "gqNzaWfEQL7b8hu70kUzpDNugs5mtHm5gqJ2PglG7jVm8LNIklCsFodAlp+IUt5aksRPNiJLrOPbENBpI2l37y34ryPmaAOjdHhuiqNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgM5QNMk4rpr+ii/k5PDLdUxBDFVRXqg5B9o2VWF5WHNKiaGKFoWHEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLomtkzQPoo3ByZoWhcMQg0yzn+2qPOUOtD9MdN+OOUdJrDeCVNAjs3mBTaqdNd8+jcDFzxECElPmzjycwaLkQQiLbh0+86ZoKf/WZAzTCttHlf5ki8sQmPl/GDL1AbHTnOG2bFfCFLNXeUQ9zzNzt5IQhjrcEonAyxCBr0XTMq7P3bw6s/Unh41C1DNgVUkQtZWlzs4bA42Xy96NwMnPEQDPGvm/oHzSfG1WrIBZ2E2de3zdLj2ii+a3eOpNld37rR2ErFUzFfq0ZPyPx1xaFXLz9rm64fGCYX6GR/LBcugehc8RAeHQofpw7z6xI+mSaHc8fBUuVob6btHFrmQtEV/OS9yzoDE2tE+usK6G0Zp5g/hmuSunSlUM2psAIq9nTubqnA6JzZMQgUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVGjdmlkxCAA4eUWJCiFqfLC0tiVPlW779iV3nzSiL6SNMtWvGuVTqJsds0D6KRub3RlxAZoYnAtbzKjc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlomhi",
+        "gaN0eG6Lo2FtdAGjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaNncnDEIDOUDTJOK6a/oov5OTwy3VMQQxVUV6oOQfaNlVheVhzSomx2zQPopG5vdGXEBmhicC1vM6NyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "signedtxn has no sig",
+      "verify_framed": true
+    },
+    {
       "name": "verify_hb_valid_proof",
       "group": [
         "gqNzaWfEQPk/9yjUYCxz0u5BQmp4hPyNFlmAITvvhSPdxHRExbJMyo+vR6wa/1xewk3qnzBbOIe47zjnnluzKmSYvjR1Cw6jdHhuiaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomhihaFhxCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6JrZM0D6KNwcmaFoXDEINMs5/tqjzlDrQ/THTfjjlHSaw3glTQI7N5gU2qnTXfPo3Axc8RAhJT5s48nMGi5EEIi24dPvOmaCn/1mQM0wrbR5X+ZIvLEJj5fxgy9QGx05zhtmxXwhSzV3lEPc8zc7eSEIY63BKJwMsQga9F0zKuz928OrP1J4eNQtQzYFVJELWVpc7OGwONl8vejcDJzxEAzxr5v6B80nxtVqyAWdhNnXt83S49oovmt3jqTZXd+60dhKxVMxX6tGT8j8dcWhVy8/a5uuHxgmF+hkfywXLoHoXPEQHl0KH6cO8+sSPpkmh3PHwVLlaG+m7Rxa5kLRFfzkvcs6AxNrRPrrCuhtGaeYP4Zrkrp0pVDNqbACKvZ07m6pwOic2TEIFFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRo3ZpZMQgAOHlFiQohanywtLYlT5Vu+/Yld580oi+kjTLVrxrlU6ibHbNA+ikbm90ZcQGaGJwLXYxo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaJoYg=="

@@ -443,7 +443,10 @@ fn verify_transaction_group_cached_inner(
     let unverified =
         cache.get_unverified_transaction_groups(std::slice::from_ref(&owned_group), context);
     if unverified.is_empty() {
-        // The whole group is already verified under this exact context.
+        // The whole group is already verified under this exact context. A
+        // heartbeat proof is not part of what the cache vouches for (block
+        // validation caches a group without it), so it is checked on a hit too.
+        crate::signature::check_heartbeat_proofs(txgroup)?;
         return Ok(());
     }
 
@@ -476,6 +479,9 @@ fn verify_transaction_group_cached_inner(
         }
         verify_transaction_signature(stx, txgroup, group_index, &mut lsig_budget, consensus)?;
     }
+    // go's batch also holds each heartbeat's proof (issue #2218): a group with
+    // a bad proof is never cached as verified.
+    crate::signature::check_heartbeat_proofs(txgroup)?;
 
     cache.add(Arc::new(GroupContext::new(context.clone(), owned_group)));
     Ok(())

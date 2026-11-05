@@ -960,6 +960,54 @@ fn encode_offset_id(pk: &[u8; 32], batch: u64, offset: u64) -> Vec<u8> {
     buf
 }
 
+/// Verify the heartbeat proof of ONE group member (issue #2218), selecting
+/// heartbeats by `txn_type == "hb"` as go's `txnBatchPrep` and `block.rs` do.
+/// Any other transaction passes. A heartbeat with no heartbeat fields or no
+/// proof fails. The shared rule behind [`check_heartbeat_proofs`] (admission,
+/// gossip and the verified-group cache) and block validation, so the two
+/// cannot drift; each caller keeps its own error text.
+pub fn verify_member_heartbeat_proof(stx: &SignedTransaction) -> Result<(), AlgoError> {
+    if stx.txn.txn_type != "hb" {
+        return Ok(());
+    }
+    let Some(hb) = stx.txn.heartbeat.as_ref() else {
+        return Err(AlgoError::Validation {
+            message: "heartbeat transaction missing its heartbeat fields".into(),
+        });
+    };
+    let Some(proof) = hb.proof.as_ref() else {
+        return Err(AlgoError::Validation {
+            message: "heartbeat transaction missing proof".into(),
+        });
+    };
+    verify_heartbeat_proof(
+        proof,
+        &hb.vote_id,
+        stx.txn.last_valid.0,
+        hb.key_dilution,
+        &hb.seed,
+    )
+}
+
+/// go's `txnBatchPrep` enqueues every heartbeat's proof (`HeartbeatProof.
+/// BatchPrep`, three ed25519 signatures) into the SAME batch as the members'
+/// signatures, so a bad proof surfaces as the bare batch failure
+/// ([`algo_error::BATCH_HAS_FAILED_SIGS`]), exactly like a bad signature
+/// (issue #2218). Run it AFTER the members' own signature checks (go's batch
+/// verifies last) and on a verified-group cache hit too: block validation
+/// verifies proofs but does not keep an unverified proof out of the cache.
+pub fn check_heartbeat_proofs(group: &[SignedTransaction]) -> Result<(), AlgoError> {
+    if group
+        .iter()
+        .any(|stx| verify_member_heartbeat_proof(stx).is_err())
+    {
+        return Err(AlgoError::Validation {
+            message: algo_error::BATCH_HAS_FAILED_SIGS.into(),
+        });
+    }
+    Ok(())
+}
+
 /// Verify a heartbeat proof (three-level ed25519 ephemeral key tree).
 ///
 /// This implements the same verification as Go's `HeartbeatProof.BatchPrep()`
@@ -1816,9 +1864,7 @@ mod tests {
 
         // Sender 0xAA..AA is not a valid ed25519 public key, so this should fail.
         let err = verify_single_sig(&stx).unwrap_err();
-        assert!(
-            err.to_string().contains("invalid public key") || err.is_batch_sig_failure()
-        );
+        assert!(err.to_string().contains("invalid public key") || err.is_batch_sig_failure());
     }
 
     #[test]

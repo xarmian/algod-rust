@@ -910,7 +910,17 @@ func heartbeatProofRows(e wfEnv) []wfGroupRow {
 		}
 		return wfGroupRow{name: "verify_hb_" + name, group: out}
 	}
+	// Ordering rows: the proof is checked in the batch, which verifies LAST, so
+	// a member's signature-format error (a missing signature) comes first and is
+	// framed; a bad member signature next to a valid proof is the batch failure.
+	validBadSig := single("valid_proof_with_a_bad_member_signature", valid("o1"))
+	validBadSig.group[0].Sig[0] ^= 1
+	badThenUnsigned := grouped("bad_proof_then_a_member_without_a_signature",
+		hb("o2", secrets.OneTimeSignatureVerifier, seed, flip(good, "sig"), dilution), pay("o3"))
+	badThenUnsigned.group[1].Sig = crypto.Signature{}
 	return []wfGroupRow{
+		validBadSig,
+		badThenUnsigned,
 		single("valid_proof", valid("v1")),
 		single("proof_for_another_seed", hb("s1", secrets.OneTimeSignatureVerifier, seed, secrets.Sign(id, otherSeed).ToHeartbeatProof(), dilution)),
 		single("proof_under_another_vote_id", hb("s2", other.OneTimeSignatureVerifier, seed, good, dilution)),
