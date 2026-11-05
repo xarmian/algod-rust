@@ -3694,6 +3694,217 @@ fn an_inner_transaction_funding_a_later_member_is_admitted_like_go() {
     assert!(PRECHECK_OVER_REJECTS.load(std::sync::atomic::Ordering::Relaxed) > before);
 }
 
+/// Issue #2187: `[app call by S, F pays R]` over an evaluator whose ledger
+/// holds the application. The program (AVM `version`) funds `Accounts 1`
+/// (F) with 3 Algo by an inner payment when `funds`, else does nothing; the
+/// call names F in its accounts array when `reference_f`. F pays `amount`.
+fn app_then_pay_group(
+    version: u8,
+    funds: bool,
+    reference_f: bool,
+    amount: u64,
+) -> (SimpleBlockEvaluator, Vec<SignedTransaction>) {
+    let s = key(3);
+    let f = key(7);
+    let r = key(4);
+    let app_id = 904u64;
+    let app_addr = Address(algo_ledger::avm_context::app_address(app_id));
+    let (ledger, eval) = evaluator(&[
+        (s.0, funded(5_000_000)),
+        (r.0, funded(1_000_000)),
+        (app_addr, funded(10_000_000)),
+    ]);
+    let program = if funds {
+        format!(
+            "#pragma version {version}\nitxn_begin\nint pay\nitxn_field TypeEnum\n\
+             txn Accounts 1\nitxn_field Receiver\nint 3000000\nitxn_field Amount\n\
+             int 0\nitxn_field Fee\nitxn_submit\nint 1\n"
+        )
+    } else {
+        format!("#pragma version {version}\nint 1\n")
+    };
+    put_app(&ledger, app_id, s.0, &program);
+    let mut call = base_txn(s.0, TxnType::Appl);
+    call.application_id = app_id;
+    call.fee = 2_000;
+    if reference_f {
+        call.accounts = Some(vec![f.0]);
+    }
+    let mut pay_r = pay_txn(&f, r.0, amount, 5);
+    pay_r.fee = 1_000;
+    let gid = algo_codec::compute_group_id(&[call.clone(), pay_r.clone()]);
+    call.group = gid.0;
+    pay_r.group = gid.0;
+    (eval, vec![sign(call, &s.1), sign(pay_r, &f.1)])
+}
+
+/// Issue #2187: an evaluator whose real apply gave up cannot run the dry run,
+/// yet go accepts `[app call funds F, F pays R]`: the shortfall of F, which
+/// the call references, is not provably an overspend, so it is admitted.
+#[test]
+fn an_incomplete_evaluator_admits_a_shortfall_the_app_call_may_credit() {
+    let (mut eval, group) = app_then_pay_group(8, true, true, 1_000);
+    eval.exec.as_mut().unwrap().incomplete = true;
+    eval.transaction_group(&group)
+        .expect("admitted on the cheap checks, like go");
+}
+
+/// Issue #2187: from AVM version 9 on every account a group member mentions
+/// is available to the program, and F is the sender of the later member, so a
+/// version 9 call can credit F without naming it.
+#[test]
+fn a_version_9_app_call_may_credit_any_group_sender() {
+    let (mut eval, group) = app_then_pay_group(9, false, false, 1_000);
+    eval.exec.as_mut().unwrap().incomplete = true;
+    eval.transaction_group(&group)
+        .expect("a version 9 program may pay the sender of a group member");
+}
+
+/// Issue #2187: the deferral is bounded by what the call can reach: a
+/// version 8 call that does not name the account cannot credit it, so the
+/// overspend is proven cheaply, with go's text, with no real apply at all.
+#[test]
+fn an_unreachable_shortfall_stays_rejected_after_an_app_call() {
+    for incomplete in [true, false] {
+        let (mut eval, group) = app_then_pay_group(8, false, false, 900_000_000);
+        eval.exec.as_mut().unwrap().incomplete = incomplete;
+        let err = eval.transaction_group(&group).expect_err("overspend");
+        assert!(err.to_string().contains("overspend"), "{err}");
+        let exec = eval.exec.as_ref().unwrap();
+        assert_eq!(exec.incomplete, incomplete);
+        assert_eq!(exec.spent, Duration::ZERO, "no admission time charged");
+    }
+}
+
+/// Issue #2187: only an application call counts as a credit the precheck
+/// cannot see. An earlier payment is modelled, so with an unrelated version 8
+/// call in between the later overspend is still proven.
+#[test]
+fn an_earlier_payment_is_not_an_unmodelled_credit() {
+    let a = key(1);
+    let s = key(3);
+    let f = key(7);
+    let r = key(4);
+    let app_id = 904u64;
+    let (ledger, mut eval) = evaluator(&[
+        (a.0, funded(50_000_000)),
+        (s.0, funded(5_000_000)),
+        (r.0, funded(1_000_000)),
+    ]);
+    put_app(&ledger, app_id, s.0, "#pragma version 8\nint 1\n");
+    let mut call = base_txn(s.0, TxnType::Appl);
+    call.application_id = app_id;
+    let mut members = [
+        pay_txn(&a, f.0, 1_000_000, 1),
+        call,
+        pay_txn(&f, r.0, 900_000_000, 2),
+    ];
+    let gid = algo_codec::compute_group_id(&members);
+    for m in members.iter_mut() {
+        m.group = gid.0;
+    }
+    let [m0, m1, m2] = members;
+    let group = vec![sign(m0, &a.1), sign(m1, &s.1), sign(m2, &f.1)];
+    eval.exec.as_mut().unwrap().incomplete = true;
+    let err = eval.transaction_group(&group).expect_err("overspend");
+    assert!(err.to_string().contains("overspend"), "{err}");
+}
+
+/// Issue #2187: a stream of creditable overspends against a COMPLETE
+/// evaluator never poisons it. The dry runs are charged to the
+/// reconciliation budget only; once that is spent the precheck's verdict
+/// stands (admitting there would leave the group unevaluated and turn the
+/// evaluator incomplete), the admission budget stays untouched, and an
+/// honest group still takes the real apply afterwards.
+#[test]
+fn a_stream_of_creditable_overspends_neither_poisons_nor_exhausts_the_evaluator() {
+    let (mut eval, _) = app_then_pay_group(9, false, true, 1_000);
+    eval.exec.as_mut().unwrap().reconcile_runs = RECONCILE_MAX_RUNS - 5;
+    for n in 0..20u64 {
+        let (_, group) = app_then_pay_group(9, false, true, 900_000_000 + n);
+        let err = eval.transaction_group(&group).expect_err("overspend");
+        assert!(err.to_string().contains("overspend"), "{err}");
+        let exec = eval.exec.as_ref().unwrap();
+        assert!(!exec.incomplete, "group {n} poisoned the evaluator");
+        assert_eq!(exec.spent, Duration::ZERO, "main budget charged");
+        assert!(exec.reconcile_runs <= RECONCILE_MAX_RUNS);
+    }
+    assert_eq!(
+        eval.exec.as_ref().unwrap().reconcile_runs,
+        RECONCILE_MAX_RUNS,
+        "the dry runs stopped at the bound"
+    );
+    eval.transaction_group(&[pay(&key(3), key(4).0, 1_000, None)])
+        .expect("an honest group");
+    let exec = eval.exec.as_ref().unwrap();
+    assert!(!exec.incomplete);
+    assert_eq!(exec.groups.len(), 1, "it took the real-apply path");
+}
+
+/// Issue #2187: a complete evaluator with its reconciliation budget spent
+/// keeps the precheck's verdict for a creditable shortfall (it must not turn
+/// incomplete just to admit a group without evaluating it).
+#[test]
+fn a_spent_reconciliation_budget_does_not_turn_a_complete_evaluator_incomplete() {
+    let (mut eval, group) = app_then_pay_group(8, true, true, 1_000);
+    eval.exec.as_mut().unwrap().reconcile_runs = RECONCILE_MAX_RUNS;
+    eval.transaction_group(&group)
+        .expect_err("the precheck's verdict stands");
+    let exec = eval.exec.as_ref().unwrap();
+    assert!(!exec.incomplete);
+    assert_eq!(exec.spent, Duration::ZERO);
+}
+
+/// Issue #2187: the other over-reject shape of the precheck. An inner
+/// payment rekeys F back to itself, so a later member authorized by F is
+/// valid in go although the ledger says F is rekeyed to the application; the
+/// precheck refuses the authorizer, the dry run accepts, the group is
+/// admitted and counted.
+#[test]
+fn an_inner_rekey_before_a_later_member_is_reconciled() {
+    let s = key(3);
+    let f = key(7);
+    let r = key(4);
+    let app_id = 904u64;
+    let app_addr = Address(algo_ledger::avm_context::app_address(app_id));
+    let mut f_account = funded(5_000_000);
+    f_account.auth_addr = Some(app_addr);
+    let (ledger, mut eval) = evaluator(&[
+        (s.0, funded(5_000_000)),
+        (f.0, f_account),
+        (r.0, funded(1_000_000)),
+        (app_addr, funded(10_000_000)),
+    ]);
+    put_app(
+        &ledger,
+        app_id,
+        s.0,
+        concat!(
+            "#pragma version 8\n",
+            "itxn_begin\nint pay\nitxn_field TypeEnum\n",
+            "txn Accounts 1\nitxn_field Sender\n",
+            "txn Accounts 1\nitxn_field Receiver\n",
+            "txn Accounts 1\nitxn_field RekeyTo\n",
+            "int 0\nitxn_field Amount\nint 0\nitxn_field Fee\n",
+            "itxn_submit\nint 1\n",
+        ),
+    );
+    let mut call = base_txn(s.0, TxnType::Appl);
+    call.application_id = app_id;
+    call.fee = 2_000;
+    call.accounts = Some(vec![f.0]);
+    let mut pay_r = pay_txn(&f, r.0, 1_000, 5);
+    pay_r.fee = 1_000;
+    let gid = algo_codec::compute_group_id(&[call.clone(), pay_r.clone()]);
+    call.group = gid.0;
+    pay_r.group = gid.0;
+    let group = vec![sign(call, &s.1), sign(pay_r, &f.1)];
+    let before = PRECHECK_OVER_REJECTS.load(std::sync::atomic::Ordering::Relaxed);
+    eval.transaction_group(&group)
+        .expect("go accepts it: the inner rekey clears F's authorizer");
+    assert!(PRECHECK_OVER_REJECTS.load(std::sync::atomic::Ordering::Relaxed) > before);
+}
+
 /// The count-based bound: with the run count spent the precheck's verdict
 /// stands, deterministically.
 #[test]
