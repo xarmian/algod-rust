@@ -1759,6 +1759,12 @@ fn reason_of(e: &algo_error::AlgoError, pc: usize) -> (String, algo_error::Rejec
 /// <reason>` (`ledger/eval/eval.go`), as the typed
 /// [`algo_error::AlgoError::Rejected`] keeping the structured AVM diagnostics
 /// reachable through its source.
+/// The AVM version byte of a program; an absent or empty program is
+/// "unknown", which callers treat as the newest version (may credit).
+fn program_version(program: Option<&[u8]>) -> u8 {
+    program.and_then(|p| p.first().copied()).unwrap_or(u8::MAX)
+}
+
 fn go_rejection(txid: &str, error: algo_error::AlgoError) -> algo_error::AlgoError {
     // go's `Alive` and `checkDup` errors reach the pool bare and typed
     // (`TxnDeadError` or a genesis mismatch, `TransactionInLedgerError`,
@@ -1850,9 +1856,22 @@ const RECONCILE_BUDGET: Duration = Duration::from_millis(250);
 /// next to the wall-clock [`RECONCILE_BUDGET`]).
 const RECONCILE_MAX_RUNS: u32 = 256;
 
+/// Distinct short senders one INCOMPLETE evaluator admits a creditable
+/// shortfall for (issue #2187), with no real apply to confirm it. A sender
+/// whose degraded admission is already pending does not spend another slot, and
+/// a slot is spent only when the group is really admitted. The bound is
+/// honest but weak: senders are free to invent, so spam from 32 fresh senders
+/// uses it up for the rest of the round (evaluators are rebuilt every round)
+/// and honest inner-funded groups are refused until then. What it bounds is
+/// the number of groups block assembly will drop, not an open door.
+const DEGRADED_SENDER_CAP: usize = 32;
+
 /// Groups the real apply accepted after the admission precheck had refused
-/// them (the precheck does not model what an application call does: inner
-/// transaction credits, an inner rekey, so it can over-reject): counted, and logged at most once per [`OVER_REJECT_LOG_EVERY`].
+/// them (the precheck does not model what an application call does: an inner
+/// transaction credit, an inner rekey, so it can over-reject): counted, and
+/// logged at most once per [`OVER_REJECT_LOG_EVERY`]. Only the dry run counts
+/// here; the degraded-mode admission of a balance shortfall (an incomplete
+/// evaluator, no dry run) is not an over-reject it could confirm.
 static PRECHECK_OVER_REJECTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static OVER_REJECTS_LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static OVER_REJECT_LAST_LOG_SECS: std::sync::atomic::AtomicU64 =
@@ -1879,7 +1898,7 @@ fn note_precheck_over_reject() {
             total,
             "pool: the real apply accepted group(s) the admission precheck refused \
              (an application call's inner transactions change what a later member sees: \
-             a credit, a rekey); admitted as go would"
+             a credit, a rekey); admitted after the dry run, as go would"
         );
     }
 }
@@ -1905,6 +1924,9 @@ struct ExecState {
     reconcile_spent: Duration,
     /// Dry runs spent on reconciliation, bounded by [`RECONCILE_MAX_RUNS`].
     reconcile_runs: u32,
+    /// Senders whose creditable shortfall was admitted without a real apply,
+    /// bounded by [`DEGRADED_SENDER_CAP`].
+    degraded_senders: HashSet<Address>,
     /// Set once a group was admitted without being evaluated (stale base or
     /// spent budget): the overlay no longer matches the admitted set, so
     /// admission stops consulting it. Assembly is unaffected.
@@ -2495,7 +2517,21 @@ impl SimpleBlockEvaluator {
     /// 6. Transaction ID duplicate detection (in-block overlay + ledger)
     /// 7. Lease uniqueness check (in-block overlay + ledger snapshot)
     /// 8. Rekey/auth-addr validation (authorizer matches ledger's auth_addr)
-    /// 9. Sender balance precheck (fee + amount against overlay/snapshot)
+    /// 9. Sender balance precheck (fee + amount against overlay/snapshot). A
+    ///    shortfall is refused at once, except on an evaluator without a usable
+    ///    real apply (`exec.incomplete` or no exec state, the degraded mode of
+    ///    issue #2187) when an earlier member is an application call that may
+    ///    have credited the sender ([`Self::app_call_may_credit`]: every call
+    ///    except a creation of version 4 or older). The shortfall is then
+    ///    RECORDED and not judged, every later member's checks and the group
+    ///    fees still run, and the recorded one is returned last
+    ///    (`GroupReject::creditable`) for `resolve_precheck_rejection` to admit
+    ///    (within a per-sender cap) or refuse. Known residuals: the admitted
+    ///    group's unmodelled credit is not in the overlay, so its sender is
+    ///    saturated to 0 and its receiver credited as if the sender could pay
+    ///    (#2217, `a_degraded_admission_leaves_phantom_balances`); and a later
+    ///    member's outright failure is reported instead of the deferred
+    ///    member's overspend that go would name first.
     ///
     /// Returns the txids it checked (over the group with genesis fields
     /// restored), so `transaction_group` records the same txids and the
@@ -2514,7 +2550,7 @@ impl SimpleBlockEvaluator {
                     error,
                     member: None,
                     after_apply: false,
-                    creditable: false,
+                    creditable: None,
                     txids: Vec::new(),
                 })
             })?;
@@ -2577,7 +2613,7 @@ impl SimpleBlockEvaluator {
                 error,
                 member: None,
                 after_apply: false,
-                creditable: false,
+                creditable: None,
                 txids: Vec::new(),
             })
         })?;
@@ -2589,13 +2625,19 @@ impl SimpleBlockEvaluator {
         // top-level members that can credit Algos in a way this precheck does
         // not model (inner payments, inner close-outs; issue #2187).
         let mut earlier_app_calls: Vec<usize> = Vec::new();
+        // Only an evaluator without a usable real apply carries on past a
+        // creditable shortfall; the first one is kept and returned at the end.
+        // With no exec state at all (a legacy evaluator) nothing can run the real
+        // apply either, which `resolve_precheck_rejection` treats the same way.
+        let degraded = self.exec.as_ref().is_none_or(|exec| exec.incomplete);
+        let mut deferred: Option<Box<GroupReject>> = None;
         for (member, (stx, restored_stx)) in txgroup.iter().zip(&restored).enumerate() {
             let fail = |error: algo_error::AlgoError| {
                 Box::new(GroupReject {
                     error,
                     member: Some(member),
                     after_apply: false,
-                    creditable: false,
+                    creditable: None,
                     txids: txids.clone(),
                 })
             };
@@ -2640,35 +2682,50 @@ impl SimpleBlockEvaluator {
             let required = already_spent.saturating_add(cost);
             let available = base.saturating_add(credited);
             if available < required {
-                // go's `eval.transaction` moves the fee first, then the amount;
-                // each failing `Move` is a `ledgercore.OverspendError` carrying
-                // the sender as the cow state stood before THAT move.
-                let balance_now = available.saturating_sub(already_spent);
-                let txid_text = algo_types::Digest(txid).to_string();
-                let (data_balance, tried, after_fee) = if balance_now < fee {
-                    (balance_now, fee, false)
-                } else {
-                    (balance_now - fee, stx.txn.amount, true)
-                };
-                let message = self.overspend_message(
-                    &txid_text,
-                    &sender,
-                    tried,
-                    OverspendContext {
-                        data_balance,
-                        after_fee,
-                        balance_now,
-                        earlier_in_group: already_spent > 0,
-                    },
-                );
-                let mut reject = fail(algo_error::AlgoError::Rejected {
-                    source: None,
-                    message,
-                    class: algo_error::RejectClass::Other,
-                });
-                reject.creditable =
-                    self.shortfall_may_be_credited(txgroup, &earlier_app_calls, &sender);
-                return Err(reject);
+                // Issue #2187: a shortfall after an application call that may
+                // reach this sender is not provably go's overspend.
+                let credit = degraded
+                    && earlier_app_calls
+                        .iter()
+                        .any(|&i| Self::app_call_may_credit(&txgroup[i].txn));
+                if !(credit && deferred.is_some()) {
+                    // go's `eval.transaction` moves the fee first, then the amount;
+                    // each failing `Move` is a `ledgercore.OverspendError` carrying
+                    // the sender as the cow state stood before THAT move.
+                    let balance_now = available.saturating_sub(already_spent);
+                    let txid_text = algo_types::Digest(txid).to_string();
+                    let (data_balance, tried, after_fee) = if balance_now < fee {
+                        (balance_now, fee, false)
+                    } else {
+                        (balance_now - fee, stx.txn.amount, true)
+                    };
+                    let message = self.overspend_message(
+                        &txid_text,
+                        &sender,
+                        tried,
+                        OverspendContext {
+                            data_balance,
+                            after_fee,
+                            balance_now,
+                            earlier_in_group: already_spent > 0,
+                        },
+                    );
+                    let mut reject = fail(algo_error::AlgoError::Rejected {
+                        source: None,
+                        message,
+                        class: algo_error::RejectClass::Other,
+                    });
+                    reject.creditable = credit.then_some(sender);
+                    if !credit {
+                        return Err(reject);
+                    }
+                    // Verdict-only parity with go's member order: if a LATER
+                    // member fails outright, its error is reported, while go
+                    // would report this member's overspend when the credit
+                    // does not cover it. An evaluator without a real apply
+                    // cannot tell the two apart; both are rejections.
+                    deferred = Some(reject);
+                }
             }
             // The members whose effects on Algo balances this precheck does
             // not model, recorded as soon as the member passed its own checks
@@ -2714,118 +2771,32 @@ impl SimpleBlockEvaluator {
                 error,
                 member: None,
                 after_apply: false,
-                creditable: false,
+                creditable: None,
                 txids: Vec::new(),
             })
         })?;
+        // The recorded shortfall decides last: every other check passed.
+        if let Some(reject) = deferred {
+            return Err(reject);
+        }
 
         Ok(txids)
     }
 
-    /// The highest AVM version among the programs an application call of
-    /// `txgroup` can reach: those of every application the group names (the
-    /// called application, foreign applications, `access` references) and the
-    /// programs of the group's own creations. `u8::MAX` when an application
-    /// is not in the committed ledger (created by a pending group, deleted,
-    /// unreadable): nothing is assumed of it.
-    fn group_max_program_version(&self, txgroup: &[algo_types::SignedTransaction]) -> u8 {
-        let version_of = |program: &[u8]| program.first().copied().unwrap_or(u8::MAX);
-        let mut max = 0u8;
-        let mut ids: Vec<u64> = Vec::new();
-        for stx in txgroup {
-            let t = &stx.txn;
-            if t.txn_type != TxnType::Appl {
-                continue;
-            }
-            if t.application_id == 0 {
-                for program in [&t.approval_program, &t.clear_state_program] {
-                    max = max.max(program.as_ref().map_or(u8::MAX, |p| version_of(p)));
-                }
-            } else {
-                ids.push(t.application_id);
-            }
-            ids.extend(t.foreign_apps.iter().flatten().copied());
-            ids.extend(
-                t.access
-                    .iter()
-                    .flatten()
-                    .map(|r| r.app)
-                    .filter(|id| *id != 0),
-            );
-        }
-        ids.sort_unstable();
-        ids.dedup();
-        if ids.is_empty() {
-            return max;
-        }
-        let Ok(ledger) = self.ledger.lock() else {
-            return u8::MAX;
-        };
-        for id in ids {
-            match ledger.get_app_params(id) {
-                Some(params) => {
-                    max = max
-                        .max(version_of(&params.approval_program))
-                        .max(version_of(&params.clear_state_program));
-                }
-                None => return u8::MAX,
-            }
-        }
-        max
-    }
-
-    /// Could an application call of the group, earlier than the member whose
-    /// sender `account` is short, have credited `account` through an inner
-    /// transaction (issue #2187)? `false` is a PROOF that it could not, so the
-    /// shortfall is go's `overspend`; `true` means the precheck cannot tell.
-    ///
-    /// go's inner payments pay only accounts that are "available" to the
-    /// calling program (`EvalContext.availableAccount`,
-    /// `data/transactions/logic/eval.go`, filled from
-    /// `resources.fillApplicationCall*`):
-    /// - the call's sender, its `accounts` array, its application's address,
-    ///   the addresses of its foreign applications (and of applications
-    ///   created in the group);
-    /// - from AVM version 9 on (`sharedResourcesVersion`), also every account
-    ///   any member of the group mentions (sender, receiver, close-to, ...).
-    ///   `account` is the sender of a group member, so it is always available
-    ///   to a version >= 9 program;
-    /// - an inner application call hands the callee the caller's resources
-    ///   and the callee runs at its own version, so the group's highest
-    ///   program version decides the sharing rule, not the caller's alone.
-    ///
-    /// Inner transactions need program version 5, so a group whose programs
-    /// are all older cannot credit anyone. Below 9 only the direct references
-    /// count. The precheck never reads a program: an unknown application is
-    /// treated as the newest version.
-    fn shortfall_may_be_credited(
-        &self,
-        txgroup: &[algo_types::SignedTransaction],
-        earlier_app_calls: &[usize],
-        account: &Address,
-    ) -> bool {
-        if earlier_app_calls.is_empty() {
-            return false;
-        }
-        let max_version = self.group_max_program_version(txgroup);
-        if max_version < 5 {
-            return false;
-        }
-        if max_version >= 9 {
-            return true;
-        }
-        earlier_app_calls.iter().any(|&i| {
-            let t = &txgroup[i].txn;
-            let app_address = |id: u64| Address(algo_ledger::avm_context::app_address(id));
-            t.sender == *account
-                || t.accounts.iter().flatten().any(|a| a == account)
-                || (t.application_id != 0 && app_address(t.application_id) == *account)
-                || t.foreign_apps
-                    .iter()
-                    .flatten()
-                    .any(|id| app_address(*id) == *account)
-                || t.application_id == 0
-        })
+    /// Could the application call `call` (an earlier member) have credited a
+    /// later member's sender through an inner transaction (issue #2187)?
+    /// `false` PROVES it could not; `true` means it may. The whole rule:
+    /// - a CREATION whose approval program is version 4 or older: no (inner
+    ///   transactions start at version 5, `itxn_begin`), the only group-local
+    ///   fact that proves anything;
+    /// - everything else: may. A call to an EXISTING application is not
+    ///   looked up (an incomplete evaluator's overlay is stale and a read
+    ///   would take the ledger lock), and from version 5 on the references
+    ///   (`accounts`, `access`, foreign applications), sharing (version 9) and
+    ///   inner-called callees make a narrower bound too easy to get wrong.
+    fn app_call_may_credit(call: &algo_types::Transaction) -> bool {
+        call.application_id != 0
+            || program_version(call.approval_program.as_ref().map(|p| p.as_slice())) >= 5
     }
 
     /// go's `OverspendError` text for `sender` (see `algo_validate::overspend`).
@@ -2914,13 +2885,14 @@ struct GroupReject {
     /// of an earlier member's, ranks first (the other per-member checks run
     /// before the apply: only an EARLIER member's apply failure ranks first).
     after_apply: bool,
-    /// The failing check is a balance shortfall of an account an EARLIER
-    /// application call of the group could credit through an inner transaction
-    /// (issue #2187, [`SimpleBlockEvaluator::shortfall_may_be_credited`]): the
-    /// precheck cannot prove it is a failure in go. With a usable real apply
-    /// the reconciliation settles it; without one (an incomplete evaluator) it
-    /// is admitted instead of refused.
-    creditable: bool,
+    /// `Some(sender)`: the failing check is the balance shortfall of `sender`
+    /// that an EARLIER application call of the group may have credited through
+    /// an inner transaction (issue #2187, [`SimpleBlockEvaluator::app_call_may_credit`]).
+    /// Recorded by `validate_group` on an incomplete evaluator (or one with no
+    /// exec state) only, after every other check of the group passed. Without a
+    /// real apply to settle it, `resolve_precheck_rejection` may admit it,
+    /// within a per-sender cap.
+    creditable: Option<Address>,
     /// The txids of the whole group (over the restored members), hashed once;
     /// empty for a failure of the stateless checks.
     txids: Vec<algo_types::Digest>,
@@ -3379,8 +3351,9 @@ impl SimpleBlockEvaluator {
     ///
     /// Without a usable real apply the dry run cannot be made. An incomplete
     /// evaluator then admits a shortfall that an earlier application call may
-    /// have credited (`reject.creditable`, issue #2187); every other
-    /// rejection, and any rejection of a complete evaluator whose
+    /// have credited (`reject.creditable`, issue #2187; every other check of
+    /// the group already passed) for at most [`DEGRADED_SENDER_CAP`] distinct senders; every
+    /// other rejection, and any rejection of a complete evaluator whose
     /// reconciliation budget is spent, keeps the precheck's error.
     ///
     /// Otherwise the precheck's own error stands. The dry run never changes the
@@ -3393,7 +3366,7 @@ impl SimpleBlockEvaluator {
         &mut self,
         txgroup: &[algo_types::SignedTransaction],
         reject: GroupReject,
-    ) -> Result<Vec<algo_types::Digest>, algo_error::AlgoError> {
+    ) -> Result<(Vec<algo_types::Digest>, Option<Address>), algo_error::AlgoError> {
         let Some(member) = reject.member.filter(|m| reject.after_apply || *m > 0) else {
             return Err(reject.error);
         };
@@ -3417,9 +3390,27 @@ impl SimpleBlockEvaluator {
             // budget is spent keeps the precheck's verdict instead: admitting
             // there would leave the group unevaluated and turn the evaluator
             // incomplete, which a stream of such groups could force.
-            let gave_up = self.exec.as_ref().is_none_or(|exec| exec.incomplete);
-            if reject.creditable && gave_up {
-                return Ok(reject.txids);
+            // `creditable` is only ever set by `validate_group` while the
+            // evaluator has no usable real apply (incomplete, or no exec state).
+            debug_assert!(
+                reject.creditable.is_none()
+                    || self.exec.as_ref().is_none_or(|exec| exec.incomplete),
+                "a creditable shortfall implies an evaluator that gave up"
+            );
+            if let Some(sender) = reject.creditable {
+                match self.exec.as_ref() {
+                    // No exec state: nothing to cap, as before issue #2187.
+                    None => return Ok((reject.txids, None)),
+                    Some(exec)
+                        if exec.incomplete
+                            && (exec.degraded_senders.contains(&sender)
+                                || exec.degraded_senders.len() < DEGRADED_SENDER_CAP) =>
+                    {
+                        // The slot is taken once the group is really admitted.
+                        return Ok((reject.txids, Some(sender)));
+                    }
+                    Some(_) => {}
+                }
             }
             return Err(reject.error);
         }
@@ -3440,7 +3431,7 @@ impl SimpleBlockEvaluator {
             }
             Reconciled::Accepted => {
                 note_precheck_over_reject();
-                Ok(reject.txids)
+                Ok((reject.txids, None))
             }
             Reconciled::FailedAt(..) | Reconciled::Unknown => Err(reject.error),
         }
@@ -3753,11 +3744,19 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         &mut self,
         txgroup: &[algo_types::SignedTransaction],
     ) -> Result<(), algo_error::AlgoError> {
+        // The sender whose degraded admission (issue #2187) this group is: its
+        // slot is taken only once the group is really admitted, below.
+        let mut degraded_sender: Option<Address> = None;
         let txids = match self.validate_group(txgroup) {
             Ok(txids) => txids,
             // `Ok`: the real apply accepts what the precheck refused, so the
-            // group is admitted as go would admit it, below.
-            Err(reject) => self.resolve_precheck_rejection(txgroup, *reject)?,
+            // group is admitted as go would admit it, below; or an evaluator
+            // with no real apply admits a creditable shortfall.
+            Err(reject) => {
+                let (txids, sender) = self.resolve_precheck_rejection(txgroup, *reject)?;
+                degraded_sender = sender;
+                txids
+            }
         };
 
         // Convert each transaction to STIB (SignedTxnInBlock) format:
@@ -4249,7 +4248,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                 error,
                 member: Some(member),
                 after_apply: true,
-                creditable: false,
+                creditable: None,
                 txids: txids.clone(),
             };
             if let Err(error) = self.resolve_precheck_rejection(txgroup, reject) {
@@ -4290,6 +4289,10 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                 len: stibs.len(),
                 fees: group_fees,
             });
+        }
+
+        if let (Some(sender), Some(exec)) = (degraded_sender, self.exec.as_mut()) {
+            exec.degraded_senders.insert(sender);
         }
 
         // All checks passed — commit the STIB data and byte counts.
@@ -5004,6 +5007,7 @@ impl PoolLedgerAdapter {
                 spent: Duration::ZERO,
                 reconcile_spent: Duration::ZERO,
                 reconcile_runs: 0,
+                degraded_senders: HashSet::new(),
                 incomplete: false,
                 last_passes: 0,
                 final_state_proof_next: None,
