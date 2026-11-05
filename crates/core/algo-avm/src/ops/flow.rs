@@ -75,8 +75,9 @@ pub fn op_assert(machine: &mut AvmMachine, _instruction: &Instruction) -> Result
     if val != 0 {
         Ok(())
     } else {
+        // go `opAssert`: `assert failed pc=<byte offset>`.
         Err(AlgoError::Avm {
-            message: "assert failed: top of stack is zero".to_string(),
+            message: format!("assert failed pc={}", machine.byte_pc()),
         })
     }
 }

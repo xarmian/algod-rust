@@ -231,7 +231,8 @@ fn arith_exp_basic() {
 
 #[test]
 fn arith_exp_zero_to_zero() {
-    assert!(binary_uint_test(4, 0, 0, 0x94, 1));
+    // go `opExpImpl`: 0^0 is undefined, an error (issue #2200).
+    binary_uint_error(4, 0, 0, 0x94);
 }
 
 #[test]
@@ -247,7 +248,9 @@ fn arith_shl_basic() {
 
 #[test]
 fn arith_shl_64_zeroes() {
-    assert!(binary_uint_test(4, 0xFF, 64, 0x90, 0));
+    // go `opShiftLeft`: a shift above 63 is an error, not 0 (issue #2200).
+    binary_uint_error(4, 0xFF, 64, 0x90);
+    assert!(binary_uint_test(4, 1, 63, 0x90, 1 << 63));
 }
 
 #[test]
@@ -257,7 +260,9 @@ fn arith_shr_basic() {
 
 #[test]
 fn arith_shr_64_zeroes() {
-    assert!(binary_uint_test(4, u64::MAX, 64, 0x91, 0));
+    // go `opShiftRight`: a shift above 63 is an error, not 0 (issue #2200).
+    binary_uint_error(4, u64::MAX, 64, 0x91);
+    assert!(binary_uint_test(4, u64::MAX, 63, 0x91, 1));
 }
 
 #[test]
@@ -2598,5 +2603,52 @@ fn frame_access_below_stack_without_enough_args_errors() {
     assert!(
         result.is_err(),
         "frame_dig -10 below the frame base must error, got {result:?}"
+    );
+}
+
+// ===========================================================================
+// go's EvalError texts and byte-offset pc (issue #2200)
+// ===========================================================================
+
+/// Run `version` + `code` to its first error and return the error text and
+/// go's `pc` (a byte offset, the version byte counts).
+fn first_error(version: u8, code: &[u8]) -> (String, usize) {
+    let program = parse(&prog(version, code)).expect("parse");
+    let mut m = AvmMachine::new(program, ExecMode::LogicSig, 100_000);
+    let err = m
+        .run(&mut NullContext)
+        .expect_err("the program must fail at run time");
+    (err.to_string(), m.byte_pc())
+}
+
+#[test]
+fn eval_error_text_and_byte_pc_match_go() {
+    // `int 1; int 0; /` assembles to pushint 1; pushint 0; `/`: go reports
+    // `err=/ 0. Details: pc=5` (the oracle row `verify_logicsig_err_div_zero`).
+    let mut code = Vec::new();
+    code.extend_from_slice(&pushint(1));
+    code.extend_from_slice(&pushint(0));
+    code.push(0x0a); // /
+    assert_eq!(first_error(8, &code), ("AVM: / 0".to_string(), 5));
+
+    // A bytes value in a uint64 argument position: go's `step` gate.
+    let mut code = vec![0x80, 0x01, 0x01]; // pushbytes 0x01
+    code.extend_from_slice(&pushint(1));
+    code.push(0x08); // +
+    assert_eq!(
+        first_error(8, &code),
+        ("AVM: + arg 0 wanted uint64 but got []byte".to_string(), 6)
+    );
+
+    // An empty stack: `stack underflow in <op>`.
+    assert_eq!(
+        first_error(8, &[0x48]), // pop
+        ("AVM: stack underflow in pop".to_string(), 1)
+    );
+
+    // `err` at the first instruction is pc=1 (after the version byte).
+    assert_eq!(
+        first_error(8, &[0x00]),
+        ("AVM: err opcode executed".to_string(), 1)
     );
 }

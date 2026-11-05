@@ -35,7 +35,7 @@ fn avm_err(msg: impl Into<String>) -> AlgoError {
 pub fn op_add(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
     let b = machine.pop_uint()?;
     let a = machine.pop_uint()?;
-    let result = a.checked_add(b).ok_or_else(|| avm_err("+ overflow"))?;
+    let result = a.checked_add(b).ok_or_else(|| avm_err("+ overflowed"))?;
     machine.push(AvmValue::Uint64(result))
 }
 
@@ -44,7 +44,7 @@ pub fn op_sub(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<()
     let b = machine.pop_uint()?;
     let a = machine.pop_uint()?;
     if a < b {
-        return Err(avm_err("- underflow"));
+        return Err(avm_err("- would result negative"));
     }
     machine.push(AvmValue::Uint64(a - b))
 }
@@ -53,7 +53,7 @@ pub fn op_sub(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<()
 pub fn op_mul(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
     let b = machine.pop_uint()?;
     let a = machine.pop_uint()?;
-    let result = a.checked_mul(b).ok_or_else(|| avm_err("* overflow"))?;
+    let result = a.checked_mul(b).ok_or_else(|| avm_err("* overflowed"))?;
     machine.push(AvmValue::Uint64(result))
 }
 
@@ -62,7 +62,7 @@ pub fn op_div(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<()
     let b = machine.pop_uint()?;
     let a = machine.pop_uint()?;
     if b == 0 {
-        return Err(avm_err("/ division by zero"));
+        return Err(avm_err("/ 0"));
     }
     machine.push(AvmValue::Uint64(a / b))
 }
@@ -72,7 +72,7 @@ pub fn op_modulo(machine: &mut AvmMachine, _instruction: &Instruction) -> Result
     let b = machine.pop_uint()?;
     let a = machine.pop_uint()?;
     if b == 0 {
-        return Err(avm_err("% division by zero"));
+        return Err(avm_err("% 0"));
     }
     machine.push(AvmValue::Uint64(a % b))
 }
@@ -210,96 +210,79 @@ pub fn op_divmodw(machine: &mut AvmMachine, _instruction: &Instruction) -> Resul
 
 /// `exp` (0x94): pop b, pop a, push a^b. 0^0=1. Overflow → error.
 pub fn op_exp(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
-    let b = machine.pop_uint()?;
-    let a = machine.pop_uint()?;
-
-    if b == 0 {
-        // a^0 = 1 for all a, including 0^0 = 1
-        return machine.push(AvmValue::Uint64(1));
+    let exp = machine.pop_uint()?;
+    let base = machine.pop_uint()?;
+    // go `opExpImpl` (`data/transactions/logic/eval.go`), texts included.
+    if exp == 0 && base == 0 {
+        return Err(avm_err("0^0 is undefined"));
     }
-    if a == 0 {
+    if base == 0 {
         return machine.push(AvmValue::Uint64(0));
     }
-
-    // Binary exponentiation with u128 intermediate to detect overflow
-    let mut result: u128 = 1;
-    let mut base: u128 = a as u128;
-    let mut exp = b;
-
-    while exp > 0 {
-        if exp & 1 == 1 {
-            result = result
-                .checked_mul(base)
-                .ok_or_else(|| avm_err("exp overflow"))?;
-            if result > u64::MAX as u128 {
-                return Err(avm_err("exp overflow"));
-            }
-        }
-        exp >>= 1;
-        if exp > 0 {
-            base = base
-                .checked_mul(base)
-                .ok_or_else(|| avm_err("exp overflow"))?;
-        }
+    if exp == 0 || base == 1 {
+        return machine.push(AvmValue::Uint64(1));
     }
-
-    machine.push(AvmValue::Uint64(result as u64))
+    // base is now at least 2, so exp can not be 64
+    if exp >= 64 {
+        return Err(avm_err(format!("{base}^{exp} overflow")));
+    }
+    let mut answer = base;
+    for _ in 1..exp {
+        answer = answer
+            .checked_mul(base)
+            .ok_or_else(|| avm_err(format!("{base}^{exp} overflow")))?;
+    }
+    machine.push(AvmValue::Uint64(answer))
 }
 
 /// `expw` (0x95): pop b, pop a, push (high, low) of a^b as 128-bit.
 /// Overflow past 128 bits → error.
 pub fn op_expw(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
-    let b = machine.pop_uint()?;
-    let a = machine.pop_uint()?;
-
-    if b == 0 {
-        machine.push(AvmValue::Uint64(0))?;
-        return machine.push(AvmValue::Uint64(1));
-    }
-    if a == 0 {
-        machine.push(AvmValue::Uint64(0))?;
-        return machine.push(AvmValue::Uint64(0));
-    }
-
-    // Binary exponentiation with checked 128-bit arithmetic
-    let mut result: u128 = 1;
-    let mut base: u128 = a as u128;
-    let mut exp = b;
-
-    while exp > 0 {
-        if exp & 1 == 1 {
-            result = result
-                .checked_mul(base)
-                .ok_or_else(|| avm_err("expw overflow"))?;
+    let exp = machine.pop_uint()?;
+    let base = machine.pop_uint()?;
+    // go `opExpwImpl`, texts included.
+    let value: u128 = if exp == 0 && base == 0 {
+        return Err(avm_err("0^0 is undefined"));
+    } else if base == 0 {
+        0
+    } else if exp == 0 || base == 1 {
+        1
+    } else if exp >= 128 {
+        // base is at least 2, so exp can not be 128
+        return Err(avm_err(format!("{base}^{exp} overflow")));
+    } else {
+        let mut answer = base as u128;
+        for _ in 1..exp {
+            answer = answer
+                .checked_mul(base as u128)
+                .ok_or_else(|| avm_err(format!("{base}^{exp} overflow")))?;
         }
-        exp >>= 1;
-        if exp > 0 {
-            base = base
-                .checked_mul(base)
-                .ok_or_else(|| avm_err("expw overflow"))?;
-        }
-    }
-
-    let high = (result >> 64) as u64;
-    let low = result as u64;
-    machine.push(AvmValue::Uint64(high))?;
-    machine.push(AvmValue::Uint64(low))
+        answer
+    };
+    machine.push(AvmValue::Uint64((value >> 64) as u64))?;
+    machine.push(AvmValue::Uint64(value as u64))
 }
 
-/// `shl` (0x90): pop b, pop a. If b >= 64, push 0. Else push a << b.
+/// `shl` (0x90): pop b, pop a. b > 63 is an error (go `opShiftLeft`:
+/// `shl arg too big, (<b>)`). Else push a << b.
 pub fn op_shl(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
     let b = machine.pop_uint()?;
     let a = machine.pop_uint()?;
-    let result = if b >= 64 { 0 } else { a << b };
-    machine.push(AvmValue::Uint64(result))
+    if b > 63 {
+        return Err(avm_err(format!("shl arg too big, ({b})")));
+    }
+    machine.push(AvmValue::Uint64(a << b))
 }
 
-/// `shr` (0x91): pop b, pop a. If b >= 64, push 0. Else push a >> b.
+/// `shr` (0x91): pop b, pop a. b > 63 is an error (go `opShiftRight`:
+/// `shr arg too big, (<b>)`). Else push a >> b.
 pub fn op_shr(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
     let b = machine.pop_uint()?;
     let a = machine.pop_uint()?;
-    let result = if b >= 64 { 0 } else { a >> b };
-    machine.push(AvmValue::Uint64(result))
+    if b > 63 {
+        return Err(avm_err(format!("shr arg too big, ({b})")));
+    }
+    machine.push(AvmValue::Uint64(a >> b))
 }
 
 /// `sqrt` (0x92): pop a, push integer square root (floor).
@@ -802,8 +785,9 @@ mod tests {
         let instr = dummy_instruction();
         m.push(AvmValue::Uint64(0)).unwrap();
         m.push(AvmValue::Uint64(0)).unwrap();
-        op_exp(&mut m, &instr).unwrap();
-        assert_eq!(m.pop_uint().unwrap(), 1);
+        // go `opExpImpl`: 0^0 is an error, not 1 (issue #2200).
+        let err = op_exp(&mut m, &instr).unwrap_err();
+        assert_eq!(err.to_string(), "AVM: 0^0 is undefined");
     }
 
     #[test]
@@ -866,8 +850,14 @@ mod tests {
         let instr = dummy_instruction();
         m.push(AvmValue::Uint64(1)).unwrap();
         m.push(AvmValue::Uint64(64)).unwrap();
+        // go `opShiftLeft`: a shift above 63 is an error, not 0 (issue #2200).
+        let err = op_shl(&mut m, &instr).unwrap_err();
+        assert_eq!(err.to_string(), "AVM: shl arg too big, (64)");
+        let mut m = make_machine();
+        m.push(AvmValue::Uint64(1)).unwrap();
+        m.push(AvmValue::Uint64(63)).unwrap();
         op_shl(&mut m, &instr).unwrap();
-        assert_eq!(m.pop_uint().unwrap(), 0);
+        assert_eq!(m.pop_uint().unwrap(), 1 << 63);
     }
 
     #[test]
@@ -886,8 +876,14 @@ mod tests {
         let instr = dummy_instruction();
         m.push(AvmValue::Uint64(u64::MAX)).unwrap();
         m.push(AvmValue::Uint64(64)).unwrap();
+        // go `opShiftRight`: a shift above 63 is an error, not 0 (issue #2200).
+        let err = op_shr(&mut m, &instr).unwrap_err();
+        assert_eq!(err.to_string(), "AVM: shr arg too big, (64)");
+        let mut m = make_machine();
+        m.push(AvmValue::Uint64(u64::MAX)).unwrap();
+        m.push(AvmValue::Uint64(63)).unwrap();
         op_shr(&mut m, &instr).unwrap();
-        assert_eq!(m.pop_uint().unwrap(), 0);
+        assert_eq!(m.pop_uint().unwrap(), 1);
     }
 
     // ---- Sqrt ----
@@ -1092,11 +1088,9 @@ mod tests {
         let instr = dummy_instruction();
         m.push(AvmValue::Uint64(0)).unwrap();
         m.push(AvmValue::Uint64(0)).unwrap();
-        op_expw(&mut m, &instr).unwrap();
-        let low = m.pop_uint().unwrap();
-        let high = m.pop_uint().unwrap();
-        assert_eq!(high, 0);
-        assert_eq!(low, 1);
+        // go `opExpwImpl`: 0^0 is an error, not (0, 1) (issue #2200).
+        let err = op_expw(&mut m, &instr).unwrap_err();
+        assert_eq!(err.to_string(), "AVM: 0^0 is undefined");
     }
 
     #[test]

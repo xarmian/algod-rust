@@ -735,6 +735,35 @@ func blockDupOracle() {
 			Lsig: transactions.LogicSig{Logic: ops.Program},
 		})}
 	}
+	// Issue #2200: one row per AVM error kind (go `EvalError` text and the byte
+	// offset `pc`), each a LogicSig-only escrow payment whose program errors at
+	// run time. A label breaks the assembler's static stack typing where the
+	// error is a run-time one.
+	lsigErrorSources := []struct{ name, src string }{
+		{"div_zero", "int 1\nint 0\n/"},
+		{"mod_zero", "int 1\nint 0\n%"},
+		{"add_overflow", "int 18446744073709551615\nint 1\n+"},
+		{"sub_negative", "int 0\nint 1\n-"},
+		{"mul_overflow", "int 18446744073709551615\nint 2\n*"},
+		{"err_opcode", "err"},
+		{"assert_failed", "int 0\nassert\nint 1"},
+		{"stack_underflow", "b end\nend:\npop\nint 1"},
+		{"wrong_type", "byte 0x01\nint 1\nb end\nend:\n+"},
+		{"btoi_too_long", "byte 0x010203040506070809\nbtoi"},
+		{"substring_range", "byte 0x0102\nsubstring 1 5\nlen"},
+		{"retsub_empty", "b end\nend:\nretsub"},
+		{"final_stack_too_long", "int 1\nint 1"},
+		{"final_stack_bytes", "byte 0x01"},
+		{"final_stack_empty", "int 1\npop"},
+		{"exp_zero_zero", "int 0\nint 0\nexp\nint 1"},
+		{"shl_too_big", "int 1\nint 64\nshl\nint 1"},
+		{"bzero_too_large", "int 4096\nint 1\n+\nbzero\nlen"},
+		{"getbyte_range", "byte 0x01\nint 5\ngetbyte"},
+		{"budget_exceeded", "int 0\nloop:\nint 1\n+\ndup\nint 100000\n<\nbnz loop\nint 1"},
+	}
+	for _, e := range lsigErrorSources {
+		wfSpecs = append(wfSpecs, lsigRow("verify_logicsig_err_"+e.name, "#pragma version 8\n"+e.src))
+	}
 	wfSpecs = append(wfSpecs,
 		lsigRow("verify_logicsig_rejects", "#pragma version 8\nint 0"),
 		lsigRow("verify_logicsig_errors", "#pragma version 8\nint 1\nint 0\n/"),

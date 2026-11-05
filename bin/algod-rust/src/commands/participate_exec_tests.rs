@@ -3105,23 +3105,11 @@ fn wellformed_and_group_error_texts_match_go() {
             (Err(e), want) => {
                 let (text, kind) = rest_error_text(&e);
                 let (rust_framed, rust_reason) = split_frame(&text);
-                // A LogicSig that ERRORS: go prints the AVM's own error and the
-                // program counter of its `EvalError` (`err=/ 0. Details:
-                // pc=5`, a byte offset); the AVM's wording (`/ division by
-                // zero` here) and its `pc` (an instruction index here) are the
-                // AVM's, so for this one row only the part before `err=` is
-                // compared (tracked in a separate AVM-parity issue).
-                let avm_err = |t: &str| -> String {
-                    match t.find("err=") {
-                        Some(a) => format!("{}<avm error and pc>", &t[..a + 4]),
-                        None => t.to_string(),
-                    }
-                };
-                let (rust_reason, want) = if row.name == "verify_logicsig_errors" {
-                    (avm_err(rust_reason), avm_err(want))
-                } else {
-                    (rust_reason.to_string(), want.to_string())
-                };
+                // A LogicSig that ERRORS (`verify_logicsig_err_*`, one row per AVM error
+                // kind, and `verify_logicsig_errors`): go prints the AVM's own error
+                // and the byte offset `pc` of its `EvalError` (`err=/ 0. Details:
+                // pc=5`), compared in full (issue #2200).
+                let (rust_reason, want) = (rust_reason.to_string(), want.to_string());
                 if rust_reason != want || rust_framed != row.verify_framed {
                     mismatches.push(format!(
                         "{} (REST path)\n  go:   {:?} (framed: {})\n  rust: {:?} (framed: {})",

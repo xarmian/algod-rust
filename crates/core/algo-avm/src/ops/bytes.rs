@@ -104,10 +104,7 @@ pub fn op_itob(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(
 pub fn op_btoi(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
     let a = machine.pop_bytes()?;
     if a.len() > 8 {
-        return Err(avm_err(format!(
-            "btoi: byte string length {} exceeds 8",
-            a.len()
-        )));
+        return Err(avm_err(format!("btoi arg too long, got {} bytes", a.len())));
     }
     let mut val: u64 = 0;
     for &byte in &a {
@@ -138,11 +135,12 @@ pub fn op_substring(machine: &mut AvmMachine, instruction: &Instruction) -> Resu
         _ => return Err(avm_err("substring: expected Uint8Pair immediate")),
     };
     let a = machine.pop_bytes()?;
-    if s > e {
-        return Err(avm_err(format!("substring: start {s} > end {e}")));
+    // go `substring`: end before start, then the range check.
+    if e < s {
+        return Err(avm_err("substring end before start"));
     }
-    if e > a.len() {
-        return Err(avm_err(format!("substring: end {e} > length {}", a.len())));
+    if s > a.len() || e > a.len() {
+        return Err(avm_err("substring range beyond length of string"));
     }
     machine.push(crate::machine::AvmValue::Bytes(a[s..e].to_vec()))
 }
@@ -152,14 +150,19 @@ pub fn op_substring3(
     machine: &mut AvmMachine,
     _instruction: &Instruction,
 ) -> Result<(), AlgoError> {
-    let e = machine.pop_uint()? as usize;
-    let s = machine.pop_uint()? as usize;
+    let e = machine.pop_uint()?;
+    let s = machine.pop_uint()?;
     let a = machine.pop_bytes()?;
-    if s > e {
-        return Err(avm_err(format!("substring3: start {s} > end {e}")));
+    // go `opSubstring3`: a start or end past MaxInt32 is a range error first.
+    if s > i32::MAX as u64 || e > i32::MAX as u64 {
+        return Err(avm_err("substring range beyond length of string"));
     }
-    if e > a.len() {
-        return Err(avm_err(format!("substring3: end {e} > length {}", a.len())));
+    let (s, e) = (s as usize, e as usize);
+    if e < s {
+        return Err(avm_err("substring end before start"));
+    }
+    if s > a.len() || e > a.len() {
+        return Err(avm_err("substring range beyond length of string"));
     }
     machine.push(crate::machine::AvmValue::Bytes(a[s..e].to_vec()))
 }
@@ -316,9 +319,7 @@ pub fn op_replace3(machine: &mut AvmMachine, _instruction: &Instruction) -> Resu
 pub fn op_bzero(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
     let n = machine.pop_uint()? as usize;
     if n > MAX_BYTES_LEN {
-        return Err(avm_err(format!(
-            "bzero: length {n} exceeds maximum {MAX_BYTES_LEN}"
-        )));
+        return Err(avm_err("bzero attempted to create a too large string"));
     }
     machine.push(crate::machine::AvmValue::Bytes(vec![0u8; n]))
 }

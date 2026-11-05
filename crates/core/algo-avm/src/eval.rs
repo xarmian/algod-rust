@@ -197,7 +197,7 @@ fn attach_eval_error_details(
     AlgoError::AvmLogicSig {
         source: Box::new(err),
         message,
-        pc: machine.pc,
+        pc: machine.byte_pc(),
         group_index,
         app_index,
         eval_states: logicsig_eval_states(machine, group_index),
