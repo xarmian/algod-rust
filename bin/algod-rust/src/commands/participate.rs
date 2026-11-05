@@ -2117,17 +2117,20 @@ impl SimpleBlockEvaluator {
         // go's `verify.TxnGroup` reports the first not-well-formed member as
         // `transaction <%+v of the SignedTxn> invalid : <reason>`, bare, before
         // the pool is involved (issue #2193): see `verify_rejection`.
+        // go's `verify.TxnGroup` hands `WellFormed` the header's special addresses
+        // (`groupCtx.specAddrs`), so a sender that is the rewards pool, a payment
+        // from the fee sink and a keyreg from the fee sink are refused here with
+        // go's text (issue #2198). The evaluator holds the same header.
+        let specials = algo_validate::SpecialAddresses {
+            fee_sink: self.hdr.fee_sink,
+            rewards_pool: self.hdr.rewards_pool,
+        };
         for stx in txgroup {
-            // go passes its special addresses here; this path does not (the
-            // evaluator's own tests spend from the fee sink through it), so
-            // the rewards-pool and fee-sink rules are not applied on the REST
-            // path: a deliberate non-change of accept/reject, tracked in
-            // issue #2198 (the oracle rows for those rules skip this path).
             algo_validate::validate_transaction_wellformed_in_mode(
                 &stx.txn,
                 true,
                 params,
-                None, // SpecialAddresses not available without ledger lookup
+                Some(&specials),
                 algo_validate::WellFormedMode::Admission,
             )
             .map_err(|e| Self::verify_rejection(algo_error::VerifyKind::NotWell, Some(stx), e))?;
@@ -3719,6 +3722,63 @@ impl SimpleBlockEvaluator {
         }
         // 3. Default: sender is its own authorizer.
         *sender
+    }
+}
+
+#[cfg(test)]
+impl SimpleBlockEvaluator {
+    /// Put `group` into the pending payset as an already-admitted group,
+    /// skipping every admission check: go's block evaluator has no `WellFormed`
+    /// (admission refuses a fee-sink sender under go's special-address rules,
+    /// issue #2198), so a test of the apply path alone needs a way in that does
+    /// not go through `transaction_group`. The real apply still judges it when
+    /// the block is generated (`finalize_payset` re-runs the whole payset, and
+    /// `FeesCollected` / the proposer payout come from that apply, not from the
+    /// numbers recorded here).
+    ///
+    /// It keeps the bookkeeping the payset, the group table and the size
+    /// accounting need to stay in step (the same `fees_collected`, `txn_bytes`
+    /// and `ExecGroup` `transaction_group` records), and it requires the exec
+    /// state: without it the payset and the group table cannot be kept
+    /// consistent, so that case panics. It does not record the group's txids or
+    /// leases in the pending overlay: callers admit nothing after it that could
+    /// duplicate them.
+    pub(crate) fn admit_group_apply_path_only_for_test(
+        &mut self,
+        group: &[algo_types::SignedTransaction],
+    ) {
+        let genesis_rule = self.genesis_rule();
+        let stibs: Vec<algo_types::SignedTransaction> = group
+            .iter()
+            .map(|stx| {
+                let mut stib = stx.clone();
+                genesis_rule.strip(&mut stib);
+                stib
+            })
+            .collect();
+        let fees = algo_ledger::block_header::payset_fees_collected(&stibs, &self.hdr.fee_sink);
+        let bytes: usize = stibs.iter().map(Self::encoded_len).sum();
+        assert!(
+            self.txn_bytes + bytes <= self.max_txn_bytes,
+            "the helper must not exceed the block size limit"
+        );
+        let exec = self
+            .exec
+            .as_mut()
+            .expect("the apply-path helper needs the exec state");
+        assert_eq!(
+            exec.groups.iter().map(|g| g.len).sum::<usize>(),
+            self.included_txns.len(),
+            "the group table must cover the payset before the helper adds to it"
+        );
+        exec.groups.push(ExecGroup {
+            start: self.included_txns.len(),
+            len: stibs.len(),
+            fees,
+        });
+        self.fees_collected += fees;
+        self.txn_bytes += bytes;
+        self.included_txns.extend(stibs);
     }
 }
 
@@ -13574,7 +13634,11 @@ mod tests {
     #[test]
     fn sender_is_fee_sink_no_fees_collected_increment() {
         let ledger = test_ledger();
-        let params = v41_params();
+        // The admission path refuses a fee-sink payment under go's special-address
+        // rules (issue #2198): with payouts enabled the sink cannot spend at all.
+        // Before payouts (v39) it may pay the rewards pool, which keeps this
+        // accounting test (go `takeFee`) on a transaction go's WellFormed accepts.
+        let params = consensus_params_for_version(algo_types::consensus::CONSENSUS_V39).unwrap();
         // Use a deterministic address as FeeSink. We need the sender to
         // BE the fee_sink address.
         let (fee_sink_addr, fee_sink_key) = test_keypair(210);
@@ -13605,8 +13669,9 @@ mod tests {
                 round: Round(100),
                 genesis_id: "test-v1".to_string(),
                 genesis_hash: [0xAA; 32],
-                current_protocol: CONSENSUS_V41.to_string(),
+                current_protocol: algo_types::consensus::CONSENSUS_V39.to_string(),
                 fee_sink: fee_sink_addr, // FeeSink IS the sender
+                rewards_pool: receiver,  // the one account the sink may pay
                 ..Default::default()
             },
             consensus_params: params.clone(),
