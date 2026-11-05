@@ -1684,7 +1684,8 @@ pub fn canonical_encode_merkle_signature(sig: &MerkleSignature) -> Vec<u8> {
     if let Some(ref proof) = sig.proof {
         m.add_map("prf", canonical_encode_merkle_proof(proof));
     }
-    m.add_bytes("sig", &sig.signature);
+    // go: `FalconSignature` is a `[]byte`: length-only omitempty (issue #2196).
+    m.add_var_bytes("sig", &sig.signature);
     if let Some(ref vkey) = sig.verifying_key {
         m.add_map("vkey", canonical_encode_falcon_verifier(vkey));
     }
@@ -1740,7 +1741,9 @@ pub fn canonical_encode_state_proof_body(sp: &StateProofBody) -> Vec<u8> {
     if let Some(ref sp_proofs) = sp.sig_proofs {
         m.add_map("S", canonical_encode_merkle_proof(sp_proofs));
     }
-    m.add_bytes("c", &sp.sig_commit);
+    // go: `SigCommit` is a `[]byte` (GenericDigest): omitempty drops only a
+    // zero-LENGTH slice, an all-zero 64-byte commitment is encoded (issue #2196).
+    m.add_var_bytes("c", &sp.sig_commit);
     if let Some(ref positions) = sp.positions_to_reveal {
         if !positions.is_empty() {
             let mut buf = Vec::new();
@@ -2295,7 +2298,7 @@ pub fn canonical_encode_account_application_model(
 mod tests {
     use super::*;
     use algo_types::Round;
-    use rand::{RngExt, Rng, SeedableRng};
+    use rand::{Rng, RngExt, SeedableRng};
     use rand_chacha::ChaCha20Rng;
 
     #[test]
@@ -4754,5 +4757,44 @@ mod tests {
                 "randomized msgpack round-trip mismatch at iteration {i}"
             );
         }
+    }
+    /// go's omitempty on a `[]byte` drops only a zero-LENGTH slice, so an
+    /// all-zero 64-byte `SigCommit` (and an all-zero `FalconSignature`) is
+    /// encoded; the txid and the signed bytes depend on it (issue #2196).
+    #[test]
+    fn state_proof_all_zero_byte_fields_are_encoded_like_go() {
+        let body = StateProofBody {
+            sig_commit: ByteBuf::from(vec![0u8; 64]),
+            ..Default::default()
+        };
+        let encoded = canonical_encode_state_proof_body(&body);
+        let v = rmpv::decode::read_value(&mut &encoded[..]).unwrap();
+        let c = v
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("c"))
+            .expect("an all-zero commitment is encoded");
+        assert_eq!(c.1.as_slice().map(<[u8]>::len), Some(64));
+        // A zero-length commitment is still omitted.
+        let empty = canonical_encode_state_proof_body(&StateProofBody::default());
+        assert!(
+            !empty.windows(2).any(|w| w == [0xa1, b'c']),
+            "empty commitment omitted"
+        );
+
+        let sig = MerkleSignature {
+            signature: ByteBuf::from(vec![0u8; 2]),
+            ..Default::default()
+        };
+        let encoded = canonical_encode_merkle_signature(&sig);
+        let v = rmpv::decode::read_value(&mut &encoded[..]).unwrap();
+        assert!(
+            v.as_map()
+                .unwrap()
+                .iter()
+                .any(|(k, _)| k.as_str() == Some("sig")),
+            "an all-zero signature is encoded"
+        );
     }
 }

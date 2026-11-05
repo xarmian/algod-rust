@@ -686,6 +686,13 @@ func blockDupOracle() {
 	}) {
 		wfSpecs = append(wfSpecs, orderSpec{name: r.name, group: one(r.tx)})
 	}
+	for _, r := range wellFormedGroupRows(wfEnv{
+		params: params, sender: sender, receiver: acctB, sink: sink, pool: pool,
+		genesisHash: genesisHash,
+		sign:        func(t transactions.Transaction) transactions.SignedTxn { return t.Sign(secrets) },
+	}) {
+		wfSpecs = append(wfSpecs, orderSpec{name: r.name, group: r.group})
+	}
 	for _, g := range gossip {
 		switch g.name {
 		case "gossip_dup_then_inconsistent_group", "gossip_inconsistent_group_only",

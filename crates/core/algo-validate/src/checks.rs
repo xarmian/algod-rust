@@ -101,7 +101,7 @@ fn check_basic_state_proof(sp: &StateProofBody) -> Result<(), AlgoError> {
 
     if sp.sig_commit.len() != hash_size {
         return Err(err(format!(
-            "state proof SigCommit has an unexpected size: SigCommit is {} bytes, expected {hash_size}",
+            "state proof has an unexpected signature commitment size: has length {}, expected {hash_size}",
             sp.sig_commit.len()
         )));
     }
@@ -163,7 +163,16 @@ fn check_state_proof(state_proof_type: u64, sp: &StateProofBody) -> Result<(), A
 /// absent on the wire -- go's `StateProof` is a plain (non-pointer) struct
 /// field, so an absent wire value still decodes to (and must pass checks
 /// as) its zero value, not be skipped.
-fn check_state_proof_reveals(txn: &Transaction) -> Result<(), AlgoError> {
+///
+/// go runs this check in TWO places and so does this port, through this one
+/// helper (issue #2196): per member in `WellFormed` (so the gossip test stage
+/// and the REST path report the first malformed member in go's order, called
+/// from `rules::validate_transaction_wellformed_in_mode`) and at group level in
+/// `checkTxnGroup` ([`check_txn_group`], which block validation, the agreement
+/// demux's `proposalCarriesInvalidTxn` screen, simulation and the REST path run).
+/// Block validation checks the payload there, in `check_txn_group`, even for an
+/// `stpf` whose per-transaction rules `block.rs` skips.
+pub(crate) fn check_state_proof_payload(txn: &Transaction) -> Result<(), AlgoError> {
     let default_sp = StateProofBody::default();
     let sp = txn.state_proof.as_ref().unwrap_or(&default_sp);
     check_state_proof(txn.state_proof_type, sp)
@@ -215,7 +224,7 @@ pub fn check_txn_group(group: &[SignedTransaction]) -> Result<(), AlgoError> {
                 }
             }
             "stpf" => {
-                check_state_proof_reveals(txn)?;
+                check_state_proof_payload(txn)?;
             }
             "appl" => {
                 avail_trigger = true;
@@ -286,6 +295,22 @@ mod tests {
         txn.heartbeat = None;
         let err = check_txn_group(&[signed(txn)]).unwrap_err();
         assert!(err.to_string().contains("heartbeat"), "got: {err}");
+    }
+
+    /// go's `CheckTxnGroup` errors that are not a `TxGroupMalformedError` carry
+    /// `GroupIndex = -1` (`txnGroupBatchPrep`), so there is no member index to
+    /// report: the error is the bare text wherever the member sits (issue
+    /// #2196; the REST path returns it unframed).
+    #[test]
+    fn a_group_error_has_no_member_index_in_the_text() {
+        let pay = base_txn("pay");
+        let mut hb = base_txn("hb");
+        hb.heartbeat = None;
+        let err = check_txn_group(&[signed(pay.clone()), signed(hb), signed(pay)]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "validation error: heartbeat transaction is missing its heartbeat fields"
+        );
     }
 
     #[test]
@@ -407,7 +432,7 @@ mod tests {
     #[test]
     fn state_proof_reveal_short_signature_is_rejected() {
         let txn = stpf_txn_with_reveal(reveal_with(1, 1, 1));
-        let err = check_txn_group(&[signed(txn)]).unwrap_err();
+        let err = check_state_proof_payload(&txn).unwrap_err();
         assert!(err.to_string().contains("signature"), "got: {err}");
     }
 
@@ -418,21 +443,21 @@ mod tests {
             (MAX_ENCODED_TREE_DEPTH + 1) as u8,
             MAX_ENCODED_TREE_DEPTH + 1,
         ));
-        let err = check_txn_group(&[signed(txn)]).unwrap_err();
+        let err = check_state_proof_payload(&txn).unwrap_err();
         assert!(err.to_string().contains("proof"), "got: {err}");
     }
 
     #[test]
     fn state_proof_reveal_tree_depth_exceeds_path_len_is_rejected() {
         let txn = stpf_txn_with_reveal(reveal_with(2, 5, 3));
-        let err = check_txn_group(&[signed(txn)]).unwrap_err();
+        let err = check_state_proof_payload(&txn).unwrap_err();
         assert!(err.to_string().contains("proof"), "got: {err}");
     }
 
     #[test]
     fn state_proof_reveal_within_bounds_is_accepted() {
         let txn = stpf_txn_with_reveal(reveal_with(2, 4, 4));
-        check_txn_group(&[signed(txn)]).unwrap();
+        check_state_proof_payload(&txn).unwrap();
     }
 
     #[test]
@@ -446,7 +471,7 @@ mod tests {
             }),
             part: None,
         });
-        check_txn_group(&[signed(txn)]).unwrap();
+        check_state_proof_payload(&txn).unwrap();
     }
 
     // ── Application box index bound ────────────────────────────────
@@ -546,14 +571,14 @@ mod tests {
 
     #[test]
     fn state_proof_basic_suite_accepts_a_well_formed_proof() {
-        check_txn_group(&[signed(well_formed_stpf_txn())]).unwrap();
+        check_state_proof_payload(&well_formed_stpf_txn()).unwrap();
     }
 
     #[test]
     fn state_proof_basic_suite_rejects_unsupported_state_proof_type() {
         let mut txn = well_formed_stpf_txn();
         txn.state_proof_type = 1;
-        let err = check_txn_group(&[signed(txn)]).unwrap_err();
+        let err = check_state_proof_payload(&txn).unwrap_err();
         assert!(err.to_string().contains("unsupported"), "got: {err}");
     }
 
@@ -565,7 +590,7 @@ mod tests {
                 hash_type: HashType::Sha256 as u16,
             });
         }
-        let err = check_txn_group(&[signed(txn)]).unwrap_err();
+        let err = check_state_proof_payload(&txn).unwrap_err();
         assert!(err.to_string().contains("hash algorithm"), "got: {err}");
     }
 
@@ -577,7 +602,7 @@ mod tests {
                 hash_type: HashType::Sha256 as u16,
             });
         }
-        let err = check_txn_group(&[signed(txn)]).unwrap_err();
+        let err = check_state_proof_payload(&txn).unwrap_err();
         assert!(err.to_string().contains("hash algorithm"), "got: {err}");
     }
 
@@ -587,7 +612,7 @@ mod tests {
         if let Some(sp) = txn.state_proof.as_mut() {
             sp.part_proofs.as_mut().unwrap().path = Some(vec![Some(ByteBuf::from(vec![0u8; 32]))]);
         }
-        let err = check_txn_group(&[signed(txn)]).unwrap_err();
+        let err = check_state_proof_payload(&txn).unwrap_err();
         assert!(err.to_string().contains("unexpected size"), "got: {err}");
     }
 
@@ -597,8 +622,11 @@ mod tests {
         if let Some(sp) = txn.state_proof.as_mut() {
             sp.sig_commit = ByteBuf::from(vec![0u8; 32]);
         }
-        let err = check_txn_group(&[signed(txn)]).unwrap_err();
-        assert!(err.to_string().contains("SigCommit"), "got: {err}");
+        let err = check_state_proof_payload(&txn).unwrap_err();
+        assert!(
+            err.to_string().contains("signature commitment size"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -627,7 +655,7 @@ mod tests {
         if let Some(sp) = txn.state_proof.as_mut() {
             sp.reveals = Some(reveals);
         }
-        let err = check_txn_group(&[signed(txn)]).unwrap_err();
+        let err = check_state_proof_payload(&txn).unwrap_err();
         assert!(err.to_string().contains("hash algorithm"), "got: {err}");
     }
 
@@ -655,7 +683,7 @@ mod tests {
         if let Some(sp) = txn.state_proof.as_mut() {
             sp.reveals = Some(reveals);
         }
-        let err = check_txn_group(&[signed(txn)]).unwrap_err();
+        let err = check_state_proof_payload(&txn).unwrap_err();
         assert!(err.to_string().contains("unexpected size"), "got: {err}");
     }
 
@@ -683,7 +711,7 @@ mod tests {
         if let Some(sp) = txn.state_proof.as_mut() {
             sp.reveals = Some(reveals);
         }
-        check_txn_group(&[signed(txn)]).unwrap();
+        check_state_proof_payload(&txn).unwrap();
     }
 
     // ── check_payset: contiguous-group walking ─────────────────────

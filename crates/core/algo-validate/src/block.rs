@@ -2193,4 +2193,83 @@ mod tests {
             result.errors
         );
     }
+
+    // ── State-proof payload (issue #2196) ──
+
+    /// A block whose payset carries an `stpf` transaction with `payload`.
+    fn stpf_block(payload: algo_types::StateProofBody) -> Block {
+        let stx = SignedTransaction {
+            txn: Transaction {
+                txn_type: "stpf".into(),
+                sender: Address::STATE_PROOF_SENDER,
+                fee: 0,
+                first_valid: Round(1),
+                last_valid: Round(1000),
+                state_proof: Some(payload),
+                ..Default::default()
+            },
+            has_genesis_id: true,
+            ..Default::default()
+        };
+        let mut block = empty_block();
+        block.payset = vec![stx];
+        block.txn_commitment = compute_payset_merkle_root(&block);
+        set_expected_load(&mut block);
+        block
+    }
+
+    fn block_has_payload_error(result: &BlockValidationResult) -> bool {
+        result
+            .errors
+            .iter()
+            .any(|e| e.to_string().contains("signature commitment size"))
+    }
+
+    /// An `stpf` that carries a payload skips the per-transaction rules
+    /// (including well-formedness) in `validate_block`, so the payload is
+    /// checked by the group-level screen (`checks::check_txn_group` ->
+    /// `check_state_proof_payload`, go's `checkTxnGroup`): a malformed one
+    /// invalidates the block, a well-formed one does not trip that check.
+    #[test]
+    fn block_rejects_a_malformed_state_proof_payload() {
+        let sumhash = algo_types::MerkleProof {
+            path: None,
+            hash_factory: Some(algo_types::HashFactory { hash_type: 1 }),
+            tree_depth: 0,
+        };
+        let good = algo_types::StateProofBody {
+            sig_commit: serde_bytes::ByteBuf::from(vec![7u8; 64]),
+            sig_proofs: Some(sumhash.clone()),
+            part_proofs: Some(sumhash),
+            ..Default::default()
+        };
+        let mut bad = good.clone();
+        bad.sig_commit = serde_bytes::ByteBuf::from(vec![7u8; 63]);
+
+        let result = validate_block(
+            &stpf_block(bad),
+            Some(90),
+            "test-v1",
+            &test_genesis_hash(),
+            None,
+        );
+        assert!(!result.is_valid);
+        assert!(
+            block_has_payload_error(&result),
+            "expected the payload error, got: {:?}",
+            result.errors
+        );
+        let result = validate_block(
+            &stpf_block(good),
+            Some(90),
+            "test-v1",
+            &test_genesis_hash(),
+            None,
+        );
+        assert!(
+            !block_has_payload_error(&result),
+            "a well-formed payload must not be refused: {:?}",
+            result.errors
+        );
+    }
 }

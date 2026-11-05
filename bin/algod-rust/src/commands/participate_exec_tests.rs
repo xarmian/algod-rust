@@ -879,6 +879,22 @@ fn spt(next: u64) -> Option<rmpv::Value> {
     )]))
 }
 
+/// A payload that passes go's `checkStateProof` (issue #2196: admission refuses
+/// a malformed one): a 64-byte commitment and Sumhash-typed proofs.
+fn well_formed_state_proof_body() -> algo_types::StateProofBody {
+    let sumhash = algo_types::MerkleProof {
+        path: None,
+        hash_factory: Some(algo_types::HashFactory { hash_type: 1 }),
+        tree_depth: 0,
+    };
+    algo_types::StateProofBody {
+        sig_commit: serde_bytes::ByteBuf::from(vec![7u8; 64]),
+        sig_proofs: Some(sumhash.clone()),
+        part_proofs: Some(sumhash),
+        ..Default::default()
+    }
+}
+
 fn state_proof_txn(last_attested_round: u64) -> SignedTransaction {
     let mut t = base_txn(Address::STATE_PROOF_SENDER, TxnType::Stpf);
     t.fee = 0;
@@ -887,7 +903,7 @@ fn state_proof_txn(last_attested_round: u64) -> SignedTransaction {
         last_attested_round,
         ..Default::default()
     });
-    t.state_proof = Some(algo_types::StateProofBody::default());
+    t.state_proof = Some(well_formed_state_proof_body());
     SignedTransaction {
         txn: t,
         ..Default::default()

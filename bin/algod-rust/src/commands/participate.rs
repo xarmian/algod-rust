@@ -2133,6 +2133,16 @@ impl SimpleBlockEvaluator {
             .map_err(|e| Self::verify_rejection(algo_error::VerifyKind::NotWell, Some(stx), e))?;
         }
 
+        // go's `txnGroupBatchPrep` runs `transactions.CheckTxnGroup` right after
+        // every member is well formed and before the group ID is judged: the
+        // group-wide rules (a heartbeat grouped with an application call or an
+        // asset creation, a box index above the foreign apps, a missing heartbeat
+        // payload). A failure is a `TxGroupError` with the not-well-formed
+        // reason, returned bare (issue #2196). The gossip test stage does not
+        // run it (go's `TestTransactionGroup` does not).
+        algo_validate::check_txn_group(txgroup)
+            .map_err(|e| Self::verify_rejection(algo_error::VerifyKind::NotWell, None, e))?;
+
         // 3. Group ID consistency. This is fresh-submission (pool-admission)
         // validation, not block-replay -- use the strict variant so a lone
         // submitted transaction whose `Group` field is non-zero (i.e. it
@@ -10988,6 +10998,22 @@ mod tests {
                 first_valid: Round(1),
                 last_valid: Round(1000),
                 genesis_hash: [0xAA; 32], // matches make_evaluator's block header
+                // go's `checkStateProof` (issue #2196): a 64-byte commitment and
+                // Sumhash-typed proofs.
+                state_proof: Some(algo_types::StateProofBody {
+                    sig_commit: serde_bytes::ByteBuf::from(vec![7u8; 64]),
+                    sig_proofs: Some(algo_types::MerkleProof {
+                        path: None,
+                        hash_factory: Some(algo_types::HashFactory { hash_type: 1 }),
+                        tree_depth: 0,
+                    }),
+                    part_proofs: Some(algo_types::MerkleProof {
+                        path: None,
+                        hash_factory: Some(algo_types::HashFactory { hash_type: 1 }),
+                        tree_depth: 0,
+                    }),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             sig: [0u8; 64],

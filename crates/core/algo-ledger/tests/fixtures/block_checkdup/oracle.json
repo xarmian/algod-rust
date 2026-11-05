@@ -969,6 +969,198 @@
       "verify_framed": true
     },
     {
+      "name": "wf_stpf_payload_valid",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQPI/QUJcRb2SSo4XE0oO8c0pW9YazwhdrqDgJrHUQnS9ejOusVKkRWcoyLs4fd5tFrfC5wd1bX+0s8fCu9QDLQCjdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaJzcIOhUIGjaHNogaF0AaFTgaNoc2iBoXQBoWPEQAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwekdHlwZaRzdHBm"
+      ],
+      "test_error": "",
+      "verify_error": ""
+    },
+    {
+      "name": "wf_stpf_payload_default",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQPyGUDkfVMKvBEYK98diD6Ze3zNvcncMR70GZPLf41iEcBmD8PcX7DAWtAPS16Zi2NHkanwhDpmxsaKNPuk6SwmjdHhuhqJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaR0eXBlpHN0cGY="
+      ],
+      "test_error": "transaction PUSJUR2Z4NKEEHX7RSDG6OYDUUONS7MBA7ZO4CTMS4B7S7KSR5WA: malformed: state proof has an unexpected signature commitment size: has length 0, expected 64",
+      "verify_error": "state proof has an unexpected signature commitment size: has length 0, expected 64",
+      "verify_framed": true
+    },
+    {
+      "name": "wf_stpf_unsupported_type",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQCaCg7rbaVrGXr+cgRCGZJ0X0700WdzfKIKx9kADSWkLJ6re2YNS0wrPxsFGu32GAvkhQmHzFgYCGjv1KDKVwg6jdHhuiKJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaJzcIOhUIGjaHNogaF0AaFTgaNoc2iBoXQBoWPEQAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwemc3B0eXBlAaR0eXBlpHN0cGY="
+      ],
+      "test_error": "transaction DSNCSBQ3BMLGKRHKOBPJD2SIBIKKHOU3MD5LAJDREJZRWFHF4ATA: malformed: state proof has an unsupported type: 1",
+      "verify_error": "state proof has an unsupported type: 1",
+      "verify_framed": true
+    },
+    {
+      "name": "wf_stpf_commit_size",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQPMH+vsMMqFNFYxbeGUoCr795NX1SCBRHIxAAni+abe+MtMrwnr+sgAqk6Vkr0r9hZnwjLNql0wkoaL7R/aTggKjdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaJzcIOhUIGjaHNogaF0AaFTgaNoc2iBoXQBoWPEPwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHB6R0eXBlpHN0cGY="
+      ],
+      "test_error": "transaction X3643EJ2IRSGTWL3SWHGL3WRBPOICXYAWWICYKDCM3CU355WWJ5Q: malformed: state proof has an unexpected signature commitment size: has length 63, expected 64",
+      "verify_error": "state proof has an unexpected signature commitment size: has length 63, expected 64",
+      "verify_framed": true
+    },
+    {
+      "name": "wf_stpf_sig_proofs_hash",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQD/+2zMXb3b2hstrBMEQJstq91Qx4hmxXpVmF56DEiBWo1Cjz54qPoQ1qpnRM8JB1c3yoCVB5l5rp2eTbtocewWjdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaJzcIKhUIGjaHNogaF0AaFjxEAHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHpHR5cGWkc3RwZg=="
+      ],
+      "test_error": "transaction FMSYTEDRNSASGFZMVRLXLMGTYKAUKPC5DMNNO3RNHMRYDGUCAOBA: malformed: state proof uses an unexpected hash algorithm: uses 0, expected 1",
+      "verify_error": "state proof uses an unexpected hash algorithm: uses 0, expected 1",
+      "verify_framed": true
+    },
+    {
+      "name": "wf_stpf_part_proofs_hash",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQDle+0KxC9WunrYOz4YSRc30dMQn6NGaPj0l3vKF/WPaebmpB5cy/a4Szcb1EjKud5dDeOifCJxQGB4kirkoMQejdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaJzcIKhU4GjaHNogaF0AaFjxEAHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHpHR5cGWkc3RwZg=="
+      ],
+      "test_error": "transaction ZSQN6QTF4A6MMDTNHXZCLDZQ5Y4SSMG5UJ557MWOCWRIG7XTDKJA: malformed: state proof uses an unexpected hash algorithm: uses 0, expected 1",
+      "verify_error": "state proof uses an unexpected hash algorithm: uses 0, expected 1",
+      "verify_framed": true
+    },
+    {
+      "name": "wf_stpf_sig_proofs_path",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQMMMk/KueILq3nY7ggLrYRR4WPKGWZheS9Kq3zTS3fEx/DdRfrMjLaTh5h1ClmIrEO4yk1BXcGxE+Ada7mOCkwujdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaJzcIOhUIGjaHNogaF0AaFTgqNoc2iBoXQBo3B0aJHEBQcHBwcHoWPEQAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwekdHlwZaRzdHBm"
+      ],
+      "test_error": "transaction B6XSCFSJ4EOQIP6FEXK4JCKESFQL5LEYMHP4IEMVFXUD5KBYN5MA: malformed: state proof has a Merkle path element with an unexpected size: element 0 has length 5, expected 64",
+      "verify_error": "state proof has a Merkle path element with an unexpected size: element 0 has length 5, expected 64",
+      "verify_framed": true
+    },
+    {
+      "name": "wf_stpf_part_proofs_path",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQCC+f+4zPRyXWnCk8ntCed6m+YMQpAIXGePYP/EP3IFKEhw79QqexM9/KmN5Yl80DgsySKCnyEaPP4jVKtNoyAmjdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaJzcIOhUIKjaHNogaF0AaNwdGiSxEAHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHxD8HBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwehU4GjaHNogaF0AaFjxEAHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHpHR5cGWkc3RwZg=="
+      ],
+      "test_error": "transaction Z7WRVLM2T6AWXVIWNAHTEOVCBN4TSLFRNB7SHGRLBAYYSYQBY7SA: malformed: state proof has a Merkle path element with an unexpected size: element 1 has length 63, expected 64",
+      "verify_error": "state proof has a Merkle path element with an unexpected size: element 1 has length 63, expected 64",
+      "verify_framed": true
+    },
+    {
+      "name": "wf_stpf_path_empty_sibling_is_fine",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQISNajbije4hgnfPHmlV/6VHRec0K4Z3LflYJn79/nvCtcpnW8EiWHCUCY/z/LgYkGuLXubNj5ok7m8cr5/KigKjdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaJzcIOhUIGjaHNogaF0AaFTgqNoc2iBoXQBo3B0aJLEAMRABwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHB6FjxEAHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHpHR5cGWkc3RwZg=="
+      ],
+      "test_error": "",
+      "verify_error": ""
+    },
+    {
+      "name": "wf_stpf_reveal_zero_signature_is_skipped",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQF4PlrmD8RsosjyeXA8vpMoz9xFTsC0uq50OS5t05y3U97K8EmcAiZC6puC5fYEy7eZMOTMjhcjdDCxrfNwMCQejdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaJzcIShUIGjaHNogaF0AaFTgaNoc2iBoXQBoWPEQAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwehcoEAgKR0eXBlpHN0cGY="
+      ],
+      "test_error": "",
+      "verify_error": ""
+    },
+    {
+      "name": "wf_stpf_reveal_short_signature",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQA1UNjwu0ZUcMTOudR5pUWpXNDH2OHRmgRYp1aycuoD6Uy8D35zmQJOkxQl9gEbpMdMA3DrgwR9UbdQrVAqUDwOjdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaJzcIShUIGjaHNogaF0AaFTgaNoc2iBoXQBoWPEQAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwehcoEAgaFzgaFzgaNzaWfEAQGkdHlwZaRzdHBm"
+      ],
+      "test_error": "transaction 3NYXNJO6Y5JAZOAVZZCQJAVGODQWI2SSONIFX2M5PY4POIV2RL5Q: malformed: state proof reveal has an empty or too-short signature",
+      "verify_error": "state proof reveal has an empty or too-short signature",
+      "verify_framed": true
+    },
+    {
+      "name": "wf_stpf_reveal_depth_over_path",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQOO0xhLvQHnkb4w5xB3Qon8knqwrCF3DlFvIYWzOBYtaqKEn0yroPRtZf+eftqLxaDOJ+42jGcMQxtkTXaxRTgajdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaJzcIShUIGjaHNogaF0AaFTgaNoc2iBoXQBoWPEQAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwehcoEAgaFzgaFzgqNwcmaCo2hzaIGhdAGidGQBo3NpZ8QCAQCkdHlwZaRzdHBm"
+      ],
+      "test_error": "transaction XSY5MFSCDHGDGKS7RATNJI6DDRZHCRI2GWOIAZL7AUNSC3A2ZLDA: malformed: state proof reveal has an invalid Merkle proof depth",
+      "verify_error": "state proof reveal has an invalid Merkle proof depth",
+      "verify_framed": true
+    },
+    {
+      "name": "wf_stpf_reveal_depth_too_big",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQBO4x0/9Oyo6WBoqda4LvJUWOm7qN6Exwi5yEem+H+S2v0iy/aq5pvbmr82LIpWa8ah4c+QJttORvzK31A35ngijdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaJzcIShUIGjaHNogaF0AaFTgaNoc2iBoXQBoWPEQAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwehcoEAgaFzgaFzgqNwcmaDo2hzaIGhdAGjcHRo3AARwMDAwMDAwMDAwMDAwMDAwMCidGQRo3NpZ8QCAQCkdHlwZaRzdHBm"
+      ],
+      "test_error": "transaction 7WWTYKCHC57NEEKEDCR3Z5YDWJ5ZV362D2FDYJEULPU4EW6GK54A: malformed: state proof reveal has an invalid Merkle proof depth",
+      "verify_error": "state proof reveal has an invalid Merkle proof depth",
+      "verify_framed": true
+    },
+    {
+      "name": "wf_stpf_reveal_merkle_hash",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQJD4Lz1zCdQUeXTwIbfXJDbhCXl4m3dJesbG+ZLw4QSOA5v+MwyzxYkR/BmC4ro+IdHeAUzjX3J9tMiAlobikQSjdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaJzcIShUIGjaHNogaF0AaFTgaNoc2iBoXQBoWPEQAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwehcoEAgaFzgaFzgaNzaWfEAgEApHR5cGWkc3RwZg=="
+      ],
+      "test_error": "transaction UID6E7DBBFWZWMT37EGIQUSTJVZ5YCNEG3AZ57XYJJFZPSKXA6FQ: malformed: state proof uses an unexpected hash algorithm: uses 0, expected 1",
+      "verify_error": "state proof uses an unexpected hash algorithm: uses 0, expected 1",
+      "verify_framed": true
+    },
+    {
+      "name": "wf_stpf_reveal_merkle_path",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQHFKlxTRtxYq5Bkr64E7s5ygBn2DVGzQYbBiA6HrBey+rF3LwcSDg3/rDUG/lTkkFEa9jQqe7AUH4DwjiqDkwgajdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaJzcIShUIGjaHNogaF0AaFTgaNoc2iBoXQBoWPEQAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwehcoEAgaFzgaFzgqNwcmaDo2hzaIGhdAGjcHRokcQFBwcHBweidGQBo3NpZ8QCAQCkdHlwZaRzdHBm"
+      ],
+      "test_error": "transaction 2ZB2JLAPGHNNEF7MQGT7F6LPBQFDXIC3LEXSJIRA4FIHROBN4PHA: malformed: state proof has a Merkle path element with an unexpected size: element 0 has length 5, expected 64",
+      "verify_error": "state proof has a Merkle path element with an unexpected size: element 0 has length 5, expected 64",
+      "verify_framed": true
+    },
+    {
+      "name": "wf_stpf_reveal_valid",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQJGiqZy6mr0mkXK7p3BJpE9H6TpKhRENmhysUGcuSK2bpABvEjyYOSvcbfbq7LF283n0FTm54e7ZRy6Gs4JUDgSjdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaJzcIShUIGjaHNogaF0AaFTgaNoc2iBoXQBoWPEQAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwehcoEAgaFzgaFzgqNwcmaDo2hzaIGhdAGjcHRokcRABwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHB6J0ZAGjc2lnxAIBAKR0eXBlpHN0cGY="
+      ],
+      "test_error": "",
+      "verify_error": ""
+    },
+    {
+      "name": "wf_stpf_commit_all_zero_bytes",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQOASY69Hm1piPE3iVdOVPabLU9XJmR+i2on0Dw++OfegWmhm5VoE6UsMYuPy4VNE6iH52xDxkXpCS/b7tUO/+AqjdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaJzcIOhUIGjaHNogaF0AaFTgaNoc2iBoXQBoWPEQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACkdHlwZaRzdHBm"
+      ],
+      "test_error": "",
+      "verify_error": ""
+    },
+    {
+      "name": "wf_stpf_reveal_all_zero_signature_bytes",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQJ9WKphZYZv8wYx4kOVEhQ7epj/bJ5l2q4gyN5UzCE4QGGO/XbZZfbyxs7hoTVThs9sSo1DKODLuU/dY5La35gqjdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaJzcIShUIGjaHNogaF0AaFTgaNoc2iBoXQBoWPEQAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwehcoEAgaFzgaFzgqNwcmaDo2hzaIGhdAGjcHRokcRABwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHB6J0ZAGjc2lnxAIAAKR0eXBlpHN0cGY="
+      ],
+      "test_error": "",
+      "verify_error": ""
+    },
+    {
+      "name": "wf_stpf_order_commit_before_proofs",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQO/oOmnso0UEC7gY3BURIBZVjSdgx/yPm+VWiqUt7uURxvw4qFcukHCa+QEpKF1ZZ/tMkr9GsJxR8GR6XhDxLA+jdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaJzcIKhUIGjaHNogaF0AaFjxAEHpHR5cGWkc3RwZg=="
+      ],
+      "test_error": "transaction 5BOMGOQNHRHYEK5SA5CE7DALYJ2MADFTWELCLMT2PFX4CFZWFXGA: malformed: state proof has an unexpected signature commitment size: has length 1, expected 64",
+      "verify_error": "state proof has an unexpected signature commitment size: has length 1, expected 64",
+      "verify_framed": true
+    },
+    {
+      "name": "wf_stpf_order_sig_proofs_before_part",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQNgyivDA0fndIhxAJVWRrtK2xxRf3aijjeefHR53/vZ7CwnWfy/r+aSiD0oWHTgYhv1gSXET766OrfDjaVwTEwujdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaJzcIGhY8RABwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHB6R0eXBlpHN0cGY="
+      ],
+      "test_error": "transaction VIGHMQPBL7QSHWQXBJBPY763VYSY4GRQVTFUC5PQLTXKZIFHJEIQ: malformed: state proof uses an unexpected hash algorithm: uses 0, expected 1",
+      "verify_error": "state proof uses an unexpected hash algorithm: uses 0, expected 1",
+      "verify_framed": true
+    },
+    {
+      "name": "wf_stpf_order_proofs_before_reveals",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQP7epPE+FEiLzIcaK53MwNdt6/Mu0vulbyXO48ij4VwREoUu7USjRW0OxMuCmsbt68dgOsmwz1/8regf8S30EQyjdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaJzcIShUIKjaHNogaF0AaNwdGiRxAUHBwcHB6FTgaNoc2iBoXQBoWPEQAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwehcoEAgaFzgaFzgaNzaWfEAQGkdHlwZaRzdHBm"
+      ],
+      "test_error": "transaction T5Y5W42EAZRVDOGFEOGZIRGLM5IZM4G65WTC5T7Z2NOOFL3D4WCA: malformed: state proof has a Merkle path element with an unexpected size: element 0 has length 5, expected 64",
+      "verify_error": "state proof has a Merkle path element with an unexpected size: element 0 has length 5, expected 64",
+      "verify_framed": true
+    },
+    {
+      "name": "wf_stpf_order_type_before_payload",
+      "group": [
+        "g6RzZ25yxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaNzaWfEQLSmRSmNWNHRFzRVhuY7iu49okZQ3e4ywuoV0gO93zYWUNBqJvQNwA9iFN9u6cjyVZA+gJ1eM4tQ/oYPbhstPgijdHhuh6JmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ijc25kxCC7PFJiqdXHTSAn46fq5Nb/cM9sTOTF4FfBHtOblTRCBaZzcHR5cGUBpHR5cGWkc3RwZg=="
+      ],
+      "test_error": "transaction PZDQHPFDPQCVOFLADVRCFYTBKWIEDK4CTKRYBIUG3NZIYBCLJYHQ: malformed: state proof has an unsupported type: 1",
+      "verify_error": "state proof has an unsupported type: 1",
+      "verify_framed": true
+    },
+    {
       "name": "wf_hb_proof_empty",
       "group": [
         "gqNzaWfEQN28sYK1ASko5vmJeoMHGwoiBcFNSAncmFL3tXW2aApxkB65GQ1sOCaR+CEb2d0zCy2gn5/YT1rMbUIMiEIwwAujdHhuiaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomhihKFhxCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6JrZAGic2TEIAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAo3ZpZMQgAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACibHbNA+ikbm90ZcQLd2YtaGItcHJvb2ajc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlomhi"
@@ -1192,6 +1384,33 @@
       "test_error": "transaction PSQOFNOEJBXFNFISNWTBAYWTCQW32UQLHQO3LCTB4VBWDWV6IOXQ: malformed: the following transaction fields need to be clear/set together : votekey, selkey, votekd",
       "verify_error": "the following transaction fields need to be clear/set together : votekey, selkey, votekd",
       "verify_framed": true
+    },
+    {
+      "name": "wf_group_hb_with_appl",
+      "group": [
+        "gqNzaWfEQHO/WJDQrf9Sx5rSmDiH53U1y7YyEruqUjvl//8ltdWfWyb3FJ3OVZ25gmKoy4GwOypcV/1Tz/TzXr1HDA48TQmjdHhuiqNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQg/JuzgycFsBRsui0skCZE1qvNXk6tBKaRLPsct/CewJeiaGKFoWHEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLomtkAaNwcmaBoXPEQAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACic2TEIAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAo3ZpZMQgAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACibHbNA+ikbm90ZcQGd2ZnLWExo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaJoYg==",
+        "gqNzaWfEQN+Oo6oy0MR2ksES26GQxIIdQS3ttgCyLS9Rkls5jQXXqE6dw9X6prmzp6N/JM63JNIpABVzKoeLfY/qHodusw2jdHhuiqRhcGlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQg/JuzgycFsBRsui0skCZE1qvNXk6tBKaRLPsct/CewJeibHbNA+ikbm90ZcQGd2ZnLWEyo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhcHBs"
+      ],
+      "test_error": "",
+      "verify_error": "heartbeat transaction may not be grouped with an application call or asset creation"
+    },
+    {
+      "name": "wf_group_appl_then_hb",
+      "group": [
+        "gqNzaWfEQP5xiHsrbC7Ve8L1sdTeQMtduQkAxj9k00MyjcWnv8SDtuJdE34AM9hmbl/1Phl2+MQlBPNIt2XvmYLK/nO8KAGjdHhuiqRhcGlkAaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgvangWEwpLC/YDPsPq8zDfsA+pqlNqMMKTRZOwiuNllmibHbNA+ikbm90ZcQGd2ZnLWIxo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhcHBs",
+        "gqNzaWfEQJEjoxI+q2NA44CwFJKt9JjmIWnxd/ZQ4tmuAn3g7F8qR8IXZp1RI9iNqIth+euquGLebUEc7nycbIt17dx8KQKjdHhuiqNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgvangWEwpLC/YDPsPq8zDfsA+pqlNqMMKTRZOwiuNllmiaGKFoWHEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLomtkAaNwcmaBoXPEQAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACic2TEIAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAo3ZpZMQgAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACibHbNA+ikbm90ZcQGd2ZnLWIyo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaJoYg=="
+      ],
+      "test_error": "",
+      "verify_error": "heartbeat transaction may not be grouped with an application call or asset creation"
+    },
+    {
+      "name": "wf_group_hb_with_asset_creation",
+      "group": [
+        "gqNzaWfEQFij23Tsyy20c2wTWYv+ZlpdmgcFSArWpqnBluWpFTAn/2+yJFVMfpW4PTvtD2pnUrOz/AGcAzuZTStxPwkE5AGjdHhuiqNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgs5alAySV+4AhUse+HwUa8MkrpDT/lzLGbIU0OTSWrjGiaGKFoWHEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLomtkAaNwcmaBoXPEQAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACic2TEIAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAo3ZpZMQgAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACibHbNA+ikbm90ZcQGd2ZnLWMxo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaJoYg==",
+        "gqNzaWfEQKkF/7+Pp1xCsLnf5FfGTVumzSO1RLtc1L0lUsJ8IGlG8V/ZVEG4CMwl8+LHjvbfZQGP3gYr+ZgZWOrQUzw3XwWjdHhuiqRhcGFygaF0AaNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgs5alAySV+4AhUse+HwUa8MkrpDT/lzLGbIU0OTSWrjGibHbNA+ikbm90ZcQGd2ZnLWMyo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhY2Zn"
+      ],
+      "test_error": "",
+      "verify_error": "heartbeat transaction may not be grouped with an application call or asset creation"
     },
     {
       "name": "group_gossip_dup_then_inconsistent_group",

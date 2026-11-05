@@ -144,8 +144,8 @@ pub enum WellFormedMode {
     Block,
     /// The submission paths (REST and gossip admission), which also reject an
     /// unknown transaction type with go's `unknown tx type <type>` (the
-    /// `default` case of `WellFormed`'s type switch). Admission only ever
-    /// rejects MORE than [`WellFormedMode::Block`], and only for that case.
+    /// `default` case of `WellFormed`'s type switch). Apart from that case the
+    /// two modes run the same rules, the state-proof payload check included.
     Admission,
 }
 
@@ -628,6 +628,10 @@ pub fn validate_transaction_wellformed_in_mode(
                 message: "lease must be zero in state-proof transaction".to_string(),
             });
         }
+        // Go: `StateProofTxnFields.wellFormed` ends in `checkStateProof` (issue
+        // #2196), so every admission path rejects a malformed payload with go's
+        // text.
+        crate::checks::check_state_proof_payload(txn)?;
     }
 
     // Go: the type switch's `default` case (see
@@ -5226,7 +5230,20 @@ mod tests {
 
     #[test]
     fn test_stpf_valid_ok() {
-        let txn = make_stpf_txn();
+        // The payload must pass `checkStateProof` too (issue #2196): a 64-byte
+        // commitment and Sumhash (type 1) proofs.
+        let sumhash = algo_types::MerkleProof {
+            path: None,
+            hash_factory: Some(algo_types::HashFactory { hash_type: 1 }),
+            tree_depth: 0,
+        };
+        let mut txn = make_stpf_txn();
+        txn.state_proof = Some(algo_types::StateProofBody {
+            sig_commit: ByteBuf::from(vec![0u8; 64]),
+            sig_proofs: Some(sumhash.clone()),
+            part_proofs: Some(sumhash),
+            ..Default::default()
+        });
         let params = v42_params();
         assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
     }

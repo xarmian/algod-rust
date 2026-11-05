@@ -641,6 +641,11 @@ pub fn old_validate_transaction_wellformed(
                 message: "lease must be zero in state-proof transaction".to_string(),
             });
         }
+        // Issue #2196 (deliberate go-parity delta): go's `wellFormed` ends in
+        // `checkStateProof`. Block validation ran it AFTER wellformedness via
+        // `check_payset`, so the block path's verdict is unchanged; this
+        // reference carries the check so the wellformed comparison stays exact.
+        crate::checks::check_state_proof_payload(txn)?;
     }
 
     // ── Cross-field type isolation (Go: transaction.go's `WellFormed`,
