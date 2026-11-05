@@ -1214,6 +1214,57 @@ fn proposal_validation_entry_point_enforces_validate_for_payouts() {
     assert!(err.to_string().contains("proposer missing"), "{err}");
 }
 
+/// `takeFee` accounting for a fee-sink sender on the CURRENT protocol (v41,
+/// payouts enabled; the v39 variant is `sender_is_fee_sink_no_fees_collected_increment`).
+/// Admission refuses the sender under go's special-address rules (issue #2198),
+/// so it enters through the apply path only: the generated block must collect
+/// no fee for it, and the validation entry point must agree.
+#[test]
+fn a_fee_sink_sender_collects_no_fee_in_a_generated_block() {
+    let a = key(1);
+    let b = key(2);
+    let (ledger, mut eval) = evaluator(&[
+        (a.0, funded(50_000_000)),
+        (b.0, funded(1_000_000)),
+        (
+            FEE_SINK,
+            AccountData {
+                auth_addr: Some(a.0),
+                ..funded(50_000_000)
+            },
+        ),
+    ]);
+    let mut from_sink = base_txn(FEE_SINK, TxnType::Pay);
+    from_sink.receiver = b.0;
+    from_sink.amount = 1_000;
+    from_sink.fee = 1_000;
+    let mut from_sink = sign(from_sink, &a.1);
+    from_sink.auth_addr = Some(a.0);
+
+    let err = eval
+        .transaction_group(std::slice::from_ref(&from_sink))
+        .expect_err("admission refuses a fee-sink sender");
+    assert!(
+        err.to_string()
+            .contains("cannot spend from fee sink address"),
+        "{err}"
+    );
+
+    eval.admit_group_apply_path_only_for_test(&[from_sink]);
+    assert_eq!(
+        eval.fees_collected, 0,
+        "the sink's own fee is not collected"
+    );
+    let mut block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.payset.len(), 1, "the real apply accepts it");
+    assert_eq!(block.fees_collected, 0, "the block collects no fee for it");
+    block.proposer = a.0;
+    payout_validator(&ledger)
+        .validate(&block)
+        .map(|_| ())
+        .expect("validation agrees on the fee");
+}
+
 /// Issue #1908: go's `FeesCollected` also counts every paid INNER transaction
 /// fee (`takeFee` in `ledger/eval/applications.go`). The proposer must emit
 /// top-level + inner fees (and derive the payout from that), the overlay

@@ -3732,7 +3732,17 @@ impl SimpleBlockEvaluator {
     /// (admission refuses a fee-sink sender under go's special-address rules,
     /// issue #2198), so a test of the apply path alone needs a way in that does
     /// not go through `transaction_group`. The real apply still judges it when
-    /// the block is generated.
+    /// the block is generated (`finalize_payset` re-runs the whole payset, and
+    /// `FeesCollected` / the proposer payout come from that apply, not from the
+    /// numbers recorded here).
+    ///
+    /// It keeps the bookkeeping the payset, the group table and the size
+    /// accounting need to stay in step (the same `fees_collected`, `txn_bytes`
+    /// and `ExecGroup` `transaction_group` records), and it requires the exec
+    /// state: without it the payset and the group table cannot be kept
+    /// consistent, so that case panics. It does not record the group's txids or
+    /// leases in the pending overlay: callers admit nothing after it that could
+    /// duplicate them.
     pub(crate) fn admit_group_apply_path_only_for_test(
         &mut self,
         group: &[algo_types::SignedTransaction],
@@ -3746,13 +3756,28 @@ impl SimpleBlockEvaluator {
                 stib
             })
             .collect();
-        if let Some(exec) = self.exec.as_mut() {
-            exec.groups.push(ExecGroup {
-                start: self.included_txns.len(),
-                len: stibs.len(),
-                fees: 0,
-            });
-        }
+        let fees = algo_ledger::block_header::payset_fees_collected(&stibs, &self.hdr.fee_sink);
+        let bytes: usize = stibs.iter().map(Self::encoded_len).sum();
+        assert!(
+            self.txn_bytes + bytes <= self.max_txn_bytes,
+            "the helper must not exceed the block size limit"
+        );
+        let exec = self
+            .exec
+            .as_mut()
+            .expect("the apply-path helper needs the exec state");
+        assert_eq!(
+            exec.groups.iter().map(|g| g.len).sum::<usize>(),
+            self.included_txns.len(),
+            "the group table must cover the payset before the helper adds to it"
+        );
+        exec.groups.push(ExecGroup {
+            start: self.included_txns.len(),
+            len: stibs.len(),
+            fees,
+        });
+        self.fees_collected += fees;
+        self.txn_bytes += bytes;
         self.included_txns.extend(stibs);
     }
 }
