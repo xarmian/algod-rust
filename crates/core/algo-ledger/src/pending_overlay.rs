@@ -192,12 +192,6 @@ impl PendingOverlay {
         })
     }
 
-    /// A pending group created, updated or deleted application `app_id`
-    /// (its committed program is then not what a later group would run).
-    pub fn touches_app(&self, app_id: u64) -> bool {
-        self.app_params.contains_key(&app_id)
-    }
-
     /// Number of overlay entries (diagnostics and tests).
     pub fn len(&self) -> usize {
         self.accounts.len()

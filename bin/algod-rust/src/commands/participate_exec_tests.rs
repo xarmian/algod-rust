@@ -3847,12 +3847,16 @@ fn a_degraded_admission_admits_the_unmodified_group() {
 }
 
 /// Issue #2187: admitting a creditable shortfall on an incomplete evaluator
-/// does not skip the other checks of the later members.
+/// does not skip the other checks of the later members. The reported error is
+/// the later member's outright failure (a certain one), not F's deferred
+/// shortfall that go would name first if the credit did not cover it:
+/// verdict-only parity, documented on `validate_group`.
 #[test]
 fn a_degraded_admission_still_refuses_an_expired_later_member() {
     let (mut eval, group) = degraded_group(Defect::Expired);
     let err = eval.transaction_group(&group).expect_err("expired");
     assert!(err.to_string().starts_with("txn dead: round"), "{err}");
+    assert!(!err.to_string().contains("overspend"), "{err}");
     assert!(eval.exec.as_ref().unwrap().groups.is_empty());
 }
 
@@ -3925,48 +3929,6 @@ fn a_creation_below_version_5_cannot_credit_a_later_shortfall() {
         .expect("a version 6 creation may pay G");
 }
 
-/// Issue #2187: below version 9 the program reaches only its references, so
-/// of two short senders the one the creation names is creditable and the other
-/// is not: the group is refused for the second.
-#[test]
-fn a_shortfall_the_call_cannot_reach_is_not_waved_through() {
-    let g = key(7);
-    let h = key(8);
-    let (mut eval, group) = creation_group(6, &[g.0], &[&g, &h]);
-    let err = eval
-        .transaction_group(&group)
-        .expect_err("H is out of reach");
-    let text = err.to_string();
-    assert!(text.contains("overspend"), "{text}");
-    assert!(text.contains(&h.0.to_string()), "names H: {text}");
-    // Control: only G.
-    let (mut eval, group) = creation_group(6, &[g.0], &[&g]);
-    eval.transaction_group(&group)
-        .expect("G alone is creditable");
-    // Version 9 shares every group sender: H is reachable too.
-    let (mut eval, group) = creation_group(9, &[g.0], &[&g, &h]);
-    eval.transaction_group(&group)
-        .expect("version 9 shares senders");
-}
-
-/// Issue #2187: the residual risk of calls to existing applications (their
-/// program version is not read: no ledger access on the rejection path) is
-/// capped per evaluator, so spam of them cannot be admitted without bound.
-#[test]
-fn degraded_admissions_are_capped_per_evaluator() {
-    let (mut eval, group) = degraded_group(Defect::None);
-    eval.exec.as_mut().unwrap().degraded_admissions = DEGRADED_ADMISSION_CAP;
-    let err = eval.transaction_group(&group).expect_err("cap spent");
-    assert!(err.to_string().contains("overspend"), "{err}");
-    let (mut eval, group) = degraded_group(Defect::None);
-    eval.exec.as_mut().unwrap().degraded_admissions = DEGRADED_ADMISSION_CAP - 1;
-    eval.transaction_group(&group).expect("one left");
-    assert_eq!(
-        eval.exec.as_ref().unwrap().degraded_admissions,
-        DEGRADED_ADMISSION_CAP
-    );
-}
-
 /// `[pay, app call, short pay]` on an incomplete evaluator: the call stands
 /// between the payment and the short member, so F's shortfall is creditable.
 #[test]
@@ -4011,75 +3973,9 @@ fn a_plain_payment_alone_never_makes_a_shortfall_creditable() {
     assert!(err.to_string().contains("overspend"), "{err}");
 }
 
-/// `creation_group` variant: the creation (AVM `version`) is given by the
-/// caller's closure, so it can carry `access` or foreign applications.
-fn creation_group_with(
-    version: u8,
-    tweak: impl FnOnce(&mut Transaction),
-    senders: &[&Key],
-) -> (SimpleBlockEvaluator, Vec<SignedTransaction>) {
-    let s = key(3);
-    let r = key(4);
-    let (_ledger, mut eval) = evaluator(&[(s.0, funded(5_000_000)), (r.0, funded(1_000_000))]);
-    let program =
-        algo_avm::assembler::assemble_string(&format!("#pragma version {version}\nint 1\n"))
-            .expect("assembles")
-            .program;
-    let mut create = base_txn(s.0, TxnType::Appl);
-    create.approval_program = Some(serde_bytes::ByteBuf::from(program.clone()));
-    create.clear_state_program = Some(serde_bytes::ByteBuf::from(program));
-    tweak(&mut create);
-    let mut members = vec![create];
-    for (i, k) in senders.iter().enumerate() {
-        members.push(pay_txn(k, r.0, 1_000, 20 + i as u8));
-    }
-    let gid = algo_codec::compute_group_id(&members);
-    members.iter_mut().for_each(|m| m.group = gid.0);
-    let mut signed = vec![sign(members[0].clone(), &s.1)];
-    for (m, k) in members[1..].iter().zip(senders) {
-        signed.push(sign(m.clone(), &k.1));
-    }
-    eval.exec.as_mut().unwrap().incomplete = true;
-    (eval, signed)
-}
-
-/// Issue #2187: go fills an app call's available accounts from its `access`
-/// list as well as `accounts`, so a version 6 creation whose `access` names
-/// G may pay G.
-#[test]
-fn an_access_list_address_is_reachable_by_a_version_6_creation() {
-    let g = key(7);
-    let h = key(8);
-    let named = |create: &mut Transaction| {
-        create.access = Some(vec![algo_types::ResourceRef {
-            address: g.0,
-            ..Default::default()
-        }]);
-    };
-    let (mut eval, group) = creation_group_with(6, named, &[&g]);
-    eval.transaction_group(&group)
-        .expect("G is named in access");
-    let (mut eval, group) = creation_group_with(6, named, &[&h]);
-    let err = eval.transaction_group(&group).expect_err("H is not named");
-    assert!(err.to_string().contains("overspend"), "{err}");
-}
-
-/// Issue #2187: a version 6 program that names a foreign application may
-/// inner-call it, and a version 9 callee shares every group sender, so even an
-/// unnamed F is reachable; without a foreign application it is not.
-#[test]
-fn a_version_6_creation_naming_a_foreign_app_may_reach_any_sender_through_it() {
-    let f = key(7);
-    let (mut eval, group) = creation_group_with(6, |c| c.foreign_apps = Some(vec![900]), &[&f]);
-    eval.transaction_group(&group)
-        .expect("the callee may be version 9");
-    let (mut eval, group) = creation_group_with(6, |_| {}, &[&f]);
-    let err = eval.transaction_group(&group).expect_err("nothing to call");
-    assert!(err.to_string().contains("overspend"), "{err}");
-}
-
-/// Two applications on one evaluator: 905 is version 2 (no inner
-/// transactions), 906 is version 9.
+/// Two applications on one evaluator: 905 is version 2, 906 is version 9.
+/// (The degraded rule does not read them: every call to an existing
+/// application may credit.)
 fn two_app_evaluator() -> SimpleBlockEvaluator {
     let s = key(3);
     let r = key(4);
@@ -4089,10 +3985,11 @@ fn two_app_evaluator() -> SimpleBlockEvaluator {
     eval
 }
 
-/// `[call to `app_id` by S, F pays R (short)]`; `note` keeps the txids apart.
-fn call_then_short_pay(app_id: u64, note: u8) -> Vec<SignedTransaction> {
+/// `[call to `app_id` by S, key(seed) pays R (short)]`; `note` keeps the txids
+/// of repeated groups apart.
+fn call_then_short_pay(app_id: u64, seed: u8, note: u8) -> Vec<SignedTransaction> {
     let s = key(3);
-    let f = key(7);
+    let f = key(seed);
     let r = key(4);
     let mut call = base_txn(s.0, TxnType::Appl);
     call.application_id = app_id;
@@ -4104,70 +4001,110 @@ fn call_then_short_pay(app_id: u64, note: u8) -> Vec<SignedTransaction> {
     vec![sign(m0, &s.1), sign(m1, &f.1)]
 }
 
-/// Issue #2187: calls to a version 2 application can never credit anyone, so
-/// spam of them is refused without spending the cap, and an honest
-/// inner-funded group (version 9 application) is still admitted afterwards.
+/// Issue #2187: the per-sender cap. Repeated groups of ONE short sender share
+/// one slot (an honest sender is not starved by its own retries).
 #[test]
-fn spam_of_harmless_calls_does_not_use_up_the_degraded_cap() {
+fn one_short_sender_takes_one_cap_slot_however_many_groups() {
     let mut eval = two_app_evaluator();
     eval.exec.as_mut().unwrap().incomplete = true;
-    for n in 0..(DEGRADED_ADMISSION_CAP as u8 + 8) {
-        let err = eval
-            .transaction_group(&call_then_short_pay(905, n))
-            .expect_err("a version 2 call cannot credit");
-        assert!(err.to_string().contains("overspend"), "{err}");
+    for n in 0..(DEGRADED_SENDER_CAP as u8 + 8) {
+        eval.transaction_group(&call_then_short_pay(906, 7, n))
+            .expect("the same sender, one slot");
     }
-    assert_eq!(eval.exec.as_ref().unwrap().degraded_admissions, 0);
-    eval.transaction_group(&call_then_short_pay(906, 200))
-        .expect("an honest version 9 group");
-    assert_eq!(eval.exec.as_ref().unwrap().degraded_admissions, 1);
+    assert_eq!(eval.exec.as_ref().unwrap().degraded_senders.len(), 1);
 }
 
-/// The cap itself, across groups: version 9 calls are admitted until it is
-/// spent, then refused with go's overspend text.
+/// Distinct short senders each take a slot until the cap is spent; then a NEW
+/// sender is refused with go's overspend text while an admitted sender still
+/// gets through.
 #[test]
-fn the_cap_admits_exactly_its_number_of_creditable_groups() {
+fn distinct_short_senders_are_capped() {
     let mut eval = two_app_evaluator();
     eval.exec.as_mut().unwrap().incomplete = true;
-    for n in 0..DEGRADED_ADMISSION_CAP as u8 {
-        eval.transaction_group(&call_then_short_pay(906, n))
+    for n in 0..DEGRADED_SENDER_CAP as u8 {
+        eval.transaction_group(&call_then_short_pay(906, 100 + n, n))
             .expect("within the cap");
     }
     let err = eval
-        .transaction_group(&call_then_short_pay(906, 250))
-        .expect_err("cap spent");
+        .transaction_group(&call_then_short_pay(906, 200, 250))
+        .expect_err("cap spent for a new sender");
     assert!(err.to_string().contains("overspend"), "{err}");
+    assert_eq!(
+        eval.exec.as_ref().unwrap().degraded_senders.len(),
+        DEGRADED_SENDER_CAP
+    );
+    eval.transaction_group(&call_then_short_pay(906, 100, 251))
+        .expect("an admitted sender keeps its slot");
 }
 
-/// An evaluator with no exec state at all admits a creditable shortfall as it
-/// did before the cap existed (nothing to cap, nothing to panic), and still
-/// refuses what is provably not creditable.
+/// A slot is taken only when the group is really admitted: a group refused for
+/// another reason (here an expired later member) leaves the cap untouched.
+#[test]
+fn a_refused_degraded_group_takes_no_slot() {
+    let (mut eval, group) = degraded_group(Defect::Expired);
+    eval.transaction_group(&group).expect_err("expired");
+    assert!(eval.exec.as_ref().unwrap().degraded_senders.is_empty());
+}
+
+/// An evaluator with no exec state admits a creditable shortfall as it did
+/// before the cap existed (nothing to cap, nothing to panic), and still
+/// refuses what the group itself proves harmless (a version 4 creation).
 #[test]
 fn an_evaluator_without_exec_state_admits_a_creditable_shortfall() {
     let mut eval = two_app_evaluator();
     eval.exec = None;
-    for n in 0..(DEGRADED_ADMISSION_CAP as u8 + 4) {
-        eval.transaction_group(&call_then_short_pay(906, n))
+    for n in 0..(DEGRADED_SENDER_CAP as u8 + 4) {
+        eval.transaction_group(&call_then_short_pay(906, 7, n))
             .expect("no exec state, no cap");
     }
-    let err = eval
-        .transaction_group(&call_then_short_pay(905, 250))
-        .expect_err("a version 2 call cannot credit");
+    let g = key(7);
+    let (mut eval, group) = creation_group(4, &[g.0], &[&g]);
+    eval.exec = None;
+    let err = eval.transaction_group(&group).expect_err("version 4");
     assert!(err.to_string().contains("overspend"), "{err}");
 }
 
-/// Error attribution, verdict-only: with `[call, F short (creditable), T
-/// expired]` the group is refused and the error is T's, a certain failure,
-/// where go would name F's overspend if the credit did not cover it.
+/// The group-local rule, exactly: only a creation of version 4 or older proves
+/// a call harmless; an existing application, a version 5 creation and a
+/// creation with no readable program may credit.
 #[test]
-fn a_later_outright_failure_is_the_reported_error_after_a_deferred_shortfall() {
-    let (mut eval, group) = degraded_group(Defect::Expired);
-    let err = eval.transaction_group(&group).expect_err("refused");
-    let expired_txid = txid(&group[2]);
-    assert!(err.to_string().starts_with("txn dead: round"), "{err}");
-    assert!(
-        !err.to_string().contains("overspend"),
-        "T's failure, not F's deferred shortfall ({expired_txid}): {err}"
+fn the_group_local_rule_is_exact() {
+    let mut create = base_txn(key(3).0, TxnType::Appl);
+    let program = |v: u8| {
+        algo_avm::assembler::assemble_string(&format!("#pragma version {v}\nint 1\n"))
+            .expect("assembles")
+            .program
+    };
+    create.approval_program = Some(serde_bytes::ByteBuf::from(program(4)));
+    assert!(!SimpleBlockEvaluator::app_call_may_credit(&create));
+    create.approval_program = Some(serde_bytes::ByteBuf::from(program(5)));
+    assert!(SimpleBlockEvaluator::app_call_may_credit(&create));
+    create.approval_program = Some(serde_bytes::ByteBuf::from(Vec::new()));
+    assert!(SimpleBlockEvaluator::app_call_may_credit(&create));
+    create.approval_program = None;
+    assert!(SimpleBlockEvaluator::app_call_may_credit(&create));
+    create.application_id = 906;
+    create.approval_program = Some(serde_bytes::ByteBuf::from(program(2)));
+    assert!(SimpleBlockEvaluator::app_call_may_credit(&create));
+}
+
+/// Known residual (follow-up #2217): the cheap overlay of an incomplete
+/// evaluator does not know the inner credit that justified the admission, so
+/// the short sender is saturated to 0 and the receiver is credited as if the
+/// sender could pay. Pinned so a change to it is deliberate.
+#[test]
+fn a_degraded_admission_leaves_phantom_balances() {
+    let mut eval = two_app_evaluator();
+    eval.exec.as_mut().unwrap().incomplete = true;
+    let f = key(7);
+    let r = key(4);
+    eval.transaction_group(&call_then_short_pay(906, 7, 1))
+        .expect("admitted");
+    assert_eq!(eval.try_effective_balance(&f.0).expect("F"), 0);
+    assert_eq!(
+        eval.try_effective_balance(&r.0).expect("R"),
+        1_000_000 + 1_000,
+        "R holds a credit F could not pay"
     );
 }
 
