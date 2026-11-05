@@ -93,6 +93,11 @@ type blockDupFixture struct {
 	// they run in), plus the group-error and signature texts of the REST
 	// path; see wellformed.go.
 	WellFormed []blockDupWFRow `json:"wellformed"`
+	// Issue #2197: what go's decoder (`protocol.Decode`, the generated msgp
+	// unmarshaller) says of a `SignedTxn` whose sender is the zero address. go
+	// encodes it with no `snd` key, and since v4.7.2 `snd` is `codec:",required"`:
+	// the decode fails before `WellFormed` could run.
+	DecodeRequired []blockDupDecodeRow `json:"decode_required"`
 	// Issue #2193: `Transaction.WellFormed` itself, per consensus version
 	// (the protocol gates the ledger's own protocol cannot reach).
 	WellFormedProto []blockDupWFProtoRow `json:"wellformed_proto"`
@@ -117,6 +122,13 @@ type blockDupWFRow struct {
 	// frame (a not-well-formed or unsigned member, a failed signature or
 	// LogicSig of one member); group-level errors are returned bare.
 	VerifyFramed bool `json:"verify_framed,omitempty"`
+}
+
+// blockDupDecodeRow is go's decode of one encoded `SignedTxn`.
+type blockDupDecodeRow struct {
+	Name        string `json:"name"`
+	Txn         string `json:"txn"`
+	DecodeError string `json:"decode_error"`
 }
 
 // blockDupWFProtoRow is `Transaction.WellFormed(spec, proto)` of one
@@ -744,6 +756,26 @@ func blockDupOracle() {
 			}
 		}
 		f.WellFormed = append(f.WellFormed, row)
+	}
+
+	// Issue #2197: the rows whose sender is the zero address are well formed
+	// to the in-memory `WellFormed` above, but cannot cross the wire: go's own
+	// decoder refuses them (`snd` is a required field).
+	for _, r := range wellFormedRows(wfEnv{
+		params: params, sender: sender, receiver: acctB, sink: sink, pool: pool,
+		genesisHash: genesisHash,
+		sign:        func(t transactions.Transaction) transactions.SignedTxn { return t.Sign(secrets) },
+	}) {
+		if !strings.Contains(r.name, "zero_sender") {
+			continue
+		}
+		enc := protocol.Encode(&r.tx)
+		var back transactions.SignedTxn
+		f.DecodeRequired = append(f.DecodeRequired, blockDupDecodeRow{
+			Name:        r.name,
+			Txn:         b64(enc),
+			DecodeError: errText(protocol.Decode(enc, &back)),
+		})
 	}
 
 	// Issue #2193: WellFormed per consensus version, on a heartbeat with valid
