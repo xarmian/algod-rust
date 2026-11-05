@@ -52,7 +52,7 @@ use crate::rules::{
     MAX_TIMESTAMP_INCREMENT,
 };
 use crate::signature::{
-    logic_sig_group_size_check, verify_auth_addr_sender_diff, verify_heartbeat_proof,
+    logic_sig_group_size_check, verify_auth_addr_sender_diff, verify_member_heartbeat_proof,
     verify_rekeying_supported, verify_transaction_signature,
 };
 use crate::verified_txn_cache::{GroupContext, VerificationContext, VerifiedTransactionCache};
@@ -539,31 +539,17 @@ pub fn validate_block_with_cache(
                 }
             }
 
-            // Heartbeat proof verification (Go: stxnCoreChecks, verify/txn.go).
-            // For heartbeat transactions, verify the one-time-sig proof that
-            // demonstrates possession of the account's participation keys.
-            if stx.txn.txn_type == "hb" {
-                if let Some(ref hb) = stx.txn.heartbeat {
-                    if let Some(ref proof) = hb.proof {
-                        if let Err(e) = verify_heartbeat_proof(
-                            proof,
-                            &hb.vote_id,
-                            stx.txn.last_valid.0,
-                            hb.key_dilution,
-                            &hb.seed,
-                        ) {
-                            errors.push(BlockValidationError::SignatureVerificationFailed {
-                                txn_index: idx,
-                                error: format!("heartbeat proof verification failed: {e}"),
-                            });
-                        }
-                    } else {
-                        errors.push(BlockValidationError::SignatureVerificationFailed {
-                            txn_index: idx,
-                            error: "heartbeat transaction missing proof".to_string(),
-                        });
-                    }
-                }
+            // Heartbeat proof verification (Go: `txnBatchPrep` ->
+            // `HeartbeatProof.BatchPrep`, verify/txn.go): the shared member rule,
+            // which selects heartbeats by type and counts a missing payload or
+            // proof as a failed proof. A bad proof keeps the group out of the
+            // verified-group cache, like a bad signature.
+            if let Err(e) = verify_member_heartbeat_proof(stx) {
+                group_sig_ok = false;
+                errors.push(BlockValidationError::SignatureVerificationFailed {
+                    txn_index: idx,
+                    error: format!("heartbeat proof verification failed: {e}"),
+                });
             }
 
             // AuthAddr != Sender check (Go: EnforceAuthAddrSenderDiff, future only).

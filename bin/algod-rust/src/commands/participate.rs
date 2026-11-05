@@ -2104,8 +2104,10 @@ impl SimpleBlockEvaluator {
         // correctness gates (proof verification, challenge eligibility,
         // free-fee eligibility) are enforced elsewhere: LogicSig signature
         // verification a few lines below (this account's accepting
-        // program), `block.rs`'s block-level `verify_heartbeat_proof` call,
-        // and `apply::apply_heartbeat`'s challenge/vote-ID/seed checks.
+        // program), the heartbeat proof check in the same signature stage
+        // (`check_heartbeat_proofs`, issue #2218, shared with block
+        // validation), and `apply::apply_heartbeat`'s challenge/vote-ID/seed
+        // checks.
 
         // 2. Per-transaction well-formedness. go's `Transaction.WellFormed` has
         // no fee check at all (fee pooling is unconditional since v28): the fee
@@ -2236,8 +2238,12 @@ impl SimpleBlockEvaluator {
             }
         } else {
             verify_member_signatures()?;
+            // go's batch also holds every heartbeat's proof (issue #2218); the
+            // cached path above checks it inside
+            // `verify_transaction_group_cached`, the same place the gossip
+            // `BatchVerifier` does.
+            algo_validate::check_heartbeat_proofs(txgroup)?;
         }
-
         // 6. (moved) The validity window and the genesis ID / hash checks are
         // go's `BlockHeader.Alive`, which `BlockEvaluator.transaction` runs per
         // transaction, before that transaction's `checkDup`: see
@@ -11123,6 +11129,143 @@ mod tests {
         eval.transaction_group(&[stx])
             .expect("a well-formed accepting-LogicSig heartbeat must be admitted");
         assert_eq!(eval.pay_set_size(), 1);
+    }
+
+    // ---- Issue #2218: the heartbeat proof is part of go's signature batch ----
+
+    /// A heartbeat with a real, valid proof (built like the node's own heartbeat
+    /// service does), and the same one with a bit of its leaf signature flipped.
+    fn heartbeat_with_and_without_a_valid_proof() -> (SignedTransaction, SignedTransaction) {
+        let first_id = algo_consensus_crypto::one_time_id_for_round(0, 10);
+        let last_id = algo_consensus_crypto::one_time_id_for_round(2000, 10);
+        let voting = algo_consensus_crypto::OneTimeSignatureSecrets::generate(
+            first_id.batch,
+            last_id.batch - first_id.batch + 1,
+        );
+        let vote_id = voting.verifier();
+        let good = algo_ledger::build_heartbeat_transaction(algo_ledger::HeartbeatParams {
+            hb_address: Address([7u8; 32]),
+            voting: &voting,
+            vote_id,
+            key_dilution: 10,
+            genesis_hash: [0xAA; 32],
+            latest_round: Round(90),
+            latest_seed: [0x55u8; 32],
+            challenge_discount: false,
+        });
+        let mut bad = good.clone();
+        bad.txn
+            .heartbeat
+            .as_mut()
+            .and_then(|hb| hb.proof.as_mut())
+            .expect("the builder sets a proof")
+            .sig[0] ^= 1;
+        (good, bad)
+    }
+
+    fn cache_context(eval: &SimpleBlockEvaluator) -> algo_validate::VerificationContext {
+        algo_validate::VerificationContext {
+            spec_addrs: algo_validate::SpecialAddresses {
+                fee_sink: eval.hdr.fee_sink,
+                rewards_pool: eval.hdr.rewards_pool,
+            },
+            consensus_version: eval.hdr.current_protocol.clone(),
+        }
+    }
+
+    /// go's `txnBatchPrep` enqueues the proof's signatures into the batch, so a
+    /// bad proof is the bare batch failure, like a bad signature; the same group
+    /// with a valid proof is admitted (no cache).
+    #[test]
+    fn a_tampered_heartbeat_proof_is_the_batch_failure() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (good, bad) = heartbeat_with_and_without_a_valid_proof();
+        let mut eval = make_evaluator(&ledger, &params, 100, &[]);
+        let err = eval.transaction_group(&[bad]).unwrap_err();
+        assert!(err.is_batch_sig_failure(), "{err}");
+        let mut eval = make_evaluator(&ledger, &params, 100, &[]);
+        eval.transaction_group(&[good])
+            .expect("a valid proof is admitted");
+    }
+
+    /// The same through the verified-group cache (the gossip `BatchVerifier`'s
+    /// path): a bad proof fails and is never cached; a valid one is admitted and
+    /// cached; and a group the cache already vouches for (block validation caches
+    /// a group without checking the proof) is still refused for its proof.
+    #[test]
+    fn a_tampered_heartbeat_proof_fails_through_the_verified_group_cache() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (good, bad) = heartbeat_with_and_without_a_valid_proof();
+        let cache = Arc::new(algo_validate::VerifiedTransactionCache::new(16));
+        let mut eval = make_evaluator(&ledger, &params, 100, &[]);
+        eval.verified_txn_cache = Some(cache.clone());
+        let context = cache_context(&eval);
+
+        let err = eval
+            .transaction_group(std::slice::from_ref(&bad))
+            .unwrap_err();
+        assert!(err.is_batch_sig_failure(), "{err}");
+        assert!(
+            !cache
+                .get_unverified_transaction_groups(&[vec![bad.clone()]], &context)
+                .is_empty(),
+            "a group with a bad proof is never cached"
+        );
+
+        // A pre-existing cache entry for the bad group does not skip the proof.
+        cache.add(Arc::new(algo_validate::GroupContext::new(
+            context.clone(),
+            vec![bad.clone()],
+        )));
+        let err = eval.transaction_group(&[bad]).unwrap_err();
+        assert!(err.is_batch_sig_failure(), "cache hit: {err}");
+
+        let mut eval = make_evaluator(&ledger, &params, 100, &[]);
+        eval.verified_txn_cache = Some(cache.clone());
+        eval.transaction_group(std::slice::from_ref(&good))
+            .expect("a valid proof is admitted");
+        assert!(
+            cache
+                .get_unverified_transaction_groups(&[vec![good]], &context)
+                .is_empty(),
+            "a verified group is cached"
+        );
+    }
+
+    /// The gossip stage's own entry point (`verify_transaction_group_cached`,
+    /// what the shared `BatchVerifier` runs): a bad proof is the batch failure
+    /// and the group is not cached; a valid one is cached.
+    #[test]
+    fn the_gossip_batch_verifier_function_checks_the_heartbeat_proof() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (good, bad) = heartbeat_with_and_without_a_valid_proof();
+        let eval = make_evaluator(&ledger, &params, 100, &[]);
+        let context = cache_context(&eval);
+        let cache = algo_validate::VerifiedTransactionCache::new(16);
+        let err = algo_validate::verify_transaction_group_cached(
+            std::slice::from_ref(&bad),
+            &context,
+            &params,
+            &cache,
+        )
+        .unwrap_err();
+        assert!(err.is_batch_sig_failure(), "{err}");
+        assert!(!cache
+            .get_unverified_transaction_groups(&[vec![bad]], &context)
+            .is_empty());
+        algo_validate::verify_transaction_group_cached(
+            std::slice::from_ref(&good),
+            &context,
+            &params,
+            &cache,
+        )
+        .expect("a valid proof verifies");
+        assert!(cache
+            .get_unverified_transaction_groups(&[vec![good]], &context)
+            .is_empty());
     }
 
     /// A heartbeat whose LogicSig sets `RekeyTo` fails the accepting
