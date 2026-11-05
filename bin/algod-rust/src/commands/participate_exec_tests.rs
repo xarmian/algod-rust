@@ -3788,61 +3788,227 @@ fn a_shortfall_before_any_app_call_stays_rejected_in_degraded_mode() {
     }
 }
 
-/// Issue #2187: admitting a creditable shortfall on an incomplete evaluator
-/// does not skip the other checks: `[app call, F short, third member]` is
-/// still refused when the third member is expired, wrongly authorized, or the
-/// group's fees are below the minimum.
-#[test]
-fn a_degraded_admission_still_runs_every_other_check() {
+/// What is wrong with the third member of [`degraded_group`].
+#[derive(Clone, Copy, PartialEq)]
+enum Defect {
+    None,
+    Expired,
+    GroupFees,
+    WrongAuthorizer,
+}
+
+/// `[app call by S (names F), F pays R (short), T pays R]`: the later members'
+/// checks must still run when the evaluator admits F's shortfall without a
+/// real apply (issue #2187). T is rekeyed in the ledger under `WrongAuthorizer`
+/// while its member is validly signed by T itself.
+fn degraded_group(defect: Defect) -> (SimpleBlockEvaluator, Vec<SignedTransaction>) {
     let s = key(3);
     let f = key(7);
     let r = key(4);
-    for case in ["expired", "wrong authorizer", "group fees"] {
-        let (mut eval, group) = app_then_pay_group(9, false, true, 1_000);
-        eval.exec.as_mut().unwrap().incomplete = true;
-        // The same group plus a third member by S.
-        let mut members: Vec<Transaction> = group.iter().map(|g| g.txn.clone()).collect();
-        let mut third = pay_txn(&s, r.0, 1_000, 6);
-        match case {
-            "expired" => {
-                third.first_valid = Round(5_000);
-                third.last_valid = Round(6_000);
-            }
-            "group fees" => {
-                for m in members.iter_mut() {
-                    m.fee = 0;
-                }
-                third.fee = 0;
-            }
-            _ => {}
-        }
-        members.push(third);
-        for m in members.iter_mut() {
-            m.group = [0; 32];
-        }
-        let gid = algo_codec::compute_group_id(&members);
-        for m in members.iter_mut() {
-            m.group = gid.0;
-        }
-        let keys = [&s, &f, &s];
-        let mut regrouped: Vec<SignedTransaction> = members
-            .into_iter()
-            .zip(keys)
-            .map(|(t, k)| sign(t, &k.1))
-            .collect();
-        if case == "wrong authorizer" {
-            regrouped[2].auth_addr = Some(r.0);
-        }
-        // Control: without the third member's defect the group is admitted.
-        if case == "expired" {
-            let (mut ok_eval, ok_group) = app_then_pay_group(9, false, true, 1_000);
-            ok_eval.exec.as_mut().unwrap().incomplete = true;
-            ok_eval.transaction_group(&ok_group).expect("admitted");
-        }
-        eval.transaction_group(&regrouped)
-            .expect_err(&format!("{case} must be refused"));
-        assert!(eval.exec.as_ref().unwrap().groups.is_empty());
+    let t = key(9);
+    let app_id = 904u64;
+    let app_addr = Address(algo_ledger::avm_context::app_address(app_id));
+    let mut t_account = funded(5_000_000);
+    if defect == Defect::WrongAuthorizer {
+        t_account.auth_addr = Some(key(10).0);
     }
+    let (ledger, mut eval) = evaluator(&[
+        (s.0, funded(5_000_000)),
+        (r.0, funded(1_000_000)),
+        (t.0, t_account),
+        (app_addr, funded(10_000_000)),
+    ]);
+    put_app(&ledger, app_id, s.0, "#pragma version 9\nint 1\n");
+    let mut call = base_txn(s.0, TxnType::Appl);
+    call.application_id = app_id;
+    call.accounts = Some(vec![f.0]);
+    let mut members = [call, pay_txn(&f, r.0, 1_000, 5), pay_txn(&t, r.0, 1_000, 6)];
+    match defect {
+        Defect::Expired => {
+            members[2].first_valid = Round(5_000);
+            members[2].last_valid = Round(6_000);
+        }
+        Defect::GroupFees => members.iter_mut().for_each(|m| m.fee = 0),
+        Defect::None | Defect::WrongAuthorizer => {}
+    }
+    let gid = algo_codec::compute_group_id(&members);
+    members.iter_mut().for_each(|m| m.group = gid.0);
+    let [m0, m1, m2] = members;
+    eval.exec.as_mut().unwrap().incomplete = true;
+    (eval, vec![sign(m0, &s.1), sign(m1, &f.1), sign(m2, &t.1)])
+}
+
+/// Control for the three cases below: the unmodified group is admitted on the
+/// incomplete evaluator (F's shortfall is creditable by the call).
+#[test]
+fn a_degraded_admission_admits_the_unmodified_group() {
+    let (mut eval, group) = degraded_group(Defect::None);
+    eval.transaction_group(&group).expect("admitted");
+}
+
+/// Issue #2187: admitting a creditable shortfall on an incomplete evaluator
+/// does not skip the other checks of the later members.
+#[test]
+fn a_degraded_admission_still_refuses_an_expired_later_member() {
+    let (mut eval, group) = degraded_group(Defect::Expired);
+    let err = eval.transaction_group(&group).expect_err("expired");
+    assert!(err.to_string().starts_with("txn dead: round"), "{err}");
+    assert!(eval.exec.as_ref().unwrap().groups.is_empty());
+}
+
+#[test]
+fn a_degraded_admission_still_checks_the_group_fees() {
+    let (mut eval, group) = degraded_group(Defect::GroupFees);
+    let err = eval.transaction_group(&group).expect_err("fees");
+    assert!(err.to_string().contains("fees is less than"), "{err}");
+    assert!(eval.exec.as_ref().unwrap().groups.is_empty());
+}
+
+/// T's member is validly signed by T, but the ledger says T is rekeyed: the
+/// authorizer check of a member AFTER the skipped shortfall still runs.
+#[test]
+fn a_degraded_admission_still_checks_a_later_authorizer() {
+    let (mut eval, group) = degraded_group(Defect::WrongAuthorizer);
+    let err = eval.transaction_group(&group).expect_err("authorizer");
+    assert!(
+        err.to_string().contains("should have been authorized by"),
+        "{err}"
+    );
+    assert!(eval.exec.as_ref().unwrap().groups.is_empty());
+}
+
+/// `[create (AVM `version`, `names` in its accounts), one pay per sender
+/// (each empty)]` on an incomplete evaluator.
+fn creation_group(
+    version: u8,
+    names: &[Address],
+    senders: &[&Key],
+) -> (SimpleBlockEvaluator, Vec<SignedTransaction>) {
+    let s = key(3);
+    let r = key(4);
+    let (_ledger, mut eval) = evaluator(&[(s.0, funded(5_000_000)), (r.0, funded(1_000_000))]);
+    let program =
+        algo_avm::assembler::assemble_string(&format!("#pragma version {version}\nint 1\n"))
+            .expect("assembles")
+            .program;
+    let mut create = base_txn(s.0, TxnType::Appl);
+    create.approval_program = Some(serde_bytes::ByteBuf::from(program.clone()));
+    create.clear_state_program = Some(serde_bytes::ByteBuf::from(program));
+    if !names.is_empty() {
+        create.accounts = Some(names.to_vec());
+    }
+    let mut members = vec![create];
+    for (i, k) in senders.iter().enumerate() {
+        members.push(pay_txn(k, r.0, 1_000, 20 + i as u8));
+    }
+    let gid = algo_codec::compute_group_id(&members);
+    members.iter_mut().for_each(|m| m.group = gid.0);
+    let mut signed = vec![sign(members[0].clone(), &s.1)];
+    for (m, k) in members[1..].iter().zip(senders) {
+        signed.push(sign(m.clone(), &k.1));
+    }
+    eval.exec.as_mut().unwrap().incomplete = true;
+    (eval, signed)
+}
+
+/// Issue #2187: the bound that needs no ledger access. An app CREATION carries
+/// its program in the group: version 4 cannot make inner transactions, so a
+/// later shortfall is go's overspend; version 5 and up may credit.
+#[test]
+fn a_creation_below_version_5_cannot_credit_a_later_shortfall() {
+    let g = key(7);
+    let (mut eval, group) = creation_group(4, &[g.0], &[&g]);
+    let err = eval.transaction_group(&group).expect_err("overspend");
+    assert!(err.to_string().contains("overspend"), "{err}");
+    let (mut eval, group) = creation_group(6, &[g.0], &[&g]);
+    eval.transaction_group(&group)
+        .expect("a version 6 creation may pay G");
+}
+
+/// Issue #2187: below version 9 the program reaches only its references, so
+/// of two short senders the one the creation names is creditable and the other
+/// is not: the group is refused for the second.
+#[test]
+fn a_shortfall_the_call_cannot_reach_is_not_waved_through() {
+    let g = key(7);
+    let h = key(8);
+    let (mut eval, group) = creation_group(6, &[g.0], &[&g, &h]);
+    let err = eval
+        .transaction_group(&group)
+        .expect_err("H is out of reach");
+    let text = err.to_string();
+    assert!(text.contains("overspend"), "{text}");
+    assert!(text.contains(&h.0.to_string()), "names H: {text}");
+    // Control: only G.
+    let (mut eval, group) = creation_group(6, &[g.0], &[&g]);
+    eval.transaction_group(&group)
+        .expect("G alone is creditable");
+    // Version 9 shares every group sender: H is reachable too.
+    let (mut eval, group) = creation_group(9, &[g.0], &[&g, &h]);
+    eval.transaction_group(&group)
+        .expect("version 9 shares senders");
+}
+
+/// Issue #2187: the residual risk of calls to existing applications (their
+/// program version is not read: no ledger access on the rejection path) is
+/// capped per evaluator, so spam of them cannot be admitted without bound.
+#[test]
+fn degraded_admissions_are_capped_per_evaluator() {
+    let (mut eval, group) = degraded_group(Defect::None);
+    eval.exec.as_mut().unwrap().degraded_admissions = DEGRADED_ADMISSION_CAP;
+    let err = eval.transaction_group(&group).expect_err("cap spent");
+    assert!(err.to_string().contains("overspend"), "{err}");
+    let (mut eval, group) = degraded_group(Defect::None);
+    eval.exec.as_mut().unwrap().degraded_admissions = DEGRADED_ADMISSION_CAP - 1;
+    eval.transaction_group(&group).expect("one left");
+    assert_eq!(
+        eval.exec.as_ref().unwrap().degraded_admissions,
+        DEGRADED_ADMISSION_CAP
+    );
+}
+
+/// `[pay, app call, short pay]` on an incomplete evaluator: the call stands
+/// between the payment and the short member, so F's shortfall is creditable.
+#[test]
+fn a_shortfall_after_a_payment_and_an_app_call_is_creditable() {
+    let a = key(1);
+    let s = key(3);
+    let f = key(7);
+    let r = key(4);
+    let app_id = 904u64;
+    let (ledger, mut eval) = evaluator(&[
+        (a.0, funded(50_000_000)),
+        (s.0, funded(5_000_000)),
+        (r.0, funded(1_000_000)),
+    ]);
+    put_app(&ledger, app_id, s.0, "#pragma version 8\nint 1\n");
+    let mut call = base_txn(s.0, TxnType::Appl);
+    call.application_id = app_id;
+    call.accounts = Some(vec![f.0]);
+    let mut members = [pay_txn(&a, r.0, 1_000, 1), call, pay_txn(&f, r.0, 1_000, 2)];
+    let gid = algo_codec::compute_group_id(&members);
+    members.iter_mut().for_each(|m| m.group = gid.0);
+    let [m0, m1, m2] = members;
+    let group = vec![sign(m0, &a.1), sign(m1, &s.1), sign(m2, &f.1)];
+    eval.exec.as_mut().unwrap().incomplete = true;
+    eval.transaction_group(&group).expect("creditable");
+}
+
+/// A plain payment alone never makes a later shortfall creditable.
+#[test]
+fn a_plain_payment_alone_never_makes_a_shortfall_creditable() {
+    let a = key(1);
+    let f = key(7);
+    let r = key(4);
+    let (_ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (r.0, funded(1_000_000))]);
+    let mut members = [pay_txn(&a, f.0, 1_000, 1), pay_txn(&f, r.0, 900_000_000, 2)];
+    let gid = algo_codec::compute_group_id(&members);
+    members.iter_mut().for_each(|m| m.group = gid.0);
+    let [m0, m1] = members;
+    let group = vec![sign(m0, &a.1), sign(m1, &f.1)];
+    eval.exec.as_mut().unwrap().incomplete = true;
+    let err = eval.transaction_group(&group).expect_err("overspend");
+    assert!(err.to_string().contains("overspend"), "{err}");
 }
 
 /// Issue #2187: a stream of creditable overspends against a COMPLETE
