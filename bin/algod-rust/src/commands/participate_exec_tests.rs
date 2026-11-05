@@ -4011,6 +4011,166 @@ fn a_plain_payment_alone_never_makes_a_shortfall_creditable() {
     assert!(err.to_string().contains("overspend"), "{err}");
 }
 
+/// `creation_group` variant: the creation (AVM `version`) is given by the
+/// caller's closure, so it can carry `access` or foreign applications.
+fn creation_group_with(
+    version: u8,
+    tweak: impl FnOnce(&mut Transaction),
+    senders: &[&Key],
+) -> (SimpleBlockEvaluator, Vec<SignedTransaction>) {
+    let s = key(3);
+    let r = key(4);
+    let (_ledger, mut eval) = evaluator(&[(s.0, funded(5_000_000)), (r.0, funded(1_000_000))]);
+    let program =
+        algo_avm::assembler::assemble_string(&format!("#pragma version {version}\nint 1\n"))
+            .expect("assembles")
+            .program;
+    let mut create = base_txn(s.0, TxnType::Appl);
+    create.approval_program = Some(serde_bytes::ByteBuf::from(program.clone()));
+    create.clear_state_program = Some(serde_bytes::ByteBuf::from(program));
+    tweak(&mut create);
+    let mut members = vec![create];
+    for (i, k) in senders.iter().enumerate() {
+        members.push(pay_txn(k, r.0, 1_000, 20 + i as u8));
+    }
+    let gid = algo_codec::compute_group_id(&members);
+    members.iter_mut().for_each(|m| m.group = gid.0);
+    let mut signed = vec![sign(members[0].clone(), &s.1)];
+    for (m, k) in members[1..].iter().zip(senders) {
+        signed.push(sign(m.clone(), &k.1));
+    }
+    eval.exec.as_mut().unwrap().incomplete = true;
+    (eval, signed)
+}
+
+/// Issue #2187: go fills an app call's available accounts from its `access`
+/// list as well as `accounts`, so a version 6 creation whose `access` names
+/// G may pay G.
+#[test]
+fn an_access_list_address_is_reachable_by_a_version_6_creation() {
+    let g = key(7);
+    let h = key(8);
+    let named = |create: &mut Transaction| {
+        create.access = Some(vec![algo_types::ResourceRef {
+            address: g.0,
+            ..Default::default()
+        }]);
+    };
+    let (mut eval, group) = creation_group_with(6, named, &[&g]);
+    eval.transaction_group(&group)
+        .expect("G is named in access");
+    let (mut eval, group) = creation_group_with(6, named, &[&h]);
+    let err = eval.transaction_group(&group).expect_err("H is not named");
+    assert!(err.to_string().contains("overspend"), "{err}");
+}
+
+/// Issue #2187: a version 6 program that names a foreign application may
+/// inner-call it, and a version 9 callee shares every group sender, so even an
+/// unnamed F is reachable; without a foreign application it is not.
+#[test]
+fn a_version_6_creation_naming_a_foreign_app_may_reach_any_sender_through_it() {
+    let f = key(7);
+    let (mut eval, group) = creation_group_with(6, |c| c.foreign_apps = Some(vec![900]), &[&f]);
+    eval.transaction_group(&group)
+        .expect("the callee may be version 9");
+    let (mut eval, group) = creation_group_with(6, |_| {}, &[&f]);
+    let err = eval.transaction_group(&group).expect_err("nothing to call");
+    assert!(err.to_string().contains("overspend"), "{err}");
+}
+
+/// Two applications on one evaluator: 905 is version 2 (no inner
+/// transactions), 906 is version 9.
+fn two_app_evaluator() -> SimpleBlockEvaluator {
+    let s = key(3);
+    let r = key(4);
+    let (ledger, eval) = evaluator(&[(s.0, funded(5_000_000)), (r.0, funded(1_000_000))]);
+    put_app(&ledger, 905, s.0, "#pragma version 2\nint 1\n");
+    put_app(&ledger, 906, s.0, "#pragma version 9\nint 1\n");
+    eval
+}
+
+/// `[call to `app_id` by S, F pays R (short)]`; `note` keeps the txids apart.
+fn call_then_short_pay(app_id: u64, note: u8) -> Vec<SignedTransaction> {
+    let s = key(3);
+    let f = key(7);
+    let r = key(4);
+    let mut call = base_txn(s.0, TxnType::Appl);
+    call.application_id = app_id;
+    call.note = serde_bytes::ByteBuf::from(vec![note]);
+    let mut members = [call, pay_txn(&f, r.0, 1_000, note)];
+    let gid = algo_codec::compute_group_id(&members);
+    members.iter_mut().for_each(|m| m.group = gid.0);
+    let [m0, m1] = members;
+    vec![sign(m0, &s.1), sign(m1, &f.1)]
+}
+
+/// Issue #2187: calls to a version 2 application can never credit anyone, so
+/// spam of them is refused without spending the cap, and an honest
+/// inner-funded group (version 9 application) is still admitted afterwards.
+#[test]
+fn spam_of_harmless_calls_does_not_use_up_the_degraded_cap() {
+    let mut eval = two_app_evaluator();
+    eval.exec.as_mut().unwrap().incomplete = true;
+    for n in 0..(DEGRADED_ADMISSION_CAP as u8 + 8) {
+        let err = eval
+            .transaction_group(&call_then_short_pay(905, n))
+            .expect_err("a version 2 call cannot credit");
+        assert!(err.to_string().contains("overspend"), "{err}");
+    }
+    assert_eq!(eval.exec.as_ref().unwrap().degraded_admissions, 0);
+    eval.transaction_group(&call_then_short_pay(906, 200))
+        .expect("an honest version 9 group");
+    assert_eq!(eval.exec.as_ref().unwrap().degraded_admissions, 1);
+}
+
+/// The cap itself, across groups: version 9 calls are admitted until it is
+/// spent, then refused with go's overspend text.
+#[test]
+fn the_cap_admits_exactly_its_number_of_creditable_groups() {
+    let mut eval = two_app_evaluator();
+    eval.exec.as_mut().unwrap().incomplete = true;
+    for n in 0..DEGRADED_ADMISSION_CAP as u8 {
+        eval.transaction_group(&call_then_short_pay(906, n))
+            .expect("within the cap");
+    }
+    let err = eval
+        .transaction_group(&call_then_short_pay(906, 250))
+        .expect_err("cap spent");
+    assert!(err.to_string().contains("overspend"), "{err}");
+}
+
+/// An evaluator with no exec state at all admits a creditable shortfall as it
+/// did before the cap existed (nothing to cap, nothing to panic), and still
+/// refuses what is provably not creditable.
+#[test]
+fn an_evaluator_without_exec_state_admits_a_creditable_shortfall() {
+    let mut eval = two_app_evaluator();
+    eval.exec = None;
+    for n in 0..(DEGRADED_ADMISSION_CAP as u8 + 4) {
+        eval.transaction_group(&call_then_short_pay(906, n))
+            .expect("no exec state, no cap");
+    }
+    let err = eval
+        .transaction_group(&call_then_short_pay(905, 250))
+        .expect_err("a version 2 call cannot credit");
+    assert!(err.to_string().contains("overspend"), "{err}");
+}
+
+/// Error attribution, verdict-only: with `[call, F short (creditable), T
+/// expired]` the group is refused and the error is T's, a certain failure,
+/// where go would name F's overspend if the credit did not cover it.
+#[test]
+fn a_later_outright_failure_is_the_reported_error_after_a_deferred_shortfall() {
+    let (mut eval, group) = degraded_group(Defect::Expired);
+    let err = eval.transaction_group(&group).expect_err("refused");
+    let expired_txid = txid(&group[2]);
+    assert!(err.to_string().starts_with("txn dead: round"), "{err}");
+    assert!(
+        !err.to_string().contains("overspend"),
+        "T's failure, not F's deferred shortfall ({expired_txid}): {err}"
+    );
+}
+
 /// Issue #2187: a stream of creditable overspends against a COMPLETE
 /// evaluator never poisons it. The dry runs are charged to the
 /// reconciliation budget only; once that is spent the precheck's verdict

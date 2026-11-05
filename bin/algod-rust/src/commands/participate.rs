@@ -1852,11 +1852,14 @@ const RECONCILE_MAX_RUNS: u32 = 256;
 
 /// Groups one INCOMPLETE evaluator may admit on a balance shortfall that an
 /// earlier application call may have credited (issue #2187), with no real
-/// apply to confirm it. A call to an EXISTING application is assumed able to
-/// credit (reading its program version would take a ledger lock and clone the
-/// programs on the rejection path); this cap bounds what that assumption can
-/// let in per evaluator (rebuilt every round), so the residual risk is a
-/// bounded number of groups block assembly will drop, not an open door.
+/// apply to confirm it. Only calls whose program version allows an inner
+/// payment reach the cap (`app_call_may_credit`: a provably harmless call, a
+/// version below 5, is refused outright and spends nothing), but such a
+/// program that does not actually pay is indistinguishable here, so spam of
+/// them can still use the cap up for the rest of the round (evaluators are
+/// rebuilt every round). The residual risk is a bounded number of groups block
+/// assembly will drop, and honest inner-funded groups refused until the next
+/// round, not an open door.
 const DEGRADED_ADMISSION_CAP: u32 = 32;
 
 /// Groups the real apply accepted after the admission precheck had refused
@@ -2614,7 +2617,9 @@ impl SimpleBlockEvaluator {
         let mut earlier_app_calls: Vec<usize> = Vec::new();
         // Only an evaluator without a usable real apply carries on past a
         // creditable shortfall; the first one is kept and returned at the end.
-        let degraded = self.exec.as_ref().is_some_and(|exec| exec.incomplete);
+        // With no exec state at all (a legacy evaluator) nothing can run the real
+        // apply either, which `resolve_precheck_rejection` treats the same way.
+        let degraded = self.exec.as_ref().is_none_or(|exec| exec.incomplete);
         let mut deferred: Option<Box<GroupReject>> = None;
         for (member, (stx, restored_stx)) in txgroup.iter().zip(&restored).enumerate() {
             let fail = |error: algo_error::AlgoError| {
@@ -2672,7 +2677,7 @@ impl SimpleBlockEvaluator {
                 let credit = degraded
                     && earlier_app_calls
                         .iter()
-                        .any(|&i| Self::app_call_may_credit(&txgroup[i].txn, &sender));
+                        .any(|&i| self.app_call_may_credit(&txgroup[i].txn, &sender));
                 if !(credit && deferred.is_some()) {
                     // go's `eval.transaction` moves the fee first, then the amount;
                     // each failing `Move` is a `ledgercore.OverspendError` carrying
@@ -2704,6 +2709,11 @@ impl SimpleBlockEvaluator {
                     if !credit {
                         return Err(reject);
                     }
+                    // Verdict-only parity with go's member order: if a LATER
+                    // member fails outright, its error is reported, while go
+                    // would report this member's overspend when the credit
+                    // does not cover it. An evaluator without a real apply
+                    // cannot tell the two apart; both are rejections.
                     deferred = Some(reject);
                 }
             }
@@ -2763,38 +2773,66 @@ impl SimpleBlockEvaluator {
         Ok(txids)
     }
 
+    /// The highest AVM version among the programs of the committed
+    /// application `app_id`, `u8::MAX` when unknown (not in the ledger, an
+    /// application a pending group created or whose program a pending group
+    /// updated, the lock poisoned). One lock acquisition and one read, and
+    /// only for a creditable-shortfall candidate of an incomplete evaluator.
+    fn committed_app_version(&self, app_id: u64) -> u8 {
+        let touched = self
+            .exec
+            .as_ref()
+            .is_some_and(|exec| exec.overlay.touches_app(app_id));
+        if touched {
+            return u8::MAX;
+        }
+        let Ok(ledger) = self.ledger.lock() else {
+            return u8::MAX;
+        };
+        let version_of = |program: &[u8]| program.first().copied().unwrap_or(u8::MAX);
+        ledger.get_app_params(app_id).map_or(u8::MAX, |params| {
+            version_of(&params.approval_program).max(version_of(&params.clear_state_program))
+        })
+    }
+
     /// Could the application call `call` (an earlier member) have credited
     /// `account` through an inner transaction (issue #2187)? `false` PROVES it
-    /// could not; `true` means unknown. Group-local information only, no
-    /// ledger access:
-    /// - an application CREATION carries its approval program, so its version
-    ///   is known: below 5 no inner transaction exists (`itxn_begin` is v5),
-    ///   from 9 on every account a group member mentions is available to the
-    ///   program (`sharedResourcesVersion`) and the short account is a member's
-    ///   sender, and in between only the call's references are reachable
-    ///   (sender, `accounts`, the addresses of its foreign applications; a
-    ///   superset of go's `availableAccount`, which is safe here);
-    /// - a call to an EXISTING application: its version is not read, so
-    ///   unknown; [`DEGRADED_ADMISSION_CAP`] bounds the residual risk.
-    fn app_call_may_credit(call: &algo_types::Transaction, account: &Address) -> bool {
-        if call.application_id != 0 {
-            return true;
-        }
-        let version = call
-            .approval_program
-            .as_ref()
-            .and_then(|program| program.first().copied())
-            .unwrap_or(0);
+    /// could not (in the state this evaluator can see); `true` means it may.
+    /// The version of the program decides, read from the creation's own
+    /// approval program or from the committed application
+    /// ([`Self::committed_app_version`]; a program updated by a pending group
+    /// that this evaluator never evaluated can read stale, which can only
+    /// refuse a group, as before issue #2187, never admit one):
+    /// - below 5 no inner transaction exists (`itxn_begin` is v5): no;
+    /// - from 9 on every account a group member mentions is available to the
+    ///   program (`sharedResourcesVersion`, `availableAccount`) and the short
+    ///   account is a member's sender: yes;
+    /// - in between only the call's own references are available (its sender,
+    ///   `accounts`, `access` addresses, its application's address), but a
+    ///   foreign application or an `access` application may be inner-called,
+    ///   and the callee runs at ITS version (a version 9 callee shares every
+    ///   group sender): yes whenever the call names one.
+    fn app_call_may_credit(&self, call: &algo_types::Transaction, account: &Address) -> bool {
+        let version = if call.application_id == 0 {
+            call.approval_program
+                .as_ref()
+                .and_then(|program| program.first().copied())
+                .unwrap_or(0)
+        } else {
+            self.committed_app_version(call.application_id)
+        };
         match version {
             0..=4 => false,
             5..=8 => {
-                call.sender == *account
+                let names_app = call.foreign_apps.iter().flatten().next().is_some()
+                    || call.access.iter().flatten().any(|r| r.app != 0);
+                names_app
+                    || call.sender == *account
                     || call.accounts.iter().flatten().any(|a| a == account)
-                    || call
-                        .foreign_apps
-                        .iter()
-                        .flatten()
-                        .any(|id| Address(algo_ledger::avm_context::app_address(*id)) == *account)
+                    || call.access.iter().flatten().any(|r| r.address == *account)
+                    || (call.application_id != 0
+                        && Address(algo_ledger::avm_context::app_address(call.application_id))
+                            == *account)
             }
             _ => true,
         }
@@ -3394,11 +3432,16 @@ impl SimpleBlockEvaluator {
             // produces only while `exec.incomplete`, after every other check
             // of every member and the group fees passed.
             if reject.creditable {
-                if let Some(exec) = self.exec.as_mut().filter(|exec| exec.incomplete) {
-                    if exec.degraded_admissions < DEGRADED_ADMISSION_CAP {
+                match self.exec.as_mut() {
+                    // No exec state: nothing to cap, as before issue #2187.
+                    None => return Ok(reject.txids),
+                    Some(exec)
+                        if exec.incomplete && exec.degraded_admissions < DEGRADED_ADMISSION_CAP =>
+                    {
                         exec.degraded_admissions += 1;
                         return Ok(reject.txids);
                     }
+                    Some(_) => {}
                 }
             }
             return Err(reject.error);
