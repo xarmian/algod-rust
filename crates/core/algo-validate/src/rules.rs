@@ -628,6 +628,14 @@ pub fn validate_transaction_wellformed_in_mode(
                 message: "lease must be zero in state-proof transaction".to_string(),
             });
         }
+        // Go: `StateProofTxnFields.wellFormed` ends in `checkStateProof` (issue
+        // #2196), so every admission path rejects a malformed payload with go's
+        // text. An absent `StateProof` field is go's zero value, not skipped.
+        let default_payload = algo_types::StateProofBody::default();
+        crate::checks::check_state_proof(
+            txn.state_proof_type,
+            txn.state_proof.as_ref().unwrap_or(&default_payload),
+        )?;
     }
 
     // Go: the type switch's `default` case (see
@@ -5226,7 +5234,20 @@ mod tests {
 
     #[test]
     fn test_stpf_valid_ok() {
-        let txn = make_stpf_txn();
+        // The payload must pass `checkStateProof` too (issue #2196): a 64-byte
+        // commitment and Sumhash (type 1) proofs.
+        let sumhash = algo_types::MerkleProof {
+            path: None,
+            hash_factory: Some(algo_types::HashFactory { hash_type: 1 }),
+            tree_depth: 0,
+        };
+        let mut txn = make_stpf_txn();
+        txn.state_proof = Some(algo_types::StateProofBody {
+            sig_commit: ByteBuf::from(vec![0u8; 64]),
+            sig_proofs: Some(sumhash.clone()),
+            part_proofs: Some(sumhash),
+            ..Default::default()
+        });
         let params = v42_params();
         assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
     }

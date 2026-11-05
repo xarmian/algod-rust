@@ -41,6 +41,9 @@ import (
 
 	"github.com/algorand/go-algorand/config"
 	"github.com/algorand/go-algorand/crypto"
+	"github.com/algorand/go-algorand/crypto/merklearray"
+	"github.com/algorand/go-algorand/crypto/merklesignature"
+	"github.com/algorand/go-algorand/crypto/stateproof"
 	"github.com/algorand/go-algorand/data/basics"
 	"github.com/algorand/go-algorand/data/transactions"
 	"github.com/algorand/go-algorand/protocol"
@@ -530,6 +533,100 @@ func wellFormedRows(e wfEnv) []wfRow {
 			t.Note = []byte("n")
 			t.Group = crypto.Digest(key32)
 		}))
+
+		// ---- the payload rules (issue #2196): StateProofTxnFields.wellFormed
+		// ends in checkStateProof, so the gossip test stage and verify.TxnGroup
+		// both refuse a malformed payload with go's text. ----
+		// Non-zero bytes: an all-zero commitment is a degenerate value no real proof
+		// carries (the Rust canonical encoder omits it, which would change the signed bytes).
+		digest := func(n int) crypto.GenericDigest {
+			d := make(crypto.GenericDigest, n)
+			for i := range d {
+				d[i] = 7
+			}
+			return d
+		}
+		sumhash := crypto.HashFactory{HashType: crypto.Sumhash}
+		goodProof := func() stateproof.StateProof {
+			return stateproof.StateProof{
+				SigCommit:  digest(64),
+				SigProofs:  merklearray.Proof{HashFactory: sumhash},
+				PartProofs: merklearray.Proof{HashFactory: sumhash},
+			}
+		}
+		spp := func(note string, f func(*stateproof.StateProof)) transactions.Transaction {
+			return sp(note, func(t *transactions.Transaction) {
+				s := goodProof()
+				f(&s)
+				t.StateProof = s
+			})
+		}
+		oneReveal := func(sig merklesignature.Signature) map[uint64]stateproof.Reveal {
+			r := stateproof.Reveal{}
+			r.SigSlot.Sig = sig
+			return map[uint64]stateproof.Reveal{0: r}
+		}
+		leaf := func(depth uint8, hash crypto.HashFactory, path ...crypto.GenericDigest) merklearray.SingleLeafProof {
+			return merklearray.SingleLeafProof{Proof: merklearray.Proof{TreeDepth: depth, HashFactory: hash, Path: path}}
+		}
+		revealSig := func(proof merklearray.SingleLeafProof) merklesignature.Signature {
+			s := merklesignature.Signature{Signature: make(crypto.FalconSignature, 2), Proof: proof}
+			s.Signature[0] = 1
+			return s
+		}
+		add("stpf_payload_valid", spp("sp-ok", func(*stateproof.StateProof) {}))
+		add("stpf_payload_default", sp("sp-default", func(*transactions.Transaction) {}))
+		add("stpf_unsupported_type", sp("sp-type", func(t *transactions.Transaction) {
+			t.StateProof = goodProof()
+			t.StateProofType = 1
+		}))
+		add("stpf_commit_size", spp("sp-commit", func(s *stateproof.StateProof) { s.SigCommit = digest(63) }))
+		add("stpf_sig_proofs_hash", spp("sp-sph", func(s *stateproof.StateProof) { s.SigProofs.HashFactory = crypto.HashFactory{} }))
+		add("stpf_part_proofs_hash", spp("sp-pph", func(s *stateproof.StateProof) { s.PartProofs.HashFactory = crypto.HashFactory{} }))
+		add("stpf_sig_proofs_path", spp("sp-spp", func(s *stateproof.StateProof) { s.SigProofs.Path = []crypto.GenericDigest{digest(5)} }))
+		add("stpf_part_proofs_path", spp("sp-ppp", func(s *stateproof.StateProof) {
+			s.PartProofs.Path = []crypto.GenericDigest{digest(64), digest(63)}
+		}))
+		add("stpf_path_empty_sibling_is_fine", spp("sp-empty-sib", func(s *stateproof.StateProof) {
+			s.SigProofs.Path = []crypto.GenericDigest{digest(0), digest(64)}
+		}))
+		add("stpf_reveal_zero_signature_is_skipped", spp("sp-rz", func(s *stateproof.StateProof) {
+			s.Reveals = oneReveal(merklesignature.Signature{})
+		}))
+		add("stpf_reveal_short_signature", spp("sp-rss", func(s *stateproof.StateProof) {
+			s.Reveals = oneReveal(merklesignature.Signature{Signature: crypto.FalconSignature{1}})
+		}))
+		add("stpf_reveal_depth_over_path", spp("sp-rdp", func(s *stateproof.StateProof) {
+			s.Reveals = oneReveal(revealSig(leaf(1, sumhash)))
+		}))
+		add("stpf_reveal_depth_too_big", spp("sp-rdb", func(s *stateproof.StateProof) {
+			path := make([]crypto.GenericDigest, merklearray.MaxEncodedTreeDepth+1)
+			s.Reveals = oneReveal(revealSig(leaf(merklearray.MaxEncodedTreeDepth+1, sumhash, path...)))
+		}))
+		add("stpf_reveal_merkle_hash", spp("sp-rmh", func(s *stateproof.StateProof) {
+			s.Reveals = oneReveal(revealSig(leaf(0, crypto.HashFactory{})))
+		}))
+		add("stpf_reveal_merkle_path", spp("sp-rmp", func(s *stateproof.StateProof) {
+			s.Reveals = oneReveal(revealSig(leaf(1, sumhash, digest(5))))
+		}))
+		add("stpf_reveal_valid", spp("sp-rv", func(s *stateproof.StateProof) {
+			s.Reveals = oneReveal(revealSig(leaf(1, sumhash, digest(64))))
+		}))
+		add("stpf_order_commit_before_proofs", spp("sp-oc", func(s *stateproof.StateProof) {
+			s.SigCommit = digest(1)
+			s.SigProofs.HashFactory = crypto.HashFactory{}
+		}))
+		add("stpf_order_sig_proofs_before_part", spp("sp-os", func(s *stateproof.StateProof) {
+			s.SigProofs.HashFactory = crypto.HashFactory{}
+			s.PartProofs.HashFactory = crypto.HashFactory{}
+		}))
+		add("stpf_order_proofs_before_reveals", spp("sp-op", func(s *stateproof.StateProof) {
+			s.PartProofs.Path = []crypto.GenericDigest{digest(5)}
+			s.Reveals = oneReveal(merklesignature.Signature{Signature: crypto.FalconSignature{1}})
+		}))
+		add("stpf_order_type_before_payload", sp("sp-ot", func(t *transactions.Transaction) {
+			t.StateProofType = 1
+		}))
 	}
 
 	// ---- heartbeat ----
@@ -655,4 +752,71 @@ func wellFormedRows(e wfEnv) []wfRow {
 		seen[r.name] = true
 	}
 	return rows
+}
+
+// wfGroupRow is one multi-member row: a group whose group ID commits to its
+// members, signed.
+type wfGroupRow struct {
+	name  string
+	group []transactions.SignedTxn
+}
+
+// wellFormedGroupRows are the group-wide rules of `transactions.CheckTxnGroup`
+// (issue #2196) that `Transaction.WellFormed` does not see: a heartbeat grouped
+// with a transaction that triggers resource availability. go's gossip test
+// stage does not run `CheckTxnGroup`; `verify.TxnGroup` does, after every
+// member is well formed. There are no "is fine" control rows: go's
+// `verify.TxnGroup` also checks each heartbeat's proof signature, which these
+// placeholder heartbeats fail for an unrelated reason (the controls live in
+// `algo_validate::checks` unit tests).
+func wellFormedGroupRows(e wfEnv) []wfGroupRow {
+	header := func(note string) transactions.Header {
+		return transactions.Header{
+			Sender:      e.sender,
+			Fee:         basics.MicroAlgos{Raw: e.params.MinTxnFee},
+			FirstValid:  1,
+			LastValid:   1000,
+			Note:        []byte("wfg-" + note),
+			GenesisID:   blockDupGenesisID,
+			GenesisHash: e.genesisHash,
+		}
+	}
+	hb := func(note string) transactions.Transaction {
+		t := transactions.Transaction{Type: protocol.HeartbeatTx, Header: header(note)}
+		h := &transactions.HeartbeatTxnFields{HbAddress: e.receiver}
+		h.HbProof.Sig[0] = 1
+		h.HbSeed[0] = 1
+		h.HbVoteID[0] = 1
+		h.HbKeyDilution = 1
+		t.HeartbeatTxnFields = h
+		return t
+	}
+	appl := func(note string) transactions.Transaction {
+		t := transactions.Transaction{Type: protocol.ApplicationCallTx, Header: header(note)}
+		t.ApplicationID = 1
+		return t
+	}
+	acfgCreate := func(note string) transactions.Transaction {
+		t := transactions.Transaction{Type: protocol.AssetConfigTx, Header: header(note)}
+		t.AssetParams = basics.AssetParams{Total: 1}
+		return t
+	}
+	grouped := func(name string, txns ...transactions.Transaction) wfGroupRow {
+		var hashes []crypto.Digest
+		for _, t := range txns {
+			hashes = append(hashes, crypto.Digest(t.ID()))
+		}
+		gid := crypto.HashObj(transactions.TxGroup{TxGroupHashes: hashes})
+		out := make([]transactions.SignedTxn, len(txns))
+		for i, t := range txns {
+			t.Group = gid
+			out[i] = e.sign(t)
+		}
+		return wfGroupRow{name: "wf_group_" + name, group: out}
+	}
+	return []wfGroupRow{
+		grouped("hb_with_appl", hb("a1"), appl("a2")),
+		grouped("appl_then_hb", appl("b1"), hb("b2")),
+		grouped("hb_with_asset_creation", hb("c1"), acfgCreate("c2")),
+	}
 }

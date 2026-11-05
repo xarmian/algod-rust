@@ -101,7 +101,7 @@ fn check_basic_state_proof(sp: &StateProofBody) -> Result<(), AlgoError> {
 
     if sp.sig_commit.len() != hash_size {
         return Err(err(format!(
-            "state proof SigCommit has an unexpected size: SigCommit is {} bytes, expected {hash_size}",
+            "state proof has an unexpected signature commitment size: has length {}, expected {hash_size}",
             sp.sig_commit.len()
         )));
     }
@@ -150,7 +150,10 @@ fn check_basic_state_proof(sp: &StateProofBody) -> Result<(), AlgoError> {
 /// Mirrors Go's `checkStateProof` (`data/transactions/checks.go`,
 /// `v5.0.1-stable`): dispatches on `StateProofType`, rejecting any type
 /// other than `StateProofBasic`.
-fn check_state_proof(state_proof_type: u64, sp: &StateProofBody) -> Result<(), AlgoError> {
+pub(crate) fn check_state_proof(
+    state_proof_type: u64,
+    sp: &StateProofBody,
+) -> Result<(), AlgoError> {
     match state_proof_type {
         STATE_PROOF_BASIC => check_basic_state_proof(sp),
         other => Err(err(format!("state proof has an unsupported type: {other}"))),
@@ -598,7 +601,10 @@ mod tests {
             sp.sig_commit = ByteBuf::from(vec![0u8; 32]);
         }
         let err = check_txn_group(&[signed(txn)]).unwrap_err();
-        assert!(err.to_string().contains("SigCommit"), "got: {err}");
+        assert!(
+            err.to_string().contains("signature commitment size"),
+            "got: {err}"
+        );
     }
 
     #[test]
