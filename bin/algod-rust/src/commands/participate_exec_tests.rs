@@ -3128,12 +3128,13 @@ fn wellformed_and_group_error_texts_match_go() {
     );
     // Rows the Rust decoder refuses are not judged by the evaluator at all;
     // none may be skipped silently. go encodes a zero sender as an absent
-    // `snd` key and decodes it, so its `WellFormed` is what rejects the
-    // transaction ("transaction cannot have zero sender"); the Rust decoder
-    // rejects the missing key earlier, with its own text. Both reject, so
-    // accept/reject is the same; the rule itself is pinned by
-    // `rules::tests::test_zero_sender_rejected` and the order rows that do
-    // not need an absent sender.
+    // `snd` key, and since v4.7.2 `snd` is `codec:",required"`: go's own
+    // decoder refuses these rows too (`missing required field: snd`), so they
+    // cannot reach `WellFormed` over the wire in go either. Both decoders
+    // reject, which `go_and_rust_both_refuse_a_zero_sender_at_decode` proves
+    // against the oracle's `decode_required` rows (issue #2197); the rule
+    // itself is pinned by `rules::tests::test_zero_sender_rejected` and the
+    // order rows that do not need an absent sender.
     assert_eq!(
         undecodable,
         [
@@ -3143,6 +3144,47 @@ fn wellformed_and_group_error_texts_match_go() {
         ],
         "rows go encodes and the Rust decoder refuses"
     );
+}
+
+/// Issue #2197: a transaction whose sender is the zero address is encoded by
+/// go with no `snd` key, and go's own decoder refuses it (`snd` is a required
+/// field since v4.7.2: `missing required field: snd`). The Rust decoder
+/// refuses it at the same stage, so no accept/reject verdict differs, and the
+/// zero-sender `wellformed` rows are undecodable on both sides. (go's third
+/// row fails an earlier bound of the same decode, the note length.)
+#[test]
+fn go_and_rust_both_refuse_a_zero_sender_at_decode() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/core/algo-ledger/tests/fixtures/block_checkdup/oracle.json");
+    let raw = std::fs::read_to_string(&path).expect("read the go oracle fixture");
+    let o: serde_json::Value = serde_json::from_str(&raw).expect("parse the go oracle fixture");
+    let rows = o["decode_required"].as_array().expect("decode rows");
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|r| r["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "wf_zero_sender_payment",
+            "wf_zero_sender_axfer",
+            "wf_order_note_before_zero_sender"
+        ],
+        "the same rows `wellformed_and_group_error_texts_match_go` cannot decode"
+    );
+    for r in rows {
+        let name = r["name"].as_str().expect("name");
+        let go_error = r["decode_error"].as_str().expect("decode_error");
+        assert!(!go_error.is_empty(), "{name}: go decodes it");
+        let bytes = oracle_b64(r["txn"].as_str().expect("txn"));
+        let rust_error = algo_codec::decode_signed_txn_stream(&bytes)
+            .expect_err(&format!("{name}: the Rust decoder accepts it"));
+        // The stream decoder wraps the field error; its source names the field.
+        let rust_error = format!("{rust_error:?}");
+        if go_error.contains("missing required field: snd") {
+            assert!(rust_error.contains("snd"), "{name}: {rust_error}");
+        }
+    }
 }
 
 /// One signed group of `members` (the group ID computed over them).
