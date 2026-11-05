@@ -1180,8 +1180,10 @@ fn proposal_validation_entry_point_enforces_validate_for_payouts() {
         // The sink is rekeyed to `a` so the test can sign for it.
         let mut from_sink = sign(from_sink, &a.1);
         from_sink.auth_addr = Some(a.0);
-        eval.transaction_group(&[from_sink])
-            .expect("fee sink sender");
+        // go's admission refuses a fee-sink sender (WellFormed with the special
+        // addresses, issue #2198), but its block evaluator has no WellFormed:
+        // the transaction enters the proposal through the apply path only.
+        eval.admit_group_apply_path_only_for_test(&[from_sink]);
         let mut block = eval.generate_block(&[]).expect("generate_block");
         assert_eq!(block.fees_collected, 3_000);
         assert!(block.proposer_payout > 0, "must exercise a real payout");
@@ -3031,13 +3033,9 @@ fn wellformed_and_group_error_texts_match_go() {
         // the pool tag the same failure gets on the gossip test stage; where go
         // accepts, Rust must accept (the window, duplicates and fees are not
         // `verify.TxnGroup`'s). The rules that need the special addresses
-        // (rewards-pool sender, fee-sink payment and keyreg) are not applied
-        // on the REST path today (the path passes none; issue #2198), so those
-        // rows are compared on the test stage only.
-        let needs_specials = row.name.contains("fee_sink") || row.name == "wf_rewards_pool_sender";
-        if needs_specials {
-            continue;
-        }
+        // (rewards-pool sender, fee-sink payment and keyreg) are compared too:
+        // go's `verify.TxnGroup` hands `WellFormed` the header's addresses and
+        // so does this path (issue #2198).
         let eval = order_evaluator(&ledger);
         match (
             eval.validate_group_stateless_inner(group),
