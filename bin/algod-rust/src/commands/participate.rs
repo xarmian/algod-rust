@@ -2237,6 +2237,38 @@ impl SimpleBlockEvaluator {
         } else {
             verify_member_signatures()?;
         }
+        // go's `txnBatchPrep` also enqueues every heartbeat's proof
+        // (`HeartbeatProof.BatchPrep`, three ed25519 signatures) into the SAME
+        // batch as the member's own signature, so a bad proof is the batch
+        // failure, returned bare like a bad signature (issue #2218). The proof
+        // is checked here whether or not the group's signatures came from the
+        // verified-group cache: block validation verifies it too, but does not
+        // keep it out of the cache.
+        for stx in txgroup {
+            let Some(hb) = stx
+                .txn
+                .heartbeat
+                .as_ref()
+                .filter(|_| stx.txn.txn_type == "hb")
+            else {
+                continue;
+            };
+            let proof_ok = hb.proof.as_ref().is_some_and(|proof| {
+                algo_validate::verify_heartbeat_proof(
+                    proof,
+                    &hb.vote_id,
+                    stx.txn.last_valid.0,
+                    hb.key_dilution,
+                    &hb.seed,
+                )
+                .is_ok()
+            });
+            if !proof_ok {
+                return Err(algo_error::AlgoError::Validation {
+                    message: algo_error::BATCH_HAS_FAILED_SIGS.into(),
+                });
+            }
+        }
 
         // 6. (moved) The validity window and the genesis ID / hash checks are
         // go's `BlockHeader.Alive`, which `BlockEvaluator.transaction` runs per

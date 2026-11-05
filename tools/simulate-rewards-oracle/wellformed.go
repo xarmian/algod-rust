@@ -45,6 +45,7 @@ import (
 	"github.com/algorand/go-algorand/crypto/merklesignature"
 	"github.com/algorand/go-algorand/crypto/stateproof"
 	"github.com/algorand/go-algorand/data/basics"
+	"github.com/algorand/go-algorand/data/committee"
 	"github.com/algorand/go-algorand/data/transactions"
 	"github.com/algorand/go-algorand/protocol"
 )
@@ -828,5 +829,97 @@ func wellFormedGroupRows(e wfEnv) []wfGroupRow {
 		grouped("hb_with_appl", hb("a1"), appl("a2")),
 		grouped("appl_then_hb", appl("b1"), hb("b2")),
 		grouped("hb_with_asset_creation", hb("c1"), acfgCreate("c2")),
+	}
+}
+
+// heartbeatProofRows are the rows for go's heartbeat proof check (issue #2218):
+// `verify.TxnGroup` -> `txnBatchPrep` -> `HeartbeatProof.BatchPrep` enqueues the
+// proof's three signatures into the same batch as the member's own signature,
+// so a bad proof surfaces as the batch failure (`At least one signature didn't
+// pass verification`, returned bare), exactly like a bad signature. The proofs
+// are real ones generated from deterministic participation secrets (a seeded
+// PRNG), so the fixture does not drift between runs. go's gossip test stage
+// (`TestTransactionGroup`) verifies no signature and accepts every row.
+func heartbeatProofRows(e wfEnv) []wfGroupRow {
+	const lastValid = 1000
+	const dilution = 1000
+	id := basics.OneTimeIDForRound(lastValid, dilution)
+	secrets := crypto.GenerateOneTimeSignatureSecretsRNG(id.Batch, 1, crypto.MakePRNG([]byte("hb-proof-oracle-secrets-1")))
+	other := crypto.GenerateOneTimeSignatureSecretsRNG(id.Batch, 1, crypto.MakePRNG([]byte("hb-proof-oracle-secrets-2")))
+	var seed, otherSeed committee.Seed
+	for i := range seed {
+		seed[i] = 0x51
+		otherSeed[i] = 0x52
+	}
+	good := secrets.Sign(id, seed).ToHeartbeatProof()
+	header := func(note string) transactions.Header {
+		return transactions.Header{
+			Sender:      e.sender,
+			Fee:         basics.MicroAlgos{Raw: e.params.MinTxnFee},
+			FirstValid:  1,
+			LastValid:   lastValid,
+			Note:        []byte("hbp-" + note),
+			GenesisID:   blockDupGenesisID,
+			GenesisHash: e.genesisHash,
+		}
+	}
+	hb := func(note string, voteID crypto.OneTimeSignatureVerifier, sd committee.Seed, proof crypto.HeartbeatProof, keyDilution uint64) transactions.Transaction {
+		t := transactions.Transaction{Type: protocol.HeartbeatTx, Header: header(note)}
+		t.HeartbeatTxnFields = &transactions.HeartbeatTxnFields{
+			HbAddress:     e.receiver,
+			HbProof:       proof,
+			HbSeed:        sd,
+			HbVoteID:      voteID,
+			HbKeyDilution: keyDilution,
+		}
+		return t
+	}
+	pay := func(note string) transactions.Transaction {
+		t := transactions.Transaction{Type: protocol.PaymentTx, Header: header(note)}
+		t.Receiver = e.receiver
+		t.Amount = basics.MicroAlgos{Raw: 1}
+		return t
+	}
+	valid := func(note string) transactions.Transaction {
+		return hb(note, secrets.OneTimeSignatureVerifier, seed, good, dilution)
+	}
+	flip := func(proof crypto.HeartbeatProof, field string) crypto.HeartbeatProof {
+		switch field {
+		case "sig":
+			proof.Sig[0] ^= 1
+		case "pk1sig":
+			proof.PK1Sig[0] ^= 1
+		case "pk2sig":
+			proof.PK2Sig[0] ^= 1
+		}
+		return proof
+	}
+	single := func(name string, t transactions.Transaction) wfGroupRow {
+		return wfGroupRow{name: "verify_hb_" + name, group: []transactions.SignedTxn{e.sign(t)}}
+	}
+	grouped := func(name string, txns ...transactions.Transaction) wfGroupRow {
+		var hashes []crypto.Digest
+		for _, t := range txns {
+			hashes = append(hashes, crypto.Digest(t.ID()))
+		}
+		gid := crypto.HashObj(transactions.TxGroup{TxGroupHashes: hashes})
+		out := make([]transactions.SignedTxn, len(txns))
+		for i, t := range txns {
+			t.Group = gid
+			out[i] = e.sign(t)
+		}
+		return wfGroupRow{name: "verify_hb_" + name, group: out}
+	}
+	return []wfGroupRow{
+		single("valid_proof", valid("v1")),
+		single("proof_for_another_seed", hb("s1", secrets.OneTimeSignatureVerifier, seed, secrets.Sign(id, otherSeed).ToHeartbeatProof(), dilution)),
+		single("proof_under_another_vote_id", hb("s2", other.OneTimeSignatureVerifier, seed, good, dilution)),
+		single("tampered_sig", hb("s3", secrets.OneTimeSignatureVerifier, seed, flip(good, "sig"), dilution)),
+		single("tampered_pk1sig", hb("s4", secrets.OneTimeSignatureVerifier, seed, flip(good, "pk1sig"), dilution)),
+		single("tampered_pk2sig", hb("s5", secrets.OneTimeSignatureVerifier, seed, flip(good, "pk2sig"), dilution)),
+		single("key_dilution_changes_the_batch", hb("s6", secrets.OneTimeSignatureVerifier, seed, good, dilution+1)),
+		grouped("group_valid_with_payment", valid("g1"), pay("g2")),
+		grouped("group_bad_proof_first", hb("g3", secrets.OneTimeSignatureVerifier, seed, flip(good, "sig"), dilution), pay("g4")),
+		grouped("group_bad_proof_last", pay("g5"), hb("g6", secrets.OneTimeSignatureVerifier, seed, flip(good, "sig"), dilution)),
 	}
 }
