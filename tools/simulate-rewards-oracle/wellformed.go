@@ -612,6 +612,16 @@ func wellFormedRows(e wfEnv) []wfRow {
 		add("stpf_reveal_valid", spp("sp-rv", func(s *stateproof.StateProof) {
 			s.Reveals = oneReveal(revealSig(leaf(1, sumhash, digest(64))))
 		}))
+		// go's omitempty on a `[]byte` drops only a zero-LENGTH slice: an all-zero
+		// commitment or signature is encoded, so the txid and signed bytes
+		// depend on it (the Rust canonical encoder used to omit all-zero bytes).
+		add("stpf_commit_all_zero_bytes", spp("sp-c0", func(s *stateproof.StateProof) {
+			s.SigCommit = make(crypto.GenericDigest, 64)
+		}))
+		add("stpf_reveal_all_zero_signature_bytes", spp("sp-rz2", func(s *stateproof.StateProof) {
+			sig := merklesignature.Signature{Signature: make(crypto.FalconSignature, 2), Proof: leaf(1, sumhash, digest(64))}
+			s.Reveals = oneReveal(sig)
+		}))
 		add("stpf_order_commit_before_proofs", spp("sp-oc", func(s *stateproof.StateProof) {
 			s.SigCommit = digest(1)
 			s.SigProofs.HashFactory = crypto.HashFactory{}

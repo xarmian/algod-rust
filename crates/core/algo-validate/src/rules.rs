@@ -144,8 +144,8 @@ pub enum WellFormedMode {
     Block,
     /// The submission paths (REST and gossip admission), which also reject an
     /// unknown transaction type with go's `unknown tx type <type>` (the
-    /// `default` case of `WellFormed`'s type switch). Admission only ever
-    /// rejects MORE than [`WellFormedMode::Block`], and only for that case.
+    /// `default` case of `WellFormed`'s type switch). Apart from that case the
+    /// two modes run the same rules, the state-proof payload check included.
     Admission,
 }
 
@@ -630,12 +630,8 @@ pub fn validate_transaction_wellformed_in_mode(
         }
         // Go: `StateProofTxnFields.wellFormed` ends in `checkStateProof` (issue
         // #2196), so every admission path rejects a malformed payload with go's
-        // text. An absent `StateProof` field is go's zero value, not skipped.
-        let default_payload = algo_types::StateProofBody::default();
-        crate::checks::check_state_proof(
-            txn.state_proof_type,
-            txn.state_proof.as_ref().unwrap_or(&default_payload),
-        )?;
+        // text.
+        crate::checks::check_state_proof_payload(txn)?;
     }
 
     // Go: the type switch's `default` case (see
