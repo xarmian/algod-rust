@@ -543,13 +543,17 @@ pub fn validate_block_with_cache(
             // `HeartbeatProof.BatchPrep`, verify/txn.go): the shared member rule,
             // which selects heartbeats by type and counts a missing payload or
             // proof as a failed proof. A bad proof keeps the group out of the
-            // verified-group cache, like a bad signature.
-            if let Err(e) = verify_member_heartbeat_proof(stx) {
-                group_sig_ok = false;
-                errors.push(BlockValidationError::SignatureVerificationFailed {
-                    txn_index: idx,
-                    error: format!("heartbeat proof verification failed: {e}"),
-                });
+            // verified-group cache, like a bad signature, so an
+            // `already_verified` group was proof-checked when it entered the
+            // cache (issue #2223) and is not checked again.
+            if !already_verified {
+                if let Err(e) = verify_member_heartbeat_proof(stx) {
+                    group_sig_ok = false;
+                    errors.push(BlockValidationError::SignatureVerificationFailed {
+                        txn_index: idx,
+                        error: format!("heartbeat proof verification failed: {e}"),
+                    });
+                }
             }
 
             // AuthAddr != Sender check (Go: EnforceAuthAddrSenderDiff, future only).

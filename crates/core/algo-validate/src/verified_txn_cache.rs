@@ -443,10 +443,12 @@ fn verify_transaction_group_cached_inner(
     let unverified =
         cache.get_unverified_transaction_groups(std::slice::from_ref(&owned_group), context);
     if unverified.is_empty() {
-        // The whole group is already verified under this exact context. A
-        // heartbeat proof is not part of what the cache vouches for (block
-        // validation caches a group without it), so it is checked on a hit too.
-        crate::signature::check_heartbeat_proofs(txgroup)?;
+        // The whole group is already verified under this exact context. The
+        // cache only ever holds proof-checked groups (issue #2223): its only
+        // production writers are the `cache.add` below, which runs after the
+        // heartbeat proofs are checked, and `block.rs`, which adds a group only
+        // while `group_sig_ok` (a bad proof clears it). So a hit needs no
+        // proof re-check.
         return Ok(());
     }
 

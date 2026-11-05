@@ -994,8 +994,9 @@ pub fn verify_member_heartbeat_proof(stx: &SignedTransaction) -> Result<(), Algo
 /// signatures, so a bad proof surfaces as the bare batch failure
 /// ([`algo_error::BATCH_HAS_FAILED_SIGS`]), exactly like a bad signature
 /// (issue #2218). Run it AFTER the members' own signature checks (go's batch
-/// verifies last) and on a verified-group cache hit too: block validation
-/// verifies proofs but does not keep an unverified proof out of the cache.
+/// verifies last). Every writer of the verified-group cache runs it (or the
+/// shared member rule) before adding a group, so a cache hit needs no re-check
+/// (issue #2223).
 pub fn check_heartbeat_proofs(group: &[SignedTransaction]) -> Result<(), AlgoError> {
     if group
         .iter()

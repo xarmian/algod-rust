@@ -11190,9 +11190,10 @@ mod tests {
     }
 
     /// The same through the verified-group cache (the gossip `BatchVerifier`'s
-    /// path): a bad proof fails and is never cached; a valid one is admitted and
-    /// cached; and a group the cache already vouches for (block validation caches
-    /// a group without checking the proof) is still refused for its proof.
+    /// path): a bad proof fails and is never cached, a valid one is admitted and
+    /// cached. The cache only ever holds proof-checked groups (issue #2223), so a
+    /// HIT is served without re-verifying: a group seeded into the cache is
+    /// trusted as is (this is what makes the hit cheap).
     #[test]
     fn a_tampered_heartbeat_proof_fails_through_the_verified_group_cache() {
         let ledger = test_ledger();
@@ -11214,14 +11215,6 @@ mod tests {
             "a group with a bad proof is never cached"
         );
 
-        // A pre-existing cache entry for the bad group does not skip the proof.
-        cache.add(Arc::new(algo_validate::GroupContext::new(
-            context.clone(),
-            vec![bad.clone()],
-        )));
-        let err = eval.transaction_group(&[bad]).unwrap_err();
-        assert!(err.is_batch_sig_failure(), "cache hit: {err}");
-
         let mut eval = make_evaluator(&ledger, &params, 100, &[]);
         eval.verified_txn_cache = Some(cache.clone());
         eval.transaction_group(std::slice::from_ref(&good))
@@ -11232,6 +11225,32 @@ mod tests {
                 .is_empty(),
             "a verified group is cached"
         );
+    }
+
+    /// A cache hit is not re-verified (issue #2223): the invariant (only
+    /// proof-checked groups enter the cache) makes the second proof check
+    /// redundant, so a group the cache vouches for is accepted by
+    /// `verify_transaction_group_cached` without touching its proof.
+    #[test]
+    fn a_cache_hit_is_served_without_re_verifying_the_heartbeat_proof() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (_, bad) = heartbeat_with_and_without_a_valid_proof();
+        let eval = make_evaluator(&ledger, &params, 100, &[]);
+        let context = cache_context(&eval);
+        let cache = algo_validate::VerifiedTransactionCache::new(16);
+        // Seeded by hand, which the real writers never do for a bad proof.
+        cache.add(Arc::new(algo_validate::GroupContext::new(
+            context.clone(),
+            vec![bad.clone()],
+        )));
+        algo_validate::verify_transaction_group_cached(
+            std::slice::from_ref(&bad),
+            &context,
+            &params,
+            &cache,
+        )
+        .expect("a cache hit is served from the cache");
     }
 
     /// The gossip stage's own entry point (`verify_transaction_group_cached`,
