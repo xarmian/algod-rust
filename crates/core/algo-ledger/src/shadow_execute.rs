@@ -904,18 +904,6 @@ pub fn scratch_execute_payset<L: LedgerStore>(
     block: &Block,
     lists: Option<crate::apply::ListsRequest>,
 ) -> Result<ScratchPayset, ScratchFailure> {
-    scratch_execute_payset_with_txids(store, block, lists, None)
-}
-
-/// [`scratch_execute_payset`] with the payset's txids already known by the
-/// caller (see [`crate::proposal_eval::evaluate_payset_with_txids`], issue
-/// #2132).
-pub fn scratch_execute_payset_with_txids<L: LedgerStore>(
-    store: &mut L,
-    block: &Block,
-    lists: Option<crate::apply::ListsRequest>,
-    txids: Option<Vec<algo_types::Digest>>,
-) -> Result<ScratchPayset, ScratchFailure> {
     // Input flag (reviewed, intentional): only this final epilogue apply
     // needs the post-payset sink balance.
     let mut probe = ExecProbe {
@@ -925,7 +913,6 @@ pub fn scratch_execute_payset_with_txids<L: LedgerStore>(
             knock_offline_exclude: lists.as_ref().map(|l| l.own_addresses.clone()),
             // go generates with Generate + Validate: `checkDup` (#2127).
             check_dup: true,
-            txids,
             ..Default::default()
         },
         ..Default::default()

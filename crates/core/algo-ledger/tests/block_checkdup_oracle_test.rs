@@ -1014,15 +1014,11 @@ fn evaluate_payset_uses_the_supplied_txids_instead_of_rehashing() {
     // Made-up ids are looked up as supplied (the payset is NOT rehashed), so
     // the committed duplicate is not seen.
     let made_up: Vec<Digest> = (0..real.len()).map(|i| Digest([0xEE - i as u8; 32])).collect();
-    if let Err(ScratchFailure::Txn { error, .. }) =
-        evaluate_payset_with_txids(&base, &candidate, None, Some(made_up))
-    {
-        assert_ne!(
-            error.to_string(),
-            sc.validate_error,
-            "the supplied ids must be used, not recomputed"
-        );
-    }
+    let made_up_result = evaluate_payset_with_txids(&base, &candidate, None, Some(made_up));
+    assert!(
+        made_up_result.is_ok(),
+        "the supplied ids must be used, not recomputed: {made_up_result:?}"
+    );
     // A count that does not match the payset is refused, not hashed around.
     let short = real[..real.len() - 1].to_vec();
     match evaluate_payset_with_txids(&base, &candidate, None, Some(short)) {
