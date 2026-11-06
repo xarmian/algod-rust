@@ -2652,3 +2652,102 @@ fn eval_error_text_and_byte_pc_match_go() {
         ("AVM: err opcode executed".to_string(), 1)
     );
 }
+
+// ===========================================================================
+// go's argument gate order, and byte offsets with multi-byte immediates
+// (issue #2200)
+// ===========================================================================
+
+/// `first_error`, with a budget the caller picks.
+fn first_error_with_budget(code: &[u8], budget: i64) -> (String, usize) {
+    let program = parse(&prog(8, code)).expect("parse");
+    let mut m = AvmMachine::new(program, ExecMode::LogicSig, budget);
+    let err = m.run(&mut NullContext).expect_err("must fail");
+    (err.to_string(), m.byte_pc())
+}
+
+#[test]
+fn the_gate_reports_the_lowest_wrong_argument() {
+    // [bytes, bytes] `+`: go reports argument 0, not the top one.
+    let code = [0x80, 0x01, 0x01, 0x80, 0x01, 0x02, 0x08];
+    assert_eq!(
+        first_error(8, &code),
+        ("AVM: + arg 0 wanted uint64 but got []byte".to_string(), 7)
+    );
+    // [uint64, bytes] `+`: argument 1.
+    let mut code = pushint(1).to_vec();
+    code.extend_from_slice(&[0x80, 0x01, 0x01, 0x08]);
+    assert_eq!(
+        first_error(8, &code),
+        ("AVM: + arg 1 wanted uint64 but got []byte".to_string(), 6)
+    );
+}
+
+#[test]
+fn the_gate_checks_the_stack_height_before_any_type() {
+    // [bytes] `+`: go reports the underflow, not a type error.
+    let code = [0x80, 0x01, 0x01, 0x08];
+    assert_eq!(
+        first_error(8, &code),
+        ("AVM: stack underflow in +".to_string(), 4)
+    );
+}
+
+#[test]
+fn the_gate_runs_before_the_cost_is_charged() {
+    // Two pushes use the whole budget of 2, so `+` could not be charged; its
+    // arguments are also wrong, and go reports the type error first.
+    let code = [0x80, 0x01, 0x01, 0x80, 0x01, 0x02, 0x08];
+    assert_eq!(
+        first_error_with_budget(&code, 2),
+        ("AVM: + arg 0 wanted uint64 but got []byte".to_string(), 7)
+    );
+    // Well typed, the same budget is what runs out.
+    let mut code = pushint(1).to_vec();
+    code.extend_from_slice(&pushint(2));
+    code.push(0x08);
+    assert_eq!(
+        first_error_with_budget(&code, 2).0,
+        "AVM: dynamic cost budget exceeded, executing +: local program cost was 2"
+    );
+}
+
+#[test]
+fn byte_pc_counts_multi_byte_immediates_exactly() {
+    // pushint 300 is 0x81 + a two-byte varint (offsets 1..=3); pushbytes
+    // 0xAABBCC is 0x80 0x03 + 3 bytes (4..=8); `+` is at offset 9.
+    let mut code = pushint(300).to_vec();
+    assert_eq!(code.len(), 3);
+    code.extend_from_slice(&[0x80, 0x03, 0xAA, 0xBB, 0xCC]);
+    code.push(0x08);
+    assert_eq!(
+        first_error(8, &code),
+        ("AVM: + arg 1 wanted uint64 but got []byte".to_string(), 9)
+    );
+    // intcblock 3 2 1 0 is 0x20 + count + 3 one-byte values: 5 bytes (1..=5), so
+    // `err` is at offset 6.
+    let code = [0x20, 0x03, 0x01, 0x02, 0x03, 0x00];
+    assert_eq!(
+        first_error(8, &code),
+        ("AVM: err opcode executed".to_string(), 6)
+    );
+    // The implicit end of the program is the program length (version byte
+    // included): `int 1; int 1` leaves two values, reported at the end.
+    let mut code = pushint(1).to_vec();
+    code.extend_from_slice(&pushint(1));
+    assert_eq!(
+        first_error(8, &code),
+        ("AVM: stack len is 2 instead of 1".to_string(), 5)
+    );
+}
+
+#[test]
+fn no_stale_mnemonic_outside_an_instruction() {
+    // After an instruction ran, a pop outside any instruction (final-stack
+    // handling, frame code) is a plain underflow, not `... in pop`.
+    let program = parse(&prog(8, &[0x81, 0x01, 0x48])).expect("parse"); // pushint 1; pop
+    let mut m = AvmMachine::new(program, ExecMode::LogicSig, 100);
+    m.step(&mut NullContext).expect("pushint");
+    m.step(&mut NullContext).expect("pop");
+    assert_eq!(m.pop().unwrap_err().to_string(), "AVM: stack underflow");
+}

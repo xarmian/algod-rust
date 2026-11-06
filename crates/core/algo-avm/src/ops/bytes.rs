@@ -353,7 +353,7 @@ pub fn op_bdiv(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(
     let b = BigUint::from_bytes_be(&machine.pop_bytes()?);
     let a = BigUint::from_bytes_be(&machine.pop_bytes()?);
     if b == BigUint::ZERO {
-        return Err(avm_err("b/: division by zero"));
+        return Err(avm_err("division by zero"));
     }
     let result = biguint_to_bytes(&(a / b));
     machine.push(crate::machine::AvmValue::Bytes(result))
@@ -373,7 +373,7 @@ pub fn op_bmod(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(
     let b = BigUint::from_bytes_be(&machine.pop_bytes()?);
     let a = BigUint::from_bytes_be(&machine.pop_bytes()?);
     if b == BigUint::ZERO {
-        return Err(avm_err("b%: division by zero"));
+        return Err(avm_err("modulo by zero"));
     }
     let result = biguint_to_bytes(&(a % b));
     machine.push(crate::machine::AvmValue::Bytes(result))

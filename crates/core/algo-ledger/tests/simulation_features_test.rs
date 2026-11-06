@@ -340,10 +340,9 @@ fn extra_opcode_budget_with_trace_reports_per_txn_pc_trace() {
 /// still fails with go's "dynamic cost budget exceeded" message while the
 /// per-transaction partial `AppBudgetConsumed`/`AppBudgetAdded` accounting
 /// for the txn that ran out is still reported. algod-rust's AVM reports the
-/// same condition with its own wording ("cost budget exceeded: budget is
-/// {budget} after charging {cost}", `algo-avm/src/machine.rs`) rather than
-/// go's exact string, so this asserts on the shared substring instead of a
-/// byte-identical message (phase17 `parity_ledger_sim.md`,
+/// same condition with go's wording (`dynamic cost budget exceeded, executing
+/// <op>: local program cost was <n>`, `algo-avm/src/machine.rs`, issue #2200),
+/// so this asserts go's fixed prefix (phase17 `parity_ledger_sim.md`,
 /// `TestAppCallWithExtraBudgetOverBudget`).
 #[test]
 fn extra_opcode_budget_insufficient_still_fails_with_partial_accounting() {
@@ -373,8 +372,8 @@ fn extra_opcode_budget_insufficient_still_fails_with_partial_accounting() {
         .as_deref()
         .expect("group must fail: insufficient extra budget");
     assert!(
-        failure_message.contains("cost budget exceeded"),
-        "expected a cost-budget-exceeded failure, got: {failure_message}"
+        failure_message.contains("dynamic cost budget exceeded, executing "),
+        "expected go's cost-budget-exceeded failure, got: {failure_message}"
     );
     assert_eq!(
         group.failed_at,
@@ -472,8 +471,8 @@ fn app_call_over_budget_matches_go_reported_figures_exactly() {
         .as_deref()
         .expect("group must fail: over budget");
     assert!(
-        failure_message.contains("cost budget exceeded"),
-        "expected a cost-budget-exceeded failure, got: {failure_message}"
+        failure_message.contains("dynamic cost budget exceeded, executing "),
+        "expected go's cost-budget-exceeded failure, got: {failure_message}"
     );
     assert_eq!(group.failed_at, Some(vec![1]));
     // go's exact documented figures for this program (`TestAppCallOverBudget`):

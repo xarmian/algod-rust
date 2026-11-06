@@ -353,8 +353,8 @@ fn test_budget_exhaustion() {
     assert!(result.is_err(), "should exhaust cost budget");
     let err_msg = format!("{}", result.unwrap_err());
     assert!(
-        err_msg.contains("cost budget exceeded"),
-        "error should mention budget: {err_msg}"
+        err_msg.contains("dynamic cost budget exceeded, executing "),
+        "error should be go's budget text: {err_msg}"
     );
 }
 

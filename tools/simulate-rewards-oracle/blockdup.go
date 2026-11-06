@@ -760,6 +760,20 @@ func blockDupOracle() {
 		{"bzero_too_large", "int 4096\nint 1\n+\nbzero\nlen"},
 		{"getbyte_range", "byte 0x01\nint 5\ngetbyte"},
 		{"budget_exceeded", "int 0\nloop:\nint 1\n+\ndup\nint 100000\n<\nbnz loop\nint 1"},
+		// go's step gate: the stack height first, then the arguments from
+		// argument 0 upward (not the top one), then the cost.
+		{"lower_arg_wrong", "byte 0x01\nbyte 0x02\nb end\nend:\n+"},
+		{"underflow_before_type", "byte 0x01\nb end\nend:\n+"},
+		{"divw_zero", "int 1\nint 2\nint 0\ndivw"},
+		{"divw_overflow", "int 5\nint 0\nint 3\ndivw"},
+		{"divmodw_zero", "int 1\nint 1\nint 0\nint 0\ndivmodw"},
+		{"bytes_div_zero", "byte 0x05\nbyte 0x00\nb/"},
+		{"bytes_mod_zero", "byte 0x05\nbyte 0x00\nb%"},
+		// Ten ed25519verify calls leave the budget below the cost of an
+		// eleventh, whose arguments are ALSO of the wrong type: the type error
+		// comes first, the cost is never charged.
+		{"type_before_cost", strings.Repeat("byte 0x01\nint 64\nbzero\nint 32\nbzero\ned25519verify\npop\n", 10) +
+			"int 1\nint 1\nint 1\nb gate\ngate:\ned25519verify\n"},
 	}
 	for _, e := range lsigErrorSources {
 		wfSpecs = append(wfSpecs, lsigRow("verify_logicsig_err_"+e.name, "#pragma version 8\n"+e.src))

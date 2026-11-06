@@ -201,14 +201,15 @@ pub struct AvmMachine {
     /// Program counter (instruction index, not byte offset). go's `pc` in an
     /// `EvalError` is a byte offset: see [`AvmMachine::byte_pc`].
     pub pc: usize,
-    /// Mnemonic of the instruction being executed (`""` before the first), for
-    /// go's per-opcode error texts (`stack underflow in <op>`, `<op> arg <i>
-    /// wanted ... but got ...`, `dynamic cost budget exceeded, executing <op>`).
-    pub(crate) current_op: &'static str,
-    /// The current instruction's argument count (`OpSpec::stack_pops`, `-1`
-    /// when dynamic) and the stack height before it ran: they place a type
+    /// `(opcode byte, sub-opcode)` of the instruction being executed, `None`
+    /// outside an instruction (finish and final-stack checks, frame handling):
+    /// the opcode's mnemonic for go's per-opcode error texts (`stack underflow
+    /// in <op>`, `<op> arg <i> wanted ... but got ...`, `dynamic cost budget
+    /// exceeded, executing <op>`) is resolved from it only when an error is
+    /// formatted, so execution pays two byte stores per instruction.
+    pub(crate) current_instr: Option<(u8, Option<u8>)>,
+    /// The stack height before the current instruction ran: places a type
     /// error's `arg <i>` index like go's `step`. Diagnostic only.
-    pub(crate) current_op_pops: i8,
     pub(crate) current_op_base_height: usize,
     /// Cost budget remaining. Shared/pooled across app calls — inner app calls
     /// add to and consume from this, so its delta is not this program's own
@@ -281,8 +282,7 @@ impl AvmMachine {
             call_stack: Vec::new(),
             scratch,
             pc: 0,
-            current_op: "",
-            current_op_pops: -1,
+            current_instr: None,
             current_op_base_height: 0,
             budget,
             cost: 0,
@@ -318,16 +318,86 @@ impl AvmMachine {
         opcode::resolve_spec(opcode_byte, sub_opcode)
     }
 
-    /// Remember which opcode is about to run, for go's per-opcode error texts.
-    fn note_current_op(&mut self, instr: &Instruction) {
-        if let Some(spec) = self.resolve_cost_spec(instr.opcode, instr.sub_opcode) {
-            self.current_op = spec.name;
-            self.current_op_pops = spec.stack_pops;
-        } else {
-            self.current_op = "";
-            self.current_op_pops = -1;
-        }
+    /// Mark `instr` as the instruction being executed (see
+    /// [`AvmMachine::current_instr`]).
+    #[inline]
+    fn begin_instruction(&mut self, instr: &Instruction) {
+        self.current_instr = Some((instr.opcode, instr.sub_opcode));
         self.current_op_base_height = self.stack.len();
+    }
+
+    /// The spec of the instruction being executed, if any.
+    fn current_spec(&self) -> Option<&'static opcode::OpSpec> {
+        let (byte, sub) = self.current_instr?;
+        self.resolve_cost_spec(byte, sub)
+    }
+
+    /// The current opcode's mnemonic (`""` outside an instruction).
+    fn current_op_name(&self) -> &'static str {
+        self.current_spec().map_or("", |spec| spec.name)
+    }
+
+    /// Whether go's argument gate (`EvalContext.step`) passes: enough values
+    /// on the stack and each of the opcode's `proto` argument types matched,
+    /// for the opcodes the [`crate::arg_gate`] table lists. The hot path: no
+    /// error is built here (see [`AvmMachine::arg_gate_error`]).
+    #[inline(always)]
+    fn arg_gate_passes(&self, instr: &Instruction) -> bool {
+        if instr.sub_opcode.is_some() {
+            return true;
+        }
+        let Some(types) = crate::arg_gate::arg_types(instr.opcode) else {
+            return true;
+        };
+        let len = self.stack.len();
+        let n = types.len();
+        if len < n {
+            return false;
+        }
+        // At most four arguments: a plain indexed loop on the top of the stack.
+        let top = &self.stack[len - n..];
+        let mut i = 0;
+        while i < n {
+            if !crate::arg_gate::accepts(types[i], &top[i]) {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    /// go's argument gate failure for `instr` (call only when
+    /// [`AvmMachine::arg_gate_passes`] is false): the stack height first, then
+    /// the first wrong argument from argument 0 upward, BEFORE the cost is
+    /// charged.
+    #[cold]
+    #[inline(never)]
+    fn arg_gate_error(&self, instr: &Instruction) -> AlgoError {
+        let types = crate::arg_gate::arg_types(instr.opcode).unwrap_or(&[]);
+        let name = self.current_op_name();
+        if self.stack.len() < types.len() {
+            return AlgoError::Avm {
+                message: format!("stack underflow in {name}"),
+            };
+        }
+        let first = self.stack.len() - types.len();
+        for (i, want) in types.iter().enumerate() {
+            let got = match (&self.stack[first + i], want) {
+                (_, crate::arg_gate::ArgType::Any) => continue,
+                (AvmValue::Uint64(_), crate::arg_gate::ArgType::Uint) => continue,
+                (AvmValue::Bytes(_), crate::arg_gate::ArgType::Bytes) => continue,
+                (AvmValue::Uint64(_), _) => "uint64",
+                (AvmValue::Bytes(_), _) => "[]byte",
+            };
+            return AlgoError::Avm {
+                message: format!("{name} arg {i} wanted {} but got {got}", want.name()),
+            };
+        }
+        // Unreachable when `arg_gate_passes` is false; a plain error rather
+        // than a panic on a path reachable from untrusted programs.
+        AlgoError::Avm {
+            message: format!("argument gate failed in {name}"),
+        }
     }
 
     /// Execute one instruction and advance the PC.
@@ -335,6 +405,14 @@ impl AvmMachine {
     /// `ctx` provides external state access (transaction fields, app state, etc.).
     /// Pure-opcode tests can pass `&mut NullContext`.
     pub fn step(&mut self, ctx: &mut dyn AvmContext) -> Result<(), AlgoError> {
+        let result = self.step_inner(ctx);
+        // No instruction is current once it ran (or failed): a pop outside an
+        // instruction must not print a stale mnemonic.
+        self.current_instr = None;
+        result
+    }
+
+    fn step_inner(&mut self, ctx: &mut dyn AvmContext) -> Result<(), AlgoError> {
         if self.finished {
             return Err(AlgoError::Avm {
                 message: "step called after execution finished".to_string(),
@@ -351,7 +429,12 @@ impl AvmMachine {
 
         // Record opcode hit for coverage tracking.
         self.opcode_hits[instr.opcode as usize] = true;
-        self.note_current_op(&instr);
+        self.begin_instruction(&instr);
+
+        // go's argument gate runs before the cost is charged.
+        if !self.arg_gate_passes(&instr) {
+            return Err(self.arg_gate_error(&instr));
+        }
 
         // Charge static cost. Must resolve through `resolve_spec` (not the
         // bare prefix-byte `lookup`) so a multi-byte "prefix opcode" family
@@ -396,6 +479,16 @@ impl AvmMachine {
         ctx: &mut dyn AvmContext,
         tracer: &mut dyn EvalTracer,
     ) -> Result<(), AlgoError> {
+        let result = self.step_with_tracer_inner(ctx, tracer);
+        self.current_instr = None;
+        result
+    }
+
+    fn step_with_tracer_inner(
+        &mut self,
+        ctx: &mut dyn AvmContext,
+        tracer: &mut dyn EvalTracer,
+    ) -> Result<(), AlgoError> {
         if self.finished {
             return Err(AlgoError::Avm {
                 message: "step called after execution finished".to_string(),
@@ -412,7 +505,7 @@ impl AvmMachine {
 
         // Record opcode hit for coverage tracking.
         self.opcode_hits[instr.opcode as usize] = true;
-        self.note_current_op(&instr);
+        self.begin_instruction(&instr);
 
         // Tracer: before opcode (called before cost charge so budget-
         // exhaustion opcodes are visible in the trace, matching go-algorand).
@@ -428,6 +521,14 @@ impl AvmMachine {
         // must be read from the pre-dispatch stack here since `ops::dispatch`
         // does not currently thread a tracer through to the opcode handlers.
         let scratch_write_slot = scratch_write_slot(&instr, &self.stack);
+
+        // go's argument gate runs before the cost is charged.
+        if !self.arg_gate_passes(&instr) {
+            let e = self.arg_gate_error(&instr);
+            let msg = e.to_string();
+            tracer.after_opcode(old_pc, instr.opcode, &self.stack, &self.scratch, Some(&msg));
+            return Err(e);
+        }
 
         // Charge static cost. Must resolve through `resolve_spec` (not the
         // bare prefix-byte `lookup`) so a multi-byte "prefix opcode" family
@@ -501,30 +602,36 @@ impl AvmMachine {
     /// `pc=` reports. Past the last instruction (the implicit end of the
     /// program) it is the program length, like go's.
     pub fn byte_pc(&self) -> usize {
-        // Programs below version 128 have a one-byte version header.
-        1 + match self.program.instructions.get(self.pc) {
-            Some(instr) => instr.offset,
-            None => self.end_of_program_offset,
-        }
+        // The version header is a uvarint: one byte below 128, two above.
+        let header = if self.version < 128 { 1 } else { 2 };
+        header
+            + match self.program.instructions.get(self.pc) {
+                Some(instr) => instr.offset,
+                None => self.end_of_program_offset,
+            }
     }
 
-    /// go's `<op> arg <i> wanted <T> but got <U>` (`step`'s argument type gate),
-    /// for the value just popped. The index counts from the deepest argument
-    /// like go's; an op with a dynamic argument count reports its popped
-    /// position from the stack height before it ran.
+    /// go's `<op> arg <i> wanted <T> but got <U>` for the value just popped by
+    /// an opcode the [`crate::arg_gate`] table does not cover (the table's own
+    /// opcodes are gated before they run). The index counts from the opcode's
+    /// own deepest argument like go's, which needs the opcode's argument count:
+    /// for an opcode whose count is dynamic (`stack_pops == -1`) there is no
+    /// such index, so the text is the generic one rather than a position
+    /// measured from the bottom of the whole stack.
     fn arg_type_error(&self, wanted: &str, got: &str) -> AlgoError {
-        let position = self.stack.len();
-        let first = if self.current_op_pops >= 0 {
-            self.current_op_base_height
-                .saturating_sub(self.current_op_pops as usize)
-        } else {
-            0
-        };
+        let spec = self.current_spec();
+        let pops = spec.map_or(-1, |s| s.stack_pops);
+        if pops < 0 {
+            return AlgoError::Avm {
+                message: format!("expected {wanted} on stack, got {got}"),
+            };
+        }
+        let first = self.current_op_base_height.saturating_sub(pops as usize);
         AlgoError::Avm {
             message: format!(
                 "{} arg {} wanted {wanted} but got {got}",
-                self.current_op,
-                position.saturating_sub(first)
+                self.current_op_name(),
+                self.stack.len().saturating_sub(first)
             ),
         }
     }
@@ -544,10 +651,9 @@ impl AvmMachine {
     pub fn pop(&mut self) -> Result<AvmValue, AlgoError> {
         self.stack.pop().ok_or_else(|| AlgoError::Avm {
             // go: `stack underflow in <op>` (`step`'s argument gate).
-            message: if self.current_op.is_empty() {
-                "stack underflow".to_string()
-            } else {
-                format!("stack underflow in {}", self.current_op)
+            message: match self.current_op_name() {
+                "" => "stack underflow".to_string(),
+                name => format!("stack underflow in {name}"),
             },
         })
     }
@@ -607,7 +713,8 @@ impl AvmMachine {
             return Err(AlgoError::Avm {
                 message: format!(
                     "dynamic cost budget exceeded, executing {}: local program cost was {}",
-                    self.current_op, self.cost
+                    self.current_op_name(),
+                    self.cost
                 ),
             });
         }
@@ -1326,5 +1433,36 @@ mod tests {
             result.err()
         );
         assert!(result.unwrap(), "program should approve");
+    }
+    /// An opcode with a dynamic argument count (`dig`, `stack_pops == -1`) has
+    /// no argument index relative to its own arguments, so a type error from a
+    /// typed pop carries the generic text, not a position measured from the
+    /// bottom of the whole stack (issue #2200).
+    #[test]
+    fn a_dynamic_count_opcode_has_no_positional_arg_index() {
+        let program = Program {
+            version: 8,
+            instructions: vec![],
+        };
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
+        for _ in 0..5 {
+            m.push(AvmValue::Uint64(1)).unwrap();
+        }
+        m.push(AvmValue::Bytes(vec![1])).unwrap();
+        m.current_instr = Some((0x4b, None)); // dig: dynamic pop count
+        m.current_op_base_height = m.stack.len();
+        let err = m.pop_uint().unwrap_err().to_string();
+        assert_eq!(err, "AVM: expected uint64 on stack, got []byte");
+        // A fixed-count opcode keeps go's text with an index from its own
+        // deepest argument (`btoi` takes one, so a wrongly typed top value is
+        // its argument 0 whatever lies beneath it).
+        m.current_instr = Some((0x17, None)); // btoi: one argument
+        m.push(AvmValue::Bytes(vec![1])).unwrap();
+        m.current_op_base_height = m.stack.len();
+        m.pop_bytes().unwrap();
+        m.push(AvmValue::Uint64(9)).unwrap();
+        m.current_op_base_height = m.stack.len();
+        let err = m.pop_bytes().unwrap_err().to_string();
+        assert_eq!(err, "AVM: btoi arg 0 wanted []byte but got uint64");
     }
 }

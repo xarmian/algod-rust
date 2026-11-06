@@ -195,8 +195,9 @@ pub fn op_divmodw(machine: &mut AvmMachine, _instruction: &Instruction) -> Resul
     let a = (a_high as u128) << 64 | a_low as u128;
     let b = (b_high as u128) << 64 | b_low as u128;
 
+    // go `opDivModw`: both denominator words zero is `/ 0`.
     if b == 0 {
-        return Err(avm_err("divmodw division by zero"));
+        return Err(avm_err("/ 0"));
     }
 
     let q = a / b;
@@ -341,16 +342,16 @@ pub fn op_divw(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(
     let a_low = machine.pop_uint()?;
     let a_high = machine.pop_uint()?;
 
+    // go `opDivw`: `divw 0`, then `divw overflow: <y> <= <hi>`.
     if b == 0 {
-        return Err(avm_err("divw division by zero"));
+        return Err(avm_err("divw 0"));
+    }
+    if b <= a_high {
+        return Err(avm_err(format!("divw overflow: {b} <= {a_high}")));
     }
 
     let a = (a_high as u128) << 64 | a_low as u128;
     let q = a / b as u128;
-
-    if q > u64::MAX as u128 {
-        return Err(avm_err("divw result overflow"));
-    }
 
     machine.push(AvmValue::Uint64(q as u64))
 }
