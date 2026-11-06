@@ -10950,6 +10950,58 @@ mod tests {
         assert!(err.to_string().contains("transaction already in ledger"));
     }
 
+    /// The pool's `CowOverlay` copy of `checkDup` and the ledger-side
+    /// [`algo_ledger::check_dup::BlockDups`] must tag the same duplicate
+    /// alike: which of the two answers (the copy before the apply, the ledger
+    /// side in it) must not change the error text or the pool error tag
+    /// (issue #2131).
+    #[test]
+    fn cow_overlay_and_ledger_side_dups_agree_on_text_and_tag() {
+        use algo_error::AlgoError;
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::CONSENSUS_V41,
+        )
+        .expect("v41");
+        let sender = Address([1; 32]);
+        let lease = [0xBB; 32];
+        let mut txn = algo_types::Transaction {
+            sender,
+            lease,
+            first_valid: algo_types::Round(1),
+            last_valid: algo_types::Round(500),
+            ..Default::default()
+        };
+        txn.lease = lease;
+        let txid = [0x42; 32];
+        let class_of = |e: &AlgoError| match e {
+            AlgoError::Rejected { class, message, .. } => (message.clone(), *class),
+            other => panic!("unclassified {other:?}"),
+        };
+
+        let mut pool_copy = CowOverlay::new();
+        pool_copy.record_txid(txid);
+        pool_copy.record_lease(&sender, &lease, 500);
+        let mut ledger_side = algo_ledger::check_dup::BlockDups::new();
+        ledger_side.record(&txn, algo_types::Digest(txid));
+
+        // The same txid again.
+        let pool_err = pool_copy.check_txid(&txid).unwrap_err();
+        let ledger_err = ledger_side
+            .check(&consensus, &txn, algo_types::Digest(txid), 100)
+            .unwrap_err();
+        assert_eq!(class_of(&pool_err), class_of(&ledger_err));
+
+        // The same lease under another txid.
+        let other = [0x43; 32];
+        let pool_err = pool_copy
+            .check_lease_in_overlay(&sender, &lease, 100, &other)
+            .unwrap_err();
+        let ledger_err = ledger_side
+            .check(&consensus, &txn, algo_types::Digest(other), 100)
+            .unwrap_err();
+        assert_eq!(class_of(&pool_err), class_of(&ledger_err));
+    }
+
     #[test]
     fn cow_overlay_lease_dedup() {
         let mut overlay = CowOverlay::new();

@@ -1764,7 +1764,7 @@ struct GroupCells {
     apply_data_len: Option<usize>,
     /// The block's `checkDup` records before the group
     /// ([`crate::check_dup::BlockCheckDup::mark`]).
-    checkdup_mark: Option<usize>,
+    checkdup_mark: Option<crate::check_dup::DupMark>,
 }
 
 impl GroupCells {
@@ -2102,7 +2102,12 @@ pub struct ProbeRequest {
     /// The txids and leases the earlier groups of the same pending block
     /// hold, when the caller keeps them across groups (the pool's evaluator,
     /// issue #2131): `checkDup` then starts from them instead of an empty
-    /// block. `None`: a fresh set for this apply.
+    /// block. `None`: a fresh owned set for this apply.
+    ///
+    /// Only honoured together with [`Self::check_dup`] (or a validating
+    /// apply): without a `checkDup` nothing would read or extend it, which is
+    /// a caller bug (`debug_assert!` in the apply). Cloned, not taken, so the
+    /// caller's handle stays valid for what it does after the apply.
     pub block_dups: Option<crate::check_dup::SharedBlockDups>,
     /// Evaluate as a block *generator* (pool admission, block assembly):
     /// go `EvaluatorOptions.Generate` / `roundCowState.generate`, carried
@@ -2731,6 +2736,10 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     // the ones the txtail records, hashed once here (or handed over by the
     // pool) and reused for the block's txtail row below (issue #2127).
     let run_check_dup = validate || probe.as_ref().is_some_and(|p| p.request.check_dup);
+    debug_assert!(
+        run_check_dup || probe.as_ref().is_none_or(|p| p.request.block_dups.is_none()),
+        "ProbeRequest::block_dups is only honoured with checkDup on"
+    );
     let (checkdup, checked_txtail) = if run_check_dup {
         let txids = match probe.as_mut().and_then(|p| p.request.txids.take()) {
             Some(txids) if txids.len() == stored_block.payset.len() => txids,
@@ -2748,12 +2757,14 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         // The block's txtail row, from the very txids `checkDup` checks.
         let txtail = algo_codec::build_txtail_from_block_with_txids(stored_block, &txids)?;
         (
-            Some(RefCell::new(match probe.as_mut().and_then(|p| p.request.block_dups.take()) {
-                Some(dups) => {
-                    crate::check_dup::BlockCheckDup::with_block_dups(block.round.0, txids, dups)
-                }
-                None => crate::check_dup::BlockCheckDup::new(block.round.0, txids),
-            })),
+            Some(RefCell::new(
+                match probe.as_ref().and_then(|p| p.request.block_dups.clone()) {
+                    Some(dups) => {
+                        crate::check_dup::BlockCheckDup::with_block_dups(block.round.0, txids, dups)
+                    }
+                    None => crate::check_dup::BlockCheckDup::new(block.round.0, txids),
+                },
+            )),
             Some(txtail),
         )
     } else {

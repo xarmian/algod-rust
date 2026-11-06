@@ -847,4 +847,104 @@ mod tests {
         evaluate_group_discarding(&l, &mut ov, &t, &group, None).expect("asked, not admitted");
         evaluate_group(&l, &mut ov, &t, &group).expect("then admitted");
     }
+
+    /// The pending block's recorded txid count.
+    fn recorded(ov: &PendingOverlay) -> usize {
+        crate::check_dup::lock_dups(&ov.block_dups()).txid_count()
+    }
+
+    /// A member that fails AFTER an earlier member of its group was recorded
+    /// leaves no record of the group: the earlier member is admitted when
+    /// resubmitted (issue #2131).
+    #[test]
+    fn a_group_failing_at_its_second_member_leaves_no_in_block_record() {
+        let a = addr(1);
+        let b = addr(2);
+        let l = ledger(&[(a, funded(50_000_000)), (b, funded(1_000_000))]);
+        let t = template(&l);
+        let mut ov = PendingOverlay::new(&l);
+        let first = pay(a, b, 1_000_000, None);
+        let group = [first.clone(), pay(b, a, 900_000_000, None)];
+        let err = evaluate_group(&l, &mut ov, &t, &group).expect_err("second overspends");
+        assert!(matches!(err, GroupEvalError::Txn { index: 1, .. }));
+        assert_eq!(recorded(&ov), 0, "the rejected group is not recorded");
+        evaluate_group(&l, &mut ov, &t, &[first]).expect("the first member is admitted alone");
+        assert_eq!(recorded(&ov), 1);
+    }
+
+    /// A panic in the middle of the evaluation (the last read panics, long
+    /// after the group was recorded by `checkDup`) leaves no record either.
+    #[test]
+    fn a_panicking_evaluation_leaves_no_in_block_record() {
+        use crate::locked_base::LockedBase;
+        use std::sync::Mutex;
+
+        let a = addr(1);
+        let group = [pay(a, addr(2), 5_000_000, None)];
+        // An uninterrupted run counts the reads and shows the group is
+        // recorded by the time the evaluation ends.
+        let total = {
+            let shared = Mutex::new(ledger(&[(a, funded(50_000_000))]));
+            let (t, mut ov) = {
+                let l = shared.lock().unwrap();
+                (template(&l), PendingOverlay::new(&*l))
+            };
+            let base = LockedBase::new(&shared, Round(0));
+            evaluate_group(&base, &mut ov, &t, &group).expect("group");
+            assert_eq!(recorded(&ov), 1);
+            base.stats().acquisitions
+        };
+        let shared = Mutex::new(ledger(&[(a, funded(50_000_000))]));
+        let (t, mut ov) = {
+            let l = shared.lock().unwrap();
+            (template(&l), PendingOverlay::new(&*l))
+        };
+        let base = LockedBase::new(&shared, Round(0));
+        base.before_acquisition(total - 1, || panic!("injected read panic"));
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let res = evaluate_group(&base, &mut ov, &t, &group);
+        std::panic::set_hook(prev);
+        match res {
+            Err(GroupEvalError::Other(e)) => assert!(e.to_string().contains("panicked"), "{e}"),
+            other => panic!("expected the panic verdict, got {other:?}"),
+        }
+        assert_eq!(recorded(&ov), 0, "a panicked group is not recorded");
+        assert!(ov.is_empty());
+    }
+
+    /// A base that moved while the group was evaluated (Stale: the apply
+    /// itself succeeded and recorded the group) leaves no record.
+    #[test]
+    fn a_stale_evaluation_leaves_no_in_block_record() {
+        use crate::locked_base::LockedBase;
+        use std::sync::{Arc, Mutex};
+
+        let a = addr(1);
+        let group = [pay(a, addr(2), 5_000_000, None)];
+        let total = {
+            let shared = Mutex::new(ledger(&[(a, funded(50_000_000))]));
+            let (t, mut ov) = {
+                let l = shared.lock().unwrap();
+                (template(&l), PendingOverlay::new(&*l))
+            };
+            let base = LockedBase::new(&shared, Round(0));
+            evaluate_group(&base, &mut ov, &t, &group).expect("group");
+            base.stats().acquisitions
+        };
+        let shared = Arc::new(Mutex::new(ledger(&[(a, funded(50_000_000))])));
+        let (t, mut ov) = {
+            let l = shared.lock().unwrap();
+            (template(&l), PendingOverlay::new(&*l))
+        };
+        let base = LockedBase::new(&shared, Round(0));
+        // A commit lands before the last read, after `checkDup` recorded.
+        let m = shared.clone();
+        base.before_acquisition(total - 1, move || {
+            m.lock().unwrap().set_current_round(Round(1));
+        });
+        let res = evaluate_group(&base, &mut ov, &t, &group);
+        assert!(matches!(res, Err(GroupEvalError::Stale)), "{res:?}");
+        assert_eq!(recorded(&ov), 0, "a stale group is not recorded");
+    }
 }
