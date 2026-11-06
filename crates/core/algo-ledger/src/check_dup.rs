@@ -80,6 +80,13 @@ fn typed(message: String, class: RejectClass) -> AlgoError {
 }
 
 /// A [`BlockDups`] shared between the evaluations of one pending block.
+///
+/// Single-owner invariant: at any time ONE evaluation extends it, namely the
+/// one holding `&mut PendingOverlay` (`evaluate_group_impl`). The shared
+/// `checkDup` takes the mutex separately for the block-half check and for the
+/// record (so it is never held across a ledger read), so the pair is not
+/// atomic; it is correct only because nothing else records in between. A
+/// debug build asserts it ([`BlockCheckDup::check`]).
 pub type SharedBlockDups = std::sync::Arc<std::sync::Mutex<BlockDups>>;
 
 /// Lock `dups`. The guard is only ever held for one short, store-free
@@ -156,7 +163,7 @@ impl BlockDups {
     /// already holds. Returns whether `txn` is subject to the lease checks
     /// (the protocol supports leases and the lease is set), so the ledger half
     /// gates on the same flag.
-    pub fn check(
+    fn check(
         &self,
         consensus: &ConsensusParams,
         txn: &Transaction,
@@ -521,7 +528,13 @@ impl BlockCheckDup {
             // check and, separately, for the record, never across the ledger
             // reads of the ledger half.
             BlockHalf::Shared(shared) => {
-                let leased = lock_dups(shared).check(consensus, &stx.txn, txid, self.ledger.round);
+                let (before, leased) = {
+                    let block = lock_dups(shared);
+                    (
+                        block.mark(),
+                        block.check(consensus, &stx.txn, txid, self.ledger.round),
+                    )
+                };
                 leased
                     .and_then(|leased| {
                         check_dup_ledger_half(
@@ -533,7 +546,17 @@ impl BlockCheckDup {
                             &mut self.ledger,
                         )
                     })
-                    .map(|()| lock_dups(shared).record(&stx.txn, txid))
+                    .map(|()| {
+                        let mut block = lock_dups(shared);
+                        // The single-owner invariant ([`SharedBlockDups`]): no
+                        // other record landed between the check and this one.
+                        debug_assert_eq!(
+                            block.mark(),
+                            before,
+                            "the shared BlockDups was extended during a check"
+                        );
+                        block.record(&stx.txn, txid);
+                    })
             }
         };
         if let Err(e) = checked {

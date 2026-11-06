@@ -116,6 +116,41 @@ pub fn evaluate_group_discarding<B: OverlayBase + ?Sized>(
     evaluate_group_impl(base, overlay, template, group, txids, false)
 }
 
+/// Rolls the pending block's `checkDup` record back to where it was when the
+/// guard was made, when dropped, unless [`Self::commit`] kept the group: a
+/// rejected, stale, panicked or discarded evaluation (every exit of
+/// `evaluate_group_impl` but the kept one) records nothing, however it ends.
+struct DupsGuard {
+    dups: crate::check_dup::SharedBlockDups,
+    mark: crate::check_dup::DupMark,
+    kept: bool,
+}
+
+impl DupsGuard {
+    fn new(dups: crate::check_dup::SharedBlockDups) -> Self {
+        let mark = crate::check_dup::lock_dups(&dups).mark();
+        Self {
+            dups,
+            mark,
+            kept: false,
+        }
+    }
+
+    /// Keep the group's records for good (also drops the undo log).
+    fn commit(&mut self) {
+        crate::check_dup::lock_dups(&self.dups).commit();
+        self.kept = true;
+    }
+}
+
+impl Drop for DupsGuard {
+    fn drop(&mut self) {
+        if !self.kept {
+            crate::check_dup::lock_dups(&self.dups).rollback_to(self.mark);
+        }
+    }
+}
+
 fn evaluate_group_impl<B: OverlayBase + ?Sized>(
     base: &B,
     overlay: &mut PendingOverlay,
@@ -136,15 +171,7 @@ fn evaluate_group_impl<B: OverlayBase + ?Sized>(
     // and leases of the groups already admitted (issue #2131), and the
     // group's own records are kept only when it is (below).
     let block_dups = overlay.block_dups();
-    let dups_mark = crate::check_dup::lock_dups(&block_dups).mark();
-    let undo_dups = |keep: bool| {
-        let mut dups = crate::check_dup::lock_dups(&block_dups);
-        if keep {
-            dups.commit();
-        } else {
-            dups.rollback_to(dups_mark);
-        }
-    };
+    let mut dups_guard = DupsGuard::new(block_dups.clone());
     let mut ad: Vec<ApplyData> = Vec::with_capacity(group.len());
     let mut probe = ExecProbe {
         request: ProbeRequest {
@@ -182,13 +209,12 @@ fn evaluate_group_impl<B: OverlayBase + ?Sized>(
         // A read saw another committed state: nothing this evaluation
         // concluded (accept or reject) says anything about the pending block.
         overlay.rollback_group();
-        undo_dups(false);
         return Err(GroupEvalError::Stale);
     }
     match res {
         Ok(Ok(())) => {
-            undo_dups(keep);
             if keep {
+                dups_guard.commit();
                 overlay.commit_group(probe.out.final_txn_counter);
             } else {
                 overlay.rollback_group();
@@ -201,7 +227,6 @@ fn evaluate_group_impl<B: OverlayBase + ?Sized>(
         }
         Ok(Err(error)) => {
             overlay.rollback_group();
-            undo_dups(false);
             match probe.out.failed_txn_index {
                 Some(index) if index < group.len() => Err(GroupEvalError::Txn { index, error }),
                 _ => Err(GroupEvalError::Other(error)),
@@ -209,7 +234,6 @@ fn evaluate_group_impl<B: OverlayBase + ?Sized>(
         }
         Err(_) => {
             overlay.rollback_group();
-            undo_dups(false);
             Err(GroupEvalError::Other(AlgoError::Ledger {
                 message: "group evaluation panicked".into(),
             }))

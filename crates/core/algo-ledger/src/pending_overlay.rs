@@ -168,6 +168,10 @@ impl PendingOverlay {
 
     /// The block's `checkDup` record, shared with the evaluations that extend
     /// it ([`crate::apply::ProbeRequest::block_dups`]).
+    ///
+    /// Single owner: only the evaluation holding `&mut self` may extend the
+    /// record ([`crate::check_dup::SharedBlockDups`]); a clone is for that
+    /// evaluation's own probe and rollback guard, not for another thread.
     pub fn block_dups(&self) -> crate::check_dup::SharedBlockDups {
         self.block_dups.clone()
     }

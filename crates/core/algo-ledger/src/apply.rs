@@ -2108,6 +2108,10 @@ pub struct ProbeRequest {
     /// apply): without a `checkDup` nothing would read or extend it, which is
     /// a caller bug (`debug_assert!` in the apply). Cloned, not taken, so the
     /// caller's handle stays valid for what it does after the apply.
+    ///
+    /// Single owner: the caller extends it from one evaluation at a time (the
+    /// one holding `&mut PendingOverlay`); the shared `checkDup` is not atomic
+    /// across its check and its record ([`crate::check_dup::SharedBlockDups`]).
     pub block_dups: Option<crate::check_dup::SharedBlockDups>,
     /// Evaluate as a block *generator* (pool admission, block assembly):
     /// go `EvaluatorOptions.Generate` / `roundCowState.generate`, carried
