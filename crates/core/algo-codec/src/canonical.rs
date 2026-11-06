@@ -1912,6 +1912,9 @@ thread_local! {
 /// Test hook: how many times a whole payset's txids were hashed on THIS thread
 /// ([`payset_txids_with_rule`]), so a test can show that a caller reuses ids
 /// it already has instead of hashing the payset again (issue #2134).
+///
+/// The counter is thread-local: work done on another thread is not counted,
+/// so a test must run the code under test on its own (test) thread.
 #[cfg(any(test, feature = "test-hooks"))]
 pub fn payset_txid_hash_runs() -> u64 {
     PAYSET_TXID_HASH_RUNS.with(std::cell::Cell::get)

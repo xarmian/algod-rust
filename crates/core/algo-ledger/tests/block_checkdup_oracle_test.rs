@@ -626,6 +626,12 @@ fn span_txid_cache_matches_the_per_lookup_scan() {
         "{found:?}"
     );
     assert!(!found.contains(&id(3)));
+    // Lookups that follow with nothing new do not read the missing row again.
+    let reads = l.span_row_reads();
+    for _ in 0..4 {
+        assert!(q(&l, &[id(2), id(4)]).contains(&id(4)));
+    }
+    assert_eq!(l.span_row_reads(), reads, "the missing row was re-read per lookup");
     // The row written later is picked up by the next lookup.
     l.put_txtail(3, &tail_row(3, &[id(3)])).unwrap();
     let found = q(&l, &[id(2), id(3), id(4)]);
@@ -1129,9 +1135,7 @@ fn evaluate_payset_uses_the_supplied_txids_instead_of_rehashing() {
     }
     // Made-up ids are looked up as supplied (the payset is NOT rehashed), so
     // the committed duplicate is not seen.
-    let made_up: Vec<Digest> = (0..real.len())
-        .map(|i| Digest([0xEE - i as u8; 32]))
-        .collect();
+    let made_up: Vec<Digest> = (0..real.len()).map(|i| Digest([0xEE - i as u8; 32])).collect();
     let made_up_result = evaluate_payset_with_txids(&base, &candidate, None, Some(made_up));
     assert!(
         made_up_result.is_ok(),

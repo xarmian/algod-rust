@@ -98,8 +98,7 @@ pub type SharedBlockDups = std::sync::Arc<std::sync::Mutex<BlockDups>>;
 /// many for a block that is being abandoned), so the poison is ignored
 /// rather than turning every later admission into a panic.
 pub fn lock_dups(dups: &SharedBlockDups) -> std::sync::MutexGuard<'_, BlockDups> {
-    dups.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    dups.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// A point [`BlockDups::rollback_to`] can return to.
@@ -668,21 +667,14 @@ pub fn prologue_prepass<L: LedgerStore + ?Sized>(store: &L, block: &algo_types::
     prologue_prepass_reusing(store, block, None)
 }
 
-/// [`prologue_prepass`] that starts from the ledger half of the execution
-/// that just failed to reach a verdict (`reuse`, issue #2134): its txids (so
-/// the payset is not hashed again) and the confirmed-txid set it loaded (so
-/// the txtail is not queried again). Only valid when the execution ran against
-/// the same base state: the same round (checked here) on a base that did not
-/// move (the callers' stale checks). A `reuse` for another round or payset
-/// length is ignored and the ledger half is rebuilt.
-/// Whether the ledger half `ledger` of a finished execution belongs to
-/// `block`: its round and length, and (in every build) its first and last txid
-/// against a hash of the payset's first and last transaction, so a caller that
-/// hands over the wrong payset's state is caught for two hashes instead of a
-/// whole-payset rehash. The execution and the pre-pass are the same
-/// function's output over the same block (`probe.out.ledger_dups` of the apply
-/// of this very `block`), so a mismatch is a caller bug, never a normal
-/// outcome; debug builds also compare every id.
+/// A cheap sanity check, not a proof, that the ledger half `ledger` handed to
+/// [`prologue_prepass_reusing`] is the one of `block`: its round and length,
+/// and (in every build) its first and last txid against a hash of the
+/// payset's first and last transaction. A caller that hands over the state of
+/// a payset that differs only in the middle passes it: the caller guarantees
+/// the state comes from the apply of this very `block` (`probe.out.ledger_dups`
+/// of the same evaluation), which is the only way the callers here get it.
+/// Debug builds compare every id.
 fn reuse_matches(
     ledger: &LedgerDups,
     block: &algo_types::Block,
@@ -714,6 +706,16 @@ fn reuse_matches(
     ends_match
 }
 
+/// [`prologue_prepass`] that starts from the ledger half of the execution
+/// that just failed to reach a verdict (`reuse`, issue #2134): its txids (so
+/// the payset is not hashed again) and the confirmed-txid set it loaded (so
+/// the txtail is not queried again).
+///
+/// Preconditions the CALLER guarantees: `reuse` comes from the apply of this
+/// very `block` (not another payset), run against `store`'s state, which did
+/// not move since (the callers' stale checks). Only the round and length (and
+/// the payset's first and last txid, see `reuse_matches`) are checked here; a
+/// `reuse` that fails them is ignored and the ledger half is rebuilt.
 pub fn prologue_prepass_reusing<L: LedgerStore + ?Sized>(
     store: &L,
     block: &algo_types::Block,

@@ -329,6 +329,7 @@ pub fn evaluate_proposal_check<B: OverlayBase + ?Sized>(base: &B, block: &Block)
     // One overlay for the evaluation and, rolled back, the pre-pass after it
     // (issue #2134): `PendingOverlay::new` reads the chain scalars.
     let mut overlay = PendingOverlay::new(base);
+    let state_before = overlay_reuse_state(&overlay);
     let result = evaluate_block_on_overlay_with(base, &mut overlay, block, &mut probe);
     // Only a clean apply failure leaves the overlay in a state `rollback_group`
     // is known to restore completely (its undo journal covers every write the
@@ -341,7 +342,10 @@ pub fn evaluate_proposal_check<B: OverlayBase + ?Sized>(base: &B, block: &Block)
     }
     let reuse = probe.out.ledger_dups.take();
     let prepass = if clean_failure {
-        prepass_after_clean_failure(base, &mut overlay, block, reuse)
+        let verdict = prepass_after_clean_failure(base, &mut overlay, block, reuse);
+        // The reuse relies on the failed group leaving the overlay as it was.
+        debug_assert_eq!(overlay_reuse_state(&overlay), state_before);
+        verdict
     } else {
         prologue_prepass_with(base, &mut PendingOverlay::new(base), block, reuse)
     };
@@ -355,6 +359,17 @@ pub fn evaluate_proposal_check<B: OverlayBase + ?Sized>(base: &B, block: &Block)
 pub fn prologue_prepass<B: OverlayBase + ?Sized>(base: &B, block: &Block) -> Option<String> {
     let mut overlay = PendingOverlay::new(base);
     prologue_prepass_with(base, &mut overlay, block, None)
+}
+
+/// What reusing an overlay after a failed group relies on being unchanged:
+/// the pool-withdrawal flag, the block's `checkDup` record, and that nothing
+/// is pending in the overlay (accounts, holdings, parameters, boxes, leases).
+fn overlay_reuse_state(overlay: &PendingOverlay) -> (bool, usize, bool) {
+    (
+        overlay.pool_withdrawn(),
+        crate::check_dup::lock_dups(&overlay.block_dups()).txid_count(),
+        overlay.is_empty(),
+    )
 }
 
 /// The pre-pass on the overlay a CLEAN apply failure left behind: the group in
@@ -894,9 +909,7 @@ mod tests {
             ),
             "{error:?}"
         );
-        assert!(error
-            .to_string()
-            .starts_with("transaction already in ledger: "));
+        assert!(error.to_string().starts_with("transaction already in ledger: "));
     }
 
     /// The same for a lease an earlier group of the pending block holds.
@@ -1083,6 +1096,7 @@ mod tests {
 
             let mut probe = crate::shadow_execute::proposal_check_probe();
             let mut overlay = PendingOverlay::new(&l);
+            let state_before = overlay_reuse_state(&overlay);
             let result = evaluate_block_on_overlay_with(&l, &mut overlay, &block, &mut probe);
             if !matches!(result, Err(ScratchFailure::Txn { .. })) {
                 continue; // evaluated fully, or no clean failure: not this path
@@ -1090,6 +1104,7 @@ mod tests {
             let reuse = probe.out.ledger_dups.take();
             let reused_overlay_with_reuse =
                 prepass_after_clean_failure(&l, &mut overlay, &block, reuse);
+            assert_eq!(overlay_reuse_state(&overlay), state_before);
             let reused_overlay_without =
                 prepass_after_clean_failure(&l, &mut overlay, &block, None);
             assert_eq!(

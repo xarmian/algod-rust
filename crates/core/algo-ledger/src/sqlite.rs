@@ -2315,12 +2315,20 @@ struct SpanTxids {
     /// The committed round the span started from (`None`: not built).
     committed: Option<u64>,
     /// Every round of `committed + 1 ..= synced_to` was read once: decoded
-    /// into `ids`, or (a missing or unreadable row) listed in `missing`.
+    /// into `ids`, or (an absent or unreadable row) listed in `missing`. An
+    /// undecodable row counts as read (it adds no ids, as the old scan treated
+    /// it, and is warned about once) and is not read again.
     synced_to: u64,
-    /// The rounds of the range whose row was absent when read. They are read
-    /// again on every sync, as the old per-lookup scan did (a row written
-    /// later is still seen), and never hide the rounds after them.
+    /// The rounds of the range whose row was absent when read. They never
+    /// hide the rounds after them. They are read again when the ledger's round
+    /// advanced since the last retry, or when `put_txtail` wrote one of them
+    /// (`retry_requested`): not on every lookup, so the lookups of one block
+    /// evaluation do not repeat the reads under the lock.
     missing: Vec<u64>,
+    /// The ledger round at the last retry of `missing`.
+    retried_at: u64,
+    /// `put_txtail` wrote a row listed in `missing`.
+    retry_requested: bool,
     ids: std::collections::HashSet<algo_types::Digest>,
 }
 
@@ -2355,6 +2363,9 @@ pub struct SqliteLedger {
     /// Test hook: in-span txtail rows decoded so far.
     #[cfg(any(test, feature = "test-hooks"))]
     span_rows_decoded: std::sync::atomic::AtomicU64,
+    /// Test hook: in-span txtail row reads (decoded or absent) so far.
+    #[cfg(any(test, feature = "test-hooks"))]
+    span_row_reads: std::sync::atomic::AtomicU64,
     /// Test hook: [`LedgerStore::txtail_confirmed_txids`] calls so far.
     #[cfg(any(test, feature = "test-hooks"))]
     confirmed_txid_loads: std::sync::atomic::AtomicU64,
@@ -3278,6 +3289,8 @@ impl SqliteLedger {
             #[cfg(any(test, feature = "test-hooks"))]
             span_rows_decoded: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
+            span_row_reads: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
             confirmed_txid_loads: std::sync::atomic::AtomicU64::new(0),
             lease_snapshot: None,
             chain_snapshot: None,
@@ -3423,13 +3436,27 @@ impl SqliteLedger {
                 committed: Some(committed),
                 synced_to: committed,
                 missing: Vec::new(),
+                retried_at: self.current_round.0,
+                retry_requested: false,
                 ids: std::collections::HashSet::new(),
             };
         }
         let mut still_missing = Vec::new();
-        let retry = std::mem::take(&mut span.missing);
+        let due = span.retry_requested || self.current_round.0 > span.retried_at;
+        let missing = std::mem::take(&mut span.missing);
+        let (retry, parked) = if due {
+            (missing, Vec::new())
+        } else {
+            (Vec::new(), missing)
+        };
+        span.retried_at = self.current_round.0;
+        span.retry_requested = false;
+        still_missing.extend(parked);
         let fresh = span.synced_to + 1..=self.current_round.0;
         for round in retry.into_iter().chain(fresh) {
+            #[cfg(any(test, feature = "test-hooks"))]
+            self.span_row_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let Some(bytes) = self.get_txtail(round).ok().flatten() else {
                 still_missing.push(round);
                 continue;
@@ -3437,22 +3464,24 @@ impl SqliteLedger {
             #[cfg(any(test, feature = "test-hooks"))]
             self.span_rows_decoded
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if let Ok(tail) = rmp_serde::from_slice::<algo_types::TxTailRound>(&bytes) {
-                span.ids.extend(tail.txn_ids.iter().filter_map(|id| {
+            match rmp_serde::from_slice::<algo_types::TxTailRound>(&bytes) {
+                Ok(tail) => span.ids.extend(tail.txn_ids.iter().filter_map(|id| {
                     <[u8; 32]>::try_from(id.as_ref())
                         .ok()
                         .map(algo_types::Digest)
-                }));
+                })),
+                Err(e) => tracing::warn!(round, "span txtail row is undecodable, skipped: {e}"),
             }
         }
         span.synced_to = span.synced_to.max(self.current_round.0);
         span.missing = still_missing;
     }
 
-    /// A span row that was already decoded is being replaced (`put_txtail` is
-    /// `INSERT OR REPLACE`): drop the span's decoded txids so the next lookup
-    /// reads the rows again. A row that was missing is retried by every sync
-    /// anyway; a round beyond the synced range has not been read yet.
+    /// A span row is being written (`put_txtail` is `INSERT OR REPLACE`): one
+    /// already decoded makes the span's decoded txids stale, so they are
+    /// dropped and the next lookup reads the rows again; a missing one is
+    /// flagged for the next sync's retry; a round beyond the synced range has
+    /// not been read yet.
     fn invalidate_span_txids_for(&mut self, round: u64) {
         let span = self
             .span_txids
@@ -3461,7 +3490,12 @@ impl SqliteLedger {
         let Some(committed) = span.committed else {
             return;
         };
-        if round > committed && round <= span.synced_to && !span.missing.contains(&round) {
+        if round <= committed || round > span.synced_to {
+            return;
+        }
+        if span.missing.contains(&round) {
+            span.retry_requested = true;
+        } else {
             *span = SpanTxids::default();
         }
     }
@@ -3470,6 +3504,13 @@ impl SqliteLedger {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn span_rows_decoded(&self) -> u64 {
         self.span_rows_decoded
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test hook (issue #2134): in-span txtail row reads so far.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn span_row_reads(&self) -> u64 {
+        self.span_row_reads
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -18166,6 +18207,7 @@ mod tests {
             txtail_dups: _, // derived from committed txtail rows
             span_txids: _,  // derived from the span's txtail rows
             span_rows_decoded: _,
+            span_row_reads: _,
             confirmed_txid_loads: _,
             lease_snapshot: _,
             chain_snapshot: _,
