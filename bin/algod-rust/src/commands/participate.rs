@@ -1368,6 +1368,12 @@ struct CowOverlay {
     /// payment txns) is deducted and the receiver's balance is credited.
     balance_deltas: HashMap<Address, u64>,
     /// Leases recorded within this block. Maps (sender, lease) to last_valid.
+    ///
+    /// This and `seen_txids` are the pool's own in-block `checkDup` copy. The
+    /// ledger-side evaluation (`evaluate_group`) now keeps the pending block's
+    /// txids and leases itself (issue #2131), but this copy stays: it is the
+    /// ONLY in-block check when the real apply cannot run (`exec` incomplete,
+    /// over its admission budget or stale) and it answers before the apply.
     leases: HashMap<(Address, [u8; 32]), u64>,
     /// Transaction IDs seen within this block, for duplicate detection.
     seen_txids: HashSet<[u8; 32]>,

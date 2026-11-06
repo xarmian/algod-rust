@@ -79,6 +79,15 @@ fn typed(message: String, class: RejectClass) -> AlgoError {
     }
 }
 
+/// A [`BlockDups`] shared between the evaluations of one pending block.
+pub type SharedBlockDups = std::sync::Arc<std::sync::Mutex<BlockDups>>;
+
+/// Lock `dups` (a poisoned lock still holds a consistent set: every
+/// mutation is a single map operation).
+pub fn lock_dups(dups: &SharedBlockDups) -> std::sync::MutexGuard<'_, BlockDups> {
+    dups.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// A lease's key: (sender, lease).
 type LeaseKey = (Address, [u8; 32]);
 
@@ -156,6 +165,12 @@ impl BlockDups {
     #[must_use]
     pub fn mark(&self) -> usize {
         self.journal.len()
+    }
+
+    /// Keep everything recorded so far for good: the undo log is dropped, so
+    /// a long-lived pending block's does not grow with every admitted group.
+    pub fn commit(&mut self) {
+        self.journal.clear();
     }
 
     /// Undo every [`Self::record`] since `mark`: go applies a group to a
@@ -339,7 +354,9 @@ pub fn check_dup<L: LedgerStore + ?Sized>(
 /// can tell such a rejection apart from any other evaluation error.
 #[derive(Debug)]
 pub struct BlockCheckDup {
-    block: BlockDups,
+    /// Shared so that a pool's pending block can keep ONE [`BlockDups`] across
+    /// its groups, like go's single block cow (issue #2131).
+    block: SharedBlockDups,
     ledger: LedgerDups,
     violation: Option<(usize, String)>,
 }
@@ -350,7 +367,20 @@ impl BlockCheckDup {
     #[must_use]
     pub fn new(round: u64, txids: Vec<Digest>) -> Self {
         Self {
-            block: BlockDups::new(),
+            block: SharedBlockDups::default(),
+            ledger: LedgerDups::new(round, txids),
+            violation: None,
+        }
+    }
+
+    /// [`Self::new`] seeded with the txids and leases the earlier groups of
+    /// the same pending block hold (`block`), which this evaluation extends
+    /// as it admits transactions (go's one `roundCowState` per pending-block
+    /// evaluator, issue #2131).
+    #[must_use]
+    pub fn with_block_dups(round: u64, txids: Vec<Digest>, block: SharedBlockDups) -> Self {
+        Self {
+            block,
             ledger: LedgerDups::new(round, txids),
             violation: None,
         }
@@ -366,14 +396,14 @@ impl BlockCheckDup {
     /// A point [`Self::rollback_to`] can return to (taken before a group).
     #[must_use]
     pub fn mark(&self) -> usize {
-        self.block.mark()
+        lock_dups(&self.block).mark()
     }
 
     /// Forget the txids and leases recorded since `mark` (a failed group,
     /// see [`BlockDups::rollback_to`]). The recorded violation stays: it is
     /// the verdict of the evaluation that failed.
     pub fn rollback_to(&mut self, mark: usize) {
-        self.block.rollback_to(mark);
+        lock_dups(&self.block).rollback_to(mark);
     }
 
     /// The payset's txids, as the txtail records them.
@@ -405,18 +435,12 @@ impl BlockCheckDup {
             self.violation = Some((index, e.to_string()));
             return Err(e);
         }
-        if let Err(e) = check_dup(
-            store,
-            consensus,
-            &stx.txn,
-            txid,
-            &self.block,
-            &mut self.ledger,
-        ) {
+        let mut block = lock_dups(&self.block);
+        if let Err(e) = check_dup(store, consensus, &stx.txn, txid, &block, &mut self.ledger) {
             self.violation = Some((index, e.to_string()));
             return Err(e);
         }
-        self.block.record(&stx.txn, txid);
+        block.record(&stx.txn, txid);
         Ok(())
     }
 
@@ -599,6 +623,27 @@ mod tests {
             last_valid: Round(last_valid),
             ..Default::default()
         }
+    }
+
+    /// A committed prefix of a shared [`BlockDups`] survives a later rollback
+    /// and the undo log does not keep growing (issue #2131).
+    #[test]
+    fn commit_keeps_the_records_and_drops_the_undo_log() {
+        let mut dups = BlockDups::new();
+        dups.record(&leased_txn(1, 50), Digest([1; 32]));
+        dups.commit();
+        assert_eq!(dups.mark(), 0, "the journal is dropped");
+        let mark = dups.mark();
+        let mut other = leased_txn(1, 60);
+        other.sender = Address([9; 32]);
+        dups.record(&other, Digest([2; 32]));
+        dups.rollback_to(mark);
+        let consensus = consensus_params_for_version(CONSENSUS_V23).expect("known protocol");
+        // The committed record is still held, the rolled-back one is gone.
+        assert!(dups
+            .check(&consensus, &leased_txn(1, 50), Digest([1; 32]), 11)
+            .is_err());
+        assert!(dups.check(&consensus, &other, Digest([2; 32]), 11).is_ok());
     }
 
     fn check(protocol: &str, txn: &Transaction) -> Result<(), AlgoError> {

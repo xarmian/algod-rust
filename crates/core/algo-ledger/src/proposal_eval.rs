@@ -132,6 +132,19 @@ fn evaluate_group_impl<B: OverlayBase + ?Sized>(
     block.payset = group.to_vec();
 
     overlay.begin_group();
+    // go's one block cow per pending block: `checkDup` starts from the txids
+    // and leases of the groups already admitted (issue #2131), and the
+    // group's own records are kept only when it is (below).
+    let block_dups = overlay.block_dups();
+    let dups_mark = crate::check_dup::lock_dups(&block_dups).mark();
+    let undo_dups = |keep: bool| {
+        let mut dups = crate::check_dup::lock_dups(&block_dups);
+        if keep {
+            dups.commit();
+        } else {
+            dups.rollback_to(dups_mark);
+        }
+    };
     let mut ad: Vec<ApplyData> = Vec::with_capacity(group.len());
     let mut probe = ExecProbe {
         request: ProbeRequest {
@@ -143,6 +156,7 @@ fn evaluate_group_impl<B: OverlayBase + ?Sized>(
             // against the live ledger, not the pool's snapshot (issue #2127).
             check_dup: true,
             txids,
+            block_dups: Some(block_dups.clone()),
             ..ProbeRequest::default()
         },
         ..ExecProbe::default()
@@ -168,10 +182,12 @@ fn evaluate_group_impl<B: OverlayBase + ?Sized>(
         // A read saw another committed state: nothing this evaluation
         // concluded (accept or reject) says anything about the pending block.
         overlay.rollback_group();
+        undo_dups(false);
         return Err(GroupEvalError::Stale);
     }
     match res {
         Ok(Ok(())) => {
+            undo_dups(keep);
             if keep {
                 overlay.commit_group(probe.out.final_txn_counter);
             } else {
@@ -185,6 +201,7 @@ fn evaluate_group_impl<B: OverlayBase + ?Sized>(
         }
         Ok(Err(error)) => {
             overlay.rollback_group();
+            undo_dups(false);
             match probe.out.failed_txn_index {
                 Some(index) if index < group.len() => Err(GroupEvalError::Txn { index, error }),
                 _ => Err(GroupEvalError::Other(error)),
@@ -192,6 +209,7 @@ fn evaluate_group_impl<B: OverlayBase + ?Sized>(
         }
         Err(_) => {
             overlay.rollback_group();
+            undo_dups(false);
             Err(GroupEvalError::Other(AlgoError::Ledger {
                 message: "group evaluation panicked".into(),
             }))
@@ -759,5 +777,74 @@ mod tests {
         assert!(shared.try_lock().is_ok());
         assert!(base.stats().acquisitions > 1);
         assert!(!base.is_stale());
+    }
+
+    /// go keeps ONE block cow per pending-block evaluator, so a later group is
+    /// checked against every earlier group of the block: a repeated txid is an
+    /// in-block `transaction already in ledger` (issue #2131).
+    #[test]
+    fn a_later_group_repeating_an_earlier_txid_is_an_in_block_duplicate() {
+        let a = addr(1);
+        let l = ledger(&[(a, funded(50_000_000)), (addr(2), funded(1_000_000))]);
+        let t = template(&l);
+        let mut ov = PendingOverlay::new(&l);
+        let group = [pay(a, addr(2), 1_000, None)];
+        evaluate_group(&l, &mut ov, &t, &group).expect("first");
+        let err = evaluate_group(&l, &mut ov, &t, &group).expect_err("repeat");
+        let GroupEvalError::Txn { index: 0, error } = err else {
+            panic!("expected a txn rejection, got {err:?}");
+        };
+        assert!(
+            matches!(
+                &error,
+                algo_error::AlgoError::Rejected {
+                    class: algo_error::RejectClass::TxidInLedger { in_block: true },
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().starts_with("transaction already in ledger: "));
+    }
+
+    /// The same for a lease an earlier group of the pending block holds.
+    #[test]
+    fn a_later_group_reusing_an_earlier_lease_is_an_in_block_lease_conflict() {
+        let a = addr(1);
+        let l = ledger(&[(a, funded(50_000_000)), (addr(2), funded(1_000_000))]);
+        let t = template(&l);
+        let mut ov = PendingOverlay::new(&l);
+        let mut first = pay(a, addr(2), 1_000, None);
+        first.txn.lease = [7; 32];
+        let mut second = pay(a, addr(2), 2_000, None);
+        second.txn.lease = [7; 32];
+        evaluate_group(&l, &mut ov, &t, &[first]).expect("first");
+        let err = evaluate_group(&l, &mut ov, &t, &[second]).expect_err("same lease");
+        let GroupEvalError::Txn { index: 0, error } = err else {
+            panic!("expected a txn rejection, got {err:?}");
+        };
+        assert!(
+            matches!(
+                &error,
+                algo_error::AlgoError::Rejected {
+                    class: algo_error::RejectClass::LeaseInLedger { in_block: true },
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// A rejected or discarded evaluation records nothing: the same group is
+    /// admitted afterwards.
+    #[test]
+    fn a_discarded_group_leaves_no_in_block_record() {
+        let a = addr(1);
+        let l = ledger(&[(a, funded(50_000_000)), (addr(2), funded(1_000_000))]);
+        let t = template(&l);
+        let mut ov = PendingOverlay::new(&l);
+        let group = [pay(a, addr(2), 1_000, None)];
+        evaluate_group_discarding(&l, &mut ov, &t, &group, None).expect("asked, not admitted");
+        evaluate_group(&l, &mut ov, &t, &group).expect("then admitted");
     }
 }

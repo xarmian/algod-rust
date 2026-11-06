@@ -2099,6 +2099,11 @@ pub struct ProbeRequest {
     /// The payset's txids (as the txtail records them), when the caller
     /// already hashed them; otherwise the apply hashes them for `checkDup`.
     pub txids: Option<Vec<algo_types::Digest>>,
+    /// The txids and leases the earlier groups of the same pending block
+    /// hold, when the caller keeps them across groups (the pool's evaluator,
+    /// issue #2131): `checkDup` then starts from them instead of an empty
+    /// block. `None`: a fresh set for this apply.
+    pub block_dups: Option<crate::check_dup::SharedBlockDups>,
     /// Evaluate as a block *generator* (pool admission, block assembly):
     /// go `EvaluatorOptions.Generate` / `roundCowState.generate`, carried
     /// into [`ApplyContext::generate`]. Policies that must never affect
@@ -2743,10 +2748,12 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         // The block's txtail row, from the very txids `checkDup` checks.
         let txtail = algo_codec::build_txtail_from_block_with_txids(stored_block, &txids)?;
         (
-            Some(RefCell::new(crate::check_dup::BlockCheckDup::new(
-                block.round.0,
-                txids,
-            ))),
+            Some(RefCell::new(match probe.as_mut().and_then(|p| p.request.block_dups.take()) {
+                Some(dups) => {
+                    crate::check_dup::BlockCheckDup::with_block_dups(block.round.0, txids, dups)
+                }
+                None => crate::check_dup::BlockCheckDup::new(block.round.0, txids),
+            })),
             Some(txtail),
         )
     } else {
