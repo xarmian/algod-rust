@@ -1916,6 +1916,10 @@ struct ExecGroup {
     len: usize,
     /// Fees the group contributed to `fees_collected`.
     fees: u64,
+    /// The group's txids (as the txtail records them), hashed once by
+    /// admission and handed to every later scratch pass (issue #2132). Empty
+    /// when a group was added without them: the pass then hashes the payset.
+    txids: Vec<algo_types::Digest>,
 }
 
 /// Real-apply state of one pending block evaluator.
@@ -3020,7 +3024,20 @@ impl SimpleBlockEvaluator {
             &self.ledger,
             algo_types::Round(template.round.0.saturating_sub(1)),
         );
-        let r = algo_ledger::proposal_eval::evaluate_payset(&base, &candidate, request);
+        // The groups' txids, hashed once at admission, in payset order; a
+        // group table that does not carry them all (a group added without
+        // them) leaves `checkDup` to hash the payset (issue #2132).
+        let txids = (groups.iter().map(|g| g.txids.len()).sum::<usize>() == payset.len()
+            && groups.iter().all(|g| g.txids.len() == g.len))
+        .then(|| {
+            groups
+                .iter()
+                .flat_map(|g| g.txids.iter().copied())
+                .collect::<Vec<_>>()
+        });
+        let r = algo_ledger::proposal_eval::evaluate_payset_with_txids(
+            &base, &candidate, request, txids,
+        );
         self.note_lock_use(&base);
         if base.is_poisoned() {
             return Err(algo_ledger::locked_base::LockedBase::poison_error());
@@ -3774,6 +3791,13 @@ impl SimpleBlockEvaluator {
             self.txn_bytes + bytes <= self.max_txn_bytes,
             "the helper must not exceed the block size limit"
         );
+        let txids: Vec<algo_types::Digest> = stibs
+            .iter()
+            .map(|stib| {
+                let (gen, gh) = genesis_rule.restored_genesis(stib);
+                algo_codec::compute_txn_id_with_genesis(&stib.txn, gen, gh)
+            })
+            .collect();
         let exec = self
             .exec
             .as_mut()
@@ -3787,6 +3811,7 @@ impl SimpleBlockEvaluator {
             start: self.included_txns.len(),
             len: stibs.len(),
             fees,
+            txids,
         });
         self.fees_collected += fees;
         self.txn_bytes += bytes;
@@ -4352,7 +4377,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // failing inner transaction or a rejecting program; this can.
         // Evaluated once here; the result also feeds the ApplyData of the
         // proposed block.
-        match self.exec_group(&stibs, txids) {
+        match self.exec_group(&stibs, txids.clone()) {
             // The evaluated fees include inner-transaction fees (issue #1908).
             Ok(Some(fees)) => {
                 self.fees_collected = fees_collected_checkpoint.saturating_add(fees);
@@ -4370,6 +4395,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                 start: self.included_txns.len(),
                 len: stibs.len(),
                 fees: group_fees,
+                txids,
             });
         }
 

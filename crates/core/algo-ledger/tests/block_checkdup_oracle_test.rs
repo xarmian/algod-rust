@@ -974,3 +974,59 @@ fn prepasses_report_could_not_run_instead_of_clean() {
         )
     );
 }
+
+/// The block-generation scratch passes take the pool's txids
+/// (`evaluate_payset_with_txids`): `checkDup` uses the supplied ids instead of
+/// hashing the payset again (issue #2132). Observable through the txtail
+/// lookup: the real ids of the `committed_txid` payset are caught, made-up
+/// ones are looked up as given, and a wrong count is refused.
+#[test]
+fn evaluate_payset_uses_the_supplied_txids_instead_of_rehashing() {
+    use algo_ledger::locked_base::LockedBase;
+    use algo_ledger::proposal_eval::{evaluate_payset, evaluate_payset_with_txids};
+    use algo_ledger::shadow_execute::ScratchFailure;
+    use algo_types::{Digest, Round};
+
+    let o = load_oracle();
+    let sc = scenario(&o, "committed_txid");
+    let candidate = block(&sc.block);
+    let real = algo_codec::block_txids_with_rule(
+        &candidate,
+        &algo_types::genesis_restore::GenesisRestoreRule::for_block(&candidate),
+    );
+    let shared = Arc::new(Mutex::new(sqlite(&o)));
+    let base = LockedBase::new(&shared, Round(1));
+
+    // Hashing: the committed transaction is caught (go's text).
+    match evaluate_payset(&base, &candidate, None) {
+        Err(ScratchFailure::Txn { index: 0, error }) => {
+            assert_eq!(error.to_string(), sc.validate_error)
+        }
+        other => panic!("rehashing: {other:?}"),
+    }
+    // The real ids handed over: the same verdict.
+    match evaluate_payset_with_txids(&base, &candidate, None, Some(real.clone())) {
+        Err(ScratchFailure::Txn { index: 0, error }) => {
+            assert_eq!(error.to_string(), sc.validate_error)
+        }
+        other => panic!("supplied real ids: {other:?}"),
+    }
+    // Made-up ids are looked up as supplied (the payset is NOT rehashed), so
+    // the committed duplicate is not seen.
+    let made_up: Vec<Digest> = (0..real.len()).map(|i| Digest([0xEE - i as u8; 32])).collect();
+    if let Err(ScratchFailure::Txn { error, .. }) =
+        evaluate_payset_with_txids(&base, &candidate, None, Some(made_up))
+    {
+        assert_ne!(
+            error.to_string(),
+            sc.validate_error,
+            "the supplied ids must be used, not recomputed"
+        );
+    }
+    // A count that does not match the payset is refused, not hashed around.
+    let short = real[..real.len() - 1].to_vec();
+    match evaluate_payset_with_txids(&base, &candidate, None, Some(short)) {
+        Err(ScratchFailure::Other(e)) => assert!(e.to_string().contains("checkDup:"), "{e}"),
+        other => panic!("a short txid list must be refused: {other:?}"),
+    }
+}

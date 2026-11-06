@@ -460,6 +460,7 @@ fn assembled_block_drops_an_injected_unapplyable_group_and_carries_apply_data() 
         start,
         len: 1,
         fees: 1_000,
+        txids: Vec::new(),
     });
     eval.fees_collected += 1_000;
     let mut block = eval.generate_block(&[]).expect("generate_block");
@@ -2287,6 +2288,7 @@ fn overlay_assembly_equals_the_locked_scratch_pass_over_random_mixes() {
                 start: at,
                 len: 1,
                 fees: 1_000,
+                txids: Vec::new(),
             },
         );
         eval.fees_collected += 1_000;
@@ -4413,4 +4415,54 @@ fn the_live_lease_table_gives_the_snapshot_verdict() {
             .to_string()
         );
     }
+}
+
+/// Admission hands every group's txids (hashed once for `checkDup`) to the
+/// scratch passes of block assembly (issue #2132): they are exactly what
+/// hashing the assembled payset again would give, and the proposed block is
+/// built from them.
+#[test]
+fn admitted_groups_carry_the_txids_the_scratch_passes_reuse() {
+    let a = key(1);
+    let b = key(2);
+    let (ledger, _pool) = fixture(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))], &[]);
+    let adapter = PoolLedgerAdapter::new(ledger.clone());
+    let mut eval = adapter
+        .start_simple_evaluator(genesis_header(), 0, 0)
+        .expect("start_evaluator");
+    eval.transaction_group(&[leased_pay(&a, b.0, [0x71; 32], 7)])
+        .expect("first group");
+    let mut members = [(1_000u64, 2_000u64), (2_000, 0)].map(|(amount, fee)| {
+        let mut t = base_txn(a.0, TxnType::Pay);
+        t.receiver = b.0;
+        t.amount = amount;
+        t.fee = fee;
+        t
+    });
+    let gid = algo_codec::compute_group_id(&members);
+    for t in members.iter_mut() {
+        t.group = gid.0;
+    }
+    let group: Vec<_> = members.into_iter().map(|t| sign(t, &a.1)).collect();
+    eval.transaction_group(&group)
+        .expect("a second, two-member group");
+    let supplied: Vec<algo_types::Digest> = eval
+        .exec
+        .as_ref()
+        .unwrap()
+        .groups
+        .iter()
+        .flat_map(|g| g.txids.iter().copied())
+        .collect();
+    assert_eq!(supplied.len(), 3);
+    let block = algo_types::Block {
+        payset: eval.included_txns.clone(),
+        ..Default::default()
+    };
+    let rehashed = algo_codec::block_txids_with_rule(&block, &eval.genesis_rule());
+    assert_eq!(supplied, rehashed);
+    // And the assembly (which feeds them to every scratch pass) still
+    // produces the whole payset.
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.payset.len(), 3);
 }
