@@ -1901,8 +1901,15 @@ pub fn build_txtail_from_block_with_rule(
 /// so no `Transaction` (possibly a large appl) is ever cloned. Idempotent:
 /// an already-restored txn keeps its own genesis fields.
 pub fn block_txids_with_rule(block: &Block, rule: &GenesisRestoreRule<'_>) -> Vec<Digest> {
-    block
-        .payset
+    payset_txids_with_rule(&block.payset, rule)
+}
+
+/// [`block_txids_with_rule`] for a payset that is not (yet) inside a block.
+pub fn payset_txids_with_rule(
+    payset: &[SignedTransaction],
+    rule: &GenesisRestoreRule<'_>,
+) -> Vec<Digest> {
+    payset
         .iter()
         .map(|stx| {
             let (gen, gh) = rule.restored_genesis(stx);

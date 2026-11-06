@@ -456,10 +456,12 @@ fn assembled_block_drops_an_injected_unapplyable_group_and_carries_apply_data() 
     eval.genesis_rule().strip(&mut stib);
     let start = eval.included_txns.len();
     eval.included_txns.push(stib);
+    let txids = Some(carried_txids(&eval, start, 1));
     eval.exec.as_mut().unwrap().groups.push(ExecGroup {
         start,
         len: 1,
         fees: 1_000,
+        txids,
     });
     eval.fees_collected += 1_000;
     let mut block = eval.generate_block(&[]).expect("generate_block");
@@ -2281,12 +2283,14 @@ fn overlay_assembly_equals_the_locked_scratch_pass_over_random_mixes() {
         for g in eval.exec.as_mut().unwrap().groups.iter_mut().skip(pos) {
             g.start += 1;
         }
+        let txids = Some(carried_txids(&eval, at, 1));
         eval.exec.as_mut().unwrap().groups.insert(
             pos,
             ExecGroup {
                 start: at,
                 len: 1,
                 fees: 1_000,
+                txids,
             },
         );
         eval.fees_collected += 1_000;
@@ -4413,4 +4417,221 @@ fn the_live_lease_table_gives_the_snapshot_verdict() {
             .to_string()
         );
     }
+}
+
+/// The txids of `len` payset transactions of `eval` from `start`, hashed as
+/// the txtail records them (what a smuggled-in group carries).
+fn carried_txids(eval: &SimpleBlockEvaluator, start: usize, len: usize) -> Vec<algo_types::Digest> {
+    algo_codec::payset_txids_with_rule(&eval.included_txns[start..start + len], &eval.genesis_rule())
+}
+
+/// Admission hands every group's txids (hashed once for `checkDup`) to the
+/// scratch passes of block assembly (issue #2132): they are exactly what
+/// hashing the assembled payset again would give, and the proposed block is
+/// built from them.
+#[test]
+fn admitted_groups_carry_the_txids_the_scratch_passes_reuse() {
+    let a = key(1);
+    let b = key(2);
+    let (ledger, _pool) = fixture(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))], &[]);
+    let adapter = PoolLedgerAdapter::new(ledger.clone());
+    let mut eval = adapter
+        .start_simple_evaluator(genesis_header(), 0, 0)
+        .expect("start_evaluator");
+    eval.transaction_group(&[leased_pay(&a, b.0, [0x71; 32], 7)])
+        .expect("first group");
+    let mut members = [(1_000u64, 2_000u64), (2_000, 0)].map(|(amount, fee)| {
+        let mut t = base_txn(a.0, TxnType::Pay);
+        t.receiver = b.0;
+        t.amount = amount;
+        t.fee = fee;
+        t
+    });
+    let gid = algo_codec::compute_group_id(&members);
+    for t in members.iter_mut() {
+        t.group = gid.0;
+    }
+    let group: Vec<_> = members.into_iter().map(|t| sign(t, &a.1)).collect();
+    eval.transaction_group(&group)
+        .expect("a second, two-member group");
+    let supplied = ExecGroup::flatten_txids(&eval.exec.as_ref().unwrap().groups)
+        .expect("every admitted group carries its txids");
+    assert_eq!(supplied.len(), 3);
+    let block = algo_types::Block {
+        payset: eval.included_txns.clone(),
+        ..Default::default()
+    };
+    let rehashed = algo_codec::block_txids_with_rule(&block, &eval.genesis_rule());
+    assert_eq!(supplied, rehashed);
+    // And the assembly (which feeds them to every scratch pass) still
+    // produces the whole payset.
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.payset.len(), 3);
+}
+
+/// The carried txids are the ones the txtail rebuilds through the block's
+/// genesis rule, whichever of the transaction's genesis id / hash is present
+/// (issue #2132): a transaction without a genesis id, one without a genesis
+/// hash, and one with neither are admitted (or refused) by admission as it
+/// decides, and every ADMITTED group's carried txids equal a rehash of the
+/// assembled payset (debug builds also assert this in every scratch pass).
+#[test]
+fn carried_txids_equal_the_rehash_for_transactions_without_genesis_fields() {
+    let a = key(1);
+    let b = key(2);
+    let (ledger, _pool) = fixture(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))], &[]);
+    let adapter = PoolLedgerAdapter::new(ledger.clone());
+    let mut eval = adapter
+        .start_simple_evaluator(genesis_header(), 0, 0)
+        .expect("start_evaluator");
+    let variant = |amount: u64, with_id: bool, with_hash: bool| {
+        let mut t = base_txn(a.0, TxnType::Pay);
+        t.receiver = b.0;
+        t.amount = amount;
+        if !with_id {
+            t.genesis_id = String::new();
+        }
+        if !with_hash {
+            t.genesis_hash = [0u8; 32];
+        }
+        sign(t, &a.1)
+    };
+    let mut admitted = 0;
+    for (amount, with_id, with_hash) in [
+        (1_000u64, true, true),
+        (2_000, false, true),
+        (3_000, true, false),
+        (4_000, false, false),
+    ] {
+        if eval
+            .transaction_group(&[variant(amount, with_id, with_hash)])
+            .is_ok()
+        {
+            admitted += 1;
+        }
+    }
+    assert!(admitted >= 2, "the id-less variant must be admitted too");
+    let supplied = ExecGroup::flatten_txids(&eval.exec.as_ref().unwrap().groups)
+        .expect("every admitted group carries its txids");
+    assert_eq!(supplied.len(), admitted);
+    let block = algo_types::Block {
+        payset: eval.included_txns.clone(),
+        ..Default::default()
+    };
+    assert_eq!(
+        supplied,
+        algo_codec::block_txids_with_rule(&block, &eval.genesis_rule())
+    );
+    assert_eq!(
+        eval.generate_block(&[]).expect("generate_block").payset.len(),
+        admitted
+    );
+}
+
+/// Dropping or truncating groups, and the failure / bisection passes of
+/// assembly, keep every group's txids aligned with the payset (issue #2132):
+/// the table still flattens (no fallback to hashing) and equals a rehash.
+#[test]
+fn removing_and_truncating_groups_keeps_the_txids_aligned() {
+    let a = key(1);
+    let b = key(2);
+    let (ledger, _pool) = fixture(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))], &[]);
+    let adapter = PoolLedgerAdapter::new(ledger.clone());
+    let mut eval = adapter
+        .start_simple_evaluator(genesis_header(), 0, 0)
+        .expect("start_evaluator");
+    for note in 1..=4u8 {
+        eval.transaction_group(&[leased_pay(&a, b.0, [0x80 + note; 32], note)])
+            .expect("admitted");
+    }
+    let mut groups = std::mem::take(&mut eval.exec.as_mut().unwrap().groups);
+    let mut payset = eval.included_txns.clone();
+    let rehash = |payset: &[SignedTransaction]| {
+        algo_codec::payset_txids_with_rule(payset, &eval.genesis_rule())
+    };
+    let all = ExecGroup::flatten_txids(&groups).expect("all carried");
+    assert_eq!(all, rehash(&payset));
+
+    // Drop a MIDDLE group: the later group's txids shift with it.
+    SimpleBlockEvaluator::remove_group(&mut groups, &mut payset, 1);
+    let after_remove = ExecGroup::flatten_txids(&groups).expect("still carried");
+    assert_eq!(after_remove.len(), 3);
+    assert_eq!(after_remove, rehash(&payset));
+    assert!(!after_remove.contains(&all[1]), "the dropped txid is gone");
+
+    // Truncate to a prefix, as the oversize and failure passes do.
+    SimpleBlockEvaluator::truncate_groups(&mut groups, &mut payset, 2);
+    let after_truncate = ExecGroup::flatten_txids(&groups).expect("still carried");
+    assert_eq!(after_truncate, vec![all[0], all[2]]);
+    assert_eq!(after_truncate, rehash(&payset));
+
+    // A bisection probe evaluates a prefix of the groups.
+    assert_eq!(
+        ExecGroup::flatten_txids(&groups[..1]).expect("prefix"),
+        vec![all[0]]
+    );
+    // A group added without its txids makes the pass hash instead.
+    groups[1].txids = None;
+    assert!(ExecGroup::flatten_txids(&groups).is_none());
+}
+
+/// A bad group smuggled into the MIDDLE of the admitted groups is dropped by
+/// the failure pass and the retry still gets aligned txids: every pass (debug
+/// builds assert it) is handed what a rehash of ITS payset gives.
+#[test]
+fn a_failing_middle_group_keeps_the_retry_pass_txids_aligned() {
+    let a = key(1);
+    let b = key(2);
+    let c = key(3);
+    let (ledger, _pool) = fixture(
+        &[
+            (a.0, funded(50_000_000)),
+            (b.0, funded(1_000_000)),
+            (c.0, funded(5_000_000)),
+        ],
+        &[],
+    );
+    let adapter = PoolLedgerAdapter::new(ledger.clone());
+    let mut eval = adapter
+        .start_simple_evaluator(genesis_header(), 0, 0)
+        .expect("start_evaluator");
+    eval.transaction_group(&[leased_pay(&a, b.0, [0x91; 32], 1)])
+        .expect("first");
+    eval.transaction_group(&[leased_pay(&a, b.0, [0x92; 32], 2)])
+        .expect("second");
+    // A pay from an account that does not exist cannot apply.
+    let ghost = key(9);
+    let bad = {
+        let mut t = base_txn(ghost.0, TxnType::Pay);
+        t.receiver = b.0;
+        t.amount = 1;
+        sign(t, &ghost.1)
+    };
+    let mut stib = bad;
+    eval.genesis_rule().strip(&mut stib);
+    let at = 1usize;
+    eval.included_txns.insert(at, stib);
+    let txids = Some(carried_txids(&eval, at, 1));
+    {
+        let exec = eval.exec.as_mut().unwrap();
+        for g in exec.groups.iter_mut().skip(1) {
+            g.start += 1;
+        }
+        exec.groups.insert(
+            1,
+            ExecGroup {
+                start: at,
+                len: 1,
+                fees: 1_000,
+                txids,
+            },
+        );
+    }
+    eval.fees_collected += 1_000;
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.payset.len(), 2, "the bad middle group was dropped");
+    assert!(
+        eval.exec.as_ref().unwrap().last_passes >= 2,
+        "a failing pass and a clean retry ran"
+    );
 }

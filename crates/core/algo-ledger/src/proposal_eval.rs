@@ -260,6 +260,20 @@ pub fn evaluate_payset<B: OverlayBase + ?Sized>(
     block: &Block,
     lists: Option<ListsRequest>,
 ) -> Result<ScratchPayset, ScratchFailure> {
+    evaluate_payset_with_txids(base, block, lists, None)
+}
+
+/// [`evaluate_payset`] with the payset's txids (as the txtail records them,
+/// in payset order) already known by the caller, as the pool knows every
+/// pending transaction's: `checkDup` then does not hash the whole payset on
+/// every scratch pass (issue #2132). `None` hashes it here; a count that does
+/// not match the payset is refused (`checkDup: N txids for a payset of M`).
+pub fn evaluate_payset_with_txids<B: OverlayBase + ?Sized>(
+    base: &B,
+    block: &Block,
+    lists: Option<ListsRequest>,
+    txids: Option<Vec<algo_types::Digest>>,
+) -> Result<ScratchPayset, ScratchFailure> {
     #[cfg(any(test, feature = "test-hooks"))]
     if crate::shadow_execute::test_hooks::should_fail(block.payset.len()) {
         return Err(ScratchFailure::Other(AlgoError::Ledger {
@@ -274,6 +288,7 @@ pub fn evaluate_payset<B: OverlayBase + ?Sized>(
             knock_offline_exclude: lists.as_ref().map(|l| l.own_addresses.clone()),
             // go generates with Generate + Validate: `checkDup` (#2127).
             check_dup: true,
+            txids,
             ..Default::default()
         },
         ..Default::default()
