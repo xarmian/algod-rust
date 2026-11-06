@@ -503,6 +503,8 @@ pub fn replay_corpus(args: &ReplayCorpusArgs) -> anyhow::Result<ReplayResult> {
         last_error: Mutex::new(None),
     });
     let fetcher: Arc<dyn BlockFetcher> = corpus_fetcher.clone();
+    // The number of concurrent fetch workers; the sync pass's window of rounds
+    // ahead of the apply cursor is larger (DIV-010), unlike go's single window.
     let parallel = node_config.catchup_parallel_blocks;
 
     let before = proc_stats();

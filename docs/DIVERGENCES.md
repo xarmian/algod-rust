@@ -580,18 +580,31 @@ that actually started; the number of workers (concurrent fetches) stays
 `parallel_blocks`, and a single worker (`CatchupParallelBlocks: 1`, strictly
 serial) keeps a window of 1 (no prefetch). A worker whose round is fetched
 takes the next round while an earlier one is still slow, up to that window.
-Once a worker has seen the tip, workers claim no round more than
-`parallel_blocks` beyond the apply cursor (go's window; go stops launching),
-so the 404-bound requests past the tip are not doubled (8 workers: 13 requests
-beyond the tip in the unit test, 21 without the gate). Apply order,
+Once a round's fetch has finally failed (the tip), workers claim no round more
+than `parallel_blocks` beyond the apply cursor (go's window; go stops
+launching), in one atomic compare-and-swap with the bound, and gated workers
+sleep on a condition variable until the cursor moves or the pass ends; one
+transient "no block" answer that a later attempt resolves does not engage the
+gate. So the 404-bound requests past the tip are not doubled (8 workers: 13
+requests beyond the tip in the unit test, 21 without the gate). If no fetch
+worker can be started at all the pass ends as a retryable `NoBlock`, not
+`Done`. Apply order,
 authentication, the commit path, the retry and tip-probe rules are unchanged.
 
 **Memory and wasted work.** Bounded by a block COUNT, not bytes: at most
 `min(workers, 32)` fetched blocks wait beyond the workers' own, i.e. 16 extra
 blocks by default and 32 extra at `CatchupParallelBlocks >= 32` (96 rounds in
-the window at 64). A betanet block is about 600 bytes; a full mainnet block is
-at most the consensus maximum (`MaxTxnBytesPerBlock`). The work discarded when
-an invalid round stops the pass grows by the same number of blocks.
+the window at 64). The byte worst case is the window times the consensus block
+maximum (`MaxTxnBytesPerBlock`, 5 MiB from consensus v33): 32 x 5 MiB = 160 MiB
+by default (80 MiB more than a window of 16), 96 x 5 MiB = 480 MiB at 64
+workers, and it needs consecutive completely full blocks (a betanet block is
+about 600 bytes; mainnet blocks are far from the maximum). No byte bound and no
+config switch were added: a byte bound would need the size of a block that is
+still being fetched (unknown until it arrives), and a new `config.json` field
+would be algod-rust-only configuration for a case `CatchupParallelBlocks`
+already controls (it scales the window; `1` is strictly serial). The work
+discarded when an invalid round stops the pass grows by the same number of
+blocks.
 
 **Wire / consensus impact.** None: the same rounds are requested and every
 block is authenticated and applied in round order exactly as before.
