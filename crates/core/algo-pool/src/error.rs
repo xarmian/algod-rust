@@ -334,7 +334,7 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
         PoolError::AlreadyInLedger(_) => PoolErrorTag::TxId,
         PoolError::Evaluator(msg) => classify_evaluator_message(msg),
         PoolError::EvaluatorWithDetail(msg, _) => classify_evaluator_message(msg),
-        PoolError::TxnRejected { class, message, .. } => match class {
+        PoolError::TxnRejected { class, message, .. } => match class.unframed() {
             algo_error::RejectClass::TealReject => PoolErrorTag::TealReject,
             algo_error::RejectClass::TealErr => PoolErrorTag::TealErr,
             // go `ClassifyTxPoolError` on the typed checkDup errors (#2127).
@@ -360,6 +360,8 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
             algo_error::RejectClass::Alive | algo_error::RejectClass::Other => {
                 classify_evaluator_message(message)
             }
+            // `unframed()` never returns `Framed`.
+            algo_error::RejectClass::Framed(_) => unreachable!("unframed() removed the framing"),
         },
         // Classified as before (a generic evaluator rejection), so the
         // metrics and the gossip handlers' peer handling do not change.
@@ -709,6 +711,38 @@ mod tests {
             (LeaseInLedger { in_block: true }, PoolErrorTag::LeaseEval),
         ] {
             assert_eq!(classify_pool_error(&rej(class)), tag, "{class:?}");
+        }
+    }
+
+    /// A framed rejection is tagged exactly as its unframed class: `Framed(
+    /// MinBalance)` is `min_balance` whatever the text, `Framed(Other)` reads
+    /// the text like `Other` (issue #2133).
+    #[test]
+    fn framed_rejections_are_tagged_like_their_unframed_class() {
+        use algo_error::{FramedKind, RejectClass};
+        let rej = |class, message: &str| PoolError::TxnRejected {
+            message: message.into(),
+            class,
+            detail: None,
+        };
+        assert_eq!(
+            classify_pool_error(&rej(RejectClass::Framed(FramedKind::MinBalance), "anything")),
+            PoolErrorTag::MinBalance
+        );
+        let overspend =
+            "transaction T: overspend (account A, data {AccountBaseData:{}}, tried to spend 1uA)";
+        let by_text = classify_pool_error(&rej(RejectClass::Other, overspend));
+        assert_ne!(by_text, PoolErrorTag::EvalGeneric, "the text selects a tag");
+        assert_eq!(
+            classify_pool_error(&rej(RejectClass::Framed(FramedKind::Other), overspend)),
+            by_text
+        );
+        for class in [
+            RejectClass::Framed(FramedKind::MinBalance),
+            RejectClass::Framed(FramedKind::Other),
+        ] {
+            assert!(class.is_framed());
+            assert!(!class.unframed().is_framed());
         }
     }
 

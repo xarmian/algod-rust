@@ -1775,25 +1775,32 @@ fn go_rejection(txid: &str, error: algo_error::AlgoError) -> algo_error::AlgoErr
     // go's `Alive` and `checkDup` errors reach the pool bare and typed
     // (`TxnDeadError` or a genesis mismatch, `TransactionInLedgerError`,
     // `LeaseInLedgerError`): the pool tags them from the type, and go adds no
-    // `transaction <txid>:` frame to them.
+    // `transaction <txid>:` frame to them. A rejection its producer already
+    // framed as go frames it (`transaction <txid>: ...`: the authorizer check,
+    // a min-balance failure) is typed `Framed` and is not framed twice. Both
+    // are decided from the type, never from the message text (issue #2133).
     if let algo_error::AlgoError::Rejected {
         class:
             algo_error::RejectClass::Alive
             | algo_error::RejectClass::TxidInLedger { .. }
-            | algo_error::RejectClass::LeaseInLedger { .. },
+            | algo_error::RejectClass::LeaseInLedger { .. }
+            | algo_error::RejectClass::Framed(_),
         ..
     } = &error
     {
         return error;
     }
-    // A rejection already framed as go frames it (`transaction <txid>: ...`,
-    // e.g. the authorizer check) is not framed twice.
-    if let algo_error::AlgoError::Rejected { message, .. } = &error {
-        if message.starts_with(&format!("transaction {txid}: ")) {
-            return error;
-        }
-    }
     let (reason, class) = pool_reason(&error);
+    // A framed rejection reached through a wrapper (`reason_of` looks through
+    // an `AvmLogicSig`'s source) carries its own frame in `reason`: it is not
+    // framed again, and keeps its (framed) class.
+    if class.is_framed() {
+        return algo_error::AlgoError::Rejected {
+            message: reason,
+            class,
+            source: Some(Box::new(error)),
+        };
+    }
     algo_error::AlgoError::Rejected {
         message: format!("transaction {txid}: {reason}"),
         class,
@@ -2698,16 +2705,11 @@ impl SimpleBlockEvaluator {
             if txn_authorizer != correct_authorizer {
                 // go returns this text bare (`fmt.Errorf`, txid first), with no
                 // algod-rust category prefix.
-                return Err(fail(algo_error::AlgoError::Rejected {
-                    source: None,
-                    message: format!(
-                        "transaction {}: should have been authorized by {} but was actually authorized by {}",
-                        algo_types::Digest(txid),
-                        correct_authorizer,
-                        txn_authorizer,
-                    ),
-                    class: algo_error::RejectClass::Other,
-                }));
+                return Err(fail(algo_error::authorizer_rejection(
+                    algo_types::Digest(txid),
+                    correct_authorizer,
+                    txn_authorizer,
+                )));
             }
             let is_pay = stx.txn.txn_type == TxnType::Pay;
             let fee = stx.txn.fee;
@@ -4325,15 +4327,15 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                         algo_error::min_balance_rejected(addr, balance, min_bal, total_assets)
                     } else if max_min > 0 && min_bal > max_min {
                         // `MaximumMinimumBalance` is 0 (no limit) from v32+.
-                        algo_error::AlgoError::Rejected {
-                            source: None,
-                            message: format!(
+                        // go frames it `transaction <txid>: ` (typed `Framed`).
+                        algo_error::framed_rejection(
+                            txids[member],
+                            format!(
                                 "account {} would use too much space after this transaction. \
                                  Minimum balance requirements would be {} (greater than max {})",
                                 addr, min_bal, max_min,
                             ),
-                            class: algo_error::RejectClass::Other,
-                        }
+                        )
                     } else {
                         continue;
                     };
@@ -4346,18 +4348,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         if let Some((member, error)) = min_balance_violation {
             // go's `transaction <txid>: %w` frame.
             let txid = txids[member].to_string();
-            let error = match error {
-                algo_error::AlgoError::Rejected {
-                    message,
-                    class,
-                    source,
-                } => algo_error::AlgoError::Rejected {
-                    message: format!("transaction {txid}: {message}"),
-                    class,
-                    source,
-                },
-                other => other,
-            };
+            let error = algo_error::frame_min_balance(error, || txid);
             // go applies each member fully (programs included) BEFORE its
             // `checkMinBalance`: an earlier member's apply failure, or this
             // member's own, is what go reports. Settle it with a dry run of
@@ -12459,7 +12450,7 @@ mod tests {
         assert!(matches!(
             err,
             algo_error::AlgoError::Rejected {
-                class: algo_error::RejectClass::MinBalance,
+                class: algo_error::RejectClass::Framed(algo_error::FramedKind::MinBalance),
                 ..
             }
         ));

@@ -930,7 +930,7 @@ impl TransactionPool {
                     // `RejectClass` must be decided here. Any other class a
                     // future evaluator reports is still a typed
                     // `TxnRejected` (never silently admitted).
-                    AlgoError::Rejected { class, .. } => match class {
+                    AlgoError::Rejected { class, .. } => match class.unframed() {
                         algo_error::RejectClass::Alive
                         | algo_error::RejectClass::TxidInLedger { .. }
                         | algo_error::RejectClass::LeaseInLedger { .. }
@@ -942,6 +942,10 @@ impl TransactionPool {
                         | algo_error::RejectClass::TealErr
                         | algo_error::RejectClass::MinBalance
                         | algo_error::RejectClass::Other => pool_error_from_evaluator(&e),
+                        // `unframed()` never returns `Framed`.
+                        algo_error::RejectClass::Framed(_) => {
+                            unreachable!("unframed() removed the framing")
+                        }
                     },
                     // Not a verdict on the group (for example a poisoned
                     // ledger lock): a plain evaluator failure.
@@ -3917,6 +3921,62 @@ mod tests {
             Ok(Block::default())
         }
         fn reset_txn_bytes(&mut self) {}
+    }
+
+    /// A framed rejection from the evaluator stays a typed `TxnRejected` with
+    /// its class and text, and is tagged like its unframed class (issue #2133).
+    #[test]
+    fn framed_rejections_stay_typed_with_their_class_and_tag() {
+        use algo_error::{FramedKind, RejectClass};
+        for (class, message, tag) in [
+            (
+                RejectClass::Framed(FramedKind::MinBalance),
+                "transaction X: account A balance 50 below min 100000 (0 assets)",
+                crate::error::PoolErrorTag::MinBalance,
+            ),
+            (
+                RejectClass::Framed(FramedKind::Other),
+                "transaction X: should have been authorized by A but was actually authorized by B",
+                crate::error::PoolErrorTag::EvalGeneric,
+            ),
+        ] {
+            let pool = make_pool_with_evaluator(1000);
+            let mut guard = pool.mu.lock();
+            let txgroup = vec![make_test_txn(9)];
+            guard.evaluator = Some(Box::new(ErrEvaluator {
+                round: Round(2),
+                make: match class {
+                    RejectClass::Framed(FramedKind::MinBalance) => || AlgoError::Rejected {
+                        source: None,
+                        message: "transaction X: account A balance 50 below min 100000 (0 assets)"
+                            .to_string(),
+                        class: RejectClass::Framed(FramedKind::MinBalance),
+                    },
+                    _ => || AlgoError::Rejected {
+                        source: None,
+                        message:
+                            "transaction X: should have been authorized by A but was actually authorized by B"
+                                .to_string(),
+                        class: RejectClass::Framed(FramedKind::Other),
+                    },
+                },
+            }));
+            let err = pool
+                .add_to_pending_block_evaluator_once(&txgroup, &mut guard)
+                .expect_err("rejected");
+            match &err {
+                PoolError::TxnRejected {
+                    class: got,
+                    message: got_message,
+                    ..
+                } => {
+                    assert_eq!(*got, class);
+                    assert_eq!(got_message, message);
+                }
+                other => panic!("expected a typed rejection, got {other:?}"),
+            }
+            assert_eq!(crate::error::classify_pool_error(&err), tag);
+        }
     }
 
     /// Issue #1776: the pool maps the evaluator error TYPE. A typed

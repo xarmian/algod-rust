@@ -4635,3 +4635,101 @@ fn a_failing_middle_group_keeps_the_retry_pass_txids_aligned() {
         "a failing pass and a clean retry ran"
     );
 }
+
+/// `go_rejection` decides from the error's TYPE whether an evaluator error is
+/// already in go's framed form, not from its text (issue #2133): an error
+/// whose text merely starts like a framed one is still framed (once), and each
+/// typed pre-framed rejection passes through unchanged with its pool tag.
+#[test]
+fn go_rejection_decides_framing_from_the_type_not_the_text() {
+    use algo_error::{AlgoError, RejectClass};
+    let txid = "TXID".to_string();
+
+    // Looks framed, is not: an untyped error whose text starts like go's frame.
+    for lookalike in [
+        AlgoError::Rejected {
+            source: None,
+            message: format!("transaction {txid}: not really framed"),
+            class: RejectClass::Other,
+        },
+        AlgoError::Ledger {
+            message: format!("transaction {txid}: not really framed"),
+        },
+    ] {
+        let out = super::go_rejection(&txid, lookalike);
+        assert_eq!(
+            out.to_string(),
+            format!("transaction {txid}: transaction {txid}: not really framed"),
+            "framed once more, by type"
+        );
+    }
+
+    // Typed pre-framed rejections pass through untouched.
+    let authorizer = algo_error::authorizer_rejection(&txid, "ADDR1", "ADDR2");
+    let text = authorizer.to_string();
+    assert_eq!(
+        text,
+        "transaction TXID: should have been authorized by ADDR1 but was actually authorized by ADDR2"
+    );
+    assert_eq!(super::go_rejection(&txid, authorizer).to_string(), text);
+
+    let framed_min = algo_error::frame_min_balance(
+        algo_error::min_balance_rejected("ADDR", 50, 100_000, 0),
+        || txid.clone(),
+    );
+    let text = framed_min.to_string();
+    let out = super::go_rejection(&txid, framed_min);
+    assert_eq!(out.to_string(), text);
+    assert!(matches!(
+        out,
+        AlgoError::Rejected {
+            class: RejectClass::Framed(algo_error::FramedKind::MinBalance),
+            ..
+        }
+    ));
+
+    // A `Framed(Other)` rejection (the max-minimum-balance one) passes through.
+    let framed_other = algo_error::framed_rejection(&txid, "account A would use too much space");
+    let text = framed_other.to_string();
+    assert_eq!(text, "transaction TXID: account A would use too much space");
+    let out = super::go_rejection(&txid, framed_other);
+    assert_eq!(out.to_string(), text);
+    assert!(matches!(
+        out,
+        AlgoError::Rejected {
+            class: RejectClass::Framed(algo_error::FramedKind::Other),
+            ..
+        }
+    ));
+
+    // A framed rejection reached through an `AvmLogicSig` wrapper (which
+    // `reason_of` looks through) keeps its single frame and its framed class.
+    let nested = AlgoError::AvmLogicSig {
+        source: Box::new(algo_error::authorizer_rejection(&txid, "ADDR1", "ADDR2")),
+        message: "logic sig failure".into(),
+        pc: 0,
+        group_index: 0,
+        app_index: None,
+        eval_states: Vec::new(),
+    };
+    let out = super::go_rejection(&txid, nested);
+    assert_eq!(
+        out.to_string(),
+        "transaction TXID: should have been authorized by ADDR1 but was actually authorized by ADDR2",
+        "no second frame"
+    );
+    assert!(matches!(
+        out,
+        AlgoError::Rejected {
+            class: RejectClass::Framed(_),
+            ..
+        }
+    ));
+
+    // An UNframed typed min-balance rejection is framed once, tag kept.
+    let out = super::go_rejection(&txid, algo_error::min_balance_rejected("ADDR", 50, 100_000, 0));
+    assert_eq!(
+        out.to_string(),
+        "transaction TXID: account ADDR balance 50 below min 100000 (0 assets)"
+    );
+}

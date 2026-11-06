@@ -206,8 +206,10 @@ pub fn min_balance_error_text(
 /// Whether `msg` carries a [`min_balance_error_text`], anywhere in it (go's
 /// `errors.As` finds a `MinBalanceError` anywhere in the wrapped chain, e.g.
 /// behind a `transaction <txid>: ` frame, with anything after it). The typed
-/// [`RejectClass::MinBalance`] is what the evaluators report; this reads the
-/// go shape for errors that reach the pool only as text.
+/// [`RejectClass::MinBalance`] (unframed) or [`RejectClass::Framed`]
+/// `(`[`FramedKind::MinBalance`]`)` (framed with the txid) is what the
+/// evaluators report; this reads the go shape for errors that reach the pool
+/// only as text.
 pub fn is_min_balance_error_text(msg: &str) -> bool {
     // `<digits>` at the start of `s`, then the rest.
     fn number(s: &str) -> Option<&str> {
@@ -250,22 +252,56 @@ pub fn min_balance_rejected(
 
 /// go's `BlockEvaluator.transaction` wraps a `checkMinBalance` failure
 /// `transaction <txid>: %w` (`ledger/eval/eval.go`). Frames an unframed
-/// [`RejectClass::MinBalance`] rejection that way, keeping its class; any
-/// other error (and an already framed one) is returned unchanged. `txid` is
-/// only evaluated for the failure.
+/// [`RejectClass::MinBalance`] rejection that way, as
+/// [`RejectClass::Framed`]`(`[`FramedKind::MinBalance`]`)` (same pool tag);
+/// any other error (an already framed one included, by its type) is
+/// returned unchanged. `txid` is only evaluated for the failure.
 pub fn frame_min_balance(err: AlgoError, txid: impl FnOnce() -> String) -> AlgoError {
     match err {
         AlgoError::Rejected {
             source,
             message,
             class: RejectClass::MinBalance,
-        } if !message.starts_with("transaction ") => AlgoError::Rejected {
-            source,
-            message: format!("transaction {}: {message}", txid()),
-            class: RejectClass::MinBalance,
-        },
+        } => {
+            // Every producer of a `MinBalance` rejection is `min_balance_rejected`
+            // (unframed); a pre-framed one is `Framed`, never this class.
+            debug_assert!(
+                !message.starts_with("transaction "),
+                "an unframed MinBalance rejection must not already carry the frame: {message}"
+            );
+            AlgoError::Rejected {
+                source,
+                message: format!("transaction {}: {message}", txid()),
+                class: RejectClass::Framed(FramedKind::MinBalance),
+            }
+        }
         other => other,
     }
+}
+
+/// A rejection its producer framed itself as go frames it, `transaction
+/// <txid>: <reason>`, typed [`RejectClass::Framed`]`(`[`FramedKind::Other`]`)`
+/// so the pool passes it through unframed and tags it from the text.
+pub fn framed_rejection(txid: impl std::fmt::Display, reason: impl std::fmt::Display) -> AlgoError {
+    AlgoError::Rejected {
+        source: None,
+        message: format!("transaction {txid}: {reason}"),
+        class: RejectClass::Framed(FramedKind::Other),
+    }
+}
+
+/// go's authorizer check (`transaction <txid>: should have been authorized by
+/// <A> but was actually authorized by <B>`), which go returns bare
+/// (`fmt.Errorf`, txid first): an already framed rejection.
+pub fn authorizer_rejection(
+    txid: impl std::fmt::Display,
+    correct: impl std::fmt::Display,
+    actual: impl std::fmt::Display,
+) -> AlgoError {
+    framed_rejection(
+        txid,
+        format!("should have been authorized by {correct} but was actually authorized by {actual}"),
+    )
 }
 
 /// Pool error-tag family of an [`AlgoError::Rejected`].
@@ -290,7 +326,10 @@ pub enum RejectClass {
     /// it from the error (`txn_dead` / `txn_early`, else `eval`).
     Alive,
     /// go `ledgercore.MinBalanceError` from `checkMinBalance` (an account left
-    /// below its minimum balance). go's pool tags it `min_balance`.
+    /// below its minimum balance), UNFRAMED: the group loops, which know the
+    /// txid, frame it with [`frame_min_balance`] into
+    /// [`RejectClass::Framed`]`(`[`FramedKind::MinBalance`]`)`. go's pool tags
+    /// both forms `min_balance`.
     MinBalance,
     /// go `ledgercore.TxGroupMalformedError` from `TestTransactionGroup`
     /// (inconsistent, empty or incomplete group ID), whose pool tag is
@@ -309,6 +348,46 @@ pub enum RejectClass {
     /// [`VerifyKind`] is the pool tag the same failure gets on the gossip
     /// test stage.
     Verify(VerifyKind),
+    /// A rejection already in go's `transaction <txid>: <reason>` frame, whose
+    /// producer framed it itself: the pool must not frame it again. Decided
+    /// by this type, never by sniffing the message text (issue #2133). The
+    /// [`FramedKind`] says which go error it is, for the pool tag.
+    Framed(FramedKind),
+}
+
+/// The class of a [`RejectClass::Framed`] rejection before its producer framed
+/// it: the pool tag family it keeps (issue #2133). Only [`RejectClass::unframed`]
+/// and [`RejectClass::is_framed`] need to know the pairing; a pool-tag `match`
+/// uses `class.unframed()` and lists each tag once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FramedKind {
+    /// go's `ledgercore.MinBalanceError` behind the `transaction <txid>:`
+    /// frame: [`RejectClass::MinBalance`] once unframed.
+    MinBalance,
+    /// Any other rejection a producer framed itself (go's authorizer check
+    /// error, the max-minimum-balance rejection): [`RejectClass::Other`] once
+    /// unframed, its pool tag read from the text.
+    Other,
+}
+
+impl RejectClass {
+    /// Whether the producer already framed the message (`transaction <txid>:
+    /// <reason>`): the pool must not frame it again.
+    #[must_use]
+    pub fn is_framed(self) -> bool {
+        matches!(self, Self::Framed(_))
+    }
+
+    /// The class without its framing: the one representation per pool tag
+    /// family, for a `match` that does not care whether the text is framed.
+    #[must_use]
+    pub fn unframed(self) -> Self {
+        match self {
+            Self::Framed(FramedKind::MinBalance) => Self::MinBalance,
+            Self::Framed(FramedKind::Other) => Self::Other,
+            other => other,
+        }
+    }
 }
 
 /// What a [`RejectClass::Verify`] verdict is, for the pool's error tag
@@ -448,7 +527,7 @@ mod tests {
                     message,
                     "transaction TXID: account ADDR balance 50 below min 100000 (2 assets)"
                 );
-                assert_eq!(*class, RejectClass::MinBalance);
+                assert_eq!(*class, RejectClass::Framed(FramedKind::MinBalance));
             }
             other => panic!("not a rejection: {other:?}"),
         }
