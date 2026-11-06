@@ -1368,6 +1368,12 @@ struct CowOverlay {
     /// payment txns) is deducted and the receiver's balance is credited.
     balance_deltas: HashMap<Address, u64>,
     /// Leases recorded within this block. Maps (sender, lease) to last_valid.
+    ///
+    /// This and `seen_txids` are the pool's own in-block `checkDup` copy. The
+    /// ledger-side evaluation (`evaluate_group`) now keeps the pending block's
+    /// txids and leases itself (issue #2131), but this copy stays: it is the
+    /// ONLY in-block check when the real apply cannot run (`exec` incomplete,
+    /// over its admission budget or stale) and it answers before the apply.
     leases: HashMap<(Address, [u8; 32]), u64>,
     /// Transaction IDs seen within this block, for duplicate detection.
     seen_txids: HashSet<[u8; 32]>,
@@ -10942,6 +10948,65 @@ mod tests {
         overlay.record_txid(txid);
         let err = overlay.check_txid(&txid).unwrap_err();
         assert!(err.to_string().contains("transaction already in ledger"));
+    }
+
+    /// The pool's `CowOverlay` copy of `checkDup` and the ledger-side
+    /// [`algo_ledger::check_dup::BlockDups`] must tag the same duplicate
+    /// alike: which of the two answers (the copy before the apply, the ledger
+    /// side in it) must not change the error text or the pool error tag
+    /// (issue #2131).
+    #[test]
+    fn cow_overlay_and_ledger_side_dups_agree_on_text_and_tag() {
+        use algo_error::AlgoError;
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::CONSENSUS_V41,
+        )
+        .expect("v41");
+        let sender = Address([1; 32]);
+        let lease = [0xBB; 32];
+        let gh = [0x6E; 32];
+        let rule = algo_types::genesis_restore::GenesisRestoreRule::unstripped("", &gh);
+        let state = algo_ledger::state::LedgerState::new();
+        // Two transactions of one sender sharing a lease (different notes).
+        let stx = |note: u8| {
+            let mut s = algo_types::SignedTransaction::default();
+            s.txn.sender = sender;
+            s.txn.lease = lease;
+            s.txn.first_valid = algo_types::Round(1);
+            s.txn.last_valid = algo_types::Round(500);
+            s.txn.genesis_hash = gh;
+            s.txn.note = serde_bytes::ByteBuf::from(vec![note]);
+            s
+        };
+        let (first, second) = (stx(1), stx(2));
+        let id = |s: &algo_types::SignedTransaction| algo_codec::compute_txn_id(&s.txn);
+        let (id1, id2) = (id(&first), id(&second));
+        let class_of = |e: &AlgoError| match e {
+            AlgoError::Rejected { class, message, .. } => (message.clone(), *class),
+            other => panic!("unclassified {other:?}"),
+        };
+
+        let mut pool_copy = CowOverlay::new();
+        pool_copy.record_txid(id1.0);
+        pool_copy.record_lease(&sender, &lease, 500);
+
+        // The ledger side through its public checker: `first` is admitted,
+        // then the same transaction again (a txid duplicate), then `second`
+        // (a lease conflict under another txid).
+        let mut ledger_side = algo_ledger::check_dup::BlockCheckDup::new(100, vec![id1, id1, id2]);
+        let check = |c: &mut algo_ledger::check_dup::BlockCheckDup,
+                     s: &algo_types::SignedTransaction,
+                     i: usize| c.check(&state, &consensus, &rule, s, i);
+        check(&mut ledger_side, &first, 0).expect("the first is admitted");
+        let ledger_txid_err = check(&mut ledger_side, &first, 1).unwrap_err();
+        let ledger_lease_err = check(&mut ledger_side, &second, 2).unwrap_err();
+
+        let pool_txid_err = pool_copy.check_txid(&id1.0).unwrap_err();
+        assert_eq!(class_of(&pool_txid_err), class_of(&ledger_txid_err));
+        let pool_lease_err = pool_copy
+            .check_lease_in_overlay(&sender, &lease, 100, &id2.0)
+            .unwrap_err();
+        assert_eq!(class_of(&pool_lease_err), class_of(&ledger_lease_err));
     }
 
     #[test]

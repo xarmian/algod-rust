@@ -79,6 +79,37 @@ fn typed(message: String, class: RejectClass) -> AlgoError {
     }
 }
 
+/// A [`BlockDups`] shared between the evaluations of one pending block.
+///
+/// Single-owner invariant: at any time ONE evaluation extends it, namely the
+/// one holding `&mut PendingOverlay` (`evaluate_group_impl`). The shared
+/// `checkDup` takes the mutex separately for the block-half check and for the
+/// record (so it is never held across a ledger read), so the pair is not
+/// atomic; it is correct only because nothing else records in between. A
+/// debug build asserts it ([`BlockCheckDup::check`]).
+pub type SharedBlockDups = std::sync::Arc<std::sync::Mutex<BlockDups>>;
+
+/// Lock `dups`. The guard is only ever held for one short, store-free
+/// operation (a block-half check, a [`BlockDups::record`], a mark or a
+/// rollback), never across a ledger read or a callback, so a poisoned lock
+/// means some thread panicked inside one of those few map operations (in
+/// practice an allocation failure, which aborts instead). The set is then
+/// still usable for `checkDup` (at worst it holds one record too few or too
+/// many for a block that is being abandoned), so the poison is ignored
+/// rather than turning every later admission into a panic.
+pub fn lock_dups(dups: &SharedBlockDups) -> std::sync::MutexGuard<'_, BlockDups> {
+    dups.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A point [`BlockDups::rollback_to`] can return to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DupMark {
+    len: usize,
+    /// [`BlockDups::commit`] count when the mark was taken: a mark from
+    /// before a commit no longer names an undo-log position.
+    generation: u64,
+}
+
 /// A lease's key: (sender, lease).
 type LeaseKey = (Address, [u8; 32]);
 
@@ -90,6 +121,8 @@ pub struct BlockDups {
     leases: HashMap<LeaseKey, u64>,
     /// Undo log of [`Self::record`], for [`Self::rollback_to`].
     journal: Vec<DupUndo>,
+    /// How many times [`Self::commit`] dropped the undo log.
+    generation: u64,
 }
 
 /// What one [`BlockDups::record`] changed.
@@ -154,8 +187,28 @@ impl BlockDups {
 
     /// A point [`Self::rollback_to`] can return to.
     #[must_use]
-    pub fn mark(&self) -> usize {
-        self.journal.len()
+    pub fn mark(&self) -> DupMark {
+        DupMark {
+            len: self.journal.len(),
+            generation: self.generation,
+        }
+    }
+
+    /// Keep everything recorded so far for good: the undo log is dropped, so
+    /// a long-lived pending block's does not grow with every admitted group.
+    ///
+    /// Contract: no [`DupMark`] taken before this call may be used again; a
+    /// stale mark panics in debug builds in [`Self::rollback_to`] (in release
+    /// builds the rollback is a no-op, never an undo of the wrong records).
+    pub fn commit(&mut self) {
+        self.journal.clear();
+        self.generation += 1;
+    }
+
+    /// The number of distinct txids recorded (diagnostics and tests).
+    #[must_use]
+    pub fn txid_count(&self) -> usize {
+        self.txids.len()
     }
 
     /// Undo every [`Self::record`] since `mark`: go applies a group to a
@@ -163,8 +216,15 @@ impl BlockDups {
     /// txids and leases never reach the block (go `addTx` runs only for an
     /// applied group). No caller continues an evaluation after a failed
     /// group today (each fails the whole block); this guards future ones.
-    pub fn rollback_to(&mut self, mark: usize) {
-        while self.journal.len() > mark {
+    pub fn rollback_to(&mut self, mark: DupMark) {
+        debug_assert_eq!(
+            mark.generation, self.generation,
+            "BlockDups mark used after a commit"
+        );
+        if mark.generation != self.generation {
+            return;
+        }
+        while self.journal.len() > mark.len {
             let Some(undo) = self.journal.pop() else {
                 break;
             };
@@ -304,6 +364,19 @@ pub fn check_dup<L: LedgerStore + ?Sized>(
     ledger: &mut LedgerDups,
 ) -> Result<(), AlgoError> {
     let leased = block.check(consensus, txn, txid, ledger.round)?;
+    check_dup_ledger_half(store, consensus, txn, txid, leased, ledger)
+}
+
+/// What [`check_dup`] runs after the block's own half: `leased` is that
+/// half's verdict on whether the lease checks apply.
+fn check_dup_ledger_half<L: LedgerStore + ?Sized>(
+    store: &L,
+    consensus: &ConsensusParams,
+    txn: &Transaction,
+    txid: Digest,
+    leased: bool,
+    ledger: &mut LedgerDups,
+) -> Result<(), AlgoError> {
     // go's block cow: a lease an earlier group of the same pending block
     // holds (the pool's overlay) is an in-block conflict.
     if leased && store.pending_block_lease(&txn.sender, &txn.lease, ledger.round) {
@@ -328,6 +401,32 @@ pub fn check_dup<L: LedgerStore + ?Sized>(
     Ok(())
 }
 
+/// The block half of [`BlockCheckDup`]: an owned set for a single block, or
+/// the pool's [`SharedBlockDups`], which keeps ONE record across the groups of
+/// its pending block like go's single block cow (issue #2131). Only the pool
+/// pays for the `Arc<Mutex<_>>`.
+#[derive(Debug)]
+enum BlockHalf {
+    Owned(BlockDups),
+    Shared(SharedBlockDups),
+}
+
+impl BlockHalf {
+    fn mark(&self) -> DupMark {
+        match self {
+            Self::Owned(block) => block.mark(),
+            Self::Shared(shared) => lock_dups(shared).mark(),
+        }
+    }
+
+    fn rollback_to(&mut self, mark: DupMark) {
+        match self {
+            Self::Owned(block) => block.rollback_to(mark),
+            Self::Shared(shared) => lock_dups(shared).rollback_to(mark),
+        }
+    }
+}
+
 /// go `BlockEvaluator.transaction`'s checks under `Validate` across one
 /// block (issue #2127): `BlockHeader.Alive`, then `checkDup` against the
 /// block's own txids and leases so far ([`BlockDups`]) and the ledger
@@ -339,7 +438,7 @@ pub fn check_dup<L: LedgerStore + ?Sized>(
 /// can tell such a rejection apart from any other evaluation error.
 #[derive(Debug)]
 pub struct BlockCheckDup {
-    block: BlockDups,
+    block: BlockHalf,
     ledger: LedgerDups,
     violation: Option<(usize, String)>,
 }
@@ -350,7 +449,20 @@ impl BlockCheckDup {
     #[must_use]
     pub fn new(round: u64, txids: Vec<Digest>) -> Self {
         Self {
-            block: BlockDups::new(),
+            block: BlockHalf::Owned(BlockDups::new()),
+            ledger: LedgerDups::new(round, txids),
+            violation: None,
+        }
+    }
+
+    /// [`Self::new`] seeded with the txids and leases the earlier groups of
+    /// the same pending block hold (`block`), which this evaluation extends
+    /// as it admits transactions (go's one `roundCowState` per pending-block
+    /// evaluator, issue #2131).
+    #[must_use]
+    pub fn with_block_dups(round: u64, txids: Vec<Digest>, block: SharedBlockDups) -> Self {
+        Self {
+            block: BlockHalf::Shared(block),
             ledger: LedgerDups::new(round, txids),
             violation: None,
         }
@@ -365,14 +477,14 @@ impl BlockCheckDup {
 
     /// A point [`Self::rollback_to`] can return to (taken before a group).
     #[must_use]
-    pub fn mark(&self) -> usize {
+    pub fn mark(&self) -> DupMark {
         self.block.mark()
     }
 
     /// Forget the txids and leases recorded since `mark` (a failed group,
     /// see [`BlockDups::rollback_to`]). The recorded violation stays: it is
     /// the verdict of the evaluation that failed.
-    pub fn rollback_to(&mut self, mark: usize) {
+    pub fn rollback_to(&mut self, mark: DupMark) {
         self.block.rollback_to(mark);
     }
 
@@ -405,18 +517,52 @@ impl BlockCheckDup {
             self.violation = Some((index, e.to_string()));
             return Err(e);
         }
-        if let Err(e) = check_dup(
-            store,
-            consensus,
-            &stx.txn,
-            txid,
-            &self.block,
-            &mut self.ledger,
-        ) {
+        let checked = match &mut self.block {
+            // Sync replay, validation and proposal checks: a plain owned set.
+            BlockHalf::Owned(block) => {
+                check_dup(store, consensus, &stx.txn, txid, block, &mut self.ledger).map(|()| {
+                    block.record(&stx.txn, txid);
+                })
+            }
+            // The pool's pending block: the lock is held for the block-half
+            // check and, separately, for the record, never across the ledger
+            // reads of the ledger half.
+            BlockHalf::Shared(shared) => {
+                let (before, leased) = {
+                    let block = lock_dups(shared);
+                    (
+                        block.mark(),
+                        block.check(consensus, &stx.txn, txid, self.ledger.round),
+                    )
+                };
+                leased
+                    .and_then(|leased| {
+                        check_dup_ledger_half(
+                            store,
+                            consensus,
+                            &stx.txn,
+                            txid,
+                            leased,
+                            &mut self.ledger,
+                        )
+                    })
+                    .map(|()| {
+                        let mut block = lock_dups(shared);
+                        // The single-owner invariant ([`SharedBlockDups`]): no
+                        // other record landed between the check and this one.
+                        debug_assert_eq!(
+                            block.mark(),
+                            before,
+                            "the shared BlockDups was extended during a check"
+                        );
+                        block.record(&stx.txn, txid);
+                    })
+            }
+        };
+        if let Err(e) = checked {
             self.violation = Some((index, e.to_string()));
             return Err(e);
         }
-        self.block.record(&stx.txn, txid);
         Ok(())
     }
 
@@ -599,6 +745,40 @@ mod tests {
             last_valid: Round(last_valid),
             ..Default::default()
         }
+    }
+
+    /// A mark taken before a commit is a contract violation: it panics in
+    /// debug builds instead of undoing the wrong records.
+    // debug-assertions-ok: the guard is a debug_assert!, so the test only exists where it fires (release is a documented no-op).
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "mark used after a commit")]
+    fn a_mark_from_before_a_commit_is_refused() {
+        let mut dups = BlockDups::new();
+        let stale = dups.mark();
+        dups.record(&leased_txn(1, 50), Digest([1; 32]));
+        dups.commit();
+        dups.rollback_to(stale);
+    }
+
+    /// A committed prefix of a shared [`BlockDups`] survives a later rollback
+    /// and the undo log does not keep growing (issue #2131).
+    #[test]
+    fn commit_keeps_the_records_and_drops_the_undo_log() {
+        let mut dups = BlockDups::new();
+        dups.record(&leased_txn(1, 50), Digest([1; 32]));
+        dups.commit();
+        let mark = dups.mark();
+        let mut other = leased_txn(1, 60);
+        other.sender = Address([9; 32]);
+        dups.record(&other, Digest([2; 32]));
+        dups.rollback_to(mark);
+        let consensus = consensus_params_for_version(CONSENSUS_V23).expect("known protocol");
+        // The committed record is still held, the rolled-back one is gone.
+        assert!(dups
+            .check(&consensus, &leased_txn(1, 50), Digest([1; 32]), 11)
+            .is_err());
+        assert!(dups.check(&consensus, &other, Digest([2; 32]), 11).is_ok());
     }
 
     fn check(protocol: &str, txn: &Transaction) -> Result<(), AlgoError> {

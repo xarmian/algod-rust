@@ -102,6 +102,11 @@ pub struct PendingOverlay {
     /// withdrawal (go runs `StartEvaluator` once per pending block, issue
     /// #2116); later groups must not repeat it.
     pool_withdrawn: bool,
+    /// The txids and leases of the committed groups: go's one block cow per
+    /// pending-block evaluator, so `checkDup` of a later group sees every
+    /// earlier group of the block (issue #2131). A new overlay (the
+    /// evaluator's recompute) starts empty.
+    block_dups: crate::check_dup::SharedBlockDups,
 }
 
 impl PendingOverlay {
@@ -132,6 +137,7 @@ impl PendingOverlay {
             chain,
             journal: Vec::new(),
             pool_withdrawn: false,
+            block_dups: Default::default(),
         }
     }
 
@@ -158,6 +164,16 @@ impl PendingOverlay {
         self.leases.discard_undo();
         let opened = self.leases.try_begin_undo();
         debug_assert!(opened);
+    }
+
+    /// The block's `checkDup` record, shared with the evaluations that extend
+    /// it ([`crate::apply::ProbeRequest::block_dups`]).
+    ///
+    /// Single owner: only the evaluation holding `&mut self` may extend the
+    /// record ([`crate::check_dup::SharedBlockDups`]); a clone is for that
+    /// evaluation's own probe and rollback guard, not for another thread.
+    pub fn block_dups(&self) -> crate::check_dup::SharedBlockDups {
+        self.block_dups.clone()
     }
 
     /// Keep the group effects. `final_txn_counter` is the counter after the
