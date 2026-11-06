@@ -250,21 +250,39 @@ pub fn min_balance_rejected(
 
 /// go's `BlockEvaluator.transaction` wraps a `checkMinBalance` failure
 /// `transaction <txid>: %w` (`ledger/eval/eval.go`). Frames an unframed
-/// [`RejectClass::MinBalance`] rejection that way, keeping its class; any
-/// other error (and an already framed one) is returned unchanged. `txid` is
-/// only evaluated for the failure.
+/// [`RejectClass::MinBalance`] rejection that way, as
+/// [`RejectClass::Framed`]`(`[`FramedKind::MinBalance`]`)` (same pool tag);
+/// any other error (an already framed one included, by its type) is
+/// returned unchanged. `txid` is only evaluated for the failure.
 pub fn frame_min_balance(err: AlgoError, txid: impl FnOnce() -> String) -> AlgoError {
     match err {
         AlgoError::Rejected {
             source,
             message,
             class: RejectClass::MinBalance,
-        } if !message.starts_with("transaction ") => AlgoError::Rejected {
+        } => AlgoError::Rejected {
             source,
             message: format!("transaction {}: {message}", txid()),
-            class: RejectClass::MinBalance,
+            class: RejectClass::Framed(FramedKind::MinBalance),
         },
         other => other,
+    }
+}
+
+/// go's authorizer check (`transaction <txid>: should have been authorized by
+/// <A> but was actually authorized by <B>`), which go returns bare
+/// (`fmt.Errorf`, txid first): a typed, already framed rejection.
+pub fn authorizer_rejection(
+    txid: impl std::fmt::Display,
+    correct: impl std::fmt::Display,
+    actual: impl std::fmt::Display,
+) -> AlgoError {
+    AlgoError::Rejected {
+        source: None,
+        message: format!(
+            "transaction {txid}: should have been authorized by {correct} but was actually authorized by {actual}"
+        ),
+        class: RejectClass::Framed(FramedKind::Authorizer),
     }
 }
 
@@ -309,6 +327,25 @@ pub enum RejectClass {
     /// [`VerifyKind`] is the pool tag the same failure gets on the gossip
     /// test stage.
     Verify(VerifyKind),
+    /// A rejection already in go's `transaction <txid>: <reason>` frame, whose
+    /// producer framed it itself: the pool must not frame it again. Decided
+    /// by this type, never by sniffing the message text (issue #2133). The
+    /// [`FramedKind`] says which go error it is, for the pool tag.
+    Framed(FramedKind),
+}
+
+/// What an already framed [`RejectClass::Framed`] rejection is (issue #2133).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FramedKind {
+    /// go's `ledgercore.MinBalanceError` behind the `transaction <txid>:`
+    /// frame (pool tag `min_balance`, as [`RejectClass::MinBalance`]).
+    MinBalance,
+    /// go's authorizer check error (pool tag from its text, a generic
+    /// evaluator rejection).
+    Authorizer,
+    /// Any other rejection a producer framed itself (pool tag from its text,
+    /// as [`RejectClass::Other`]).
+    Other,
 }
 
 /// What a [`RejectClass::Verify`] verdict is, for the pool's error tag
@@ -448,7 +485,7 @@ mod tests {
                     message,
                     "transaction TXID: account ADDR balance 50 below min 100000 (2 assets)"
                 );
-                assert_eq!(*class, RejectClass::MinBalance);
+                assert_eq!(*class, RejectClass::Framed(FramedKind::MinBalance));
             }
             other => panic!("not a rejection: {other:?}"),
         }

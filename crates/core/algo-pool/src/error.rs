@@ -343,7 +343,10 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
             algo_error::RejectClass::LeaseInLedger { in_block: true } => PoolErrorTag::LeaseEval,
             algo_error::RejectClass::LeaseInLedger { in_block: false } => PoolErrorTag::Lease,
             // go `ClassifyTxPoolError` on the typed `MinBalanceError`.
-            algo_error::RejectClass::MinBalance => PoolErrorTag::MinBalance,
+            algo_error::RejectClass::MinBalance
+            | algo_error::RejectClass::Framed(algo_error::FramedKind::MinBalance) => {
+                PoolErrorTag::MinBalance
+            }
             // go `ClassifyTxPoolError` on `TxGroupMalformedError` (every reason
             // but `ExceedMaxSize` is `groupid`) and `TxnNotWellFormedError`.
             algo_error::RejectClass::GroupId => PoolErrorTag::GroupId,
@@ -357,7 +360,11 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
                 algo_error::VerifyKind::TooLarge => PoolErrorTag::TooLarge,
                 algo_error::VerifyKind::Other => PoolErrorTag::EvalGeneric,
             },
-            algo_error::RejectClass::Alive | algo_error::RejectClass::Other => {
+            algo_error::RejectClass::Alive
+            | algo_error::RejectClass::Other
+            | algo_error::RejectClass::Framed(
+                algo_error::FramedKind::Authorizer | algo_error::FramedKind::Other,
+            ) => {
                 classify_evaluator_message(message)
             }
         },

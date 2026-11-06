@@ -1718,15 +1718,12 @@ fn check_authorizer_for<L: crate::store_trait::LedgerStore>(
     if actual_authorizer != correct_authorizer {
         let txid = txid.unwrap_or_else(|| algo_codec::compute_txn_id(&stx.txn));
         // go returns this text bare (`fmt.Errorf`), and simulate and the
-        // proposal check report it as is.
-        return Err(AlgoError::Rejected {
-            source: None,
-            message: format!(
-                "transaction {}: should have been authorized by {} but was actually authorized by {}",
-                txid, correct_authorizer, actual_authorizer
-            ),
-            class: algo_error::RejectClass::Other,
-        });
+        // proposal check report it as is: typed as already framed.
+        return Err(algo_error::authorizer_rejection(
+            txid,
+            correct_authorizer,
+            actual_authorizer,
+        ));
     }
     Ok(())
 }

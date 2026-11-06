@@ -941,6 +941,7 @@ impl TransactionPool {
                         | algo_error::RejectClass::TealReject
                         | algo_error::RejectClass::TealErr
                         | algo_error::RejectClass::MinBalance
+                        | algo_error::RejectClass::Framed(_)
                         | algo_error::RejectClass::Other => pool_error_from_evaluator(&e),
                     },
                     // Not a verdict on the group (for example a poisoned
