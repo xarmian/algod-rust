@@ -2054,7 +2054,7 @@ pub(crate) fn apply_block_impl_ex<L: crate::store_trait::LedgerStore>(
 /// caller before the call) and what the apply reports back
 /// ([`ProbeOutput`], read by the caller after it). Kept in separate structs
 /// so an input is never mistaken for a result (issue #1799).
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct ExecProbe {
     /// Inputs.
     pub request: ProbeRequest,
@@ -2096,6 +2096,11 @@ pub struct ProbeRequest {
     /// The payset's txids (as the txtail records them), when the caller
     /// already hashed them; otherwise the apply hashes them for `checkDup`.
     pub txids: Option<Vec<algo_types::Digest>>,
+    /// Hand the `checkDup` ledger half (the payset's txids and the confirmed
+    /// set the apply loaded) back in [`ProbeOutput::ledger_dups`], for a
+    /// caller that continues with the same payset (the proposal check's
+    /// pre-pass, issue #2134). Needs [`Self::check_dup`].
+    pub keep_ledger_dups: bool,
     /// The txids and leases the earlier groups of the same pending block
     /// hold, when the caller keeps them across groups (the pool's evaluator,
     /// issue #2131): `checkDup` then starts from them instead of an empty
@@ -2125,12 +2130,14 @@ pub struct ProbeRequest {
 }
 
 /// What an apply reports back to its [`ExecProbe`] caller.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct ProbeOutput {
     /// The latest prologue (`Alive` / `checkDup` / authorizer) rejection
     /// when [`ProbeRequest::check_dup`] (or validation) ran it: the payset
     /// index it rejected and go's error text.
     pub dup_violation: Option<(usize, String)>,
+    /// The `checkDup` ledger half, when [`ProbeRequest::keep_ledger_dups`].
+    pub ledger_dups: Option<crate::check_dup::LedgerDups>,
     /// Payset index of the transaction whose apply failed. `None` when the
     /// apply did not fail, or failed in a group-level step that no single
     /// transaction owns.
@@ -3135,6 +3142,14 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
             .checkdup
             .as_ref()
             .and_then(|c| c.borrow().violation().map(|(i, m)| (i, m.to_owned())));
+        // The last reader of `ctx.checkdup` (nothing after this block reads
+        // it, and the spent checker refuses further checks).
+        if p.request.keep_ledger_dups {
+            p.out.ledger_dups = ctx
+                .checkdup
+                .as_ref()
+                .map(|c| c.borrow_mut().take_ledger_dups());
+        }
         if result.is_ok() {
             p.out.final_txn_counter = ctx.txn_counter.get();
             p.out.final_fees_collected = ctx.fees_collected.get();

@@ -21,6 +21,9 @@
 mod canonical;
 mod digest;
 
+#[cfg(any(test, feature = "test-hooks"))]
+pub use canonical::payset_txid_hash_runs;
+
 pub use canonical::{
     block_txids_with_rule, build_txtail_from_block, payset_txids_with_rule, build_txtail_from_block_with_rule,
     build_txtail_from_block_with_txids,

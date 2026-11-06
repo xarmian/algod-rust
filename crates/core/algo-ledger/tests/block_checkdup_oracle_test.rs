@@ -545,6 +545,128 @@ fn sqlite_txid_lookup_sees_rounds_applied_in_the_open_span() {
     );
 }
 
+/// The in-span txids are decoded once per span, not once per lookup (issue
+/// #2134): ten lookups decode the span's row a single time, and after the
+/// commit the shared cache answers with no span decode.
+#[test]
+fn in_span_txtail_rows_are_decoded_once_per_span() {
+    let o = load_oracle();
+    let block1 = block(&o.block1);
+    let committed = algo_codec::block_txids_with_rule(
+        &block1,
+        &algo_types::genesis_restore::GenesisRestoreRule::for_block(&block1),
+    );
+    let mut l = SqliteLedger::open_in_memory().expect("in-memory ledger");
+    seed(&mut l, &o, |l, b| {
+        l.begin_block().expect("begin span");
+        algo_ledger::apply::apply_block(l, b).expect("apply round 1 in the span");
+        // Many lookups of the span's txids, as one block evaluation issues.
+        let before = l.span_rows_decoded();
+        for _ in 0..5 {
+            assert_eq!(
+                l.txtail_confirmed_txids(&committed, 1000).len(),
+                committed.len()
+            );
+            assert!(l.txtail_contains_txid(&committed[0], 1000));
+        }
+        assert_eq!(
+            l.span_rows_decoded() - before,
+            1,
+            "round 1's row decoded once for ten lookups"
+        );
+        l.commit_block().expect("commit span");
+    });
+    // After the commit the shared cache answers; no span row is decoded.
+    let after_commit = l.span_rows_decoded();
+    assert_eq!(
+        l.txtail_confirmed_txids(&committed, 1000).len(),
+        committed.len()
+    );
+    assert_eq!(l.span_rows_decoded(), after_commit);
+}
+
+/// One txtail row for `round` holding `ids`.
+fn tail_row(round: u64, ids: &[algo_types::Digest]) -> Vec<u8> {
+    let tail = algo_types::TxTailRound {
+        txn_ids: ids
+            .iter()
+            .map(|d| serde_bytes::ByteBuf::from(d.0.to_vec()))
+            .collect(),
+        last_valid: vec![1000; ids.len()],
+        leases: Vec::new(),
+        hdr: algo_types::BlockHeader {
+            round: algo_types::Round(round),
+            ..Default::default()
+        },
+    };
+    algo_codec::canonical_encode_txtail_round(&tail)
+}
+
+/// The per-span txid cache (issue #2134) keeps the old per-lookup semantics:
+/// a missing middle row does not hide the rounds after it (and a row written
+/// later is seen), a further round decodes only its own row, a replaced row
+/// is re-read, and an aborted span's rows do not leak into the next span.
+#[test]
+fn span_txid_cache_matches_the_per_lookup_scan() {
+    use algo_types::{Digest, Round};
+    let o = load_oracle();
+    let mut l = sqlite(&o);
+    let id = |b: u8| Digest([b; 32]);
+    let q = |l: &SqliteLedger, ids: &[Digest]| l.txtail_confirmed_txids(ids, 1000);
+
+    // A span from round 1 that "applied" rounds 2..=4 where round 3's row
+    // never landed (a failed `put_txtail` is only logged by the apply).
+    l.begin_block().expect("begin span");
+    l.put_txtail(2, &tail_row(2, &[id(2)])).unwrap();
+    l.put_txtail(4, &tail_row(4, &[id(4)])).unwrap();
+    l.set_current_round(Round(4));
+    let found = q(&l, &[id(2), id(3), id(4)]);
+    assert!(
+        found.contains(&id(2)) && found.contains(&id(4)),
+        "{found:?}"
+    );
+    assert!(!found.contains(&id(3)));
+    // Lookups that follow with nothing new do not read the missing row again.
+    let reads = l.span_row_reads();
+    for _ in 0..4 {
+        assert!(q(&l, &[id(2), id(4)]).contains(&id(4)));
+    }
+    assert_eq!(l.span_row_reads(), reads, "the missing row was re-read per lookup");
+    // The row written later is picked up by the next lookup.
+    l.put_txtail(3, &tail_row(3, &[id(3)])).unwrap();
+    let found = q(&l, &[id(2), id(3), id(4)]);
+    assert_eq!(found.len(), 3, "{found:?}");
+
+    // A further round decodes only its own row.
+    let before = l.span_rows_decoded();
+    l.put_txtail(5, &tail_row(5, &[id(5)])).unwrap();
+    l.set_current_round(Round(5));
+    assert!(q(&l, &[id(5)]).contains(&id(5)));
+    assert_eq!(l.span_rows_decoded() - before, 1, "only round 5's row");
+
+    // A row already decoded is replaced: the next lookup sees the new ids.
+    l.put_txtail(4, &tail_row(4, &[id(44)])).unwrap();
+    let found = q(&l, &[id(4), id(44)]);
+    assert!(
+        found.contains(&id(44)) && !found.contains(&id(4)),
+        "{found:?}"
+    );
+
+    // An aborted span leaves nothing behind: the next span, with a different
+    // round 2, answers from its own rows only.
+    l.rollback_block().expect("abort the span");
+    l.begin_block().expect("begin the next span");
+    l.put_txtail(2, &tail_row(2, &[id(22)])).unwrap();
+    l.set_current_round(Round(2));
+    let found = q(&l, &[id(2), id(22), id(3), id(5)]);
+    assert!(found.contains(&id(22)), "{found:?}");
+    assert!(
+        !found.contains(&id(2)) && !found.contains(&id(3)) && !found.contains(&id(5)),
+        "the aborted span's ids leaked: {found:?}"
+    );
+    l.rollback_block().expect("abort");
+}
+
 /// A span opened on a ledger rewound below rounds the shared txid cache
 /// already loaded does not see those discarded rounds' txids (issue #2127).
 #[test]
@@ -1025,4 +1147,73 @@ fn evaluate_payset_uses_the_supplied_txids_instead_of_rehashing() {
         Err(ScratchFailure::Other(e)) => assert!(e.to_string().contains("checkDup:"), "{e}"),
         other => panic!("a short txid list must be refused: {other:?}"),
     }
+}
+
+/// The proposal check's pre-pass starts from the failed execution's ledger
+/// half (issue #2134): the txids are not hashed again and the txtail's
+/// confirmed set is not loaded again. Verdicts are unchanged.
+#[test]
+fn the_prepass_reuses_the_executions_txids_and_confirmed_set() {
+    use algo_ledger::check_dup::{prologue_prepass_reusing, LedgerDups, Prepass};
+    use algo_ledger::shadow_execute::{scratch_proposal_check, ProposalCheck, ViolationKind};
+
+    let o = load_oracle();
+    let sc = scenario(&o, "committed_txid");
+    let mut candidate = block(&sc.block);
+    let mut overspend = candidate.payset[0].clone();
+    overspend.txn.note = serde_bytes::ByteBuf::from(b"overspend".to_vec());
+    overspend.txn.amount = u64::MAX / 2;
+    candidate.payset.insert(0, overspend);
+
+    let l = sqlite(&o);
+    // A reuse for another round is ignored: the ledger half is rebuilt.
+    let other_round = LedgerDups::new(candidate.round.0 + 1, Vec::new());
+    assert_eq!(
+        prologue_prepass_reusing(&l, &candidate, Some(other_round)),
+        Prepass::Violation(sc.validate_error.clone())
+    );
+
+    // Locked check: the execution hashes the payset and loads the confirmed
+    // set once; the pre-pass that follows its no-verdict reuses both (one
+    // hash run and one load, not two; the hash count is per thread).
+    let mut l = sqlite(&o);
+    let before = l.confirmed_txid_loads();
+    let hashes_before = algo_codec::payset_txid_hash_runs();
+    assert_eq!(
+        scratch_proposal_check(&mut l, &candidate),
+        ProposalCheck::Violation {
+            kind: ViolationKind::Transaction,
+            message: sc.validate_error.clone(),
+        }
+    );
+    assert_eq!(
+        l.confirmed_txid_loads() - before,
+        1,
+        "the pre-pass queried the txtail again"
+    );
+    assert_eq!(
+        algo_codec::payset_txid_hash_runs() - hashes_before,
+        1,
+        "the pre-pass hashed the payset again"
+    );
+
+    // Overlay check, through the validator.
+    let ledger = Arc::new(Mutex::new(l));
+    let before = ledger.lock().unwrap().confirmed_txid_loads();
+    let hashes_before = algo_codec::payset_txid_hash_runs();
+    let validator = PayoutCheckingValidator::new(StubBlockValidator::accepting(), ledger.clone());
+    match validator.validate(&candidate).map(|_| ()) {
+        Err(AgreementError::ValidationFailed(message)) => assert_eq!(message, sc.validate_error),
+        other => panic!("overlay check: expected go's checkDup verdict, got {other:?}"),
+    }
+    assert_eq!(
+        ledger.lock().unwrap().confirmed_txid_loads() - before,
+        1,
+        "the overlay pre-pass queried the txtail again"
+    );
+    assert_eq!(
+        algo_codec::payset_txid_hash_runs() - hashes_before,
+        1,
+        "the overlay pre-pass hashed the payset again"
+    );
 }

@@ -2308,6 +2308,30 @@ impl std::ops::Deref for TxtailView<'_> {
     }
 }
 
+/// The txids of the rounds an open span has applied, see
+/// `SqliteLedger::span_txids` (issue #2134).
+#[derive(Debug, Default)]
+struct SpanTxids {
+    /// The committed round the span started from (`None`: not built).
+    committed: Option<u64>,
+    /// Every round of `committed + 1 ..= synced_to` was read once: decoded
+    /// into `ids`, or (an absent or unreadable row) listed in `missing`. An
+    /// undecodable row counts as read (it adds no ids, as the old scan treated
+    /// it, and is warned about once) and is not read again.
+    synced_to: u64,
+    /// The rounds of the range whose row was absent when read. They never
+    /// hide the rounds after them. They are read again when the ledger's round
+    /// advanced since the last retry, or when `put_txtail` wrote one of them
+    /// (`retry_requested`): not on every lookup, so the lookups of one block
+    /// evaluation do not repeat the reads under the lock.
+    missing: Vec<u64>,
+    /// The ledger round at the last retry of `missing`.
+    retried_at: u64,
+    /// `put_txtail` wrote a row listed in `missing`.
+    retry_requested: bool,
+    ids: std::collections::HashSet<algo_types::Digest>,
+}
+
 pub struct SqliteLedger {
     conn: Connection,
     /// Ledger prefix for the on-disk database pair, or `None` for in-memory
@@ -2332,6 +2356,19 @@ pub struct SqliteLedger {
     /// ledger (e.g. after a catchpoint import) starts a fresh one. It needs
     /// no block snapshot.
     txtail_dups: std::sync::Mutex<crate::txtail_cache::TxTailDupCache>,
+    /// The txids of the rounds the open span has applied (`committed + 1 ..=
+    /// current_round`), decoded once per span instead of once per lookup
+    /// (issue #2134). Reset when a span begins, commits or aborts.
+    span_txids: std::sync::Mutex<SpanTxids>,
+    /// Test hook: in-span txtail rows decoded so far.
+    #[cfg(any(test, feature = "test-hooks"))]
+    span_rows_decoded: std::sync::atomic::AtomicU64,
+    /// Test hook: in-span txtail row reads (decoded or absent) so far.
+    #[cfg(any(test, feature = "test-hooks"))]
+    span_row_reads: std::sync::atomic::AtomicU64,
+    /// Test hook: [`LedgerStore::txtail_confirmed_txids`] calls so far.
+    #[cfg(any(test, feature = "test-hooks"))]
+    confirmed_txid_loads: std::sync::atomic::AtomicU64,
     /// Snapshot of `lease_table` taken at `begin_block`, restored by
     /// `rollback_block`. The SQLite/trie rollback does not cover the in-memory
     /// lease table, so without this a partially-applied-then-rolled-back block
@@ -3248,6 +3285,13 @@ impl SqliteLedger {
             read_pool: None,
             lease_table: LeaseTable::new(),
             txtail_dups: std::sync::Mutex::new(crate::txtail_cache::TxTailDupCache::new()),
+            span_txids: std::sync::Mutex::new(SpanTxids::default()),
+            #[cfg(any(test, feature = "test-hooks"))]
+            span_rows_decoded: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            span_row_reads: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            confirmed_txid_loads: std::sync::atomic::AtomicU64::new(0),
             lease_snapshot: None,
             chain_snapshot: None,
             pending_abort: false,
@@ -3355,10 +3399,11 @@ impl SqliteLedger {
     /// committed when the span began, and never moved backwards (that would
     /// force a full rebuild); a span starting behind the cache (a rewound
     /// ledger) is answered from a throwaway cache of the span start's window
-    /// instead. The rounds the span applied since then are
-    /// read from their rows directly (a span is short), so their txids are
-    /// found too; the round being applied has no row yet and is
-    /// `checkDup`'s in-block half.
+    /// instead. The rounds the span applied since then are read from their
+    /// rows (a span is short), so their txids are found too: decoded once per
+    /// span into a per-span set ([`Self::sync_span_txids`], issue #2134) that
+    /// begin, commit, abort and a replaced span row reset; the round being
+    /// applied has no row yet and is `checkDup`'s in-block half.
     fn txtail_found(
         &self,
         txids: &[algo_types::Digest],
@@ -3368,27 +3413,120 @@ impl SqliteLedger {
         let mut found = cache.confirmed(txids, max_txn_life);
         drop(cache);
         if self.in_block && committed < self.current_round.0 {
-            // One hash set per lookup: each in-span row is matched in O(1)
-            // per txid instead of scanning the queried ids.
-            let wanted: std::collections::HashSet<&algo_types::Digest> = txids.iter().collect();
-            for round in committed + 1..=self.current_round.0 {
-                let Some(bytes) = self.get_txtail(round).ok().flatten() else {
-                    continue;
-                };
-                let Ok(tail) = rmp_serde::from_slice::<algo_types::TxTailRound>(&bytes) else {
-                    continue;
-                };
-                for id in &tail.txn_ids {
-                    if let Ok(id) = <[u8; 32]>::try_from(id.as_ref()) {
-                        let id = algo_types::Digest(id);
-                        if wanted.contains(&id) {
-                            found.insert(id);
-                        }
-                    }
-                }
-            }
+            // The span's own txids, decoded once per span (issue #2134): each
+            // lookup is a membership test per queried id.
+            let mut span = self
+                .span_txids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.sync_span_txids(&mut span, committed);
+            found.extend(txids.iter().filter(|id| span.ids.contains(id)).copied());
         }
         found
+    }
+
+    /// Bring `span` up to the rounds `committed + 1 ..= current_round`: a row
+    /// is decoded once, except that a round whose row is absent (a failed
+    /// `put_txtail` is only logged by the apply) is skipped like the old scan
+    /// skipped it, without hiding the later rounds, and is read again by every
+    /// sync until its row exists.
+    fn sync_span_txids(&self, span: &mut SpanTxids, committed: u64) {
+        if span.committed != Some(committed) || span.synced_to > self.current_round.0 {
+            *span = SpanTxids {
+                committed: Some(committed),
+                synced_to: committed,
+                missing: Vec::new(),
+                retried_at: self.current_round.0,
+                retry_requested: false,
+                ids: std::collections::HashSet::new(),
+            };
+        }
+        let mut still_missing = Vec::new();
+        let due = span.retry_requested || self.current_round.0 > span.retried_at;
+        let missing = std::mem::take(&mut span.missing);
+        let (retry, parked) = if due {
+            (missing, Vec::new())
+        } else {
+            (Vec::new(), missing)
+        };
+        span.retried_at = self.current_round.0;
+        span.retry_requested = false;
+        still_missing.extend(parked);
+        let fresh = span.synced_to + 1..=self.current_round.0;
+        for round in retry.into_iter().chain(fresh) {
+            #[cfg(any(test, feature = "test-hooks"))]
+            self.span_row_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(bytes) = self.get_txtail(round).ok().flatten() else {
+                still_missing.push(round);
+                continue;
+            };
+            #[cfg(any(test, feature = "test-hooks"))]
+            self.span_rows_decoded
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match rmp_serde::from_slice::<algo_types::TxTailRound>(&bytes) {
+                Ok(tail) => span.ids.extend(tail.txn_ids.iter().filter_map(|id| {
+                    <[u8; 32]>::try_from(id.as_ref())
+                        .ok()
+                        .map(algo_types::Digest)
+                })),
+                Err(e) => tracing::warn!(round, "span txtail row is undecodable, skipped: {e}"),
+            }
+        }
+        span.synced_to = span.synced_to.max(self.current_round.0);
+        span.missing = still_missing;
+    }
+
+    /// A span row is being written (`put_txtail` is `INSERT OR REPLACE`): one
+    /// already decoded makes the span's decoded txids stale, so they are
+    /// dropped and the next lookup reads the rows again; a missing one is
+    /// flagged for the next sync's retry; a round beyond the synced range has
+    /// not been read yet.
+    fn invalidate_span_txids_for(&mut self, round: u64) {
+        let span = self
+            .span_txids
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(committed) = span.committed else {
+            return;
+        };
+        if round <= committed || round > span.synced_to {
+            return;
+        }
+        if span.missing.contains(&round) {
+            span.retry_requested = true;
+        } else {
+            *span = SpanTxids::default();
+        }
+    }
+
+    /// Test hook (issue #2134): in-span txtail rows decoded so far.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn span_rows_decoded(&self) -> u64 {
+        self.span_rows_decoded
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test hook (issue #2134): in-span txtail row reads so far.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn span_row_reads(&self) -> u64 {
+        self.span_row_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test hook (issue #2134): confirmed-txid loads (`txtail_confirmed_txids`)
+    /// so far.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn confirmed_txid_loads(&self) -> u64 {
+        self.confirmed_txid_loads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn reset_span_txids(&self) {
+        *self
+            .span_txids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SpanTxids::default();
     }
 
     /// The shared txid cache synced as [`Self::txtail_found`] describes, and
@@ -3841,6 +3979,7 @@ impl SqliteLedger {
         self.lease_snapshot = Some(self.lease_table.clone());
         self.chain_snapshot = Some(self.capture_chain_snapshot(false));
         self.in_block = true;
+        self.reset_span_txids();
         self.read_cache.clear();
         // Issue #523: start this block's `accounttotals` delta accumulator
         // clean. Guards against `set_account`/`remove_account` calls made
@@ -4661,6 +4800,7 @@ impl SqliteLedger {
         // The committed lease changes stand; discard the rollback snapshot.
         self.lease_snapshot = None;
         self.in_block = false;
+        self.reset_span_txids();
         self.apply_knock_index_commit(&knock_changed);
 
         // Issue #1187: emit the periodic AccountUpdates telemetry-equivalent
@@ -5279,6 +5419,7 @@ impl SqliteLedger {
             }
         }
         self.in_block = false;
+        self.reset_span_txids();
         if let Some(snap) = self.chain_snapshot.take() {
             self.discard_uncommitted_deltas(snap.current_round.0);
             self.apply_chain_snapshot(snap);
@@ -9303,6 +9444,7 @@ impl LedgerStore for SqliteLedger {
 
     fn put_txtail(&mut self, round: u64, data: &[u8]) -> Result<(), AlgoError> {
         let _st = crate::follow_timing::StateTimer::write();
+        self.invalidate_span_txids_for(round);
         self.conn
             .execute_cached(
                 "INSERT OR REPLACE INTO txtail (rnd, data) VALUES (?1, ?2)",
@@ -9333,6 +9475,9 @@ impl LedgerStore for SqliteLedger {
         txids: &[algo_types::Digest],
         max_txn_life: u64,
     ) -> std::collections::HashSet<algo_types::Digest> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.confirmed_txid_loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.txtail_found(txids, max_txn_life)
     }
 
@@ -18060,6 +18205,10 @@ mod tests {
             read_pool: _,   // separate read-only connections, no chain state
             lease_table: _, // restored via lease_snapshot
             txtail_dups: _, // derived from committed txtail rows
+            span_txids: _,  // derived from the span's txtail rows
+            span_rows_decoded: _,
+            span_row_reads: _,
+            confirmed_txid_loads: _,
             lease_snapshot: _,
             chain_snapshot: _,
             pending_abort: _,

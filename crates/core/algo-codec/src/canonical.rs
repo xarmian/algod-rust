@@ -1904,11 +1904,29 @@ pub fn block_txids_with_rule(block: &Block, rule: &GenesisRestoreRule<'_>) -> Ve
     payset_txids_with_rule(&block.payset, rule)
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
+thread_local! {
+    static PAYSET_TXID_HASH_RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test hook: how many times a whole payset's txids were hashed on THIS thread
+/// ([`payset_txids_with_rule`]), so a test can show that a caller reuses ids
+/// it already has instead of hashing the payset again (issue #2134).
+///
+/// The counter is thread-local: work done on another thread is not counted,
+/// so a test must run the code under test on its own (test) thread.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn payset_txid_hash_runs() -> u64 {
+    PAYSET_TXID_HASH_RUNS.with(std::cell::Cell::get)
+}
+
 /// [`block_txids_with_rule`] for a payset that is not (yet) inside a block.
 pub fn payset_txids_with_rule(
     payset: &[SignedTransaction],
     rule: &GenesisRestoreRule<'_>,
 ) -> Vec<Digest> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    PAYSET_TXID_HASH_RUNS.with(|runs| runs.set(runs.get() + 1));
     payset
         .iter()
         .map(|stx| {
