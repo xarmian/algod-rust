@@ -1431,8 +1431,12 @@ mod tests {
         dl.download::<fn(DownloadProgress)>("test-v1.0", 8, &dest, None)
             .await
             .unwrap();
+        // The writer thread is signalled to finish before `download` returns,
+        // but its exit (the tracker's idle count) can trail by a scheduling
+        // slice; a zero timeout raced it on loaded CI runners (issue #2229).
+        // A bounded wait keeps the intent: no writer is left running.
         assert!(
-            dl.wait_for_writers(Duration::ZERO),
+            dl.wait_for_writers(Duration::from_secs(5)),
             "a writer is still running"
         );
         assert_eq!(std::fs::read(&dest).unwrap(), BODY);
