@@ -1791,6 +1791,16 @@ fn go_rejection(txid: &str, error: algo_error::AlgoError) -> algo_error::AlgoErr
         return error;
     }
     let (reason, class) = pool_reason(&error);
+    // A framed rejection reached through a wrapper (`reason_of` looks through
+    // an `AvmLogicSig`'s source) carries its own frame in `reason`: it is not
+    // framed again, and keeps its (framed) class.
+    if class.is_framed() {
+        return algo_error::AlgoError::Rejected {
+            message: reason,
+            class,
+            source: Some(Box::new(error)),
+        };
+    }
     algo_error::AlgoError::Rejected {
         message: format!("transaction {txid}: {reason}"),
         class,
@@ -4317,15 +4327,15 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                         algo_error::min_balance_rejected(addr, balance, min_bal, total_assets)
                     } else if max_min > 0 && min_bal > max_min {
                         // `MaximumMinimumBalance` is 0 (no limit) from v32+.
-                        algo_error::AlgoError::Rejected {
-                            source: None,
-                            message: format!(
+                        // go frames it `transaction <txid>: ` (typed `Framed`).
+                        algo_error::framed_rejection(
+                            txids[member],
+                            format!(
                                 "account {} would use too much space after this transaction. \
                                  Minimum balance requirements would be {} (greater than max {})",
                                 addr, min_bal, max_min,
                             ),
-                            class: algo_error::RejectClass::Other,
-                        }
+                        )
                     } else {
                         continue;
                     };
@@ -4338,19 +4348,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         if let Some((member, error)) = min_balance_violation {
             // go's `transaction <txid>: %w` frame.
             let txid = txids[member].to_string();
-            let error = match error {
-                // The max-minimum-balance rejection has no go type of its own.
-                algo_error::AlgoError::Rejected {
-                    message,
-                    class: algo_error::RejectClass::Other,
-                    source,
-                } => algo_error::AlgoError::Rejected {
-                    message: format!("transaction {txid}: {message}"),
-                    class: algo_error::RejectClass::Framed(algo_error::FramedKind::Other),
-                    source,
-                },
-                other => algo_error::frame_min_balance(other, || txid),
-            };
+            let error = algo_error::frame_min_balance(error, || txid);
             // go applies each member fully (programs included) BEFORE its
             // `checkMinBalance`: an earlier member's apply failure, or this
             // member's own, is what go reports. Settle it with a dry run of
