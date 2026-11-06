@@ -930,6 +930,16 @@ impl CatchupService {
     /// before applying every block.
     const MAX_PARALLEL_BLOCKS: u64 = 256;
 
+    /// Rounds a pass may have claimed ahead of the apply cursor (in flight
+    /// plus fetched and waiting), as a multiple of `parallel_blocks`; at most
+    /// `parallel_blocks` of them are being fetched at any time (issue #2204).
+    ///
+    /// DIVERGENCE DIV-010: go's window holds `limitedParallelRequests` rounds
+    /// in total (in flight and fetched-and-waiting), so one slow round idles
+    /// the workers behind it; here the window is twice as long and the number
+    /// of concurrent fetches stays `parallel_blocks`.
+    const FETCH_AHEAD_FACTOR: u64 = 2;
+
     /// Pull consecutive blocks from the network starting at the ledger's
     /// next round, until a fetch fails (normally the network tip).
     ///
@@ -1182,18 +1192,22 @@ impl CatchupService {
         // the window moves up by one each time the first round is written.
         // The same here with permits: a worker must hold one before it claims
         // a round, and the apply loop hands one back after each round it
-        // applies. So at most `parallel_blocks` rounds are ever fetched,
-        // in flight or buffered, ahead of the apply cursor (the fetch-ahead
-        // budget `CatchupParallelBlocks` expresses), which also caps what is
-        // wasted when an invalid round stops the pass. Result channel
-        // capacity equals the window, so a worker's `send` never blocks.
-        let (permit_tx, permit_rx) = crossbeam_channel::bounded::<()>(parallel_blocks as usize);
-        for _ in 0..parallel_blocks {
+        // applies. At most `parallel_blocks` rounds are in flight (one per
+        // worker, `CatchupParallelBlocks`) and at most [`Self::FETCH_AHEAD_FACTOR`]
+        // times as many are in flight or buffered ahead of the apply cursor
+        // (DIV-010: with the window equal to the worker count, one slow round
+        // parks every worker whose round finished, 11 of 16 in flight on
+        // average live), which also caps what is wasted when an invalid round
+        // stops the pass. Result channel capacity equals the window, so a
+        // worker's `send` never blocks.
+        let window = parallel_blocks.saturating_mul(Self::FETCH_AHEAD_FACTOR);
+        let (permit_tx, permit_rx) = crossbeam_channel::bounded::<()>(window as usize);
+        for _ in 0..window {
             let _ = permit_tx.send(());
         }
         let mut permit_tx = Some(permit_tx);
         let (result_tx, result_rx) =
-            crossbeam_channel::bounded::<(u64, FetchOutcome)>(parallel_blocks as usize);
+            crossbeam_channel::bounded::<(u64, FetchOutcome)>(window as usize);
 
         let mut workers = Vec::with_capacity(parallel_blocks as usize);
         for _ in 0..parallel_blocks {
@@ -3829,11 +3843,77 @@ mod tests {
         assert_eq!(ledger.next_round(), Round(601));
         assert_eq!(exit, SyncExitReason::NoBlock);
         let ahead = fetcher.max_ahead.load(Ordering::SeqCst);
+        // In flight <= parallel_blocks; claimed (in flight + buffered) <= the
+        // fetch-ahead window, `FETCH_AHEAD_FACTOR` x parallel_blocks (#2204).
         assert!(
-            ahead < 8,
+            ahead < 8 * CatchupService::FETCH_AHEAD_FACTOR,
             "a fetch ran {ahead} rounds ahead of the apply cursor with parallel_blocks=8"
         );
         assert!(ahead > 0, "the workers never ran ahead: not a pipeline");
+    }
+
+    /// Fetch-latency-bound catchup (issue #2204): one slow round must not
+    /// idle the other workers. Round 1 is held until the fetchers have
+    /// started `2 x parallel_blocks` rounds; the apply loop cannot pass round
+    /// 1, so with a window of exactly `parallel_blocks` the rounds fetched
+    /// behind it fill the window and every worker parks (measured live: 11 of
+    /// 16 fetches in flight on average, 54 blocks/s against 16/latency).
+    #[test]
+    fn a_slow_round_does_not_idle_the_other_workers() {
+        struct HoldFirstFetcher {
+            started: AtomicU64,
+            want_started: u64,
+            reached: AtomicBool,
+            /// Whether enough rounds had started by the time round 1 was let go.
+            reached_while_held: AtomicBool,
+        }
+        impl BlockFetcher for HoldFirstFetcher {
+            fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
+                if round.0 > 40 {
+                    return Err(FetchError::NoBlockForRound { round });
+                }
+                let n = self.started.fetch_add(1, Ordering::SeqCst) + 1;
+                if n >= self.want_started {
+                    self.reached.store(true, Ordering::SeqCst);
+                }
+                if round.0 == 1 {
+                    // Hold the first round until enough later rounds started.
+                    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                    while !self.reached.load(Ordering::SeqCst)
+                        && std::time::Instant::now() < deadline
+                    {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    self.reached_while_held
+                        .store(self.reached.load(Ordering::SeqCst), Ordering::SeqCst);
+                }
+                Ok(FetchedBlockCert {
+                    block: make_valid_empty_block(round.0),
+                    cert: Some(make_cert(round.0)),
+                    raw_payset_blobs: None,
+                })
+            }
+        }
+
+        let (ledger, ledger_dyn) = permissive_ledger();
+        let fetcher = Arc::new(HoldFirstFetcher {
+            started: AtomicU64::new(0),
+            want_started: 2 * 4,
+            reached: AtomicBool::new(false),
+            reached_while_held: AtomicBool::new(false),
+        });
+        let fetcher_dyn: Arc<dyn BlockFetcher> = fetcher.clone();
+        let shutdown_rx = never_shutdown();
+
+        CatchupService::sync_range(&ledger_dyn, &fetcher_dyn, &shutdown_rx, 4);
+
+        assert!(
+            fetcher.reached_while_held.load(Ordering::SeqCst),
+            "only {} rounds were started while round 1 was held: the workers idled behind the \
+             slow round instead of fetching on",
+            fetcher.started.load(Ordering::SeqCst)
+        );
+        assert_eq!(ledger.next_round(), Round(41));
     }
 
     // -- Issue #2165 review: liveness of the unbounded pass --
@@ -4312,10 +4392,14 @@ mod tests {
         assert_eq!(exit, SyncExitReason::NoBlock);
         assert_eq!(ledger.next_round(), Round(21));
         let beyond = fetcher.beyond.load(Ordering::SeqCst);
-        // 8 workers each ask once; the lowest asks `threshold + 1` times.
+        // The fetch-ahead window's workers each ask once (a window of
+        // `8 x FETCH_AHEAD_FACTOR` rounds, 8 of them in flight); the lowest asks
+        // `threshold + 1` times.
+        let window = 8 * CatchupService::FETCH_AHEAD_FACTOR;
         assert!(
-            beyond <= 8 + 6 + 4,
-            "{beyond} tip probe requests for a window of 8 (unmultiplied would be 48)"
+            beyond <= window + 6 + 4,
+            "{beyond} tip probe requests for a window of {window} (multiplied would be {})",
+            window * 7
         );
         assert!(
             started.elapsed() >= Duration::from_millis(400),

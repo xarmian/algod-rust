@@ -61,6 +61,7 @@ consensus-compatible. It exists for three readers:
 | DIV-007 | `simulate` serves only `Request.Round` = the latest round; an earlier round is rejected with go's `round %d before dbRound %d` (dbRound = latest), where go serves any round back to its tracker `dbRound` | simulate (`POST /v2/transactions/simulate` with `round`) | landed | 2026-10-31 | none (affects only whether a simulate request with a past round is served; no block, state or consensus path) | `crates/core/algo-ledger/src/simulation/mod.rs` (`Simulator::simulate`) | `ledger/simulation/simulator.go` (`Simulate`, `simulatorLedger.start`), `ledger/acctupdates.go` (`RoundOffsetError`) | `simulation_gaps_test.rs` (`start_round_selection`, `simulate_at_a_past_round_is_rejected_not_evaluated_on_latest_state`, `simulate_round_before_db_round_is_rejected`); the latest-round path stays proven by the #2118 go oracle (`simulation_rewards_oracle_test.rs`) |
 | DIV-008 | The ledger checkpoints the tracker WAL (PASSIVE, `main` only) every time it opens a `ReadSnapshot`, under the ledger lock; go has no long-lived read snapshot | ledger SQLite WAL maintenance (pool evaluator snapshot) | landed | 2026-11-02 | none (a checkpoint only copies committed pages from the WAL into the database file; durability settings unchanged) | `crates/core/algo-ledger/src/sqlite.rs` (`SqliteLedger::open_read_snapshot`, `checkpoint_tracker_wal_for_snapshot`), `crates/core/algo-ledger/src/follow_timing.rs` (metrics) | `util/db/dbutil.go` (`_journal_mode=wal`, default `wal_autocheckpoint`) | `wal_overlapping_reader_test.rs` (WAL bound, foreign-reader limit, 40 randomized kills, cost benchmark), live betanet follow, replay-corpus final-state equality (#2166) |
 | DIV-009 | A block's archive rows (`put_block` / `put_block_cert`) are buffered during the block span and committed to the block file on a second connection BEFORE the tracker transaction commits (go: blockdb commit, then trackers lag); a ledger crash leaves the archive at most one block ahead of the tracker | ledger SQLite commit order (`commit_block`) | landed | 2026-11-02 | none (same files, schema and rows; the archive rows become durable one commit earlier, durability settings unchanged) | `crates/core/algo-ledger/src/sqlite.rs` (`PendingArchive`, `SqliteLedger::flush_pending_archive`, `reconcile_orphans`, `begin_block`, `put_block`, `put_block_cert`, `forget_before`, `open_split`), `crates/core/algo-ledger/src/read_pool.rs` (`ArchiveInflight`, `in_flight`) | `ledger/ledger.go` (`AddValidatedBlock`: `blockQ.putBlock` before `trackers.newBlock`), `ledger/tracker.go` (`loadFromDisk`) | `wal_overlapping_reader_test.rs` (failpoint crash at every commit step in both write orders, randomized hard kills, abort/sync-ahead/savepoint tests, cost benchmark) (#2209) |
+| DIV-010 | The catchup pass's fetch window is `2 x CatchupParallelBlocks` rounds ahead of the apply cursor (in flight plus fetched and waiting) with at most `CatchupParallelBlocks` fetches in flight; go's window holds `limitedParallelRequests` rounds in total | block catchup / replay scheduling (`CatchupService::sync_pass_core`) | landed | 2026-11-06 | none (the same blocks are fetched, authenticated and applied in round order; only how many fetched blocks may wait for an earlier slow round differs) | `crates/core/algo-ledger/src/catchup_service.rs` (`FETCH_AHEAD_FACTOR`, `sync_pass_core`) | `catchup/service.go` (`pipelinedFetch`, `limitedParallelRequests`, `fetchAndWrite`) | `catchup_service` tests (`a_slow_round_does_not_idle_the_other_workers`, `sync_range_fetch_window_never_exceeds_the_parallel_budget`), live betanet replay with the block-hash gate (#2204) |
 
 ## Entries
 
@@ -549,3 +550,51 @@ falls back on an unreadable committed round, and the pool tests
 transaction as before (and the kill window returns).
 
 **How go-algorand could port it.** go already has this order; nothing to port.
+
+
+### DIV-010 — a fetch window twice the number of concurrent fetches
+
+**Status:** landed (#2204).
+
+**What go-algorand does.** `catchup/service.go` `pipelinedFetch` keeps a
+sliding window of `limitedParallelRequests` rounds (`CatchupParallelBlocks`,
+16 by default) starting at the first round not yet written: a worker fetches
+its round (`fetchAndWrite`), then waits for the previous round to be written
+before writing its own, and a new round enters the window when the first one
+is written. A fetched round that waits for an earlier slow one therefore
+still occupies its slot, and the number of fetches actually in flight falls
+below the window whenever one round is slower than the others.
+
+**What algod-rust did.** The same: a permit pool of `parallel_blocks` permits,
+returned when a round is applied. On the live betanet catchup (three relays,
+a 160/173/303 ms request round trip per relay, blocks of about 600 bytes) the
+fetches in flight averaged 11 of 16 (Little's law over the per-request
+timings) and the replay ran at 56 blocks/s, the window divided by the
+slowest-of-the-window latency rather than by the average latency.
+
+**What algod-rust does instead.** `sync_pass_core` gives out
+`FETCH_AHEAD_FACTOR x parallel_blocks` (2x) permits, while the number of
+workers (concurrent fetches) stays `parallel_blocks`. A worker whose round is
+fetched takes the next round while an earlier one is still slow, up to a
+buffer of one more window of fetched blocks (bounded memory: 32 blocks by
+default). Apply order, authentication, the commit path, the retry and
+tip-probe rules are unchanged; the bound on what is wasted when an invalid
+round stops the pass doubles (two windows).
+
+**Wire / consensus impact.** None: the same rounds are requested (the tip
+probe sends about one more window of requests once per pass) and every
+block is authenticated and applied in round order exactly as before.
+
+**How parity is proven.** `catchup_service` tests: the window test now bounds
+the rounds claimed ahead by `FETCH_AHEAD_FACTOR x parallel_blocks`,
+`a_slow_round_does_not_idle_the_other_workers` holds the first round until
+`2 x parallel_blocks` rounds have started (it fails with a factor of 1), the
+tip-probe test bounds the probes by the window; the live betanet replay
+(native, release, n = 3 alternating runs) ended with equal block hashes
+against a public node (#2204 / PR).
+
+**How to switch back.** Set `FETCH_AHEAD_FACTOR` to 1.
+
+**How go-algorand could port it.** Give `pipelinedFetch` a second, larger
+bound on the number of rounds fetched ahead of the write cursor and keep the
+worker count at `limitedParallelRequests`.
