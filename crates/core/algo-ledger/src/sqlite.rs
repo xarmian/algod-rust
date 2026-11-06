@@ -2314,8 +2314,13 @@ impl std::ops::Deref for TxtailView<'_> {
 struct SpanTxids {
     /// The committed round the span started from (`None`: not built).
     committed: Option<u64>,
-    /// Rounds `committed + 1 ..= synced_to` are decoded into `ids`.
+    /// Every round of `committed + 1 ..= synced_to` was read once: decoded
+    /// into `ids`, or (a missing or unreadable row) listed in `missing`.
     synced_to: u64,
+    /// The rounds of the range whose row was absent when read. They are read
+    /// again on every sync, as the old per-lookup scan did (a row written
+    /// later is still seen), and never hide the rounds after them.
+    missing: Vec<u64>,
     ids: std::collections::HashSet<algo_types::Digest>,
 }
 
@@ -3381,10 +3386,11 @@ impl SqliteLedger {
     /// committed when the span began, and never moved backwards (that would
     /// force a full rebuild); a span starting behind the cache (a rewound
     /// ledger) is answered from a throwaway cache of the span start's window
-    /// instead. The rounds the span applied since then are
-    /// read from their rows directly (a span is short), so their txids are
-    /// found too; the round being applied has no row yet and is
-    /// `checkDup`'s in-block half.
+    /// instead. The rounds the span applied since then are read from their
+    /// rows (a span is short), so their txids are found too: decoded once per
+    /// span into a per-span set ([`Self::sync_span_txids`], issue #2134) that
+    /// begin, commit, abort and a replaced span row reset; the round being
+    /// applied has no row yet and is `checkDup`'s in-block half.
     fn txtail_found(
         &self,
         txids: &[algo_types::Digest],
@@ -3406,32 +3412,57 @@ impl SqliteLedger {
         found
     }
 
-    /// Bring `span` up to the rounds `committed + 1 ..= current_round`: only
-    /// the rounds not decoded yet are read. A round whose row is absent stops
-    /// the sync there (nothing is skipped), so a row written later is still
-    /// picked up by the next lookup.
+    /// Bring `span` up to the rounds `committed + 1 ..= current_round`: a row
+    /// is decoded once, except that a round whose row is absent (a failed
+    /// `put_txtail` is only logged by the apply) is skipped like the old scan
+    /// skipped it, without hiding the later rounds, and is read again by every
+    /// sync until its row exists.
     fn sync_span_txids(&self, span: &mut SpanTxids, committed: u64) {
         if span.committed != Some(committed) || span.synced_to > self.current_round.0 {
             *span = SpanTxids {
                 committed: Some(committed),
                 synced_to: committed,
+                missing: Vec::new(),
                 ids: std::collections::HashSet::new(),
             };
         }
-        while span.synced_to < self.current_round.0 {
-            let round = span.synced_to + 1;
+        let mut still_missing = Vec::new();
+        let retry = std::mem::take(&mut span.missing);
+        let fresh = span.synced_to + 1..=self.current_round.0;
+        for round in retry.into_iter().chain(fresh) {
             let Some(bytes) = self.get_txtail(round).ok().flatten() else {
-                break;
+                still_missing.push(round);
+                continue;
             };
             #[cfg(any(test, feature = "test-hooks"))]
             self.span_rows_decoded
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if let Ok(tail) = rmp_serde::from_slice::<algo_types::TxTailRound>(&bytes) {
                 span.ids.extend(tail.txn_ids.iter().filter_map(|id| {
-                    <[u8; 32]>::try_from(id.as_ref()).ok().map(algo_types::Digest)
+                    <[u8; 32]>::try_from(id.as_ref())
+                        .ok()
+                        .map(algo_types::Digest)
                 }));
             }
-            span.synced_to = round;
+        }
+        span.synced_to = span.synced_to.max(self.current_round.0);
+        span.missing = still_missing;
+    }
+
+    /// A span row that was already decoded is being replaced (`put_txtail` is
+    /// `INSERT OR REPLACE`): drop the span's decoded txids so the next lookup
+    /// reads the rows again. A row that was missing is retried by every sync
+    /// anyway; a round beyond the synced range has not been read yet.
+    fn invalidate_span_txids_for(&mut self, round: u64) {
+        let span = self
+            .span_txids
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(committed) = span.committed else {
+            return;
+        };
+        if round > committed && round <= span.synced_to && !span.missing.contains(&round) {
+            *span = SpanTxids::default();
         }
     }
 
@@ -9372,6 +9403,7 @@ impl LedgerStore for SqliteLedger {
 
     fn put_txtail(&mut self, round: u64, data: &[u8]) -> Result<(), AlgoError> {
         let _st = crate::follow_timing::StateTimer::write();
+        self.invalidate_span_txids_for(round);
         self.conn
             .execute_cached(
                 "INSERT OR REPLACE INTO txtail (rnd, data) VALUES (?1, ?2)",

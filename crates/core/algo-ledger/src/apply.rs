@@ -2054,7 +2054,7 @@ pub(crate) fn apply_block_impl_ex<L: crate::store_trait::LedgerStore>(
 /// caller before the call) and what the apply reports back
 /// ([`ProbeOutput`], read by the caller after it). Kept in separate structs
 /// so an input is never mistaken for a result (issue #1799).
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct ExecProbe {
     /// Inputs.
     pub request: ProbeRequest,
@@ -2130,7 +2130,7 @@ pub struct ProbeRequest {
 }
 
 /// What an apply reports back to its [`ExecProbe`] caller.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct ProbeOutput {
     /// The latest prologue (`Alive` / `checkDup` / authorizer) rejection
     /// when [`ProbeRequest::check_dup`] (or validation) ran it: the payset
@@ -3142,6 +3142,8 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
             .checkdup
             .as_ref()
             .and_then(|c| c.borrow().violation().map(|(i, m)| (i, m.to_owned())));
+        // The last reader of `ctx.checkdup` (nothing after this block reads
+        // it, and the spent checker refuses further checks).
         if p.request.keep_ledger_dups {
             p.out.ledger_dups = ctx
                 .checkdup

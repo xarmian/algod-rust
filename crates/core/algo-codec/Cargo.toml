@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Test hooks (never in production): the whole-payset txid hash counter.
+test-hooks = []
+
 [dependencies]
 algo-types.workspace = true
 algo-error.workspace = true

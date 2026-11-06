@@ -21,8 +21,11 @@
 mod canonical;
 mod digest;
 
+#[cfg(any(test, feature = "test-hooks"))]
+pub use canonical::payset_txid_hash_runs;
+
 pub use canonical::{
-    block_txids_with_rule, build_txtail_from_block, payset_txid_hash_runs, payset_txids_with_rule, build_txtail_from_block_with_rule,
+    block_txids_with_rule, build_txtail_from_block, build_txtail_from_block_with_rule,
     build_txtail_from_block_with_txids,
     canonical_encode_account_application_model, canonical_encode_account_asset_model,
     canonical_encode_account_data, canonical_encode_app_local_state, canonical_encode_app_params,
@@ -38,8 +41,9 @@ pub use canonical::{
     canonical_encode_state_schema, canonical_encode_teal_key_value, canonical_encode_transaction,
     canonical_encode_tx_group, canonical_encode_txtail_round, canonical_encode_txtail_round_lease,
     canonical_encode_unauthenticated_proposal, decode_state_proof_verification_context,
-    resource_flags, write_str_marker_and_bytes, write_value_str_preserving, BaseOnlineAccountData,
-    OnlineRoundParamsData, ResourcesData, StateProofVerificationContext,
+    payset_txids_with_rule, resource_flags, write_str_marker_and_bytes,
+    write_value_str_preserving, BaseOnlineAccountData, OnlineRoundParamsData, ResourcesData,
+    StateProofVerificationContext,
 };
 pub use digest::{
     compute_block_digest, compute_block_header_digest, compute_block_header_digest_512,

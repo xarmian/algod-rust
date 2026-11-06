@@ -546,9 +546,8 @@ fn sqlite_txid_lookup_sees_rounds_applied_in_the_open_span() {
 }
 
 /// The in-span txids are decoded once per span, not once per lookup (issue
-/// #2134): repeated lookups of any ids decode the span's row a single time, a
-/// further round applied in the span decodes only its own row, and a rollback
-/// or commit starts the next span from scratch, still answering correctly.
+/// #2134): ten lookups decode the span's row a single time, and after the
+/// commit the shared cache answers with no span decode.
 #[test]
 fn in_span_txtail_rows_are_decoded_once_per_span() {
     let o = load_oracle();
@@ -564,7 +563,10 @@ fn in_span_txtail_rows_are_decoded_once_per_span() {
         // Many lookups of the span's txids, as one block evaluation issues.
         let before = l.span_rows_decoded();
         for _ in 0..5 {
-            assert_eq!(l.txtail_confirmed_txids(&committed, 1000).len(), committed.len());
+            assert_eq!(
+                l.txtail_confirmed_txids(&committed, 1000).len(),
+                committed.len()
+            );
             assert!(l.txtail_contains_txid(&committed[0], 1000));
         }
         assert_eq!(
@@ -576,8 +578,87 @@ fn in_span_txtail_rows_are_decoded_once_per_span() {
     });
     // After the commit the shared cache answers; no span row is decoded.
     let after_commit = l.span_rows_decoded();
-    assert_eq!(l.txtail_confirmed_txids(&committed, 1000).len(), committed.len());
+    assert_eq!(
+        l.txtail_confirmed_txids(&committed, 1000).len(),
+        committed.len()
+    );
     assert_eq!(l.span_rows_decoded(), after_commit);
+}
+
+/// One txtail row for `round` holding `ids`.
+fn tail_row(round: u64, ids: &[algo_types::Digest]) -> Vec<u8> {
+    let tail = algo_types::TxTailRound {
+        txn_ids: ids
+            .iter()
+            .map(|d| serde_bytes::ByteBuf::from(d.0.to_vec()))
+            .collect(),
+        last_valid: vec![1000; ids.len()],
+        leases: Vec::new(),
+        hdr: algo_types::BlockHeader {
+            round: algo_types::Round(round),
+            ..Default::default()
+        },
+    };
+    algo_codec::canonical_encode_txtail_round(&tail)
+}
+
+/// The per-span txid cache (issue #2134) keeps the old per-lookup semantics:
+/// a missing middle row does not hide the rounds after it (and a row written
+/// later is seen), a further round decodes only its own row, a replaced row
+/// is re-read, and an aborted span's rows do not leak into the next span.
+#[test]
+fn span_txid_cache_matches_the_per_lookup_scan() {
+    use algo_types::{Digest, Round};
+    let o = load_oracle();
+    let mut l = sqlite(&o);
+    let id = |b: u8| Digest([b; 32]);
+    let q = |l: &SqliteLedger, ids: &[Digest]| l.txtail_confirmed_txids(ids, 1000);
+
+    // A span from round 1 that "applied" rounds 2..=4 where round 3's row
+    // never landed (a failed `put_txtail` is only logged by the apply).
+    l.begin_block().expect("begin span");
+    l.put_txtail(2, &tail_row(2, &[id(2)])).unwrap();
+    l.put_txtail(4, &tail_row(4, &[id(4)])).unwrap();
+    l.set_current_round(Round(4));
+    let found = q(&l, &[id(2), id(3), id(4)]);
+    assert!(
+        found.contains(&id(2)) && found.contains(&id(4)),
+        "{found:?}"
+    );
+    assert!(!found.contains(&id(3)));
+    // The row written later is picked up by the next lookup.
+    l.put_txtail(3, &tail_row(3, &[id(3)])).unwrap();
+    let found = q(&l, &[id(2), id(3), id(4)]);
+    assert_eq!(found.len(), 3, "{found:?}");
+
+    // A further round decodes only its own row.
+    let before = l.span_rows_decoded();
+    l.put_txtail(5, &tail_row(5, &[id(5)])).unwrap();
+    l.set_current_round(Round(5));
+    assert!(q(&l, &[id(5)]).contains(&id(5)));
+    assert_eq!(l.span_rows_decoded() - before, 1, "only round 5's row");
+
+    // A row already decoded is replaced: the next lookup sees the new ids.
+    l.put_txtail(4, &tail_row(4, &[id(44)])).unwrap();
+    let found = q(&l, &[id(4), id(44)]);
+    assert!(
+        found.contains(&id(44)) && !found.contains(&id(4)),
+        "{found:?}"
+    );
+
+    // An aborted span leaves nothing behind: the next span, with a different
+    // round 2, answers from its own rows only.
+    l.rollback_block().expect("abort the span");
+    l.begin_block().expect("begin the next span");
+    l.put_txtail(2, &tail_row(2, &[id(22)])).unwrap();
+    l.set_current_round(Round(2));
+    let found = q(&l, &[id(2), id(22), id(3), id(5)]);
+    assert!(found.contains(&id(22)), "{found:?}");
+    assert!(
+        !found.contains(&id(2)) && !found.contains(&id(3)) && !found.contains(&id(5)),
+        "the aborted span's ids leaked: {found:?}"
+    );
+    l.rollback_block().expect("abort");
 }
 
 /// A span opened on a ledger rewound below rounds the shared txid cache
@@ -1048,7 +1129,9 @@ fn evaluate_payset_uses_the_supplied_txids_instead_of_rehashing() {
     }
     // Made-up ids are looked up as supplied (the payset is NOT rehashed), so
     // the committed duplicate is not seen.
-    let made_up: Vec<Digest> = (0..real.len()).map(|i| Digest([0xEE - i as u8; 32])).collect();
+    let made_up: Vec<Digest> = (0..real.len())
+        .map(|i| Digest([0xEE - i as u8; 32]))
+        .collect();
     let made_up_result = evaluate_payset_with_txids(&base, &candidate, None, Some(made_up));
     assert!(
         made_up_result.is_ok(),

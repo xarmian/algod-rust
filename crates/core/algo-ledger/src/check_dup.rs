@@ -98,7 +98,8 @@ pub type SharedBlockDups = std::sync::Arc<std::sync::Mutex<BlockDups>>;
 /// many for a block that is being abandoned), so the poison is ignored
 /// rather than turning every later admission into a panic.
 pub fn lock_dups(dups: &SharedBlockDups) -> std::sync::MutexGuard<'_, BlockDups> {
-    dups.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    dups.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// A point [`BlockDups::rollback_to`] can return to.
@@ -245,7 +246,7 @@ impl BlockDups {
 /// `round`, loaded lazily and at most once (issue #2125): which of its
 /// `txids` the txtail already holds, and, for a past `round`, the leases in
 /// force in go's window.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LedgerDups {
     round: u64,
     txids: Vec<Digest>,
@@ -474,8 +475,10 @@ impl BlockCheckDup {
     }
 
     /// Hand the ledger half (the payset's txids and whatever confirmed set it
-    /// loaded) to a caller that continues with the same payset, leaving an
-    /// empty one behind (issue #2134).
+    /// loaded) to a caller that continues with the same payset (issue #2134).
+    /// The checker is spent afterwards: it keeps no txids, so a later
+    /// [`Self::check`] fails loudly (`checkDup: no txid for payset index`)
+    /// instead of passing.
     pub fn take_ledger_dups(&mut self) -> LedgerDups {
         let round = self.ledger.round;
         std::mem::replace(&mut self.ledger, LedgerDups::new(round, Vec::new()))
@@ -672,6 +675,45 @@ pub fn prologue_prepass<L: LedgerStore + ?Sized>(store: &L, block: &algo_types::
 /// the same base state: the same round (checked here) on a base that did not
 /// move (the callers' stale checks). A `reuse` for another round or payset
 /// length is ignored and the ledger half is rebuilt.
+/// Whether the ledger half `ledger` of a finished execution belongs to
+/// `block`: its round and length, and (in every build) its first and last txid
+/// against a hash of the payset's first and last transaction, so a caller that
+/// hands over the wrong payset's state is caught for two hashes instead of a
+/// whole-payset rehash. The execution and the pre-pass are the same
+/// function's output over the same block (`probe.out.ledger_dups` of the apply
+/// of this very `block`), so a mismatch is a caller bug, never a normal
+/// outcome; debug builds also compare every id.
+fn reuse_matches(
+    ledger: &LedgerDups,
+    block: &algo_types::Block,
+    rule: &GenesisRestoreRule<'_>,
+) -> bool {
+    let hash = |stx: &algo_types::SignedTransaction| {
+        let (gen, gh) = rule.restored_genesis(stx);
+        algo_codec::compute_txn_id_with_genesis(&stx.txn, gen, gh)
+    };
+    let ids = ledger.txids();
+    if ledger.round() != block.round.0 || ids.len() != block.payset.len() {
+        return false;
+    }
+    let ends_match = match (
+        ids.first().zip(block.payset.first()),
+        ids.last().zip(block.payset.last()),
+    ) {
+        (Some((first_id, first)), Some((last_id, last))) => {
+            *first_id == hash(first) && *last_id == hash(last)
+        }
+        _ => true,
+    };
+    // What the execution hashed is what a rehash gives (hashed one by one, so
+    // the whole-payset hash counter stays honest).
+    debug_assert!(
+        !ends_match || ids.iter().copied().eq(block.payset.iter().map(hash)),
+        "the reused txids differ from a rehash of the payset"
+    );
+    ends_match
+}
+
 pub fn prologue_prepass_reusing<L: LedgerStore + ?Sized>(
     store: &L,
     block: &algo_types::Block,
@@ -690,16 +732,7 @@ pub fn prologue_prepass_reusing<L: LedgerStore + ?Sized>(
         ));
     }
     let mut check = match reuse {
-        Some(ledger) if ledger.round() == block.round.0 && ledger.txids().len() == block.payset.len() => {
-            // What the execution hashed is what a rehash gives (hashed here
-            // one by one, so the whole-payset hash counter stays honest).
-            debug_assert!(
-                ledger.txids().iter().copied().eq(block.payset.iter().map(|stx| {
-                    let (gen, gh) = rule.restored_genesis(stx);
-                    algo_codec::compute_txn_id_with_genesis(&stx.txn, gen, gh)
-                })),
-                "the reused txids differ from a rehash of the payset"
-            );
+        Some(ledger) if reuse_matches(&ledger, block, &rule) => {
             BlockCheckDup::from_ledger_dups(ledger)
         }
         _ => BlockCheckDup::new(
@@ -867,5 +900,54 @@ mod tests {
         // v23 sees the lease either way.
         assert!(check(CONSENSUS_V23, &leased_txn(6, 20)).is_err());
         assert!(check(CONSENSUS_V23, &leased_txn(5, 20)).is_err());
+    }
+
+    /// A spent checker (its ledger half handed over) refuses further checks
+    /// instead of passing them (issue #2134).
+    #[test]
+    fn a_checker_whose_ledger_half_was_taken_refuses_to_check() {
+        let state = ledger_with_lease_in_round_5();
+        let consensus = consensus_params_for_version(CONSENSUS_V23).expect("known protocol");
+        let rule = algo_types::genesis_restore::GenesisRestoreRule::unstripped("", &[0; 32]);
+        let mut check = BlockCheckDup::new(11, vec![Digest([1; 32])]);
+        let taken = check.take_ledger_dups();
+        assert_eq!(taken.txids(), [Digest([1; 32])]);
+        let mut stx = algo_types::SignedTransaction::default();
+        stx.txn.first_valid = Round(1);
+        stx.txn.last_valid = Round(100);
+        let err = check
+            .check(&state, &consensus, &rule, &stx, 0)
+            .expect_err("a spent checker must not pass");
+        assert!(
+            err.to_string().contains("no txid for payset index"),
+            "{err}"
+        );
+    }
+
+    /// The reuse guard compares the payset's ends in every build: a ledger
+    /// half of another payset is not reused (issue #2134).
+    #[test]
+    fn a_reused_ledger_half_of_another_payset_is_rebuilt() {
+        let rule = algo_types::genesis_restore::GenesisRestoreRule::unstripped("", &[0; 32]);
+        let mut stx = algo_types::SignedTransaction::default();
+        stx.txn.first_valid = Round(1);
+        stx.txn.last_valid = Round(100);
+        let block = algo_types::Block {
+            round: Round(11),
+            payset: vec![stx],
+            ..Default::default()
+        };
+        let right = algo_codec::block_txids_with_rule(&block, &rule);
+        assert!(reuse_matches(&LedgerDups::new(11, right), &block, &rule));
+        assert!(!reuse_matches(
+            &LedgerDups::new(11, vec![Digest([9; 32])]),
+            &block,
+            &rule
+        ));
+        assert!(!reuse_matches(
+            &LedgerDups::new(12, Vec::new()),
+            &block,
+            &rule
+        ));
     }
 }

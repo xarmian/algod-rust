@@ -330,17 +330,22 @@ pub fn evaluate_proposal_check<B: OverlayBase + ?Sized>(base: &B, block: &Block)
     // (issue #2134): `PendingOverlay::new` reads the chain scalars.
     let mut overlay = PendingOverlay::new(base);
     let result = evaluate_block_on_overlay_with(base, &mut overlay, block, &mut probe);
+    // Only a clean apply failure leaves the overlay in a state `rollback_group`
+    // is known to restore completely (its undo journal covers every write the
+    // apply made). A panic in the middle of a write, a stale base or any other
+    // failure gets a fresh overlay for the pre-pass instead.
+    let clean_failure = matches!(result, Err(ScratchFailure::Txn { .. }));
     let check = crate::shadow_execute::proposal_check_from(result, &probe);
     if !matches!(check, ProposalCheck::NoVerdict { .. }) {
         return check;
     }
-    // Whatever the failed evaluation left in the group in progress is undone.
-    overlay.rollback_group();
     let reuse = probe.out.ledger_dups.take();
-    crate::shadow_execute::with_prologue_prepass(
-        check,
-        prologue_prepass_with(base, &mut overlay, block, reuse),
-    )
+    let prepass = if clean_failure {
+        prepass_after_clean_failure(base, &mut overlay, block, reuse)
+    } else {
+        prologue_prepass_with(base, &mut PendingOverlay::new(base), block, reuse)
+    };
+    crate::shadow_execute::with_prologue_prepass(check, prepass)
 }
 
 /// [`crate::check_dup::prologue_prepass`] on a fresh overlay over `base`:
@@ -350,6 +355,19 @@ pub fn evaluate_proposal_check<B: OverlayBase + ?Sized>(base: &B, block: &Block)
 pub fn prologue_prepass<B: OverlayBase + ?Sized>(base: &B, block: &Block) -> Option<String> {
     let mut overlay = PendingOverlay::new(base);
     prologue_prepass_with(base, &mut overlay, block, None)
+}
+
+/// The pre-pass on the overlay a CLEAN apply failure left behind: the group in
+/// progress is rolled back first (the undo journal and the lease table), then
+/// the pre-pass runs on it with the failed evaluation's ledger half.
+fn prepass_after_clean_failure<B: OverlayBase + ?Sized>(
+    base: &B,
+    overlay: &mut PendingOverlay,
+    block: &Block,
+    reuse: Option<crate::check_dup::LedgerDups>,
+) -> Option<String> {
+    overlay.rollback_group();
+    prologue_prepass_with(base, overlay, block, reuse)
 }
 
 /// [`prologue_prepass`] over an overlay the caller already has (empty or
@@ -364,12 +382,9 @@ fn prologue_prepass_with<B: OverlayBase + ?Sized>(
     if base.base_is_stale() || block.round.0 != overlay.base_round().0 + 1 {
         return None;
     }
-    let verdict = crate::check_dup::prologue_prepass_reusing(
-        &OverlayStore::new(base, overlay),
-        block,
-        reuse,
-    )
-    .violation();
+    let verdict =
+        crate::check_dup::prologue_prepass_reusing(&OverlayStore::new(base, overlay), block, reuse)
+            .violation();
     (!base.base_is_stale()).then_some(verdict).flatten()
 }
 
@@ -879,7 +894,9 @@ mod tests {
             ),
             "{error:?}"
         );
-        assert!(error.to_string().starts_with("transaction already in ledger: "));
+        assert!(error
+            .to_string()
+            .starts_with("transaction already in ledger: "));
     }
 
     /// The same for a lease an earlier group of the pending block holds.
@@ -1021,5 +1038,76 @@ mod tests {
         let res = evaluate_group(&base, &mut ov, &t, &group);
         assert!(matches!(res, Err(GroupEvalError::Stale)), "{res:?}");
         assert_eq!(recorded(&ov), 0, "a stale group is not recorded");
+    }
+
+    /// The overlay a failed evaluation leaves behind, after `rollback_group`,
+    /// gives the pre-pass exactly the verdict a fresh overlay does, with the
+    /// execution's ledger half reused or not, across random mixes of plain,
+    /// leased, repeated and unevaluable (overspending) transactions (issue
+    /// #2134).
+    #[test]
+    fn reused_overlay_prepass_verdict_equals_a_fresh_overlay_one() {
+        let a = addr(1);
+        let b = addr(2);
+        let l = ledger(&[(a, funded(500_000_000)), (b, funded(1_000_000))]);
+        let t = template(&l);
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let (mut violations, mut clean) = (0, 0);
+        for _ in 0..60 {
+            let mut payset: Vec<SignedTransaction> = Vec::new();
+            for i in 0..(2 + next(5)) {
+                let mut stx = match next(4) {
+                    0 => pay(a, b, 1_000_000_000_000, None), // unevaluable here
+                    _ => pay(a, b, 1_000 + next(3), None),
+                };
+                if next(3) == 0 {
+                    stx.txn.lease = [1 + next(2) as u8; 32];
+                }
+                stx.txn.note = serde_bytes::ByteBuf::from(vec![next(3) as u8, i as u8 % 2]);
+                // A repeat of an earlier member (a txid duplicate).
+                if !payset.is_empty() && next(5) == 0 {
+                    stx = payset[next(payset.len() as u64) as usize].clone();
+                }
+                payset.push(stx);
+            }
+            let mut block = t.clone();
+            block.payset = payset;
+
+            let fresh = prologue_prepass(&l, &block);
+
+            let mut probe = crate::shadow_execute::proposal_check_probe();
+            let mut overlay = PendingOverlay::new(&l);
+            let result = evaluate_block_on_overlay_with(&l, &mut overlay, &block, &mut probe);
+            if !matches!(result, Err(ScratchFailure::Txn { .. })) {
+                continue; // evaluated fully, or no clean failure: not this path
+            }
+            let reuse = probe.out.ledger_dups.take();
+            let reused_overlay_with_reuse =
+                prepass_after_clean_failure(&l, &mut overlay, &block, reuse);
+            let reused_overlay_without =
+                prepass_after_clean_failure(&l, &mut overlay, &block, None);
+            assert_eq!(
+                reused_overlay_with_reuse,
+                fresh,
+                "payset {:?}",
+                block.payset.len()
+            );
+            assert_eq!(reused_overlay_without, fresh);
+            if fresh.is_some() {
+                violations += 1;
+            } else {
+                clean += 1;
+            }
+        }
+        assert!(
+            violations > 0 && clean > 0,
+            "{violations} violations, {clean} clean"
+        );
     }
 }
