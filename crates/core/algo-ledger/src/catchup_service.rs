@@ -398,6 +398,9 @@ struct PassCtx {
     tip_seen: AtomicBool,
     /// Rounds currently probing the tip; only the lowest keeps retrying.
     probing: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+    /// The round the apply loop waits for next (its cursor), for the workers'
+    /// tip gate (issue #2204).
+    applied: AtomicU64,
 }
 
 impl PassCtx {
@@ -407,6 +410,7 @@ impl PassCtx {
             window_limit: AtomicU64::new(u64::MAX),
             tip_seen: AtomicBool::new(false),
             probing: std::sync::Mutex::new(Default::default()),
+            applied: AtomicU64::new(0),
         }
     }
 }
@@ -924,21 +928,38 @@ impl CatchupService {
     /// value for the default filter timeout.
     const PERIODIC_SYNC_INTERVAL: Duration = Duration::from_secs(4);
 
-    /// Upper bound on the fetch window (`CatchupParallelBlocks`). A pass is
+    /// Upper bound on the number of fetch workers (`CatchupParallelBlocks`;
+    /// the window of rounds ahead of the apply cursor is
+    /// [`Self::fetch_window`] of it). A pass is
     /// not bounded in length (issue #2165): like go's `pipelinedFetch` it
     /// runs until a fetch fails at the network tip, and checks for shutdown
     /// before applying every block.
     const MAX_PARALLEL_BLOCKS: u64 = 256;
 
+    /// Most rounds, beyond the workers' own, a pass may have fetched and
+    /// waiting ahead of the apply cursor (issue #2204): the memory and the
+    /// discarded work an invalid round costs are bounded by a BLOCK COUNT
+    /// (no byte cap), `workers + min(workers, FETCH_AHEAD_MAX_EXTRA)`.
+    const FETCH_AHEAD_MAX_EXTRA: u64 = 32;
+
     /// Rounds a pass may have claimed ahead of the apply cursor (in flight
-    /// plus fetched and waiting), as a multiple of `parallel_blocks`; at most
-    /// `parallel_blocks` of them are being fetched at any time (issue #2204).
+    /// plus fetched and waiting) for `workers` fetch workers; at most
+    /// `workers` of them are being fetched at any time (issue #2204).
     ///
     /// DIVERGENCE DIV-010: go's window holds `limitedParallelRequests` rounds
     /// in total (in flight and fetched-and-waiting), so one slow round idles
-    /// the workers behind it; here the window is twice as long and the number
-    /// of concurrent fetches stays `parallel_blocks`.
-    const FETCH_AHEAD_FACTOR: u64 = 2;
+    /// the workers behind it; here the window is up to twice as long
+    /// (`workers + min(workers, FETCH_AHEAD_MAX_EXTRA)`) and the number of
+    /// concurrent fetches stays the worker count. A single worker
+    /// (`CatchupParallelBlocks: 1`, the strictly serial setting) keeps a
+    /// window of 1: no prefetch.
+    fn fetch_window(workers: u64) -> u64 {
+        if workers <= 1 {
+            workers
+        } else {
+            workers + workers.min(Self::FETCH_AHEAD_MAX_EXTRA)
+        }
+    }
 
     /// Pull consecutive blocks from the network starting at the ledger's
     /// next round, until a fetch fails (normally the network tip).
@@ -1192,22 +1213,23 @@ impl CatchupService {
         // the window moves up by one each time the first round is written.
         // The same here with permits: a worker must hold one before it claims
         // a round, and the apply loop hands one back after each round it
-        // applies. At most `parallel_blocks` rounds are in flight (one per
-        // worker, `CatchupParallelBlocks`) and at most [`Self::FETCH_AHEAD_FACTOR`]
-        // times as many are in flight or buffered ahead of the apply cursor
-        // (DIV-010: with the window equal to the worker count, one slow round
-        // parks every worker whose round finished, 11 of 16 in flight on
-        // average live), which also caps what is wasted when an invalid round
-        // stops the pass. Result channel capacity equals the window, so a
-        // worker's `send` never blocks.
-        let window = parallel_blocks.saturating_mul(Self::FETCH_AHEAD_FACTOR);
-        let (permit_tx, permit_rx) = crossbeam_channel::bounded::<()>(window as usize);
-        for _ in 0..window {
-            let _ = permit_tx.send(());
-        }
-        let mut permit_tx = Some(permit_tx);
+        // applies. At most one round per worker is in flight
+        // (`CatchupParallelBlocks` workers) and at most
+        // [`Self::fetch_window`] of the workers actually started are in flight
+        // or buffered ahead of the apply cursor (DIV-010: with the window equal
+        // to the worker count, one slow round parks every worker whose round
+        // finished, 11 of 16 in flight on average live), which also caps what
+        // is wasted when an invalid round stops the pass. The channels are
+        // sized for the largest window; the permits handed out once the
+        // workers are spawned are the window of the workers that really
+        // started. A result channel with room for the window means a worker's
+        // `send` never blocks.
+        let max_window = Self::fetch_window(parallel_blocks);
+        ctx.applied.store(start_round.0, Ordering::SeqCst);
+        let (permit_tx, permit_rx) = crossbeam_channel::bounded::<()>(max_window as usize);
+        let permit_tx = Some(permit_tx);
         let (result_tx, result_rx) =
-            crossbeam_channel::bounded::<(u64, FetchOutcome)>(window as usize);
+            crossbeam_channel::bounded::<(u64, FetchOutcome)>(max_window as usize);
 
         let mut workers = Vec::with_capacity(parallel_blocks as usize);
         for _ in 0..parallel_blocks {
@@ -1232,6 +1254,23 @@ impl CatchupService {
                     // sender (it is over) wakes and ends every idle worker.
                     if permits.recv().is_err() || stop.load(Ordering::SeqCst) {
                         return;
+                    }
+                    // Tip gate (issue #2204): once a worker has seen the tip,
+                    // do not claim a round more than `parallel_blocks` beyond
+                    // the apply cursor, as go's window (go stops launching
+                    // fetches after the first failure): the extra window only
+                    // pays off while blocks exist, and past the tip every
+                    // claimed round is a request for a block that is not
+                    // there. The slot is held until the cursor moves or the
+                    // pass ends.
+                    while ctx.tip_seen.load(Ordering::SeqCst)
+                        && next_to_fetch.load(Ordering::SeqCst)
+                            >= ctx.applied.load(Ordering::SeqCst) + parallel_blocks
+                    {
+                        if stop.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(2));
                     }
                     let round = next_to_fetch.fetch_add(1, Ordering::SeqCst);
                     // Past an unsupported round the apply loop stops at: the
@@ -1283,6 +1322,15 @@ impl CatchupService {
                 }
             }
         }
+        // The window of the workers that really started (fewer than
+        // `parallel_blocks` when a thread could not be spawned).
+        let window = Self::fetch_window(workers.len() as u64);
+        if let Some(tx) = &permit_tx {
+            for _ in 0..window {
+                let _ = tx.send(());
+            }
+        }
+        let mut permit_tx = permit_tx;
         // Drop this thread's sender clone so the channel closes once every
         // worker has exited (each worker holds its own clone until then).
         drop(result_tx);
@@ -1523,6 +1571,7 @@ impl CatchupService {
                     }
                 }
                 next_apply += 1;
+                ctx.applied.store(next_apply, Ordering::SeqCst);
                 // The window slides: the applied round's slot is free again.
                 if let Some(tx) = &permit_tx {
                     let _ = tx.try_send(());
@@ -3526,7 +3575,7 @@ mod tests {
 
     /// Port of go's `TestOnSwitchToUnSupportedProtocol3`: interruption with
     /// short notice — the switch boundary is reached with fewer rounds of
-    /// warning than the fetch-ahead window (`parallel_blocks`), so a worker
+    /// warning than the fetch-ahead window (`fetch_window(parallel_blocks)`), so a worker
     /// may already be mid-fetch on the unsupported round when the boundary
     /// is discovered. go's assertion is `< lastRoundLocal+2` (i.e. the extra
     /// prefetched round is buffered but never *applied*) — the strict
@@ -3546,7 +3595,7 @@ mod tests {
         });
         let shutdown_rx = never_shutdown();
 
-        // parallel_blocks=2: workers may prefetch round 2 (unsupported)
+        // parallel_blocks=2 (a window of 4): workers may prefetch round 2 (unsupported)
         // concurrently with round 1 (supported), but the boundary must
         // still be honored exactly — no partial/out-of-order commit.
         CatchupService::sync_pass_inner(&ledger_dyn, &fetcher, &shutdown_rx, 2);
@@ -3796,11 +3845,13 @@ mod tests {
     }
 
     /// Records, at the start of each fetch, how far ahead of the ledger's
-    /// apply cursor the requested round is.
+    /// apply cursor the requested round is, and how many fetches run at once.
     struct AheadTrackingFetcher {
         ledger: Arc<PermissiveCatchupLedger>,
         up_to: u64,
         max_ahead: AtomicU64,
+        inflight: AtomicU64,
+        max_inflight: AtomicU64,
     }
 
     impl BlockFetcher for AheadTrackingFetcher {
@@ -3810,8 +3861,11 @@ mod tests {
             }
             let ahead = round.0.saturating_sub(self.ledger.next_round().0);
             self.max_ahead.fetch_max(ahead, Ordering::SeqCst);
+            let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_inflight.fetch_max(now, Ordering::SeqCst);
             // A little latency so the workers really do run ahead.
             thread::sleep(Duration::from_millis(1));
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
             Ok(FetchedBlockCert {
                 block: make_valid_empty_block(round.0),
                 cert: Some(make_cert(round.0)),
@@ -3820,10 +3874,9 @@ mod tests {
         }
     }
 
-    /// The pipeline is a sliding window like go's (`firstRound ..
-    /// firstRound+limitedParallelRequests`): never more than
-    /// `parallel_blocks` rounds claimed beyond the apply cursor, however long
-    /// the pass runs.
+    /// The pipeline is a sliding window: at most `parallel_blocks` fetches
+    /// run at once and a round is never claimed `fetch_window(parallel_blocks)`
+    /// or more rounds beyond the apply cursor, however long the pass runs.
     #[test]
     fn sync_range_fetch_window_never_exceeds_the_parallel_budget() {
         let ledger = Arc::new(PermissiveCatchupLedger {
@@ -3834,6 +3887,8 @@ mod tests {
             ledger: Arc::clone(&ledger),
             up_to: 600,
             max_ahead: AtomicU64::new(0),
+            inflight: AtomicU64::new(0),
+            max_inflight: AtomicU64::new(0),
         });
         let fetcher_dyn: Arc<dyn BlockFetcher> = fetcher.clone();
         let shutdown_rx = never_shutdown();
@@ -3842,50 +3897,76 @@ mod tests {
 
         assert_eq!(ledger.next_round(), Round(601));
         assert_eq!(exit, SyncExitReason::NoBlock);
+        let window = CatchupService::fetch_window(8);
+        assert_eq!(window, 16);
         let ahead = fetcher.max_ahead.load(Ordering::SeqCst);
-        // In flight <= parallel_blocks; claimed (in flight + buffered) <= the
-        // fetch-ahead window, `FETCH_AHEAD_FACTOR` x parallel_blocks (#2204).
+        // `ahead` is measured against the cursor at the start of the fetch, so
+        // it is below the window by construction of the permits.
         assert!(
-            ahead < 8 * CatchupService::FETCH_AHEAD_FACTOR,
-            "a fetch ran {ahead} rounds ahead of the apply cursor with parallel_blocks=8"
+            ahead < window,
+            "a fetch ran {ahead} rounds ahead of the apply cursor, window {window}"
         );
         assert!(ahead > 0, "the workers never ran ahead: not a pipeline");
+        let concurrent = fetcher.max_inflight.load(Ordering::SeqCst);
+        assert!(
+            concurrent <= 8,
+            "{concurrent} fetches ran at once with parallel_blocks=8"
+        );
+        assert!(concurrent > 1, "the fetches never overlapped: not parallel");
+    }
+
+    /// A single worker (`CatchupParallelBlocks: 1`, strictly serial catchup)
+    /// keeps a window of one round: no prefetch; larger counts are capped by
+    /// `FETCH_AHEAD_MAX_EXTRA` (issue #2204).
+    #[test]
+    fn the_fetch_window_is_exact_for_one_worker_and_capped_for_many() {
+        assert_eq!(CatchupService::fetch_window(0), 0);
+        assert_eq!(CatchupService::fetch_window(1), 1);
+        assert_eq!(CatchupService::fetch_window(2), 4);
+        assert_eq!(CatchupService::fetch_window(16), 32);
+        assert_eq!(CatchupService::fetch_window(64), 96);
+        assert_eq!(
+            CatchupService::fetch_window(256),
+            256 + CatchupService::FETCH_AHEAD_MAX_EXTRA
+        );
     }
 
     /// Fetch-latency-bound catchup (issue #2204): one slow round must not
-    /// idle the other workers. Round 1 is held until the fetchers have
-    /// started `2 x parallel_blocks` rounds; the apply loop cannot pass round
-    /// 1, so with a window of exactly `parallel_blocks` the rounds fetched
-    /// behind it fill the window and every worker parks (measured live: 11 of
-    /// 16 fetches in flight on average, 54 blocks/s against 16/latency).
+    /// idle the other workers, and the window is exactly
+    /// `fetch_window(parallel_blocks)`. Round 1 is held; the workers behind
+    /// it must claim rounds up to the window (8 of them for 4 workers) and not
+    /// one more, and nothing is released by timing: the test waits on the
+    /// fetchers' own notifications.
     #[test]
     fn a_slow_round_does_not_idle_the_other_workers() {
+        use std::sync::{Condvar, Mutex};
+
         struct HoldFirstFetcher {
-            started: AtomicU64,
-            want_started: u64,
-            reached: AtomicBool,
-            /// Whether enough rounds had started by the time round 1 was let go.
-            reached_while_held: AtomicBool,
+            started: Mutex<Vec<u64>>,
+            started_cv: Condvar,
+            released: Mutex<bool>,
+            released_cv: Condvar,
+            up_to: u64,
         }
         impl BlockFetcher for HoldFirstFetcher {
             fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
-                if round.0 > 40 {
+                if round.0 > self.up_to {
                     return Err(FetchError::NoBlockForRound { round });
                 }
-                let n = self.started.fetch_add(1, Ordering::SeqCst) + 1;
-                if n >= self.want_started {
-                    self.reached.store(true, Ordering::SeqCst);
+                {
+                    self.started.lock().unwrap().push(round.0);
+                    self.started_cv.notify_all();
                 }
                 if round.0 == 1 {
-                    // Hold the first round until enough later rounds started.
-                    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-                    while !self.reached.load(Ordering::SeqCst)
-                        && std::time::Instant::now() < deadline
-                    {
-                        thread::sleep(Duration::from_millis(5));
+                    let mut released = self.released.lock().unwrap();
+                    while !*released {
+                        let (guard, timeout) = self
+                            .released_cv
+                            .wait_timeout(released, Duration::from_secs(30))
+                            .unwrap();
+                        released = guard;
+                        assert!(!timeout.timed_out(), "round 1 was never released");
                     }
-                    self.reached_while_held
-                        .store(self.reached.load(Ordering::SeqCst), Ordering::SeqCst);
                 }
                 Ok(FetchedBlockCert {
                     block: make_valid_empty_block(round.0),
@@ -3897,22 +3978,58 @@ mod tests {
 
         let (ledger, ledger_dyn) = permissive_ledger();
         let fetcher = Arc::new(HoldFirstFetcher {
-            started: AtomicU64::new(0),
-            want_started: 2 * 4,
-            reached: AtomicBool::new(false),
-            reached_while_held: AtomicBool::new(false),
+            started: Mutex::new(Vec::new()),
+            started_cv: Condvar::new(),
+            released: Mutex::new(false),
+            released_cv: Condvar::new(),
+            up_to: 40,
         });
         let fetcher_dyn: Arc<dyn BlockFetcher> = fetcher.clone();
-        let shutdown_rx = never_shutdown();
+        let policy = FetchPolicy {
+            no_block_backoff: Duration::from_millis(1),
+            retry_backoff: Duration::from_millis(1),
+            ..FetchPolicy::default()
+        };
+        let window = CatchupService::fetch_window(4) as usize;
+        assert_eq!(window, 8);
+        let pass = {
+            let ledger_dyn = ledger_dyn.clone();
+            thread::spawn(move || sync_range_with_policy(&ledger_dyn, &fetcher_dyn, 4, policy))
+        };
 
-        CatchupService::sync_range(&ledger_dyn, &fetcher_dyn, &shutdown_rx, 4);
-
-        assert!(
-            fetcher.reached_while_held.load(Ordering::SeqCst),
-            "only {} rounds were started while round 1 was held: the workers idled behind the \
-             slow round instead of fetching on",
-            fetcher.started.load(Ordering::SeqCst)
-        );
+        // Wait (by notification) until the window is claimed.
+        {
+            let mut started = fetcher.started.lock().unwrap();
+            while started.len() < window {
+                let (guard, timeout) = fetcher
+                    .started_cv
+                    .wait_timeout(started, Duration::from_secs(30))
+                    .unwrap();
+                started = guard;
+                assert!(
+                    !timeout.timed_out(),
+                    "only {} rounds started while round 1 was held: the workers idled behind \
+                     the slow round",
+                    started.len()
+                );
+            }
+        }
+        // Not one round beyond the window may be claimed meanwhile (a negative
+        // observation: it can only miss a violation, never invent one).
+        thread::sleep(Duration::from_millis(200));
+        {
+            let mut started = fetcher.started.lock().unwrap().clone();
+            started.sort_unstable();
+            assert_eq!(
+                started,
+                (1..=window as u64).collect::<Vec<_>>(),
+                "exactly rounds 1..={window} are claimed while round 1 is held"
+            );
+        }
+        *fetcher.released.lock().unwrap() = true;
+        fetcher.released_cv.notify_all();
+        let exit = pass.join().unwrap();
+        assert_eq!(exit, SyncExitReason::NoBlock);
         assert_eq!(ledger.next_round(), Round(41));
     }
 
@@ -4392,14 +4509,14 @@ mod tests {
         assert_eq!(exit, SyncExitReason::NoBlock);
         assert_eq!(ledger.next_round(), Round(21));
         let beyond = fetcher.beyond.load(Ordering::SeqCst);
-        // The fetch-ahead window's workers each ask once (a window of
-        // `8 x FETCH_AHEAD_FACTOR` rounds, 8 of them in flight); the lowest asks
-        // `threshold + 1` times.
-        let window = 8 * CatchupService::FETCH_AHEAD_FACTOR;
+        // Past the tip the workers' gate keeps the claims within
+        // `parallel_blocks` of the apply cursor (go's window), not the larger
+        // fetch-ahead window (issue #2204): 8 workers each ask once; the lowest
+        // asks `threshold + 1` times. Without the gate this count was 21.
+        println!("tip probe requests beyond the tip: {beyond}");
         assert!(
-            beyond <= window + 6 + 4,
-            "{beyond} tip probe requests for a window of {window} (multiplied would be {})",
-            window * 7
+            beyond <= 8 + 6 + 4,
+            "{beyond} tip probe requests for 8 workers (multiplied would be 48)"
         );
         assert!(
             started.elapsed() >= Duration::from_millis(400),
