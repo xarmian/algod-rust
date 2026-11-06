@@ -726,6 +726,7 @@ mod tests {
 
     /// A mark taken before a commit is a contract violation: it panics in
     /// debug builds instead of undoing the wrong records.
+    // debug-assertions-ok: the guard is a debug_assert!, so the test only exists where it fires (release is a documented no-op).
     #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "mark used after a commit")]
