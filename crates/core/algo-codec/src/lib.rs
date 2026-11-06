@@ -22,7 +22,7 @@ mod canonical;
 mod digest;
 
 pub use canonical::{
-    block_txids_with_rule, build_txtail_from_block, payset_txids_with_rule, build_txtail_from_block_with_rule,
+    block_txids_with_rule, build_txtail_from_block, payset_txid_hash_runs, payset_txids_with_rule, build_txtail_from_block_with_rule,
     build_txtail_from_block_with_txids,
     canonical_encode_account_application_model, canonical_encode_account_asset_model,
     canonical_encode_account_data, canonical_encode_app_local_state, canonical_encode_app_params,

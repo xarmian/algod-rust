@@ -326,12 +326,21 @@ pub fn evaluate_proposal_check<B: OverlayBase + ?Sized>(base: &B, block: &Block)
         )));
     }
     let mut probe = crate::shadow_execute::proposal_check_probe();
-    let result = evaluate_block_on_overlay(base, block, &mut probe);
+    // One overlay for the evaluation and, rolled back, the pre-pass after it
+    // (issue #2134): `PendingOverlay::new` reads the chain scalars.
+    let mut overlay = PendingOverlay::new(base);
+    let result = evaluate_block_on_overlay_with(base, &mut overlay, block, &mut probe);
     let check = crate::shadow_execute::proposal_check_from(result, &probe);
     if !matches!(check, ProposalCheck::NoVerdict { .. }) {
         return check;
     }
-    crate::shadow_execute::with_prologue_prepass(check, prologue_prepass(base, block))
+    // Whatever the failed evaluation left in the group in progress is undone.
+    overlay.rollback_group();
+    let reuse = probe.out.ledger_dups.take();
+    crate::shadow_execute::with_prologue_prepass(
+        check,
+        prologue_prepass_with(base, &mut overlay, block, reuse),
+    )
 }
 
 /// [`crate::check_dup::prologue_prepass`] on a fresh overlay over `base`:
@@ -340,11 +349,27 @@ pub fn evaluate_proposal_check<B: OverlayBase + ?Sized>(base: &B, block: &Block)
 /// advanced while it ran.
 pub fn prologue_prepass<B: OverlayBase + ?Sized>(base: &B, block: &Block) -> Option<String> {
     let mut overlay = PendingOverlay::new(base);
+    prologue_prepass_with(base, &mut overlay, block, None)
+}
+
+/// [`prologue_prepass`] over an overlay the caller already has (empty or
+/// rolled back) and the ledger half of the evaluation that just ran on it
+/// (`reuse`, [`crate::check_dup::prologue_prepass_reusing`]).
+fn prologue_prepass_with<B: OverlayBase + ?Sized>(
+    base: &B,
+    overlay: &mut PendingOverlay,
+    block: &Block,
+    reuse: Option<crate::check_dup::LedgerDups>,
+) -> Option<String> {
     if base.base_is_stale() || block.round.0 != overlay.base_round().0 + 1 {
         return None;
     }
-    let verdict = crate::check_dup::prologue_prepass(&OverlayStore::new(base, &mut overlay), block)
-        .violation();
+    let verdict = crate::check_dup::prologue_prepass_reusing(
+        &OverlayStore::new(base, overlay),
+        block,
+        reuse,
+    )
+    .violation();
     (!base.base_is_stale()).then_some(verdict).flatten()
 }
 
@@ -357,13 +382,24 @@ fn evaluate_block_on_overlay<B: OverlayBase + ?Sized>(
     probe: &mut ExecProbe,
 ) -> Result<Vec<ApplyData>, ScratchFailure> {
     let mut overlay = PendingOverlay::new(base);
+    evaluate_block_on_overlay_with(base, &mut overlay, block, probe)
+}
+
+/// [`evaluate_block_on_overlay`] on an overlay the caller made (and may reuse
+/// afterwards: a failed evaluation leaves its group open, to be rolled back).
+fn evaluate_block_on_overlay_with<B: OverlayBase + ?Sized>(
+    base: &B,
+    overlay: &mut PendingOverlay,
+    block: &Block,
+    probe: &mut ExecProbe,
+) -> Result<Vec<ApplyData>, ScratchFailure> {
     if base.base_is_stale() || block.round.0 != overlay.base_round().0 + 1 {
         return Err(ScratchFailure::Stale);
     }
     let mut ad: Vec<ApplyData> = Vec::with_capacity(block.payset.len());
     overlay.begin_group();
     let res = {
-        let mut store = OverlayStore::new(base, &mut overlay);
+        let mut store = OverlayStore::new(base, &mut *overlay);
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             apply_block_impl_probe(
                 &mut store,

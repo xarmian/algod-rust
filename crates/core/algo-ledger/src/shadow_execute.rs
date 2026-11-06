@@ -978,9 +978,12 @@ pub fn scratch_proposal_check<L: LedgerStore>(store: &mut L, block: &Block) -> P
     {
         return check;
     }
+    // The execution's txids and confirmed set are reused (issue #2134): the
+    // scratch apply ran on this very store at this very round.
     with_prologue_prepass(
         check,
-        crate::check_dup::prologue_prepass(&*store, block).violation(),
+        crate::check_dup::prologue_prepass_reusing(&*store, block, probe.out.ledger_dups.take())
+            .violation(),
     )
 }
 
@@ -1010,6 +1013,7 @@ pub(crate) fn proposal_check_probe() -> ExecProbe {
         request: ProbeRequest {
             validate_payouts: true,
             check_dup: true,
+            keep_ledger_dups: true,
             ..Default::default()
         },
         ..Default::default()

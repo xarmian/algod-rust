@@ -545,6 +545,41 @@ fn sqlite_txid_lookup_sees_rounds_applied_in_the_open_span() {
     );
 }
 
+/// The in-span txids are decoded once per span, not once per lookup (issue
+/// #2134): repeated lookups of any ids decode the span's row a single time, a
+/// further round applied in the span decodes only its own row, and a rollback
+/// or commit starts the next span from scratch, still answering correctly.
+#[test]
+fn in_span_txtail_rows_are_decoded_once_per_span() {
+    let o = load_oracle();
+    let block1 = block(&o.block1);
+    let committed = algo_codec::block_txids_with_rule(
+        &block1,
+        &algo_types::genesis_restore::GenesisRestoreRule::for_block(&block1),
+    );
+    let mut l = SqliteLedger::open_in_memory().expect("in-memory ledger");
+    seed(&mut l, &o, |l, b| {
+        l.begin_block().expect("begin span");
+        algo_ledger::apply::apply_block(l, b).expect("apply round 1 in the span");
+        // Many lookups of the span's txids, as one block evaluation issues.
+        let before = l.span_rows_decoded();
+        for _ in 0..5 {
+            assert_eq!(l.txtail_confirmed_txids(&committed, 1000).len(), committed.len());
+            assert!(l.txtail_contains_txid(&committed[0], 1000));
+        }
+        assert_eq!(
+            l.span_rows_decoded() - before,
+            1,
+            "round 1's row decoded once for ten lookups"
+        );
+        l.commit_block().expect("commit span");
+    });
+    // After the commit the shared cache answers; no span row is decoded.
+    let after_commit = l.span_rows_decoded();
+    assert_eq!(l.txtail_confirmed_txids(&committed, 1000).len(), committed.len());
+    assert_eq!(l.span_rows_decoded(), after_commit);
+}
+
 /// A span opened on a ledger rewound below rounds the shared txid cache
 /// already loaded does not see those discarded rounds' txids (issue #2127).
 #[test]
@@ -1025,4 +1060,73 @@ fn evaluate_payset_uses_the_supplied_txids_instead_of_rehashing() {
         Err(ScratchFailure::Other(e)) => assert!(e.to_string().contains("checkDup:"), "{e}"),
         other => panic!("a short txid list must be refused: {other:?}"),
     }
+}
+
+/// The proposal check's pre-pass starts from the failed execution's ledger
+/// half (issue #2134): the txids are not hashed again and the txtail's
+/// confirmed set is not loaded again. Verdicts are unchanged.
+#[test]
+fn the_prepass_reuses_the_executions_txids_and_confirmed_set() {
+    use algo_ledger::check_dup::{prologue_prepass_reusing, LedgerDups, Prepass};
+    use algo_ledger::shadow_execute::{scratch_proposal_check, ProposalCheck, ViolationKind};
+
+    let o = load_oracle();
+    let sc = scenario(&o, "committed_txid");
+    let mut candidate = block(&sc.block);
+    let mut overspend = candidate.payset[0].clone();
+    overspend.txn.note = serde_bytes::ByteBuf::from(b"overspend".to_vec());
+    overspend.txn.amount = u64::MAX / 2;
+    candidate.payset.insert(0, overspend);
+
+    let l = sqlite(&o);
+    // A reuse for another round is ignored: the ledger half is rebuilt.
+    let other_round = LedgerDups::new(candidate.round.0 + 1, Vec::new());
+    assert_eq!(
+        prologue_prepass_reusing(&l, &candidate, Some(other_round)),
+        Prepass::Violation(sc.validate_error.clone())
+    );
+
+    // Locked check: the execution hashes the payset and loads the confirmed
+    // set once; the pre-pass that follows its no-verdict reuses both (one
+    // hash run and one load, not two; the hash count is per thread).
+    let mut l = sqlite(&o);
+    let before = l.confirmed_txid_loads();
+    let hashes_before = algo_codec::payset_txid_hash_runs();
+    assert_eq!(
+        scratch_proposal_check(&mut l, &candidate),
+        ProposalCheck::Violation {
+            kind: ViolationKind::Transaction,
+            message: sc.validate_error.clone(),
+        }
+    );
+    assert_eq!(
+        l.confirmed_txid_loads() - before,
+        1,
+        "the pre-pass queried the txtail again"
+    );
+    assert_eq!(
+        algo_codec::payset_txid_hash_runs() - hashes_before,
+        1,
+        "the pre-pass hashed the payset again"
+    );
+
+    // Overlay check, through the validator.
+    let ledger = Arc::new(Mutex::new(l));
+    let before = ledger.lock().unwrap().confirmed_txid_loads();
+    let hashes_before = algo_codec::payset_txid_hash_runs();
+    let validator = PayoutCheckingValidator::new(StubBlockValidator::accepting(), ledger.clone());
+    match validator.validate(&candidate).map(|_| ()) {
+        Err(AgreementError::ValidationFailed(message)) => assert_eq!(message, sc.validate_error),
+        other => panic!("overlay check: expected go's checkDup verdict, got {other:?}"),
+    }
+    assert_eq!(
+        ledger.lock().unwrap().confirmed_txid_loads() - before,
+        1,
+        "the overlay pre-pass queried the txtail again"
+    );
+    assert_eq!(
+        algo_codec::payset_txid_hash_runs() - hashes_before,
+        1,
+        "the overlay pre-pass hashed the payset again"
+    );
 }

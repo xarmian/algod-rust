@@ -245,7 +245,7 @@ impl BlockDups {
 /// `round`, loaded lazily and at most once (issue #2125): which of its
 /// `txids` the txtail already holds, and, for a past `round`, the leases in
 /// force in go's window.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LedgerDups {
     round: u64,
     txids: Vec<Digest>,
@@ -269,6 +269,12 @@ impl LedgerDups {
     #[must_use]
     pub fn txids(&self) -> &[Digest] {
         &self.txids
+    }
+
+    /// The round it was built for.
+    #[must_use]
+    pub fn round(&self) -> u64 {
+        self.round
     }
 
     fn txid_in_ledger<L: LedgerStore + ?Sized>(
@@ -455,6 +461,26 @@ impl BlockCheckDup {
         }
     }
 
+    /// A checker for a block whose ledger half is already known (hashed txids,
+    /// and the confirmed set when the execution that just ran loaded it): the
+    /// block half starts empty (issue #2134).
+    #[must_use]
+    pub fn from_ledger_dups(ledger: LedgerDups) -> Self {
+        Self {
+            block: BlockHalf::Owned(BlockDups::new()),
+            ledger,
+            violation: None,
+        }
+    }
+
+    /// Hand the ledger half (the payset's txids and whatever confirmed set it
+    /// loaded) to a caller that continues with the same payset, leaving an
+    /// empty one behind (issue #2134).
+    pub fn take_ledger_dups(&mut self) -> LedgerDups {
+        let round = self.ledger.round;
+        std::mem::replace(&mut self.ledger, LedgerDups::new(round, Vec::new()))
+    }
+
     /// [`Self::new`] seeded with the txids and leases the earlier groups of
     /// the same pending block hold (`block`), which this evaluation extends
     /// as it admits transactions (go's one `roundCowState` per pending-block
@@ -636,6 +662,21 @@ impl Prepass {
 /// block's protocol is unknown or its payset is not in valid stripped form
 /// (an evaluation error, not a `checkDup` verdict).
 pub fn prologue_prepass<L: LedgerStore + ?Sized>(store: &L, block: &algo_types::Block) -> Prepass {
+    prologue_prepass_reusing(store, block, None)
+}
+
+/// [`prologue_prepass`] that starts from the ledger half of the execution
+/// that just failed to reach a verdict (`reuse`, issue #2134): its txids (so
+/// the payset is not hashed again) and the confirmed-txid set it loaded (so
+/// the txtail is not queried again). Only valid when the execution ran against
+/// the same base state: the same round (checked here) on a base that did not
+/// move (the callers' stale checks). A `reuse` for another round or payset
+/// length is ignored and the ledger half is rebuilt.
+pub fn prologue_prepass_reusing<L: LedgerStore + ?Sized>(
+    store: &L,
+    block: &algo_types::Block,
+    reuse: Option<LedgerDups>,
+) -> Prepass {
     let Some(consensus) =
         algo_types::consensus::consensus_params_for_version(&block.current_protocol)
     else {
@@ -648,10 +689,24 @@ pub fn prologue_prepass<L: LedgerStore + ?Sized>(store: &L, block: &algo_types::
             e.0, e.1
         ));
     }
-    let mut check = BlockCheckDup::new(
-        block.round.0,
-        algo_codec::block_txids_with_rule(block, &rule),
-    );
+    let mut check = match reuse {
+        Some(ledger) if ledger.round() == block.round.0 && ledger.txids().len() == block.payset.len() => {
+            // What the execution hashed is what a rehash gives (hashed here
+            // one by one, so the whole-payset hash counter stays honest).
+            debug_assert!(
+                ledger.txids().iter().copied().eq(block.payset.iter().map(|stx| {
+                    let (gen, gh) = rule.restored_genesis(stx);
+                    algo_codec::compute_txn_id_with_genesis(&stx.txn, gen, gh)
+                })),
+                "the reused txids differ from a rehash of the payset"
+            );
+            BlockCheckDup::from_ledger_dups(ledger)
+        }
+        _ => BlockCheckDup::new(
+            block.round.0,
+            algo_codec::block_txids_with_rule(block, &rule),
+        ),
+    };
     for (index, stx) in block.payset.iter().enumerate() {
         if let Err(e) = check.check(store, &consensus, &rule, stx, index) {
             return match check.violation() {
