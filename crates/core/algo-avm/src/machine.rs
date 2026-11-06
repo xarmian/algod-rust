@@ -198,8 +198,16 @@ pub struct AvmMachine {
     pub call_stack: Vec<CallFrame>,
     /// Scratch space (256 slots).
     pub scratch: Vec<AvmValue>,
-    /// Program counter (instruction index, not byte offset).
+    /// Program counter (instruction index, not byte offset). go's `pc` in an
+    /// `EvalError` is a byte offset: see [`AvmMachine::byte_pc`].
     pub pc: usize,
+    /// `(opcode byte, sub-opcode)` of the instruction being executed, `None`
+    /// outside an instruction (finish and final-stack checks, frame handling):
+    /// the opcode's mnemonic for go's per-opcode error texts (`stack underflow
+    /// in <op>`, `<op> arg <i> wanted ... but got ...`, `dynamic cost budget
+    /// exceeded, executing <op>`) is resolved from it only when an error is
+    /// formatted, so execution pays two byte stores per instruction.
+    pub(crate) current_instr: Option<(u8, Option<u8>)>,
     /// Cost budget remaining. Shared/pooled across app calls — inner app calls
     /// add to and consume from this, so its delta is not this program's own
     /// cost (use [`AvmMachine::cost`] for that).
@@ -271,6 +279,7 @@ impl AvmMachine {
             call_stack: Vec::new(),
             scratch,
             pc: 0,
+            current_instr: None,
             budget,
             cost: 0,
             mode,
@@ -305,11 +314,100 @@ impl AvmMachine {
         opcode::resolve_spec(opcode_byte, sub_opcode)
     }
 
+    /// Mark `instr` as the instruction being executed (see
+    /// [`AvmMachine::current_instr`]).
+    #[inline]
+    fn begin_instruction(&mut self, instr: &Instruction) {
+        self.current_instr = Some((instr.opcode, instr.sub_opcode));
+    }
+
+    /// The spec of the instruction being executed, if any.
+    fn current_spec(&self) -> Option<&'static opcode::OpSpec> {
+        let (byte, sub) = self.current_instr?;
+        self.resolve_cost_spec(byte, sub)
+    }
+
+    /// The current opcode's mnemonic (`""` outside an instruction).
+    fn current_op_name(&self) -> &'static str {
+        self.current_spec().map_or("", |spec| spec.name)
+    }
+
+    /// Whether go's argument gate (`EvalContext.step`) passes: enough values
+    /// on the stack and each of the opcode's `proto` argument types matched,
+    /// for the opcodes the [`crate::arg_gate`] table lists. The hot path: no
+    /// error is built here (see [`AvmMachine::arg_gate_error`]).
+    #[inline(always)]
+    fn arg_gate_passes(&self, instr: &Instruction) -> bool {
+        if instr.sub_opcode.is_some() {
+            return true;
+        }
+        let Some(types) = crate::arg_gate::arg_types(instr.opcode) else {
+            return true;
+        };
+        let len = self.stack.len();
+        let n = types.len();
+        if len < n {
+            return false;
+        }
+        // At most four arguments: a plain indexed loop on the top of the stack.
+        let top = &self.stack[len - n..];
+        let mut i = 0;
+        while i < n {
+            if !crate::arg_gate::accepts(types[i], &top[i]) {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    /// go's argument gate failure for `instr` (call only when
+    /// [`AvmMachine::arg_gate_passes`] is false): the stack height first, then
+    /// the first wrong argument from argument 0 upward, BEFORE the cost is
+    /// charged.
+    #[cold]
+    #[inline(never)]
+    fn arg_gate_error(&self, instr: &Instruction) -> AlgoError {
+        let types = crate::arg_gate::arg_types(instr.opcode).unwrap_or(&[]);
+        let name = self.current_op_name();
+        if self.stack.len() < types.len() {
+            return AlgoError::Avm {
+                message: format!("stack underflow in {name}"),
+            };
+        }
+        let first = self.stack.len() - types.len();
+        for (i, want) in types.iter().enumerate() {
+            let got = match (&self.stack[first + i], want) {
+                (_, crate::arg_gate::ArgType::Any) => continue,
+                (AvmValue::Uint64(_), crate::arg_gate::ArgType::Uint) => continue,
+                (AvmValue::Bytes(_), crate::arg_gate::ArgType::Bytes) => continue,
+                (AvmValue::Uint64(_), _) => "uint64",
+                (AvmValue::Bytes(_), _) => "[]byte",
+            };
+            return AlgoError::Avm {
+                message: format!("{name} arg {i} wanted {} but got {got}", want.name()),
+            };
+        }
+        // Unreachable when `arg_gate_passes` is false; a plain error rather
+        // than a panic on a path reachable from untrusted programs.
+        AlgoError::Avm {
+            message: format!("argument gate failed in {name}"),
+        }
+    }
+
     /// Execute one instruction and advance the PC.
     ///
     /// `ctx` provides external state access (transaction fields, app state, etc.).
     /// Pure-opcode tests can pass `&mut NullContext`.
     pub fn step(&mut self, ctx: &mut dyn AvmContext) -> Result<(), AlgoError> {
+        let result = self.step_inner(ctx);
+        // No instruction is current once it ran (or failed): a pop outside an
+        // instruction must not print a stale mnemonic.
+        self.current_instr = None;
+        result
+    }
+
+    fn step_inner(&mut self, ctx: &mut dyn AvmContext) -> Result<(), AlgoError> {
         if self.finished {
             return Err(AlgoError::Avm {
                 message: "step called after execution finished".to_string(),
@@ -326,6 +424,12 @@ impl AvmMachine {
 
         // Record opcode hit for coverage tracking.
         self.opcode_hits[instr.opcode as usize] = true;
+        self.begin_instruction(&instr);
+
+        // go's argument gate runs before the cost is charged.
+        if !self.arg_gate_passes(&instr) {
+            return Err(self.arg_gate_error(&instr));
+        }
 
         // Charge static cost. Must resolve through `resolve_spec` (not the
         // bare prefix-byte `lookup`) so a multi-byte "prefix opcode" family
@@ -370,6 +474,16 @@ impl AvmMachine {
         ctx: &mut dyn AvmContext,
         tracer: &mut dyn EvalTracer,
     ) -> Result<(), AlgoError> {
+        let result = self.step_with_tracer_inner(ctx, tracer);
+        self.current_instr = None;
+        result
+    }
+
+    fn step_with_tracer_inner(
+        &mut self,
+        ctx: &mut dyn AvmContext,
+        tracer: &mut dyn EvalTracer,
+    ) -> Result<(), AlgoError> {
         if self.finished {
             return Err(AlgoError::Avm {
                 message: "step called after execution finished".to_string(),
@@ -386,12 +500,22 @@ impl AvmMachine {
 
         // Record opcode hit for coverage tracking.
         self.opcode_hits[instr.opcode as usize] = true;
+        self.begin_instruction(&instr);
 
         // Tracer: before opcode (called before cost charge so budget-
         // exhaustion opcodes are visible in the trace, matching go-algorand).
         tracer.before_opcode(self.pc, instr.opcode);
 
-        // Capture the scratch slot a `store`/`stores` instruction is about to
+        // go's argument gate runs before the cost is charged.
+        if !self.arg_gate_passes(&instr) {
+            let e = self.arg_gate_error(&instr);
+            let msg = e.to_string();
+            tracer.after_opcode(old_pc, instr.opcode, &self.stack, &self.scratch, Some(&msg));
+            return Err(e);
+        }
+
+        // After the argument gate (no stack-dependent precompute before the
+        // underflow check): capture the scratch slot a `store`/`stores` instruction is about to
         // write, *before* dispatch mutates the stack/immediates state (issue
         // #1225). Reported to the tracer only if dispatch actually succeeds
         // (see below) -- go-algorand's tracer only records the write once the
@@ -469,6 +593,32 @@ impl AvmMachine {
         Ok(self.pass)
     }
 
+    /// go's `cx.pc`: the BYTE offset of the current instruction in the whole
+    /// program (the version byte counts), which is what an `EvalError`'s
+    /// `pc=` reports. Past the last instruction (the implicit end of the
+    /// program) it is the program length, like go's.
+    pub fn byte_pc(&self) -> usize {
+        // The version header is a uvarint: one byte below 128, two above.
+        let header = if self.version < 128 { 1 } else { 2 };
+        header
+            + match self.program.instructions.get(self.pc) {
+                Some(instr) => instr.offset,
+                None => self.end_of_program_offset,
+            }
+    }
+
+    /// The type error for the value just popped by an opcode the
+    /// [`crate::arg_gate`] table does not cover (the table's own opcodes are
+    /// gated before they run, so go's exact `<op> arg <i> wanted <T> but got
+    /// <U>` is produced there). Without the opcode's argument types the lowest
+    /// wrong argument cannot be computed, and a lazily popped (top-first)
+    /// index could name the wrong argument, so this text carries no index.
+    fn arg_type_error(&self, wanted: &str, got: &str) -> AlgoError {
+        AlgoError::Avm {
+            message: format!("expected {wanted} on stack, got {got}"),
+        }
+    }
+
     /// Push a value onto the stack.
     pub fn push(&mut self, val: AvmValue) -> Result<(), AlgoError> {
         if self.stack.len() >= MAX_STACK_DEPTH {
@@ -483,7 +633,11 @@ impl AvmMachine {
     /// Pop any value from the stack.
     pub fn pop(&mut self) -> Result<AvmValue, AlgoError> {
         self.stack.pop().ok_or_else(|| AlgoError::Avm {
-            message: "stack underflow".to_string(),
+            // go: `stack underflow in <op>` (`step`'s argument gate).
+            message: match self.current_op_name() {
+                "" => "stack underflow".to_string(),
+                name => format!("stack underflow in {name}"),
+            },
         })
     }
 
@@ -509,9 +663,7 @@ impl AvmMachine {
             // programs are raw bytecode, so a crafted program can push a
             // non-nil, zero-length bytes value where the assembler's own
             // static type tracker would never allow it.
-            AvmValue::Bytes(_) => Err(AlgoError::Avm {
-                message: "expected uint64 on stack, got bytes".to_string(),
-            }),
+            AvmValue::Bytes(_) => Err(self.arg_type_error("uint64", "[]byte")),
         }
     }
 
@@ -519,9 +671,7 @@ impl AvmMachine {
     pub fn pop_bytes(&mut self) -> Result<Vec<u8>, AlgoError> {
         match self.pop()? {
             AvmValue::Bytes(b) => Ok(b),
-            AvmValue::Uint64(_) => Err(AlgoError::Avm {
-                message: "expected bytes on stack, got uint64".to_string(),
-            }),
+            AvmValue::Uint64(_) => Err(self.arg_type_error("[]byte", "uint64")),
         }
     }
 
@@ -541,12 +691,22 @@ impl AvmMachine {
     /// calling `ops::dispatch`), so real execution outcomes are unaffected.
     pub fn charge_cost(&mut self, cost: u64) -> Result<(), AlgoError> {
         if cost as i64 > self.budget {
-            return Err(AlgoError::Avm {
-                message: format!(
-                    "cost budget exceeded: budget is {} after charging {cost}",
-                    self.budget - cost as i64
+            // go's `step`: `dynamic cost budget exceeded, executing <op>: local
+            // program cost was <cost so far>`. The budget compared is the
+            // pooled one and the figure printed is this program's own `cost`,
+            // both as go's (`remainingBudget()` vs `cx.cost`). Outside an
+            // instruction (direct calls) there is no opcode to name.
+            let message = match self.current_op_name() {
+                "" => format!(
+                    "dynamic cost budget exceeded: local program cost was {}",
+                    self.cost
                 ),
-            });
+                name => format!(
+                    "dynamic cost budget exceeded, executing {name}: local program cost was {}",
+                    self.cost
+                ),
+            };
+            return Err(AlgoError::Avm { message });
         }
         // Track this program's own cumulative cost independently of the shared
         // (pooled) budget, mirroring go-algorand's `cx.cost`.
@@ -641,7 +801,7 @@ impl AvmMachine {
     /// Pop a frame from the call stack.
     pub fn pop_call_frame(&mut self) -> Result<CallFrame, AlgoError> {
         self.call_stack.pop().ok_or_else(|| AlgoError::Avm {
-            message: "call stack underflow (retsub without callsub)".to_string(),
+            message: "retsub with empty callstack".to_string(),
         })
     }
 
@@ -1263,5 +1423,27 @@ mod tests {
             result.err()
         );
         assert!(result.unwrap(), "program should approve");
+    }
+
+    /// A typed pop in an opcode outside the arg-gate table carries no
+    /// positional `arg N`: popping top-first it could name the wrong argument
+    /// (issue #2200). `setbyte` with two wrong arguments (go: arg 0).
+    #[test]
+    fn an_ungated_opcode_has_no_positional_arg_index() {
+        use crate::arg_gate::arg_types;
+        assert!(arg_types(0x56).is_none(), "setbyte must stay ungated for this test");
+        let program = Program {
+            version: 8,
+            instructions: vec![],
+        };
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
+        // setbyte(A, B, C): A bytes, B uint, C uint. Both A and C wrong.
+        m.push(AvmValue::Uint64(1)).unwrap();
+        m.push(AvmValue::Uint64(1)).unwrap();
+        m.push(AvmValue::Bytes(vec![1])).unwrap();
+        m.current_instr = Some((0x56, None));
+        let err = m.pop_uint().unwrap_err().to_string();
+        assert_eq!(err, "AVM: expected uint64 on stack, got []byte");
+        assert!(!err.contains("arg "));
     }
 }

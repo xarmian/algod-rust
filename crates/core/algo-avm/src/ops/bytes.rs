@@ -31,9 +31,6 @@ use crate::machine::AvmMachine;
 /// Maximum byte string length in the AVM.
 const MAX_BYTES_LEN: usize = 4096;
 
-/// Maximum result length for big-int multiplication.
-const MAX_BIGINT_MUL_LEN: usize = 128;
-
 /// Maximum result length for other big-int ops.
 const MAX_BIGINT_LEN: usize = 64;
 
@@ -61,16 +58,26 @@ fn biguint_to_bytes(v: &BigUint) -> Vec<u8> {
     }
 }
 
-/// Check that a byte result does not exceed `max_len`.
-fn check_len(bytes: &[u8], max_len: usize, op: &str) -> Result<(), AlgoError> {
-    if bytes.len() > max_len {
-        Err(avm_err(format!(
-            "{op}: result length {} exceeds maximum {max_len}",
-            bytes.len()
-        )))
-    } else {
-        Ok(())
+/// go's `maxByteMathSize` input check (`opBytesBinOp`, `opBytesSqrt`, ...).
+fn check_bigint_input(bytes: &[u8]) -> Result<BigUint, AlgoError> {
+    if bytes.len() > MAX_BIGINT_LEN {
+        return Err(avm_err("math attempted on large byte-array"));
     }
+    Ok(BigUint::from_bytes_be(bytes))
+}
+
+/// Pop one byte-math operand (at most 64 bytes, else go's error).
+fn pop_bigint(machine: &mut AvmMachine) -> Result<BigUint, AlgoError> {
+    check_bigint_input(&machine.pop_bytes()?)
+}
+
+/// Pop the two operands `(a, b)` of a byte-math opcode; go checks both
+/// lengths before anything else about the values.
+fn pop_bigint_pair(machine: &mut AvmMachine) -> Result<(BigUint, BigUint), AlgoError> {
+    let b = machine.pop_bytes()?;
+    let a = machine.pop_bytes()?;
+    let (a, b) = (check_bigint_input(&a), check_bigint_input(&b));
+    Ok((a?, b?))
 }
 
 /// Pad the shorter of two byte slices with leading zeros so both are the same length.
@@ -104,10 +111,7 @@ pub fn op_itob(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(
 pub fn op_btoi(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
     let a = machine.pop_bytes()?;
     if a.len() > 8 {
-        return Err(avm_err(format!(
-            "btoi: byte string length {} exceeds 8",
-            a.len()
-        )));
+        return Err(avm_err(format!("btoi arg too long, got {} bytes", a.len())));
     }
     let mut val: u64 = 0;
     for &byte in &a {
@@ -138,11 +142,12 @@ pub fn op_substring(machine: &mut AvmMachine, instruction: &Instruction) -> Resu
         _ => return Err(avm_err("substring: expected Uint8Pair immediate")),
     };
     let a = machine.pop_bytes()?;
-    if s > e {
-        return Err(avm_err(format!("substring: start {s} > end {e}")));
+    // go `substring`: end before start, then the range check.
+    if e < s {
+        return Err(avm_err("substring end before start"));
     }
-    if e > a.len() {
-        return Err(avm_err(format!("substring: end {e} > length {}", a.len())));
+    if s > a.len() || e > a.len() {
+        return Err(avm_err("substring range beyond length of string"));
     }
     machine.push(crate::machine::AvmValue::Bytes(a[s..e].to_vec()))
 }
@@ -152,14 +157,19 @@ pub fn op_substring3(
     machine: &mut AvmMachine,
     _instruction: &Instruction,
 ) -> Result<(), AlgoError> {
-    let e = machine.pop_uint()? as usize;
-    let s = machine.pop_uint()? as usize;
+    let e = machine.pop_uint()?;
+    let s = machine.pop_uint()?;
     let a = machine.pop_bytes()?;
-    if s > e {
-        return Err(avm_err(format!("substring3: start {s} > end {e}")));
+    // go `opSubstring3`: a start or end past MaxInt32 is a range error first.
+    if s > i32::MAX as u64 || e > i32::MAX as u64 {
+        return Err(avm_err("substring range beyond length of string"));
     }
-    if e > a.len() {
-        return Err(avm_err(format!("substring3: end {e} > length {}", a.len())));
+    let (s, e) = (s as usize, e as usize);
+    if e < s {
+        return Err(avm_err("substring end before start"));
+    }
+    if s > a.len() || e > a.len() {
+        return Err(avm_err("substring range beyond length of string"));
     }
     machine.push(crate::machine::AvmValue::Bytes(a[s..e].to_vec()))
 }
@@ -316,9 +326,7 @@ pub fn op_replace3(machine: &mut AvmMachine, _instruction: &Instruction) -> Resu
 pub fn op_bzero(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
     let n = machine.pop_uint()? as usize;
     if n > MAX_BYTES_LEN {
-        return Err(avm_err(format!(
-            "bzero: length {n} exceeds maximum {MAX_BYTES_LEN}"
-        )));
+        return Err(avm_err("bzero attempted to create a too large string"));
     }
     machine.push(crate::machine::AvmValue::Bytes(vec![0u8; n]))
 }
@@ -327,21 +335,19 @@ pub fn op_bzero(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<
 // Big-integer byte-math operations
 // ---------------------------------------------------------------------------
 
-/// `b+` (0xa0): pop b, pop a, push a+b as bytes. Max 64 bytes.
+/// `b+` (0xa0): pop b, pop a, push a+b as bytes. Inputs are at most 64 bytes
+/// (the result may be longer, as go's).
 pub fn op_badd(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
-    let b = BigUint::from_bytes_be(&machine.pop_bytes()?);
-    let a = BigUint::from_bytes_be(&machine.pop_bytes()?);
+    let (a, b) = pop_bigint_pair(machine)?;
     let result = biguint_to_bytes(&(a + b));
-    check_len(&result, MAX_BIGINT_LEN, "b+")?;
     machine.push(crate::machine::AvmValue::Bytes(result))
 }
 
 /// `b-` (0xa1): pop b, pop a, push a-b as bytes. Error if a < b.
 pub fn op_bsub(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
-    let b = BigUint::from_bytes_be(&machine.pop_bytes()?);
-    let a = BigUint::from_bytes_be(&machine.pop_bytes()?);
+    let (a, b) = pop_bigint_pair(machine)?;
     if a < b {
-        return Err(avm_err("b-: underflow (a < b)"));
+        return Err(avm_err("byte math would have negative result"));
     }
     let result = biguint_to_bytes(&(a - b));
     machine.push(crate::machine::AvmValue::Bytes(result))
@@ -349,30 +355,26 @@ pub fn op_bsub(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(
 
 /// `b/` (0xa2): pop b, pop a, push a/b as bytes. Division by zero → error.
 pub fn op_bdiv(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
-    let b = BigUint::from_bytes_be(&machine.pop_bytes()?);
-    let a = BigUint::from_bytes_be(&machine.pop_bytes()?);
+    let (a, b) = pop_bigint_pair(machine)?;
     if b == BigUint::ZERO {
-        return Err(avm_err("b/: division by zero"));
+        return Err(avm_err("division by zero"));
     }
     let result = biguint_to_bytes(&(a / b));
     machine.push(crate::machine::AvmValue::Bytes(result))
 }
 
-/// `b*` (0xa3): pop b, pop a, push a*b as bytes. Max 128 bytes.
+/// `b*` (0xa3): pop b, pop a, push a*b as bytes. Inputs are at most 64 bytes.
 pub fn op_bmul(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
-    let b = BigUint::from_bytes_be(&machine.pop_bytes()?);
-    let a = BigUint::from_bytes_be(&machine.pop_bytes()?);
+    let (a, b) = pop_bigint_pair(machine)?;
     let result = biguint_to_bytes(&(a * b));
-    check_len(&result, MAX_BIGINT_MUL_LEN, "b*")?;
     machine.push(crate::machine::AvmValue::Bytes(result))
 }
 
 /// `b%` (0xaa): pop b, pop a, push a%b as bytes. Division by zero → error.
 pub fn op_bmod(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
-    let b = BigUint::from_bytes_be(&machine.pop_bytes()?);
-    let a = BigUint::from_bytes_be(&machine.pop_bytes()?);
+    let (a, b) = pop_bigint_pair(machine)?;
     if b == BigUint::ZERO {
-        return Err(avm_err("b%: division by zero"));
+        return Err(avm_err("modulo by zero"));
     }
     let result = biguint_to_bytes(&(a % b));
     machine.push(crate::machine::AvmValue::Bytes(result))
@@ -380,43 +382,37 @@ pub fn op_bmod(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(
 
 /// `b<` (0xa4): pop b, pop a, push (a < b) as uint64.
 pub fn op_blt(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
-    let b = BigUint::from_bytes_be(&machine.pop_bytes()?);
-    let a = BigUint::from_bytes_be(&machine.pop_bytes()?);
+    let (a, b) = pop_bigint_pair(machine)?;
     machine.push(crate::machine::AvmValue::Uint64(if a < b { 1 } else { 0 }))
 }
 
 /// `b>` (0xa5): pop b, pop a, push (a > b) as uint64.
 pub fn op_bgt(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
-    let b = BigUint::from_bytes_be(&machine.pop_bytes()?);
-    let a = BigUint::from_bytes_be(&machine.pop_bytes()?);
+    let (a, b) = pop_bigint_pair(machine)?;
     machine.push(crate::machine::AvmValue::Uint64(if a > b { 1 } else { 0 }))
 }
 
 /// `b<=` (0xa6): pop b, pop a, push (a <= b) as uint64.
 pub fn op_ble(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
-    let b = BigUint::from_bytes_be(&machine.pop_bytes()?);
-    let a = BigUint::from_bytes_be(&machine.pop_bytes()?);
+    let (a, b) = pop_bigint_pair(machine)?;
     machine.push(crate::machine::AvmValue::Uint64(if a <= b { 1 } else { 0 }))
 }
 
 /// `b>=` (0xa7): pop b, pop a, push (a >= b) as uint64.
 pub fn op_bge(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
-    let b = BigUint::from_bytes_be(&machine.pop_bytes()?);
-    let a = BigUint::from_bytes_be(&machine.pop_bytes()?);
+    let (a, b) = pop_bigint_pair(machine)?;
     machine.push(crate::machine::AvmValue::Uint64(if a >= b { 1 } else { 0 }))
 }
 
 /// `b==` (0xa8): pop b, pop a, push (a == b) as uint64.
 pub fn op_beq(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
-    let b = BigUint::from_bytes_be(&machine.pop_bytes()?);
-    let a = BigUint::from_bytes_be(&machine.pop_bytes()?);
+    let (a, b) = pop_bigint_pair(machine)?;
     machine.push(crate::machine::AvmValue::Uint64(if a == b { 1 } else { 0 }))
 }
 
 /// `b!=` (0xa9): pop b, pop a, push (a != b) as uint64.
 pub fn op_bne(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
-    let b = BigUint::from_bytes_be(&machine.pop_bytes()?);
-    let a = BigUint::from_bytes_be(&machine.pop_bytes()?);
+    let (a, b) = pop_bigint_pair(machine)?;
     machine.push(crate::machine::AvmValue::Uint64(if a != b { 1 } else { 0 }))
 }
 
@@ -468,7 +464,7 @@ pub fn op_bbitwise_not(
 
 /// `bsqrt` (0x96): pop a (bytes), push integer square root as bytes.
 pub fn op_bsqrt(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
-    let a = BigUint::from_bytes_be(&machine.pop_bytes()?);
+    let a = pop_bigint(machine)?;
     let result = biguint_to_bytes(&a.sqrt());
     machine.push(crate::machine::AvmValue::Bytes(result))
 }
@@ -777,6 +773,26 @@ mod tests {
         let instr = dummy_instr(0xa0, Immediates::None);
         op_badd(&mut m, &instr).unwrap();
         assert_eq!(m.pop_bytes().unwrap(), vec![0x01, 0x00]);
+    }
+
+    // go `opBytesBinOp`: the INPUTS are limited to 64 bytes, not the result.
+    #[test]
+    fn test_badd_limits_inputs_not_the_result() {
+        let instr = dummy_instr(0xa0, Immediates::None);
+        let mut m = machine_with_stack(vec![bytes_val(&[0xFF; 64]), bytes_val(&[0x01])]);
+        op_badd(&mut m, &instr).unwrap();
+        assert_eq!(m.pop_bytes().unwrap().len(), 65);
+        let mut m = machine_with_stack(vec![bytes_val(&[0; 65]), bytes_val(&[0x01])]);
+        let err = op_badd(&mut m, &instr).unwrap_err().to_string();
+        assert_eq!(err, "AVM: math attempted on large byte-array");
+    }
+
+    #[test]
+    fn test_bsub_negative_text() {
+        let mut m = machine_with_stack(vec![bytes_val(&[0x01]), bytes_val(&[0x02])]);
+        let instr = dummy_instr(0xa1, Immediates::None);
+        let err = op_bsub(&mut m, &instr).unwrap_err().to_string();
+        assert_eq!(err, "AVM: byte math would have negative result");
     }
 
     // ---- b- ----

@@ -1558,6 +1558,294 @@
       "verify_error": "transactionGroup: incomplete group: VOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOVQ != IBYSFRHI6OBW6DFGCQSKKXL3D2HPUKILKUP3TQ3OVTRXH6536LOQ ({{} [EOF2WP5IQTSYE45MCCID5TABEO2MIRSVTK27JRROMS3TE7WSLY2A EVCYK3OVMAGKPFNLBWOO76OWJ3L4YBRVZMMLYH2RNZF5UBLISKWA]})"
     },
     {
+      "name": "verify_logicsig_err_div_zero",
+      "group": [
+        "gqRsc2lngaFsxAYIgQGBAAqjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEH3dmLXZlcmlmeV9sb2dpY3NpZ19lcnJfZGl2X3plcm+jcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIDVey1+l5DrqMiB1DkwDUSsLJBfY/bTrtWHeXxPqsxB5pHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "transaction BQ5MHQIDEHHZV2PJ43CTN4MD5U25II3FUDJRSLB52PUALICHS7TA: rejected by logic err=/ 0. Details: pc=5",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_mod_zero",
+      "group": [
+        "gqRsc2lngaFsxAYIgQGBABijdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEH3dmLXZlcmlmeV9sb2dpY3NpZ19lcnJfbW9kX3plcm+jcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIA25hO/ORBWp+7HPmPOiDaqlCLUUop9+MwSXL7P54aK/pHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "transaction JZTE3N3VORSCVTD7UNJTLZ6WZC6Y34DTQPE4RJ5XRWHXV5Q76NDQ: rejected by logic err=% 0. Details: pc=5",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_add_overflow",
+      "group": [
+        "gqRsc2lngaFsxA8Igf///////////wGBAQijdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEI3dmLXZlcmlmeV9sb2dpY3NpZ19lcnJfYWRkX292ZXJmbG93o3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCBGNCeMGEe9Fj7RmHEeDB53oEnTM0ilr3/7u+3OgGjdnaR0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "transaction C2HBJMC3FQ522C7SMAGP4O4TLIWEIIYFHHJSKMAWOK3XOA4BIDNA: rejected by logic err=+ overflowed. Details: pc=14",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_sub_negative",
+      "group": [
+        "gqRsc2lngaFsxAYIgQCBAQmjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEI3dmLXZlcmlmeV9sb2dpY3NpZ19lcnJfc3ViX25lZ2F0aXZlo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCANu3cbH8Y7XCG1V7/ZRT/WlHh8tbfxnR5Livm2l/EHvqR0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "transaction MJAXZAJLK2NAKQZ5WLDW4UV7QD66PTPZYSWJQQWQGYHMMCGM6SJA: rejected by logic err=- would result negative. Details: pc=5",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_mul_overflow",
+      "group": [
+        "gqRsc2lngaFsxA8Igf///////////wGBAgujdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEI3dmLXZlcmlmeV9sb2dpY3NpZ19lcnJfbXVsX292ZXJmbG93o3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCCKpDdQeZF1YmX04piRbPFCKp1UM8SYrjqHf5FE0WwUk6R0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "transaction J77MGO6ALFL5U64YTQIWOYLWMDYZJRMEBO7V6XU7UZV5O45TND6Q: rejected by logic err=* overflowed. Details: pc=14",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_err_opcode",
+      "group": [
+        "gqRsc2lngaFsxAIIAKN0eG6Ko2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQhd2YtdmVyaWZ5X2xvZ2ljc2lnX2Vycl9lcnJfb3Bjb2Rlo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCCMil25WlJZCkYOZXUTQNSYlR0GQuTKDEYvKuIq/Z6tS6R0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "transaction D4VI746YHTY7WD4KA6CB2NTXYOZUWR7NDWR6XGUZTR2KS6OI3JQQ: rejected by logic err=err opcode executed. Details: pc=1",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_assert_failed",
+      "group": [
+        "gqRsc2lngaFsxAYIgQBEgQGjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEJHdmLXZlcmlmeV9sb2dpY3NpZ19lcnJfYXNzZXJ0X2ZhaWxlZKNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgNGGcOn89x53BkpYvPNBgx82rTw81MRIIFWRAa2TwuUekdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "transaction F57WLPO5EE2XRCDWZVB7NY5SPCVASOHYJJZ7XILKG7ANF4B7HDZQ: rejected by logic err=assert failed pc=3. Details: pc=3",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_stack_underflow",
+      "group": [
+        "gqRsc2lngaFsxAcIQgAASIEBo3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxCZ3Zi12ZXJpZnlfbG9naWNzaWdfZXJyX3N0YWNrX3VuZGVyZmxvd6NyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgJfkF835NhfpsQjqFr3QqdR3MMLFrZj2zbzp8t4tcLZCkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "transaction SCDKXFFVCVCZP32YOEAWHBAX6WD6ZUBPALSXFXTGZJWMYXPSJXEA: rejected by logic err=stack underflow in pop. Details: pc=4",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_wrong_type",
+      "group": [
+        "gqRsc2lngaFsxAoIgAEBgQFCAAAIo3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxCF3Zi12ZXJpZnlfbG9naWNzaWdfZXJyX3dyb25nX3R5cGWjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIKWRjaJ7s36gVzEdhJYdX0gUN6wTzK24CoDYPD2aQc6ypHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "transaction BHBUQKSHL7TBZNFVGJXYWHPRKMDITN3DDO7DTKVKRLHI65Y3WQQQ: rejected by logic err=+ arg 0 wanted uint64 but got []byte. Details: pc=9",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_btoi_too_long",
+      "group": [
+        "gqRsc2lngaFsxA0IgAkBAgMEBQYHCAkXo3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxCR3Zi12ZXJpZnlfbG9naWNzaWdfZXJyX2J0b2lfdG9vX2xvbmejcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEICSfvHAdmb2IbRIzgKH1x1CJ+Ec0zYTpxL4ZBXVsnK67pHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "transaction 2VLYAT2CV7IEZQC6VEU4TIZBIM6AUQAVKEN526AUSTQ4CGVWJTUQ: rejected by logic err=btoi arg too long, got 9 bytes. Details: pc=12",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_substring_range",
+      "group": [
+        "gqRsc2lngaFsxAkIgAIBAlEBBRWjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEJndmLXZlcmlmeV9sb2dpY3NpZ19lcnJfc3Vic3RyaW5nX3Jhbmdlo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCBsaCEqFqZHxuBDRA9R4YKTdDy7fzDEaCTmGt7F6DqQ86R0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "transaction 5QEFIL2IJRMFDHJIXNZHNCGPB7GBXTT3RK22RRP6AXY6TPJC6SKA: rejected by logic err=substring range beyond length of string. Details: pc=5",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_retsub_empty",
+      "group": [
+        "gqRsc2lngaFsxAUIQgAAiaN0eG6Ko2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQjd2YtdmVyaWZ5X2xvZ2ljc2lnX2Vycl9yZXRzdWJfZW1wdHmjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIL6PvANmYaY9LR30NPTqhVD1DDzEQp14YcqTpDmNTIU4pHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "transaction BJE7XT5CCCY6MYQCZ6IG4MCPRHT37MTW2BRCSK3VXAUNQGG6EKKQ: rejected by logic err=retsub with empty callstack. Details: pc=4",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_final_stack_too_long",
+      "group": [
+        "gqRsc2lngaFsxAYIIAEBIiKjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEK3dmLXZlcmlmeV9sb2dpY3NpZ19lcnJfZmluYWxfc3RhY2tfdG9vX2xvbmejcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIKTAYihA8s4obQdPZR15Er92ypTx4TW8MyYOkGpxLnBTpHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "transaction NFYVVMA674AKXNWYYPKLLOGVA4C74QXW5LFC6OY625P3WKRNPESQ: rejected by logic err=stack len is 2 instead of 1. Details: pc=6",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_final_stack_bytes",
+      "group": [
+        "gqRsc2lngaFsxAQIgAEBo3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxCh3Zi12ZXJpZnlfbG9naWNzaWdfZXJyX2ZpbmFsX3N0YWNrX2J5dGVzo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCB3gMxLVyLv9Z03aYVUqU2efxwPtKaj5o2oAVcfvDhW1qR0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "transaction NPBGRCYOEHF7ZCPNJR7RPEWWN4GW4OQJUVGXPLC7WYM73CFSKN6Q: rejected by logic err=stack finished with bytes not int. Details: pc=4",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_final_stack_empty",
+      "group": [
+        "gqRsc2lngaFsxAQIgQFIo3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxCh3Zi12ZXJpZnlfbG9naWNzaWdfZXJyX2ZpbmFsX3N0YWNrX2VtcHR5o3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCDZJ/Be5KGmDzYyCJaKd8X2BuVNfZCE1i4cPKBEkeD3kaR0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "transaction VGDF3GY5TYAQA7BOZINGQQJXQAPCNZZHL64O77WV6KG4UZIKSYJQ: rejected by logic err=stack len is 0 instead of 1. Details: pc=4",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_exp_zero_zero",
+      "group": [
+        "gqRsc2lngaFsxAkIIAEAIiKUgQGjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEJHdmLXZlcmlmeV9sb2dpY3NpZ19lcnJfZXhwX3plcm9femVyb6NyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgbR6N4ozYjc7B6uCdkSZGwv9oUPZiQcbcU+1HrfJR/gekdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "transaction 73JPTNDWB64NXTBZZ3YQHXCD4WP6NECUN5CPTWNIFASC7IG267XQ: rejected by logic err=0^0 is undefined. Details: pc=6",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_shl_too_big",
+      "group": [
+        "gqRsc2lngaFsxAkIIAEBIoFAkCKjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEIndmLXZlcmlmeV9sb2dpY3NpZ19lcnJfc2hsX3Rvb19iaWejcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIE9X0xNhk9qYqjCNryoMRzBGHvunbiRziyDgFCWCANyapHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "transaction 6KBHCAGBKOWFJWGUJAZV3LFP7YVFWUCBJLQOYZHNR5BY5FKMEYMA: rejected by logic err=shl arg too big, (64). Details: pc=7",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_bzero_too_large",
+      "group": [
+        "gqRsc2lngaFsxAkIgYAggQEIrxWjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEJndmLXZlcmlmeV9sb2dpY3NpZ19lcnJfYnplcm9fdG9vX2xhcmdlo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCDox20731buUxQnU56CG4cgWDc9MqeZnu6tVwDjqmmeTKR0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "transaction OUH25J7KF33LIN7WQZRP6S4KMAEIQ4JDO5DNCSL52N5OBPVD2CFQ: rejected by logic err=bzero attempted to create a too large string. Details: pc=7",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_getbyte_range",
+      "group": [
+        "gqRsc2lngaFsxAcIgAEBgQVVo3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxCR3Zi12ZXJpZnlfbG9naWNzaWdfZXJyX2dldGJ5dGVfcmFuZ2WjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIB8DSXZHbRnqtL+CKyTGiF4dWS26z4pPohpylHXAFRA/pHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "transaction VT5D6KPJODHEXN5H55EUBTFZS7THJ5RJVWJBKQOEJZQOQPQCAJRQ: rejected by logic err=getbyte index beyond array length. Details: pc=6",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_budget_exceeded",
+      "group": [
+        "gqRsc2lngaFsxBIIIAEBgQAiCEmBoI0GDED/9SKjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEJndmLXZlcmlmeV9sb2dpY3NpZ19lcnJfYnVkZ2V0X2V4Y2VlZGVko3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC5/TOYOBiaJTQJd6CGeJuw855tzmJs3sXY1TTma7qKY6R0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "transaction 2YGQUBOVSATTF5CTYG6UYCRYZT2SSV7M5VLHICRPSA4CCJ23XY7A: rejected by logic err=dynamic cost budget exceeded, executing intc_0: local program cost was 20000. Details: pc=6",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_lower_arg_wrong",
+      "group": [
+        "gqRsc2lngaFsxAsIgAEBgAECQgAACKN0eG6Ko2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQmd2YtdmVyaWZ5X2xvZ2ljc2lnX2Vycl9sb3dlcl9hcmdfd3JvbmejcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIL+KQEAF3kh8enbbshfjgrSUDl9GE+9JwAaz3FgwZ3U8pHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "transaction 6MZGP4D4QPBHL7VK4UQGE3ATEGYH4WKOGVZLHCEU74SA7JNNDKIA: rejected by logic err=+ arg 0 wanted uint64 but got []byte. Details: pc=10",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_underflow_before_type",
+      "group": [
+        "gqRsc2lngaFsxAgIgAEBQgAACKN0eG6Ko2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQsd2YtdmVyaWZ5X2xvZ2ljc2lnX2Vycl91bmRlcmZsb3dfYmVmb3JlX3R5cGWjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIExcGPw/loTJvPPp75uPYtzwuRTOeSO8yXnPrakiZwFzpHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "transaction FQBZBPUESBXOMXQ4ZEFTXWIKP4WES3LLGV4QYUZ7F35TM7CKUT7A: rejected by logic err=stack underflow in +. Details: pc=7",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_divw_zero",
+      "group": [
+        "gqRsc2lngaFsxAgIgQGBAoEAl6N0eG6Ko2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQgd2YtdmVyaWZ5X2xvZ2ljc2lnX2Vycl9kaXZ3X3plcm+jcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEILe4NtUR4bgYfpeBfp4xFb2Ec6JMGfdzzXONiwwnjl3zpHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "transaction N4UMQ36RZOBRA34NJFJXRUAICDSTENOM4CLP36JGX5S34QGQ6ZZA: rejected by logic err=divw 0. Details: pc=7",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_divw_overflow",
+      "group": [
+        "gqRsc2lngaFsxAgIgQWBAIEDl6N0eG6Ko2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQkd2YtdmVyaWZ5X2xvZ2ljc2lnX2Vycl9kaXZ3X292ZXJmbG93o3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC4UgvlFYUeIqWYomeOvXLDFxU3LXRPJFzekxFoJh4zK6R0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "transaction 6MGI6PKYYI4AFGAPX2EVDY5OXMYVVOU7FB2GQ3ONFGOQI4IAXZKQ: rejected by logic err=divw overflow: 3 \u003c= 5. Details: pc=7",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_divmodw_zero",
+      "group": [
+        "gqRsc2lngaFsxAoIIAIBACIiIyMfo3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxCN3Zi12ZXJpZnlfbG9naWNzaWdfZXJyX2Rpdm1vZHdfemVyb6NyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgcSad3bUmAFemDsCSFE6i5i88NQXfBOAJBYhiBNDwl0OkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "transaction 4J6MEQRZ3SI6VJCZ4BJET2Z6H3VOPDM2TGTCH7JN4X27MRMENRLQ: rejected by logic err=/ 0. Details: pc=9",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_bytes_div_zero",
+      "group": [
+        "gqRsc2lngaFsxAgIgAEFgAEAoqN0eG6Ko2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQld2YtdmVyaWZ5X2xvZ2ljc2lnX2Vycl9ieXRlc19kaXZfemVyb6NyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgwT9lNHMMWi6TWDB9bQE3AouZ8DWqW61cFtq3/MsWBQykdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "transaction LTB6X3BE4EHOMECDQOJ6ZOE5OFGEFP447ELO3FHT57PJCTI2REZQ: rejected by logic err=division by zero. Details: pc=7",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_bytes_mod_zero",
+      "group": [
+        "gqRsc2lngaFsxAgIgAEFgAEAqqN0eG6Ko2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQld2YtdmVyaWZ5X2xvZ2ljc2lnX2Vycl9ieXRlc19tb2RfemVyb6NyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgeE2TfEEZ+6D/yqfxiOnwwJ3IQ5LnAm/hAFkafUUIwn2kdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "transaction B5SXGMR246WRJFLL4IUX7VI6IVO2WNFSTDU3RKKO3546KJQHJSFA: rejected by logic err=modulo by zero. Details: pc=7",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_bytes_add_large_input",
+      "group": [
+        "gqRsc2lngaFsxAgIgUGvgAEBoKN0eG6Ko2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQsd2YtdmVyaWZ5X2xvZ2ljc2lnX2Vycl9ieXRlc19hZGRfbGFyZ2VfaW5wdXSjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIFrzK8SYtYfPHylaHMPoWC3aOUIb4L1nVDV5KFiSfmxppHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "transaction 72QBK5LDR5YEJCJQFGBOUFOUULKKAS5LXBJZFTK5RFAK2CTNL5WQ: rejected by logic err=math attempted on large byte-array. Details: pc=7",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_bytes_sub_negative",
+      "group": [
+        "gqRsc2lngaFsxAgIgAEBgAECoaN0eG6Ko2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQpd2YtdmVyaWZ5X2xvZ2ljc2lnX2Vycl9ieXRlc19zdWJfbmVnYXRpdmWjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIGPxNZxeFVMDy39bXdd/plwPobR9Cu4b3D2z5UTFELkwpHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "transaction UVHZ4KAOTQLLOZ7A6QH6K5UEWQBUTIARYLQNYGBBBTDMMPMOXD3A: rejected by logic err=byte math would have negative result. Details: pc=7",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_bytes_mul_large_input",
+      "group": [
+        "gqRsc2lngaFsxAgIgAECgUGvo6N0eG6Ko2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQsd2YtdmVyaWZ5X2xvZ2ljc2lnX2Vycl9ieXRlc19tdWxfbGFyZ2VfaW5wdXSjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIMzUc5xcCNvWvOJGrND96WQG5FvNbMI2ueQ893eRxk49pHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "transaction 45UPHSR7AUPOKHMOJ7A4PLEZK5SVMMBY5HAYKAV3X64B2AWA4AQQ: rejected by logic err=math attempted on large byte-array. Details: pc=7",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_bytes_lt_large_input",
+      "group": [
+        "gqRsc2lngaFsxAgIgUGvgAEBpKN0eG6Ko2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQrd2YtdmVyaWZ5X2xvZ2ljc2lnX2Vycl9ieXRlc19sdF9sYXJnZV9pbnB1dKNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgwUnzVAmIupVLKndOchY0TH/z8cI7SbtiZ3xS6rdNgWSkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "transaction X3QXTO5ZHBGYZ6J2RL72IB6GMBGPOMYIO3EQTNBGWNBBC47QNAAQ: rejected by logic err=math attempted on large byte-array. Details: pc=7",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_err_type_before_cost",
+      "group": [
+        "gqRsc2lngaFsxFcIIANAIAEmAQEBKCKvI68ESCgiryOvBEgoIq8jrwRIKCKvI68ESCgiryOvBEgoIq8jrwRIKCKvI68ESCgiryOvBEgoIq8jrwRIKCKvI68ESCQkJEIAAASjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEJ3dmLXZlcmlmeV9sb2dpY3NpZ19lcnJfdHlwZV9iZWZvcmVfY29zdKNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgGPJ6uPyshsrPuwO3HqIICbf3W6rQ8jmEXFvvFvOzBYqkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "transaction HFC3NPX4SDRLWST7KPTTQPDXEUYQSHGICSTMLNAJWG36RLXLBJCA: rejected by logic err=ed25519verify arg 0 wanted []byte but got uint64. Details: pc=86",
+      "verify_framed": true
+    },
+    {
       "name": "verify_logicsig_rejects",
       "group": [
         "gqRsc2lngaFsxAMIgQCjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEGndmLXZlcmlmeV9sb2dpY3NpZ19yZWplY3Rzo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCAg0Be/QbaNPW4z+ZHYK4nVg62o2fo3pZLDZd37gLnLYaR0eXBlo3BheQ=="

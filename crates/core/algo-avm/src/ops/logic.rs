@@ -174,7 +174,7 @@ pub fn op_getbyte(machine: &mut AvmMachine, _instruction: &Instruction) -> Resul
 
     if n >= bytes.len() as u64 {
         return Err(AlgoError::Avm {
-            message: format!("getbyte: index {n} >= length {} of bytes", bytes.len()),
+            message: "getbyte index beyond array length".to_string(),
         });
     }
 

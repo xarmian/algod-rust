@@ -167,7 +167,8 @@ pub enum AlgoError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
         message: String,
-        /// Instruction index at which evaluation failed.
+        /// Byte offset (go's `cx.pc`, the version byte counts) at which
+        /// evaluation failed.
         pc: usize,
         /// Index of the failing transaction within its group.
         group_index: usize,
@@ -335,7 +336,7 @@ pub type Result<T> = std::result::Result<T, AlgoError>;
 /// `returnError()` (`daemon/algod/api/server/v2/utils.go`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AvmErrorDetail {
-    /// Instruction index at which evaluation failed.
+    /// Byte offset (go's `cx.pc`) at which evaluation failed.
     pub pc: usize,
     /// Index of the failing transaction within its group.
     pub group_index: usize,
