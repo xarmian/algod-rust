@@ -208,9 +208,6 @@ pub struct AvmMachine {
     /// exceeded, executing <op>`) is resolved from it only when an error is
     /// formatted, so execution pays two byte stores per instruction.
     pub(crate) current_instr: Option<(u8, Option<u8>)>,
-    /// The stack height before the current instruction ran: places a type
-    /// error's `arg <i>` index like go's `step`. Diagnostic only.
-    pub(crate) current_op_base_height: usize,
     /// Cost budget remaining. Shared/pooled across app calls — inner app calls
     /// add to and consume from this, so its delta is not this program's own
     /// cost (use [`AvmMachine::cost`] for that).
@@ -283,7 +280,6 @@ impl AvmMachine {
             scratch,
             pc: 0,
             current_instr: None,
-            current_op_base_height: 0,
             budget,
             cost: 0,
             mode,
@@ -323,7 +319,6 @@ impl AvmMachine {
     #[inline]
     fn begin_instruction(&mut self, instr: &Instruction) {
         self.current_instr = Some((instr.opcode, instr.sub_opcode));
-        self.current_op_base_height = self.stack.len();
     }
 
     /// The spec of the instruction being executed, if any.
@@ -511,7 +506,16 @@ impl AvmMachine {
         // exhaustion opcodes are visible in the trace, matching go-algorand).
         tracer.before_opcode(self.pc, instr.opcode);
 
-        // Capture the scratch slot a `store`/`stores` instruction is about to
+        // go's argument gate runs before the cost is charged.
+        if !self.arg_gate_passes(&instr) {
+            let e = self.arg_gate_error(&instr);
+            let msg = e.to_string();
+            tracer.after_opcode(old_pc, instr.opcode, &self.stack, &self.scratch, Some(&msg));
+            return Err(e);
+        }
+
+        // After the argument gate (no stack-dependent precompute before the
+        // underflow check): capture the scratch slot a `store`/`stores` instruction is about to
         // write, *before* dispatch mutates the stack/immediates state (issue
         // #1225). Reported to the tracer only if dispatch actually succeeds
         // (see below) -- go-algorand's tracer only records the write once the
@@ -521,14 +525,6 @@ impl AvmMachine {
         // must be read from the pre-dispatch stack here since `ops::dispatch`
         // does not currently thread a tracer through to the opcode handlers.
         let scratch_write_slot = scratch_write_slot(&instr, &self.stack);
-
-        // go's argument gate runs before the cost is charged.
-        if !self.arg_gate_passes(&instr) {
-            let e = self.arg_gate_error(&instr);
-            let msg = e.to_string();
-            tracer.after_opcode(old_pc, instr.opcode, &self.stack, &self.scratch, Some(&msg));
-            return Err(e);
-        }
 
         // Charge static cost. Must resolve through `resolve_spec` (not the
         // bare prefix-byte `lookup`) so a multi-byte "prefix opcode" family
@@ -611,28 +607,15 @@ impl AvmMachine {
             }
     }
 
-    /// go's `<op> arg <i> wanted <T> but got <U>` for the value just popped by
-    /// an opcode the [`crate::arg_gate`] table does not cover (the table's own
-    /// opcodes are gated before they run). The index counts from the opcode's
-    /// own deepest argument like go's, which needs the opcode's argument count:
-    /// for an opcode whose count is dynamic (`stack_pops == -1`) there is no
-    /// such index, so the text is the generic one rather than a position
-    /// measured from the bottom of the whole stack.
+    /// The type error for the value just popped by an opcode the
+    /// [`crate::arg_gate`] table does not cover (the table's own opcodes are
+    /// gated before they run, so go's exact `<op> arg <i> wanted <T> but got
+    /// <U>` is produced there). Without the opcode's argument types the lowest
+    /// wrong argument cannot be computed, and a lazily popped (top-first)
+    /// index could name the wrong argument, so this text carries no index.
     fn arg_type_error(&self, wanted: &str, got: &str) -> AlgoError {
-        let spec = self.current_spec();
-        let pops = spec.map_or(-1, |s| s.stack_pops);
-        if pops < 0 {
-            return AlgoError::Avm {
-                message: format!("expected {wanted} on stack, got {got}"),
-            };
-        }
-        let first = self.current_op_base_height.saturating_sub(pops as usize);
         AlgoError::Avm {
-            message: format!(
-                "{} arg {} wanted {wanted} but got {got}",
-                self.current_op_name(),
-                self.stack.len().saturating_sub(first)
-            ),
+            message: format!("expected {wanted} on stack, got {got}"),
         }
     }
 
@@ -709,14 +692,21 @@ impl AvmMachine {
     pub fn charge_cost(&mut self, cost: u64) -> Result<(), AlgoError> {
         if cost as i64 > self.budget {
             // go's `step`: `dynamic cost budget exceeded, executing <op>: local
-            // program cost was <cost so far>`.
-            return Err(AlgoError::Avm {
-                message: format!(
-                    "dynamic cost budget exceeded, executing {}: local program cost was {}",
-                    self.current_op_name(),
+            // program cost was <cost so far>`. The budget compared is the
+            // pooled one and the figure printed is this program's own `cost`,
+            // both as go's (`remainingBudget()` vs `cx.cost`). Outside an
+            // instruction (direct calls) there is no opcode to name.
+            let message = match self.current_op_name() {
+                "" => format!(
+                    "dynamic cost budget exceeded: local program cost was {}",
                     self.cost
                 ),
-            });
+                name => format!(
+                    "dynamic cost budget exceeded, executing {name}: local program cost was {}",
+                    self.cost
+                ),
+            };
+            return Err(AlgoError::Avm { message });
         }
         // Track this program's own cumulative cost independently of the shared
         // (pooled) budget, mirroring go-algorand's `cx.cost`.
@@ -1434,35 +1424,26 @@ mod tests {
         );
         assert!(result.unwrap(), "program should approve");
     }
-    /// An opcode with a dynamic argument count (`dig`, `stack_pops == -1`) has
-    /// no argument index relative to its own arguments, so a type error from a
-    /// typed pop carries the generic text, not a position measured from the
-    /// bottom of the whole stack (issue #2200).
+
+    /// A typed pop in an opcode outside the arg-gate table carries no
+    /// positional `arg N`: popping top-first it could name the wrong argument
+    /// (issue #2200). `setbyte` with two wrong arguments (go: arg 0).
     #[test]
-    fn a_dynamic_count_opcode_has_no_positional_arg_index() {
+    fn an_ungated_opcode_has_no_positional_arg_index() {
+        use crate::arg_gate::arg_types;
+        assert!(arg_types(0x56).is_none(), "setbyte must stay ungated for this test");
         let program = Program {
             version: 8,
             instructions: vec![],
         };
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
-        for _ in 0..5 {
-            m.push(AvmValue::Uint64(1)).unwrap();
-        }
+        // setbyte(A, B, C): A bytes, B uint, C uint. Both A and C wrong.
+        m.push(AvmValue::Uint64(1)).unwrap();
+        m.push(AvmValue::Uint64(1)).unwrap();
         m.push(AvmValue::Bytes(vec![1])).unwrap();
-        m.current_instr = Some((0x4b, None)); // dig: dynamic pop count
-        m.current_op_base_height = m.stack.len();
+        m.current_instr = Some((0x56, None));
         let err = m.pop_uint().unwrap_err().to_string();
         assert_eq!(err, "AVM: expected uint64 on stack, got []byte");
-        // A fixed-count opcode keeps go's text with an index from its own
-        // deepest argument (`btoi` takes one, so a wrongly typed top value is
-        // its argument 0 whatever lies beneath it).
-        m.current_instr = Some((0x17, None)); // btoi: one argument
-        m.push(AvmValue::Bytes(vec![1])).unwrap();
-        m.current_op_base_height = m.stack.len();
-        m.pop_bytes().unwrap();
-        m.push(AvmValue::Uint64(9)).unwrap();
-        m.current_op_base_height = m.stack.len();
-        let err = m.pop_bytes().unwrap_err().to_string();
-        assert_eq!(err, "AVM: btoi arg 0 wanted []byte but got uint64");
+        assert!(!err.contains("arg "));
     }
 }

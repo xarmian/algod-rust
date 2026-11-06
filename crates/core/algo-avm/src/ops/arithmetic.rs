@@ -209,7 +209,7 @@ pub fn op_divmodw(machine: &mut AvmMachine, _instruction: &Instruction) -> Resul
     machine.push(AvmValue::Uint64(r as u64))
 }
 
-/// `exp` (0x94): pop b, pop a, push a^b. 0^0=1. Overflow → error.
+/// `exp` (0x94): pop b, pop a, push a^b. 0^0 is an error (go `opExpImpl`). Overflow → error.
 pub fn op_exp(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
     let exp = machine.pop_uint()?;
     let base = machine.pop_uint()?;

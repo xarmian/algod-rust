@@ -769,6 +769,10 @@ func blockDupOracle() {
 		{"divmodw_zero", "int 1\nint 1\nint 0\nint 0\ndivmodw"},
 		{"bytes_div_zero", "byte 0x05\nbyte 0x00\nb/"},
 		{"bytes_mod_zero", "byte 0x05\nbyte 0x00\nb%"},
+		{"bytes_add_large_input", "int 65\nbzero\nbyte 0x01\nb+"},
+		{"bytes_sub_negative", "byte 0x01\nbyte 0x02\nb-"},
+		{"bytes_mul_large_input", "byte 0x02\nint 65\nbzero\nb*"},
+		{"bytes_lt_large_input", "int 65\nbzero\nbyte 0x01\nb<"},
 		// Ten ed25519verify calls leave the budget below the cost of an
 		// eleventh, whose arguments are ALSO of the wrong type: the type error
 		// comes first, the cost is never charged.
