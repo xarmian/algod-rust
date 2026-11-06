@@ -897,6 +897,11 @@ func heartbeatProofRows(e wfEnv) []wfGroupRow {
 	single := func(name string, t transactions.Transaction) wfGroupRow {
 		return wfGroupRow{name: "verify_hb_" + name, group: []transactions.SignedTxn{e.sign(t)}}
 	}
+	// A WellFormed refusal (named wf_, so the Rust side expects the not-well-formed
+	// pool tag), not a signature-batch one.
+	wellFormedFirst := func(name string, t transactions.Transaction) wfGroupRow {
+		return wfGroupRow{name: "wf_hb_" + name, group: []transactions.SignedTxn{e.sign(t)}}
+	}
 	grouped := func(name string, txns ...transactions.Transaction) wfGroupRow {
 		var hashes []crypto.Digest
 		for _, t := range txns {
@@ -921,6 +926,11 @@ func heartbeatProofRows(e wfEnv) []wfGroupRow {
 	return []wfGroupRow{
 		validBadSig,
 		badThenUnsigned,
+		// go runs WellFormed on every member before the proof batch, so a zero key
+		// dilution (a division by zero in the batch id) and a heartbeat with no
+		// fields are answered with go's WellFormed text (issue #2223).
+		wellFormedFirst("zero_key_dilution_before_the_proof", hb("z1", secrets.OneTimeSignatureVerifier, seed, good, 0)),
+		wellFormedFirst("no_heartbeat_fields_before_the_proof", transactions.Transaction{Type: protocol.HeartbeatTx, Header: header("z2")}),
 		single("valid_proof", valid("v1")),
 		single("proof_for_another_seed", hb("s1", secrets.OneTimeSignatureVerifier, seed, secrets.Sign(id, otherSeed).ToHeartbeatProof(), dilution)),
 		single("proof_under_another_vote_id", hb("s2", other.OneTimeSignatureVerifier, seed, good, dilution)),
