@@ -61,7 +61,7 @@ consensus-compatible. It exists for three readers:
 | DIV-007 | `simulate` serves only `Request.Round` = the latest round; an earlier round is rejected with go's `round %d before dbRound %d` (dbRound = latest), where go serves any round back to its tracker `dbRound` | simulate (`POST /v2/transactions/simulate` with `round`) | landed | 2026-10-31 | none (affects only whether a simulate request with a past round is served; no block, state or consensus path) | `crates/core/algo-ledger/src/simulation/mod.rs` (`Simulator::simulate`) | `ledger/simulation/simulator.go` (`Simulate`, `simulatorLedger.start`), `ledger/acctupdates.go` (`RoundOffsetError`) | `simulation_gaps_test.rs` (`start_round_selection`, `simulate_at_a_past_round_is_rejected_not_evaluated_on_latest_state`, `simulate_round_before_db_round_is_rejected`); the latest-round path stays proven by the #2118 go oracle (`simulation_rewards_oracle_test.rs`) |
 | DIV-008 | The ledger checkpoints the tracker WAL (PASSIVE, `main` only) every time it opens a `ReadSnapshot`, under the ledger lock; go has no long-lived read snapshot | ledger SQLite WAL maintenance (pool evaluator snapshot) | landed | 2026-11-02 | none (a checkpoint only copies committed pages from the WAL into the database file; durability settings unchanged) | `crates/core/algo-ledger/src/sqlite.rs` (`SqliteLedger::open_read_snapshot`, `checkpoint_tracker_wal_for_snapshot`), `crates/core/algo-ledger/src/follow_timing.rs` (metrics) | `util/db/dbutil.go` (`_journal_mode=wal`, default `wal_autocheckpoint`) | `wal_overlapping_reader_test.rs` (WAL bound, foreign-reader limit, 40 randomized kills, cost benchmark), live betanet follow, replay-corpus final-state equality (#2166) |
 | DIV-009 | A block's archive rows (`put_block` / `put_block_cert`) are buffered during the block span and committed to the block file on a second connection BEFORE the tracker transaction commits (go: blockdb commit, then trackers lag); a ledger crash leaves the archive at most one block ahead of the tracker | ledger SQLite commit order (`commit_block`) | landed | 2026-11-02 | none (same files, schema and rows; the archive rows become durable one commit earlier, durability settings unchanged) | `crates/core/algo-ledger/src/sqlite.rs` (`PendingArchive`, `SqliteLedger::flush_pending_archive`, `reconcile_orphans`, `begin_block`, `put_block`, `put_block_cert`, `forget_before`, `open_split`), `crates/core/algo-ledger/src/read_pool.rs` (`ArchiveInflight`, `in_flight`) | `ledger/ledger.go` (`AddValidatedBlock`: `blockQ.putBlock` before `trackers.newBlock`), `ledger/tracker.go` (`loadFromDisk`) | `wal_overlapping_reader_test.rs` (failpoint crash at every commit step in both write orders, randomized hard kills, abort/sync-ahead/savepoint tests, cost benchmark) (#2209) |
-| DIV-010 | The catchup pass's fetch window is `CatchupParallelBlocks + min(CatchupParallelBlocks, 32)` rounds ahead of the apply cursor (in flight plus fetched and waiting; `1` stays 1) with at most `CatchupParallelBlocks` fetches in flight, and the window shrinks back to `CatchupParallelBlocks` once the tip is seen; go's window holds `limitedParallelRequests` rounds in total | block catchup / replay scheduling (`CatchupService::sync_pass_core`) | landed | 2026-11-06 | none (the same blocks are fetched, authenticated and applied in round order; only how many fetched blocks may wait for an earlier slow round differs) | `crates/core/algo-ledger/src/catchup_service.rs` (`FETCH_AHEAD_MAX_EXTRA`, `fetch_window`, `sync_pass_core`) | `catchup/service.go` (`pipelinedFetch`, `limitedParallelRequests`, `fetchAndWrite`) | `catchup_service` tests (`a_slow_round_does_not_idle_the_other_workers`, `sync_range_fetch_window_never_exceeds_the_parallel_budget`, `the_tip_probe_is_not_multiplied_by_the_window`, `the_fetch_window_is_exact_for_one_worker_and_capped_for_many`), live betanet replay with the block-hash gate (#2204) |
+| DIV-010 | The catchup pass's fetch window is `CatchupParallelBlocks + min(CatchupParallelBlocks, 32)` rounds ahead of the apply cursor (in flight plus fetched and waiting; `1` stays 1, deliberately no prefetch for the serial setting) with at most `CatchupParallelBlocks` fetches in flight, and once a round's fetch has finally failed new claims are bounded by the apply cursor plus the started workers (rounds already claimed stay claimed); go's window holds `limitedParallelRequests` rounds in total | block catchup / replay scheduling (`CatchupService::sync_pass_core`) | landed | 2026-11-06 | none (the same blocks are fetched, authenticated and applied in round order; only how many fetched blocks may wait for an earlier slow round differs) | `crates/core/algo-ledger/src/catchup_service.rs` (`FETCH_AHEAD_MAX_EXTRA`, `fetch_window`, `sync_pass_core`) | `catchup/service.go` (`pipelinedFetch`, `limitedParallelRequests`, `fetchAndWrite`) | `catchup_service` tests (`a_slow_round_does_not_idle_the_other_workers`, `sync_range_fetch_window_never_exceeds_the_parallel_budget`, `the_tip_probe_is_not_multiplied_by_the_window`, `past_the_tip_no_round_beyond_the_cursor_plus_the_workers_is_requested`, `the_tip_gate_claims_exactly_up_to_the_limit_however_many_workers_race`, `the_fetch_window_is_exact_for_one_worker_and_capped_for_many`), live betanet replay with the block-hash gate (PR #2236, evidence in the entry) |
 
 ## Entries
 
@@ -577,18 +577,31 @@ slowest-of-the-window latency rather than by the average latency.
 `fetch_window(workers) = workers + min(workers, FETCH_AHEAD_MAX_EXTRA = 32)`
 permits (32 for the default 16 workers, 96 for 64), computed from the workers
 that actually started; the number of workers (concurrent fetches) stays
-`parallel_blocks`, and a single worker (`CatchupParallelBlocks: 1`, strictly
-serial) keeps a window of 1 (no prefetch). A worker whose round is fetched
-takes the next round while an earlier one is still slow, up to that window.
-Once a round's fetch has finally failed (the tip), workers claim no round more
-than `parallel_blocks` beyond the apply cursor (go's window; go stops
-launching), in one atomic compare-and-swap with the bound, and gated workers
-sleep on a condition variable until the cursor moves or the pass ends; one
-transient "no block" answer that a later attempt resolves does not engage the
-gate. So the 404-bound requests past the tip are not doubled (8 workers: 13
-requests beyond the tip in the unit test, 21 without the gate). If no fetch
-worker can be started at all the pass ends as a retryable `NoBlock`, not
-`Done`. Apply order,
+`parallel_blocks`. The serial setting is deliberate: up to
+`NO_PREFETCH_WORKERS = 1` worker keeps a window of 1 (`CatchupParallelBlocks:
+1` stays strictly serial, no prefetch), while two workers already get a window
+of 4, because with concurrency there is something for a slow round to idle. A
+worker whose round is fetched takes the next round while an earlier one is
+still slow, up to that window.
+
+Once ANY round's fetch has finally failed (the lowest probing round out of
+attempts, or a higher round that gave up at once because a lower one is
+probing: the apply loop stops the pass at the first failed round whatever the
+lower rounds do), NEW claims are bounded by `applied + started workers` (go's
+window; go launches nothing after the first failure); rounds already claimed
+stay claimed, so the claims in flight at that moment (up to the window) are
+still fetched. The bound check and the claim are one atomic
+compare-and-swap, and gated workers sleep on a condition variable that the
+apply loop notifies (only once the gate is engaged) when the cursor moves, with
+a version counter so a notification between the failed claim and the sleep is
+not lost (a 100 ms timeout is only a safety net). One transient "no block"
+answer that a later attempt resolves does not engage the gate. So the 404-bound
+requests past the tip are not doubled (8 workers: 13 requests beyond the tip
+in the unit test, 21 without the gate; with the cursor stuck at round 1 the
+highest round ever requested is at most 8, it reaches 16 without the gate). If
+no fetch worker can be started at all (a failing thread spawn, #1650) the pass
+ends as a retryable `NoBlock`, not `Done`; with fewer workers than requested
+the window and the gate bound follow the workers that started. Apply order,
 authentication, the commit path, the retry and tip-probe rules are unchanged.
 
 **Memory and wasted work.** Bounded by a block COUNT, not bytes: at most
@@ -616,9 +629,30 @@ concurrent fetches never exceed `parallel_blocks`;
 notification and not by timing, that exactly rounds `1..=fetch_window` are
 claimed (it fails with a window of `workers`); the tip-probe test bounds the
 requests past the tip; `the_fetch_window_is_exact_for_one_worker_and_capped_for_many`
-pins the window function. The live betanet replay (native, release, n = 3
-alternating runs) ended with equal block hashes against a public node (#2204 /
-PR).
+pins the window function (the serial setting included).
+
+**Live evidence (PR #2236).** Native release builds on one Windows 11
+machine, betanet over its three public relays (`r1s`, `r2s`, `r3s`
+`.betanet.algodev.network:4162`), 2026-11-06 and 2026-11-07. Each run:
+an empty data directory, the node started with the betanet `genesis.json`,
+`POST /v2/catchup/<latest label of the betanet catchpoint index>`, then
+`/v2/status` polled each second; the replay rate is the blocks applied between
+the catchpoint clearing and the node being within 12 rounds of the public node
+`betanet-api.4160.nodely.dev`'s head (6.4k to 7k blocks per run in the final set, 12k to 15k in the earlier ones). After each
+run the hashes of five recent rounds (`/v2/blocks/{round}/hash`; a
+non-archival node keeps only recent blocks) were compared with the public
+node's: equal in every run (6 of 6 in each set). Alternating runs of `main`
+and this change (final head), blocks/s: 53.7 / 53.8 / 54.7 (mean 54.1) against
+86.5 / 85.8 / 87.9 (mean 86.7, +60 %); the set before it: 53.0 / 53.1 / 54.4
+against 88.6 / 86.3 / 89.3; the set on the first version of the change:
+55.9 -> 87.7.
+Profile of the `main` runs: request round trip p50 160 / 173 / 303 ms for the
+three relays, 11.1 fetches in flight on average. The process CPU over 60
+seconds at the tip was no worse (final set: main 0.84 / 1.23 / 1.19 s, this
+change 0.84 / 0.92 / 1.06 s; the set before: 1.07 s mean against 1.09 s; about
+1.5 to 2 % of a core). The harness is a throwaway script, not in the repository; go on the
+same host and the Docker `catchup` tier were not run (no go build and no Docker
+daemon on that machine).
 
 **How to switch back.** Make `fetch_window` return its argument.
 
