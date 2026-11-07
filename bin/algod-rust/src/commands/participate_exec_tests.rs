@@ -4187,23 +4187,353 @@ fn the_group_local_rule_is_exact() {
     assert!(SimpleBlockEvaluator::app_call_may_credit(&create));
 }
 
-/// Known residual (follow-up #2217): the cheap overlay of an incomplete
-/// evaluator does not know the inner credit that justified the admission, so
-/// the short sender is saturated to 0 and the receiver is credited as if the
-/// sender could pay. Pinned so a change to it is deliberate.
-#[test]
-fn a_degraded_admission_leaves_phantom_balances() {
+/// Signs `parts` (transaction, its signer) as one group.
+fn signed_parts(parts: Vec<(Transaction, &Key)>) -> Vec<SignedTransaction> {
+    let mut txns: Vec<Transaction> = parts.iter().map(|(t, _)| t.clone()).collect();
+    let gid = algo_codec::compute_group_id(&txns);
+    txns.iter_mut().for_each(|t| t.group = gid.0);
+    txns.into_iter()
+        .zip(parts)
+        .map(|(t, (_, k))| sign(t, &k.1))
+        .collect()
+}
+
+/// `[call to 906 by S, then `members` (each a payment by a short sender)]`.
+fn call_then(members: Vec<(Transaction, &Key)>, call_note: u8) -> Vec<SignedTransaction> {
+    let s = key(3);
+    let mut call = base_txn(s.0, TxnType::Appl);
+    call.application_id = 906;
+    call.note = serde_bytes::ByteBuf::from(vec![call_note]);
+    let mut parts = vec![(call, &s)];
+    parts.extend(members);
+    signed_parts(parts)
+}
+
+fn degraded_evaluator() -> SimpleBlockEvaluator {
     let mut eval = two_app_evaluator();
     eval.exec.as_mut().unwrap().incomplete = true;
+    eval
+}
+
+fn unknown_of(eval: &SimpleBlockEvaluator) -> HashSet<Address> {
+    (*eval.exec.as_ref().unwrap().unknown_balances).clone()
+}
+
+fn balance(eval: &mut SimpleBlockEvaluator, who: &Address) -> u64 {
+    eval.try_effective_balance(who).expect("balance")
+}
+
+/// Issue #2217: the cheap overlay of an incomplete evaluator does not know the
+/// inner credit that justified a degraded admission, so it must not keep the
+/// unmodelled member's balance moves (the short sender saturated to 0 and the
+/// receiver credited as if the sender could pay were phantom balances). The
+/// touched balances are UNKNOWN instead: later checks do not judge them (the
+/// block assembly re-runs the real apply and drops what fails), while an
+/// address the admission never touched is still judged.
+#[test]
+fn a_degraded_admission_does_not_leave_phantom_balances() {
+    let mut eval = degraded_evaluator();
     let f = key(7);
     let r = key(4);
+    let f_before = balance(&mut eval, &f.0);
+    let r_before = balance(&mut eval, &r.0);
     eval.transaction_group(&call_then_short_pay(906, 7, 1))
         .expect("admitted");
-    assert_eq!(eval.try_effective_balance(&f.0).expect("F"), 0);
     assert_eq!(
-        eval.try_effective_balance(&r.0).expect("R"),
-        1_000_000 + 1_000,
-        "R holds a credit F could not pay"
+        balance(&mut eval, &f.0),
+        f_before,
+        "F was not saturated to 0"
+    );
+    assert_eq!(balance(&mut eval, &r.0), r_before, "R was not credited");
+    let unknown = unknown_of(&eval);
+    assert!(unknown.contains(&f.0) && unknown.contains(&r.0));
+    // F's own later group: the inner credit may well fund it, so a balance
+    // the evaluator cannot know does not refuse it.
+    eval.transaction_group(&[pay(&f, key(5).0, 1_000, None)])
+        .expect("F's later group is not refused on an unknown balance");
+    // Negative control: an address the admission never touched is judged.
+    eval.transaction_group(&[pay(&key(201), key(5).0, 1_000, None)])
+        .expect_err("an untouched short sender is still refused");
+}
+
+/// Issue #2217 review: EVERY short member of a group is unmodelled, not only
+/// the first one `deferred` keeps: `[call, F pays R1 (short), F pays R2
+/// (short)]` credits neither receiver.
+#[test]
+fn a_degraded_admission_with_two_short_members_credits_neither_receiver() {
+    let mut eval = degraded_evaluator();
+    let f = key(7);
+    let (r1, r2) = (key(4), key(5));
+    let r2_before = balance(&mut eval, &r2.0);
+    let group = call_then(
+        vec![
+            (pay_txn(&f, r1.0, 1_000, 1), &f),
+            (pay_txn(&f, r2.0, 2_000, 2), &f),
+        ],
+        1,
+    );
+    eval.transaction_group(&group).expect("admitted");
+    assert_eq!(balance(&mut eval, &r2.0), r2_before, "the second receiver");
+    assert!(unknown_of(&eval).contains(&r2.0));
+}
+
+/// Issue #2217 review: the unknown set propagates inside the group: `[call, F
+/// pays R (short), R pays X]` applies R's payment against no balance at all,
+/// X gets no phantom credit and is unknown too.
+#[test]
+fn a_degraded_admission_propagates_unknown_balances_through_the_group() {
+    let mut eval = degraded_evaluator();
+    let f = key(7);
+    let (r, x) = (key(4), key(5));
+    let x_before = balance(&mut eval, &x.0);
+    let r_before = balance(&mut eval, &r.0);
+    let group = call_then(
+        vec![
+            (pay_txn(&f, r.0, 1_000, 1), &f),
+            (pay_txn(&r, x.0, 500, 2), &r),
+        ],
+        2,
+    );
+    eval.transaction_group(&group).expect("admitted");
+    assert_eq!(balance(&mut eval, &x.0), x_before, "X got a phantom credit");
+    assert_eq!(balance(&mut eval, &r.0), r_before, "R was debited");
+    assert!(unknown_of(&eval).contains(&x.0));
+    // Across groups: a later payment BY the now-unknown R credits nobody.
+    let y = key(6);
+    let y_before = balance(&mut eval, &y.0);
+    eval.transaction_group(&[pay(&r, y.0, 300, None)])
+        .expect("R is unknown");
+    assert_eq!(balance(&mut eval, &y.0), y_before);
+    assert!(unknown_of(&eval).contains(&y.0));
+}
+
+/// Issue #2217 review: the close target of an unmodelled payment is unknown
+/// and receives nothing.
+#[test]
+fn a_degraded_admission_with_a_close_target_credits_nothing() {
+    let mut eval = degraded_evaluator();
+    let f = key(7);
+    let (r, c) = (key(4), key(8));
+    let c_before = balance(&mut eval, &c.0);
+    let mut close = pay_txn(&f, r.0, 1_000, 3);
+    close.close_remainder_to = c.0;
+    eval.transaction_group(&call_then(vec![(close, &f)], 3))
+        .expect("admitted");
+    assert_eq!(balance(&mut eval, &c.0), c_before, "the close target");
+    assert!(unknown_of(&eval).contains(&c.0));
+}
+
+/// Issue #2217 review: the short member can be an application call (only the
+/// fee is short). Its sender, the fee sink and what it references (the
+/// application's account, foreign accounts, foreign applications) are unknown;
+/// the fee is neither debited nor credited to the sink. Inner-transaction
+/// targets beyond the references are not knowable: as for every application
+/// call before this change, the overlay never modelled inner effects, and the
+/// group-local creditable rule (`app_call_may_credit`) is what admits their
+/// consequences.
+#[test]
+fn a_degraded_admission_with_a_short_app_call_marks_what_the_call_references() {
+    let mut eval = degraded_evaluator();
+    let f = key(7);
+    let named = key(9);
+    let sink = eval.hdr.fee_sink;
+    let sink_before = balance(&mut eval, &sink);
+    let mut call = base_txn(f.0, TxnType::Appl);
+    call.application_id = 905;
+    call.accounts = Some(vec![named.0]);
+    call.foreign_apps = Some(vec![906]);
+    eval.transaction_group(&call_then(vec![(call, &f)], 4))
+        .expect("admitted");
+    // S's call is modelled (one 1_000 fee reaches the sink); F's is not.
+    assert_eq!(
+        balance(&mut eval, &sink),
+        sink_before + 1_000,
+        "F's fee credit was skipped"
+    );
+    let unknown = unknown_of(&eval);
+    for who in [
+        f.0,
+        sink,
+        named.0,
+        Address(algo_ledger::avm_context::app_address(905)),
+        Address(algo_ledger::avm_context::app_address(906)),
+    ] {
+        assert!(unknown.contains(&who), "{who} should be unknown");
+    }
+}
+
+/// Issue #2217 review: the V41 access list references accounts and
+/// applications too (`app_call_may_credit` counts it); a short application call
+/// that references them through `access` marks them unknown like the legacy
+/// `accounts` / `foreign_apps` fields.
+#[test]
+fn a_degraded_admission_with_a_short_app_call_marks_its_access_list() {
+    let mut eval = degraded_evaluator();
+    let f = key(7);
+    let named = key(9);
+    let mut call = base_txn(f.0, TxnType::Appl);
+    call.application_id = 905;
+    call.access = Some(vec![
+        algo_types::ResourceRef {
+            address: named.0,
+            ..Default::default()
+        },
+        algo_types::ResourceRef {
+            app: 906,
+            ..Default::default()
+        },
+    ]);
+    eval.transaction_group(&call_then(vec![(call, &f)], 5))
+        .expect("admitted");
+    let unknown = unknown_of(&eval);
+    for who in [named.0, Address(algo_ledger::avm_context::app_address(906))] {
+        assert!(unknown.contains(&who), "{who} should be unknown");
+    }
+}
+
+/// Issue #2217 review: an evaluator with no exec state (a unit-test fake: the
+/// only production constructor, `make_evaluator`, always builds `exec:
+/// Some(..)`) cannot carry unknown marks, so it keeps the behaviour from before
+/// #2217 entirely: the moves are applied (consistently, not restored with
+/// nothing marked), so the receiver holds what the sender paid it.
+#[test]
+fn an_evaluator_without_exec_state_keeps_the_pre_2217_behaviour() {
+    let mut eval = degraded_evaluator();
+    eval.exec = None;
+    let r = key(4);
+    let r_before = balance(&mut eval, &r.0);
+    eval.transaction_group(&call_then_short_pay(906, 7, 1))
+        .expect("admitted");
+    assert_eq!(balance(&mut eval, &r.0), r_before + 1_000);
+}
+
+/// Issue #2217 review: EVERY creditable sender of a group takes a cap slot,
+/// not only the first one `deferred` keeps: with one slot left, `[call, F1 pays
+/// (short), F2 pays (short)]` is refused (it needs two), while a group with one
+/// new short sender is admitted and takes the last slot.
+#[test]
+fn every_creditable_sender_of_a_group_counts_against_the_cap() {
+    let mut eval = degraded_evaluator();
+    {
+        let exec = eval.exec.as_mut().unwrap();
+        for n in 0..DEGRADED_SENDER_CAP as u8 - 1 {
+            exec.degraded_senders.insert(key(150 + n).0);
+        }
+    }
+    let (f1, f2, r) = (key(7), key(8), key(4));
+    let two = call_then(
+        vec![
+            (pay_txn(&f1, r.0, 1_000, 1), &f1),
+            (pay_txn(&f2, r.0, 1_000, 2), &f2),
+        ],
+        6,
+    );
+    let err = eval.transaction_group(&two).expect_err("needs two slots");
+    assert!(err.to_string().contains("overspend"), "{err}");
+    assert_eq!(
+        eval.exec.as_ref().unwrap().degraded_senders.len(),
+        DEGRADED_SENDER_CAP - 1,
+        "a refused group takes no slot"
+    );
+    let one = call_then(vec![(pay_txn(&f1, r.0, 1_000, 3), &f1)], 7);
+    eval.transaction_group(&one).expect("one slot is left");
+    assert_eq!(
+        eval.exec.as_ref().unwrap().degraded_senders.len(),
+        DEGRADED_SENDER_CAP
+    );
+}
+
+/// Issue #2217 review: the balance read of the restore snapshot can fail; the
+/// group is then rolled back like every other failure (overlay and fees as
+/// before), not left half applied for the next group. R's pending-rewards
+/// arithmetic overflows at a huge rewards level, S's does not.
+#[test]
+fn a_failing_restore_snapshot_rolls_the_group_back() {
+    let s = key(3);
+    let r = key(4);
+    let (ledger, mut eval) = evaluator(&[
+        (s.0, funded(5_000_000)),
+        (r.0, funded(20_000_000_000_000_000)),
+    ]);
+    put_app(&ledger, 906, s.0, "#pragma version 9\nint 1\n");
+    eval.exec.as_mut().unwrap().incomplete = true;
+    eval.hdr.rewards_level = 1_000_000_000;
+    let s_before = balance(&mut eval, &s.0);
+    let fees_before = eval.fees_collected;
+    eval.transaction_group(&call_then_short_pay(906, 7, 1))
+        .expect_err("R's balance cannot be read");
+    assert_eq!(
+        eval.fees_collected, fees_before,
+        "fees were not rolled back"
+    );
+    assert_eq!(
+        balance(&mut eval, &s.0),
+        s_before,
+        "the modelled member's moves were not rolled back"
+    );
+    assert!(eval.included_txns.is_empty());
+}
+
+/// Issue #2217 review: the minimum balance of an address whose moves were
+/// restored is not judged against its stale overlay balance: `[call S, F opts
+/// in to an asset]` with F below the minimum and short for the fee (the call's
+/// inner payment may fund it) is admitted.
+#[test]
+fn a_degraded_admission_does_not_judge_the_minimum_of_an_unknown_balance() {
+    let mut eval = degraded_evaluator();
+    let f = key(7);
+    eval.snapshot.accounts.insert(f.0, Some(funded(500)));
+    let mut optin = base_txn(f.0, TxnType::Axfer);
+    optin.xaid = 7;
+    optin.asset_receiver = Some(f.0);
+    eval.transaction_group(&call_then(vec![(optin, &f)], 9))
+        .expect("admitted: F's minimum is unknown, not judged");
+    assert!(unknown_of(&eval).contains(&f.0));
+}
+
+/// Issue #2217 review: an admitted group with two short senders takes a slot
+/// for EACH of them, so a retry by either does not take a new one.
+#[test]
+fn a_group_with_two_short_senders_takes_two_cap_slots() {
+    let mut eval = degraded_evaluator();
+    let (f1, f2, r) = (key(7), key(8), key(4));
+    let group = call_then(
+        vec![
+            (pay_txn(&f1, r.0, 1_000, 1), &f1),
+            (pay_txn(&f2, r.0, 1_000, 2), &f2),
+        ],
+        8,
+    );
+    eval.transaction_group(&group).expect("admitted");
+    let slots = &eval.exec.as_ref().unwrap().degraded_senders;
+    assert!(slots.contains(&f1.0) && slots.contains(&f2.0), "{slots:?}");
+}
+
+/// Issue #2217 review (item 8): an unknown-balance shortfall is admitted even
+/// as a group's first member, so the per-sender cap must bound it: the same
+/// cap as for the creditable senders, shared. Cheap admissions are re-verified
+/// at block assembly, so what this costs is evaluation budget only.
+#[test]
+fn unknown_balance_admissions_are_capped_per_sender() {
+    let mut eval = degraded_evaluator();
+    let senders: Vec<Key> = (0..DEGRADED_SENDER_CAP as u8 + 1)
+        .map(|n| key(150 + n))
+        .collect();
+    for k in &senders {
+        let exec = eval.exec.as_mut().unwrap();
+        Arc::make_mut(&mut exec.unknown_balances).insert(k.0);
+    }
+    for (n, k) in senders.iter().take(DEGRADED_SENDER_CAP).enumerate() {
+        eval.transaction_group(&[pay(k, key(5).0, 1_000, None)])
+            .unwrap_or_else(|e| panic!("sender {n} is within the cap: {e}"));
+    }
+    let err = eval
+        .transaction_group(&[pay(&senders[DEGRADED_SENDER_CAP], key(5).0, 1_000, None)])
+        .expect_err("the cap is spent for a new sender");
+    assert!(err.to_string().contains("overspend"), "{err}");
+    assert_eq!(
+        eval.exec.as_ref().unwrap().degraded_senders.len(),
+        DEGRADED_SENDER_CAP
     );
 }
 
