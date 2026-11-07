@@ -1942,10 +1942,17 @@ impl ExecGroup {
     }
 }
 
-/// What [`SimpleBlockEvaluator::resolve_precheck_rejection`] admits: the
-/// group's txids and, for a degraded admission (issue #2187), the short sender
-/// and the index of the member whose balance moves are unmodelled (#2217).
-type ResolvedPrecheck = (Vec<algo_types::Digest>, Option<(Address, usize)>);
+/// The members of one group whose Algo balance moves the cheap overlay must not
+/// apply (issue #2217), as decided by `validate_group`: the members admitted on
+/// a creditable shortfall, and every member sent from an address whose balance
+/// is unknown (including one made unknown earlier in the same group).
+#[derive(Default)]
+struct DegradedMoves {
+    /// Per member of the group; empty when no member is unmodelled.
+    unmodelled: Vec<bool>,
+    /// The addresses this group makes unknown, recorded on admission.
+    unknown: Vec<Address>,
+}
 
 /// Real-apply state of one pending block evaluator.
 struct ExecState {
@@ -1963,14 +1970,16 @@ struct ExecState {
     /// bounded by [`DEGRADED_SENDER_CAP`].
     degraded_senders: HashSet<Address>,
     /// Addresses whose Algo balance the cheap checks no longer know (issue
-    /// #2217): the sender, receiver and close target of a member admitted on a
-    /// creditable shortfall without a real apply (its unmodelled inner credit
-    /// is not in the overlay, and its moves are not applied, so the overlay
-    /// holds the pre-group balance, which may be too low or too high). A later
-    /// shortfall of one of them is treated like a creditable one (recorded,
-    /// admitted within the per-sender cap) instead of refused; the block
-    /// assembly re-runs the real apply and drops what fails. Only filled
-    /// while the evaluator is incomplete.
+    /// #2217): the overlay did not apply the moves of a member admitted on a
+    /// creditable shortfall (its unmodelled inner credit is not in the
+    /// overlay), nor of any member sent from an unknown address, and every
+    /// destination of such a member (receiver, close target, fee sink, an
+    /// application call's referenced accounts and applications) is unknown in
+    /// turn. A later shortfall of an unknown sender is treated like a
+    /// creditable one (recorded, admitted within the per-sender cap) instead
+    /// of refused; block assembly re-runs the real apply and drops what
+    /// fails, so this costs evaluation budget, never an invalid block. Only
+    /// filled while the evaluator is incomplete; bounded by the block's size.
     unknown_balances: HashSet<Address>,
     /// Set once a group was admitted without being evaluated (stale base or
     /// spent budget): the overlay no longer matches the admitted set, so
@@ -2590,14 +2599,13 @@ impl SimpleBlockEvaluator {
     ///    RECORDED and not judged, every later member's checks and the group
     ///    fees still run, and the recorded one is returned last
     ///    (`GroupReject::creditable`) for `resolve_precheck_rejection` to admit
-    ///    (within a per-sender cap) or refuse. The admitted member's balance
-    ///    moves are NOT applied to the overlay (its unmodelled credit is not in
-    ///    it); its sender, receiver and close target become unknown
-    ///    (`ExecState::unknown_balances`), and a later shortfall of one of
-    ///    them is treated like a creditable one (#2217,
-    ///    `a_degraded_admission_does_not_leave_phantom_balances`). A known
-    ///    residual: a later member's outright failure is reported instead of
-    ///    the deferred member's overspend that go would name first.
+    ///    (within a per-sender cap) or refuse. Every such member, and every
+    ///    member sent from an address left unknown by one, is NOT modelled
+    ///    (`DegradedMoves`): the overlay does not keep its balance moves, and
+    ///    the addresses it touches become unknown in turn (#2217, tests
+    ///    `a_degraded_admission_*`). A known residual: a later member's
+    ///    outright failure is reported instead of the deferred member's
+    ///    overspend that go would name first.
     ///
     /// Returns the txids it checked (over the group with genesis fields
     /// restored), so `transaction_group` records the same txids and the
@@ -2606,6 +2614,7 @@ impl SimpleBlockEvaluator {
     fn validate_group(
         &mut self,
         txgroup: &[algo_types::SignedTransaction],
+        moves: &mut DegradedMoves,
     ) -> Result<Vec<algo_types::Digest>, Box<GroupReject>> {
         // Run all stateless checks first; reuse the restored (genesis fields
         // populated) copies rather than cloning + restoring the group again.
@@ -2697,6 +2706,15 @@ impl SimpleBlockEvaluator {
         // apply either, which `resolve_precheck_rejection` treats the same way.
         let degraded = self.exec.as_ref().is_none_or(|exec| exec.incomplete);
         let mut deferred: Option<Box<GroupReject>> = None;
+        // Issue #2217: the unknown addresses (from earlier groups, then grown
+        // by this group's unmodelled members) and the members whose balance
+        // moves are not modelled.
+        let mut unknown_now: HashSet<Address> = match (degraded, self.exec.as_ref()) {
+            (true, Some(exec)) => exec.unknown_balances.clone(),
+            _ => HashSet::new(),
+        };
+        let mut marked: Vec<Address> = Vec::new();
+        let mut unmodelled_members = vec![false; txgroup.len()];
         for (member, (stx, restored_stx)) in txgroup.iter().zip(&restored).enumerate() {
             let fail = |error: algo_error::AlgoError| {
                 Box::new(GroupReject {
@@ -2742,19 +2760,18 @@ impl SimpleBlockEvaluator {
             let already_spent = spent.get(&sender).copied().unwrap_or(0);
             let required = already_spent.saturating_add(cost);
             let available = base.saturating_add(credited);
+            let unknown_sender = degraded && unknown_now.contains(&sender);
+            let mut credited = false;
             if available < required {
                 // Issue #2187: a shortfall after an application call that may
-                // reach this sender is not provably go's overspend.
+                // reach this sender is not provably go's overspend. Issue
+                // #2217: nor is one of an address whose balance is unknown.
                 let credit = degraded
                     && (earlier_app_calls
                         .iter()
                         .any(|&i| Self::app_call_may_credit(&txgroup[i].txn))
-                        // Issue #2217: a balance an earlier degraded admission
-                        // left unknown is not judged either.
-                        || self
-                            .exec
-                            .as_ref()
-                            .is_some_and(|exec| exec.unknown_balances.contains(&sender)));
+                        || unknown_sender);
+                credited = credit;
                 if !(credit && deferred.is_some()) {
                     // go's `eval.transaction` moves the fee first, then the amount;
                     // each failing `Move` is a `ledgercore.OverspendError` carrying
@@ -2792,6 +2809,39 @@ impl SimpleBlockEvaluator {
                     // does not cover it. An evaluator without a real apply
                     // cannot tell the two apart; both are rejections.
                     deferred = Some(reject);
+                }
+            }
+            // Issue #2217: a member admitted on a creditable shortfall, or sent
+            // from an unknown address, is not modelled: `transaction_group`
+            // skips its balance moves, and every address it would have moved
+            // value to (and the sender itself) becomes unknown, so the
+            // unknown set propagates through the rest of the group too.
+            if credited || unknown_sender {
+                unmodelled_members[member] = true;
+                let mut touched = vec![sender];
+                if fee > 0 {
+                    touched.push(self.hdr.fee_sink);
+                }
+                if is_pay {
+                    touched.push(stx.txn.receiver);
+                    touched.push(stx.txn.close_remainder_to);
+                }
+                if stx.txn.txn_type == TxnType::Appl {
+                    // Inner transactions can pay anyone: what a call
+                    // references is all that is known of its targets.
+                    let app_ids = std::iter::once(stx.txn.application_id)
+                        .chain(stx.txn.foreign_apps.iter().flatten().copied());
+                    touched.extend(
+                        app_ids
+                            .filter(|&id| id != 0)
+                            .map(|id| Address(algo_ledger::avm_context::app_address(id))),
+                    );
+                    touched.extend(stx.txn.accounts.iter().flatten().copied());
+                }
+                for addr in touched {
+                    if !addr.is_zero() && unknown_now.insert(addr) {
+                        marked.push(addr);
+                    }
                 }
             }
             // The members whose effects on Algo balances this precheck does
@@ -2842,6 +2892,10 @@ impl SimpleBlockEvaluator {
                 txids: Vec::new(),
             })
         })?;
+        if unmodelled_members.iter().any(|&u| u) {
+            moves.unmodelled = unmodelled_members;
+            moves.unknown = marked;
+        }
         // The recorded shortfall decides last: every other check passed.
         if let Some(reject) = deferred {
             return Err(reject);
@@ -3449,7 +3503,7 @@ impl SimpleBlockEvaluator {
         &mut self,
         txgroup: &[algo_types::SignedTransaction],
         reject: GroupReject,
-    ) -> Result<ResolvedPrecheck, algo_error::AlgoError> {
+    ) -> Result<(Vec<algo_types::Digest>, Option<Address>), algo_error::AlgoError> {
         // A first member cannot be funded by an earlier one, except when its
         // sender's balance is unknown after a degraded admission (#2217; only
         // then does `validate_group` mark a first member creditable).
@@ -3496,8 +3550,7 @@ impl SimpleBlockEvaluator {
                                 || exec.degraded_senders.len() < DEGRADED_SENDER_CAP) =>
                     {
                         // The slot is taken once the group is really admitted.
-                        // The short member's moves are not applied (#2217).
-                        return Ok((reject.txids, Some((sender, member))));
+                        return Ok((reject.txids, Some(sender)));
                     }
                     Some(_) => {}
                 }
@@ -3896,9 +3949,10 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
     ) -> Result<(), algo_error::AlgoError> {
         // The sender whose degraded admission (issue #2187) this group is: its
         // slot is taken only once the group is really admitted, below.
-        // The member whose balance moves are unmodelled is returned with it.
-        let mut degraded_sender: Option<(Address, usize)> = None;
-        let txids = match self.validate_group(txgroup) {
+        let mut degraded_sender: Option<Address> = None;
+        // Issue #2217: the members whose balance moves are not applied.
+        let mut moves = DegradedMoves::default();
+        let txids = match self.validate_group(txgroup, &mut moves) {
             Ok(txids) => txids,
             // `Ok`: the real apply accepts what the precheck refused, so the
             // group is admitted as go would admit it, below; or an evaluator
@@ -4023,14 +4077,30 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                 );
             }
 
-            // Issue #2217: the member admitted on a creditable shortfall has
-            // effects this overlay cannot model (the inner credit that funds
-            // it): applying its moves would saturate the sender to 0 and
-            // credit the receiver an amount the sender could not pay. Its
-            // balance moves are skipped (the addresses become unknown below);
-            // everything else of the member (txid, lease, rekey, resource
-            // counts) is recorded as for any member.
-            let unmodelled = degraded_sender.is_some_and(|(_, m)| m == member);
+            // Issue #2217: an unmodelled member (see `DegradedMoves`) applies
+            // its moves below as any member would, then the balances it
+            // touched are put back to what they were before it, so the
+            // overlay never holds a phantom balance (the unknown addresses
+            // are recorded on admission).
+            let restore: Vec<(Address, u64)> = if moves.unmodelled.get(member) == Some(&true) {
+                let mut addrs = vec![stx.txn.sender];
+                if stx.txn.fee > 0 {
+                    addrs.push(fee_sink);
+                }
+                if stx.txn.txn_type == TxnType::Pay {
+                    addrs.push(stx.txn.receiver);
+                    addrs.push(stx.txn.close_remainder_to);
+                }
+                let mut before: Vec<(Address, u64)> = Vec::new();
+                for addr in addrs {
+                    if !addr.is_zero() && !before.iter().any(|(a, _)| *a == addr) {
+                        before.push((addr, self.try_effective_balance(&addr)?));
+                    }
+                }
+                before
+            } else {
+                Vec::new()
+            };
 
             // Update balances in overlay following Go's apply.Payment() order:
             // 1. Debit fee from sender, credit fee to FeeSink (takeFee)
@@ -4039,109 +4109,113 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             //    to close address and zero the sender (cow.CloseAccount)
             let sender = &stx.txn.sender;
             let sender_balance = self.try_effective_balance(sender)?;
-            if !unmodelled {
-                // Credit fee to FeeSink (mirrors Go's takeFee -> cow.Move).
-                // Track fees_collected running total for the block header.
-                //
-                // Go's cow.Move(sender, FeeSink, fee) is a no-op when sender
-                // IS the FeeSink (src == dst), so the fee neither leaves nor
-                // arrives — the balance is unchanged. We mirror this by
-                // skipping the fee debit/credit entirely when sender == fee_sink.
-                //
-                // When the sender IS the FeeSink, Go's takeFee does NOT add
-                // the fee to feesCollected (eval.go:1253-1254) because there
-                // are no net algos added to the Sink.
-                let sender_after_fee = if sender == &fee_sink {
-                    // Self-transfer of fee: balance unchanged, no fees_collected bump.
-                    sender_balance
-                } else {
-                    if stx.txn.fee > 0 {
-                        let fee_sink_balance = self.try_effective_balance(&fee_sink)?;
-                        self.overlay.set_balance_tracked(
-                            &fee_sink,
-                            fee_sink_balance.saturating_add(stx.txn.fee),
-                            &mut checkpoint,
-                        );
-                    }
-                    sender_balance.saturating_sub(stx.txn.fee)
-                };
 
-                // ── Transaction-type-specific balance mutations ────────
-                // In Go, `applyTransaction()` (eval.go:1276) switches on the
-                // transaction type after `takeFee()`. Only payment transactions
-                // move Algos (amount + close_remainder_to). All other types
-                // (keyreg, acfg, axfer, afrz, appl, stpf, hb) only pay the
-                // fee — any type-specific side effects (asset units for axfer,
-                // app state for appl, etc.) do not affect Algo balances.
-                match stx.txn.txn_type {
-                    TxnType::Pay => {
-                        // Credit receiver for payment transactions.
-                        // This must happen BEFORE close-out so that when
-                        // receiver == sender, the balance is correctly computed
-                        // before zeroing. Mirrors Go's cow.Move(sender,
-                        // receiver, amount).
-                        if stx.txn.amount > 0 && !stx.txn.receiver.is_zero() {
-                            let receiver = &stx.txn.receiver;
-                            if receiver == sender {
-                                // Self-payment: fee is debited but amount is a
-                                // no-op (debit and credit cancel out). Just
-                                // debit fee.
-                                self.overlay.set_balance_tracked(
-                                    sender,
-                                    sender_after_fee,
-                                    &mut checkpoint,
-                                );
-                            } else {
-                                let recv_balance = self.try_effective_balance(receiver)?;
-                                self.overlay.set_balance_tracked(
-                                    receiver,
-                                    recv_balance.saturating_add(stx.txn.amount),
-                                    &mut checkpoint,
-                                );
-                                self.overlay.set_balance_tracked(
-                                    sender,
-                                    sender_after_fee.saturating_sub(stx.txn.amount),
-                                    &mut checkpoint,
-                                );
-                            }
+            // Credit fee to FeeSink (mirrors Go's takeFee -> cow.Move).
+            // Track fees_collected running total for the block header.
+            //
+            // Go's cow.Move(sender, FeeSink, fee) is a no-op when sender
+            // IS the FeeSink (src == dst), so the fee neither leaves nor
+            // arrives — the balance is unchanged. We mirror this by
+            // skipping the fee debit/credit entirely when sender == fee_sink.
+            //
+            // When the sender IS the FeeSink, Go's takeFee does NOT add
+            // the fee to feesCollected (eval.go:1253-1254) because there
+            // are no net algos added to the Sink.
+            let sender_after_fee = if sender == &fee_sink {
+                // Self-transfer of fee: balance unchanged, no fees_collected bump.
+                sender_balance
+            } else {
+                if stx.txn.fee > 0 {
+                    let fee_sink_balance = self.try_effective_balance(&fee_sink)?;
+                    self.overlay.set_balance_tracked(
+                        &fee_sink,
+                        fee_sink_balance.saturating_add(stx.txn.fee),
+                        &mut checkpoint,
+                    );
+                }
+                sender_balance.saturating_sub(stx.txn.fee)
+            };
+
+            // ── Transaction-type-specific balance mutations ────────
+            // In Go, `applyTransaction()` (eval.go:1276) switches on the
+            // transaction type after `takeFee()`. Only payment transactions
+            // move Algos (amount + close_remainder_to). All other types
+            // (keyreg, acfg, axfer, afrz, appl, stpf, hb) only pay the
+            // fee — any type-specific side effects (asset units for axfer,
+            // app state for appl, etc.) do not affect Algo balances.
+            match stx.txn.txn_type {
+                TxnType::Pay => {
+                    // Credit receiver for payment transactions.
+                    // This must happen BEFORE close-out so that when
+                    // receiver == sender, the balance is correctly computed
+                    // before zeroing. Mirrors Go's cow.Move(sender,
+                    // receiver, amount).
+                    if stx.txn.amount > 0 && !stx.txn.receiver.is_zero() {
+                        let receiver = &stx.txn.receiver;
+                        if receiver == sender {
+                            // Self-payment: fee is debited but amount is a
+                            // no-op (debit and credit cancel out). Just
+                            // debit fee.
+                            self.overlay.set_balance_tracked(
+                                sender,
+                                sender_after_fee,
+                                &mut checkpoint,
+                            );
                         } else {
+                            let recv_balance = self.try_effective_balance(receiver)?;
+                            self.overlay.set_balance_tracked(
+                                receiver,
+                                recv_balance.saturating_add(stx.txn.amount),
+                                &mut checkpoint,
+                            );
                             self.overlay.set_balance_tracked(
                                 sender,
                                 sender_after_fee.saturating_sub(stx.txn.amount),
                                 &mut checkpoint,
                             );
                         }
-
-                        // Handle close_remainder_to: the sender's entire
-                        // remaining balance (after fee + amount + receiver
-                        // credit) goes to the close address and the sender's
-                        // balance becomes 0. Closing an account to zero is
-                        // valid (the account is deleted). Mirrors Go's
-                        // apply.Payment() -> cow.CloseAccount().
-                        if !stx.txn.close_remainder_to.is_zero() {
-                            let close_addr = &stx.txn.close_remainder_to;
-                            let remaining = self.try_effective_balance(sender)?;
-                            if remaining > 0 && close_addr != sender {
-                                let close_balance = self.try_effective_balance(close_addr)?;
-                                self.overlay.set_balance_tracked(
-                                    close_addr,
-                                    close_balance.saturating_add(remaining),
-                                    &mut checkpoint,
-                                );
-                            }
-                            // Sender balance goes to zero after close.
-                            self.overlay.set_balance_tracked(sender, 0, &mut checkpoint);
-                        }
+                    } else {
+                        self.overlay.set_balance_tracked(
+                            sender,
+                            sender_after_fee.saturating_sub(stx.txn.amount),
+                            &mut checkpoint,
+                        );
                     }
-                    // All non-payment transaction types: only the fee (already
-                    // deducted above) affects Algo balances. Asset transfers
-                    // move asset units (not Algos), and all other types have no
-                    // Algo balance side effects beyond the fee.
-                    _ => {
-                        self.overlay
-                            .set_balance_tracked(sender, sender_after_fee, &mut checkpoint);
+
+                    // Handle close_remainder_to: the sender's entire
+                    // remaining balance (after fee + amount + receiver
+                    // credit) goes to the close address and the sender's
+                    // balance becomes 0. Closing an account to zero is
+                    // valid (the account is deleted). Mirrors Go's
+                    // apply.Payment() -> cow.CloseAccount().
+                    if !stx.txn.close_remainder_to.is_zero() {
+                        let close_addr = &stx.txn.close_remainder_to;
+                        let remaining = self.try_effective_balance(sender)?;
+                        if remaining > 0 && close_addr != sender {
+                            let close_balance = self.try_effective_balance(close_addr)?;
+                            self.overlay.set_balance_tracked(
+                                close_addr,
+                                close_balance.saturating_add(remaining),
+                                &mut checkpoint,
+                            );
+                        }
+                        // Sender balance goes to zero after close.
+                        self.overlay.set_balance_tracked(sender, 0, &mut checkpoint);
                     }
                 }
+                // All non-payment transaction types: only the fee (already
+                // deducted above) affects Algo balances. Asset transfers
+                // move asset units (not Algos), and all other types have no
+                // Algo balance side effects beyond the fee.
+                _ => {
+                    self.overlay
+                        .set_balance_tracked(sender, sender_after_fee, &mut checkpoint);
+                }
+            }
+
+            for (addr, balance) in &restore {
+                self.overlay
+                    .set_balance_tracked(addr, *balance, &mut checkpoint);
             }
 
             // Handle RekeyTo: update the sender's auth_addr in the overlay.
@@ -4442,18 +4516,11 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             });
         }
 
-        if let (Some((sender, member)), Some(exec)) = (degraded_sender, self.exec.as_mut()) {
+        if let (Some(sender), Some(exec)) = (degraded_sender, self.exec.as_mut()) {
             exec.degraded_senders.insert(sender);
-            // Issue #2217: the unmodelled member's balance moves were not
-            // applied, so every address they would have touched is unknown.
-            let txn = &txgroup[member].txn;
-            exec.unknown_balances.insert(txn.sender);
-            if txn.txn_type == TxnType::Pay {
-                exec.unknown_balances.insert(txn.receiver);
-                if !txn.close_remainder_to.is_zero() {
-                    exec.unknown_balances.insert(txn.close_remainder_to);
-                }
-            }
+        }
+        if let Some(exec) = self.exec.as_mut() {
+            exec.unknown_balances.extend(moves.unknown.drain(..));
         }
 
         // All checks passed — commit the STIB data and byte counts.
@@ -11038,9 +11105,10 @@ mod tests {
     #[test]
     fn cow_overlay_and_ledger_side_dups_agree_on_text_and_tag() {
         use algo_error::AlgoError;
-        let consensus =
-            algo_types::consensus::consensus_params_for_version(algo_types::CONSENSUS_V41)
-                .expect("v41");
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::CONSENSUS_V41,
+        )
+        .expect("v41");
         let sender = Address([1; 32]);
         let lease = [0xBB; 32];
         let gh = [0x6E; 32];
