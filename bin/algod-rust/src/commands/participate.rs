@@ -1942,16 +1942,25 @@ impl ExecGroup {
     }
 }
 
-/// The members of one group whose Algo balance moves the cheap overlay must not
-/// apply (issue #2217), as decided by `validate_group`: the members admitted on
-/// a creditable shortfall, and every member sent from an address whose balance
-/// is unknown (including one made unknown earlier in the same group).
+/// What `validate_group` decides about the Algo balance moves of one group on an
+/// incomplete evaluator (issue #2217). A member is UNMODELLED when it was
+/// admitted on a creditable shortfall, or is sent from an address whose balance
+/// is unknown (one made unknown by an earlier group, or earlier in this group).
+/// `transaction_group` still applies such a member's moves, then restores the
+/// balances in [`Self::touched`], so the overlay never keeps a phantom balance.
 #[derive(Default)]
 struct DegradedMoves {
-    /// Per member of the group; empty when no member is unmodelled.
-    unmodelled: Vec<bool>,
-    /// The addresses this group makes unknown, recorded on admission.
+    /// Per member of the group: the addresses whose balance moves are not kept
+    /// (sender, fee sink, receiver, close target); empty for a modelled member,
+    /// and the whole list is empty when no member is unmodelled. The ONE source
+    /// of both the restore and the unknown marks.
+    touched: Vec<Vec<Address>>,
+    /// Every address this group makes unknown (`touched` plus what an
+    /// application call references), recorded on admission.
     unknown: Vec<Address>,
+    /// The distinct senders of every shortfall admitted as creditable, each of
+    /// which takes a [`DEGRADED_SENDER_CAP`] slot (not only the first one).
+    credited_senders: Vec<Address>,
 }
 
 /// Real-apply state of one pending block evaluator.
@@ -1980,7 +1989,7 @@ struct ExecState {
     /// of refused; block assembly re-runs the real apply and drops what
     /// fails, so this costs evaluation budget, never an invalid block. Only
     /// filled while the evaluator is incomplete; bounded by the block's size.
-    unknown_balances: HashSet<Address>,
+    unknown_balances: Arc<HashSet<Address>>,
     /// Set once a group was admitted without being evaluated (stale base or
     /// spent budget): the overlay no longer matches the admitted set, so
     /// admission stops consulting it. Assembly is unaffected.
@@ -2601,8 +2610,9 @@ impl SimpleBlockEvaluator {
     ///    (`GroupReject::creditable`) for `resolve_precheck_rejection` to admit
     ///    (within a per-sender cap) or refuse. Every such member, and every
     ///    member sent from an address left unknown by one, is NOT modelled
-    ///    (`DegradedMoves`): the overlay does not keep its balance moves, and
-    ///    the addresses it touches become unknown in turn (#2217, tests
+    ///    (`DegradedMoves`): `transaction_group` applies its moves and then
+    ///    restores the balances it touched, and the addresses it touches become
+    ///    unknown in turn (#2217, tests
     ///    `a_degraded_admission_*`). A known residual: a later member's
     ///    outright failure is reported instead of the deferred member's
     ///    overspend that go would name first.
@@ -2706,15 +2716,21 @@ impl SimpleBlockEvaluator {
         // apply either, which `resolve_precheck_rejection` treats the same way.
         let degraded = self.exec.as_ref().is_none_or(|exec| exec.incomplete);
         let mut deferred: Option<Box<GroupReject>> = None;
-        // Issue #2217: the unknown addresses (from earlier groups, then grown
-        // by this group's unmodelled members) and the members whose balance
-        // moves are not modelled.
-        let mut unknown_now: HashSet<Address> = match (degraded, self.exec.as_ref()) {
-            (true, Some(exec)) => exec.unknown_balances.clone(),
-            _ => HashSet::new(),
+        // Issue #2217: balance tracking needs the exec state to keep the
+        // unknown marks in. The only non-test constructor
+        // (`PoolLedgerAdapter::make_evaluator`) always builds `exec:
+        // Some(..)`, so an evaluator without it exists only in unit tests with a
+        // fake snapshot; it keeps the pre-#2217 behaviour (moves applied).
+        let tracked = degraded && self.exec.is_some();
+        // The unknown addresses of earlier groups (a cheap `Arc` clone, not a
+        // copy of the set) and this group's own delta.
+        let known: Arc<HashSet<Address>> = match (tracked, self.exec.as_ref()) {
+            (true, Some(exec)) => Arc::clone(&exec.unknown_balances),
+            _ => Arc::default(),
         };
         let mut marked: Vec<Address> = Vec::new();
-        let mut unmodelled_members = vec![false; txgroup.len()];
+        let mut touched_members: Vec<Vec<Address>> = vec![Vec::new(); txgroup.len()];
+        let mut credited_senders: Vec<Address> = Vec::new();
         for (member, (stx, restored_stx)) in txgroup.iter().zip(&restored).enumerate() {
             let fail = |error: algo_error::AlgoError| {
                 Box::new(GroupReject {
@@ -2760,8 +2776,8 @@ impl SimpleBlockEvaluator {
             let already_spent = spent.get(&sender).copied().unwrap_or(0);
             let required = already_spent.saturating_add(cost);
             let available = base.saturating_add(credited);
-            let unknown_sender = degraded && unknown_now.contains(&sender);
-            let mut credited = false;
+            let unknown_sender = tracked && (known.contains(&sender) || marked.contains(&sender));
+            let mut shortfall_credited = false;
             if available < required {
                 // Issue #2187: a shortfall after an application call that may
                 // reach this sender is not provably go's overspend. Issue
@@ -2771,7 +2787,12 @@ impl SimpleBlockEvaluator {
                         .iter()
                         .any(|&i| Self::app_call_may_credit(&txgroup[i].txn))
                         || unknown_sender);
-                credited = credit;
+                shortfall_credited = credit;
+                // Every creditable sender takes a cap slot, also a second
+                // short member that `deferred` does not keep.
+                if credit && !credited_senders.contains(&sender) {
+                    credited_senders.push(sender);
+                }
                 if !(credit && deferred.is_some()) {
                     // go's `eval.transaction` moves the fee first, then the amount;
                     // each failing `Move` is a `ledgercore.OverspendError` carrying
@@ -2813,36 +2834,50 @@ impl SimpleBlockEvaluator {
             }
             // Issue #2217: a member admitted on a creditable shortfall, or sent
             // from an unknown address, is not modelled: `transaction_group`
-            // skips its balance moves, and every address it would have moved
-            // value to (and the sender itself) becomes unknown, so the
+            // applies its moves as for any member, then restores the balances
+            // it touched (`DegradedMoves::touched`), and those addresses (and
+            // what an application call references) become unknown, so the
             // unknown set propagates through the rest of the group too.
-            if credited || unknown_sender {
-                unmodelled_members[member] = true;
-                let mut touched = vec![sender];
+            if tracked && (shortfall_credited || unknown_sender) {
+                let mut touched: Vec<Address> = Vec::new();
+                let mut moved = vec![sender];
                 if fee > 0 {
-                    touched.push(self.hdr.fee_sink);
+                    moved.push(self.hdr.fee_sink);
                 }
                 if is_pay {
-                    touched.push(stx.txn.receiver);
-                    touched.push(stx.txn.close_remainder_to);
+                    moved.push(stx.txn.receiver);
+                    moved.push(stx.txn.close_remainder_to);
                 }
+                for addr in moved {
+                    if !addr.is_zero() && !touched.contains(&addr) {
+                        touched.push(addr);
+                    }
+                }
+                let mut referenced: Vec<Address> = Vec::new();
                 if stx.txn.txn_type == TxnType::Appl {
                     // Inner transactions can pay anyone: what a call
-                    // references is all that is known of its targets.
-                    let app_ids = std::iter::once(stx.txn.application_id)
-                        .chain(stx.txn.foreign_apps.iter().flatten().copied());
-                    touched.extend(
+                    // references (accounts, applications, the V41 access
+                    // list) is all that is known of its targets.
+                    let mut app_ids = vec![stx.txn.application_id];
+                    app_ids.extend(stx.txn.foreign_apps.iter().flatten().copied());
+                    referenced.extend(stx.txn.accounts.iter().flatten().copied());
+                    for r in stx.txn.access.iter().flatten() {
+                        referenced.push(r.address);
+                        app_ids.push(r.app);
+                    }
+                    referenced.extend(
                         app_ids
+                            .into_iter()
                             .filter(|&id| id != 0)
                             .map(|id| Address(algo_ledger::avm_context::app_address(id))),
                     );
-                    touched.extend(stx.txn.accounts.iter().flatten().copied());
                 }
-                for addr in touched {
-                    if !addr.is_zero() && unknown_now.insert(addr) {
-                        marked.push(addr);
+                for addr in touched.iter().chain(&referenced) {
+                    if !addr.is_zero() && !known.contains(addr) && !marked.contains(addr) {
+                        marked.push(*addr);
                     }
                 }
+                touched_members[member] = touched;
             }
             // The members whose effects on Algo balances this precheck does
             // not model, recorded as soon as the member passed its own checks
@@ -2892,10 +2927,11 @@ impl SimpleBlockEvaluator {
                 txids: Vec::new(),
             })
         })?;
-        if unmodelled_members.iter().any(|&u| u) {
-            moves.unmodelled = unmodelled_members;
+        if touched_members.iter().any(|t| !t.is_empty()) {
+            moves.touched = touched_members;
             moves.unknown = marked;
         }
+        moves.credited_senders = credited_senders;
         // The recorded shortfall decides last: every other check passed.
         if let Some(reject) = deferred {
             return Err(reject);
@@ -3503,6 +3539,7 @@ impl SimpleBlockEvaluator {
         &mut self,
         txgroup: &[algo_types::SignedTransaction],
         reject: GroupReject,
+        credited: &[Address],
     ) -> Result<(Vec<algo_types::Digest>, Option<Address>), algo_error::AlgoError> {
         // A first member cannot be funded by an earlier one, except when its
         // sender's balance is unknown after a degraded admission (#2217; only
@@ -3544,12 +3581,20 @@ impl SimpleBlockEvaluator {
                 match self.exec.as_ref() {
                     // No exec state: nothing to cap, as before issue #2187.
                     None => return Ok((reject.txids, None)),
+                    // Every creditable sender of the group (#2217: not only the
+                    // first) takes a slot, new ones within the cap.
                     Some(exec)
                         if exec.incomplete
-                            && (exec.degraded_senders.contains(&sender)
-                                || exec.degraded_senders.len() < DEGRADED_SENDER_CAP) =>
+                            && exec.degraded_senders.len()
+                                + std::iter::once(&sender)
+                                    .chain(credited)
+                                    .collect::<HashSet<_>>()
+                                    .into_iter()
+                                    .filter(|s| !exec.degraded_senders.contains(*s))
+                                    .count()
+                                <= DEGRADED_SENDER_CAP =>
                     {
-                        // The slot is taken once the group is really admitted.
+                        // The slots are taken once the group is really admitted.
                         return Ok((reject.txids, Some(sender)));
                     }
                     Some(_) => {}
@@ -3958,7 +4003,8 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             // group is admitted as go would admit it, below; or an evaluator
             // with no real apply admits a creditable shortfall.
             Err(reject) => {
-                let (txids, sender) = self.resolve_precheck_rejection(txgroup, *reject)?;
+                let (txids, sender) =
+                    self.resolve_precheck_rejection(txgroup, *reject, &moves.credited_senders)?;
                 degraded_sender = sender;
                 txids
             }
@@ -4081,25 +4127,17 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             // its moves below as any member would, then the balances it
             // touched are put back to what they were before it, so the
             // overlay never holds a phantom balance (the unknown addresses
-            // are recorded on admission).
-            let restore: Vec<(Address, u64)> = if moves.unmodelled.get(member) == Some(&true) {
-                let mut addrs = vec![stx.txn.sender];
-                if stx.txn.fee > 0 {
-                    addrs.push(fee_sink);
-                }
-                if stx.txn.txn_type == TxnType::Pay {
-                    addrs.push(stx.txn.receiver);
-                    addrs.push(stx.txn.close_remainder_to);
-                }
-                let mut before: Vec<(Address, u64)> = Vec::new();
-                for addr in addrs {
-                    if !addr.is_zero() && !before.iter().any(|(a, _)| *a == addr) {
-                        before.push((addr, self.try_effective_balance(&addr)?));
+            // are recorded on admission). The list is `validate_group`'s, the
+            // same one the unknown marks come from.
+            let restore: Vec<(Address, u64)> = match moves.touched.get(member) {
+                Some(touched) if !touched.is_empty() => {
+                    let mut before = Vec::with_capacity(touched.len());
+                    for addr in touched {
+                        before.push((*addr, self.try_effective_balance(addr)?));
                     }
+                    before
                 }
-                before
-            } else {
-                Vec::new()
+                _ => Vec::new(),
             };
 
             // Update balances in overlay following Go's apply.Payment() order:
@@ -4475,7 +4513,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                 creditable: None,
                 txids: txids.clone(),
             };
-            if let Err(error) = self.resolve_precheck_rejection(txgroup, reject) {
+            if let Err(error) = self.resolve_precheck_rejection(txgroup, reject, &[]) {
                 // Rollback overlay and fees (go's child cow is dropped).
                 self.overlay.restore(checkpoint);
                 self.fees_collected = fees_collected_checkpoint;
@@ -4518,9 +4556,12 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
 
         if let (Some(sender), Some(exec)) = (degraded_sender, self.exec.as_mut()) {
             exec.degraded_senders.insert(sender);
+            exec.degraded_senders
+                .extend(moves.credited_senders.iter().copied());
         }
         if let Some(exec) = self.exec.as_mut() {
-            exec.unknown_balances.extend(moves.unknown.drain(..));
+            // `validate_group`'s `Arc` clone is gone, so this does not copy.
+            Arc::make_mut(&mut exec.unknown_balances).extend(moves.unknown.drain(..));
         }
 
         // All checks passed — commit the STIB data and byte counts.
@@ -5236,7 +5277,7 @@ impl PoolLedgerAdapter {
                 reconcile_spent: Duration::ZERO,
                 reconcile_runs: 0,
                 degraded_senders: HashSet::new(),
-                unknown_balances: HashSet::new(),
+                unknown_balances: Arc::new(HashSet::new()),
                 incomplete: false,
                 last_passes: 0,
                 final_state_proof_next: None,

@@ -4216,7 +4216,7 @@ fn degraded_evaluator() -> SimpleBlockEvaluator {
 }
 
 fn unknown_of(eval: &SimpleBlockEvaluator) -> HashSet<Address> {
-    eval.exec.as_ref().unwrap().unknown_balances.clone()
+    (*eval.exec.as_ref().unwrap().unknown_balances).clone()
 }
 
 fn balance(eval: &mut SimpleBlockEvaluator, who: &Address) -> u64 {
@@ -4362,6 +4362,105 @@ fn a_degraded_admission_with_a_short_app_call_marks_what_the_call_references() {
     }
 }
 
+/// Issue #2217 review: the V41 access list references accounts and
+/// applications too (`app_call_may_credit` counts it); a short application call
+/// that references them through `access` marks them unknown like the legacy
+/// `accounts` / `foreign_apps` fields.
+#[test]
+fn a_degraded_admission_with_a_short_app_call_marks_its_access_list() {
+    let mut eval = degraded_evaluator();
+    let f = key(7);
+    let named = key(9);
+    let mut call = base_txn(f.0, TxnType::Appl);
+    call.application_id = 905;
+    call.access = Some(vec![
+        algo_types::ResourceRef {
+            address: named.0,
+            ..Default::default()
+        },
+        algo_types::ResourceRef {
+            app: 906,
+            ..Default::default()
+        },
+    ]);
+    eval.transaction_group(&call_then(vec![(call, &f)], 5))
+        .expect("admitted");
+    let unknown = unknown_of(&eval);
+    for who in [named.0, Address(algo_ledger::avm_context::app_address(906))] {
+        assert!(unknown.contains(&who), "{who} should be unknown");
+    }
+}
+
+/// Issue #2217 review: an evaluator with no exec state (a unit-test fake: the
+/// only production constructor, `make_evaluator`, always builds `exec:
+/// Some(..)`) cannot carry unknown marks, so it keeps the behaviour from before
+/// #2217 entirely: the moves are applied (consistently, not restored with
+/// nothing marked), so the receiver holds what the sender paid it.
+#[test]
+fn an_evaluator_without_exec_state_keeps_the_pre_2217_behaviour() {
+    let mut eval = degraded_evaluator();
+    eval.exec = None;
+    let r = key(4);
+    let r_before = balance(&mut eval, &r.0);
+    eval.transaction_group(&call_then_short_pay(906, 7, 1))
+        .expect("admitted");
+    assert_eq!(balance(&mut eval, &r.0), r_before + 1_000);
+}
+
+/// Issue #2217 review: EVERY creditable sender of a group takes a cap slot,
+/// not only the first one `deferred` keeps: with one slot left, `[call, F1 pays
+/// (short), F2 pays (short)]` is refused (it needs two), while a group with one
+/// new short sender is admitted and takes the last slot.
+#[test]
+fn every_creditable_sender_of_a_group_counts_against_the_cap() {
+    let mut eval = degraded_evaluator();
+    {
+        let exec = eval.exec.as_mut().unwrap();
+        for n in 0..DEGRADED_SENDER_CAP as u8 - 1 {
+            exec.degraded_senders.insert(key(150 + n).0);
+        }
+    }
+    let (f1, f2, r) = (key(7), key(8), key(4));
+    let two = call_then(
+        vec![
+            (pay_txn(&f1, r.0, 1_000, 1), &f1),
+            (pay_txn(&f2, r.0, 1_000, 2), &f2),
+        ],
+        6,
+    );
+    let err = eval.transaction_group(&two).expect_err("needs two slots");
+    assert!(err.to_string().contains("overspend"), "{err}");
+    assert_eq!(
+        eval.exec.as_ref().unwrap().degraded_senders.len(),
+        DEGRADED_SENDER_CAP - 1,
+        "a refused group takes no slot"
+    );
+    let one = call_then(vec![(pay_txn(&f1, r.0, 1_000, 3), &f1)], 7);
+    eval.transaction_group(&one).expect("one slot is left");
+    assert_eq!(
+        eval.exec.as_ref().unwrap().degraded_senders.len(),
+        DEGRADED_SENDER_CAP
+    );
+}
+
+/// Issue #2217 review: an admitted group with two short senders takes a slot
+/// for EACH of them, so a retry by either does not take a new one.
+#[test]
+fn a_group_with_two_short_senders_takes_two_cap_slots() {
+    let mut eval = degraded_evaluator();
+    let (f1, f2, r) = (key(7), key(8), key(4));
+    let group = call_then(
+        vec![
+            (pay_txn(&f1, r.0, 1_000, 1), &f1),
+            (pay_txn(&f2, r.0, 1_000, 2), &f2),
+        ],
+        8,
+    );
+    eval.transaction_group(&group).expect("admitted");
+    let slots = &eval.exec.as_ref().unwrap().degraded_senders;
+    assert!(slots.contains(&f1.0) && slots.contains(&f2.0), "{slots:?}");
+}
+
 /// Issue #2217 review (item 8): an unknown-balance shortfall is admitted even
 /// as a group's first member, so the per-sender cap must bound it: the same
 /// cap as for the creditable senders, shared. Cheap admissions are re-verified
@@ -4373,7 +4472,8 @@ fn unknown_balance_admissions_are_capped_per_sender() {
         .map(|n| key(150 + n))
         .collect();
     for k in &senders {
-        eval.exec.as_mut().unwrap().unknown_balances.insert(k.0);
+        let exec = eval.exec.as_mut().unwrap();
+        Arc::make_mut(&mut exec.unknown_balances).insert(k.0);
     }
     for (n, k) in senders.iter().take(DEGRADED_SENDER_CAP).enumerate() {
         eval.transaction_group(&[pay(k, key(5).0, 1_000, None)])
