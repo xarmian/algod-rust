@@ -907,7 +907,14 @@ ran with. These differences remain, and they are part of what is measured:
 - **Fetch pipeline.** go's harness writes blocks in order from one goroutine,
   as `fetchAndWrite` does once the previous round is written; it does not run
   go's network fetch pipeline. algod-rust runs its real sync pass, including
-  its fetch worker threads (`CatchupParallelBlocks`).
+  its fetch worker threads (`CatchupParallelBlocks`). The same
+  `CatchupParallelBlocks` therefore means different things on the two sides:
+  go's value is the whole window (the harness does not even use it), algod-rust's
+  value is the number of concurrent fetch workers, with a window of
+  `workers + min(workers, 32)` rounds ahead of the apply cursor (DIV-010; 16
+  workers, a window of 32). The corpus fetcher is a local file read, so the
+  window has no latency to hide and does not change what this tier measures;
+  the live catchup tier is where it matters.
 
 ### The final-state equality gate
 

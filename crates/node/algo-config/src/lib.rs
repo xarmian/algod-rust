@@ -2728,7 +2728,10 @@ pub struct Local {
     /// Go: `CatchupParallelBlocks`. Wired into
     /// `CatchupService::start_with_parallelism` (issue #753 fixed a real
     /// behavioral gap: the periodic catchup path previously fetched blocks
-    /// strictly serially with no worker pool at all).
+    /// strictly serially with no worker pool at all). It is the number of
+    /// concurrent block fetches; the window of rounds fetched ahead of the
+    /// apply cursor is larger (DIV-010, issue #2204): up to twice as many,
+    /// `1` stays strictly serial.
     #[serde(
         rename = "CatchupParallelBlocks",
         default = "default_catchup_parallel_blocks"

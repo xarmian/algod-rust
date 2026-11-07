@@ -438,6 +438,9 @@ func main() {
 		Corpus:  meta.Name,
 		Rounds:  last,
 		Metrics: m,
+		// CatchupParallelBlocks: go's whole fetch window (this harness does not run
+		// the fetch pipeline); algod-rust's concurrent fetch workers, with a window of
+		// up to twice as many rounds ahead (DIV-010).
 		Config: map[string]any{
 			"Archival":                 cfg.Archival,
 			"CatchupBlockValidateMode": cfg.CatchupBlockValidateMode,
