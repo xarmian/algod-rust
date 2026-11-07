@@ -23,7 +23,7 @@ use std::hint::black_box;
 
 use algo_avm::bytecode::parse;
 use algo_avm::machine::{AvmMachine, ExecMode};
-use algo_avm::NullContext;
+use algo_avm::{NullContext, NullTracer};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -285,6 +285,30 @@ fn bench_stack_ops_execution(c: &mut Criterion) {
     );
 }
 
+/// The traced step path (`step_with_tracer`) with a `NullTracer`: what an
+/// untraced app call takes where the evaluator is generic over the tracer, and
+/// what a simulate trace builds on. Reports the cost of the per-step program
+/// counter the tracer is told about.
+fn bench_traced_step_execution(c: &mut Criterion) {
+    let raw = arithmetic_program(100);
+    let budget = 20_000;
+    c.bench_function(
+        "exec: arithmetic 100 add+pop cycles via step_with_tracer",
+        |b| {
+            b.iter(|| {
+                let program = parse(black_box(&raw)).unwrap();
+                let mut machine = AvmMachine::new(program, ExecMode::LogicSig, budget);
+                let mut tracer = NullTracer;
+                while !machine.finished {
+                    machine
+                        .step_with_tracer(&mut NullContext, &mut tracer)
+                        .unwrap();
+                }
+            });
+        },
+    );
+}
+
 fn bench_concat_execution(c: &mut Criterion) {
     let raw = concat_program(50);
     let budget = 20_000;
@@ -352,6 +376,7 @@ criterion_group!(
     bench_parse_large,
     bench_arithmetic_execution,
     bench_stack_ops_execution,
+    bench_traced_step_execution,
     bench_concat_execution,
     bench_sha256_execution,
     bench_keccak256_execution,

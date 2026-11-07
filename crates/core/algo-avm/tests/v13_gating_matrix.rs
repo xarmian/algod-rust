@@ -80,15 +80,11 @@ fn v13_sha512_opcode_has_version_13() {
     assert_eq!(spec.cost, CostKind::Dynamic);
 }
 
-/// go-algorand registers `sumhash512` at `sumhashVersion = 14`
-/// ("EXPERIMENTAL", `data/transactions/logic/opcodes.go`), one past the newest
-/// released AVM version (13), so it is not available to any parsable program
-/// (issue #2225: it used to be registered at 13).
 #[test]
-fn sumhash512_is_an_experimental_version_14_opcode() {
+fn v13_sumhash512_opcode_has_version_13() {
     let spec = lookup(0x86).expect("sumhash512 must be registered");
     assert_eq!(spec.name, "sumhash512");
-    assert_eq!(spec.version, 14);
+    assert_eq!(spec.version, 13);
     assert_eq!(spec.cost, CostKind::Dynamic);
 }
 
@@ -127,10 +123,9 @@ fn sha512_accepted_in_v13_program_at_parse() {
 }
 
 #[test]
-fn sumhash512_rejected_in_v13_program_at_parse() {
-    // Not available before version 14 (go: `sumhashVersion`).
+fn sumhash512_accepted_in_v13_program_at_parse() {
     let raw = build_program(13, &[0x80, 0x00, 0x86, 0x43]);
-    parse(&raw).expect_err("v13 program with sumhash512 must fail parse");
+    parse(&raw).expect("v13 program with sumhash512 must parse");
 }
 
 #[test]
@@ -291,6 +286,24 @@ fn run_approval_program_accepts_v12_under_v41_ceiling() {
     assert!(result.approved);
 }
 
-// `sumhash512` is a version-14 opcode (see `sumhash512_is_an_experimental_
-// version_14_opcode`), so no v13 program can execute it; its output is covered
-// byte for byte by `v13_sumhash512_vectors.rs`, which drives the handler.
+#[test]
+fn v13_sumhash512_program_executes() {
+    let mut code = vec![0x80, 0x05]; // pushbytes 5 bytes
+    code.extend_from_slice(b"hello");
+    code.push(0x86); // sumhash512
+    let raw = build_program(13, &code);
+    let program = parse(&raw).expect("parse");
+
+    let mut machine = AvmMachine::new(program, ExecMode::LogicSig, 100_000);
+    // See v13_sha512_program_executes: this deliberately leaves a bytes
+    // digest (not an int) on the stack, so step past the real
+    // instructions only and skip the strict implicit-end check.
+    while !machine.finished && machine.pc < machine.program.instructions.len() {
+        machine
+            .step(&mut NullContext)
+            .expect("v13 sumhash512 program must execute");
+    }
+
+    let top = machine.pop_bytes().expect("stack top");
+    assert_eq!(top.len(), 64, "sumhash512 output must be 64 bytes");
+}
