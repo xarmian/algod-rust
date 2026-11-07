@@ -4187,24 +4187,40 @@ fn the_group_local_rule_is_exact() {
     assert!(SimpleBlockEvaluator::app_call_may_credit(&create));
 }
 
-/// Known residual (follow-up #2217): the cheap overlay of an incomplete
-/// evaluator does not know the inner credit that justified the admission, so
-/// the short sender is saturated to 0 and the receiver is credited as if the
-/// sender could pay. Pinned so a change to it is deliberate.
+/// Issue #2217: the cheap overlay of an incomplete evaluator does not know the
+/// inner credit that justified a degraded admission, so it must not apply the
+/// unmodelled member's balance moves (the short sender saturated to 0 and the
+/// receiver credited as if the sender could pay were phantom balances). The
+/// touched balances are UNKNOWN instead: later checks do not judge them (the
+/// block assembly re-runs the real apply and drops what fails), while an
+/// address the admission never touched is still judged.
 #[test]
-fn a_degraded_admission_leaves_phantom_balances() {
+fn a_degraded_admission_does_not_leave_phantom_balances() {
     let mut eval = two_app_evaluator();
     eval.exec.as_mut().unwrap().incomplete = true;
     let f = key(7);
     let r = key(4);
+    let f_before = eval.try_effective_balance(&f.0).expect("F");
+    let r_before = eval.try_effective_balance(&r.0).expect("R");
     eval.transaction_group(&call_then_short_pay(906, 7, 1))
         .expect("admitted");
-    assert_eq!(eval.try_effective_balance(&f.0).expect("F"), 0);
+    assert_eq!(
+        eval.try_effective_balance(&f.0).expect("F"),
+        f_before,
+        "the short sender was not saturated to 0"
+    );
     assert_eq!(
         eval.try_effective_balance(&r.0).expect("R"),
-        1_000_000 + 1_000,
-        "R holds a credit F could not pay"
+        r_before,
+        "R was not credited an amount F could not pay"
     );
+    // F's own later group: the inner credit may well fund it, so a balance
+    // the evaluator cannot know does not refuse it.
+    eval.transaction_group(&[pay(&f, key(5).0, 1_000, None)])
+        .expect("F's later group is not refused on an unknown balance");
+    // Negative control: an address the admission never touched is judged.
+    eval.transaction_group(&[pay(&key(201), key(5).0, 1_000, None)])
+        .expect_err("an untouched short sender is still refused");
 }
 
 /// Issue #2187: a stream of creditable overspends against a COMPLETE
@@ -4422,7 +4438,10 @@ fn the_live_lease_table_gives_the_snapshot_verdict() {
 /// The txids of `len` payset transactions of `eval` from `start`, hashed as
 /// the txtail records them (what a smuggled-in group carries).
 fn carried_txids(eval: &SimpleBlockEvaluator, start: usize, len: usize) -> Vec<algo_types::Digest> {
-    algo_codec::payset_txids_with_rule(&eval.included_txns[start..start + len], &eval.genesis_rule())
+    algo_codec::payset_txids_with_rule(
+        &eval.included_txns[start..start + len],
+        &eval.genesis_rule(),
+    )
 }
 
 /// Admission hands every group's txids (hashed once for `checkDup`) to the
@@ -4523,7 +4542,10 @@ fn carried_txids_equal_the_rehash_for_transactions_without_genesis_fields() {
         algo_codec::block_txids_with_rule(&block, &eval.genesis_rule())
     );
     assert_eq!(
-        eval.generate_block(&[]).expect("generate_block").payset.len(),
+        eval.generate_block(&[])
+            .expect("generate_block")
+            .payset
+            .len(),
         admitted
     );
 }
@@ -4727,7 +4749,10 @@ fn go_rejection_decides_framing_from_the_type_not_the_text() {
     ));
 
     // An UNframed typed min-balance rejection is framed once, tag kept.
-    let out = super::go_rejection(&txid, algo_error::min_balance_rejected("ADDR", 50, 100_000, 0));
+    let out = super::go_rejection(
+        &txid,
+        algo_error::min_balance_rejected("ADDR", 50, 100_000, 0),
+    );
     assert_eq!(
         out.to_string(),
         "transaction TXID: account ADDR balance 50 below min 100000 (0 assets)"
