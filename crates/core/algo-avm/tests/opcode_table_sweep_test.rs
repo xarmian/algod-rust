@@ -124,16 +124,7 @@ fn opcode_table_every_entry_has_a_valid_version() {
     // opcode should be gated at version 0 (undefined/never-available) or at
     // a version beyond LogicVersion (unreachable -- the assembler caps
     // programs at MAX_AVM_VERSION, so such an opcode could never be used).
-    //
-    // Exception, named: go registers `sumhash512` at `sumhashVersion = 14`
-    // ("EXPERIMENTAL", one past the newest released AVM version); it is
-    // registered at go's version so no released program can use it (issue
-    // #2225).
-    const BEYOND_THE_RELEASED_VERSION: &[(&str, u8)] = &[("sumhash512", 14)];
     for (name, version) in all_named_opcode_versions() {
-        if BEYOND_THE_RELEASED_VERSION.contains(&(name, version)) {
-            continue;
-        }
         assert!(
             (1..=MAX_AVM_VERSION).contains(&version),
             "opcode {name:?} has out-of-range version {version} (must be 1..={MAX_AVM_VERSION})"

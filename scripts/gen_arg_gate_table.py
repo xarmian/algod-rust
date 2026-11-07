@@ -88,7 +88,7 @@ def rows():
     return sorted(out)
 
 
-def render():
+def render(table):
     body = [HEADER]
     body.append("use super::arg_gate::ArgType;\n")
     body.append(
@@ -100,14 +100,15 @@ def render():
     )
     body.append("pub(super) static TABLE: [Option<&[ArgType]>; 256] = {\n")
     body.append("    let mut t: [Option<&[ArgType]>; 256] = [None; 256];\n")
-    for op, name, args in rows():
+    for op, name, args in table:
         body.append(f"    t[0x{op:02x}] = Some(&[{', '.join(args)}]); // {name}\n")
     body.append("    t\n};\n")
     return "".join(body)
 
 
 def main():
-    text = render()
+    table = rows()
+    text = render(table)
     if "--check" in sys.argv:
         # Compare bytes with line endings normalised, so a CRLF checkout of
         # the generated file is not "stale".
@@ -117,7 +118,7 @@ def main():
             sys.exit(1)
         return
     OUT.write_bytes(text.encode())  # LF on every platform
-    print(f"wrote {OUT} ({len(rows())} opcodes)")
+    print(f"wrote {OUT} ({len(table)} opcodes)")
 
 
 if __name__ == "__main__":

@@ -500,7 +500,7 @@ impl AvmMachine {
         let old_pc = self.pc;
         // go's tracer reports the program counter as a BYTE offset into the
         // program (the version header counts), not an instruction index.
-        let old_byte_pc = if tracer.wants_pc() { self.byte_pc() } else { 0 };
+        let old_byte_pc = self.byte_pc();
 
         // Record opcode hit for coverage tracking.
         self.opcode_hits[instr.opcode as usize] = true;

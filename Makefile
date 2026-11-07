@@ -12,6 +12,7 @@ P2P_INTEROP_CLUSTER := ops/mixed-cluster-p2p
 P2P_INTEROP_1V1_CLUSTER := ops/mixed-cluster-p2p-1v1
 
 .PHONY: build test fmt fmt-check clippy lint deny ci clean coverage coverage-lcov
+.PHONY: arg-gate-table
 .PHONY: validate-api-up validate-api-down validate-api-status validate-api-logs validate-api
 .PHONY: replay-mainnet replay-testnet replay-stateful replay-mainnet-stateful replay-mainnet-1k
 .PHONY: avm-replay avm-replay-mainnet

@@ -1719,25 +1719,15 @@ mod tests {
         assert_eq!(ecdsa_verify_cost(1), 2500, "Secp256r1 cost");
     }
 
-    /// `sumhash512` is an EXPERIMENTAL version-14 opcode in go (`sumhashVersion
-    /// = 14`), so no parsable program (version <= 13) can contain it: its cost
-    /// is checked by calling the handler directly, which charges the dynamic
-    /// cost itself.
     #[test]
     fn test_hash_costs_sumhash512_matches_go_test_vectors() {
         // sumhash512: baseCost=150, chunkCost=4, chunkSize=7
         for (size, expected) in [(0usize, 150u64), (1, 154), (64, 190), (1000, 722)] {
-            let program = parse(&prog(13, &[])).unwrap();
-            let mut m = AvmMachine::new(program, ExecMode::LogicSig, 100_000);
-            m.push(AvmValue::Bytes(vec![0u8; size])).unwrap();
-            let instr = Instruction {
-                opcode: 0x86,
-                sub_opcode: None,
-                offset: 0,
-                immediates: crate::bytecode::Immediates::None,
-            };
-            op_sumhash512(&mut m, &instr).unwrap();
-            assert_eq!(m.cost, expected, "sumhash512 cost for {size}-byte input");
+            assert_eq!(
+                hash_opcode_cost(13, 0x86, size),
+                expected,
+                "sumhash512 cost for {size}-byte input"
+            );
         }
     }
 
