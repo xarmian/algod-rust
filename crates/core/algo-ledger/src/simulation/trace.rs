@@ -67,7 +67,9 @@ pub type TxnPath = Vec<usize>;
 /// Mirrors go-algorand's `simulation.OpcodeTraceUnit`.
 #[derive(Debug, Clone, Default)]
 pub struct OpcodeTraceUnit {
-    /// Program counter (instruction index) of the executed opcode.
+    /// Program counter of the executed opcode, as go reports it: a BYTE offset
+    /// into the program, the version header included (the first opcode of a
+    /// program is at `1`, as in go's simulate trace).
     pub pc: usize,
     /// Values added to the stack by this opcode (captured if `ExecTraceConfig::stack`).
     pub stack_additions: Vec<AvmValueTrace>,

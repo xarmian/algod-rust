@@ -2751,3 +2751,164 @@ fn no_stale_mnemonic_outside_an_instruction() {
     m.step(&mut NullContext).expect("pop");
     assert_eq!(m.pop().unwrap_err().to_string(), "AVM: stack underflow");
 }
+
+// ===========================================================================
+// The rest of go's argument gate table (issue #2225)
+// ===========================================================================
+
+#[test]
+fn the_gate_prints_go_type_names_for_the_aliased_arguments() {
+    // `b+` wants `bigint` (a byte string), not `[]byte`.
+    let mut code = pushint(1).to_vec();
+    code.extend_from_slice(&[0x80, 0x01, 0x01, 0xa0]); // int 1; byte 0x01; b+
+    assert_eq!(
+        first_error(8, &code),
+        ("AVM: b+ arg 0 wanted bigint but got uint64".to_string(), 6)
+    );
+    // `ed25519verify`: data `[]byte`, signature `[64]byte`, key `[32]byte`;
+    // a uint64 in the signature slot names the fixed-size type.
+    let mut code = vec![0x80, 0x01, 0x01];
+    code.extend_from_slice(&pushint(7));
+    code.extend_from_slice(&[0x80, 0x01, 0x02, 0x04]);
+    assert_eq!(
+        first_error(8, &code),
+        (
+            "AVM: ed25519verify arg 1 wanted [64]byte but got uint64".to_string(),
+            9
+        )
+    );
+}
+
+#[test]
+fn the_gate_now_covers_the_stack_and_byte_opcodes() {
+    // `setbyte` (bytes, uint64, uint64): all three arguments are wrong, go
+    // reports argument 0.
+    let mut code = pushint(1).to_vec();
+    code.extend_from_slice(&[0x80, 0x01, 0x01, 0x80, 0x01, 0x01, 0x56]);
+    assert_eq!(
+        first_error(8, &code),
+        (
+            "AVM: setbyte arg 0 wanted []byte but got uint64".to_string(),
+            9
+        )
+    );
+    // `select` (any, any, uint64): the condition is argument 2.
+    let mut code = pushint(1).to_vec();
+    code.extend_from_slice(&pushint(2));
+    code.extend_from_slice(&[0x80, 0x01, 0x01, 0x4d]);
+    assert_eq!(
+        first_error(8, &code),
+        (
+            "AVM: select arg 2 wanted uint64 but got []byte".to_string(),
+            8
+        )
+    );
+    // The stack height comes first for a four-argument opcode.
+    assert_eq!(
+        first_error(8, &[0x80, 0x01, 0x01, 0x58]), // extract3 with one value
+        ("AVM: stack underflow in extract3".to_string(), 4)
+    );
+}
+
+/// Records the program counter the tracer is told about.
+#[derive(Default)]
+struct PcTracer {
+    before: Vec<usize>,
+    after: Vec<usize>,
+}
+
+impl algo_avm::EvalTracer for PcTracer {
+    fn before_opcode(&mut self, pc: usize, _opcode: u8) {
+        self.before.push(pc);
+    }
+    fn after_opcode(
+        &mut self,
+        pc: usize,
+        _opcode: u8,
+        _stack: &[AvmValue],
+        _scratch: &[AvmValue],
+        _error: Option<&str>,
+    ) {
+        self.after.push(pc);
+    }
+}
+
+#[test]
+fn the_tracer_pc_is_a_byte_offset_with_the_version_header() {
+    // version | pushint 300 (3 bytes) | pushint 1 (2 bytes) | + | pop | pushint 1
+    let mut code = pushint(300);
+    code.extend_from_slice(&pushint(1));
+    code.push(0x08); // +
+    code.push(0x48); // pop
+    code.extend_from_slice(&pushint(1));
+    let program = parse(&prog(8, &code)).expect("parse");
+    let mut m = AvmMachine::new(program, ExecMode::LogicSig, 1000);
+    let mut tracer = PcTracer::default();
+    while !m.finished {
+        m.step_with_tracer(&mut NullContext, &mut tracer)
+            .expect("steps");
+    }
+    // Byte offsets, 1 for the version byte: 1, 4, 6, 7, 8 (not 0..=4).
+    assert_eq!(tracer.before, vec![1, 4, 6, 7, 8]);
+    assert_eq!(tracer.after, vec![1, 4, 6, 7, 8]);
+}
+
+#[test]
+fn the_tracer_pc_of_a_failing_opcode_is_its_byte_offset() {
+    // `int 1; int 0; /`: the division fails at byte 5 (go: `pc=5`), and the
+    // error path reports the same offset to the tracer.
+    let mut code = pushint(1).to_vec();
+    code.extend_from_slice(&pushint(0));
+    code.push(0x0a); // /
+    let program = parse(&prog(8, &code)).expect("parse");
+    let mut m = AvmMachine::new(program, ExecMode::LogicSig, 1000);
+    let mut tracer = PcTracer::default();
+    let err = loop {
+        match m.step_with_tracer(&mut NullContext, &mut tracer) {
+            Ok(()) => continue,
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(err.to_string(), "AVM: / 0");
+    assert_eq!(tracer.after.last(), Some(&5));
+}
+
+// ===========================================================================
+// Version-dependent run modes (issue #2225)
+// ===========================================================================
+
+/// `code` under `version` in `mode` to its first error (text only).
+fn first_error_in_mode(version: u8, mode: ExecMode, code: &[u8]) -> String {
+    let program = parse(&prog(version, code)).expect("parse");
+    let mut m = AvmMachine::new(program, mode, 100_000);
+    m.run(&mut NullContext)
+        .expect_err("the program must fail")
+        .to_string()
+}
+
+#[test]
+fn ed25519verify_is_logicsig_only_before_v5() {
+    // go's spec table: `{0x04, "ed25519verify", ..., 1, ...only(ModeSig)}` and
+    // `{0x04, ..., 5, ...}` (both modes). The mode of the PROGRAM's version is
+    // checked before the arguments: with an empty stack go reports the mode,
+    // not the underflow.
+    for version in 1..=4u8 {
+        assert_eq!(
+            first_error_in_mode(version, ExecMode::Application, &[0x04]),
+            "AVM: ed25519verify not allowed in current mode",
+            "application, v{version}"
+        );
+        assert_eq!(
+            first_error_in_mode(version, ExecMode::LogicSig, &[0x04]),
+            "AVM: stack underflow in ed25519verify",
+            "logicsig, v{version}"
+        );
+    }
+    for version in 5..=8u8 {
+        assert_eq!(
+            first_error_in_mode(version, ExecMode::Application, &[0x04]),
+            "AVM: stack underflow in ed25519verify",
+            "application, v{version}"
+        );
+    }
+}

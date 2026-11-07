@@ -312,7 +312,10 @@ fn extra_opcode_budget_with_trace_reports_per_txn_pc_trace() {
         .as_ref()
         .expect("cheap txn should have an approval program trace");
     assert_eq!(cheap_trace.opcodes.len(), 1, "one `int 1` opcode");
-    assert_eq!(cheap_trace.opcodes[0].pc, 0);
+    // go's trace `pc` is a byte offset with the version header: the first
+    // opcode of a program is at 1 (go `TestAppCallWithExtraBudget`: `{PC: 1}`,
+    // issue #2225; it used to be the instruction index 0).
+    assert_eq!(cheap_trace.opcodes[0].pc, 1);
 
     let expensive_trace = group.txn_results[1]
         .trace
@@ -323,7 +326,7 @@ fn extra_opcode_budget_with_trace_reports_per_txn_pc_trace() {
         .expect("expensive txn should have an approval program trace");
     assert_eq!(expensive_trace.opcodes.len(), 1402);
     // PCs are monotonically increasing byte offsets into the program.
-    assert_eq!(expensive_trace.opcodes[0].pc, 0);
+    assert_eq!(expensive_trace.opcodes[0].pc, 1);
     assert!(
         expensive_trace
             .opcodes
