@@ -31,6 +31,7 @@ import argparse
 import json
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -49,6 +50,13 @@ def get(url, token=None, timeout=15):
         req.add_header("X-Algo-API-Token", token)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
+
+
+def free_port():
+    """A free local TCP port for the node's REST API."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 def status(port):
@@ -73,7 +81,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bin", required=True, help="the algod-rust binary")
     ap.add_argument("--genesis", required=True, help="betanet genesis.json")
-    ap.add_argument("--port", type=int, default=8186)
+    ap.add_argument("--port", type=int, default=0, help="REST port (default: a free one)")
     ap.add_argument("--parallel", type=int, default=0, help="CatchupParallelBlocks (default: the node's)")
     ap.add_argument("--label", default="", help="catchpoint label (default: the latest of the index)")
     ap.add_argument("--timeout", type=int, default=1500)
@@ -83,6 +91,7 @@ def main():
     ap.add_argument("--rustlog", default="warn")
     a = ap.parse_args()
 
+    a.port = a.port or free_port()
     label = a.label or get(LABEL_URL).decode().strip()
     label_round = int(label.split("#")[0])
     d = tempfile.mkdtemp(prefix="catchup_native_")
@@ -156,24 +165,30 @@ def main():
                 start_round=clear[1],
                 end_round=end[1],
             )
+            # Recent rounds only (a non-archival node keeps just those), and only
+            # rounds the catchup replayed: above the catchpoint round.
             hi = end[1]
-            rounds = sorted({hi, hi - 150, hi - 300, hi - 450, hi - 600})
-            bad = []
+            rounds = sorted(r for r in {hi, hi - 150, hi - 300, hi - 450, hi - 600} if r > label_round)
+            mismatches = []
+            errors = []
             for r in rounds:
-                try:
-                    mine = json.loads(get(f"http://127.0.0.1:{a.port}/v2/blocks/{r}/hash", TOKEN)).get("blockHash")
-                except Exception as e:
-                    mine = f"ERR {e}"
-                try:
-                    ref = json.loads(get(f"{PUBLIC}/v2/blocks/{r}/hash")).get("blockHash")
-                except Exception as e:
-                    ref = f"ERR {e}"
-                if mine != ref:
-                    bad.append((r, mine, ref))
+                hashes = {}
+                for who, url, token in (
+                    ("node", f"http://127.0.0.1:{a.port}/v2/blocks/{r}/hash", TOKEN),
+                    ("public", f"{PUBLIC}/v2/blocks/{r}/hash", None),
+                ):
+                    try:
+                        hashes[who] = json.loads(get(url, token)).get("blockHash")
+                    except Exception as e:  # a failed request is not a mismatch
+                        errors.append((r, who, str(e)))
+                if len(hashes) == 2 and hashes["node"] != hashes["public"]:
+                    mismatches.append((r, hashes["node"], hashes["public"]))
             out["gate_rounds"] = rounds
-            out["gate_ok"] = not bad
-            if bad:
-                out["gate_bad"] = bad
+            out["gate_ok"] = bool(rounds) and not errors and not mismatches
+            if mismatches:
+                out["gate_mismatches"] = mismatches
+            if errors:
+                out["gate_request_errors"] = errors
             if a.follow_secs:
                 c0, r0, w0 = cpu_seconds(proc.pid), status(a.port)["last-round"], time.time()
                 time.sleep(a.follow_secs)

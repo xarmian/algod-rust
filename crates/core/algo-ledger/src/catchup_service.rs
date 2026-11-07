@@ -4487,58 +4487,110 @@ mod tests {
         );
     }
 
-    /// Two rounds miss at once, the lower one (R) then succeeds (issue #2204):
-    /// the higher one (R + 1) gives up immediately and ITS failed result ends
-    /// the pass when the apply cursor reaches it, whatever R does, so engaging
-    /// the tip gate on it costs nothing: R is applied, the pass ends `NoBlock`
-    /// at R + 1 and does not hang. (The claims before the early give-up are
-    /// the whole window; the gate then holds new claims at `cursor + workers`.)
+    /// A higher round gives up at once while a lower one is registered as
+    /// probing, and the lower one then succeeds (issue #2204). Deterministic:
+    /// round 4's worker misses only once round 3 is REGISTERED in the pass's
+    /// `probing` set (observed through the shared context, not guessed), so
+    /// its `lowest()` check always sees round 3; round 3 is let through only
+    /// after round 4 has returned.
     #[test]
-    fn two_missed_rounds_with_the_lower_one_succeeding_end_the_pass_at_the_higher_one() {
-        use std::sync::{Condvar, Mutex};
-
-        struct TwoMissFetcher {
-            started: Mutex<Vec<u64>>,
-            started_cv: Condvar,
-            released: Mutex<bool>,
-            released_cv: Condvar,
+    fn a_higher_round_gives_up_at_once_while_a_lower_one_is_registered_as_probing() {
+        struct ProbeOrderFetcher {
+            ctx: Arc<PassCtx>,
             miss3: AtomicBool,
-            miss4: AtomicBool,
-            three_missed: Mutex<bool>,
-            three_missed_cv: Condvar,
+            four_done: std::sync::Mutex<bool>,
+            four_done_cv: std::sync::Condvar,
         }
-        impl BlockFetcher for TwoMissFetcher {
+        impl BlockFetcher for ProbeOrderFetcher {
             fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
-                if round.0 > 40 {
-                    return Err(FetchError::NoBlockForRound { round });
-                }
-                if round.0 == 3 && !self.miss3.swap(true, Ordering::SeqCst) {
-                    *self.three_missed.lock().unwrap() = true;
-                    self.three_missed_cv.notify_all();
-                    return Err(FetchError::NoBlockForRound { round });
-                }
-                if round.0 == 4 && !self.miss4.swap(true, Ordering::SeqCst) {
-                    // Miss only after round 3 has missed, so 3 is probing.
-                    let mut missed = self.three_missed.lock().unwrap();
-                    while !*missed {
-                        missed = self.three_missed_cv.wait(missed).unwrap();
+                match round.0 {
+                    3 if !self.miss3.swap(true, Ordering::SeqCst) => {
+                        Err(FetchError::NoBlockForRound { round })
                     }
-                    return Err(FetchError::NoBlockForRound { round });
-                }
-                {
-                    self.started.lock().unwrap().push(round.0);
-                    self.started_cv.notify_all();
-                }
-                if round.0 == 1 {
-                    let mut released = self.released.lock().unwrap();
-                    while !*released {
-                        let (g, t) = self
-                            .released_cv
-                            .wait_timeout(released, Duration::from_secs(30))
-                            .unwrap();
-                        released = g;
-                        assert!(!t.timed_out(), "round 1 was never released");
+                    3 => {
+                        // The retry: only after round 4 has given up.
+                        let mut done = self.four_done.lock().unwrap();
+                        while !*done {
+                            let (g, t) = self
+                                .four_done_cv
+                                .wait_timeout(done, Duration::from_secs(30))
+                                .unwrap();
+                            done = g;
+                            assert!(!t.timed_out(), "round 4 never returned");
+                        }
+                        Ok(FetchedBlockCert {
+                            block: make_valid_empty_block(3),
+                            cert: Some(make_cert(3)),
+                            raw_payset_blobs: None,
+                        })
                     }
+                    4 => {
+                        // Miss only once round 3 is registered as probing.
+                        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                        while !self.ctx.probing.lock().unwrap().contains(&3) {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "round 3 never registered as probing"
+                            );
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(FetchError::NoBlockForRound { round })
+                    }
+                    other => panic!("unexpected round {other}"),
+                }
+            }
+        }
+
+        let policy = FetchPolicy {
+            no_block_backoff: Duration::from_millis(20),
+            ..FetchPolicy::default()
+        };
+        let ctx = Arc::new(PassCtx::new(policy));
+        let fetcher = Arc::new(ProbeOrderFetcher {
+            ctx: Arc::clone(&ctx),
+            miss3: AtomicBool::new(false),
+            four_done: std::sync::Mutex::new(false),
+            four_done_cv: std::sync::Condvar::new(),
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let three = {
+            let (fetcher, ctx, stop) = (Arc::clone(&fetcher), Arc::clone(&ctx), Arc::clone(&stop));
+            thread::spawn(move || {
+                CatchupService::fetch_round_with_retries(fetcher.as_ref(), Round(3), &stop, &ctx)
+            })
+        };
+        let four = {
+            let (fetcher, ctx, stop) = (Arc::clone(&fetcher), Arc::clone(&ctx), Arc::clone(&stop));
+            thread::spawn(move || {
+                CatchupService::fetch_round_with_retries(fetcher.as_ref(), Round(4), &stop, &ctx)
+            })
+        };
+        // Round 4 gave up at once (a single attempt, no probing of its own).
+        assert!(matches!(
+            four.join().unwrap(),
+            Err(FetchError::NoBlockForRound { .. })
+        ));
+        *fetcher.four_done.lock().unwrap() = true;
+        fetcher.four_done_cv.notify_all();
+        // ... and round 3, the lowest, then succeeded.
+        assert!(three.join().unwrap().is_ok());
+    }
+
+    /// Round 3 misses once and then succeeds, round 4 is missing for good
+    /// (issue #2204): rounds 1..=3 are applied and the pass ends `NoBlock` at
+    /// round 4 without hanging, whether round 4 gives up at once or runs out
+    /// of attempts (the outcome does not depend on that race), and engaging the
+    /// fetch-failure gate on it costs nothing.
+    #[test]
+    fn a_lower_round_missing_once_and_a_higher_one_missing_for_good_end_the_pass_at_the_higher_one()
+    {
+        struct Fetcher {
+            miss3: AtomicBool,
+        }
+        impl BlockFetcher for Fetcher {
+            fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
+                if round.0 >= 4 || (round.0 == 3 && !self.miss3.swap(true, Ordering::SeqCst)) {
+                    return Err(FetchError::NoBlockForRound { round });
                 }
                 Ok(FetchedBlockCert {
                     block: make_valid_empty_block(round.0),
@@ -4547,43 +4599,18 @@ mod tests {
                 })
             }
         }
-
         let (ledger, ledger_dyn) = permissive_ledger();
-        let fetcher = Arc::new(TwoMissFetcher {
-            started: Mutex::new(Vec::new()),
-            started_cv: Condvar::new(),
-            released: Mutex::new(false),
-            released_cv: Condvar::new(),
+        let fetcher: Arc<dyn BlockFetcher> = Arc::new(Fetcher {
             miss3: AtomicBool::new(false),
-            miss4: AtomicBool::new(false),
-            three_missed: Mutex::new(false),
-            three_missed_cv: Condvar::new(),
         });
-        let fetcher_dyn: Arc<dyn BlockFetcher> = fetcher.clone();
         let policy = FetchPolicy {
             no_block_backoff: Duration::from_millis(1),
             ..FetchPolicy::default()
         };
-        let pass = {
-            let ledger_dyn = ledger_dyn.clone();
-            thread::spawn(move || sync_range_with_policy(&ledger_dyn, &fetcher_dyn, 4, policy))
-        };
-        // Wait until rounds 1 and 2 have started, then release round 1.
-        {
-            let mut started = fetcher.started.lock().unwrap();
-            while started.len() < 2 {
-                let (g, t) = fetcher
-                    .started_cv
-                    .wait_timeout(started, Duration::from_secs(30))
-                    .unwrap();
-                started = g;
-                assert!(!t.timed_out(), "rounds 1 and 2 never started");
-            }
-        }
-        *fetcher.released.lock().unwrap() = true;
-        fetcher.released_cv.notify_all();
-        assert_eq!(pass.join().unwrap(), SyncExitReason::NoBlock);
-        // Rounds 1..=3 applied; round 4 (gave up) ends the pass.
+        let exit = finishes_within(Duration::from_secs(30), move || {
+            sync_range_with_policy(&ledger_dyn, &fetcher, 4, policy)
+        });
+        assert_eq!(exit, SyncExitReason::NoBlock);
         assert_eq!(ledger.next_round(), Round(4));
     }
 
