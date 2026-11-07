@@ -446,6 +446,20 @@ struct PassCtx {
     /// one transient "no block" answer that a later attempt resolves does not
     /// set it.
     fetch_failed: AtomicBool,
+    /// Serialises "read the tip gate, then claim a round" against the gate
+    /// being engaged (issue #2243). Reading `fetch_failed` and claiming were
+    /// two steps, so a worker that read "no gate" could be descheduled while
+    /// the others engaged it and consumed the window, then claim one more
+    /// round with the stale, unbounded answer (a round past the gate's bound:
+    /// seen once in ~10^4 CI runs as the ninth request of an eight-worker
+    /// pass). Under this lock every claim is either wholly before the gate
+    /// (an ungated claim, bounded only by the permit window) or wholly after
+    /// it, and once the gate is engaged every claim is bounded by
+    /// `applied + workers`.
+    claim_lock: std::sync::Mutex<()>,
+    /// Test hook: runs between the gate read and the claim, lock held.
+    #[cfg(test)]
+    claim_hook: std::sync::Mutex<Option<Box<dyn Fn() + Send>>>,
     /// The number of fetch workers that actually started: the tip gate's
     /// bound and the window are both derived from it.
     workers: AtomicU64,
@@ -467,10 +481,43 @@ impl PassCtx {
             probing: std::sync::Mutex::new(Default::default()),
             applied: AtomicU64::new(0),
             fetch_failed: AtomicBool::new(false),
+            claim_lock: std::sync::Mutex::new(()),
+            #[cfg(test)]
+            claim_hook: std::sync::Mutex::new(None),
             workers: AtomicU64::new(0),
             progress_version: AtomicU64::new(0),
             progress: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
         }
+    }
+
+    /// Claim the next round to fetch under the tip gate: while no fetch has
+    /// finally failed any round may be claimed, afterwards only rounds below
+    /// `applied + workers` (see [`claim_round`]). The gate is read and the
+    /// round claimed under [`Self::claim_lock`], so engaging the gate
+    /// ([`Self::engage_tip_gate`]) cannot slip in between (issue #2243).
+    fn claim_next(&self, next_to_fetch: &AtomicU64) -> Option<u64> {
+        let _claiming = self.claim_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let limit = self
+            .fetch_failed
+            .load(Ordering::SeqCst)
+            .then(|| self.applied.load(Ordering::SeqCst) + self.workers.load(Ordering::SeqCst));
+        #[cfg(test)]
+        if let Some(hook) = self
+            .claim_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            hook();
+        }
+        claim_round(next_to_fetch, limit)
+    }
+
+    /// Engage the workers' tip gate (a round's fetch finally failed), after
+    /// any claim that is in flight (issue #2243).
+    fn engage_tip_gate(&self) {
+        let _claiming = self.claim_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.fetch_failed.store(true, Ordering::SeqCst);
     }
 
     /// Wake the gated workers (the cursor moved, or the pass is stopping).
@@ -1410,18 +1457,16 @@ impl CatchupService {
                     // only new claims are bounded;
                     // the extra window only pays off while blocks exist, and
                     // past the tip every claimed round is a request for a
-                    // block that is not there. The check and the claim are one
-                    // atomic step (`claim_round`); a gated worker holds its
+                    // block that is not there. The gate read and the claim are
+                    // one step (`claim_next`, under the claim lock, so the
+                    // gate cannot be engaged between them); a gated worker holds its
                     // slot and sleeps until the cursor moves or the pass ends.
                     let round = loop {
                         if stop.load(Ordering::SeqCst) {
                             return;
                         }
                         let seen = ctx.progress_version();
-                        let limit = ctx.fetch_failed.load(Ordering::SeqCst).then(|| {
-                            ctx.applied.load(Ordering::SeqCst) + ctx.workers.load(Ordering::SeqCst)
-                        });
-                        match claim_round(&next_to_fetch, limit) {
+                        match ctx.claim_next(&next_to_fetch) {
                             Some(round) => break round,
                             None => ctx.wait_for_progress(seen, &stop),
                         }
@@ -1464,7 +1509,7 @@ impl CatchupService {
                         // the first round with a failed result, so even if the
                         // lower round later succeeds, the pass ends at the
                         // higher one and nothing beyond it can be used.
-                        ctx.fetch_failed.store(true, Ordering::SeqCst);
+                        ctx.engage_tip_gate();
                     }
                     if tx.send((round, outcome)).is_err() || unsupported {
                         return;
@@ -4443,6 +4488,68 @@ mod tests {
         let exit = finishes_within(Duration::from_secs(60), move || pass.join().unwrap());
         assert_ne!(exit, SyncExitReason::Done);
         assert_eq!(ledger.next_round(), Round(1));
+    }
+
+    /// Issue #2243: the tip gate cannot be engaged between a worker's read of
+    /// the gate and its claim. The hook runs exactly there (claim lock held);
+    /// a thread trying to engage the gate from inside it must wait until the
+    /// claim is done. Without the claim lock the gate is set at once, the
+    /// claim goes ahead with the stale "no gate" answer, and the round it takes
+    /// is one the gate would have refused. The engager signals on a channel
+    /// when `engage_tip_gate` returns: without the lock that happens at once
+    /// and the hook sees it immediately (a failure needs no waiting); with the
+    /// lock it cannot happen while the hook runs, which can only be shown by
+    /// waiting a bounded time for an event that must not come (the bound only
+    /// matters for the passing direction, which cannot flake: a blocked thread
+    /// never completes).
+    #[test]
+    fn the_tip_gate_cannot_be_engaged_between_the_gate_read_and_the_claim() {
+        let ctx = Arc::new(PassCtx::new(FetchPolicy::default()));
+        ctx.applied.store(1, Ordering::SeqCst);
+        ctx.workers.store(8, Ordering::SeqCst);
+        // The cursor already stands at the gate's bound for the next claim.
+        let next = AtomicU64::new(9);
+        let engaged_during_claim = Arc::new(AtomicBool::new(true));
+        let engager: Arc<std::sync::Mutex<Option<thread::JoinHandle<()>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        {
+            let (ctx2, flag, slot) = (
+                Arc::clone(&ctx),
+                Arc::clone(&engaged_during_claim),
+                Arc::clone(&engager),
+            );
+            *ctx.claim_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move || {
+                let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+                let ctx3 = Arc::clone(&ctx2);
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(thread::spawn(move || {
+                    ctx3.engage_tip_gate();
+                    let _ = done_tx.send(());
+                }));
+                // Engaged already (the lock is missing) or not within the bound.
+                let completed = done_rx.recv_timeout(Duration::from_millis(200)).is_ok();
+                flag.store(
+                    completed || ctx2.fetch_failed.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+            }));
+        }
+        // The claim saw "no gate": round 9 is taken (the ungated phase) ...
+        assert_eq!(ctx.claim_next(&next), Some(9));
+        // ... and the gate was NOT engaged while it was in flight.
+        assert!(
+            !engaged_during_claim.load(Ordering::SeqCst),
+            "the gate was engaged between the gate read and the claim"
+        );
+        let handle = engager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap();
+        handle.join().unwrap();
+        *ctx.claim_hook.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // From now on the gate bounds the claims: 10 >= applied + workers.
+        assert!(ctx.fetch_failed.load(Ordering::SeqCst));
+        assert_eq!(ctx.claim_next(&next), None);
     }
 
     /// The "no fetch worker" warning is rate limited (issue #2204 review): the
