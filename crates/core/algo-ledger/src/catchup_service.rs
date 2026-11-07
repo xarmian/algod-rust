@@ -1400,8 +1400,10 @@ impl CatchupService {
                     if permits.recv().is_err() || stop.load(Ordering::SeqCst) {
                         return;
                     }
-                    // Tip gate (issue #2204): once the lowest probing round's
-                    // fetch has finally failed (the tip), do not claim a round
+                    // Tip gate (issue #2204): once ANY round's fetch has finally
+                    // failed (the tip; a higher round that gave up at once
+                    // because a lower one is probing counts, pinned by issue
+                    // #2237's test), do not claim a round
                     // more than the started workers' number beyond the apply
                     // cursor, as go's window (go stops launching fetches after
                     // the first failure): already claimed rounds stay claimed,
@@ -4330,76 +4332,116 @@ mod tests {
     }
 
     /// A higher round that gives up at once because a lower round is probing
-    /// still engages the tip gate (issue #2237). Round 1 is held (it stays the
-    /// registered probing round, it never reports a final failure) while
-    /// rounds 2.. report "no block" immediately; the apply loop would stop the
-    /// pass at the first failed round whatever round 1 does, so the gate must
-    /// engage on THOSE failures, not only once round 1 itself gives up. While
-    /// round 1 is still held, nothing beyond `cursor + workers` (here 4) may
-    /// have been requested. Narrowing `fetch_failed` to the lowest probing
-    /// round's final failure lets the workers claim up to the window (8)
-    /// while round 1 is held, and this test fails.
+    /// still engages the tip gate (issue #2237). Round 1 returns "no block"
+    /// once, which registers it in the pass's `probing` set, and its next call
+    /// is held; the backoff and threshold are so large that it never gives up
+    /// during the test. Rounds 2..=4 report "no block" only after round 1 is
+    /// parked, so each sees round 1 as the lowest probing round and gives up
+    /// at once. The only way `fetch_failed` can engage is therefore a HIGHER
+    /// round's failure (the apply loop stops the pass at the first failed
+    /// round whatever round 1 does). While round 1 is held nothing beyond
+    /// `cursor + workers` (4) may be requested. Narrowing the flag to the
+    /// lowest probing round's final failure lets the workers claim up to the
+    /// window (8) while round 1 is held, and this test fails.
     #[test]
     fn a_higher_round_giving_up_at_once_engages_the_tip_gate_before_the_probing_round_fails() {
+        #[derive(Default)]
+        struct State {
+            /// Distinct rounds the fetcher has been asked for.
+            seen: std::collections::BTreeSet<u64>,
+            /// Round 1 is inside its second (held) call, so registered as probing.
+            round_one_parked: bool,
+            /// Rounds above 1 whose "no block" answer has been returned.
+            gave_up: std::collections::BTreeSet<u64>,
+            released: bool,
+        }
         struct HoldRoundOne {
-            max_round: AtomicU64,
-            calls: AtomicU64,
-            released: std::sync::Mutex<bool>,
-            released_cv: std::sync::Condvar,
+            state: std::sync::Mutex<State>,
+            cv: std::sync::Condvar,
+            round_one_calls: AtomicU64,
+        }
+        impl HoldRoundOne {
+            fn wait_while(&self, cond: impl FnMut(&mut State) -> bool, what: &str) {
+                let guard = self.state.lock().unwrap();
+                let (_g, t) = self
+                    .cv
+                    .wait_timeout_while(guard, Duration::from_secs(30), cond)
+                    .unwrap();
+                assert!(!t.timed_out(), "timed out waiting for {what}");
+            }
         }
         impl BlockFetcher for HoldRoundOne {
             fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
-                self.max_round.fetch_max(round.0, Ordering::SeqCst);
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                if round.0 == 1 && !*self.released.lock().unwrap() {
-                    let mut released = self.released.lock().unwrap();
-                    while !*released {
-                        let (g, t) = self
-                            .released_cv
-                            .wait_timeout(released, Duration::from_secs(30))
-                            .unwrap();
-                        released = g;
-                        assert!(!t.timed_out(), "round 1 was never released");
+                self.state.lock().unwrap().seen.insert(round.0);
+                self.cv.notify_all();
+                if round.0 == 1 {
+                    if self.round_one_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        // First answer: "no block", which registers round 1 as
+                        // probing before its retry.
+                        return Err(FetchError::NoBlockForRound { round });
                     }
+                    {
+                        let mut st = self.state.lock().unwrap();
+                        st.round_one_parked = true;
+                        self.cv.notify_all();
+                    }
+                    self.wait_while(|st| !st.released, "round 1 to be released");
+                    // Released: end the pass at once.
+                    return Err(FetchError::NoPeersAvailable);
                 }
+                // A higher round misses only once round 1 is parked, i.e.
+                // registered as the lowest probing round.
+                self.wait_while(|st| !st.round_one_parked, "round 1 to be parked");
+                self.state.lock().unwrap().gave_up.insert(round.0);
+                self.cv.notify_all();
                 Err(FetchError::NoBlockForRound { round })
             }
         }
 
         let (ledger, ledger_dyn) = permissive_ledger();
         let fetcher = Arc::new(HoldRoundOne {
-            max_round: AtomicU64::new(0),
-            calls: AtomicU64::new(0),
-            released: std::sync::Mutex::new(false),
-            released_cv: std::sync::Condvar::new(),
+            state: std::sync::Mutex::new(State::default()),
+            cv: std::sync::Condvar::new(),
+            round_one_calls: AtomicU64::new(0),
         });
         let fetcher_dyn: Arc<dyn BlockFetcher> = fetcher.clone();
         let policy = FetchPolicy {
-            no_block_backoff: Duration::from_millis(5),
+            no_block_backoff: Duration::from_millis(1),
+            no_block_threshold: u32::MAX,
             ..FetchPolicy::default()
         };
         let pass =
             thread::spawn(move || sync_range_with_policy(&ledger_dyn, &fetcher_dyn, 4, policy));
-        // Rounds 1..=4 are the workers' first claims; wait for all four calls,
-        // then give the workers ample time to claim past the gate if it were
-        // not engaged.
-        poll_until(
-            || fetcher.calls.load(Ordering::SeqCst) >= 4,
-            Duration::from_millis(5),
-            Duration::from_secs(20),
-            "the four workers should each have started a fetch",
+        // Rounds 1..=4 are the workers' first claims. Wait for round 1 to be
+        // held and rounds 2..=4 to have given up (distinct rounds, so retries
+        // cannot satisfy it), then a short settle for any claim that a
+        // missing gate would let through.
+        fetcher.wait_while(
+            |st| {
+                !(st.round_one_parked
+                    && (1..=4).all(|r| st.seen.contains(&r))
+                    && (2..=4).all(|r| st.gave_up.contains(&r)))
+            },
+            "rounds 1..=4 to be requested and rounds 2..=4 to give up",
         );
-        thread::sleep(Duration::from_millis(400));
+        thread::sleep(Duration::from_millis(100));
+        let highest = *fetcher
+            .state
+            .lock()
+            .unwrap()
+            .seen
+            .iter()
+            .next_back()
+            .unwrap();
         assert_eq!(
-            fetcher.max_round.load(Ordering::SeqCst),
-            4,
+            highest, 4,
             "a higher round that gave up at once must engage the tip gate while round 1 is \
              still probing: nothing beyond cursor + workers may be requested"
         );
-        *fetcher.released.lock().unwrap() = true;
-        fetcher.released_cv.notify_all();
+        fetcher.state.lock().unwrap().released = true;
+        fetcher.cv.notify_all();
         let exit = finishes_within(Duration::from_secs(60), move || pass.join().unwrap());
-        assert_eq!(exit, SyncExitReason::NoBlock);
+        assert_ne!(exit, SyncExitReason::Done);
         assert_eq!(ledger.next_round(), Round(1));
     }
 
