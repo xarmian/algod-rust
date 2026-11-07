@@ -31,6 +31,11 @@ name: License Compliance
 #                          intended differences from go-algorand) and the
 #                          `DIVERGENCE DIV-NNN:` source markers stay in
 #                          sync. scripts/check_divergences.py, pure Python.
+#   arg-gate-table       - issue #2225: crates/core/algo-avm/src/arg_gate_table.rs
+#                          is generated from go's proto dump
+#                          (tests/fixtures/go_op_protos.jsonl); a stale table
+#                          fails. scripts/gen_arg_gate_table.py --check, pure
+#                          Python.
 
 on:
   pull_request:
@@ -127,3 +132,15 @@ jobs:
         run: |
           python3 scripts/check_divergences_test.py
           python3 scripts/check_divergences.py
+
+  arg-gate-table:
+    name: AVM Argument Gate Table Is Generated
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Check arg_gate_table.rs against go's proto dump
+        run: python3 scripts/gen_arg_gate_table.py --check

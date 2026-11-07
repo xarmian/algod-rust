@@ -153,8 +153,9 @@ pub trait EvalTracer {
 
     /// Called before each opcode is dispatched.
     ///
-    /// `pc` is the instruction index (not byte offset). `opcode` is the raw
-    /// opcode byte.
+    /// `pc` is the program counter as go reports it: a byte offset into the
+    /// program, the version header included (issue #2225; it was an
+    /// instruction index). `opcode` is the raw opcode byte.
     fn before_opcode(&mut self, _pc: usize, _opcode: u8) {}
 
     /// Called after each opcode completes (or errors).

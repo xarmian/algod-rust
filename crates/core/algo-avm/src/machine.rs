@@ -349,7 +349,8 @@ impl AvmMachine {
         if len < n {
             return false;
         }
-        // At most four arguments: a plain indexed loop on the top of the stack.
+        // At most five arguments (`ecdsa_verify`): a plain indexed loop on the
+        // top of the stack.
         let top = &self.stack[len - n..];
         let mut i = 0;
         while i < n {
@@ -377,12 +378,12 @@ impl AvmMachine {
         }
         let first = self.stack.len() - types.len();
         for (i, want) in types.iter().enumerate() {
-            let got = match (&self.stack[first + i], want) {
-                (_, crate::arg_gate::ArgType::Any) => continue,
-                (AvmValue::Uint64(_), crate::arg_gate::ArgType::Uint) => continue,
-                (AvmValue::Bytes(_), crate::arg_gate::ArgType::Bytes) => continue,
-                (AvmValue::Uint64(_), _) => "uint64",
-                (AvmValue::Bytes(_), _) => "[]byte",
+            if crate::arg_gate::accepts(*want, &self.stack[first + i]) {
+                continue;
+            }
+            let got = match &self.stack[first + i] {
+                AvmValue::Uint64(_) => "uint64",
+                AvmValue::Bytes(_) => "[]byte",
             };
             return AlgoError::Avm {
                 message: format!("{name} arg {i} wanted {} but got {got}", want.name()),
@@ -497,6 +498,9 @@ impl AvmMachine {
 
         let instr = self.program.instructions[self.pc].clone();
         let old_pc = self.pc;
+        // go's tracer reports the program counter as a BYTE offset into the
+        // program (the version header counts), not an instruction index.
+        let old_byte_pc = self.byte_pc();
 
         // Record opcode hit for coverage tracking.
         self.opcode_hits[instr.opcode as usize] = true;
@@ -504,13 +508,19 @@ impl AvmMachine {
 
         // Tracer: before opcode (called before cost charge so budget-
         // exhaustion opcodes are visible in the trace, matching go-algorand).
-        tracer.before_opcode(self.pc, instr.opcode);
+        tracer.before_opcode(old_byte_pc, instr.opcode);
 
         // go's argument gate runs before the cost is charged.
         if !self.arg_gate_passes(&instr) {
             let e = self.arg_gate_error(&instr);
             let msg = e.to_string();
-            tracer.after_opcode(old_pc, instr.opcode, &self.stack, &self.scratch, Some(&msg));
+            tracer.after_opcode(
+                old_byte_pc,
+                instr.opcode,
+                &self.stack,
+                &self.scratch,
+                Some(&msg),
+            );
             return Err(e);
         }
 
@@ -536,7 +546,7 @@ impl AvmMachine {
                 if let Err(e) = self.charge_cost(cost) {
                     let msg = e.to_string();
                     tracer.after_opcode(
-                        old_pc,
+                        old_byte_pc,
                         instr.opcode,
                         &self.stack,
                         &self.scratch,
@@ -559,11 +569,17 @@ impl AvmMachine {
                 if let Some(slot) = scratch_write_slot {
                     tracer.record_scratch_write(slot);
                 }
-                tracer.after_opcode(old_pc, instr.opcode, &self.stack, &self.scratch, None);
+                tracer.after_opcode(old_byte_pc, instr.opcode, &self.stack, &self.scratch, None);
             }
             Err(e) => {
                 let msg = e.to_string();
-                tracer.after_opcode(old_pc, instr.opcode, &self.stack, &self.scratch, Some(&msg));
+                tracer.after_opcode(
+                    old_byte_pc,
+                    instr.opcode,
+                    &self.stack,
+                    &self.scratch,
+                    Some(&msg),
+                );
             }
         }
 
@@ -1427,21 +1443,25 @@ mod tests {
 
     /// A typed pop in an opcode outside the arg-gate table carries no
     /// positional `arg N`: popping top-first it could name the wrong argument
-    /// (issue #2200). `setbyte` with two wrong arguments (go: arg 0).
+    /// (issue #2200). `box_replace` (application-only, so not in the table)
+    /// with two wrong arguments (go: arg 0).
     #[test]
     fn an_ungated_opcode_has_no_positional_arg_index() {
         use crate::arg_gate::arg_types;
-        assert!(arg_types(0x56).is_none(), "setbyte must stay ungated for this test");
+        assert!(
+            arg_types(0xbb).is_none(),
+            "box_replace must stay ungated for this test"
+        );
         let program = Program {
             version: 8,
             instructions: vec![],
         };
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
-        // setbyte(A, B, C): A bytes, B uint, C uint. Both A and C wrong.
+        // box_replace(A, B, C): A bytes, B uint, C bytes. Both A and C wrong.
         m.push(AvmValue::Uint64(1)).unwrap();
         m.push(AvmValue::Uint64(1)).unwrap();
         m.push(AvmValue::Bytes(vec![1])).unwrap();
-        m.current_instr = Some((0x56, None));
+        m.current_instr = Some((0xbb, None));
         let err = m.pop_uint().unwrap_err().to_string();
         assert_eq!(err, "AVM: expected uint64 on stack, got []byte");
         assert!(!err.contains("arg "));
