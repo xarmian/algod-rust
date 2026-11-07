@@ -323,7 +323,10 @@ pub enum SyncExitReason {
     NoPeer,
     /// The remote peer(s) do not have the block, or repeated fetch
     /// attempts exhausted the retry budget without success. Mirrors go's
-    /// `errFetchNoBlock` / `errFetchRetryLimit`.
+    /// `errFetchNoBlock` / `errFetchRetryLimit`. Also the exit of a pass that
+    /// could not start any fetch worker thread: it is retried at the next
+    /// tick like a pass that reached the tip (`sync_now` has no caller that
+    /// reads this as "synced").
     NoBlock,
     /// Shutdown was signaled mid-pass. Mirrors go's `errCatchupStopping`.
     Stopping,
@@ -358,6 +361,9 @@ enum PeriodicTick {
 
 /// A `sync_now` caller waiting for the answer of the pass that serves it.
 type SyncWaiter = crossbeam_channel::Sender<SyncExitReason>;
+
+/// Minimum spacing of the "no fetch worker could be started" warning.
+const NO_WORKER_WARN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Starts one fetch worker thread. Production uses `Builder::spawn`; a test
 /// injects one that fails, to reach the real `Err` arm of the spawn
@@ -439,7 +445,7 @@ struct PassCtx {
     /// beyond it is worth claiming (the workers' tip gate). Unlike `tip_seen`,
     /// one transient "no block" answer that a later attempt resolves does not
     /// set it.
-    tip_reached: AtomicBool,
+    fetch_failed: AtomicBool,
     /// The number of fetch workers that actually started: the tip gate's
     /// bound and the window are both derived from it.
     workers: AtomicU64,
@@ -460,7 +466,7 @@ impl PassCtx {
             tip_seen: AtomicBool::new(false),
             probing: std::sync::Mutex::new(Default::default()),
             applied: AtomicU64::new(0),
-            tip_reached: AtomicBool::new(false),
+            fetch_failed: AtomicBool::new(false),
             workers: AtomicU64::new(0),
             progress_version: AtomicU64::new(0),
             progress: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
@@ -1037,7 +1043,12 @@ impl CatchupService {
     /// Most rounds, beyond the workers' own, a pass may have fetched and
     /// waiting ahead of the apply cursor (issue #2204): the memory and the
     /// discarded work an invalid round costs are bounded by a BLOCK COUNT
-    /// (no byte cap), `workers + min(workers, FETCH_AHEAD_MAX_EXTRA)`.
+    /// (no byte cap), `workers + min(workers, FETCH_AHEAD_MAX_EXTRA)`. The
+    /// extra is at most this many blocks at ANY worker count, so the worst
+    /// case at the clamp ceiling (`MAX_PARALLEL_BLOCKS` = 256 workers: a window
+    /// of 288 rounds, about 1.4 GiB of completely full 5 MiB blocks) is the
+    /// operator's own `CatchupParallelBlocks` choice (256 blocks, 1.25 GiB,
+    /// before this change) plus at most 32 blocks (160 MiB).
     const FETCH_AHEAD_MAX_EXTRA: u64 = 32;
 
     /// The worker count at or below which a pass does not prefetch: the
@@ -1290,6 +1301,27 @@ impl CatchupService {
         Err(last)
     }
 
+    /// Whether the "no fetch worker could be started" warning is due: at most
+    /// one per [`NO_WORKER_WARN_INTERVAL`] for the process.
+    fn no_worker_warning_due(now: std::time::Instant) -> bool {
+        static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        Self::warning_due(&mut last, now, NO_WORKER_WARN_INTERVAL)
+    }
+
+    /// The pure part of the warning rate limit.
+    fn warning_due(
+        last: &mut Option<std::time::Instant>,
+        now: std::time::Instant,
+        interval: Duration,
+    ) -> bool {
+        if last.is_some_and(|at| now.duration_since(at) < interval) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+
     /// Stop the pass's workers and wake any that sleep at the tip gate.
     fn raise_stop(stop: &AtomicBool, ctx: &PassCtx) {
         stop.store(true, Ordering::SeqCst);
@@ -1324,15 +1356,15 @@ impl CatchupService {
         // the window moves up by one each time the first round is written.
         // The same here with permits: a worker must hold one before it claims
         // a round, and the apply loop hands one back after each round it
-        // applies. At most one round per worker is in flight
-        // (`CatchupParallelBlocks` workers) and at most
-        // [`Self::fetch_window`] of the workers actually started are in flight
-        // or buffered ahead of the apply cursor (DIV-010: with the window equal
-        // to the worker count, one slow round parks every worker whose round
-        // finished, 11 of 16 in flight on average live), which also caps what
-        // is wasted when an invalid round stops the pass. The channels are
-        // sized for the largest window; the permits handed out once the
-        // workers are spawned are the window of the workers that really
+        // applies. The invariant (DIV-010): the window is
+        // `fetch_window(started workers)` rounds claimed ahead of the apply
+        // cursor (in flight plus fetched and waiting), with at most ONE
+        // in-flight round per worker. With a window equal to the worker count
+        // one slow round would park every worker whose round had finished
+        // (11 of 16 fetches in flight on average on a live betanet catchup).
+        // The window also caps what is wasted when an invalid round stops the
+        // pass. The channels are sized for the largest window; the permits are
+        // handed out once the workers are spawned, for the workers that really
         // started. A result channel with room for the window means a worker's
         // `send` never blocks.
         let max_window = Self::fetch_window(parallel_blocks);
@@ -1384,7 +1416,7 @@ impl CatchupService {
                             return;
                         }
                         let seen = ctx.progress_version();
-                        let limit = ctx.tip_reached.load(Ordering::SeqCst).then(|| {
+                        let limit = ctx.fetch_failed.load(Ordering::SeqCst).then(|| {
                             ctx.applied.load(Ordering::SeqCst) + ctx.workers.load(Ordering::SeqCst)
                         });
                         match claim_round(&next_to_fetch, limit) {
@@ -1430,7 +1462,7 @@ impl CatchupService {
                         // the first round with a failed result, so even if the
                         // lower round later succeeds, the pass ends at the
                         // higher one and nothing beyond it can be used.
-                        ctx.tip_reached.store(true, Ordering::SeqCst);
+                        ctx.fetch_failed.store(true, Ordering::SeqCst);
                     }
                     if tx.send((round, outcome)).is_err() || unsupported {
                         return;
@@ -1454,9 +1486,18 @@ impl CatchupService {
         // failure for the service loop to try again at its next tick, instead
         // of reporting `Done` for a pass that fetched nothing.
         if workers.is_empty() {
-            warn!(
-                "catchup service: no fetch worker could be started; the pass ends without fetching"
-            );
+            // The service loop treats this exactly like any other `NoBlock`
+            // exit (the tip included): it retries at its next tick, and
+            // `sync_now` waiters are answered `NoBlock`. The warning is rate
+            // limited so a persistent spawn failure does not log every tick.
+            if Self::no_worker_warning_due(std::time::Instant::now()) {
+                warn!(
+                    "catchup service: no fetch worker could be started; the pass ends without \
+                     fetching and is retried at the next tick"
+                );
+            } else {
+                debug!("catchup service: no fetch worker could be started");
+            }
             return SyncExitReason::NoBlock;
         }
         // The window of the workers that really started (fewer than
@@ -1710,11 +1751,11 @@ impl CatchupService {
                 }
                 next_apply += 1;
                 ctx.applied.store(next_apply, Ordering::SeqCst);
-                // Gated workers exist only once `tip_reached` is set. Both
+                // Gated workers exist only once `fetch_failed` is set. Both
                 // sides are SeqCst: a worker that sets the flag after this
                 // check reads `applied` afterwards and sees this store; one
                 // that was gated before it is woken here.
-                if ctx.tip_reached.load(Ordering::SeqCst) {
+                if ctx.fetch_failed.load(Ordering::SeqCst) {
                     ctx.notify_progress();
                 }
                 // The window slides: the applied round's slot is free again.
@@ -4220,35 +4261,98 @@ mod tests {
         assert_eq!(all, (100..108).collect::<Vec<_>>());
     }
 
+    /// Fetcher for the tip-gate bound: nothing exists. The first attempt of
+    /// round 1 is held until all `want` workers have started a fetch, so every
+    /// worker has made its first (ungated) claim before round 1 reports the
+    /// tip; the other rounds report it at once.
+    struct TipHoldFetcher {
+        calls: std::sync::Mutex<u64>,
+        calls_cv: std::sync::Condvar,
+        want: u64,
+        max_round: AtomicU64,
+        round1_held: AtomicBool,
+    }
+
+    impl BlockFetcher for TipHoldFetcher {
+        fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
+            self.max_round.fetch_max(round.0, Ordering::SeqCst);
+            {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                self.calls_cv.notify_all();
+            }
+            if round.0 == 1 && !self.round1_held.swap(true, Ordering::SeqCst) {
+                let mut calls = self.calls.lock().unwrap();
+                while *calls < self.want {
+                    let (g, t) = self
+                        .calls_cv
+                        .wait_timeout(calls, Duration::from_secs(30))
+                        .unwrap();
+                    calls = g;
+                    assert!(!t.timed_out(), "the other workers never started");
+                }
+            }
+            Err(FetchError::NoBlockForRound { round })
+        }
+    }
+
     /// Exact bound at the tip (issue #2204): nothing is available, so the
-    /// cursor stays at round 1 while round 1 probes (about 250 ms here). Each
-    /// of the 8 workers claims one round before any has failed; after the
-    /// first final failure every later claim is bounded by `cursor + workers`
-    /// = 9. So the highest round ever requested is at most 8; without the gate
-    /// the workers would keep claiming up to the window and reach 16.
+    /// cursor stays at round 1. All 8 workers make their first claim (round 1
+    /// is held until they have), so rounds 1..=8 are requested; every later
+    /// claim is bounded by `cursor + workers` = 9, so the highest round ever
+    /// requested is exactly 8. Without the gate the workers keep claiming up
+    /// to the window and reach 16 (the mutation check).
     #[test]
     fn past_the_tip_no_round_beyond_the_cursor_plus_the_workers_is_requested() {
         let (ledger, ledger_dyn) = permissive_ledger();
-        let fetcher = Arc::new(TipProbeCountingFetcher {
-            up_to: 0,
-            beyond: AtomicU64::new(0),
+        let fetcher = Arc::new(TipHoldFetcher {
+            calls: std::sync::Mutex::new(0),
+            calls_cv: std::sync::Condvar::new(),
+            want: 8,
             max_round: AtomicU64::new(0),
+            round1_held: AtomicBool::new(false),
         });
         let fetcher_dyn: Arc<dyn BlockFetcher> = fetcher.clone();
         let policy = FetchPolicy {
             no_block_backoff: Duration::from_millis(50),
             ..FetchPolicy::default()
         };
-        let exit = finishes_within(Duration::from_secs(30), move || {
+        let exit = finishes_within(Duration::from_secs(60), move || {
             sync_range_with_policy(&ledger_dyn, &fetcher_dyn, 8, policy)
         });
         assert_eq!(exit, SyncExitReason::NoBlock);
         assert_eq!(ledger.next_round(), Round(1));
-        let max_round = fetcher.max_round.load(Ordering::SeqCst);
-        assert!(
-            (2..=8).contains(&max_round),
-            "the gate bounds the claims to cursor (1) + workers (8) - 1 = 8, got {max_round}"
+        assert_eq!(
+            fetcher.max_round.load(Ordering::SeqCst),
+            8,
+            "rounds 1..=8 are claimed first, and the gate allows nothing beyond cursor (1) + 8 - 1"
         );
+    }
+
+    /// The "no fetch worker" warning is rate limited (issue #2204 review): the
+    /// first is due, the following ones inside the interval are not, one after
+    /// it is.
+    #[test]
+    fn the_no_worker_warning_is_rate_limited() {
+        let t0 = std::time::Instant::now();
+        let mut last = None;
+        let interval = Duration::from_secs(30);
+        assert!(CatchupService::warning_due(&mut last, t0, interval));
+        assert!(!CatchupService::warning_due(
+            &mut last,
+            t0 + Duration::from_secs(4),
+            interval
+        ));
+        assert!(!CatchupService::warning_due(
+            &mut last,
+            t0 + Duration::from_secs(29),
+            interval
+        ));
+        assert!(CatchupService::warning_due(
+            &mut last,
+            t0 + Duration::from_secs(31),
+            interval
+        ));
     }
 
     /// One transient "no block" answer mid-catchup that a later attempt

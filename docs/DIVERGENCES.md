@@ -584,10 +584,12 @@ of 4, because with concurrency there is something for a slow round to idle. A
 worker whose round is fetched takes the next round while an earlier one is
 still slow, up to that window.
 
-Once ANY round's fetch has finally failed (the lowest probing round out of
-attempts, or a higher round that gave up at once because a lower one is
-probing: the apply loop stops the pass at the first failed round whatever the
-lower rounds do), NEW claims are bounded by `applied + started workers` (go's
+Once ANY round's fetch has finally failed (normally the network tip: the
+lowest probing round out of attempts, or a higher round that gave up at once
+because a lower one is probing; the apply loop stops the pass at the first
+failed round whatever the lower rounds do; the flag is `fetch_failed`, a
+transient "no block" answer a later attempt resolves does not set it), NEW
+claims are bounded by `applied + started workers` (go's
 window; go launches nothing after the first failure); rounds already claimed
 stay claimed, so the claims in flight at that moment (up to the window) are
 still fetched. The bound check and the claim are one atomic
@@ -600,14 +602,20 @@ requests past the tip are not doubled (8 workers: 13 requests beyond the tip
 in the unit test, 21 without the gate; with the cursor stuck at round 1 the
 highest round ever requested is at most 8, it reaches 16 without the gate). If
 no fetch worker can be started at all (a failing thread spawn, #1650) the pass
-ends as a retryable `NoBlock`, not `Done`; with fewer workers than requested
+ends as a retryable `NoBlock`, not `Done` (the service loop treats it like any
+`NoBlock` exit, the tip included: retry at the next tick, `sync_now` waiters
+answered `NoBlock`, and the warning is rate limited to one per 30 s); with
+fewer workers than requested
 the window and the gate bound follow the workers that started. Apply order,
 authentication, the commit path, the retry and tip-probe rules are unchanged.
 
 **Memory and wasted work.** Bounded by a block COUNT, not bytes: at most
 `min(workers, 32)` fetched blocks wait beyond the workers' own, i.e. 16 extra
 blocks by default and 32 extra at `CatchupParallelBlocks >= 32` (96 rounds in
-the window at 64). The byte worst case is the window times the consensus block
+the window at 64; 288 at the clamp ceiling of 256 workers: with completely full
+5 MiB blocks about 1.4 GiB, of which 1.25 GiB is the operator's own
+`CatchupParallelBlocks` choice and at most 160 MiB is the extra prefetch of
+this change; the extra is operator-visible only through that setting). The byte worst case is the window times the consensus block
 maximum (`MaxTxnBytesPerBlock`, 5 MiB from consensus v33): 32 x 5 MiB = 160 MiB
 by default (80 MiB more than a window of 16), 96 x 5 MiB = 480 MiB at 64
 workers, and it needs consecutive completely full blocks (a betanet block is
@@ -650,9 +658,14 @@ Profile of the `main` runs: request round trip p50 160 / 173 / 303 ms for the
 three relays, 11.1 fetches in flight on average. The process CPU over 60
 seconds at the tip was no worse (final set: main 0.84 / 1.23 / 1.19 s, this
 change 0.84 / 0.92 / 1.06 s; the set before: 1.07 s mean against 1.09 s; about
-1.5 to 2 % of a core). The harness is a throwaway script, not in the repository; go on the
-same host and the Docker `catchup` tier were not run (no go build and no Docker
-daemon on that machine).
+1.5 to 2 % of a core). The procedure is a MANUAL native betanet check, reproducible with
+`python3 scripts/bench/catchup_native.py --bin <algod-rust> --genesis
+docker/algod/genesis/betanet/genesis.json --follow-secs 60` (run it once per
+binary, alternating, to compare); it needs the public network and is not part
+of CI. go on the same host and the Docker `catchup` tier were not run (no go
+build and no Docker daemon on that machine), and go's own `pipelinedFetch` tip
+behaviour (no new fetches after the first failure) was reasoned from the
+source, not run.
 
 **How to switch back.** Make `fetch_window` return its argument.
 
