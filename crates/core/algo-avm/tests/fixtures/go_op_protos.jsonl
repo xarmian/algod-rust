@@ -118,6 +118,7 @@
 {"opcode":131,"name":"pushints","version":8,"modes":3,"args":[]}
 {"opcode":132,"name":"ed25519verify_bare","version":7,"modes":3,"args":[{"avm":"[]byte","name":"[]byte"},{"avm":"[]byte","name":"[64]byte"},{"avm":"[]byte","name":"[32]byte"}]}
 {"opcode":133,"name":"falcon_verify","version":12,"modes":3,"args":[{"avm":"[]byte","name":"[]byte"},{"avm":"[]byte","name":"[]byte"},{"avm":"[]byte","name":"[1793]byte"}]}
+{"opcode":134,"name":"sumhash512","version":14,"modes":3,"args":[{"avm":"[]byte","name":"[]byte"}]}
 {"opcode":135,"name":"sha512","version":13,"modes":3,"args":[{"avm":"[]byte","name":"[]byte"}]}
 {"opcode":136,"name":"callsub","version":4,"modes":3,"args":[]}
 {"opcode":137,"name":"retsub","version":4,"modes":3,"args":[]}

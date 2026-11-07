@@ -250,6 +250,41 @@ fn bench_arithmetic_execution(c: &mut Criterion) {
     });
 }
 
+/// Build a program of `n` iterations of stack manipulation, each leaving the
+/// stack as it found it: `pushint 1; pushint 2; pushint 1; select; dup; swap;
+/// dup2; dig 0; pop x5`. `select`, `dup`, `swap`, `dup2` and `dig` are the hot
+/// opcodes of real contracts that go's argument gate (issue #2225) now also
+/// covers. Ends with `pushint 1; return`.
+fn stack_ops_program(n: usize) -> Vec<u8> {
+    let mut code = Vec::new();
+    for _ in 0..n {
+        code.extend_from_slice(&[0x81, 0x01, 0x81, 0x02, 0x81, 0x01]); // 1, 2, 1
+        code.push(0x4d); // select
+        code.push(0x49); // dup
+        code.push(0x4c); // swap
+        code.push(0x4a); // dup2
+        code.extend_from_slice(&[0x4b, 0x00]); // dig 0
+        code.extend_from_slice(&[0x48; 5]); // pop x5
+    }
+    code.extend_from_slice(&[0x81, 0x01, 0x43]); // pushint 1; return
+    prog(8, &code)
+}
+
+fn bench_stack_ops_execution(c: &mut Criterion) {
+    let raw = stack_ops_program(50);
+    let budget = 20_000;
+    c.bench_function(
+        "exec: stack ops (select/dup/swap/dup2/dig) 50 cycles",
+        |b| {
+            b.iter(|| {
+                let program = parse(black_box(&raw)).unwrap();
+                let mut machine = AvmMachine::new(program, ExecMode::LogicSig, budget);
+                machine.run(&mut NullContext).unwrap();
+            });
+        },
+    );
+}
+
 fn bench_concat_execution(c: &mut Criterion) {
     let raw = concat_program(50);
     let budget = 20_000;
@@ -316,6 +351,7 @@ criterion_group!(
     bench_parse_simple,
     bench_parse_large,
     bench_arithmetic_execution,
+    bench_stack_ops_execution,
     bench_concat_execution,
     bench_sha256_execution,
     bench_keccak256_execution,

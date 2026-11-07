@@ -15,6 +15,9 @@ mode BEFORE the argument gate, which the table cannot express).
 
     python3 scripts/gen_arg_gate_table.py            # rewrite the table
     python3 scripts/gen_arg_gate_table.py --check    # exit 1 if it is stale
+
+`--check` runs in CI (license-compliance.yml, job `arg-gate-table`) and in
+`make lint`, so a stale table cannot be committed silently.
 """
 import json
 import sys
@@ -30,7 +33,9 @@ OUT = ROOT / "crates/core/algo-avm/src/arg_gate_table.rs"
 # visible error). Each entry is a byte and a reason that stays vague on purpose.
 EXCLUDED = {0x07: "handler argument order under review"}
 
-# (avm type, go's StackType name) -> Rust constant
+# (avm type, go's StackType name) -> Rust constant. A gated opcode with any
+# other argument type makes the generator fail loudly (KeyError) instead of
+# guessing a name.
 KINDS = {
     ("uint64", "uint64"): "UINT",
     ("[]byte", "[]byte"): "BYTES",
@@ -42,34 +47,6 @@ KINDS = {
     ("[]byte", "[80]byte"): "BYTES80",
     ("[]byte", "[1793]byte"): "BYTES1793",
 }
-
-
-def rows():
-    out = []
-    lines = [json.loads(l) for l in FIXTURE.read_text().splitlines() if l.strip()]
-    per_byte = Counter(r["opcode"] for r in lines)
-    for r in lines:
-        if r["modes"] != 3 or not r["args"] or per_byte[r["opcode"]] != 1:
-            continue
-        if r["opcode"] in EXCLUDED:
-            continue
-        out.append((r["opcode"], r["name"], [KINDS[(a["avm"], a["name"])] for a in r["args"]]))
-    return sorted(out)
-
-
-def render():
-    body = [HEADER]
-    body.append("use super::arg_gate::ArgType;\n")
-    body.append("use super::arg_gate::{ANY, BIGINT, BYTES, BYTES1793, BYTES32, BYTES33, BYTES64, BYTES80, UINT};\n")
-    body.append("/// go's `proto` argument types by opcode byte, for every opcode go gates the\n"
-                "/// same way in every run mode (`GATE` in `arg_gate.rs` is this table).\n")
-    body.append("pub(super) static TABLE: [Option<&[ArgType]>; 256] = {\n")
-    body.append("    let mut t: [Option<&[ArgType]>; 256] = [None; 256];\n")
-    for op, name, args in rows():
-        body.append(f"    t[0x{op:02x}] = Some(&[{', '.join(args)}]); // {name}\n")
-    body.append("    t\n};\n")
-    return "".join(body)
-
 
 HEADER = """// Copyright (C) 2019-2026 Algorand Foundation Ltd.
 // Modifications Copyright (C) 2026 Algod DAO
@@ -98,14 +75,48 @@ HEADER = """// Copyright (C) 2019-2026 Algorand Foundation Ltd.
 """
 
 
+def rows():
+    out = []
+    lines = [json.loads(l) for l in FIXTURE.read_text().splitlines() if l.strip()]
+    per_byte = Counter(r["opcode"] for r in lines)
+    for r in lines:
+        if r["modes"] != 3 or not r["args"] or per_byte[r["opcode"]] != 1:
+            continue
+        if r["opcode"] in EXCLUDED:
+            continue
+        out.append((r["opcode"], r["name"], [KINDS[(a["avm"], a["name"])] for a in r["args"]]))
+    return sorted(out)
+
+
+def render():
+    body = [HEADER]
+    body.append("use super::arg_gate::ArgType;\n")
+    body.append(
+        "use super::arg_gate::{ANY, BIGINT, BYTES, BYTES1793, BYTES32, BYTES33, BYTES64, BYTES80, UINT};\n"
+    )
+    body.append(
+        "/// go's `proto` argument types by opcode byte, for every opcode go gates the\n"
+        "/// same way in every run mode (`arg_gate::arg_types` reads this table).\n"
+    )
+    body.append("pub(super) static TABLE: [Option<&[ArgType]>; 256] = {\n")
+    body.append("    let mut t: [Option<&[ArgType]>; 256] = [None; 256];\n")
+    for op, name, args in rows():
+        body.append(f"    t[0x{op:02x}] = Some(&[{', '.join(args)}]); // {name}\n")
+    body.append("    t\n};\n")
+    return "".join(body)
+
+
 def main():
     text = render()
     if "--check" in sys.argv:
-        if OUT.read_text() != text:
+        # Compare bytes with line endings normalised, so a CRLF checkout of
+        # the generated file is not "stale".
+        have = OUT.read_bytes().replace(b"\r\n", b"\n").decode()
+        if have != text:
             print(f"{OUT} is stale: run scripts/gen_arg_gate_table.py", file=sys.stderr)
             sys.exit(1)
         return
-    OUT.write_text(text)
+    OUT.write_bytes(text.encode())  # LF on every platform
     print(f"wrote {OUT} ({len(rows())} opcodes)")
 
 
