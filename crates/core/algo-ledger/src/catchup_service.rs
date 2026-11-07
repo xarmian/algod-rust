@@ -296,8 +296,15 @@ enum FetchOutcome {
     /// The round requires a protocol version this node does not support
     /// (checked before fetching).
     Unsupported,
-    /// The fetch itself failed or returned the wrong round's block.
-    Fetch(Box<Result<FetchedBlockCert, FetchError>>),
+    /// The fetch itself failed or returned the wrong round's block. The flag
+    /// is whether the worker already authenticated the block's certificate
+    /// successfully (issue #2201, go's `fetchAndWrite` does the same before
+    /// it waits for the previous round): the apply loop then skips its own
+    /// `authenticate_block`. `false` means "not authenticated here" (a
+    /// failure, or the ledger could not answer yet), never "rejected": the
+    /// apply loop authenticates such a round at its turn, so accept/reject and
+    /// the reported reason are those of in-order authentication.
+    Fetch(Box<Result<FetchedBlockCert, FetchError>>, bool),
 }
 
 /// Typed exit reason for a sync pass ([`CatchupService::sync_pass_inner`])
@@ -1437,24 +1444,51 @@ impl CatchupService {
                         if ledger.round_is_not_supported(r) {
                             return FetchOutcome::Unsupported;
                         }
-                        FetchOutcome::Fetch(Box::new(Self::fetch_round_with_retries(
-                            fetcher.as_ref(),
-                            r,
-                            &stop,
-                            &ctx,
-                        )))
+                        let result =
+                            Self::fetch_round_with_retries(fetcher.as_ref(), r, &stop, &ctx);
+                        // Authenticate the certificate here, concurrently with
+                        // the other workers and ahead of the apply cursor
+                        // (issue #2201). It reads only lookback state the
+                        // ledger already holds (committed rounds never change),
+                        // so an `Ok` here is the `Ok` in-order authentication
+                        // gives. Only a block of the requested round that
+                        // carries a certificate is tried; anything else, and
+                        // any `Err` (a bad certificate, or lookback state the
+                        // ledger cannot answer for yet), is left for the apply
+                        // loop to judge at its turn.
+                        let pre_authenticated = match &result {
+                            Ok(f) if f.block.round == r && !stop.load(Ordering::SeqCst) => {
+                                f.cert.as_ref().is_some_and(|cert| {
+                                    let started = std::time::Instant::now();
+                                    let ok = ledger.authenticate_block(&f.block, cert).is_ok();
+                                    if started.elapsed() > Duration::from_secs(1) {
+                                        warn!(
+                                            round = %r,
+                                            elapsed_ms = started.elapsed().as_millis() as u64,
+                                            "catchup service: slow authenticate_block"
+                                        );
+                                    }
+                                    ok
+                                })
+                            }
+                            _ => false,
+                        };
+                        FetchOutcome::Fetch(Box::new(result), pre_authenticated)
                     }))
                     .unwrap_or_else(|_| {
-                        FetchOutcome::Fetch(Box::new(Err(FetchError::NetworkError(format!(
-                            "fetch worker panicked fetching round {round}"
-                        )))))
+                        FetchOutcome::Fetch(
+                            Box::new(Err(FetchError::NetworkError(format!(
+                                "fetch worker panicked fetching round {round}"
+                            )))),
+                            false,
+                        )
                     });
                     let unsupported = matches!(outcome, FetchOutcome::Unsupported);
                     if unsupported {
                         // Workers fetching or retrying later rounds stop now.
                         ctx.window_limit.fetch_min(round, Ordering::SeqCst);
                     }
-                    if matches!(&outcome, FetchOutcome::Fetch(r) if r.is_err()) {
+                    if matches!(&outcome, FetchOutcome::Fetch(r, _) if r.is_err()) {
                         ctx.tip_seen.store(true, Ordering::SeqCst);
                         // ANY round's final failure engages the tip gate, a
                         // higher round that gave up at once because a lower one
@@ -1590,7 +1624,7 @@ impl CatchupService {
                         stopped = true;
                         break 'apply;
                     }
-                    FetchOutcome::Fetch(boxed) if boxed.is_err() => {
+                    FetchOutcome::Fetch(boxed, _) if boxed.is_err() => {
                         // Reaching the network tip is the normal exit from
                         // this loop, so only report at debug level.
                         let e = boxed.unwrap_err();
@@ -1609,7 +1643,7 @@ impl CatchupService {
                         stopped = true;
                         break 'apply;
                     }
-                    FetchOutcome::Fetch(boxed) => {
+                    FetchOutcome::Fetch(boxed, pre_authenticated) => {
                         let fetched_block = boxed.expect("checked Ok above via is_err guard");
                         let expected_round = Round(next_apply);
                         let block = fetched_block.block;
@@ -1642,7 +1676,11 @@ impl CatchupService {
                         // log any step of the apply path that is slow so the
                         // next live run names the culprit.
                         let step_started = std::time::Instant::now();
-                        let auth_result = ledger.authenticate_block(&block, &cert);
+                        let auth_result = if pre_authenticated {
+                            Ok(())
+                        } else {
+                            ledger.authenticate_block(&block, &cert)
+                        };
                         if step_started.elapsed() > Duration::from_secs(1) {
                             warn!(
                                 round = %expected_round,
@@ -4612,6 +4650,150 @@ mod tests {
         });
         assert_eq!(exit, SyncExitReason::NoBlock);
         assert_eq!(ledger.next_round(), Round(4));
+    }
+
+    // -- Issue #2201: certificates are authenticated ahead of the apply cursor --
+
+    /// A ledger whose `authenticate_block` can be slowed, made to fail for one
+    /// round (a tampered certificate), made to answer "not ready" for rounds
+    /// beyond the apply cursor (lookback state not there yet), and which
+    /// counts calls and concurrent calls.
+    struct AuthProbeLedger {
+        inner: MockCatchupLedger,
+        delay: Duration,
+        /// `Err` for this round whatever happens.
+        tampered_round: Option<u64>,
+        /// `Err("not ready")` for any round more than this many rounds beyond
+        /// the apply cursor (`None`: always ready).
+        ready_within: Option<u64>,
+        calls: AtomicU64,
+        calls_for_tampered: AtomicU64,
+        inflight: AtomicU64,
+        max_inflight: AtomicU64,
+    }
+
+    impl AuthProbeLedger {
+        fn new(delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                inner: MockCatchupLedger::new(Round(0)),
+                delay,
+                tampered_round: None,
+                ready_within: None,
+                calls: AtomicU64::new(0),
+                calls_for_tampered: AtomicU64::new(0),
+                inflight: AtomicU64::new(0),
+                max_inflight: AtomicU64::new(0),
+            })
+        }
+        fn with(self: Arc<Self>, f: impl FnOnce(&mut Self)) -> Arc<Self> {
+            let mut me = Arc::try_unwrap(self).ok().expect("unshared");
+            f(&mut me);
+            Arc::new(me)
+        }
+    }
+
+    impl CatchupLedger for AuthProbeLedger {
+        fn next_round(&self) -> Round {
+            self.inner.next_round()
+        }
+        fn ensure_block(&self, block: &Block, cert: &Certificate) {
+            self.inner.ensure_block(block, cert)
+        }
+        fn authenticate_block(&self, block: &Block, _cert: &Certificate) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_inflight.fetch_max(now, Ordering::SeqCst);
+            thread::sleep(self.delay);
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
+            if self.tampered_round == Some(block.round.0) {
+                self.calls_for_tampered.fetch_add(1, Ordering::SeqCst);
+                return Err(format!(
+                    "certificate of round {} is tampered",
+                    block.round.0
+                ));
+            }
+            if let Some(within) = self.ready_within {
+                let ahead = block.round.0.saturating_sub(self.inner.next_round().0);
+                if ahead > within {
+                    return Err("lookback state not ready".to_string());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn run_auth_pass(ledger: &Arc<AuthProbeLedger>, up_to: u64, parallel: u64) -> SyncExitReason {
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher: Arc<dyn BlockFetcher> = Arc::new(BoundedBlockFetcher {
+            up_to,
+            calls: AtomicU64::new(0),
+        });
+        let shutdown_rx = never_shutdown();
+        CatchupService::sync_range(&ledger_dyn, &fetcher, &shutdown_rx, parallel)
+    }
+
+    /// The certificates of the rounds ahead of the apply cursor are
+    /// authenticated concurrently (the lookahead window of go's
+    /// `fetchAndWrite`), once each, and every round is still applied.
+    #[test]
+    fn lookahead_rounds_are_authenticated_concurrently_and_once() {
+        let ledger = AuthProbeLedger::new(Duration::from_millis(15));
+        let exit = run_auth_pass(&ledger, 24, 4);
+        assert_eq!(exit, SyncExitReason::NoBlock);
+        assert_eq!(ledger.inner.next_round(), Round(25));
+        assert_eq!(
+            ledger.calls.load(Ordering::SeqCst),
+            24,
+            "each certificate is authenticated exactly once"
+        );
+        assert!(
+            ledger.max_inflight.load(Ordering::SeqCst) >= 2,
+            "the certificates were authenticated one at a time"
+        );
+    }
+
+    /// A tampered certificate at round N stops the sync at N exactly as with
+    /// in-order authentication: the same exit, nothing applied from N on, and
+    /// the same ledger position whatever the window (differential against the
+    /// serial window of one).
+    #[test]
+    fn a_tampered_certificate_stops_the_sync_at_its_round_like_in_order_authentication() {
+        let mut results = Vec::new();
+        for parallel in [1u64, 4, 16] {
+            let ledger = AuthProbeLedger::new(Duration::from_millis(1)).with(|l| {
+                l.tampered_round = Some(9);
+            });
+            let exit = run_auth_pass(&ledger, 30, parallel);
+            results.push((exit, ledger.inner.next_round()));
+            assert!(
+                ledger.calls_for_tampered.load(Ordering::SeqCst) >= 1,
+                "the tampered round was judged"
+            );
+        }
+        assert_eq!(results[0], (SyncExitReason::NoBlock, Round(9)));
+        assert_eq!(results[1], results[0]);
+        assert_eq!(results[2], results[0]);
+    }
+
+    /// A ledger that cannot yet answer for a lookahead round (an `Err` at
+    /// worker time) is not a rejection: the round is authenticated again at
+    /// its turn and accepted.
+    #[test]
+    fn a_not_ready_lookahead_answer_falls_back_to_authenticating_at_the_turn() {
+        let ledger = AuthProbeLedger::new(Duration::ZERO).with(|l| {
+            l.ready_within = Some(0);
+        });
+        let exit = run_auth_pass(&ledger, 20, 4);
+        assert_eq!(exit, SyncExitReason::NoBlock);
+        assert_eq!(
+            ledger.inner.next_round(),
+            Round(21),
+            "every round is accepted at its turn"
+        );
+        assert!(
+            ledger.calls.load(Ordering::SeqCst) > 20,
+            "the not-ready rounds were authenticated again at their turn"
+        );
     }
 
     // -- Issue #2165 review: liveness of the unbounded pass --
