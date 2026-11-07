@@ -277,8 +277,22 @@ impl RequestTracker {
         // more responses than we've ever requested: a protocol violation
         // the caller must disconnect for, exactly like go's
         // `disconnectUnexpectedTopicResp`.
-        if self.outstanding.fetch_sub(1, Ordering::SeqCst) - 1 < 0 {
-            return Err(RequestResponseError::UnrequestedResponse);
+        //
+        // go judges the counter ONLY when no request is pending at all
+        // (`lenResponseChannels() == 0`, `network/wsPeer.go:547`): the
+        // request is registered before it is enqueued and counted after, so a
+        // fast reply can arrive between the two with the counter still at
+        // zero (issue #2249: it disconnected the relay under load and stalled
+        // an all-Rust cluster). With nothing pending, a reply that is not
+        // beyond the requests ever sent is a late answer to a request whose
+        // wait timed out and is discarded.
+        let none_pending = self.pending.lock().await.is_empty();
+        let remaining = self.outstanding.fetch_sub(1, Ordering::SeqCst) - 1;
+        if none_pending {
+            if remaining < 0 {
+                return Err(RequestResponseError::UnrequestedResponse);
+            }
+            return Ok(());
         }
 
         // Deserialize response Topics
@@ -409,6 +423,59 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// Issue #2249: the request is registered (`prepare_request`) before it is
+    /// handed to the send queue and only COUNTED (`mark_request_sent`) after
+    /// it, so a fast peer's reply (a block service answering "not available"
+    /// at once, a loaded one-CPU runner) can reach the read loop between the
+    /// two. go's read loop only judges the counter when NO request is pending
+    /// (`lenResponseChannels() == 0`), so this ordering is harmless there; it
+    /// must not disconnect the peer here either. The reply is delivered and the
+    /// counter is back to zero once the send path has counted its request.
+    #[tokio::test]
+    async fn a_response_that_beats_the_requests_own_count_is_not_a_violation() {
+        let tracker = RequestTracker::new();
+        let request_topics = Topics::from_vec(vec![Topic::new("key", b"value".to_vec())]);
+        let (_serialized, hash, rx) = tracker.prepare_request(request_topics).await;
+
+        // The reply arrives BEFORE `mark_request_sent` ran.
+        let response_data = make_response(hash, "result", b"ok");
+        tracker
+            .handle_response(&response_data)
+            .await
+            .expect("a pending request makes an early reply legitimate");
+
+        tracker.mark_request_sent();
+        assert_eq!(tracker.outstanding_topic_requests(), 0);
+        let response_topics = rx.await.expect("the reply is delivered");
+        assert_eq!(response_topics.get_value("result"), Some(b"ok".as_slice()));
+    }
+
+    /// The other half of go's rule: with NO request pending, a late reply to a
+    /// request whose wait already timed out (counter still above zero) is
+    /// discarded, and one beyond the requests ever sent is a violation.
+    #[tokio::test]
+    async fn without_a_pending_request_only_an_uncounted_response_is_a_violation() {
+        let tracker = RequestTracker::new();
+        let request_topics = Topics::from_vec(vec![Topic::new("key", b"value".to_vec())]);
+        let (_serialized, hash, _rx) = tracker.prepare_request(request_topics).await;
+        tracker.mark_request_sent();
+        // The local wait timed out: the pending entry is gone, the count stays.
+        tracker.cancel_request(hash).await;
+
+        let late = make_response(hash, "result", b"late");
+        tracker
+            .handle_response(&late)
+            .await
+            .expect("late reply is discarded");
+        assert_eq!(tracker.outstanding_topic_requests(), 0);
+
+        // One more than ever requested, nothing pending: the violation.
+        assert!(matches!(
+            tracker.handle_response(&late).await,
+            Err(RequestResponseError::UnrequestedResponse)
+        ));
+    }
+
     /// Ports go-algorand's `TestDiscardUnrequestedBlockResponse`
     /// (`network/wsNetwork_test.go:4182`): a peer sending a `TopicMsgResp`
     /// with no matching outstanding request at all (the outstanding-topic-
@@ -478,8 +545,12 @@ mod tests {
     #[tokio::test]
     async fn missing_hash_field_returns_error() {
         let tracker = RequestTracker::new();
-        // A request was outstanding, so the counter check passes through to
-        // the actual payload validation being exercised here.
+        // A request is pending (as go's read loop requires before it looks
+        // at a response's payload), so the payload validation being
+        // exercised here is reached.
+        let _pending = tracker
+            .prepare_request(Topics::from_vec(vec![Topic::new("q", b"x".to_vec())]))
+            .await;
         tracker.mark_request_sent();
 
         // Build a response without the RESPONSE_HASH_FIELD
@@ -600,6 +671,10 @@ mod tests {
     #[tokio::test]
     async fn deserialization_failure_returns_error() {
         let tracker = RequestTracker::new();
+        // A pending request, so the payload is looked at (see above).
+        let _pending = tracker
+            .prepare_request(Topics::from_vec(vec![Topic::new("q", b"x".to_vec())]))
+            .await;
         tracker.mark_request_sent();
 
         // Pass garbage data that can't be deserialized as Topics
