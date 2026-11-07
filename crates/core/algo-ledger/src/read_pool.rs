@@ -147,6 +147,11 @@ pub struct LedgerReadPool {
     /// Test: make the next N `committed_round` reads fail.
     #[cfg(test)]
     pub(crate) fail_committed_round: std::sync::atomic::AtomicUsize,
+    /// Test hook (issue #2171): make the next N pooled [`Self::read_resources`]
+    /// calls fail like a pooled-connection SQL error. The fresh-connection
+    /// variant is not affected.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_pooled_resource_reads: std::sync::atomic::AtomicUsize,
     /// Rewards levels of recently read committed headers, shared by the
     /// `lookup_agreement` reward fold (round `r - lookback`) and the account
     /// lookups (the tip), so neither evicts the other. Only committed rounds
@@ -222,6 +227,8 @@ impl LedgerReadPool {
             archive_inflight,
             #[cfg(test)]
             fail_committed_round: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_pooled_resource_reads: std::sync::atomic::AtomicUsize::new(0),
             rewards_cache: RewardsLevels::default(),
             #[cfg(test)]
             header_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -271,6 +278,14 @@ impl LedgerReadPool {
                 message: format!("read pool: {e}"),
             }),
         }
+    }
+
+    /// Make the next `n` pooled [`Self::read_resources`] calls fail (issue
+    /// #2171 test hook); [`Self::read_resources_fresh`] is unaffected.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_next_pooled_resource_reads(&self, n: usize) {
+        self.fail_pooled_resource_reads
+            .store(n, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Number of idle pooled connections (diagnostics / tests).
@@ -952,29 +967,70 @@ impl LedgerReadPool {
         &self,
         f: impl FnOnce(&PoolReader<'_>) -> T,
     ) -> Result<(u64, T), AlgoError> {
-        self.with_conn(|c| {
-            let tx = c.unchecked_transaction()?;
-            let rnd: Option<i64> = tx
-                .prepare_cached("SELECT rnd FROM acctrounds WHERE id = 'acctbase'")?
-                .query_row([], |row| row.get(0))
-                .optional()?;
-            let round = rnd.map(|v| v.max(0) as u64).unwrap_or(0);
-            let reader = PoolReader {
-                conn: &tx,
-                err: std::cell::Cell::new(None),
-                round,
-                rewards_cache: &self.rewards_cache,
-                #[cfg(test)]
-                header_reads: &self.header_reads,
-            };
-            let out = f(&reader);
-            if let Some(e) = reader.err.take() {
-                return Err(e);
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            let pending = self
+                .fail_pooled_resource_reads
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if pending > 0 {
+                self.fail_pooled_resource_reads
+                    .store(pending - 1, std::sync::atomic::Ordering::SeqCst);
+                return Err(AlgoError::Ledger {
+                    message: "injected pooled resource read failure".into(),
+                });
             }
-            drop(reader);
-            tx.commit()?;
-            Ok((round, out))
-        })
+        }
+        self.with_conn(|c| self.resources_in_snapshot(c, f))
+    }
+
+    /// [`Self::read_resources`] on a connection opened for this one call and
+    /// dropped after it, instead of an idle pooled one (issue #2171). The
+    /// caller's fallback when a pooled read failed: a fresh read-only
+    /// connection sees the same committed state and needs no ledger mutex, so
+    /// the resource scans do not have to run on the locked ledger. A
+    /// persistent SQL error fails here too (`Err`), and the locked path then
+    /// decides and reports it.
+    pub fn read_resources_fresh<T>(
+        &self,
+        f: impl FnOnce(&PoolReader<'_>) -> T,
+    ) -> Result<(u64, T), AlgoError> {
+        let conn = self.open().map_err(|e| AlgoError::Ledger {
+            message: format!("read pool: open fresh read-only connection: {e}"),
+        })?;
+        self.resources_in_snapshot(&conn, f)
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("read pool: {e}"),
+            })
+    }
+
+    /// One read transaction on `c`: the committed round and `f`'s reads in
+    /// the same snapshot; the first SQL error fails the whole call.
+    fn resources_in_snapshot<T>(
+        &self,
+        c: &Connection,
+        f: impl FnOnce(&PoolReader<'_>) -> T,
+    ) -> Result<(u64, T), rusqlite::Error> {
+        let tx = c.unchecked_transaction()?;
+        let rnd: Option<i64> = tx
+            .prepare_cached("SELECT rnd FROM acctrounds WHERE id = 'acctbase'")?
+            .query_row([], |row| row.get(0))
+            .optional()?;
+        let round = rnd.map(|v| v.max(0) as u64).unwrap_or(0);
+        let reader = PoolReader {
+            conn: &tx,
+            err: std::cell::Cell::new(None),
+            round,
+            rewards_cache: &self.rewards_cache,
+            #[cfg(test)]
+            header_reads: &self.header_reads,
+        };
+        let out = f(&reader);
+        if let Some(e) = reader.err.take() {
+            return Err(e);
+        }
+        drop(reader);
+        tx.commit()?;
+        Ok((round, out))
     }
 
     /// Lock-free `SqliteLedger::online_circulation_at_round` (go's

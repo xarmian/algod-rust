@@ -524,6 +524,15 @@ fn assert_resources_match(l: &SqliteLedger, pool: &LedgerReadPool) {
     let (round, got) = pool.read_resources(|r| probe(r)).expect("pool snapshot");
     assert_eq!(round, l.last_committed_round().unwrap().unwrap_or(0));
     assert_eq!(got, want);
+    // Issue #2171: the fresh-connection variant answers the same, in the same
+    // snapshot shape, and leaves the idle pool alone.
+    let idle = pool.idle_connections();
+    let (fresh_round, fresh) = pool
+        .read_resources_fresh(|r| probe(r))
+        .expect("fresh snapshot");
+    assert_eq!(fresh_round, round);
+    assert_eq!(fresh, want);
+    assert_eq!(pool.idle_connections(), idle);
 }
 
 fn stage_ops(l: &mut SqliteLedger, round: u64, ops: impl FnOnce(&mut SqliteLedger)) {

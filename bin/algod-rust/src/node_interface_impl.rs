@@ -504,14 +504,24 @@ impl AlgodNodeInterface {
     ) -> Result<(u64, u64, T), NodeError> {
         use algo_ledger::ResourceReads as _;
         if path == ReadPath::Pool {
-            let pooled = self.pooled_resources(|r| {
-                let level = r.committed_rewards_level().ok()?;
-                Some((level, read(r, level)))
-            });
-            match pooled {
-                Some((round, Some((level, Ok(v))))) => return Ok((round, level, v)),
-                Some((_, Some((_, Err(e))))) => return Err(e),
-                _ => {}
+            // The pooled snapshot first; when it fails at snapshot level, one
+            // fresh read-only connection (issue #2171), so the scans still run
+            // without the ledger mutex; only then the locked ledger.
+            for fresh in [false, true] {
+                let scan = |r: &algo_ledger::PoolReader<'_>| {
+                    let level = r.committed_rewards_level().ok()?;
+                    Some((level, read(r, level)))
+                };
+                let got = if fresh {
+                    self.fresh_resources(scan)
+                } else {
+                    self.pooled_resources(scan)
+                };
+                match got {
+                    Some((round, Some((level, Ok(v))))) => return Ok((round, level, v)),
+                    Some((_, Some((_, Err(e))))) => return Err(e),
+                    _ => {}
+                }
             }
         }
         let ledger = self.lock_ledger(method)?;
@@ -532,9 +542,11 @@ impl AlgodNodeInterface {
     /// resources (they live in the `resources` table), so the held assets,
     /// created assets/apps and app local states are composed from the
     /// resource accessors, as go's `AccountDataToAccount` lists them. The
-    /// locked fallback is reached for an in-memory ledger (no pool) or after a
-    /// snapshot-level failure; it reads under the ledger mutex because the
-    /// accessors need the ledger itself, and the scans are bounded by
+    /// pooled snapshot is tried first, then (issue #2171) one fresh read-only
+    /// connection after a snapshot-level failure, both without the ledger
+    /// mutex. Only an in-memory ledger (one connection, no pool) and a failure
+    /// of both reach the locked fallback, which reads under the ledger mutex
+    /// because the accessors need the ledger itself; its scans are bounded by
     /// `max_resources`.
     fn account_lookup(&self, addr: &Address, kind: LookupKind) -> Result<AccountLookup, NodeError> {
         self.account_lookup_via(addr, kind, ReadPath::Pool)
@@ -599,6 +611,17 @@ impl AlgodNodeInterface {
         f: impl FnOnce(&algo_ledger::PoolReader<'_>) -> T,
     ) -> Option<(u64, T)> {
         self.read_pool()?.read_resources(f).ok()
+    }
+
+    /// [`Self::pooled_resources`] on a fresh read-only connection (issue
+    /// #2171): the fallback after a failed pooled read, still without the
+    /// ledger mutex. `None` for an in-memory ledger (no pool, and a second
+    /// connection cannot see an in-memory database) or any SQL error.
+    fn fresh_resources<T>(
+        &self,
+        f: impl FnOnce(&algo_ledger::PoolReader<'_>) -> T,
+    ) -> Option<(u64, T)> {
+        self.read_pool()?.read_resources_fresh(f).ok()
     }
 
     /// The lock-free read pool, or `None` for an in-memory ledger.
@@ -9524,6 +9547,45 @@ err
         assert!(
             elapsed < Duration::from_secs(2),
             "account lookup waited behind the held ledger mutex: {elapsed:?}"
+        );
+    }
+
+    /// Issue #2171: when the pooled read fails, the resource scans must NOT
+    /// fall back to the locked ledger on a file-backed node: they run on a
+    /// fresh read-only connection with the ledger mutex free (observed by
+    /// taking the mutex from inside the scan closure), and the answer is the
+    /// pooled one.
+    #[tokio::test]
+    async fn the_account_scan_fallback_runs_without_the_ledger_mutex() {
+        let (_dir, ledger, who) = file_backed_ledger_with_seeded_account();
+        let adapter = make_adapter_with_ledger(ledger.clone());
+        let pool = adapter.read_pool().expect("file-backed ledger has a pool");
+        pool.fail_next_pooled_resource_reads(1);
+        let mutex_was_free = std::cell::Cell::new(None);
+        let (round, _, _) = adapter
+            .committed_read("test", ReadPath::Pool, |_, level| {
+                mutex_was_free.set(Some(ledger.try_lock().is_ok()));
+                Ok(level)
+            })
+            .unwrap();
+        assert_eq!(round, 3);
+        assert_eq!(
+            mutex_was_free.get(),
+            Some(true),
+            "the fallback scan ran while holding the ledger mutex"
+        );
+
+        // Through the endpoint, with the mutex held elsewhere the whole time:
+        // the pooled read fails once, the fresh connection answers.
+        pool.fail_next_pooled_resource_reads(1);
+        let elapsed = timed_while_ledger_locked(&ledger, async {
+            let lookup = adapter.lookup_account(&who).await.unwrap();
+            assert_account_lookup_has_resources(&lookup);
+        })
+        .await;
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "account lookup fallback waited behind the held ledger mutex: {elapsed:?}"
         );
     }
 
