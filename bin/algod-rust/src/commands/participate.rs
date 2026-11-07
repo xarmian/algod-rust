@@ -1989,6 +1989,15 @@ struct ExecState {
     /// of refused; block assembly re-runs the real apply and drops what
     /// fails, so this costs evaluation budget, never an invalid block. Only
     /// filled while the evaluator is incomplete; bounded by the block's size.
+    ///
+    /// Known limits (follow-up issue): an address merely REFERENCED by a short
+    /// application call becomes unknown too and the set spreads transitively
+    /// (every unknown sender's payments mark their receivers), so one cap slot
+    /// can make later honest groups be judged on unknown balances, where
+    /// requiring an actual shortfall before marking references would not; and
+    /// a group during which the evaluator itself turns incomplete is not
+    /// tracked (the flag is read once per group). Both only weaken degraded
+    /// admission verdicts, never block assembly.
     unknown_balances: Arc<HashSet<Address>>,
     /// Set once a group was admitted without being evaluated (stale base or
     /// spent budget): the overlay no longer matches the admitted set, so
@@ -2613,7 +2622,11 @@ impl SimpleBlockEvaluator {
     ///    (`DegradedMoves`): `transaction_group` applies its moves and then
     ///    restores the balances it touched, and the addresses it touches become
     ///    unknown in turn (#2217, tests
-    ///    `a_degraded_admission_*`). A known residual: a later member's
+    ///    `a_degraded_admission_*`). Known limits of the heuristic: references
+    ///    of a short application call are marked unknown without an actual
+    ///    shortfall and the marks spread transitively, and a group during
+    ///    which the evaluator turns incomplete is not tracked (see
+    ///    `ExecState::unknown_balances`). A known residual: a later member's
     ///    outright failure is reported instead of the deferred member's
     ///    overspend that go would name first.
     ///
@@ -2724,12 +2737,13 @@ impl SimpleBlockEvaluator {
         let tracked = degraded && self.exec.is_some();
         // The unknown addresses of earlier groups (a cheap `Arc` clone, not a
         // copy of the set) and this group's own delta.
-        let known: Arc<HashSet<Address>> = match (tracked, self.exec.as_ref()) {
-            (true, Some(exec)) => Arc::clone(&exec.unknown_balances),
-            _ => Arc::default(),
+        let known: Option<Arc<HashSet<Address>>> = match (tracked, self.exec.as_ref()) {
+            (true, Some(exec)) => Some(Arc::clone(&exec.unknown_balances)),
+            _ => None,
         };
         let mut marked: Vec<Address> = Vec::new();
-        let mut touched_members: Vec<Vec<Address>> = vec![Vec::new(); txgroup.len()];
+        // Sized on the first unmodelled member only.
+        let mut touched_members: Vec<Vec<Address>> = Vec::new();
         let mut credited_senders: Vec<Address> = Vec::new();
         for (member, (stx, restored_stx)) in txgroup.iter().zip(&restored).enumerate() {
             let fail = |error: algo_error::AlgoError| {
@@ -2776,7 +2790,9 @@ impl SimpleBlockEvaluator {
             let already_spent = spent.get(&sender).copied().unwrap_or(0);
             let required = already_spent.saturating_add(cost);
             let available = base.saturating_add(credited);
-            let unknown_sender = tracked && (known.contains(&sender) || marked.contains(&sender));
+            let unknown_sender = tracked
+                && (known.as_ref().is_some_and(|k| k.contains(&sender))
+                    || marked.contains(&sender));
             let mut shortfall_credited = false;
             if available < required {
                 // Issue #2187: a shortfall after an application call that may
@@ -2873,9 +2889,15 @@ impl SimpleBlockEvaluator {
                     );
                 }
                 for addr in touched.iter().chain(&referenced) {
-                    if !addr.is_zero() && !known.contains(addr) && !marked.contains(addr) {
+                    if !addr.is_zero()
+                        && !known.as_ref().is_some_and(|k| k.contains(addr))
+                        && !marked.contains(addr)
+                    {
                         marked.push(*addr);
                     }
+                }
+                if touched_members.is_empty() {
+                    touched_members.resize(txgroup.len(), Vec::new());
                 }
                 touched_members[member] = touched;
             }
@@ -2927,7 +2949,7 @@ impl SimpleBlockEvaluator {
                 txids: Vec::new(),
             })
         })?;
-        if touched_members.iter().any(|t| !t.is_empty()) {
+        if !touched_members.is_empty() {
             moves.touched = touched_members;
             moves.unknown = marked;
         }
@@ -4133,7 +4155,16 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                 Some(touched) if !touched.is_empty() => {
                     let mut before = Vec::with_capacity(touched.len());
                     for addr in touched {
-                        before.push((*addr, self.try_effective_balance(addr)?));
+                        match self.try_effective_balance(addr) {
+                            Ok(balance) => before.push((*addr, balance)),
+                            Err(error) => {
+                                // The group's earlier mutations (and fees) are
+                                // undone, like every other failure below.
+                                self.overlay.restore(checkpoint);
+                                self.fees_collected = fees_collected_checkpoint;
+                                return Err(error);
+                            }
+                        }
                     }
                     before
                 }
@@ -4456,6 +4487,17 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                     if *addr == self.hdr.fee_sink
                         || *addr == self.hdr.rewards_pool
                         || *addr == Address::STATE_PROOF_SENDER
+                    {
+                        continue;
+                    }
+                    // Issue #2217: the overlay balance of an address whose
+                    // moves were restored (or that is unknown) is stale: its
+                    // minimum is not judged, as the fee sink's is not.
+                    if moves.unknown.contains(addr)
+                        || self
+                            .exec
+                            .as_ref()
+                            .is_some_and(|exec| exec.unknown_balances.contains(addr))
                     {
                         continue;
                     }

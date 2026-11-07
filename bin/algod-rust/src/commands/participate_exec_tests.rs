@@ -4443,6 +4443,54 @@ fn every_creditable_sender_of_a_group_counts_against_the_cap() {
     );
 }
 
+/// Issue #2217 review: the balance read of the restore snapshot can fail; the
+/// group is then rolled back like every other failure (overlay and fees as
+/// before), not left half applied for the next group. R's pending-rewards
+/// arithmetic overflows at a huge rewards level, S's does not.
+#[test]
+fn a_failing_restore_snapshot_rolls_the_group_back() {
+    let s = key(3);
+    let r = key(4);
+    let (ledger, mut eval) = evaluator(&[
+        (s.0, funded(5_000_000)),
+        (r.0, funded(20_000_000_000_000_000)),
+    ]);
+    put_app(&ledger, 906, s.0, "#pragma version 9\nint 1\n");
+    eval.exec.as_mut().unwrap().incomplete = true;
+    eval.hdr.rewards_level = 1_000_000_000;
+    let s_before = balance(&mut eval, &s.0);
+    let fees_before = eval.fees_collected;
+    eval.transaction_group(&call_then_short_pay(906, 7, 1))
+        .expect_err("R's balance cannot be read");
+    assert_eq!(
+        eval.fees_collected, fees_before,
+        "fees were not rolled back"
+    );
+    assert_eq!(
+        balance(&mut eval, &s.0),
+        s_before,
+        "the modelled member's moves were not rolled back"
+    );
+    assert!(eval.included_txns.is_empty());
+}
+
+/// Issue #2217 review: the minimum balance of an address whose moves were
+/// restored is not judged against its stale overlay balance: `[call S, F opts
+/// in to an asset]` with F below the minimum and short for the fee (the call's
+/// inner payment may fund it) is admitted.
+#[test]
+fn a_degraded_admission_does_not_judge_the_minimum_of_an_unknown_balance() {
+    let mut eval = degraded_evaluator();
+    let f = key(7);
+    eval.snapshot.accounts.insert(f.0, Some(funded(500)));
+    let mut optin = base_txn(f.0, TxnType::Axfer);
+    optin.xaid = 7;
+    optin.asset_receiver = Some(f.0);
+    eval.transaction_group(&call_then(vec![(optin, &f)], 9))
+        .expect("admitted: F's minimum is unknown, not judged");
+    assert!(unknown_of(&eval).contains(&f.0));
+}
+
 /// Issue #2217 review: an admitted group with two short senders takes a slot
 /// for EACH of them, so a retry by either does not take a new one.
 #[test]
