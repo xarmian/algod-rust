@@ -24,6 +24,7 @@
 //! stack machine, and opcode implementations for TEAL program execution.
 
 pub(crate) mod arg_gate;
+pub(crate) mod arg_gate_table;
 pub mod assembler;
 pub mod bytecode;
 pub mod context;
