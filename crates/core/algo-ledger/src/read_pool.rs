@@ -357,13 +357,21 @@ impl LedgerReadPool {
     /// Atomically consume one unit of an injected-failure counter.
     #[cfg(any(test, feature = "test-hooks"))]
     fn take_injected(counter: &std::sync::atomic::AtomicUsize) -> bool {
-        counter
-            .fetch_update(
+        // A compare-exchange loop, not `fetch_update` (renamed `try_update`
+        // on newer toolchains, where the old name is deprecated).
+        let mut cur = counter.load(std::sync::atomic::Ordering::SeqCst);
+        while cur > 0 {
+            match counter.compare_exchange(
+                cur,
+                cur - 1,
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
-                |n| n.checked_sub(1),
-            )
-            .is_ok()
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+        false
     }
 
     /// Number of idle pooled connections (diagnostics / tests).
