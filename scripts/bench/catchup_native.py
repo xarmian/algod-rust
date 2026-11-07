@@ -24,6 +24,11 @@ times each (relay speed varies between runs and over the day):
         --genesis docker/algod/genesis/betanet/genesis.json --follow-secs 60
 
 It prints one JSON object (the replay `blocks_per_s`, `gate_ok`, the follow CPU).
+On Linux it also records `mem_mb` (issue #2207): the node's VmRSS / VmHWM (exact
+lifetime peak) / RssAnon / RssFile in MB when the catchpoint download starts,
+when the catchpoint phase ends (download, import, verify, lookback blocks), when
+the node reaches the head and after the follow window, so the peak can be placed
+in a phase.
 `--rustlog warn,algo_rest_client::gossip_block_source=debug --log node.log` keeps
 the node's log for profiling.
 """
@@ -77,6 +82,24 @@ def cpu_seconds(pid):
     return ticks / os.sysconf("SC_CLK_TCK")
 
 
+def mem_mb(pid):
+    """Memory of a process in MB from /proc/<pid>/status (Linux; None elsewhere):
+    the current and peak resident set (VmRSS, VmHWM) and its anonymous (heap,
+    stacks, anonymous mmap) and file-backed (mapped files, e.g. SQLite mmap,
+    binary) parts. VmHWM is the exact lifetime peak, not a sampled maximum."""
+    keys = {"VmRSS": "rss", "VmHWM": "hwm", "RssAnon": "anon", "RssFile": "file"}
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            out = {}
+            for line in f:
+                k, _, v = line.partition(":")
+                if k in keys:
+                    out[keys[k]] = round(int(v.split()[0]) / 1024, 1)
+            return out or None
+    except OSError:
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bin", required=True, help="the algod-rust binary")
@@ -127,6 +150,7 @@ def main():
         urllib.request.urlopen(req, timeout=30).read()
         t_req = time.time()
         clear = end = None
+        mem = {}  # phase -> /proc memory snapshot (Linux only)
         seen_catchpoint = False
         last_pub = 0
         pub_lr = 0
@@ -141,8 +165,11 @@ def main():
             lr = st.get("last-round", 0)
             if cp:
                 seen_catchpoint = True
+            if cp and "catchpoint_started" not in mem:
+                mem["catchpoint_started"] = mem_mb(proc.pid)
             if seen_catchpoint and not cp and clear is None and lr >= label_round:
                 clear = (now, lr)
+                mem["catchpoint_done"] = mem_mb(proc.pid)
             if clear and now - last_pub > 5:
                 try:
                     pub_lr = json.loads(get(f"{PUBLIC}/v2/status"))["last-round"]
@@ -151,6 +178,7 @@ def main():
                 last_pub = now
             if clear and pub_lr and lr >= pub_lr - HEAD_SLACK_ROUNDS:
                 end = (now, lr)
+                mem["at_head"] = mem_mb(proc.pid)
                 break
         if not clear or not end:
             out["error"] = "no complete run"
@@ -197,6 +225,8 @@ def main():
                 out["follow_wall_s"] = round(w1 - w0, 1)
                 out["follow_rounds"] = r1 - r0
                 out["follow_cpu_pct"] = round(100 * (c1 - c0) / (w1 - w0), 2)
+                mem["after_follow"] = mem_mb(proc.pid)
+            out["mem_mb"] = {k: v for k, v in mem.items() if v}
     finally:
         proc.kill()
         try:
