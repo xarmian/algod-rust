@@ -182,8 +182,11 @@ pub struct RequestTracker {
     /// ([`mark_request_sent`](Self::mark_request_sent)) and decremented once
     /// per arriving `TopicMsgResp` response ([`handle_response`](Self::handle_response)),
     /// regardless of whether that particular response's hash is found.
-    /// A negative value after decrementing means the peer has sent more
-    /// responses than we've ever requested — a protocol violation.
+    /// A negative value after decrementing is a protocol violation (the peer
+    /// has sent more responses than we've ever requested) ONLY when no
+    /// request is pending, as in go (`network/wsPeer.go:547`); while a
+    /// request is pending the value may transiently be negative because the
+    /// request is registered before it is counted.
     ///
     /// Unlike the `pending` map (whose entries are removed as soon as an
     /// individual `Request()` call's own wait ends, including on a
@@ -266,33 +269,39 @@ impl RequestTracker {
     /// (a uvarint-encoded u64), and routes the response to the matching
     /// pending request.
     ///
-    /// If the hash is not found (stale/late response), a warning is logged
-    /// and `Ok(())` is returned. If the hash field is missing, an error is
-    /// returned.
+    /// The outstanding-topic-request counter is decremented first. When NO
+    /// request is pending (go: `lenResponseChannels() == 0`) the response is
+    /// not parsed: it is an [`UnrequestedResponse`](RequestResponseError::UnrequestedResponse)
+    /// violation if the counter went negative, otherwise a late reply that is
+    /// silently discarded. With a request pending the counter is not judged;
+    /// if the hash is not found (stale/late response) a warning is logged and
+    /// `Ok(())` is returned, and a missing/undecodable hash field is an error.
     pub async fn handle_response(&self, data: &[u8]) -> Result<(), RequestResponseError> {
-        // Decrement the outstanding-topic-request counter first, mirroring
-        // go's unconditional decrement on every `TopicMsgResp` arrival
-        // (`network/wsPeer.go:548,644`) — before any attempt to parse the
-        // payload. If this drives the counter negative, the peer has sent
-        // more responses than we've ever requested: a protocol violation
-        // the caller must disconnect for, exactly like go's
-        // `disconnectUnexpectedTopicResp`.
+        // Judge the outstanding-topic-request counter exactly as go does
+        // (`network/wsPeer.go:547-556`, `lenResponseChannels() == 0`): the
+        // counter is decremented once for every arriving `TopicMsgResp`
+        // (go: `:548`/`:644`), but a negative value is a protocol violation
+        // (`disconnectUnexpectedTopicResp`) ONLY when no request is pending.
         //
-        // go judges the counter ONLY when no request is pending at all
-        // (`lenResponseChannels() == 0`, `network/wsPeer.go:547`): the
+        // With a request pending the decrement alone is no violation: a
         // request is registered before it is enqueued and counted after, so a
-        // fast reply can arrive between the two with the counter still at
-        // zero (issue #2249: it disconnected the relay under load and stalled
-        // an all-Rust cluster). With nothing pending, a reply that is not
-        // beyond the requests ever sent is a late answer to a request whose
-        // wait timed out and is discarded.
-        let none_pending = self.pending.lock().await.is_empty();
+        // fast reply can arrive in between with the counter still at zero
+        // (issue #2249: it disconnected the relay under load and stalled an
+        // all-Rust cluster). With nothing pending, a reply that is not beyond
+        // the requests ever counted is a late answer to a request whose wait
+        // timed out and is discarded without being parsed.
+        //
+        // The `pending` lock is taken once for the emptiness check and the
+        // sender lookup so no registration or cancellation can slip between
+        // them.
+        let mut pending = self.pending.lock().await;
         let remaining = self.outstanding.fetch_sub(1, Ordering::SeqCst) - 1;
-        if none_pending {
-            if remaining < 0 {
-                return Err(RequestResponseError::UnrequestedResponse);
-            }
-            return Ok(());
+        if pending.is_empty() {
+            return if remaining < 0 {
+                Err(RequestResponseError::UnrequestedResponse)
+            } else {
+                Ok(())
+            };
         }
 
         // Deserialize response Topics
@@ -308,11 +317,9 @@ impl RequestTracker {
         let (hash_key, _) =
             decode_uvarint(hash_bytes).ok_or(RequestResponseError::InvalidHashEncoding)?;
 
-        // Look up and remove the pending request
-        let sender = {
-            let mut pending = self.pending.lock().await;
-            pending.remove(&hash_key)
-        };
+        // Look up and remove the pending request, then release the lock
+        let sender = pending.remove(&hash_key);
+        drop(pending);
 
         match sender {
             Some(tx) => {
@@ -448,6 +455,96 @@ mod tests {
         assert_eq!(tracker.outstanding_topic_requests(), 0);
         let response_topics = rx.await.expect("the reply is delivered");
         assert_eq!(response_topics.get_value("result"), Some(b"ok".as_slice()));
+    }
+
+    /// Issue #2251: two requests A and B are registered, a reply to A arrives
+    /// before EITHER has been counted, then both are counted, then B's reply
+    /// arrives. None of them is a violation and each receiver gets its own
+    /// reply; the counter ends at zero.
+    #[tokio::test]
+    async fn two_concurrent_requests_with_an_early_reply_are_not_violations() {
+        let tracker = RequestTracker::new();
+        let (_sa, hash_a, rx_a) = tracker
+            .prepare_request(Topics::from_vec(vec![Topic::new("q", b"a".to_vec())]))
+            .await;
+        let (_sb, hash_b, rx_b) = tracker
+            .prepare_request(Topics::from_vec(vec![Topic::new("q", b"b".to_vec())]))
+            .await;
+        assert_eq!(tracker.pending_count().await, 2);
+
+        // A's reply beats both counts.
+        tracker
+            .handle_response(&make_response(hash_a, "r", b"for-a"))
+            .await
+            .expect("an early reply with requests pending");
+        tracker.mark_request_sent();
+        tracker.mark_request_sent();
+        assert_eq!(tracker.outstanding_topic_requests(), 1);
+
+        tracker
+            .handle_response(&make_response(hash_b, "r", b"for-b"))
+            .await
+            .expect("B's reply");
+        assert_eq!(tracker.outstanding_topic_requests(), 0);
+        assert_eq!(tracker.pending_count().await, 0);
+        assert_eq!(
+            rx_a.await.unwrap().get_value("r"),
+            Some(b"for-a".as_slice())
+        );
+        assert_eq!(
+            rx_b.await.unwrap().get_value("r"),
+            Some(b"for-b".as_slice())
+        );
+    }
+
+    /// Issue #2251: a request whose enqueue failed (`try_send` full) is
+    /// cancelled and never counted (`request_with_timeout_via_tracker`). While
+    /// another request is pending a stray reply is judged like any reply with a
+    /// pending request (delivered or logged stale, no violation); once nothing
+    /// is pending, a reply beyond the requests ever counted is the violation.
+    #[tokio::test]
+    async fn a_cancelled_uncounted_request_never_makes_a_reply_a_violation_while_another_is_pending(
+    ) {
+        let tracker = RequestTracker::new();
+        // A: registered, enqueue failed, cancelled, never counted.
+        let (_sa, hash_a, rx_a) = tracker
+            .prepare_request(Topics::from_vec(vec![Topic::new("q", b"a".to_vec())]))
+            .await;
+        tracker.cancel_request(hash_a).await;
+        assert!(
+            rx_a.await.is_err(),
+            "the cancelled request's receiver is closed"
+        );
+        assert_eq!(tracker.outstanding_topic_requests(), 0);
+
+        // B: a real, counted request is pending.
+        let (_sb, hash_b, rx_b) = tracker
+            .prepare_request(Topics::from_vec(vec![Topic::new("q", b"b".to_vec())]))
+            .await;
+        tracker.mark_request_sent();
+
+        // A reply carrying A's (cancelled) hash: stale, but B is pending.
+        tracker
+            .handle_response(&make_response(hash_a, "r", b"stray"))
+            .await
+            .expect("a pending request makes a stray reply no violation");
+        // B's own reply still arrives, with the counter already at zero.
+        tracker
+            .handle_response(&make_response(hash_b, "r", b"for-b"))
+            .await
+            .expect("B's reply");
+        assert_eq!(
+            rx_b.await.unwrap().get_value("r"),
+            Some(b"for-b".as_slice())
+        );
+
+        // Nothing pending and nothing counted any more: the violation.
+        assert!(matches!(
+            tracker
+                .handle_response(&make_response(hash_a, "r", b"x"))
+                .await,
+            Err(RequestResponseError::UnrequestedResponse)
+        ));
     }
 
     /// The other half of go's rule: with NO request pending, a late reply to a
