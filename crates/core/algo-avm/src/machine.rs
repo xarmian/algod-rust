@@ -349,7 +349,8 @@ impl AvmMachine {
         if len < n {
             return false;
         }
-        // At most four arguments: a plain indexed loop on the top of the stack.
+        // At most five arguments (`ecdsa_verify`): a plain indexed loop on the
+        // top of the stack.
         let top = &self.stack[len - n..];
         let mut i = 0;
         while i < n {
@@ -499,7 +500,7 @@ impl AvmMachine {
         let old_pc = self.pc;
         // go's tracer reports the program counter as a BYTE offset into the
         // program (the version header counts), not an instruction index.
-        let old_byte_pc = self.byte_pc();
+        let old_byte_pc = if tracer.wants_pc() { self.byte_pc() } else { 0 };
 
         // Record opcode hit for coverage tracking.
         self.opcode_hits[instr.opcode as usize] = true;

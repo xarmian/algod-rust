@@ -151,6 +151,14 @@ pub trait EvalTracer {
     /// standard simulate response field.
     fn record_program_cost(&mut self, _program_type: ProgramType, _cost: u64) {}
 
+    /// Whether this tracer reads the `pc` it is handed by `before_opcode` and
+    /// `after_opcode`. The machine computes that byte offset only for a tracer
+    /// that does (default: yes); [`NullTracer`] does not, so an untraced
+    /// program pays nothing for it (the `pc` it is passed is then `0`).
+    fn wants_pc(&self) -> bool {
+        true
+    }
+
     /// Called before each opcode is dispatched.
     ///
     /// `pc` is the program counter as go reports it: a byte offset into the
@@ -277,7 +285,11 @@ pub enum UnnamedResourceAccess {
 /// the default no-op implementations.
 pub struct NullTracer;
 
-impl EvalTracer for NullTracer {}
+impl EvalTracer for NullTracer {
+    fn wants_pc(&self) -> bool {
+        false
+    }
+}
 
 #[cfg(test)]
 mod tests {

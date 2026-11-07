@@ -104,6 +104,7 @@ mod tests {
     struct GoOp {
         opcode: u8,
         name: String,
+        version: u64,
         modes: u8,
         args: Vec<GoArg>,
     }
@@ -189,6 +190,94 @@ mod tests {
                 crate::opcode::lookup(byte)
                     .unwrap_or_else(|| panic!("gate row for undefined opcode 0x{byte:02x}"));
             }
+        }
+    }
+
+    /// algod-rust registers every go opcode under go's name and at go's
+    /// version (one byte at a time: prefix families, whose leaves share a
+    /// byte, are checked by the family tests). A version gap would make
+    /// algod-rust accept programs go rejects (or the reverse); this is how
+    /// `sumhash512` (go: version 14, "EXPERIMENTAL") was found registered at 13.
+    #[test]
+    fn every_go_opcode_is_registered_at_gos_name_and_version() {
+        let ops = go_ops();
+        for op in &ops {
+            if ops.iter().filter(|o| o.opcode == op.opcode).count() > 1 {
+                continue;
+            }
+            let spec = crate::opcode::lookup(op.opcode)
+                .unwrap_or_else(|| panic!("0x{:02x} {} is not registered", op.opcode, op.name));
+            assert_eq!(spec.name, op.name, "0x{:02x}", op.opcode);
+            assert_eq!(
+                u64::from(spec.version),
+                op.version,
+                "0x{:02x} {}: go introduces it at version {}",
+                op.opcode,
+                op.name,
+                op.version
+            );
+        }
+    }
+
+    /// A gate row longer than what the handler pops could reject stacks the
+    /// handler accepts. Wherever the opcode table states the handler's pop
+    /// count it equals the row's length. The opcodes whose pop count is
+    /// dynamic (`-1`: the depth or the label count is an immediate) cannot be
+    /// compared; they are named here so a change is noticed, and for each of
+    /// them go's `proto` is ONE `any` argument, which is never more than the
+    /// handler needs (an immediate of 0 still needs one value).
+    #[test]
+    fn gate_rows_agree_with_the_handlers_pop_counts() {
+        let mut dynamic = Vec::new();
+        for byte in 0..=255u8 {
+            let Some(row) = arg_types(byte) else { continue };
+            let spec = crate::opcode::lookup(byte).expect("defined");
+            if spec.stack_pops < 0 {
+                assert_eq!(row.len(), 1, "0x{byte:02x} {}", spec.name);
+                dynamic.push(spec.name);
+                continue;
+            }
+            assert_eq!(
+                row.len(),
+                spec.stack_pops as usize,
+                "0x{byte:02x} {}: go's proto has {} arguments, the handler pops {}",
+                spec.name,
+                row.len(),
+                spec.stack_pops
+            );
+        }
+        assert_eq!(
+            dynamic,
+            ["dig", "cover", "uncover", "match"],
+            "opcodes with a dynamic pop count"
+        );
+    }
+
+    /// Every algod-rust opcode that pops values has a gate row or a NAMED,
+    /// deliberate exclusion: go gates it per run mode (`modes != 3`), or it is
+    /// in `EXCLUDED`. A new opcode (or a mode change) fails here until it is
+    /// classified, instead of silently keeping the lazy pop order.
+    #[test]
+    fn every_opcode_with_pops_has_a_row_or_a_named_exclusion() {
+        let ops = go_ops();
+        for byte in 0..=255u8 {
+            let Some(spec) = crate::opcode::lookup(byte) else {
+                continue;
+            };
+            if spec.sub_ops.is_some() || spec.stack_pops <= 0 || arg_types(byte).is_some() {
+                continue;
+            }
+            let go = ops
+                .iter()
+                .find(|o| o.opcode == byte)
+                .unwrap_or_else(|| panic!("0x{byte:02x} {} is not a go opcode", spec.name));
+            let mode_restricted = go.modes != 3;
+            assert!(
+                mode_restricted || EXCLUDED.contains(&byte),
+                "0x{byte:02x} {} pops {} but has no gate row and no named exclusion",
+                spec.name,
+                spec.stack_pops
+            );
         }
     }
 }

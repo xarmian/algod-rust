@@ -58,7 +58,11 @@ divergences:
 	python3 scripts/check_divergences_test.py
 	python3 scripts/check_divergences.py
 
-lint: fmt-check clippy divergences
+## The AVM argument gate table is generated from go's proto dump (issue #2225).
+arg-gate-table:
+	python3 scripts/gen_arg_gate_table.py --check
+
+lint: fmt-check clippy divergences arg-gate-table
 
 deny:
 	cargo deny check

@@ -466,7 +466,7 @@ static OPCODE_TABLE: [Option<OpSpec>; 256] = {
     // `FALCON_DET1024_SIG_COMPRESSED_MAXSIZE` (1423 bytes) in algo-falcon,
     // which already implement the correct variable-length behavior.
     op!(0x85, "falcon_verify", 12, Static(1700), 3, 1, Any, None);
-    op!(0x86, "sumhash512", 13, Dynamic, 1, 1, Any, None);
+    op!(0x86, "sumhash512", 14, Dynamic, 1, 1, Any, None);
     op!(0x87, "sha512", 13, Dynamic, 1, 1, Any, None);
 
     // ---- Subroutines / Frames ----

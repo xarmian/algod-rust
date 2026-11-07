@@ -25,7 +25,7 @@
 use super::arg_gate::ArgType;
 use super::arg_gate::{ANY, BIGINT, BYTES, BYTES1793, BYTES32, BYTES33, BYTES64, BYTES80, UINT};
 /// go's `proto` argument types by opcode byte, for every opcode go gates the
-/// same way in every run mode (`GATE` in `arg_gate.rs` is this table).
+/// same way in every run mode (`arg_gate::arg_types` reads this table).
 pub(super) static TABLE: [Option<&[ArgType]>; 256] = {
     let mut t: [Option<&[ArgType]>; 256] = [None; 256];
     t[0x01] = Some(&[BYTES]); // sha256
@@ -95,6 +95,7 @@ pub(super) static TABLE: [Option<&[ArgType]>; 256] = {
     t[0x5f] = Some(&[BYTES, BYTES]); // json_ref
     t[0x84] = Some(&[BYTES, BYTES64, BYTES32]); // ed25519verify_bare
     t[0x85] = Some(&[BYTES, BYTES, BYTES1793]); // falcon_verify
+    t[0x86] = Some(&[BYTES]); // sumhash512
     t[0x87] = Some(&[BYTES]); // sha512
     t[0x8c] = Some(&[ANY]); // frame_bury
     t[0x8d] = Some(&[UINT]); // switch
