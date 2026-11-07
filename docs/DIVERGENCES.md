@@ -384,6 +384,16 @@ attached block archive is neither copied nor fsynced. Calling it inside a
 `begin_block`..`commit_block` span skips the checkpoint (contract: call
 between blocks).
 
+**Residual file size after a long pin (#2206).** A catchpoint export, the lazy
+trie loader or an external tool holds one read transaction for a long time and
+pins the WAL; the growth during the pin (about 80 KB a block) is inherent to a
+consistent snapshot (a snapshot opened right after a checkpoint grows just the
+same, measured), but SQLite keeps the peak file size after the WAL restarts
+unless `journal_size_limit` is set. The tracker connection sets
+`PRAGMA main.journal_size_limit` to 64 MiB (`DEFAULT_TRACKER_WAL_SIZE_LIMIT`),
+so the next restart cuts the file back. Wire and consensus impact: none (a
+file-size hint of the local database).
+
 **Cost.** The checkpoint runs under the ledger mutex, once per snapshot open
 (once per block on the follow path; the pool is paused during catchup). With
 nothing to backfill a PASSIVE checkpoint does no I/O. Measured with the

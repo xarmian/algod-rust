@@ -294,6 +294,19 @@ pub const BLOCK_SUFFIX: &str = ".block.sqlite";
 /// [`SqliteLedger::set_synchronous_mode`] (issue #749).
 pub const DEFAULT_LEDGER_SYNCHRONOUS_MODE: i64 = 2;
 
+/// Default `journal_size_limit` of the tracker database, in bytes (issue
+/// #2206). A long-lived read transaction (an automatic catchpoint export,
+/// the lazy trie loader, an external tool) pins the tracker WAL, which then
+/// grows by every block committed meanwhile; SQLite reuses the file from its
+/// start once the reader is gone but keeps its peak size unless this limit
+/// is set, so a long export would leave the peak on disk for good. With the
+/// limit, the next WAL restart cuts the file back to this size. It bounds
+/// only the residual file, not growth during the pin (inherent to a
+/// consistent snapshot); 64 MiB is far above a normal working set (about 80
+/// KB per block). algod-rust-only SQLite setting; no wire or consensus effect.
+// DIVERGENCE DIV-008: journal_size_limit on the tracker, go sets none (issue #2206).
+pub const DEFAULT_TRACKER_WAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
+
 /// Default SQLite `synchronous` pragma value for rebuild-shaped
 /// connections that bulk-load a fresh accounts snapshot (catchpoint
 /// import/verify, catchpoint-sync bulk import) — go's
@@ -3060,6 +3073,13 @@ impl SqliteLedger {
         // Issue #1678: time the WAL checkpoints SQLite runs on the committing
         // thread (same PASSIVE auto-checkpoint, now observable).
         crate::follow_timing::install_wal_checkpoint_hook(&conn);
+        // Issue #2206: cut the tracker WAL file back after a long pin.
+        conn.execute_batch(&format!(
+            "PRAGMA main.journal_size_limit={DEFAULT_TRACKER_WAL_SIZE_LIMIT};"
+        ))
+        .map_err(|e| AlgoError::Ledger {
+            message: format!("journal_size_limit pragma error: {e}"),
+        })?;
 
         // G12 (TASK-109): refuse pre-v3 tracker DBs cleanly before
         // schema creation. Go's `performResourceTableMigration`
@@ -4055,6 +4075,17 @@ impl SqliteLedger {
     /// different value via this method. Takes effect immediately, unlike
     /// `journal_mode`, which SQLite requires to be set once at connect
     /// time.
+    /// Set the tracker database's `journal_size_limit` (issue #2206): after a
+    /// WAL restart the file is truncated to at most `bytes`. See
+    /// [`DEFAULT_TRACKER_WAL_SIZE_LIMIT`].
+    pub fn set_tracker_wal_size_limit(&self, bytes: i64) -> Result<(), AlgoError> {
+        self.conn
+            .execute_batch(&format!("PRAGMA main.journal_size_limit={bytes};"))
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("journal_size_limit pragma error: {e}"),
+            })
+    }
+
     pub fn set_synchronous_mode(&self, mode: i64) -> Result<(), AlgoError> {
         let mode = clamp_synchronous_mode(mode);
         self.synchronous_mode
@@ -7675,7 +7706,6 @@ impl SqliteLedger {
         data.map(|d| decode_account_data(&d)).transpose()
     }
 
-
     fn set_account_sql(&mut self, addr: &Address, account: AccountData) {
         let old = self.get_account(addr);
         // Issue #960: record this address as touched this block so
@@ -8365,7 +8395,9 @@ impl LedgerStore for SqliteLedger {
             Some(_) => self.rewards_level_at(round),
             None if self.read_pool.is_none() || round == 0 => Ok(self.rewards_level()),
             None => Err(AlgoError::Ledger {
-                message: format!("no block header at committed round {round} to read its rewards level from"),
+                message: format!(
+                    "no block header at committed round {round} to read its rewards level from"
+                ),
             }),
         }
     }
@@ -10260,7 +10292,10 @@ mod tests {
             t.elapsed() < std::time::Duration::from_millis(200),
             "another step must take the ledger lock while the export wait is pending"
         );
-        assert!(waiter.join().unwrap(), "the export finished within the wait");
+        assert!(
+            waiter.join().unwrap(),
+            "the export finished within the wait"
+        );
         assert_eq!(
             ledger.lock().unwrap().last_catchpoint_label().unwrap(),
             "7#OFFLOCK",
@@ -10286,7 +10321,9 @@ mod tests {
             "an abandoned wait leaves the export observable for a later call"
         );
         assert!(wait_for_pending_catchpoint_export_off_lock(
-            &SqliteLedger::open_in_memory().map(std::sync::Mutex::new).unwrap(),
+            &SqliteLedger::open_in_memory()
+                .map(std::sync::Mutex::new)
+                .unwrap(),
             std::time::Duration::from_millis(1)
         ));
     }
@@ -15608,6 +15645,86 @@ mod tests {
             "a new read transaction must observe the writer's committed insert"
         );
         reader.execute_batch("COMMIT").unwrap();
+    }
+
+    /// Size of the tracker WAL file on disk (0 when absent).
+    fn tracker_wal_len(prefix: &Path) -> u64 {
+        let mut p = tracker_path_for_prefix(prefix).into_os_string();
+        p.push("-wal");
+        std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Commit `batches` transactions of `rows` 4 KiB rows each into
+    /// `accountbase` on the ledger's own connection (an import-shaped load).
+    fn write_wal_load(l: &SqliteLedger, first: u64, batches: u64, rows: u64) {
+        let blob = vec![0xABu8; 4096];
+        for b in 0..batches {
+            l.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            for i in 0..rows {
+                let mut addr = [0u8; 32];
+                addr[..8].copy_from_slice(&(first + b * rows + i + 1).to_le_bytes());
+                addr[31] = 0xEE;
+                l.conn
+                    .execute_cached(
+                        "INSERT INTO accountbase (address, normalizedonlinebalance, data) \
+                         VALUES (?1, 0, ?2)",
+                        params![addr.to_vec(), blob],
+                    )
+                    .unwrap();
+            }
+            l.conn.execute_batch("COMMIT").unwrap();
+        }
+    }
+
+    /// Issue #2206: an automatic catchpoint export holds a read transaction
+    /// on the tracker for the whole export, which pins the WAL, so the WAL
+    /// grows by every block committed meanwhile -- inherent to a consistent
+    /// snapshot, and gone once the export ends. What must not happen is the
+    /// peak staying on disk: SQLite reuses a WAL file from its start after a
+    /// restart but keeps its size unless `journal_size_limit` is set. After
+    /// the pinning reader is dropped, the next restart must cut the file back
+    /// to the configured limit.
+    #[test]
+    fn the_tracker_wal_file_returns_to_its_limit_after_a_pinning_export_snapshot_ends() {
+        const LIMIT: u64 = 256 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+        let l = SqliteLedger::open_with_prefix(&prefix).expect("open ledger");
+        l.set_tracker_wal_size_limit(LIMIT as i64).unwrap();
+
+        // The export snapshot: a real read pins the WAL.
+        let snap = l.open_read_snapshot().expect("file-backed snapshot");
+        let _ = snap.get_account(&algo_types::Address([1u8; 32]));
+        write_wal_load(&l, 0, 60, 20);
+        let pinned = tracker_wal_len(&prefix);
+        assert!(
+            pinned > 4 * LIMIT,
+            "the pinned WAL grows far past the limit ({pinned} B)"
+        );
+
+        // The export ends; commits continue (blocks keep arriving).
+        drop(snap);
+        write_wal_load(&l, 10_000, 8, 1);
+        let after = tracker_wal_len(&prefix);
+        println!("tracker WAL: pinned {pinned} B, after the export ended {after} B");
+        assert!(
+            after <= 2 * LIMIT,
+            "after the export snapshot ended the WAL file must be cut back to about the \
+             journal_size_limit ({LIMIT} B), but it is {after} B (it was {pinned} B pinned)"
+        );
+    }
+
+    /// The ledger applies [`DEFAULT_TRACKER_WAL_SIZE_LIMIT`] on open, so the
+    /// bound is not opt-in.
+    #[test]
+    fn opening_a_file_backed_ledger_sets_the_default_tracker_wal_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = SqliteLedger::open_with_prefix(&dir.path().join("ledger")).unwrap();
+        let limit: i64 = l
+            .conn
+            .query_row_cached("PRAGMA main.journal_size_limit", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(limit, DEFAULT_TRACKER_WAL_SIZE_LIMIT);
     }
 
     #[test]
