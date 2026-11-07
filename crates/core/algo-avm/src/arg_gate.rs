@@ -34,12 +34,30 @@
 //! the gate). A row is go's own type list, so it can only make an error exact:
 //! any error the gate raises, go raises too. Issue #2200, #2225.
 
+/// go's name of a uint64 value / argument type (`StackType.String()`).
+pub(crate) const UINT64_NAME: &str = "uint64";
+/// go's name of a byte-string value / argument type.
+pub(crate) const BYTES_NAME: &str = "[]byte";
+
 /// What the gate compares: go's `opCompat(argType.AVMType, value type)`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ArgKind {
     Uint,
     Bytes,
     Any,
+}
+
+impl ArgKind {
+    /// go's AVM type name (`uint64`, `[]byte`, `any`): the one mapping, shared
+    /// with `AvmValue::type_name`.
+    #[cfg(test)]
+    pub(crate) fn type_name(self) -> &'static str {
+        match self {
+            ArgKind::Uint => UINT64_NAME,
+            ArgKind::Bytes => BYTES_NAME,
+            ArgKind::Any => "any",
+        }
+    }
 }
 
 /// An argument type of go's `proto`: the AVM type the gate compares and the
@@ -67,8 +85,8 @@ impl ArgType {
     }
 }
 
-pub(crate) const UINT: ArgType = ArgType::new(ArgKind::Uint, "uint64");
-pub(crate) const BYTES: ArgType = ArgType::new(ArgKind::Bytes, "[]byte");
+pub(crate) const UINT: ArgType = ArgType::new(ArgKind::Uint, UINT64_NAME);
+pub(crate) const BYTES: ArgType = ArgType::new(ArgKind::Bytes, BYTES_NAME);
 pub(crate) const ANY: ArgType = ArgType::new(ArgKind::Any, "any");
 pub(crate) const BIGINT: ArgType = ArgType::new(ArgKind::Bytes, "bigint");
 pub(crate) const BYTES32: ArgType = ArgType::new(ArgKind::Bytes, "[32]byte");
@@ -88,11 +106,43 @@ pub(crate) fn accepts(want: ArgType, value: &crate::machine::AvmValue) -> bool {
     }
 }
 
+/// Whether go lets the opcode run in `mode` for a program of `version`: go
+/// checks the mode set of the PROGRAM's version before the argument gate
+/// (`ed25519verify` is LogicSig-only before v5). Opcodes whose mode set never
+/// changes are not in the table (their own mode handling applies).
+#[inline(always)]
+pub(crate) fn mode_allows(opcode: u8, version: u8, mode: crate::machine::ExecMode) -> bool {
+    let Some(steps) = crate::arg_gate_table::MODE_VARIANTS[opcode as usize] else {
+        return true;
+    };
+    let bit = match mode {
+        crate::machine::ExecMode::LogicSig => 1,
+        crate::machine::ExecMode::Application => 2,
+    };
+    let modes = steps
+        .iter()
+        .rev()
+        .find(|(from, _)| *from <= version)
+        .map_or(0, |(_, modes)| *modes);
+    modes & bit != 0
+}
+
 /// go's argument types for the single-byte opcode `opcode`, if this table
-/// lists it.
+/// lists it (for the newest spec: see [`gate_for`] for a program's version).
 #[inline]
 pub(crate) fn arg_types(opcode: u8) -> Option<&'static [ArgType]> {
     crate::arg_gate_table::TABLE[opcode as usize]
+}
+
+/// The argument types go gates `opcode` with in a program of `version`: the
+/// table row, unless go's spec for the opcode changed after that version (then
+/// the older spec is not in the table and the opcode keeps its lazy pops).
+#[inline(always)]
+pub(crate) fn gate_for(opcode: u8, version: u8) -> Option<&'static [ArgType]> {
+    if version < crate::arg_gate_table::MIN_VERSION[opcode as usize] {
+        return None;
+    }
+    arg_types(opcode)
 }
 
 #[cfg(test)]
@@ -106,7 +156,16 @@ mod tests {
         name: String,
         version: u64,
         modes: u8,
+        stable: bool,
+        #[serde(default)]
+        variants: Vec<GoVariant>,
         args: Vec<GoArg>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct GoVariant {
+        from: u8,
+        modes: u8,
     }
 
     #[derive(serde::Deserialize)]
@@ -115,9 +174,22 @@ mod tests {
         name: String,
     }
 
-    /// Opcodes go gates that the table deliberately leaves out (see
-    /// `EXCLUDED` in `scripts/gen_arg_gate_table.py`).
-    const EXCLUDED: &[u8] = &[0x07];
+    /// The shared exclusion list (`tests/fixtures/arg_gate_exclusions.json`,
+    /// also read by the generator): `(gate_excluded, version_exceptions)`.
+    fn exclusions() -> (Vec<u8>, Vec<u8>) {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/arg_gate_exclusions.json"))
+                .expect("exclusions json");
+        let bytes = |key: &str| -> Vec<u8> {
+            v[key]
+                .as_object()
+                .expect("object")
+                .keys()
+                .map(|k| u8::from_str_radix(k.trim_start_matches("0x"), 16).expect("byte"))
+                .collect()
+        };
+        (bytes("gate_excluded"), bytes("version_exceptions"))
+    }
 
     fn go_ops() -> Vec<GoOp> {
         include_str!("../tests/fixtures/go_op_protos.jsonl")
@@ -134,11 +206,14 @@ mod tests {
     #[test]
     fn the_table_equals_gos_proto_arguments() {
         let ops = go_ops();
+        let (gate_excluded, _) = exclusions();
         let mut seen = std::collections::HashSet::new();
         for op in &ops {
             let shared = ops.iter().filter(|o| o.opcode == op.opcode).count() > 1;
-            let gated =
-                op.modes == 3 && !op.args.is_empty() && !shared && !EXCLUDED.contains(&op.opcode);
+            let gated = op.modes == 3
+                && !op.args.is_empty()
+                && !shared
+                && !gate_excluded.contains(&op.opcode);
             let row = arg_types(op.opcode);
             if !gated {
                 assert!(
@@ -158,16 +233,22 @@ mod tests {
                 .collect();
             let have: Vec<(&str, &str)> = row
                 .iter()
-                .map(|t| {
-                    let kind = match t.kind() {
-                        ArgKind::Uint => "uint64",
-                        ArgKind::Bytes => "[]byte",
-                        ArgKind::Any => "any",
-                    };
-                    (kind, t.name())
-                })
+                .map(|t| (t.kind().type_name(), t.name()))
                 .collect();
             assert_eq!(have, want, "0x{:02x} {}", op.opcode, op.name);
+            // Gated from the version go's FINAL spec starts at (0 = always).
+            let want_min = op
+                .variants
+                .last()
+                .filter(|_| !op.stable)
+                .map_or(0, |v| v.from);
+            assert_eq!(
+                crate::arg_gate_table::MIN_VERSION[op.opcode as usize],
+                want_min,
+                "0x{:02x} {}: first gated version",
+                op.opcode,
+                op.name
+            );
         }
         for byte in 0..=255u8 {
             if arg_types(byte).is_some() {
@@ -192,24 +273,21 @@ mod tests {
         }
     }
 
-    /// Opcodes whose registered version is deliberately not compared with go's
-    /// (named, with a neutral reason): `0x86` (version registration under
-    /// review).
-    const VERSION_UNDER_REVIEW: &[u8] = &[0x86];
-
     /// algod-rust registers every go opcode under go's name and at go's
     /// version (one byte at a time: prefix families, whose leaves share a
     /// byte, are checked by the family tests). A version gap would make
     /// algod-rust accept programs go rejects, or the reverse; the named
-    /// exceptions in `VERSION_UNDER_REVIEW` are the only bytes not compared.
+    /// `version_exceptions` of the shared exclusion list are the only bytes not
+    /// compared.
     #[test]
     fn every_go_opcode_is_registered_at_gos_name_and_version() {
         let ops = go_ops();
+        let (_, version_exceptions) = exclusions();
         for op in &ops {
             if ops.iter().filter(|o| o.opcode == op.opcode).count() > 1 {
                 continue;
             }
-            if VERSION_UNDER_REVIEW.contains(&op.opcode) {
+            if version_exceptions.contains(&op.opcode) {
                 continue;
             }
             let spec = crate::opcode::lookup(op.opcode)
@@ -267,6 +345,7 @@ mod tests {
     #[test]
     fn every_opcode_with_pops_has_a_row_or_a_named_exclusion() {
         let ops = go_ops();
+        let (gate_excluded, _) = exclusions();
         for byte in 0..=255u8 {
             let Some(spec) = crate::opcode::lookup(byte) else {
                 continue;
@@ -278,13 +357,71 @@ mod tests {
                 .iter()
                 .find(|o| o.opcode == byte)
                 .unwrap_or_else(|| panic!("0x{byte:02x} {} is not a go opcode", spec.name));
-            let mode_restricted = go.modes != 3;
+            // Mode-restricted, or its mode set changes between versions
+            // (`MODE_VARIANTS` gives it a version-dependent mode check), or
+            // named in the shared exclusion list.
+            let mode_restricted = go.modes != 3 || !go.stable;
             assert!(
-                mode_restricted || EXCLUDED.contains(&byte),
+                mode_restricted || gate_excluded.contains(&byte),
                 "0x{byte:02x} {} pops {} but has no gate row and no named exclusion",
                 spec.name,
                 spec.stack_pops
             );
         }
+    }
+
+    /// The version-dependent mode table is exactly go's: one entry per opcode
+    /// whose mode set differs between versions, with go's steps.
+    #[test]
+    fn mode_variants_equal_gos() {
+        let mut seen = std::collections::HashSet::new();
+        for op in go_ops() {
+            if op.stable {
+                continue;
+            }
+            let mut steps: Vec<(u8, u8)> = op.variants.iter().map(|v| (v.from, v.modes)).collect();
+            let differs = steps.iter().any(|(_, m)| *m != steps[0].1);
+            if !differs {
+                assert!(
+                    crate::arg_gate_table::MODE_VARIANTS[op.opcode as usize].is_none(),
+                    "0x{:02x} {}: only its argument types vary",
+                    op.opcode,
+                    op.name
+                );
+                continue;
+            }
+            seen.insert(op.opcode);
+            let have = crate::arg_gate_table::MODE_VARIANTS[op.opcode as usize]
+                .unwrap_or_else(|| panic!("0x{:02x} {} has no mode variants", op.opcode, op.name));
+            steps.sort_unstable();
+            assert_eq!(have.to_vec(), steps, "0x{:02x} {}", op.opcode, op.name);
+        }
+        for byte in 0..=255u8 {
+            if crate::arg_gate_table::MODE_VARIANTS[byte as usize].is_some() {
+                assert!(seen.contains(&byte), "mode variants for 0x{byte:02x}");
+            }
+        }
+        assert!(
+            seen.contains(&0x04),
+            "ed25519verify is LogicSig-only before v5"
+        );
+    }
+
+    /// An opcode whose go spec changed between versions is gated from the
+    /// version its final spec starts at: `ed25519verify` from v5.
+    #[test]
+    fn a_late_stable_opcode_is_gated_from_its_final_specs_version() {
+        for version in 1..=4u8 {
+            assert!(gate_for(0x04, version).is_none(), "v{version}");
+        }
+        for version in 5..=13u8 {
+            assert_eq!(
+                gate_for(0x04, version).map(<[ArgType]>::len),
+                Some(3),
+                "v{version}"
+            );
+        }
+        // An always-stable opcode is gated in every version.
+        assert!(gate_for(0x08, 1).is_some());
     }
 }

@@ -8,10 +8,14 @@
 
 Input: `crates/core/algo-avm/tests/fixtures/go_op_protos.jsonl`, go-algorand's
 per-opcode `proto` argument types dumped by `tools/avm-op-protos` (pinned
-v5.0.4-stable). A row is gated here only when go gates it the same way for
-every run mode (`modes == 3`) and the opcode byte is not shared by a prefix
-family; mode-restricted opcodes keep their own mode handling (go checks the
-mode BEFORE the argument gate, which the table cannot express).
+v5.0.4-stable) across EVERY AVM version. A row is gated here only when go gates
+it the same way for every run mode (`modes == 3`) and the opcode byte is not
+shared by a prefix family. An opcode whose mode set or argument types CHANGE
+between versions (`stable` false: `ed25519verify` is LogicSig-only before v5) is
+gated only for programs of the version its final spec starts at
+(`MIN_VERSION`); older programs keep the lazy pops, and a changed mode set gets
+a version-dependent mode check (`MODE_VARIANTS`, below), which go runs BEFORE
+the argument gate. Mode-restricted opcodes keep their own mode handling.
 
     python3 scripts/gen_arg_gate_table.py            # rewrite the table
     python3 scripts/gen_arg_gate_table.py --check    # exit 1 if it is stale
@@ -27,11 +31,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURE = ROOT / "crates/core/algo-avm/tests/fixtures/go_op_protos.jsonl"
 OUT = ROOT / "crates/core/algo-avm/src/arg_gate_table.rs"
-
-# Opcodes kept out of the table although go gates them: their handler needs a
-# separate look first (the gate would turn a handler-order question into a
-# visible error). Each entry is a byte and a reason that stays vague on purpose.
-EXCLUDED = {0x07: "handler argument order under review"}
+# Opcodes kept out of the table although go gates them, and opcodes whose
+# registered version is deliberately not compared with go's: ONE shared list
+# that the Rust tests read too, so the generator and the tests cannot drift.
+EXCLUSIONS = ROOT / "crates/core/algo-avm/tests/fixtures/arg_gate_exclusions.json"
 
 # (avm type, go's StackType name) -> Rust constant. A gated opcode with any
 # other argument type makes the generator fail loudly (KeyError) instead of
@@ -75,50 +78,100 @@ HEADER = """// Copyright (C) 2019-2026 Algorand Foundation Ltd.
 """
 
 
+def excluded_bytes():
+    data = json.loads(EXCLUSIONS.read_text())
+    return {int(k, 16) for k in data["gate_excluded"]}
+
+
+def fixture():
+    return [json.loads(line) for line in FIXTURE.read_text().splitlines() if line.strip()]
+
+
 def rows():
+    """(opcode, name, arg kinds, first gated version) of every gated opcode."""
     out = []
-    lines = [json.loads(l) for l in FIXTURE.read_text().splitlines() if l.strip()]
+    lines = fixture()
     per_byte = Counter(r["opcode"] for r in lines)
+    excluded = excluded_bytes()
     for r in lines:
         if r["modes"] != 3 or not r["args"] or per_byte[r["opcode"]] != 1:
             continue
-        if r["opcode"] in EXCLUDED:
+        if r["opcode"] in excluded:
             continue
-        out.append((r["opcode"], r["name"], [KINDS[(a["avm"], a["name"])] for a in r["args"]]))
+        first = 0 if r["stable"] else r["variants"][-1]["from"]
+        out.append(
+            (r["opcode"], r["name"], [KINDS[(a["avm"], a["name"])] for a in r["args"]], first)
+        )
     return sorted(out)
 
 
-def render(table):
+def mode_variants():
+    """(opcode, name, [(from_version, modes)]) for every opcode whose RUN MODE
+    set differs between versions (go: `ed25519verify`, LogicSig only before v5)."""
+    out = []
+    for r in fixture():
+        if r["stable"]:
+            continue
+        modes = [(v["from"], v["modes"]) for v in r["variants"]]
+        if len({m for _, m in modes}) > 1:
+            out.append((r["opcode"], r["name"], modes))
+    return sorted(out)
+
+
+def render(table, variants):
+    nl = "\n"
     body = [HEADER]
-    body.append("use super::arg_gate::ArgType;\n")
+    body.append("use super::arg_gate::ArgType;" + nl)
     body.append(
-        "use super::arg_gate::{ANY, BIGINT, BYTES, BYTES1793, BYTES32, BYTES33, BYTES64, BYTES80, UINT};\n"
+        "use super::arg_gate::{ANY, BIGINT, BYTES, BYTES1793, BYTES32, BYTES33, BYTES64, BYTES80, UINT};"
+        + nl
     )
+    body.append("/// go's `proto` argument types by opcode byte, for every opcode go gates the" + nl)
     body.append(
-        "/// go's `proto` argument types by opcode byte, for every opcode go gates the\n"
-        "/// same way in every run mode (`arg_gate::arg_types` reads this table).\n"
+        "/// same way in every run mode and every version (`arg_gate::arg_types` reads this table)."
+        + nl
     )
-    body.append("pub(super) static TABLE: [Option<&[ArgType]>; 256] = {\n")
-    body.append("    let mut t: [Option<&[ArgType]>; 256] = [None; 256];\n")
-    for op, name, args in table:
-        body.append(f"    t[0x{op:02x}] = Some(&[{', '.join(args)}]); // {name}\n")
-    body.append("    t\n};\n")
+    body.append("pub(super) static TABLE: [Option<&[ArgType]>; 256] = {" + nl)
+    body.append("    let mut t: [Option<&[ArgType]>; 256] = [None; 256];" + nl)
+    for op, name, args, _ in table:
+        body.append(f"    t[0x{op:02x}] = Some(&[{', '.join(args)}]); // {name}" + nl)
+    body.append("    t" + nl + "};" + nl)
+    body.append(nl)
+    body.append("/// The first program version an opcode of `TABLE` is gated for (go's spec for" + nl)
+    body.append("/// the opcode changed at that version; `0` = every version)." + nl)
+    body.append("pub(super) static MIN_VERSION: [u8; 256] = {" + nl)
+    body.append("    let mut t = [0u8; 256];" + nl)
+    for op, name, _, first in table:
+        if first:
+            body.append(f"    t[0x{op:02x}] = {first}; // {name}" + nl)
+    body.append("    t" + nl + "};" + nl)
+    body.append(nl)
+    body.append("/// Opcodes whose run-mode set changes between AVM versions, as `(first" + nl)
+    body.append("/// version, mode bits)` steps (1 = LogicSig, 2 = application): go checks" + nl)
+    body.append("/// the mode of the program's own version before anything else." + nl)
+    body.append("pub(super) static MODE_VARIANTS: [Option<&[(u8, u8)]>; 256] = {" + nl)
+    body.append("    let mut t: [Option<&[(u8, u8)]>; 256] = [None; 256];" + nl)
+    for op, name, modes in variants:
+        steps = ", ".join(f"({v}, {m})" for v, m in modes)
+        body.append(f"    t[0x{op:02x}] = Some(&[{steps}]); // {name}" + nl)
+    body.append("    t" + nl + "};" + nl)
     return "".join(body)
 
 
 def main():
     table = rows()
-    text = render(table)
+    variants = mode_variants()
+    text = render(table, variants)
     if "--check" in sys.argv:
-        # Compare bytes with line endings normalised, so a CRLF checkout of
-        # the generated file is not "stale".
+        # Compare with line endings normalised, so a CRLF checkout of the
+        # generated file is not "stale".
         have = OUT.read_bytes().replace(b"\r\n", b"\n").decode()
         if have != text:
             print(f"{OUT} is stale: run scripts/gen_arg_gate_table.py", file=sys.stderr)
             sys.exit(1)
         return
     OUT.write_bytes(text.encode())  # LF on every platform
-    print(f"wrote {OUT} ({len(table)} opcodes)")
+    print(f"wrote {OUT} ({len(table)} opcodes, {len(variants)} mode-variant)")
 
 
 if __name__ == "__main__":

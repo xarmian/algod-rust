@@ -25,7 +25,7 @@
 use super::arg_gate::ArgType;
 use super::arg_gate::{ANY, BIGINT, BYTES, BYTES1793, BYTES32, BYTES33, BYTES64, BYTES80, UINT};
 /// go's `proto` argument types by opcode byte, for every opcode go gates the
-/// same way in every run mode (`arg_gate::arg_types` reads this table).
+/// same way in every run mode and every version (`arg_gate::arg_types` reads this table).
 pub(super) static TABLE: [Option<&[ArgType]>; 256] = {
     let mut t: [Option<&[ArgType]>; 256] = [None; 256];
     t[0x01] = Some(&[BYTES]); // sha256
@@ -138,5 +138,22 @@ pub(super) static TABLE: [Option<&[ArgType]>; 256] = {
     t[0xe5] = Some(&[BYTES]); // ec_map_to
     t[0xe6] = Some(&[BYTES]); // mimc
     t[0xe7] = Some(&[BYTES]); // poseidon2
+    t
+};
+
+/// The first program version an opcode of `TABLE` is gated for (go's spec for
+/// the opcode changed at that version; `0` = every version).
+pub(super) static MIN_VERSION: [u8; 256] = {
+    let mut t = [0u8; 256];
+    t[0x04] = 5; // ed25519verify
+    t
+};
+
+/// Opcodes whose run-mode set changes between AVM versions, as `(first
+/// version, mode bits)` steps (1 = LogicSig, 2 = application): go checks
+/// the mode of the program's own version before anything else.
+pub(super) static MODE_VARIANTS: [Option<&[(u8, u8)]>; 256] = {
+    let mut t: [Option<&[(u8, u8)]>; 256] = [None; 256];
+    t[0x04] = Some(&[(1, 1), (5, 3)]); // ed25519verify
     t
 };

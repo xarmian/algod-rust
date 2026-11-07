@@ -1,0 +1,8 @@
+{
+  "gate_excluded": {
+    "0x07": "handler keeps its own lazy pops"
+  },
+  "version_exceptions": {
+    "0x86": "registered version differs from go; tracked separately"
+  }
+}

@@ -731,8 +731,8 @@ mod tests {
         let mut tracer = SimulationTracer::new(config);
 
         tracer.before_program(ProgramType::Approval, [0u8; 32]);
-        tracer.before_opcode(0, 0x81);
-        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+        tracer.before_opcode(1, 0x81);
+        tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(1)], &[], None);
         tracer.after_program(ProgramType::Approval, true, None);
 
         let trace = tracer.into_transaction_trace();
@@ -750,17 +750,18 @@ mod tests {
         let mut tracer = SimulationTracer::new(config);
 
         tracer.before_program(ProgramType::Approval, [0u8; 32]);
-        tracer.before_opcode(0, 0x81);
-        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
-        tracer.before_opcode(1, 0x43);
-        tracer.after_opcode(1, 0x43, &[AvmValue::Uint64(1)], &[], None);
+        tracer.before_opcode(1, 0x81);
+        tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(1)], &[], None);
+        tracer.before_opcode(3, 0x43);
+        tracer.after_opcode(3, 0x43, &[AvmValue::Uint64(1)], &[], None);
         tracer.after_program(ProgramType::Approval, true, None);
 
         let trace = tracer.into_transaction_trace().unwrap();
         let approval = trace.approval_program_trace.unwrap();
         assert_eq!(approval.opcodes.len(), 2);
-        assert_eq!(approval.opcodes[0].pc, 0);
-        assert_eq!(approval.opcodes[1].pc, 1);
+        // Byte offsets with the version header: `pushint 1` at 1, `return` at 3.
+        assert_eq!(approval.opcodes[0].pc, 1);
+        assert_eq!(approval.opcodes[1].pc, 3);
     }
 
     #[test]
@@ -806,8 +807,8 @@ mod tests {
         let mut tracer = SimulationTracer::new(config);
 
         tracer.before_program(ProgramType::LogicSig, [0u8; 32]);
-        tracer.before_opcode(0, 0x81);
-        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+        tracer.before_opcode(1, 0x81);
+        tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(1)], &[], None);
         tracer.after_program(ProgramType::LogicSig, true, None);
 
         let trace = tracer.into_transaction_trace().unwrap();
@@ -828,8 +829,8 @@ mod tests {
         tracer.before_program(ProgramType::Approval, [0u8; 32]);
 
         // First opcode pushes 1 value.
-        tracer.before_opcode(0, 0x81);
-        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(42)], &[], None);
+        tracer.before_opcode(1, 0x81);
+        tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(42)], &[], None);
 
         let state = tracer.current_program.as_ref().unwrap();
         let unit = &state.trace.opcodes[0];
@@ -837,8 +838,8 @@ mod tests {
         assert_eq!(unit.stack_pop_count, 0);
 
         // Second opcode pops 1, pushes 0 (net decrease by 1).
-        tracer.before_opcode(1, 0x43);
-        tracer.after_opcode(1, 0x43, &[], &[], None);
+        tracer.before_opcode(3, 0x43);
+        tracer.after_opcode(3, 0x43, &[], &[], None);
 
         let state = tracer.current_program.as_ref().unwrap();
         let unit = &state.trace.opcodes[1];
@@ -860,8 +861,8 @@ mod tests {
 
         // Top-level approval program begins
         tracer.before_program(ProgramType::Approval, [0u8; 32]);
-        tracer.before_opcode(0, 0x81);
-        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+        tracer.before_opcode(1, 0x81);
+        tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(1)], &[], None);
 
         // Inner transaction group (simulating itxn_submit hook calls)
         tracer.before_txn_group(1);
@@ -869,8 +870,8 @@ mod tests {
 
         // Inner program executes
         tracer.before_program(ProgramType::Approval, [0u8; 32]);
-        tracer.before_opcode(0, 0x81);
-        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+        tracer.before_opcode(1, 0x81);
+        tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(1)], &[], None);
         tracer.after_program(ProgramType::Approval, true, None);
 
         tracer.after_txn(0, None);
@@ -906,24 +907,24 @@ mod tests {
 
         // Top-level program
         tracer.before_program(ProgramType::Approval, [0u8; 32]);
-        tracer.before_opcode(0, 0x81);
-        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+        tracer.before_opcode(1, 0x81);
+        tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(1)], &[], None);
 
         // First inner txn
         tracer.before_txn_group(1);
         tracer.before_txn(0);
 
         tracer.before_program(ProgramType::Approval, [0u8; 32]);
-        tracer.before_opcode(0, 0x81);
-        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+        tracer.before_opcode(1, 0x81);
+        tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(1)], &[], None);
 
         // Nested inner txn (depth 2)
         tracer.before_txn_group(1);
         tracer.before_txn(0);
 
         tracer.before_program(ProgramType::Approval, [0u8; 32]);
-        tracer.before_opcode(0, 0x81);
-        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+        tracer.before_opcode(1, 0x81);
+        tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(1)], &[], None);
         tracer.after_program(ProgramType::Approval, true, None);
 
         tracer.after_txn(0, None);
@@ -984,8 +985,8 @@ mod tests {
         let mut tracer = SimulationTracer::new(config);
 
         tracer.before_program(ProgramType::Approval, [0u8; 32]);
-        tracer.before_opcode(0, 0x81);
-        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+        tracer.before_opcode(1, 0x81);
+        tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(1)], &[], None);
 
         // Inner txn group with 2 siblings
         tracer.before_txn_group(2);
@@ -993,16 +994,16 @@ mod tests {
         // Sibling 1
         tracer.before_txn(0);
         tracer.before_program(ProgramType::Approval, [0u8; 32]);
-        tracer.before_opcode(0, 0x81);
-        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+        tracer.before_opcode(1, 0x81);
+        tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(1)], &[], None);
         tracer.after_program(ProgramType::Approval, true, None);
         tracer.after_txn(0, None);
 
         // Sibling 2
         tracer.before_txn(1);
         tracer.before_program(ProgramType::Approval, [0u8; 32]);
-        tracer.before_opcode(0, 0x81);
-        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(2)], &[], None);
+        tracer.before_opcode(1, 0x81);
+        tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(2)], &[], None);
         tracer.after_program(ProgramType::Approval, true, None);
         tracer.after_txn(1, None);
 
@@ -1033,22 +1034,22 @@ mod tests {
 
         tracer.before_program(ProgramType::Approval, [0u8; 32]);
         // Opcode 0: a plain push (no inners).
-        tracer.before_opcode(0, 0x81);
-        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+        tracer.before_opcode(1, 0x81);
+        tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(1)], &[], None);
 
         // Opcode 1: itxn_submit. Two inners spawn during its execution.
         tracer.before_opcode(1, 0xb6);
         tracer.before_txn_group(2);
         tracer.before_txn(0);
         tracer.before_program(ProgramType::Approval, [0u8; 32]);
-        tracer.before_opcode(0, 0x81);
-        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+        tracer.before_opcode(1, 0x81);
+        tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(1)], &[], None);
         tracer.after_program(ProgramType::Approval, true, None);
         tracer.after_txn(0, None);
         tracer.before_txn(1);
         tracer.before_program(ProgramType::Approval, [0u8; 32]);
-        tracer.before_opcode(0, 0x81);
-        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(2)], &[], None);
+        tracer.before_opcode(1, 0x81);
+        tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(2)], &[], None);
         tracer.after_program(ProgramType::Approval, true, None);
         tracer.after_txn(1, None);
         tracer.after_txn_group(None);
@@ -1079,8 +1080,8 @@ mod tests {
         let mut tracer = SimulationTracer::new(config);
 
         tracer.before_program(ProgramType::ClearState, [7u8; 32]);
-        tracer.before_opcode(0, 0x81);
-        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(0)], &[], None);
+        tracer.before_opcode(1, 0x81);
+        tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(0)], &[], None);
         tracer.after_program(
             ProgramType::ClearState,
             false,
@@ -1107,8 +1108,8 @@ mod tests {
         let mut tracer = SimulationTracer::new(config);
 
         tracer.before_program(ProgramType::ClearState, [7u8; 32]);
-        tracer.before_opcode(0, 0x81);
-        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(0)], &[], None);
+        tracer.before_opcode(1, 0x81);
+        tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(0)], &[], None);
         tracer.after_program(ProgramType::ClearState, false, None);
 
         let trace = tracer.into_transaction_trace().unwrap();
@@ -1126,8 +1127,8 @@ mod tests {
         let mut tracer = SimulationTracer::new(config);
 
         tracer.before_program(ProgramType::ClearState, [7u8; 32]);
-        tracer.before_opcode(0, 0x81);
-        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+        tracer.before_opcode(1, 0x81);
+        tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(1)], &[], None);
         tracer.after_program(ProgramType::ClearState, true, None);
 
         let trace = tracer.into_transaction_trace().unwrap();

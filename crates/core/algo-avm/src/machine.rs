@@ -93,6 +93,15 @@ pub enum AvmValue {
 }
 
 impl AvmValue {
+    /// go's type name of the value (`uint64`, `[]byte`), the one mapping
+    /// shared with [`crate::arg_gate::ArgKind::type_name`].
+    pub(crate) fn type_name(&self) -> &'static str {
+        match self {
+            AvmValue::Uint64(_) => crate::arg_gate::UINT64_NAME,
+            AvmValue::Bytes(_) => crate::arg_gate::BYTES_NAME,
+        }
+    }
+
     /// Returns `true` if the value is "truthy" (nonzero uint64 or non-empty bytes).
     pub fn is_truthy(&self) -> bool {
         match self {
@@ -198,8 +207,10 @@ pub struct AvmMachine {
     pub call_stack: Vec<CallFrame>,
     /// Scratch space (256 slots).
     pub scratch: Vec<AvmValue>,
-    /// Program counter (instruction index, not byte offset). go's `pc` in an
-    /// `EvalError` is a byte offset: see [`AvmMachine::byte_pc`].
+    /// Program counter as an INSTRUCTION INDEX into the decoded program (not
+    /// a byte offset). go's `pc` (in an `EvalError` and in the tracer's
+    /// `before_opcode` / `after_opcode`) is the byte offset with the version
+    /// header: [`AvmMachine::byte_pc`] converts.
     pub pc: usize,
     /// `(opcode byte, sub-opcode)` of the instruction being executed, `None`
     /// outside an instruction (finish and final-stack checks, frame handling):
@@ -341,7 +352,7 @@ impl AvmMachine {
         if instr.sub_opcode.is_some() {
             return true;
         }
-        let Some(types) = crate::arg_gate::arg_types(instr.opcode) else {
+        let Some(types) = crate::arg_gate::gate_for(instr.opcode, self.version) else {
             return true;
         };
         let len = self.stack.len();
@@ -362,6 +373,16 @@ impl AvmMachine {
         true
     }
 
+    /// go's `<op> not allowed in current mode` for the instruction being
+    /// executed (`EvalContext.step`).
+    #[cold]
+    #[inline(never)]
+    fn mode_error(&self) -> AlgoError {
+        AlgoError::Avm {
+            message: format!("{} not allowed in current mode", self.current_op_name()),
+        }
+    }
+
     /// go's argument gate failure for `instr` (call only when
     /// [`AvmMachine::arg_gate_passes`] is false): the stack height first, then
     /// the first wrong argument from argument 0 upward, BEFORE the cost is
@@ -369,7 +390,7 @@ impl AvmMachine {
     #[cold]
     #[inline(never)]
     fn arg_gate_error(&self, instr: &Instruction) -> AlgoError {
-        let types = crate::arg_gate::arg_types(instr.opcode).unwrap_or(&[]);
+        let types = crate::arg_gate::gate_for(instr.opcode, self.version).unwrap_or(&[]);
         let name = self.current_op_name();
         if self.stack.len() < types.len() {
             return AlgoError::Avm {
@@ -381,10 +402,7 @@ impl AvmMachine {
             if crate::arg_gate::accepts(*want, &self.stack[first + i]) {
                 continue;
             }
-            let got = match &self.stack[first + i] {
-                AvmValue::Uint64(_) => "uint64",
-                AvmValue::Bytes(_) => "[]byte",
-            };
+            let got = self.stack[first + i].type_name();
             return AlgoError::Avm {
                 message: format!("{name} arg {i} wanted {} but got {got}", want.name()),
             };
@@ -427,7 +445,12 @@ impl AvmMachine {
         self.opcode_hits[instr.opcode as usize] = true;
         self.begin_instruction(&instr);
 
-        // go's argument gate runs before the cost is charged.
+        // go checks the opcode's run mode for the program's version first
+        // (`<op> not allowed in current mode`), then the arguments, both
+        // before the cost is charged.
+        if !crate::arg_gate::mode_allows(instr.opcode, self.version, self.mode) {
+            return Err(self.mode_error());
+        }
         if !self.arg_gate_passes(&instr) {
             return Err(self.arg_gate_error(&instr));
         }
@@ -510,7 +533,19 @@ impl AvmMachine {
         // exhaustion opcodes are visible in the trace, matching go-algorand).
         tracer.before_opcode(old_byte_pc, instr.opcode);
 
-        // go's argument gate runs before the cost is charged.
+        // Mode, then arguments, both before the cost (see `step_inner`).
+        if !crate::arg_gate::mode_allows(instr.opcode, self.version, self.mode) {
+            let e = self.mode_error();
+            let msg = e.to_string();
+            tracer.after_opcode(
+                old_byte_pc,
+                instr.opcode,
+                &self.stack,
+                &self.scratch,
+                Some(&msg),
+            );
+            return Err(e);
+        }
         if !self.arg_gate_passes(&instr) {
             let e = self.arg_gate_error(&instr);
             let msg = e.to_string();
@@ -679,7 +714,9 @@ impl AvmMachine {
             // programs are raw bytecode, so a crafted program can push a
             // non-nil, zero-length bytes value where the assembler's own
             // static type tracker would never allow it.
-            AvmValue::Bytes(_) => Err(self.arg_type_error("uint64", "[]byte")),
+            AvmValue::Bytes(_) => {
+                Err(self.arg_type_error(crate::arg_gate::UINT64_NAME, crate::arg_gate::BYTES_NAME))
+            }
         }
     }
 
@@ -687,7 +724,9 @@ impl AvmMachine {
     pub fn pop_bytes(&mut self) -> Result<Vec<u8>, AlgoError> {
         match self.pop()? {
             AvmValue::Bytes(b) => Ok(b),
-            AvmValue::Uint64(_) => Err(self.arg_type_error("[]byte", "uint64")),
+            AvmValue::Uint64(_) => {
+                Err(self.arg_type_error(crate::arg_gate::BYTES_NAME, crate::arg_gate::UINT64_NAME))
+            }
         }
     }
 

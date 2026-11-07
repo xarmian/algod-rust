@@ -2872,3 +2872,43 @@ fn the_tracer_pc_of_a_failing_opcode_is_its_byte_offset() {
     assert_eq!(err.to_string(), "AVM: / 0");
     assert_eq!(tracer.after.last(), Some(&5));
 }
+
+// ===========================================================================
+// Version-dependent run modes (issue #2225)
+// ===========================================================================
+
+/// `code` under `version` in `mode` to its first error (text only).
+fn first_error_in_mode(version: u8, mode: ExecMode, code: &[u8]) -> String {
+    let program = parse(&prog(version, code)).expect("parse");
+    let mut m = AvmMachine::new(program, mode, 100_000);
+    m.run(&mut NullContext)
+        .expect_err("the program must fail")
+        .to_string()
+}
+
+#[test]
+fn ed25519verify_is_logicsig_only_before_v5() {
+    // go's spec table: `{0x04, "ed25519verify", ..., 1, ...only(ModeSig)}` and
+    // `{0x04, ..., 5, ...}` (both modes). The mode of the PROGRAM's version is
+    // checked before the arguments: with an empty stack go reports the mode,
+    // not the underflow.
+    for version in 1..=4u8 {
+        assert_eq!(
+            first_error_in_mode(version, ExecMode::Application, &[0x04]),
+            "AVM: ed25519verify not allowed in current mode",
+            "application, v{version}"
+        );
+        assert_eq!(
+            first_error_in_mode(version, ExecMode::LogicSig, &[0x04]),
+            "AVM: stack underflow in ed25519verify",
+            "logicsig, v{version}"
+        );
+    }
+    for version in 5..=8u8 {
+        assert_eq!(
+            first_error_in_mode(version, ExecMode::Application, &[0x04]),
+            "AVM: stack underflow in ed25519verify",
+            "application, v{version}"
+        );
+    }
+}

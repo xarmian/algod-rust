@@ -19,20 +19,25 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // avm-op-protos dumps go-algorand's per-opcode `proto` argument types
-// (`data/transactions/logic/opcodes.go`) for every opcode of the newest AVM
-// version (`logic.LogicVersion`) as JSON lines, so algod-rust's argument gate
-// table (`crates/core/algo-avm/src/arg_gate.rs`, issue #2225) and its opcode
-// version table are checked against go instead of typed by hand.
+// (`data/transactions/logic/opcodes.go`) for every opcode, across EVERY AVM
+// version, as JSON lines, so algod-rust's argument gate table
+// (`crates/core/algo-avm/src/arg_gate.rs`, issue #2225) and its opcode version
+// table are checked against go instead of typed by hand.
 //
-// One object per opcode:
+// One object per opcode name:
 //
-//	{"opcode": 8, "name": "+", "version": 1, "modes": 3,
+//	{"opcode": 8, "name": "+", "version": 1, "modes": 3, "stable": true,
 //	 "args": [{"avm": "uint64", "name": "uint64"}, ...]}
 //
-// `version` is the AVM version that introduced the opcode, `modes` go's
-// `RunMode` bit set (1 = LogicSig, 2 = application, 3 = both), `avm` the AVM
-// type the gate compares (`any`, `uint64`, `[]byte`) and `name` the
+// `version` is the lowest AVM version that has the opcode, `modes` go's
+// `RunMode` bit set (1 = LogicSig, 2 = application, 3 = both) and `args` the
+// argument types, both as of the newest version (`logic.LogicVersion`). `avm`
+// is the AVM type the gate compares (`any`, `uint64`, `[]byte`) and `name` the
 // `StackType.String()` go prints in `<op> arg <i> wanted <name> but got <type>`.
+// `stable` is true when the mode set AND the argument types are identical in
+// every version that has the opcode. Otherwise `variants` lists the distinct
+// (modes, args) from the version each starts at (`ed25519verify` is LogicSig
+// only before v5), because a program of an older version meets the older spec.
 //
 // Regenerate (go-algorand pin v5.0.4-stable, deterministic):
 //
@@ -44,6 +49,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/algorand/go-algorand/data/transactions/logic"
 )
@@ -53,29 +59,76 @@ type arg struct {
 	Name string `json:"name"`
 }
 
+type variant struct {
+	From  uint64 `json:"from"`
+	Modes int    `json:"modes"`
+	Args  []arg  `json:"args"`
+}
+
 type row struct {
 	Opcode  int    `json:"opcode"`
 	Name    string `json:"name"`
 	Version uint64 `json:"version"`
 	// Modes is go's `RunMode` bit set: 1 = LogicSig only, 2 = application
 	// only, 3 = both.
-	Modes int   `json:"modes"`
-	Args  []arg `json:"args"`
+	Modes    int       `json:"modes"`
+	Stable   bool      `json:"stable"`
+	Args     []arg     `json:"args"`
+	Variants []variant `json:"variants,omitempty"`
+}
+
+func argsOf(s logic.OpSpec) []arg {
+	out := []arg{}
+	for _, t := range s.Arg.Types {
+		out = append(out, arg{AVM: t.AVMType.String(), Name: t.String()})
+	}
+	return out
+}
+
+func signature(s logic.OpSpec) string {
+	parts := []string{fmt.Sprint(int(s.Modes))}
+	for _, a := range argsOf(s) {
+		parts = append(parts, a.AVM+"/"+a.Name)
+	}
+	return strings.Join(parts, " ")
 }
 
 func main() {
-	specs := logic.OpcodesByVersion(logic.LogicVersion)
-	sort.Slice(specs, func(i, j int) bool {
-		if specs[i].Opcode != specs[j].Opcode {
-			return specs[i].Opcode < specs[j].Opcode
+	latest := logic.OpsByName[logic.LogicVersion]
+	names := make([]string, 0, len(latest))
+	for n := range latest {
+		names = append(names, n)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		a, b := latest[names[i]], latest[names[j]]
+		if a.Opcode != b.Opcode {
+			return a.Opcode < b.Opcode
 		}
-		return specs[i].Name < specs[j].Name
+		return names[i] < names[j]
 	})
 	enc := json.NewEncoder(os.Stdout)
-	for _, s := range specs {
-		r := row{Opcode: int(s.Opcode), Name: s.Name, Version: s.Version, Modes: int(s.Modes), Args: []arg{}}
-		for _, t := range s.Arg.Types {
-			r.Args = append(r.Args, arg{AVM: t.AVMType.String(), Name: t.String()})
+	for _, n := range names {
+		s := latest[n]
+		r := row{Opcode: int(s.Opcode), Name: n, Modes: int(s.Modes), Stable: true, Args: argsOf(s)}
+		var last string
+		for v := uint64(1); v <= logic.LogicVersion; v++ {
+			spec, ok := logic.OpsByName[v][n]
+			if !ok {
+				continue
+			}
+			if r.Version == 0 {
+				r.Version = v
+			}
+			sig := signature(spec)
+			if sig != last {
+				r.Variants = append(r.Variants, variant{From: v, Modes: int(spec.Modes), Args: argsOf(spec)})
+				last = sig
+			}
+		}
+		if len(r.Variants) <= 1 {
+			r.Variants = nil
+		} else {
+			r.Stable = false
 		}
 		if err := enc.Encode(r); err != nil {
 			fmt.Fprintln(os.Stderr, err)
