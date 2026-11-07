@@ -46,6 +46,11 @@ on:
       - "Makefile"
       - ".github/workflows/bench-localnet.yml"
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "commit to check out (bisect, issue #2249)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -57,6 +62,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
       - name: Unit tests (topology, aggregation, gate, rows)
         run: python3 -m unittest -v scripts/bench/test_localnet.py scripts/bench/test_run.py
       - name: Set up Docker Buildx
