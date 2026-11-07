@@ -294,6 +294,44 @@ pub const BLOCK_SUFFIX: &str = ".block.sqlite";
 /// [`SqliteLedger::set_synchronous_mode`] (issue #749).
 pub const DEFAULT_LEDGER_SYNCHRONOUS_MODE: i64 = 2;
 
+/// Default `journal_size_limit` of the tracker database, in bytes (issue
+/// #2206). A long-lived read transaction (an automatic catchpoint export,
+/// the lazy trie loader, an external tool) pins the tracker WAL, which then
+/// grows by every block committed meanwhile; SQLite reuses the file from its
+/// start once the reader is gone but keeps its peak size unless this limit
+/// is set, so a long export would leave the peak on disk for good. With the
+/// limit, the next WAL restart cuts the file back to this size. It bounds
+/// only the residual file, not growth during the pin (inherent to a
+/// consistent snapshot); 64 MiB is far above a normal working set (about 80
+/// KB per block).
+///
+/// Applied to the connections that write the tracker WAL: the
+/// [`SqliteLedger`] connection (`init`) and the raw rebuild connection
+/// [`open_ledger_connection_with_sync_mode`] (catchpoint import/verify and
+/// other bulk-loading maintenance). Not applied to read-only connections
+/// (snapshots, the lazy trie loader, the read pool), which never restart the
+/// WAL, nor to the block archive file. No `config.json` field: the value is a
+/// disk-space safety net far above any working set, not a tuning knob.
+// DIVERGENCE DIV-008: journal_size_limit on the tracker, go sets none (issue #2206).
+pub const DEFAULT_TRACKER_WAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
+
+/// `PRAGMA main.journal_size_limit` on a tracker-writing connection. A
+/// negative value would mean "no limit" in SQLite and silently disable the
+/// protection, so it is rejected.
+fn apply_tracker_wal_size_limit(conn: &Connection, bytes: i64) -> Result<(), AlgoError> {
+    if bytes < 0 {
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "journal_size_limit must not be negative (SQLite reads that as 'no limit'), got {bytes}"
+            ),
+        });
+    }
+    conn.execute_batch(&format!("PRAGMA main.journal_size_limit={bytes};"))
+        .map_err(|e| AlgoError::Ledger {
+            message: format!("journal_size_limit pragma error: {e}"),
+        })
+}
+
 /// Default SQLite `synchronous` pragma value for rebuild-shaped
 /// connections that bulk-load a fresh accounts snapshot (catchpoint
 /// import/verify, catchpoint-sync bulk import) — go's
@@ -442,6 +480,8 @@ pub fn open_ledger_connection_with_sync_mode(
     .map_err(|e| AlgoError::Ledger {
         message: format!("set pragmas on ledger connection: {e}"),
     })?;
+    // Issue #2206: this connection bulk-writes the tracker WAL.
+    apply_tracker_wal_size_limit(&conn, DEFAULT_TRACKER_WAL_SIZE_LIMIT)?;
     Ok(conn)
 }
 
@@ -3060,6 +3100,8 @@ impl SqliteLedger {
         // Issue #1678: time the WAL checkpoints SQLite runs on the committing
         // thread (same PASSIVE auto-checkpoint, now observable).
         crate::follow_timing::install_wal_checkpoint_hook(&conn);
+        // Issue #2206: cut the tracker WAL file back after a long pin.
+        apply_tracker_wal_size_limit(&conn, DEFAULT_TRACKER_WAL_SIZE_LIMIT)?;
 
         // G12 (TASK-109): refuse pre-v3 tracker DBs cleanly before
         // schema creation. Go's `performResourceTableMigration`
@@ -4045,6 +4087,14 @@ impl SqliteLedger {
             t.set_cache_target(target);
             t.set_lru_disabled(self.lru_cache_disabled);
         }
+    }
+
+    /// Set the tracker database's `journal_size_limit` (issue #2206): after a
+    /// WAL restart the file is truncated to at most `bytes`. See
+    /// [`DEFAULT_TRACKER_WAL_SIZE_LIMIT`]. A negative value is rejected (it
+    /// would disable the limit).
+    pub fn set_tracker_wal_size_limit(&self, bytes: i64) -> Result<(), AlgoError> {
+        apply_tracker_wal_size_limit(&self.conn, bytes)
     }
 
     /// Override the SQLite `synchronous` pragma on the main ledger
@@ -15608,6 +15658,137 @@ mod tests {
             "a new read transaction must observe the writer's committed insert"
         );
         reader.execute_batch("COMMIT").unwrap();
+    }
+
+    /// Size of the tracker WAL file on disk (0 when absent).
+    fn tracker_wal_len(prefix: &Path) -> u64 {
+        let mut p = tracker_path_for_prefix(prefix).into_os_string();
+        p.push("-wal");
+        std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Commit `batches` transactions of `rows` 4 KiB rows each into
+    /// `accountbase` on the ledger's own connection (an import-shaped load).
+    fn write_wal_load(l: &SqliteLedger, first: u64, batches: u64, rows: u64) {
+        let blob = vec![0xABu8; 4096];
+        for b in 0..batches {
+            l.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            for i in 0..rows {
+                let mut addr = [0u8; 32];
+                addr[..8].copy_from_slice(&(first + b * rows + i + 1).to_le_bytes());
+                addr[31] = 0xEE;
+                l.conn
+                    .execute_cached(
+                        "INSERT INTO accountbase (address, normalizedonlinebalance, data) \
+                         VALUES (?1, 0, ?2)",
+                        params![addr.to_vec(), blob],
+                    )
+                    .unwrap();
+            }
+            l.conn.execute_batch("COMMIT").unwrap();
+        }
+    }
+
+    /// Issue #2206: an automatic catchpoint export holds a read transaction
+    /// on the tracker for the whole export, which pins the WAL, so the WAL
+    /// grows by every block committed meanwhile -- inherent to a consistent
+    /// snapshot, and gone once the export ends. What must not happen is the
+    /// peak staying on disk: SQLite reuses a WAL file from its start after a
+    /// restart but keeps its size unless `journal_size_limit` is set. After
+    /// the pinning reader is dropped and the WAL is restarted, the file must
+    /// be cut back to the configured limit.
+    #[test]
+    fn the_tracker_wal_file_returns_to_its_limit_after_a_pinning_export_snapshot_ends() {
+        const LIMIT: u64 = 256 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+        let l = SqliteLedger::open_with_prefix(&prefix).expect("open ledger");
+        l.set_tracker_wal_size_limit(LIMIT as i64).unwrap();
+
+        // The limit must be many frames, or "within the limit" proves nothing.
+        let page_size: i64 = l
+            .conn
+            .query_row_cached("PRAGMA main.page_size", [], |r| r.get(0))
+            .unwrap();
+        let page_size = page_size as u64;
+        assert!(
+            LIMIT >= 32 * (page_size + 24),
+            "page size {page_size} leaves too few frames in the limit"
+        );
+
+        // The export snapshot: a real read pins the WAL.
+        let snap = l.open_read_snapshot().expect("file-backed snapshot");
+        let _ = snap.get_account(&algo_types::Address([1u8; 32]));
+        write_wal_load(&l, 0, 60, 20);
+        let pinned = tracker_wal_len(&prefix);
+        assert!(
+            pinned > 8 * LIMIT,
+            "the pinned WAL must grow far past the limit ({pinned} B)"
+        );
+        // While pinned the WAL cannot be restarted.
+        let (busy, _, _): (i64, i64, i64) = l
+            .conn
+            .query_row_cached("PRAGMA main.wal_checkpoint(RESTART)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(busy, 1, "a pinning reader blocks the WAL restart");
+        assert_eq!(tracker_wal_len(&prefix), pinned);
+
+        // The export ends: the checkpoint can now backfill everything and
+        // the next write restarts the WAL (explicit, not left to the
+        // autocheckpoint threshold), which is when the limit applies.
+        drop(snap);
+        let (busy, _, _): (i64, i64, i64) = l
+            .conn
+            .query_row_cached("PRAGMA main.wal_checkpoint(RESTART)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(busy, 0, "the WAL can be restarted once the reader is gone");
+        write_wal_load(&l, 10_000, 1, 1);
+        let after = tracker_wal_len(&prefix);
+        assert!(
+            after <= LIMIT,
+            "after the export snapshot ended the WAL file must be cut back to the \
+             journal_size_limit ({LIMIT} B), but it is {after} B (it was {pinned} B pinned)"
+        );
+    }
+
+    /// The ledger applies [`DEFAULT_TRACKER_WAL_SIZE_LIMIT`] on open, so the
+    /// bound is not opt-in, and so does the raw rebuild connection that
+    /// catchpoint import/verify bulk-writes through.
+    #[test]
+    fn opening_a_file_backed_ledger_sets_the_default_tracker_wal_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+        let l = SqliteLedger::open_with_prefix(&prefix).unwrap();
+        let limit: i64 = l
+            .conn
+            .query_row_cached("PRAGMA main.journal_size_limit", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(limit, DEFAULT_TRACKER_WAL_SIZE_LIMIT);
+        drop(l);
+
+        let raw = open_ledger_connection(&prefix).unwrap();
+        let limit: i64 = raw
+            .query_row("PRAGMA main.journal_size_limit", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(limit, DEFAULT_TRACKER_WAL_SIZE_LIMIT);
+    }
+
+    /// A negative limit means "no limit" to SQLite; the setter must not
+    /// accept it, and a rejected call changes nothing.
+    #[test]
+    fn a_negative_tracker_wal_size_limit_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = SqliteLedger::open_with_prefix(&dir.path().join("ledger")).unwrap();
+        assert!(l.set_tracker_wal_size_limit(-1).is_err());
+        let limit: i64 = l
+            .conn
+            .query_row_cached("PRAGMA main.journal_size_limit", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(limit, DEFAULT_TRACKER_WAL_SIZE_LIMIT);
     }
 
     #[test]
