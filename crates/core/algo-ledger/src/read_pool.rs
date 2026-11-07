@@ -147,6 +147,17 @@ pub struct LedgerReadPool {
     /// Test: make the next N `committed_round` reads fail.
     #[cfg(test)]
     pub(crate) fail_committed_round: std::sync::atomic::AtomicUsize,
+    /// Test hooks (issue #2171), cross-crate (the REST adapter's tests) so
+    /// gated by `test-hooks` rather than `cfg(test)` alone: make the next N
+    /// pooled resource reads fail like a pooled-connection SQL error, or like a
+    /// BUSY/LOCKED one, and count the fresh-connection reads. The fresh read is
+    /// never failed by them.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_pooled_resource_reads: std::sync::atomic::AtomicUsize,
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_pooled_resource_reads_busy: std::sync::atomic::AtomicUsize,
+    #[cfg(any(test, feature = "test-hooks"))]
+    fresh_resource_reads: std::sync::atomic::AtomicUsize,
     /// Rewards levels of recently read committed headers, shared by the
     /// `lookup_agreement` reward fold (round `r - lookback`) and the account
     /// lookups (the tip), so neither evicts the other. Only committed rounds
@@ -155,6 +166,27 @@ pub struct LedgerReadPool {
     /// Test counter: header reads that reached `blockdb` (cache misses).
     #[cfg(test)]
     pub(crate) header_reads: std::sync::atomic::AtomicUsize,
+}
+
+/// Busy timeout of the one-shot fresh read connection (issue #2171).
+const FRESH_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// A failed pooled read: the error, and whether it was SQLite contention
+/// (BUSY / LOCKED), which a retry on another connection cannot fix.
+struct PoolFailure {
+    error: AlgoError,
+    contention: bool,
+}
+
+fn is_contention(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if matches!(
+                f.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
 }
 
 /// Small bounded per-round memo of committed headers' rewards levels. A
@@ -222,6 +254,12 @@ impl LedgerReadPool {
             archive_inflight,
             #[cfg(test)]
             fail_committed_round: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_pooled_resource_reads: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_pooled_resource_reads_busy: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fresh_resource_reads: std::sync::atomic::AtomicUsize::new(0),
             rewards_cache: RewardsLevels::default(),
             #[cfg(test)]
             header_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -229,11 +267,15 @@ impl LedgerReadPool {
     }
 
     fn open(&self) -> Result<Connection, rusqlite::Error> {
+        self.open_with_busy_timeout(Duration::from_secs(2))
+    }
+
+    fn open_with_busy_timeout(&self, busy: Duration) -> Result<Connection, rusqlite::Error> {
         let conn = Connection::open_with_flags(
             &self.tracker_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        conn.busy_timeout(Duration::from_secs(2))?;
+        conn.busy_timeout(busy)?;
         // The attached schema inherits the read-only open flags.
         conn.execute(
             "ATTACH DATABASE ?1 AS blockdb",
@@ -249,11 +291,23 @@ impl LedgerReadPool {
         &self,
         f: impl FnOnce(&Connection) -> Result<T, rusqlite::Error>,
     ) -> Result<T, AlgoError> {
+        self.with_conn_classified(f).map_err(|e| e.error)
+    }
+
+    /// [`Self::with_conn`] that also says whether the failure was contention
+    /// (SQLITE_BUSY / SQLITE_LOCKED, see [`PoolFailure`]).
+    fn with_conn_classified<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, rusqlite::Error>,
+    ) -> Result<T, PoolFailure> {
         let pooled = self.idle.lock().ok().and_then(|mut v| v.pop());
         let conn = match pooled {
             Some(c) => c,
-            None => self.open().map_err(|e| AlgoError::Ledger {
-                message: format!("read pool: open read-only connection: {e}"),
+            None => self.open().map_err(|e| PoolFailure {
+                contention: is_contention(&e),
+                error: AlgoError::Ledger {
+                    message: format!("read pool: open read-only connection: {e}"),
+                },
             })?,
         };
         match f(&conn) {
@@ -267,10 +321,57 @@ impl LedgerReadPool {
                 }
                 Ok(v)
             }
-            Err(e) => Err(AlgoError::Ledger {
-                message: format!("read pool: {e}"),
+            Err(e) => Err(PoolFailure {
+                contention: is_contention(&e),
+                error: AlgoError::Ledger {
+                    message: format!("read pool: {e}"),
+                },
             }),
         }
+    }
+
+    /// Make the next `n` pooled resource reads fail like a SQL error (issue
+    /// #2171 test hook); [`Self::read_resources_fresh`] is unaffected.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_next_pooled_resource_reads(&self, n: usize) {
+        self.fail_pooled_resource_reads
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Like [`Self::fail_next_pooled_resource_reads`] but the failure is
+    /// BUSY/LOCKED contention (issue #2171 test hook).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_next_pooled_resource_reads_busy(&self, n: usize) {
+        self.fail_pooled_resource_reads_busy
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many [`Self::read_resources_fresh`] calls ran (issue #2171 test
+    /// hook).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fresh_resource_reads(&self) -> usize {
+        self.fresh_resource_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Atomically consume one unit of an injected-failure counter.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn take_injected(counter: &std::sync::atomic::AtomicUsize) -> bool {
+        // A compare-exchange loop, not `fetch_update` (renamed `try_update`
+        // on newer toolchains, where the old name is deprecated).
+        let mut cur = counter.load(std::sync::atomic::Ordering::SeqCst);
+        while cur > 0 {
+            match counter.compare_exchange(
+                cur,
+                cur - 1,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+        false
     }
 
     /// Number of idle pooled connections (diagnostics / tests).
@@ -944,37 +1045,116 @@ impl LedgerReadPool {
     /// the round and the data can never tear across a concurrent commit.
     ///
     /// The snapshot is a short read transaction that ends before this call
-    /// returns (the WAL is never pinned). Any SQL error, in `f`'s reads or
-    /// the bookkeeping, is `Err` and the caller takes the locked path. A
-    /// resource that is absent from the snapshot is an authoritative miss:
-    /// the tracker tables live in one file and commit atomically.
+    /// returns (the WAL is never pinned), on an idle pooled connection. Any
+    /// SQL error, in `f`'s reads or the bookkeeping, is `Err`. Callers that
+    /// can fall back use [`Self::read_resources_or_fresh`] (pool, then one
+    /// fresh connection, then the caller's locked ledger). A resource that is
+    /// absent from the snapshot is an authoritative miss: the tracker tables
+    /// live in one file and commit atomically.
     pub fn read_resources<T>(
         &self,
         f: impl FnOnce(&PoolReader<'_>) -> T,
     ) -> Result<(u64, T), AlgoError> {
-        self.with_conn(|c| {
-            let tx = c.unchecked_transaction()?;
-            let rnd: Option<i64> = tx
-                .prepare_cached("SELECT rnd FROM acctrounds WHERE id = 'acctbase'")?
-                .query_row([], |row| row.get(0))
-                .optional()?;
-            let round = rnd.map(|v| v.max(0) as u64).unwrap_or(0);
-            let reader = PoolReader {
-                conn: &tx,
-                err: std::cell::Cell::new(None),
-                round,
-                rewards_cache: &self.rewards_cache,
-                #[cfg(test)]
-                header_reads: &self.header_reads,
-            };
-            let out = f(&reader);
-            if let Some(e) = reader.err.take() {
-                return Err(e);
+        self.read_resources_pooled(f).map_err(|e| e.error)
+    }
+
+    /// The pooled read with the failure classified (see [`PoolFailure`]).
+    fn read_resources_pooled<T>(
+        &self,
+        f: impl FnOnce(&PoolReader<'_>) -> T,
+    ) -> Result<(u64, T), PoolFailure> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            if Self::take_injected(&self.fail_pooled_resource_reads) {
+                return Err(PoolFailure {
+                    contention: false,
+                    error: AlgoError::Ledger {
+                        message: "injected pooled resource read failure".into(),
+                    },
+                });
             }
-            drop(reader);
-            tx.commit()?;
-            Ok((round, out))
-        })
+            if Self::take_injected(&self.fail_pooled_resource_reads_busy) {
+                return Err(PoolFailure {
+                    contention: true,
+                    error: AlgoError::Ledger {
+                        message: "injected pooled resource read contention".into(),
+                    },
+                });
+            }
+        }
+        self.with_conn_classified(|c| self.resources_in_snapshot(c, f))
+    }
+
+    /// [`Self::read_resources`], and when the POOLED read itself failed with
+    /// something other than contention, once more on a fresh read-only
+    /// connection (issue #2171), so the caller's resource scans can still run
+    /// without the ledger mutex. Not retried: a BUSY/LOCKED failure (a fresh
+    /// connection would meet the same writer and wait as long again), and
+    /// anything `f` itself decides after a successful snapshot (that is
+    /// deterministic, the caller handles it). A failure of the fresh read too
+    /// is `Err`, and the caller then takes its locked path, which decides and
+    /// reports. `f` may run twice (it only reads).
+    pub fn read_resources_or_fresh<T>(
+        &self,
+        f: impl Fn(&PoolReader<'_>) -> T,
+    ) -> Result<(u64, T), AlgoError> {
+        match self.read_resources_pooled(&f) {
+            Ok(v) => Ok(v),
+            Err(e) if e.contention => Err(e.error),
+            Err(_) => self.read_resources_fresh(&f),
+        }
+    }
+
+    /// [`Self::read_resources`] on a connection opened for this one call and
+    /// dropped after it, instead of an idle pooled one (issue #2171). It sees
+    /// the same committed state and needs no ledger mutex. Its busy timeout is
+    /// short (250 ms): it is a fallback, and the locked path follows it.
+    pub fn read_resources_fresh<T>(
+        &self,
+        f: impl FnOnce(&PoolReader<'_>) -> T,
+    ) -> Result<(u64, T), AlgoError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.fresh_resource_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let conn = self
+            .open_with_busy_timeout(FRESH_BUSY_TIMEOUT)
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("read pool: open fresh read-only connection: {e}"),
+            })?;
+        self.resources_in_snapshot(&conn, f)
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("read pool: {e}"),
+            })
+    }
+
+    /// One read transaction on `c`: the committed round and `f`'s reads in
+    /// the same snapshot; the first SQL error fails the whole call.
+    fn resources_in_snapshot<T>(
+        &self,
+        c: &Connection,
+        f: impl FnOnce(&PoolReader<'_>) -> T,
+    ) -> Result<(u64, T), rusqlite::Error> {
+        let tx = c.unchecked_transaction()?;
+        let rnd: Option<i64> = tx
+            .prepare_cached("SELECT rnd FROM acctrounds WHERE id = 'acctbase'")?
+            .query_row([], |row| row.get(0))
+            .optional()?;
+        let round = rnd.map(|v| v.max(0) as u64).unwrap_or(0);
+        let reader = PoolReader {
+            conn: &tx,
+            err: std::cell::Cell::new(None),
+            round,
+            rewards_cache: &self.rewards_cache,
+            #[cfg(test)]
+            header_reads: &self.header_reads,
+        };
+        let out = f(&reader);
+        if let Some(e) = reader.err.take() {
+            return Err(e);
+        }
+        drop(reader);
+        tx.commit()?;
+        Ok((round, out))
     }
 
     /// Lock-free `SqliteLedger::online_circulation_at_round` (go's

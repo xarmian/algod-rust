@@ -511,6 +511,9 @@ impl AlgodNodeInterface {
             match pooled {
                 Some((round, Some((level, Ok(v))))) => return Ok((round, level, v)),
                 Some((_, Some((_, Err(e))))) => return Err(e),
+                // `Some((_, None))`: the snapshot worked but the tip's rewards
+                // level cannot be read (DIV-009 in-flight row, bad header) --
+                // deterministic, so no fresh retry, the locked ledger decides.
                 _ => {}
             }
         }
@@ -532,9 +535,11 @@ impl AlgodNodeInterface {
     /// resources (they live in the `resources` table), so the held assets,
     /// created assets/apps and app local states are composed from the
     /// resource accessors, as go's `AccountDataToAccount` lists them. The
-    /// locked fallback is reached for an in-memory ledger (no pool) or after a
-    /// snapshot-level failure; it reads under the ledger mutex because the
-    /// accessors need the ledger itself, and the scans are bounded by
+    /// pooled snapshot is tried first, then (issue #2171) one fresh read-only
+    /// connection after a snapshot-level failure, both without the ledger
+    /// mutex. Only an in-memory ledger (one connection, no pool) and a failure
+    /// of both reach the locked fallback, which reads under the ledger mutex
+    /// because the accessors need the ledger itself; its scans are bounded by
     /// `max_resources`.
     fn account_lookup(&self, addr: &Address, kind: LookupKind) -> Result<AccountLookup, NodeError> {
         self.account_lookup_via(addr, kind, ReadPath::Pool)
@@ -590,15 +595,18 @@ impl AlgodNodeInterface {
         })
     }
 
-    /// Run `f` on one committed read snapshot of the lock-free read pool
-    /// (issue #1893), returning the committed round read in the same snapshot
-    /// with `f`'s result. `None` (in-memory ledger, any SQL error) means the
-    /// caller must take the locked path.
+    /// Run `f` on one committed read snapshot without the ledger mutex (issue
+    /// #1893), returning the committed round read in the same snapshot with
+    /// `f`'s result: on a pooled read-only connection, and when that read
+    /// fails with something other than contention, once more on a fresh
+    /// read-only connection (issue #2171; `f` may run twice, it only reads).
+    /// `None` (in-memory ledger, or both reads failed) means the caller must
+    /// take the locked path. Every pooled resource lookup goes through here.
     fn pooled_resources<T>(
         &self,
-        f: impl FnOnce(&algo_ledger::PoolReader<'_>) -> T,
+        f: impl Fn(&algo_ledger::PoolReader<'_>) -> T,
     ) -> Option<(u64, T)> {
-        self.read_pool()?.read_resources(f).ok()
+        self.read_pool()?.read_resources_or_fresh(f).ok()
     }
 
     /// The lock-free read pool, or `None` for an in-memory ledger.
@@ -9527,6 +9535,112 @@ err
         );
     }
 
+    /// Issue #2171: when the pooled read fails, the resource scans must NOT
+    /// fall back to the locked ledger on a file-backed node: they run on a
+    /// fresh read-only connection with the ledger mutex free (observed by
+    /// taking the mutex from inside the scan closure), the fresh connection
+    /// really served the answer (its read counter moved), and the answer is
+    /// the committed round's.
+    #[tokio::test]
+    async fn the_account_scan_fallback_runs_without_the_ledger_mutex() {
+        let (_dir, ledger, who) = file_backed_ledger_with_seeded_account();
+        let adapter = make_adapter_with_ledger(ledger.clone());
+        let pool = adapter.read_pool().expect("file-backed ledger has a pool");
+        let committed = ledger
+            .lock()
+            .unwrap()
+            .last_committed_round()
+            .unwrap()
+            .unwrap();
+        let fresh_before = pool.fresh_resource_reads();
+        pool.fail_next_pooled_resource_reads(1);
+        let mutex_was_free = std::cell::Cell::new(None);
+        let (round, _, _) = adapter
+            .committed_read("test", ReadPath::Pool, |_, level| {
+                mutex_was_free.set(Some(ledger.try_lock().is_ok()));
+                Ok(level)
+            })
+            .unwrap();
+        assert_eq!(round, committed);
+        assert_eq!(
+            mutex_was_free.get(),
+            Some(true),
+            "the fallback scan ran while holding the ledger mutex"
+        );
+        assert_eq!(
+            pool.fresh_resource_reads(),
+            fresh_before + 1,
+            "the fresh connection did not serve the fallback read"
+        );
+
+        // Through the endpoint, with the mutex held elsewhere the whole time:
+        // the pooled read fails once, the fresh connection answers.
+        pool.fail_next_pooled_resource_reads(1);
+        let elapsed = timed_while_ledger_locked(&ledger, async {
+            let lookup = adapter.lookup_account(&who).await.unwrap();
+            assert_account_lookup_has_resources(&lookup);
+            assert_eq!(lookup.last_round, committed);
+        })
+        .await;
+        assert_eq!(pool.fresh_resource_reads(), fresh_before + 2);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "account lookup fallback waited behind the held ledger mutex: {elapsed:?}"
+        );
+    }
+
+    /// Issue #2171 review: every pooled resource lookup gets the fresh retry,
+    /// not only the account lookup (`pooled_resources` carries it).
+    #[tokio::test]
+    async fn the_other_resource_lookups_also_retry_on_a_fresh_connection() {
+        let (_dir, ledger, who) = file_backed_ledger_with_seeded_account();
+        let adapter = make_adapter_with_ledger(ledger.clone());
+        let pool = adapter.read_pool().expect("pool");
+        let want = adapter.lookup_asset_resource(&who, 1).await.unwrap();
+        let before = pool.fresh_resource_reads();
+        pool.fail_next_pooled_resource_reads(1);
+        let elapsed = timed_while_ledger_locked(&ledger, async {
+            let got = adapter.lookup_asset_resource(&who, 1).await.unwrap();
+            assert_eq!(got.last_round, want.last_round);
+            assert_eq!(got.asset_holding.is_some(), want.asset_holding.is_some());
+        })
+        .await;
+        assert_eq!(pool.fresh_resource_reads(), before + 1);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "asset resource lookup fallback waited behind the ledger mutex: {elapsed:?}"
+        );
+    }
+
+    /// Issue #2171 review: contention (BUSY/LOCKED) on the pooled read is not
+    /// retried on a fresh connection (it would wait as long again): straight
+    /// to the locked ledger, no fresh read.
+    #[tokio::test]
+    async fn a_busy_pooled_read_goes_straight_to_the_locked_ledger() {
+        let (_dir, ledger, _who) = file_backed_ledger_with_seeded_account();
+        let adapter = make_adapter_with_ledger(ledger.clone());
+        let pool = adapter.read_pool().expect("pool");
+        let before = pool.fresh_resource_reads();
+        pool.fail_next_pooled_resource_reads_busy(1);
+        let mutex_was_free = std::cell::Cell::new(None);
+        adapter
+            .committed_read("test", ReadPath::Pool, |_, level| {
+                mutex_was_free.set(Some(ledger.try_lock().is_ok()));
+                Ok(level)
+            })
+            .unwrap();
+        assert_eq!(
+            pool.fresh_resource_reads(),
+            before,
+            "no fresh retry on BUSY"
+        );
+        assert_eq!(
+            mutex_was_free.get(),
+            Some(false),
+            "the locked ledger answered (the scan ran under the mutex)"
+        );
+    }
+
     /// Rewards level of the committed tip in the issue #2157 fixtures.
     const REWARDS_TIP_LEVEL: u64 = 25;
 
@@ -9749,6 +9863,9 @@ err
         });
         assert!(matches!(res, Err(NodeError::Internal(_))));
         assert_eq!(scans.get(), 0, "no scan may run without a readable level");
+        // Issue #2171: the unreadable level is deterministic, so the fresh
+        // connection is not tried either.
+        assert_eq!(adapter.read_pool().unwrap().fresh_resource_reads(), 0);
     }
 
     /// Review Z2: only snapshot-level failures fall back to the locked path; a

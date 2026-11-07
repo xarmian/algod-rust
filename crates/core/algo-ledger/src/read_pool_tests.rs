@@ -524,6 +524,47 @@ fn assert_resources_match(l: &SqliteLedger, pool: &LedgerReadPool) {
     let (round, got) = pool.read_resources(|r| probe(r)).expect("pool snapshot");
     assert_eq!(round, l.last_committed_round().unwrap().unwrap_or(0));
     assert_eq!(got, want);
+    // Issue #2171: the fresh-connection variant answers the same, in the same
+    // snapshot shape, and leaves the idle pool alone.
+    let idle = pool.idle_connections();
+    let (fresh_round, fresh) = pool
+        .read_resources_fresh(|r| probe(r))
+        .expect("fresh snapshot");
+    assert_eq!(fresh_round, round);
+    assert_eq!(fresh, want);
+    assert_eq!(pool.idle_connections(), idle);
+}
+
+/// Issue #2171: `read_resources_or_fresh` serves from the pool when it can,
+/// retries once on a fresh connection when the pooled read failed (same
+/// answer), and does NOT retry on contention.
+#[test]
+fn pool_then_fresh_retry_order() {
+    let (_d, mut l) = file_ledger();
+    stage(&mut l, 1, 7, 70);
+    l.commit_block().unwrap();
+    let pool = l.read_pool().expect("file-backed pool");
+    let want = pool.read_resources(|r| probe(r)).unwrap();
+
+    // Pool healthy: no fresh read.
+    let got = pool.read_resources_or_fresh(|r| probe(r)).unwrap();
+    assert_eq!(got, want);
+    assert_eq!(pool.fresh_resource_reads(), 0);
+
+    // Pooled read fails: exactly one fresh read, same answer.
+    pool.fail_next_pooled_resource_reads(1);
+    let got = pool.read_resources_or_fresh(|r| probe(r)).unwrap();
+    assert_eq!(got, want);
+    assert_eq!(pool.fresh_resource_reads(), 1);
+
+    // Contention: no fresh read, an error for the caller's locked path.
+    pool.fail_next_pooled_resource_reads_busy(1);
+    assert!(pool.read_resources_or_fresh(|r| probe(r)).is_err());
+    assert_eq!(pool.fresh_resource_reads(), 1);
+
+    // The hooks are consumed exactly once (atomic decrement).
+    assert_eq!(pool.read_resources_or_fresh(|r| probe(r)).unwrap(), want);
+    assert_eq!(pool.fresh_resource_reads(), 1);
 }
 
 fn stage_ops(l: &mut SqliteLedger, round: u64, ops: impl FnOnce(&mut SqliteLedger)) {
