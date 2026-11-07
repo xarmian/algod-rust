@@ -453,7 +453,9 @@ struct PassCtx {
     /// round with the stale, unbounded answer (a round past the gate's bound:
     /// seen once in ~10^4 CI runs as the ninth request of an eight-worker
     /// pass). Under this lock every claim is either wholly before the gate
-    /// (a claim of the ungated phase) or wholly after it (bounded).
+    /// (an ungated claim, bounded only by the permit window) or wholly after
+    /// it, and once the gate is engaged every claim is bounded by
+    /// `applied + workers`.
     claim_lock: std::sync::Mutex<()>,
     /// Test hook: runs between the gate read and the claim, lock held.
     #[cfg(test)]
@@ -500,7 +502,12 @@ impl PassCtx {
             .load(Ordering::SeqCst)
             .then(|| self.applied.load(Ordering::SeqCst) + self.workers.load(Ordering::SeqCst));
         #[cfg(test)]
-        if let Some(hook) = self.claim_hook.lock().unwrap().as_ref() {
+        if let Some(hook) = self
+            .claim_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             hook();
         }
         claim_round(next_to_fetch, limit)
@@ -4488,7 +4495,13 @@ mod tests {
     /// a thread trying to engage the gate from inside it must wait until the
     /// claim is done. Without the claim lock the gate is set at once, the
     /// claim goes ahead with the stale "no gate" answer, and the round it takes
-    /// is one the gate would have refused.
+    /// is one the gate would have refused. The engager signals on a channel
+    /// when `engage_tip_gate` returns: without the lock that happens at once
+    /// and the hook sees it immediately (a failure needs no waiting); with the
+    /// lock it cannot happen while the hook runs, which can only be shown by
+    /// waiting a bounded time for an event that must not come (the bound only
+    /// matters for the passing direction, which cannot flake: a blocked thread
+    /// never completes).
     #[test]
     fn the_tip_gate_cannot_be_engaged_between_the_gate_read_and_the_claim() {
         let ctx = Arc::new(PassCtx::new(FetchPolicy::default()));
@@ -4505,12 +4518,19 @@ mod tests {
                 Arc::clone(&engaged_during_claim),
                 Arc::clone(&engager),
             );
-            *ctx.claim_hook.lock().unwrap() = Some(Box::new(move || {
+            *ctx.claim_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move || {
+                let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
                 let ctx3 = Arc::clone(&ctx2);
-                *slot.lock().unwrap() = Some(thread::spawn(move || ctx3.engage_tip_gate()));
-                // Ample time for an unserialised store to land.
-                thread::sleep(Duration::from_millis(300));
-                flag.store(ctx2.fetch_failed.load(Ordering::SeqCst), Ordering::SeqCst);
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(thread::spawn(move || {
+                    ctx3.engage_tip_gate();
+                    let _ = done_tx.send(());
+                }));
+                // Engaged already (the lock is missing) or not within the bound.
+                let completed = done_rx.recv_timeout(Duration::from_millis(200)).is_ok();
+                flag.store(
+                    completed || ctx2.fetch_failed.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
             }));
         }
         // The claim saw "no gate": round 9 is taken (the ungated phase) ...
@@ -4520,9 +4540,13 @@ mod tests {
             !engaged_during_claim.load(Ordering::SeqCst),
             "the gate was engaged between the gate read and the claim"
         );
-        let handle = engager.lock().unwrap().take().unwrap();
+        let handle = engager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap();
         handle.join().unwrap();
-        *ctx.claim_hook.lock().unwrap() = None;
+        *ctx.claim_hook.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // From now on the gate bounds the claims: 10 >= applied + workers.
         assert!(ctx.fetch_failed.load(Ordering::SeqCst));
         assert_eq!(ctx.claim_next(&next), None);
