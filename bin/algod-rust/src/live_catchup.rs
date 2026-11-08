@@ -342,59 +342,110 @@ impl Drop for ClearRunningOnDrop {
     }
 }
 
+/// Why a drop guard did not resume normal sync (issue #2140). Observable so
+/// tests (and logs) can tell a skip from an attempt that never happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeSkip {
+    /// The node is shutting down: the teardown stops those services itself.
+    ShuttingDown,
+    /// The run's hand-back already attempted its own `resume()`.
+    AlreadyResumed,
+    /// A newer catchup has been started and owns the ledger.
+    NewerGeneration,
+}
+
+/// What the task a drop guard spawned did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeTaskOutcome {
+    /// `resume()` was attempted (it may have panicked: that is counted).
+    Attempted,
+    /// Skipped when the task ran (shutdown or a newer catchup began meanwhile).
+    Skipped(ResumeSkip),
+}
+
+/// What [`resume_after_abnormal_exit`] decided. Production ignores the
+/// value; tests observe it.
+#[derive(Debug)]
+#[allow(dead_code)]
+enum AbnormalResume {
+    /// Decided synchronously, at guard-drop time, not to resume.
+    Skipped(ResumeSkip),
+    /// No runtime to spawn on: logged, normal sync not resumed.
+    NoRuntime,
+    /// A task was spawned; it re-checks shutdown and a newer generation before
+    /// resuming.
+    Spawned(tokio::task::JoinHandle<ResumeTaskOutcome>),
+}
+
 /// Resume normal sync from a drop guard (which cannot await), unless the node
 /// is shutting down. `resume()` is idempotent, so it is safe whether or not
 /// the pause or the hand-back got that far. Without a runtime this cannot
 /// run, which is logged (issue #2121).
 ///
-/// Two cases are decided synchronously, here at guard-drop time, and skipped
-/// with a log (issue #2140):
+/// Three cases are skipped, decided synchronously here at guard-drop time
+/// (issue #2140), and the spawned task re-checks the two that can change
+/// meanwhile (shutdown starting, a newer catchup starting; both stay true once
+/// true, so the re-check can only skip more):
+/// - the node is shutting down;
 /// - the hand-back already attempted its own `resume()` for this run
 ///   (`resume_attempted_generation`), so a second one would only duplicate it;
 /// - a NEWER catchup has been started: an aborted run's guard must never
 ///   restart the normal sync services while the newer catchup owns the ledger
-///   (two writers). The check is repeated inside the spawned task, which is
-///   monotonic: once a newer run exists it stays true.
+///   (two writers).
+///
+/// Skipping for a newer catchup never leaves the services paused: every way
+/// that newer run can end resumes them itself unless the node is shutting
+/// down (whose teardown stops them): its hand-back (`drive`, also after an
+/// abort or a failed run), its `ClearRunningOnDrop` if `drive` panics or is
+/// aborted, and its `ReservationGuard` if `start_run` is refused or the
+/// starter dies (this very function, for the newer generation, which has no
+/// still-newer run unless the same argument applies to that one).
 ///
 /// A rare concurrent duplicate `resume()` from an abort racing the hand-back
 /// is acceptable: `resume()` is idempotent ("a no-op if it's already running").
-fn resume_after_abnormal_exit(manager: &Arc<LiveCatchupManager>, generation: u64, who: &str) {
-    if manager.is_shutting_down() {
-        return;
-    }
-    if manager.hand_back_already_resumed(generation) {
-        tracing::debug!(
-            generation,
-            "{who} ended abnormally after the hand-back already attempted resume(): not resuming again"
-        );
-        return;
-    }
-    if manager.has_newer_generation(generation) {
-        tracing::warn!(
-            generation,
-            "{who} ended abnormally while a newer live catchup runs: not resuming normal sync"
-        );
-        return;
+fn resume_after_abnormal_exit(
+    manager: &Arc<LiveCatchupManager>,
+    generation: u64,
+    who: &str,
+) -> AbnormalResume {
+    if let Some(skip) = manager.resume_skip(generation) {
+        match skip {
+            ResumeSkip::ShuttingDown => {}
+            ResumeSkip::AlreadyResumed => tracing::debug!(
+                generation,
+                "{who} ended abnormally after the hand-back already attempted resume(): not resuming again"
+            ),
+            ResumeSkip::NewerGeneration => tracing::warn!(
+                generation,
+                "{who} ended abnormally while a newer live catchup runs: not resuming normal sync"
+            ),
+        }
+        return AbnormalResume::Skipped(skip);
     }
     match tokio::runtime::Handle::try_current() {
         Ok(rt) => {
             let manager = Arc::clone(manager);
             let who = who.to_string();
-            rt.spawn(async move {
-                if manager.has_newer_generation(generation) {
+            AbnormalResume::Spawned(rt.spawn(async move {
+                if let Some(skip) = manager.resume_skip(generation) {
                     tracing::warn!(
                         generation,
-                        "{who}: a newer live catchup started meanwhile: not resuming normal sync"
+                        ?skip,
+                        "{who}: conditions changed before the resume task ran: not resuming normal sync"
                     );
-                    return;
+                    return ResumeTaskOutcome::Skipped(skip);
                 }
                 manager.resume_catching_panics(generation, &who).await;
-            });
+                ResumeTaskOutcome::Attempted
+            }))
         }
-        Err(_) => tracing::error!(
-            generation,
-            "{who} ended abnormally with no runtime: normal sync was not resumed"
-        ),
+        Err(_) => {
+            tracing::error!(
+                generation,
+                "{who} ended abnormally with no runtime: normal sync was not resumed"
+            );
+            AbnormalResume::NoRuntime
+        }
     }
 }
 
@@ -936,6 +987,28 @@ impl LiveCatchupManager {
             >= generation
     }
 
+    /// Record that run `generation`'s hand-back attempts `control.resume()`.
+    /// A monotonic high-water mark (`fetch_max`): a delayed older hand-back
+    /// can never lower it below a newer run's.
+    fn note_resume_attempt(&self, generation: u64) {
+        self.resume_attempted_generation
+            .fetch_max(generation, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Why a drop guard of run `generation` must not resume normal sync now,
+    /// if so.
+    fn resume_skip(&self, generation: u64) -> Option<ResumeSkip> {
+        if self.is_shutting_down() {
+            Some(ResumeSkip::ShuttingDown)
+        } else if self.hand_back_already_resumed(generation) {
+            Some(ResumeSkip::AlreadyResumed)
+        } else if self.has_newer_generation(generation) {
+            Some(ResumeSkip::NewerGeneration)
+        } else {
+            None
+        }
+    }
+
     /// A catchup newer than run `generation` has been started
     /// (`next_generation` is the next id to hand out, so the latest started
     /// run is `next_generation - 1`).
@@ -949,13 +1022,19 @@ impl LiveCatchupManager {
     /// node's normal sync services were then NOT restarted.
     #[cfg(test)]
     pub fn resume_panics(&self) -> u64 {
-        self.stats.lock().map(|g| g.resume_panics).unwrap_or(0)
+        self.stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resume_panics
     }
 
     /// How many `resume()` tasks ended cancelled (issue #2140).
     #[cfg(test)]
     pub fn resume_cancelled(&self) -> u64 {
-        self.stats.lock().map(|g| g.resume_cancelled).unwrap_or(0)
+        self.stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resume_cancelled
     }
 
     /// Run `control.resume()` once on a task of its own and wait for it, so a
@@ -1017,7 +1096,11 @@ impl LiveCatchupManager {
             last_outcome,
             resume_panics,
             resume_cancelled,
-        } = self.stats.lock().map(|g| g.clone()).unwrap_or_default();
+        } = self
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         // Nothing to report until a live catchup has finished (or a resume
         // failed); from then on the resume counters are exported even at 0, so
         // rate()/increase() alerts work from the first catchup.
@@ -1261,8 +1344,7 @@ impl LiveCatchupManager {
         if !self.is_shutting_down() {
             // Recorded before the attempt, so a drop guard of this run that fires
             // later (an abort) does not resume a second time.
-            self.resume_attempted_generation
-                .store(generation, std::sync::atomic::Ordering::SeqCst);
+            self.note_resume_attempt(generation);
             self.resume_catching_panics(generation, "the hand-back")
                 .await;
         }
@@ -2629,26 +2711,116 @@ mod tests {
         );
         wait_idle(&manager).await;
         assert_eq!(control.resumes.load(Ordering::SeqCst), 1, "the hand-back's");
-        drop(ClearRunningOnDrop {
-            manager: Arc::clone(&manager),
-            generation: 1,
-            armed: true,
-        });
-        drop(ReservationGuard {
-            manager: Arc::clone(&manager),
-            generation: 1,
-            armed: true,
-        });
-        // The skip is decided synchronously at drop time, before anything is
-        // spawned; the yields only give a (wrongly) spawned task the chance to
-        // run so the assertion can catch it.
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
+        // Both guards call this; the decision is observable.
+        assert!(matches!(
+            resume_after_abnormal_exit(&manager, 1, "a guard"),
+            AbnormalResume::Skipped(ResumeSkip::AlreadyResumed)
+        ));
         assert_eq!(
             control.resumes.load(Ordering::SeqCst),
             1,
             "no second resume"
+        );
+    }
+
+    /// Issue #2260: shutdown can begin between a guard's drop (which decided to
+    /// resume) and its spawned task running: the task must re-check it.
+    #[tokio::test]
+    async fn the_guard_task_rechecks_shutdown_when_it_runs() {
+        let control = Arc::new(CountingControl::default());
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
+        // Current-thread runtime: the spawned task cannot run before we await.
+        let AbnormalResume::Spawned(task) = resume_after_abnormal_exit(&manager, 1, "a guard")
+        else {
+            panic!("a guard of an unattempted, latest run spawns the resume");
+        };
+        manager
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            task.await.unwrap(),
+            ResumeTaskOutcome::Skipped(ResumeSkip::ShuttingDown)
+        );
+        assert_eq!(control.resumes.load(Ordering::SeqCst), 0);
+    }
+
+    /// Issue #2260: the attempted-generation mark is a monotonic high-water
+    /// mark: a delayed older hand-back cannot lower it.
+    #[test]
+    fn the_resume_attempt_mark_never_regresses() {
+        let manager =
+            LiveCatchupManager::new(ImmediateRunner::ok(), Arc::new(CountingControl::default()));
+        manager.note_resume_attempt(5);
+        manager.note_resume_attempt(3);
+        assert!(manager.hand_back_already_resumed(5));
+        assert!(!manager.hand_back_already_resumed(6));
+    }
+
+    /// Issue #2260: metrics (and the counters) are read poison-tolerantly, like
+    /// `record_resume_failure` writes them.
+    #[tokio::test]
+    async fn metrics_survive_a_poisoned_stats_lock() {
+        let manager =
+            LiveCatchupManager::new(ImmediateRunner::ok(), Arc::new(CountingControl::default()));
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        manager.record_resume_failure(1, "test", task.await.unwrap_err());
+        let poisoner = Arc::clone(&manager);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.stats.lock().unwrap();
+            panic!("poison the stats lock");
+        })
+        .join();
+        assert!(manager.stats.lock().is_err(), "the lock is poisoned");
+        assert_eq!(manager.resume_cancelled(), 1);
+        assert!(
+            manager
+                .metrics_text()
+                .contains("algod_rust_catchpoint_catchup_resume_cancelled_total 1"),
+            "{}",
+            manager.metrics_text()
+        );
+    }
+
+    /// Issue #2260: when a guard skips because a newer catchup runs, that newer
+    /// run still resumes normal sync itself when it ends (here: aborted).
+    #[tokio::test]
+    async fn a_newer_run_resumes_normal_sync_when_it_ends_after_a_skipped_stale_guard() {
+        let control = Arc::new(CountingControl::default());
+        let manager = LiveCatchupManager::new(
+            Arc::new(SecondRunBlocksRunner {
+                runs: AtomicU32::new(0),
+            }),
+            control.clone(),
+        );
+        // Run 1 completes and hands back (resumes == 1); pretend its hand-back
+        // had been aborted before resuming, so its stale guard has work to do.
+        assert_eq!(
+            manager.start_catchup("1000#aaaa").await,
+            CatchupStartResult::Created
+        );
+        wait_idle(&manager).await;
+        assert_eq!(control.resumes.load(Ordering::SeqCst), 1);
+        manager
+            .resume_attempted_generation
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        // Run 2 starts (and stays registered); run 1's stale guard fires late.
+        assert_eq!(
+            manager.start_catchup("2000#bbbb").await,
+            CatchupStartResult::Created
+        );
+        assert!(matches!(
+            resume_after_abnormal_exit(&manager, 1, "a stale guard"),
+            AbnormalResume::Skipped(ResumeSkip::NewerGeneration)
+        ));
+        assert_eq!(control.resumes.load(Ordering::SeqCst), 1);
+        // The newer run ends (aborted): its own hand-back resumes.
+        manager.abort_catchup("2000#bbbb").await.unwrap();
+        wait_idle(&manager).await;
+        assert_eq!(
+            control.resumes.load(Ordering::SeqCst),
+            2,
+            "the newer run's hand-back resumed normal sync"
         );
     }
 
@@ -2709,21 +2881,10 @@ mod tests {
         assert!(manager.running.lock().await.is_some());
 
         // A late guard of N fires: it must not resume.
-        drop(ClearRunningOnDrop {
-            manager: Arc::clone(&manager),
-            generation: 1,
-            armed: true,
-        });
-        drop(ReservationGuard {
-            manager: Arc::clone(&manager),
-            generation: 1,
-            armed: true,
-        });
-        // Decided synchronously at drop time; the yields only let a (wrongly)
-        // spawned task run so the assertion can catch it.
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
+        assert!(matches!(
+            resume_after_abnormal_exit(&manager, 1, "a late guard"),
+            AbnormalResume::Skipped(ResumeSkip::NewerGeneration)
+        ));
         assert_eq!(
             control.resumes.load(Ordering::SeqCst),
             1,
