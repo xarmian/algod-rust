@@ -18,7 +18,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Complete AVM opcode table covering all opcodes from AVM v1 through v13.
+//! Complete AVM opcode table covering all opcodes from AVM v1 through v14.
 //!
 //! This table matches go-algorand v4.6.0's `data/transactions/logic/opcodes.go`.
 //! Each opcode has metadata for parsing, validation, and (future) execution.
@@ -26,11 +26,13 @@
 /// Maximum supported AVM version.
 ///
 /// Matches `go-algorand/data/transactions/logic/opcodes.go:31`
-/// (`const LogicVersion = 13`). Note that consensus-level acceptance of a v13
-/// program is additionally gated on `ConsensusParams::logic_sig_version` via
-/// [`crate::validator::check_program_version_allowed`]; under V41 that ceiling
-/// is still 12.
-pub const MAX_AVM_VERSION: u8 = 13;
+/// (`const LogicVersion = 14`, the hard program-version ceiling of
+/// `eval.go:1606`). Consensus-level acceptance is a second, separate gate on
+/// `ConsensusParams::logic_sig_version` via
+/// [`crate::validator::check_program_version_allowed`] (go: `eval.go:1609`):
+/// released consensus v42/v43 carry 13, only vFuture carries 14, so a v14
+/// program is rejected on every released network exactly as in go.
+pub const MAX_AVM_VERSION: u8 = 14;
 
 /// Maximum byte string length in the AVM.
 ///
@@ -466,7 +468,8 @@ static OPCODE_TABLE: [Option<OpSpec>; 256] = {
     // `FALCON_DET1024_SIG_COMPRESSED_MAXSIZE` (1423 bytes) in algo-falcon,
     // which already implement the correct variable-length behavior.
     op!(0x85, "falcon_verify", 12, Static(1700), 3, 1, Any, None);
-    op!(0x86, "sumhash512", 13, Dynamic, 1, 1, Any, None);
+    // EXPERIMENTAL: go `sumhashVersion = 14` (opcodes.go:88), i.e. vFuture only.
+    op!(0x86, "sumhash512", 14, Dynamic, 1, 1, Any, None);
     op!(0x87, "sha512", 13, Dynamic, 1, 1, Any, None);
 
     // ---- Subroutines / Frames ----

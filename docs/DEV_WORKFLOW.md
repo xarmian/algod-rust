@@ -453,8 +453,10 @@ Overrides for the Make target:
 
 ## V13 Opcode Vector Regeneration
 
-TEAL v13 opcodes (`sumhash512` 0x86, `sha512` 0x87) are tested against fixture
-files produced directly by go-algorand's underlying primitives. The fixtures
+The TEAL v13 opcode `sha512` (0x87) and the EXPERIMENTAL v14 opcode
+`sumhash512` (0x86; go `sumhashVersion = 14`, so vFuture only, issue #2255) are
+tested against fixture files produced directly by go-algorand's underlying
+primitives (the fixture directory keeps its historical `v13` name). The fixtures
 live at:
 
 - `crates/core/algo-avm/tests/fixtures/v13/sha512/vectors.json`

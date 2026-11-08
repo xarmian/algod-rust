@@ -2264,9 +2264,9 @@ fn version_gate_max_version_accepted() {
 
 #[test]
 fn version_gate_over_max_rejected() {
-    // Versions above MAX_AVM_VERSION (13 per go-algorand opcodes.go:31) must
-    // be rejected at parse time.
-    let raw = prog(14, &[0x81, 0x01, 0x43]);
+    // Versions above MAX_AVM_VERSION (14 per go-algorand opcodes.go:31,
+    // `LogicVersion`) must be rejected at parse time.
+    let raw = prog(15, &[0x81, 0x01, 0x43]);
     assert!(parse(&raw).is_err());
 }
 

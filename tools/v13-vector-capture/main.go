@@ -19,6 +19,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // v13-vector-capture: generate sha512 + sumhash512 opcode parity vectors.
+// (sha512 is AVM v13; sumhash512 is registered at v14 in go-algorand,
+// `sumhashVersion = 14`, issue #2255 - the directory keeps its `v13` name.)
 //
 // Produces JSON fixture files consumed by the Rust AVM parity tests:
 //   crates/core/algo-avm/tests/fixtures/v13/sha512/vectors.json

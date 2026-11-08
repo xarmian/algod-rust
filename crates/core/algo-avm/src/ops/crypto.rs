@@ -1732,7 +1732,7 @@ mod tests {
         // sumhash512: baseCost=150, chunkCost=4, chunkSize=7
         for (size, expected) in [(0usize, 150u64), (1, 154), (64, 190), (1000, 722)] {
             assert_eq!(
-                hash_opcode_cost(13, 0x86, size),
+                hash_opcode_cost(14, 0x86, size),
                 expected,
                 "sumhash512 cost for {size}-byte input"
             );
