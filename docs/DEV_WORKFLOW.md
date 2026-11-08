@@ -1605,6 +1605,28 @@ written, so the repair retries on the next open. Downgrade-then-upgrade is an
 unsupported flow: rows written by the older build after the marker was set are
 not repaired again.
 
+## Abandoning a stuck cut-over catchup (issue #2181)
+
+algod-rust cuts the live ledger over to the catchpoint snapshot early (#2121),
+so once a catchup has passed the import (verification, lookback or replay) a
+request for a DIFFERENT catchpoint is refused with go's `unable to start
+catchpoint catchup for 'B' - already catching up 'A'`, and aborting a cut-over
+run keeps its marker. If catchup A can never finish (peers stopped serving it,
+its file is gone, verification keeps failing), restart the node with
+
+```bash
+ALGOD_RUST_DISCARD_CUT_OVER_CATCHUP=1 algod-rust ...   # or catchpoint-sync
+```
+
+and request catchup B. The stuck catchup is then abandoned (destructive: its
+staging tables, file and partial progress are discarded, a warning is logged)
+and B starts over the cut-over ledger exactly like a request over an import-state
+marker: the marker is rewritten as "cut over" for B, so an abort still cannot
+strand the unverified snapshot without a marker. A request for the same label
+as the marker, or a run with no label, still resumes; unset the variable again
+afterwards. go has no equivalent (its ledger is untouched until the final
+Switch), so this is an algod-rust-only escape.
+
 ## Divergence hunts: diffing against public nodes
 
 `scripts/state_diff.py` compares one round (and any number of addresses)

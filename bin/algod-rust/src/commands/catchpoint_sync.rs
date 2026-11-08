@@ -2057,6 +2057,9 @@ pub async fn run(
     )?;
     let mut orchestrator = SyncOrchestrator::with_backend(config, backend);
     orchestrator.set_cancel(cancel);
+    // Issue #2181: explicit escape for a catchup stuck past its cut-over.
+    orchestrator
+        .set_discard_cut_over_catchup(algo_ledger::sync::discard_cut_over_catchup_from_env());
     orchestrator.set_progress_callback(Box::new(|progress| {
         let pct = (progress.phase_progress * 100.0) as u32;
         let eta_str = match progress.eta {
