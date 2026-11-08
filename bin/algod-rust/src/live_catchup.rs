@@ -435,40 +435,59 @@ struct ResumeTask {
     who: String,
     /// `resume()` returned normally.
     completed: bool,
-    /// `resume()` panicked (caught by the task's own `catch_unwind`).
-    panicked: bool,
+    /// `resume()` panicked (caught by the task's own `catch_unwind`), with
+    /// the panic message.
+    panicked: Option<String>,
 }
 
 impl Drop for ResumeTask {
     fn drop(&mut self) {
-        self.manager
-            .resume_in_flight
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        if self.completed {
-            return;
-        }
-        let panicked = self.panicked;
-        if let Ok(mut stats) = self.manager.stats.lock() {
-            if panicked {
+        // Record the failure FIRST (tolerating a poisoned lock), so it is
+        // counted before any waiter is woken and sees the flag cleared.
+        if !self.completed {
+            let mut stats = self
+                .manager
+                .stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.panicked.is_some() {
                 stats.resume_panics += 1;
             } else {
                 stats.resume_cancelled += 1;
             }
         }
-        if panicked {
-            tracing::error!(
+        *self
+            .manager
+            .resume_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.manager.resume_done.notify_waiters();
+        if self.completed {
+            return;
+        }
+        match &self.panicked {
+            Some(message) => tracing::error!(
                 generation = self.generation,
                 who = %self.who,
+                panic = %message,
                 "normal sync resume() panicked: the services the catchup paused were NOT restarted"
-            );
-        } else {
-            tracing::error!(
+            ),
+            None => tracing::error!(
                 generation = self.generation,
                 who = %self.who,
                 "normal sync resume() was cancelled before it finished (runtime shutdown or abort): the services the catchup paused may NOT have been restarted"
-            );
+            ),
         }
     }
+}
+
+/// The text of a caught panic payload (`&str` / `String`, else a placeholder).
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|m| (*m).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "<non-string panic payload>".to_string())
 }
 
 /// Where a registered catchup is in its lifecycle (issue #2121). Each
@@ -549,10 +568,24 @@ pub struct LiveCatchupManager {
     /// concurrent call waits on it instead of racing the first for the task
     /// handle (issue #2121).
     shutdown_outcome: tokio::sync::watch::Sender<Option<bool>>,
-    /// A `control.resume()` is in flight (issue #2140): at most one runs at a
-    /// time, so an aborted hand-back whose `resume()` task is still running
-    /// is never doubled by the drop guard's own.
-    resume_in_flight: std::sync::atomic::AtomicBool,
+    /// The `control.resume()` in flight, if any (issue #2140), as the
+    /// [`Self::pause_epoch`] at which it began: at most one runs at a time,
+    /// so an aborted hand-back whose `resume()` task is still running is
+    /// never doubled by a drop guard's own. This (not a per-generation
+    /// dedup of the two drop guards) is what bounds concurrency.
+    resume_state: StdMutex<Option<u64>>,
+    /// Bumped right before every `control.pause()`: a `resume()` that began
+    /// at or after the pause a caller must undo covers that caller; one that
+    /// began before it does not (it may have run before the pause).
+    pause_epoch: std::sync::atomic::AtomicU64,
+    /// Woken (`notify_waiters`) whenever a `resume()` task ends, however it
+    /// ends, so a caller that found one in flight waits for it without
+    /// polling.
+    resume_done: tokio::sync::Notify,
+    /// Test-only: how many callers have started waiting for an in-flight
+    /// `resume()`.
+    #[cfg(test)]
+    resume_waits: std::sync::atomic::AtomicU32,
 }
 
 impl LiveCatchupManager {
@@ -571,7 +604,11 @@ impl LiveCatchupManager {
             next_generation: std::sync::atomic::AtomicU64::new(1),
             ledger_stale_at_shutdown: std::sync::atomic::AtomicBool::new(false),
             shutdown_outcome: tokio::sync::watch::channel(None).0,
-            resume_in_flight: std::sync::atomic::AtomicBool::new(false),
+            resume_state: StdMutex::new(None),
+            pause_epoch: std::sync::atomic::AtomicU64::new(0),
+            resume_done: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            resume_waits: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -812,6 +849,8 @@ impl LiveCatchupManager {
         // before it, but the net effect (no other writer once ledger
         // download begins) is the same and simpler to reason about here
         // since `SyncOrchestrator` doesn't expose a mid-run pause hook.
+        self.pause_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.control.pause().await;
 
         // Reset progress counters for the new run — mirrors go building a
@@ -946,34 +985,62 @@ impl LiveCatchupManager {
     }
 
     /// Run `control.resume()` on a task of its own, at most one at a time
-    /// (issue #2140), and wait for it. The task's [`ResumeTask`] guard clears
-    /// the in-flight flag however it ends and records a panic (logged as an
-    /// error and counted) or a cancellation (logged and counted separately),
-    /// so neither is ever silent, even when this caller is itself dropped
-    /// mid-await (the task keeps running, still marked in flight, so a drop
-    /// guard's follow-up `resume()` is skipped instead of doubling it).
-    /// `resume()` is attempted once; the caller carries on to free the
-    /// manager.
+    /// (issue #2140), and wait for it. The task's [`ResumeTask`] guard records
+    /// a panic (logged with its message and counted) or a cancellation (logged
+    /// and counted separately), so neither is ever silent, and clears the
+    /// in-flight state however the task ends, even when this caller is itself
+    /// dropped mid-await (the task keeps running, still in flight).
+    ///
+    /// A caller that finds a `resume()` already in flight WAITS for it (no
+    /// polling): if that one began at or after the pause this caller undoes it
+    /// covers the caller, which returns; if it began before that pause (an
+    /// earlier, aborted hand-back's resume, which may have run before this
+    /// pause) the caller then issues its own, so a catchup is never handed
+    /// back without a resume that follows its pause. `resume()` is attempted
+    /// once per caller; the caller then carries on to free the manager.
     async fn resume_catching_panics(self: &Arc<Self>, generation: u64, who: &str) {
         use std::sync::atomic::Ordering;
-        if self
-            .resume_in_flight
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
+        // The pause this resume undoes is the latest one: a catchup runs at a
+        // time.
+        let my_epoch = self.pause_epoch.load(Ordering::SeqCst);
+        loop {
+            // Registered before the state is checked, so a resume ending in
+            // between cannot be missed.
+            let notified = self.resume_done.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let covered = {
+                let mut state = self
+                    .resume_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match *state {
+                    None => {
+                        *state = Some(self.pause_epoch.load(Ordering::SeqCst));
+                        break;
+                    }
+                    Some(started) => started >= my_epoch,
+                }
+            };
+            #[cfg(test)]
+            self.resume_waits.fetch_add(1, Ordering::SeqCst);
             tracing::warn!(
                 generation,
                 who,
-                "a normal sync resume() is already in flight: not starting a second one"
+                covered,
+                "a normal sync resume() is already in flight: waiting for it"
             );
-            return;
+            notified.await;
+            if covered {
+                return;
+            }
         }
         let task = ResumeTask {
             manager: Arc::clone(self),
             generation,
             who: who.to_string(),
             completed: false,
-            panicked: false,
+            panicked: None,
         };
         let control = Arc::clone(&self.control);
         let _ = tokio::spawn(async move {
@@ -993,7 +1060,7 @@ impl LiveCatchupManager {
             .await;
             match outcome {
                 Ok(()) => task.completed = true,
-                Err(_) => task.panicked = true,
+                Err(payload) => task.panicked = Some(panic_message(payload.as_ref())),
             }
         })
         .await;
@@ -1048,7 +1115,7 @@ impl LiveCatchupManager {
             metrics.push((
                 "algod_rust_catchpoint_catchup_resume_panics_total",
                 "counter",
-                "Times resuming normal sync after a live catchup panicked (the services stayed paused).",
+                "Times resuming normal sync after a live catchup panicked (the services stayed paused). The series appears only after the first failure: alert with absent() or increase().",
                 resume_panics,
             ));
         }
@@ -1056,7 +1123,7 @@ impl LiveCatchupManager {
             metrics.push((
                 "algod_rust_catchpoint_catchup_resume_cancelled_total",
                 "counter",
-                "Times the task resuming normal sync after a live catchup was cancelled before finishing (the services may have stayed paused).",
+                "Times the task resuming normal sync after a live catchup was cancelled before finishing (the services may have stayed paused). The series appears only after the first failure: alert with absent() or increase().",
                 resume_cancelled,
             ));
         }
@@ -2549,6 +2616,11 @@ mod tests {
         }
     }
 
+    /// No `resume()` is in flight.
+    fn resume_idle(manager: &LiveCatchupManager) -> bool {
+        manager.resume_state.lock().unwrap().is_none()
+    }
+
     /// Issue #2140 (review): a panicking `resume()` after an abnormal exit of
     /// the drive task (`ClearRunningOnDrop`) or of the starter
     /// (`ReservationGuard`) is attempted once and counted exactly once.
@@ -2573,7 +2645,10 @@ mod tests {
                 });
             }
             wait_until("the panic is counted", || manager.resume_panics() == 1).await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // The counter is bumped before the in-flight state is cleared:
+            // once it is clear the one resume task is over, so a second
+            // attempt could only have been counted by now.
+            wait_until("the resume task is over", || resume_idle(&manager)).await;
             assert_eq!(
                 manager.resume_panics(),
                 1,
@@ -2628,9 +2703,17 @@ mod tests {
         // The hand-back (drive) is aborted while awaiting resume().
         hand_back.abort();
         let _ = hand_back.await;
-        // The armed guard of the aborted drive task now runs its own resume.
+        // The armed guard of the aborted drive task now runs its own resume:
+        // it finds the first one in flight and, as that began at its own pause
+        // epoch, waits for it instead of starting a second.
         resume_after_abnormal_exit(&manager, 1, "guard");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        wait_until("the guard path is waiting", || {
+            manager
+                .resume_waits
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 1
+        })
+        .await;
         assert_eq!(
             control.entered.load(Ordering::SeqCst),
             1,
@@ -2638,16 +2721,93 @@ mod tests {
         );
         control.release.notify_one();
         wait_until("the one resume() finishes", || {
-            control.finished.load(Ordering::SeqCst) == 1
-        })
-        .await;
-        wait_until("the in-flight flag clears", || {
-            !manager
-                .resume_in_flight
-                .load(std::sync::atomic::Ordering::SeqCst)
+            control.finished.load(Ordering::SeqCst) == 1 && resume_idle(&manager)
         })
         .await;
         assert_eq!(control.entered.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.resume_panics(), 0);
+        assert_eq!(manager.resume_cancelled(), 0);
+    }
+
+    /// Issue #2140 (review round 3): catchup N's hand-back is aborted
+    /// mid-`resume()` (the task keeps running), catchup N+1 pauses sync, and
+    /// N+1's hand-back finds N's resume in flight. It must WAIT for it (so
+    /// `shutdown()` waits too) and then issue its own `resume()`, because N's
+    /// began before N+1's pause: never hand back without a resume that follows
+    /// the pause.
+    #[tokio::test]
+    async fn a_later_catchup_waits_for_the_in_flight_resume_then_issues_its_own() {
+        let control = Arc::new(GatedResumeControl {
+            entered: AtomicU32::new(0),
+            finished: AtomicU32::new(0),
+            release: tokio::sync::Notify::new(),
+        });
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
+
+        // Catchup N: its hand-back reaches the (gated) resume.
+        assert_eq!(
+            manager.start_catchup("1000#aaaa").await,
+            CatchupStartResult::Created
+        );
+        wait_until("N's resume() is entered", || {
+            control.entered.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        // Abort N's drive task mid-resume: its armed guard frees the slot, and
+        // its own follow-up resume is covered by the one in flight.
+        let n_task = {
+            let mut running = manager.running.lock().await;
+            match &mut running.as_mut().expect("N is registered").phase {
+                Phase::HandingBack(slot) => slot.take().expect("N's drive task"),
+                _ => panic!("N should be handing back"),
+            }
+        };
+        n_task.abort();
+        let _ = n_task.await;
+        wait_idle(&manager).await;
+        assert_eq!(control.entered.load(Ordering::SeqCst), 1);
+
+        // Catchup N+1 pauses (a later epoch); its hand-back finds N's resume
+        // in flight and waits for it.
+        assert_eq!(
+            manager.start_catchup("2000#bbbb").await,
+            CatchupStartResult::Created
+        );
+        // (N's aborted drive guard already waits too: that is wait number 1.)
+        wait_until("N+1's hand-back is waiting", || {
+            manager
+                .resume_waits
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2
+        })
+        .await;
+        // Shutdown lands now: it must wait for N+1's drive task, which waits
+        // for the resume in flight.
+        let shutdown = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.shutdown(Duration::from_secs(20)).await })
+        };
+        assert_eq!(
+            control.entered.load(Ordering::SeqCst),
+            1,
+            "N+1 has not resumed yet"
+        );
+
+        // N's resume ends: N+1 then issues its own.
+        control.release.notify_one();
+        wait_until("N+1's own resume() is issued", || {
+            control.entered.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown must wait for N+1's resume"
+        );
+        control.release.notify_one();
+        let clean = shutdown.await.unwrap();
+        assert!(clean, "shutdown finished cleanly");
+        assert_eq!(control.finished.load(Ordering::SeqCst), 2);
+        assert_eq!(control.entered.load(Ordering::SeqCst), 2);
         assert_eq!(manager.resume_panics(), 0);
         assert_eq!(manager.resume_cancelled(), 0);
     }
@@ -2679,9 +2839,7 @@ mod tests {
         assert_eq!(manager.resume_cancelled(), 1);
         assert_eq!(manager.resume_panics(), 0);
         assert_eq!(control.finished.load(Ordering::SeqCst), 0);
-        assert!(!manager
-            .resume_in_flight
-            .load(std::sync::atomic::Ordering::SeqCst));
+        assert!(resume_idle(&manager));
         assert!(manager
             .metrics_text()
             .contains("algod_rust_catchpoint_catchup_resume_cancelled_total 1"));
