@@ -154,6 +154,11 @@ struct CatchupStats {
     completed: u64,
     stopped_short: u64,
     last_outcome: Option<CatchupOutcome>,
+    /// `resume()` panicked after a live catchup (issue #2140).
+    resume_panics: u64,
+    /// The task running `resume()` was cancelled (runtime shutdown or abort)
+    /// before it finished (issue #2140).
+    resume_cancelled: u64,
 }
 
 /// Controls the node's "normal sync loop" so it can be quiesced while a
@@ -418,6 +423,54 @@ impl Drop for ReservationGuard {
     }
 }
 
+/// Guard owned by the task running `control.resume()` (issue #2140): however
+/// that task ends it clears the manager's in-flight flag, and unless it
+/// finished it records why: a panic (the task catches it and sets `panicked`;
+/// tokio drops the future only after catching the unwind, so the guard cannot
+/// tell a panic from a cancellation by itself) or a cancellation (runtime
+/// shutdown or abort). Both are logged as errors and counted, never silent.
+struct ResumeTask {
+    manager: Arc<LiveCatchupManager>,
+    generation: u64,
+    who: String,
+    /// `resume()` returned normally.
+    completed: bool,
+    /// `resume()` panicked (caught by the task's own `catch_unwind`).
+    panicked: bool,
+}
+
+impl Drop for ResumeTask {
+    fn drop(&mut self) {
+        self.manager
+            .resume_in_flight
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if self.completed {
+            return;
+        }
+        let panicked = self.panicked;
+        if let Ok(mut stats) = self.manager.stats.lock() {
+            if panicked {
+                stats.resume_panics += 1;
+            } else {
+                stats.resume_cancelled += 1;
+            }
+        }
+        if panicked {
+            tracing::error!(
+                generation = self.generation,
+                who = %self.who,
+                "normal sync resume() panicked: the services the catchup paused were NOT restarted"
+            );
+        } else {
+            tracing::error!(
+                generation = self.generation,
+                who = %self.who,
+                "normal sync resume() was cancelled before it finished (runtime shutdown or abort): the services the catchup paused may NOT have been restarted"
+            );
+        }
+    }
+}
+
 /// Where a registered catchup is in its lifecycle (issue #2121). Each
 /// phase holds the handle of the task that is doing the work at that point,
 /// joined by [`LiveCatchupManager::shutdown`]; it is `None` once a shutdown
@@ -496,10 +549,10 @@ pub struct LiveCatchupManager {
     /// concurrent call waits on it instead of racing the first for the task
     /// handle (issue #2121).
     shutdown_outcome: tokio::sync::watch::Sender<Option<bool>>,
-    /// How many times `control.resume()` itself panicked (issue #2140): the
-    /// node's normal sync services were then NOT restarted, which is worth an
-    /// alert, so it is exported by [`Self::metrics_text`].
-    resume_panics: std::sync::atomic::AtomicU64,
+    /// A `control.resume()` is in flight (issue #2140): at most one runs at a
+    /// time, so an aborted hand-back whose `resume()` task is still running
+    /// is never doubled by the drop guard's own.
+    resume_in_flight: std::sync::atomic::AtomicBool,
 }
 
 impl LiveCatchupManager {
@@ -518,7 +571,7 @@ impl LiveCatchupManager {
             next_generation: std::sync::atomic::AtomicU64::new(1),
             ledger_stale_at_shutdown: std::sync::atomic::AtomicBool::new(false),
             shutdown_outcome: tokio::sync::watch::channel(None).0,
-            resume_panics: std::sync::atomic::AtomicU64::new(0),
+            resume_in_flight: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -879,84 +932,136 @@ impl LiveCatchupManager {
         self.stats.lock().ok().and_then(|g| g.last_outcome.clone())
     }
 
-    /// Prometheus text for finished live catchups (issue #1725); empty until
-    /// one has finished, so a node that never ran a live catchup adds nothing
-    /// to `/metrics`.
+    /// How many times `control.resume()` itself panicked (issue #2140): the
+    /// node's normal sync services were then NOT restarted.
+    #[cfg(test)]
     pub fn resume_panics(&self) -> u64 {
-        self.resume_panics.load(std::sync::atomic::Ordering::SeqCst)
+        self.stats.lock().map(|g| g.resume_panics).unwrap_or(0)
     }
 
-    /// Run `control.resume()` on a task of its own so a panic in it cannot
-    /// unwind through the caller: it is logged as an error and counted
-    /// (issue #2140). `resume()` is attempted once; the caller carries on to
-    /// free the manager.
+    /// How many `resume()` tasks were cancelled before finishing (issue #2140).
+    #[cfg(test)]
+    pub fn resume_cancelled(&self) -> u64 {
+        self.stats.lock().map(|g| g.resume_cancelled).unwrap_or(0)
+    }
+
+    /// Run `control.resume()` on a task of its own, at most one at a time
+    /// (issue #2140), and wait for it. The task's [`ResumeTask`] guard clears
+    /// the in-flight flag however it ends and records a panic (logged as an
+    /// error and counted) or a cancellation (logged and counted separately),
+    /// so neither is ever silent, even when this caller is itself dropped
+    /// mid-await (the task keeps running, still marked in flight, so a drop
+    /// guard's follow-up `resume()` is skipped instead of doubling it).
+    /// `resume()` is attempted once; the caller carries on to free the
+    /// manager.
     async fn resume_catching_panics(self: &Arc<Self>, generation: u64, who: &str) {
-        let control = Arc::clone(&self.control);
-        if let Err(e) = tokio::spawn(async move { control.resume().await }).await {
-            if e.is_panic() {
-                self.resume_panics
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                tracing::error!(
-                    generation,
-                    who,
-                    "normal sync resume() panicked: the services the catchup paused were NOT restarted"
-                );
-            }
+        use std::sync::atomic::Ordering;
+        if self
+            .resume_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            tracing::warn!(
+                generation,
+                who,
+                "a normal sync resume() is already in flight: not starting a second one"
+            );
+            return;
         }
+        let mut task = ResumeTask {
+            manager: Arc::clone(self),
+            generation,
+            who: who.to_string(),
+            completed: false,
+            panicked: false,
+        };
+        let control = Arc::clone(&self.control);
+        let _ = tokio::spawn(async move {
+            // Moved whole into the task (not a field capture), so its guard
+            // lives exactly as long as the task does.
+            let mut task = task;
+            let mut resume = control.resume();
+            let outcome = std::future::poll_fn(|cx| {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    resume.as_mut().poll(cx)
+                })) {
+                    Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+                    Ok(std::task::Poll::Ready(())) => std::task::Poll::Ready(Ok(())),
+                    Err(payload) => std::task::Poll::Ready(Err(payload)),
+                }
+            })
+            .await;
+            match outcome {
+                Ok(()) => task.completed = true,
+                Err(_) => task.panicked = true,
+            }
+        })
+        .await;
     }
 
+    /// Prometheus text for finished live catchups (issue #1725); empty until
+    /// one has finished (or a resume failed), so a node that never ran a live
+    /// catchup adds nothing to `/metrics`.
     pub fn metrics_text(&self) -> String {
-        // One lock for the counters AND the last outcome: a scrape never sees
+        // One lock for every counter AND the last outcome: a scrape never sees
         // a counter bumped without its outcome (or vice versa).
         let CatchupStats {
             completed,
             stopped_short,
             last_outcome,
+            resume_panics,
+            resume_cancelled,
         } = self.stats.lock().map(|g| g.clone()).unwrap_or_default();
-        let resume_panics = self.resume_panics();
-        if completed + stopped_short + resume_panics == 0 {
-            return String::new();
+        let mut metrics: Vec<(&str, &str, &str, u64)> = Vec::new();
+        if completed + stopped_short > 0 {
+            // Rounds the last successful run's replay fell short of its target
+            // by; 0 when it reached the target.
+            let behind = match last_outcome {
+                Some(CatchupOutcome::StoppedShort {
+                    stopped_at_round,
+                    target_round,
+                }) => target_round.saturating_sub(stopped_at_round),
+                _ => 0,
+            };
+            metrics.extend([
+                (
+                    "algod_rust_catchpoint_catchup_completed_total",
+                    "counter",
+                    "Live catchpoint catchups whose replay reached its target.",
+                    completed,
+                ),
+                (
+                    "algod_rust_catchpoint_catchup_stopped_short_total",
+                    "counter",
+                    "Live catchpoint catchups whose replay stopped short of its target (normal catchup continues).",
+                    stopped_short,
+                ),
+                (
+                    "algod_rust_catchpoint_catchup_stopped_short_behind_rounds",
+                    "gauge",
+                    "Rounds the most recent successful live catchup stopped short of its target by (0 if it reached it).",
+                    behind,
+                ),
+            ]);
         }
-        // Rounds the last successful run's replay fell short of its target
-        // by; 0 when it reached the target.
-        let behind = match last_outcome {
-            Some(CatchupOutcome::StoppedShort {
-                stopped_at_round,
-                target_round,
-            }) => target_round.saturating_sub(stopped_at_round),
-            _ => 0,
-        };
-        let mut out = String::new();
-        for (name, kind, help, value) in [
-            (
-                "algod_rust_catchpoint_catchup_completed_total",
-                "counter",
-                "Live catchpoint catchups whose replay reached its target.",
-                completed,
-            ),
-            (
-                "algod_rust_catchpoint_catchup_stopped_short_total",
-                "counter",
-                "Live catchpoint catchups whose replay stopped short of its target (normal catchup continues).",
-                stopped_short,
-            ),
-            (
-                "algod_rust_catchpoint_catchup_stopped_short_behind_rounds",
-                "gauge",
-                "Rounds the most recent successful live catchup stopped short of its target by (0 if it reached it).",
-                behind,
-            ),
-            (
+        if resume_panics > 0 {
+            metrics.push((
                 "algod_rust_catchpoint_catchup_resume_panics_total",
                 "counter",
                 "Times resuming normal sync after a live catchup panicked (the services stayed paused).",
                 resume_panics,
-            ),
-        ]
-        .into_iter()
-        // The resume-panic counter only appears once it is non-zero.
-        .filter(|(name, ..)| resume_panics > 0 || !name.ends_with("resume_panics_total"))
-        {
+            ));
+        }
+        if resume_cancelled > 0 {
+            metrics.push((
+                "algod_rust_catchpoint_catchup_resume_cancelled_total",
+                "counter",
+                "Times the task resuming normal sync after a live catchup was cancelled before finishing (the services may have stayed paused).",
+                resume_cancelled,
+            ));
+        }
+        let mut out = String::new();
+        for (name, kind, help, value) in metrics {
             out.push_str(&format!(
                 "# HELP {name} {help}
 # TYPE {name} {kind}
@@ -2433,6 +2538,153 @@ mod tests {
         );
         wait_idle(&manager).await;
         assert_eq!(manager.resume_panics(), 2);
+    }
+
+    /// Poll `cond` (up to 5 s).
+    async fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Issue #2140 (review): a panicking `resume()` after an abnormal exit of
+    /// the drive task (`ClearRunningOnDrop`) or of the starter
+    /// (`ReservationGuard`) is attempted once and counted exactly once.
+    #[tokio::test]
+    async fn a_resume_panic_after_an_abnormal_exit_is_counted_once_via_either_guard() {
+        for via_reservation in [false, true] {
+            let control = Arc::new(PanickingResumeControl {
+                resumes: AtomicU32::new(0),
+            });
+            let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
+            if via_reservation {
+                drop(ReservationGuard {
+                    manager: Arc::clone(&manager),
+                    generation: 7,
+                    armed: true,
+                });
+            } else {
+                drop(ClearRunningOnDrop {
+                    manager: Arc::clone(&manager),
+                    generation: 7,
+                    armed: true,
+                });
+            }
+            wait_until("the panic is counted", || manager.resume_panics() == 1).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                manager.resume_panics(),
+                1,
+                "via_reservation={via_reservation}"
+            );
+            assert_eq!(manager.resume_cancelled(), 0);
+            assert_eq!(
+                control.resumes.load(Ordering::SeqCst),
+                1,
+                "via_reservation={via_reservation}: one attempt only"
+            );
+        }
+    }
+
+    /// A [`NormalSyncControl`] whose `resume` announces itself and then waits
+    /// for `release`.
+    struct GatedResumeControl {
+        entered: AtomicU32,
+        finished: AtomicU32,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl NormalSyncControl for GatedResumeControl {
+        async fn pause(&self) {}
+        async fn resume(&self) {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            self.release.notified().await;
+            self.finished.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Issue #2140 (review): when the hand-back is dropped mid-`resume()` the
+    /// resume task keeps running; the drop guard's follow-up must not start a
+    /// second concurrent `resume()`.
+    #[tokio::test]
+    async fn an_aborted_hand_back_and_the_guard_path_run_resume_exactly_once() {
+        let control = Arc::new(GatedResumeControl {
+            entered: AtomicU32::new(0),
+            finished: AtomicU32::new(0),
+            release: tokio::sync::Notify::new(),
+        });
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
+        let hand_back = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.resume_catching_panics(1, "hand-back").await })
+        };
+        wait_until("resume() is entered", || {
+            control.entered.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        // The hand-back (drive) is aborted while awaiting resume().
+        hand_back.abort();
+        let _ = hand_back.await;
+        // The armed guard of the aborted drive task now runs its own resume.
+        resume_after_abnormal_exit(&manager, 1, "guard");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            control.entered.load(Ordering::SeqCst),
+            1,
+            "a second concurrent resume() was started"
+        );
+        control.release.notify_one();
+        wait_until("the one resume() finishes", || {
+            control.finished.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        wait_until("the in-flight flag clears", || {
+            !manager
+                .resume_in_flight
+                .load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await;
+        assert_eq!(control.entered.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.resume_panics(), 0);
+        assert_eq!(manager.resume_cancelled(), 0);
+    }
+
+    /// Issue #2140 (review): a `resume()` task cancelled before it finishes
+    /// (here by dropping its runtime) is counted and logged as cancelled, not
+    /// swallowed.
+    #[test]
+    fn a_cancelled_resume_task_is_counted_not_swallowed() {
+        let control = Arc::new(GatedResumeControl {
+            entered: AtomicU32::new(0),
+            finished: AtomicU32::new(0),
+            release: tokio::sync::Notify::new(),
+        });
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let m = Arc::clone(&manager);
+            tokio::spawn(async move { m.resume_catching_panics(1, "hand-back").await });
+            wait_until("resume() is entered", || {
+                control.entered.load(Ordering::SeqCst) == 1
+            })
+            .await;
+        });
+        drop(rt); // cancels every task still pending
+        assert_eq!(manager.resume_cancelled(), 1);
+        assert_eq!(manager.resume_panics(), 0);
+        assert_eq!(control.finished.load(Ordering::SeqCst), 0);
+        assert!(!manager
+            .resume_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert!(manager
+            .metrics_text()
+            .contains("algod_rust_catchpoint_catchup_resume_cancelled_total 1"));
     }
 
     /// A [`CatchupRunner`] that waits for the cancellation and then reports
