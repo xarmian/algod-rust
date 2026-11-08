@@ -195,6 +195,10 @@ pub struct RequestTracker {
     /// *late* response (for a request whose local wait already gave up) that
     /// nonetheless corresponds to a real, previously-sent request.
     outstanding: AtomicI64,
+
+    /// Test-only: invoked right before a response payload is parsed.
+    #[cfg(test)]
+    parse_hook: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl RequestTracker {
@@ -204,6 +208,8 @@ impl RequestTracker {
             nonce: AtomicU64::new(0),
             pending: Mutex::new(HashMap::new()),
             outstanding: AtomicI64::new(0),
+            #[cfg(test)]
+            parse_hook: std::sync::Mutex::new(None),
         }
     }
 
@@ -291,17 +297,32 @@ impl RequestTracker {
         // the requests ever counted is a late answer to a request whose wait
         // timed out and is discarded without being parsed.
         //
-        // The `pending` lock is taken once for the emptiness check and the
-        // sender lookup so no registration or cancellation can slip between
-        // them.
-        let mut pending = self.pending.lock().await;
-        let remaining = self.outstanding.fetch_sub(1, Ordering::SeqCst) - 1;
-        if pending.is_empty() {
-            return if remaining < 0 {
-                Err(RequestResponseError::UnrequestedResponse)
-            } else {
-                Ok(())
-            };
+        // The `pending` lock is held only for the emptiness check next to the
+        // decrement, never while the (untrusted, peer-supplied) payload is
+        // parsed: a large or malformed reply must not block
+        // `prepare_request` / `cancel_request` / `pending_count` or another
+        // reply. The check is not atomic with the later lookup (a request can
+        // be registered or cancelled in between, and `mark_request_sent` is
+        // lock-free), which is harmless: go's `lenResponseChannels()` read
+        // (`wsPeer.go:547`) is equally a point-in-time snapshot.
+        {
+            let pending = self.pending.lock().await;
+            let remaining = self.outstanding.fetch_sub(1, Ordering::SeqCst) - 1;
+            if pending.is_empty() {
+                return if remaining < 0 {
+                    Err(RequestResponseError::UnrequestedResponse)
+                } else {
+                    Ok(())
+                };
+            }
+        }
+
+        #[cfg(test)]
+        {
+            let hook = self.parse_hook.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
 
         // Deserialize response Topics
@@ -317,9 +338,8 @@ impl RequestTracker {
         let (hash_key, _) =
             decode_uvarint(hash_bytes).ok_or(RequestResponseError::InvalidHashEncoding)?;
 
-        // Look up and remove the pending request, then release the lock
-        let sender = pending.remove(&hash_key);
-        drop(pending);
+        // Look up and remove the pending request (lock re-taken only now).
+        let sender = self.pending.lock().await.remove(&hash_key);
 
         match sender {
             Some(tx) => {
@@ -523,28 +543,88 @@ mod tests {
             .await;
         tracker.mark_request_sent();
 
-        // A reply carrying A's (cancelled) hash: stale, but B is pending.
+        assert_eq!(tracker.outstanding_topic_requests(), 1, "only B counted");
+
+        // A reply carrying A's (cancelled) hash: stale, but B is pending, so
+        // the decrement (1 -> 0) is no violation and the stray is discarded.
         tracker
             .handle_response(&make_response(hash_a, "r", b"stray"))
             .await
             .expect("a pending request makes a stray reply no violation");
-        // B's own reply still arrives, with the counter already at zero.
+        assert_eq!(tracker.outstanding_topic_requests(), 0);
+        assert_eq!(tracker.pending_count().await, 1, "B is still pending");
+
+        // B's own reply arrives with the counter at zero: it goes negative
+        // (0 -> -1), which is still no violation because B is pending, and
+        // B receives its answer.
         tracker
             .handle_response(&make_response(hash_b, "r", b"for-b"))
             .await
             .expect("B's reply");
+        assert_eq!(tracker.outstanding_topic_requests(), -1);
         assert_eq!(
             rx_b.await.unwrap().get_value("r"),
             Some(b"for-b".as_slice())
         );
 
-        // Nothing pending and nothing counted any more: the violation.
+        // Nothing pending and the counter negative (-1 -> -2): the violation.
         assert!(matches!(
             tracker
                 .handle_response(&make_response(hash_a, "r", b"x"))
                 .await,
             Err(RequestResponseError::UnrequestedResponse)
         ));
+        assert_eq!(tracker.outstanding_topic_requests(), -2);
+    }
+
+    /// Issue #2251 review: the `pending` lock must NOT be held while the
+    /// peer-supplied payload is parsed. The parse hook parks `handle_response`
+    /// at the parse point (deterministically, no sleeps); `prepare_request`,
+    /// `cancel_request` and `pending_count` must still complete meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parsing_response_does_not_block_the_pending_map() {
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let tracker = Arc::new(RequestTracker::new());
+        let (_s, hash, _rx) = tracker
+            .prepare_request(Topics::from_vec(vec![Topic::new("q", b"a".to_vec())]))
+            .await;
+        tracker.mark_request_sent();
+
+        let (in_parse_tx, in_parse_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        *tracker.parse_hook.lock().unwrap() = Some(Arc::new(move || {
+            in_parse_tx.send(()).unwrap();
+            // Parked "mid-parse" until the test releases it.
+            release_rx.lock().unwrap().recv().unwrap();
+        }));
+
+        let handler = {
+            let tracker = Arc::clone(&tracker);
+            let reply = make_response(hash, "r", b"v");
+            tokio::spawn(async move { tracker.handle_response(&reply).await })
+        };
+        tokio::task::spawn_blocking(move || in_parse_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        // handle_response is now inside the parse. The map must be usable.
+        let blocked = tokio::time::timeout(Duration::from_secs(10), async {
+            let (_s2, hash2, _rx2) = tracker
+                .prepare_request(Topics::from_vec(vec![Topic::new("q", b"b".to_vec())]))
+                .await;
+            assert_eq!(tracker.pending_count().await, 2);
+            tracker.cancel_request(hash2).await;
+        })
+        .await
+        .is_err();
+        // Release before asserting so a failure does not leave the thread parked.
+        release_tx.send(()).unwrap();
+        assert!(!blocked, "the pending lock was held while parsing");
+        handler.await.unwrap().expect("the reply is delivered");
     }
 
     /// The other half of go's rule: with NO request pending, a late reply to a

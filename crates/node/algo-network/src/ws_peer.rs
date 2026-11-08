@@ -4985,9 +4985,7 @@ mod tests {
     }
 
     /// Issue #2251: when the send queue is full, `request_with_timeout_via_tracker`
-    /// cancels the pending entry and never counts the request. A later reply
-    /// for it (nothing pending, nothing counted) is the unrequested-response
-    /// violation, exactly like a peer answering a request that was never sent.
+    /// cancels the pending entry and never counts the request.
     #[tokio::test]
     async fn a_request_that_failed_to_enqueue_leaves_no_pending_entry_and_no_count() {
         use crate::topics::{Topic, Topics};
@@ -5020,16 +5018,6 @@ mod tests {
             0,
             "a request that was never enqueued is never counted"
         );
-        // A reply to it now is a reply with nothing pending and nothing counted.
-        let reply = Topics::from_vec(vec![Topic::new(
-            crate::request_response::RESPONSE_HASH_FIELD,
-            vec![1u8],
-        )])
-        .marshal();
-        assert!(matches!(
-            tracker.handle_response(&reply).await,
-            Err(crate::request_response::RequestResponseError::UnrequestedResponse)
-        ));
     }
 
     /// Ports go-algorand's `TestDiscardUnrequestedBlockResponse`
