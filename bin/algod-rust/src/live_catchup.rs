@@ -348,7 +348,8 @@ fn resume_after_abnormal_exit(manager: &Arc<LiveCatchupManager>, generation: u64
     match tokio::runtime::Handle::try_current() {
         Ok(rt) => {
             let manager = Arc::clone(manager);
-            rt.spawn(async move { manager.control.resume().await });
+            let who = who.to_string();
+            rt.spawn(async move { manager.resume_catching_panics(generation, &who).await });
         }
         Err(_) => tracing::error!(
             generation,
@@ -495,6 +496,10 @@ pub struct LiveCatchupManager {
     /// concurrent call waits on it instead of racing the first for the task
     /// handle (issue #2121).
     shutdown_outcome: tokio::sync::watch::Sender<Option<bool>>,
+    /// How many times `control.resume()` itself panicked (issue #2140): the
+    /// node's normal sync services were then NOT restarted, which is worth an
+    /// alert, so it is exported by [`Self::metrics_text`].
+    resume_panics: std::sync::atomic::AtomicU64,
 }
 
 impl LiveCatchupManager {
@@ -513,6 +518,7 @@ impl LiveCatchupManager {
             next_generation: std::sync::atomic::AtomicU64::new(1),
             ledger_stale_at_shutdown: std::sync::atomic::AtomicBool::new(false),
             shutdown_outcome: tokio::sync::watch::channel(None).0,
+            resume_panics: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -876,6 +882,29 @@ impl LiveCatchupManager {
     /// Prometheus text for finished live catchups (issue #1725); empty until
     /// one has finished, so a node that never ran a live catchup adds nothing
     /// to `/metrics`.
+    pub fn resume_panics(&self) -> u64 {
+        self.resume_panics.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Run `control.resume()` on a task of its own so a panic in it cannot
+    /// unwind through the caller: it is logged as an error and counted
+    /// (issue #2140). `resume()` is attempted once; the caller carries on to
+    /// free the manager.
+    async fn resume_catching_panics(self: &Arc<Self>, generation: u64, who: &str) {
+        let control = Arc::clone(&self.control);
+        if let Err(e) = tokio::spawn(async move { control.resume().await }).await {
+            if e.is_panic() {
+                self.resume_panics
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tracing::error!(
+                    generation,
+                    who,
+                    "normal sync resume() panicked: the services the catchup paused were NOT restarted"
+                );
+            }
+        }
+    }
+
     pub fn metrics_text(&self) -> String {
         // One lock for the counters AND the last outcome: a scrape never sees
         // a counter bumped without its outcome (or vice versa).
@@ -884,7 +913,8 @@ impl LiveCatchupManager {
             stopped_short,
             last_outcome,
         } = self.stats.lock().map(|g| g.clone()).unwrap_or_default();
-        if completed + stopped_short == 0 {
+        let resume_panics = self.resume_panics();
+        if completed + stopped_short + resume_panics == 0 {
             return String::new();
         }
         // Rounds the last successful run's replay fell short of its target
@@ -916,7 +946,17 @@ impl LiveCatchupManager {
                 "Rounds the most recent successful live catchup stopped short of its target by (0 if it reached it).",
                 behind,
             ),
-        ] {
+            (
+                "algod_rust_catchpoint_catchup_resume_panics_total",
+                "counter",
+                "Times resuming normal sync after a live catchup panicked (the services stayed paused).",
+                resume_panics,
+            ),
+        ]
+        .into_iter()
+        // The resume-panic counter only appears once it is non-zero.
+        .filter(|(name, ..)| resume_panics > 0 || !name.ends_with("resume_panics_total"))
+        {
             out.push_str(&format!(
                 "# HELP {name} {help}
 # TYPE {name} {kind}
@@ -1109,7 +1149,8 @@ impl LiveCatchupManager {
         }
 
         if !self.is_shutting_down() {
-            self.control.resume().await;
+            self.resume_catching_panics(generation, "the hand-back")
+                .await;
         }
         clear_if_generation(&mut *self.running.lock().await, generation);
         clear_running.disarm();
@@ -2340,6 +2381,58 @@ mod tests {
         wait_idle(&manager).await;
         assert_eq!(control.reloads.load(Ordering::SeqCst), 1);
         assert_eq!(control.resumes.load(Ordering::SeqCst), 1);
+    }
+
+    /// A [`NormalSyncControl`] whose `resume` panics (counting its calls).
+    struct PanickingResumeControl {
+        resumes: AtomicU32,
+    }
+
+    #[async_trait]
+    impl NormalSyncControl for PanickingResumeControl {
+        async fn pause(&self) {}
+        async fn resume(&self) {
+            self.resumes.fetch_add(1, Ordering::SeqCst);
+            panic!("resume bug");
+        }
+    }
+
+    /// Issue #2140: a panic inside `resume()` itself is caught, counted
+    /// (`resume_panics`, exported as a metric) and logged as an error, `resume()`
+    /// is attempted exactly once (no second attempt from the drop guard), and
+    /// the manager is freed.
+    #[tokio::test]
+    async fn a_resume_panic_is_counted_exported_and_does_not_wedge_the_manager() {
+        let control = Arc::new(PanickingResumeControl {
+            resumes: AtomicU32::new(0),
+        });
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
+        assert_eq!(manager.resume_panics(), 0);
+        assert_eq!(
+            manager.start_catchup("1000#deadbeef").await,
+            CatchupStartResult::Created
+        );
+        wait_idle(&manager).await;
+        assert_eq!(
+            control.resumes.load(Ordering::SeqCst),
+            1,
+            "one attempt only"
+        );
+        assert_eq!(manager.resume_panics(), 1);
+        assert!(
+            manager
+                .metrics_text()
+                .contains("algod_rust_catchpoint_catchup_resume_panics_total 1"),
+            "{}",
+            manager.metrics_text()
+        );
+        // The slot is free: a new catchup can start.
+        assert_eq!(
+            manager.start_catchup("2000#cafebabe").await,
+            CatchupStartResult::Created
+        );
+        wait_idle(&manager).await;
+        assert_eq!(manager.resume_panics(), 2);
     }
 
     /// A [`CatchupRunner`] that waits for the cancellation and then reports
