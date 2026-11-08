@@ -40,7 +40,7 @@ unaccounted for in the classified inventory below.
 - Variable-length (varint) branch encoding (bnz/bz/b/callsub) — #661
 - Auto-salt TEAL v13 programs (`#pragma autosalt`) — #664
 - Byte-constant size-limit enforcement + falcon_verify signature-type audit — #666
-- sha512/sumhash512 opcode cost formula bugfix — #669
+- sha512/sumhash512 opcode cost formula bugfix — #669 (note: go registers `sumhash512` at AVM v14, not v13; algod-rust matched that in #2255)
 - gload/gloads nil-pastScratch fix — #670
 - Assembler match-opcode type tracking + deadcode disassembly fix — #672
 - SelectF128 sortition port (128-bit software-float binomial CDF) — #667

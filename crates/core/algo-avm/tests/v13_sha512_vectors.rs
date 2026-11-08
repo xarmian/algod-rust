@@ -24,9 +24,8 @@
 //! primitive (the same one `data/transactions/logic/crypto.go:128` calls into)
 //! and drives them through the Rust AVM opcode handler directly.
 //!
-//! The opcode is dispatched from the bytecode when running a v13 program;
-//! until TASK-49 bumps `MAX_AVM_VERSION` to 13, these tests exercise the
-//! handler directly with a pre-pushed stack.
+//! These tests exercise the handler directly with a pre-pushed stack; the
+//! end-to-end v13 program path is covered by `v13_gating_matrix.rs`.
 
 use algo_avm::bytecode::{Immediates, Instruction};
 use algo_avm::machine::ExecMode;

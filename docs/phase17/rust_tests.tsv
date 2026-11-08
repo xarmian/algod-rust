@@ -1776,14 +1776,14 @@ crates/core/algo-avm	combined_max_value_arithmetic	crates/core/algo-avm/tests/te
 crates/core/algo-avm	combined_itob_btoi_roundtrip	crates/core/algo-avm/tests/teal_vectors.rs	2223
 crates/core/algo-avm	combined_concat_len	crates/core/algo-avm/tests/teal_vectors.rs	2236
 crates/core/algo-avm	combined_hash_chain	crates/core/algo-avm/tests/teal_vectors.rs	2250
-crates/core/algo-avm	max_avm_version_is_13	crates/core/algo-avm/tests/v13_gating_matrix.rs	71
+crates/core/algo-avm	max_avm_version_is_14	crates/core/algo-avm/tests/v13_gating_matrix.rs	75
 crates/core/algo-avm	v13_sha512_opcode_has_version_13	crates/core/algo-avm/tests/v13_gating_matrix.rs	76
-crates/core/algo-avm	v13_sumhash512_opcode_has_version_13	crates/core/algo-avm/tests/v13_gating_matrix.rs	84
+crates/core/algo-avm	sumhash512_opcode_has_version_14	crates/core/algo-avm/tests/v13_gating_matrix.rs	91
 crates/core/algo-avm	v13_program_header_parses	crates/core/algo-avm/tests/v13_gating_matrix.rs	92
 crates/core/algo-avm	sha512_rejected_in_v12_program_at_parse	crates/core/algo-avm/tests/v13_gating_matrix.rs	102
-crates/core/algo-avm	sumhash512_rejected_in_v12_program_at_parse	crates/core/algo-avm/tests/v13_gating_matrix.rs	111
+crates/core/algo-avm	sumhash512_rejected_in_v12_and_v13_programs_at_parse	crates/core/algo-avm/tests/v13_gating_matrix.rs	120
 crates/core/algo-avm	sha512_accepted_in_v13_program_at_parse	crates/core/algo-avm/tests/v13_gating_matrix.rs	119
-crates/core/algo-avm	sumhash512_accepted_in_v13_program_at_parse	crates/core/algo-avm/tests/v13_gating_matrix.rs	126
+crates/core/algo-avm	sumhash512_accepted_in_v14_program_at_parse	crates/core/algo-avm/tests/v13_gating_matrix.rs	143
 crates/core/algo-avm	divmodw_rejected_in_v3_program_at_parse	crates/core/algo-avm/tests/v13_gating_matrix.rs	132
 crates/core/algo-avm	divmodw_accepted_in_v4_program_at_parse	crates/core/algo-avm/tests/v13_gating_matrix.rs	139
 crates/core/algo-avm	v13_program_rejected_under_v41_consensus	crates/core/algo-avm/tests/v13_gating_matrix.rs	174
@@ -1792,7 +1792,7 @@ crates/core/algo-avm	v13_sha512_program_executes	crates/core/algo-avm/tests/v13_
 crates/core/algo-avm	run_approval_program_rejects_v13_under_v41_ceiling	crates/core/algo-avm/tests/v13_gating_matrix.rs	233
 crates/core/algo-avm	run_logicsig_program_rejects_v13_under_v41_ceiling	crates/core/algo-avm/tests/v13_gating_matrix.rs	252
 crates/core/algo-avm	run_approval_program_accepts_v12_under_v41_ceiling	crates/core/algo-avm/tests/v13_gating_matrix.rs	269
-crates/core/algo-avm	v13_sumhash512_program_executes	crates/core/algo-avm/tests/v13_gating_matrix.rs	283
+crates/core/algo-avm	v14_sumhash512_program_executes	crates/core/algo-avm/tests/v13_gating_matrix.rs	359
 crates/core/algo-avm	sha512_parity_all_fixture_vectors	crates/core/algo-avm/tests/v13_sha512_vectors.rs	66
 crates/core/algo-avm	sha512_costs_15_plus_2_per_32_byte_chunk	crates/core/algo-avm/tests/v13_sha512_vectors.rs	92
 crates/core/algo-avm	sha512_budget_exhaustion_is_an_error	crates/core/algo-avm/tests/v13_sha512_vectors.rs	146
