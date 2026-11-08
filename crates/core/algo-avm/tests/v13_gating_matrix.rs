@@ -121,8 +121,14 @@ fn sumhash512_rejected_in_v12_and_v13_programs_at_parse() {
     for version in [12u8, 13] {
         let raw = build_program(version, &[0x86, 0x43]);
         let err = parse(&raw).expect_err("a pre-v14 program with sumhash512 must fail parse");
-        let msg = format!("{err}");
-        assert!(msg.contains("sumhash512") || msg.contains("v14"), "{msg}");
+        // The rejection must come from the opcode-version gate
+        // (`bytecode.rs`: "opcode <name> (0x..) requires AVM v14, but program
+        // is v<N>"), not from any other message that merely names the opcode.
+        assert_eq!(
+            format!("{err}").split_once(": ").map_or("", |(_, m)| m),
+            format!("opcode sumhash512 (0x86) requires AVM v14, but program is v{version}"),
+            "{err}"
+        );
     }
 }
 

@@ -75,7 +75,8 @@ pub fn op_sha3_256(machine: &mut AvmMachine, _instruction: &Instruction) -> Resu
     machine.push(AvmValue::Bytes(hash.to_vec()))
 }
 
-/// `sumhash512` (0x86): pop bytes, push sumhash-512 hash (64 bytes). AVM v13+.
+/// `sumhash512` (0x86): pop bytes, push sumhash-512 hash (64 bytes). AVM v14+
+/// (go `sumhashVersion = 14`, EXPERIMENTAL; see issue #2255).
 ///
 /// Uses the `algo_consensus_crypto::sumhash::sumhash512` primitive — the same
 /// hash used in State Proofs. Matches go-algorand's `opSumhash512` which calls

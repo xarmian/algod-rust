@@ -7111,7 +7111,9 @@ dup
 
     #[test]
     fn test_bnz_static_typetrack_flags_unreachable_straightline_mismatch() {
-        let source = format!("#pragma version {MAX_AVM_VERSION}\n{BNZ_PLANB_PROGRAM}");
+        let source = format!(
+            "#pragma version {MAX_AVM_VERSION}\n#pragma autosalt false\n{BNZ_PLANB_PROGRAM}"
+        );
         let errs = expect_errors(&source);
         assert!(
             errs.iter()
@@ -7124,7 +7126,7 @@ dup
     #[test]
     fn test_bnz_typetrack_false_allows_and_accepts_at_runtime() {
         let source = format!(
-            "#pragma version {MAX_AVM_VERSION}\n#pragma typetrack false\n{BNZ_PLANB_PROGRAM}"
+            "#pragma version {MAX_AVM_VERSION}\n#pragma autosalt false\n#pragma typetrack false\n{BNZ_PLANB_PROGRAM}"
         );
         let ops = assemble_string(&source).unwrap_or_else(|errs| {
             panic!("expected {source:?} to assemble cleanly, got: {errs:?}")
@@ -7972,7 +7974,7 @@ dup
         // constant block and disassembles with a `// 17` comment; the four
         // singly-used values (27, 37, 47, 5) are inlined as `pushint N`.
         let source = format!(
-            "#pragma version {v}\nint 17\nint 27\nint 37\nint 47\nint 5\nint 17\n",
+            "#pragma version {v}\n#pragma autosalt false\nint 17\nint 27\nint 37\nint 47\nint 5\nint 17\n",
             v = MAX_AVM_VERSION
         );
         let ops = assemble_string(&source).unwrap();
@@ -8023,7 +8025,7 @@ dup
         // BACK_BRANCH_ENABLED_VERSION+, a repeated `int` literal still
         // compiles to `pushint`, not `intc`, per go's `asmInt`.
         let source = format!(
-            "#pragma version {v}\nintcblock 1\nint 500\nint 500\n==\n",
+            "#pragma version {v}\n#pragma autosalt false\nintcblock 1\nint 500\nint 500\n==\n",
             v = MAX_AVM_VERSION
         );
         let ops = assemble_string(&source).unwrap();

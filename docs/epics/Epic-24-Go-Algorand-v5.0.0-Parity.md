@@ -47,7 +47,7 @@ Headline items, by consensus risk:
 
 - [x] #658 — consensus v42 parameter sweep (**foundation**) — merged, PR #682
 - [x] #663 — Falcon-1024 seed size + sign-message convention fix — merged, PR #683
-- [x] #669 — sha512/sumhash512 opcode cost formula bugfix — merged, PR #684
+- [x] #669 — sha512/sumhash512 opcode cost formula bugfix — merged, PR #684 (note: go registers `sumhash512` at AVM v14, not v13; algod-rust matched that in #2255)
 - [x] #670 — gload/gloads nil-pastScratch fix — merged, PR #685
 - [x] #686 — gload/gloads must return sibling's real scratch value, not a zero placeholder (found during #670; depends on #670) — merged, PR #713
 - [x] #672 — assembler match-opcode type tracking + deadcode disassembly fix — merged, PR #687
