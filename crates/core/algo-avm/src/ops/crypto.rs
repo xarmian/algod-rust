@@ -907,7 +907,9 @@ pub fn op_ecdsa_pk_decompress(
 
 /// `ecdsa_pk_recover` (0x07): recover public key from ECDSA signature.
 /// Immediate: curve index (Secp256k1 only).
-/// Stack: pop recovery_id (uint64, 0-3), S (bytes), R (bytes), data (32 bytes).
+/// Stack (bottom to top): data (32 bytes), recovery_id (uint64, 0-3), R, S,
+/// i.e. go's `proto("b{32}ib{32}b{32}:b{32}b{32}")` (`opcodes.go:562`);
+/// the handler pops S, R, recovery_id, data (`crypto.go:395-403`).
 /// Push X then Y (Y on top), matching go's `opEcdsaPkRecover`
 /// (`data/transactions/logic/crypto.go`), which writes X into the lower
 /// stack slot and Y into the higher one before truncating. Cost: 2000
@@ -923,10 +925,10 @@ pub fn op_ecdsa_pk_recover(
         return Err(avm_err(format!("unsupported curve {curve_byte}")));
     }
 
-    // Pop stack: recovery_id, S, R, data
-    let recid = machine.pop_uint()?;
+    // Pop stack: S, R, recovery_id, data (go: crypto.go:395-403)
     let sig_s = machine.pop_bytes()?;
     let sig_r = machine.pop_bytes()?;
+    let recid = machine.pop_uint()?;
     let data = machine.pop_bytes()?;
 
     if recid > 3 {
@@ -3186,11 +3188,10 @@ mod tests {
 
         let mut code = Vec::new();
         pushbytes(&mut code, &msg); // data (32 bytes)
+        code.push(0x81); // pushint: recovery id (go order: data, recid, R, S)
+        code.push(recid_val as u8);
         pushbytes(&mut code, r); // R
         pushbytes(&mut code, s); // S
-                                 // push recovery_id as uint64
-        code.push(0x81); // pushint
-        code.push(recid_val as u8);
         code.push(0x07); // ecdsa_pk_recover
         code.push(0x00); // Secp256k1
                          // Stack: [X, Y] with Y on top
@@ -3252,10 +3253,10 @@ mod tests {
         let mut code = Vec::new();
         pushbytes(&mut code, b"hello from ethereum");
         code.push(0x02); // keccak256
+        code.push(0x81); // pushint (recovery id / "v"), go order
+        code.push(recid_val as u8);
         pushbytes(&mut code, r);
         pushbytes(&mut code, s);
-        code.push(0x81); // pushint (recovery id / "v")
-        code.push(recid_val as u8);
         code.push(0x07); // ecdsa_pk_recover
         code.push(0x00); // Secp256k1
                          // Stack here is [X, Y] (Y on top), matching go's real order --
@@ -3276,14 +3277,72 @@ mod tests {
         );
     }
 
+    /// Issue #2253: go-algorand's own `TestEcdsaEthAddress` program
+    /// (`data/transactions/logic/crypto_test.go:841-851`), byte for byte, in
+    /// go's argument order: data, recovery id, R, S (bottom to top;
+    /// `opcodes.go:562` `b{32}ib{32}b{32}`).
     #[test]
-    fn test_ecdsa_pk_recover_invalid_recid() {
+    fn test_ecdsa_eth_address_go_literal_program_in_go_order() {
+        let r = hex_decode("745e8f55ac6189ee89ed707c36694868e3903988fbf776c8096c45da2e60c638");
+        let s = hex_decode("30c8e4a9b5d2eb53ddc6294587dd00bed8afe2c45dd72f6b4cf752e46d5ba681");
+        let addr = hex_decode("5ce9454909639d2d17a3f753ce7d93fa0b9ab12e");
+
+        let mut code = Vec::new();
+        pushbytes(&mut code, b"hello from ethereum");
+        code.push(0x02); // keccak256
+        code.push(0x81); // pushint 0 (recovery id)
+        code.push(0);
+        pushbytes(&mut code, &r);
+        pushbytes(&mut code, &s);
+        code.push(0x07); // ecdsa_pk_recover
+        code.push(0x00); // Secp256k1
+        code.push(0x50); // concat
+        code.push(0x02); // keccak256
+        code.push(0x51); // substring 12 32
+        code.push(12);
+        code.push(32);
+        pushbytes(&mut code, &addr);
+        code.push(0x12); // ==
+        code.push(0x43); // return
+
+        let m = run_prog(5, &code).expect("go accepts this program at v5..v14");
+        assert!(m.pass, "go's TestEcdsaEthAddress program must accept");
+    }
+
+    /// Issue #2253: the pre-fix (wrong) argument order, data, R, S, recovery id,
+    /// is rejected exactly as go rejects it: the argument gate reports slot 1
+    /// (the recovery id) as `[]byte` where go's proto wants `uint64`
+    /// (go: `ecdsa_pk_recover arg 1 wanted uint64 but got []byte`).
+    #[test]
+    fn test_ecdsa_pk_recover_rejects_the_old_argument_order_with_gos_message() {
         let mut code = Vec::new();
         pushbytes(&mut code, &[0u8; 32]); // data
         pushbytes(&mut code, &[1u8; 32]); // R
         pushbytes(&mut code, &[1u8; 32]); // S
+        code.push(0x81); // pushint recovery id (wrong place)
+        code.push(0);
+        code.push(0x07);
+        code.push(0x00);
+        code.push(0x43);
+
+        let Err(err) = run_prog(5, &code) else {
+            panic!("go rejects this order");
+        };
+        assert!(
+            err.to_string()
+                .contains("ecdsa_pk_recover arg 1 wanted uint64 but got []byte"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_ecdsa_pk_recover_invalid_recid() {
+        let mut code = Vec::new();
+        pushbytes(&mut code, &[0u8; 32]); // data
         code.push(0x81); // pushint
         code.push(4); // recovery id = 4 (invalid, must be 0-3)
+        pushbytes(&mut code, &[1u8; 32]); // R
+        pushbytes(&mut code, &[1u8; 32]); // S
         code.push(0x07);
         code.push(0x00);
         code.push(0x43);
@@ -3299,10 +3358,10 @@ mod tests {
     fn test_ecdsa_pk_recover_secp256r1_unsupported() {
         let mut code = Vec::new();
         pushbytes(&mut code, &[0u8; 32]); // data
-        pushbytes(&mut code, &[1u8; 32]); // R
-        pushbytes(&mut code, &[1u8; 32]); // S
         code.push(0x81); // pushint
         code.push(0); // recovery id
+        pushbytes(&mut code, &[1u8; 32]); // R
+        pushbytes(&mut code, &[1u8; 32]); // S
         code.push(0x07);
         code.push(0x01); // Secp256r1
         code.push(0x43);
