@@ -4984,6 +4984,42 @@ mod tests {
         closing.cancel();
     }
 
+    /// Issue #2251: when the send queue is full, `request_with_timeout_via_tracker`
+    /// cancels the pending entry and never counts the request.
+    #[tokio::test]
+    async fn a_request_that_failed_to_enqueue_leaves_no_pending_entry_and_no_count() {
+        use crate::topics::{Topic, Topics};
+
+        let tracker = RequestTracker::new();
+        let (send_tx, _send_rx) = mpsc::channel(1);
+        // Fill the queue so the request's `try_send` fails.
+        send_tx
+            .try_send(WriteCommand::Data(SendMessage::new(OutgoingMessage::new(
+                Tag::AgreementVote,
+                vec![0u8],
+            ))))
+            .expect("the first message fits");
+        let closing = CancellationToken::new();
+
+        let err = request_with_timeout_via_tracker(
+            &tracker,
+            &send_tx,
+            &closing,
+            Tag::UniEnsBlockReq,
+            Topics::from_vec(vec![Topic::new("q", b"x".to_vec())]),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("the send queue is full");
+        assert!(matches!(err, PeerError::SendBufferFull), "{err:?}");
+        assert_eq!(tracker.pending_count().await, 0, "the entry is cancelled");
+        assert_eq!(
+            tracker.outstanding_topic_requests(),
+            0,
+            "a request that was never enqueued is never counted"
+        );
+    }
+
     /// Ports go-algorand's `TestDiscardUnrequestedBlockResponse`
     /// (`network/wsNetwork_test.go:4182`) at the `read_loop` level: a peer
     /// that sends a `TopicMsgResp` with no matching outstanding request is a
