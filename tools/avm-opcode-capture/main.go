@@ -471,6 +471,77 @@ func generate() []Vector {
 			fmt.Sprintf("byte \"testdata\"; sha512_256; int 4; byte 0x%s; byte 0x%s; ecdsa_pk_recover Secp256k1; pop; pop; int 1", rHex, sHex), 7,
 			nil,
 		))
+		// Length handling (issue #2253 review): go concatenates R || S || recid
+		// and requires the 64 signature bytes in total (secp256k1.checkSignature,
+		// len(sig) == 65) and exactly 32 data bytes, so the split between R and
+		// S is NOT enforced per argument.
+		rb, sb := sign[:32], sign[32:64]
+		cat := func(parts ...[]byte) string {
+			var b []byte
+			for _, p := range parts {
+				b = append(b, p...)
+			}
+			return hex.EncodeToString(b)
+		}
+		msgB := msg[:]
+		// The assembler tracks constant lengths (b{N}) statically, so build each
+		// byte argument as the concat of two halves to keep it plain `bytes`.
+		opaque := func(h string) string {
+			m := (len(h) / 4) * 2
+			return fmt.Sprintf("byte 0x%s; byte 0x%s; concat", h[:m], h[m:])
+		}
+		rec := func(name, desc, dataHex string, recidArg uint64, rHex, sHex string) {
+			out = append(out, mkVector(
+				"ecdsa_pk_recover/secp256k1/"+name, desc,
+				fmt.Sprintf("%s; int %d; %s; %s; ecdsa_pk_recover Secp256k1; %s", opaque(dataHex), recidArg, opaque(rHex), opaque(sHex), check), 7,
+				nil,
+			))
+		}
+		rec("r31_s33_same_concat", "R 31 bytes, S 33 bytes, R||S unchanged: go recovers the key",
+			hex.EncodeToString(msgB), uint64(recid), cat(rb[:31]), cat(rb[31:], sb))
+		rec("r33_s31_same_concat", "R 33 bytes, S 31 bytes, R||S unchanged: go recovers the key",
+			hex.EncodeToString(msgB), uint64(recid), cat(rb, sb[:1]), cat(sb[1:]))
+		rec("r_empty_s64", "R empty, S = R||S (64 bytes): go recovers the key",
+			hex.EncodeToString(msgB), uint64(recid), "", cat(rb, sb))
+		rec("r64_s_empty", "R = R||S (64 bytes), S empty: go recovers the key",
+			hex.EncodeToString(msgB), uint64(recid), cat(rb, sb), "")
+		rec("r_empty_s_empty", "both empty: signature length 0",
+			hex.EncodeToString(msgB), uint64(recid), "", "")
+		rec("r31_s32", "R 31 + S 32 = 63 signature bytes",
+			hex.EncodeToString(msgB), uint64(recid), cat(rb[:31]), cat(sb))
+		rec("r33_s32", "R 33 + S 32 = 65 signature bytes",
+			hex.EncodeToString(msgB), uint64(recid), cat(rb, []byte{0}), cat(sb))
+		rec("data31", "31 data bytes: invalid message length",
+			cat(msgB[:31]), uint64(recid), cat(rb), cat(sb))
+		rec("data33", "33 data bytes: invalid message length",
+			cat(msgB, []byte{0}), uint64(recid), cat(rb), cat(sb))
+		rec("data_empty", "empty data: invalid message length",
+			"", uint64(recid), cat(rb), cat(sb))
+		// recovery id 4+ and a wrong-typed argument together (raw: the
+		// assembler's type tracker refuses the wrong type).
+		out = append(out, mkVectorRawAppendBytes(
+			"ecdsa_pk_recover/secp256k1/recid4_and_wrong_typed_s",
+			"recid 4 and S given as uint64: which error does go report",
+			fmt.Sprintf("byte 0x%s; int 4; byte 0x%s; int 7", cat(msgB), cat(rb)), 7,
+			[]byte{0x07, 0x00},
+			nil,
+		))
+		out = append(out, mkVectorRawAppendBytes(
+			"ecdsa_pk_recover/secp256k1/recid4_and_wrong_typed_data",
+			"recid 4 and data given as uint64",
+			fmt.Sprintf("int 9; int 4; byte 0x%s; byte 0x%s", cat(rb), cat(sb)), 7,
+			[]byte{0x07, 0x00},
+			nil,
+		))
+		out = append(out, mkVectorRawAppendBytes(
+			"ecdsa_pk_recover/secp256k1/recid4_and_bytes_recid",
+			"recid slot holds bytes (and would be >3 as a number)",
+			fmt.Sprintf("byte 0x%s; byte 0x04; byte 0x%s; byte 0x%s", cat(msgB), cat(rb), cat(sb)), 7,
+			[]byte{0x07, 0x00},
+			nil,
+		))
+		rec("recid4_with_short_data", "recid 4 and 31 data bytes: which error first",
+			cat(msgB[:31]), 4, cat(rb), cat(sb))
 		// go's own TestEcdsaEthAddress program (crypto_test.go:841-851).
 		out = append(out, mkVector(
 			"ecdsa_pk_recover/secp256k1/eth_address_go_test_program",
