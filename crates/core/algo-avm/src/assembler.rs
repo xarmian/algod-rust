@@ -4827,8 +4827,8 @@ mod tests {
     #[test]
     fn test_assemble_jump_to_the_end_byte_exact() {
         // TestAssembleJumpToTheEnd (assembler_test.go:1929-1946), at
-        // AssemblerMaxVersion (13, >= varintBranchVersion so `bnz` uses the
-        // 1-byte varint offset form): go asserts the exact assembled
+        // version 13 (>= varintBranchVersion so `bnz` uses the 1-byte varint
+        // offset form): go asserts the exact assembled
         // program bytes `0120010122224000` -- version, intcblock(count=1,
         // val=1), `intc_0`, `intc_0`, `bnz`, offset-varint(0). This is a
         // byte-exact regression pin for issue #1381: before the fix, each
@@ -4839,16 +4839,7 @@ mod tests {
         let ops = assemble_string(source).unwrap();
         assert_eq!(
             ops.program,
-            vec![
-                opcode::MAX_AVM_VERSION,
-                0x20,
-                0x01,
-                0x01,
-                0x22,
-                0x22,
-                0x40,
-                0x00
-            ]
+            vec![13, 0x20, 0x01, 0x01, 0x22, 0x22, 0x40, 0x00]
         );
     }
 
@@ -6343,7 +6334,7 @@ dup
     fn test_assemble_match_255_labels_ok() {
         let labels: Vec<String> = (0..255).map(|i| format!("label{i}")).collect();
         let source = format!(
-            "#pragma version {v}\n{pushints}\nmatch {targets}\n{defs}\n",
+            "#pragma version {v}\n#pragma autosalt false\n{pushints}\nmatch {targets}\n{defs}\n",
             v = MAX_AVM_VERSION,
             pushints = "pushint 1\n".repeat(256), // 255 labels, and the match value
             targets = labels.join(" "),

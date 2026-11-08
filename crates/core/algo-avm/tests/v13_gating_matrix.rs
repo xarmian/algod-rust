@@ -30,7 +30,8 @@
 //!      whose declared version exceeds `ConsensusParams::logic_sig_version`.
 //!
 //! References:
-//!   - go-algorand `data/transactions/logic/opcodes.go:31` — LogicVersion = 13
+//!   - go-algorand `data/transactions/logic/opcodes.go:31` — LogicVersion = 14,
+//!     `:88` — sumhashVersion = 14 (EXPERIMENTAL)
 //!   - go-algorand `data/transactions/logic/opcodes.go:657-658` — sumhash512,
 //!     sha512 specs (version 13)
 //!   - go-algorand `data/transactions/logic/opcodes.go:545` — divmodw (v4,
@@ -42,7 +43,10 @@ use algo_avm::{
     check_program_version_allowed, lookup, parse, AvmMachine, CostKind, ExecMode, NullContext,
     MAX_AVM_VERSION,
 };
-use algo_types::consensus::{consensus_params_for_version, ConsensusParams, CONSENSUS_V41};
+use algo_types::consensus::{
+    consensus_params_for_version, ConsensusParams, CONSENSUS_FUTURE, CONSENSUS_V41, CONSENSUS_V42,
+    CONSENSUS_V43,
+};
 
 fn v41_params() -> ConsensusParams {
     consensus_params_for_version(CONSENSUS_V41).expect("V41 params")
@@ -68,8 +72,11 @@ fn build_program(version: u8, body: &[u8]) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn max_avm_version_is_13() {
-    assert_eq!(MAX_AVM_VERSION, 13);
+fn max_avm_version_is_14() {
+    // go: `const LogicVersion = 14` (opcodes.go:31) is the hard program-version
+    // ceiling (`eval.go:1606`); the released consensus ceiling (v42/v43
+    // LogicSigVersion 13) is a separate, second check.
+    assert_eq!(MAX_AVM_VERSION, 14);
 }
 
 #[test]
@@ -81,10 +88,12 @@ fn v13_sha512_opcode_has_version_13() {
 }
 
 #[test]
-fn v13_sumhash512_opcode_has_version_13() {
+fn sumhash512_opcode_has_version_14() {
+    // go: `const sumhashVersion = 14` (opcodes.go:88, EXPERIMENTAL), so a v13
+    // program using it is rejected by go on released consensus.
     let spec = lookup(0x86).expect("sumhash512 must be registered");
     assert_eq!(spec.name, "sumhash512");
-    assert_eq!(spec.version, 13);
+    assert_eq!(spec.version, 14);
     assert_eq!(spec.cost, CostKind::Dynamic);
 }
 
@@ -108,11 +117,13 @@ fn sha512_rejected_in_v12_program_at_parse() {
 }
 
 #[test]
-fn sumhash512_rejected_in_v12_program_at_parse() {
-    let raw = build_program(12, &[0x86, 0x43]);
-    let err = parse(&raw).expect_err("v12 program with sumhash512 must fail parse");
-    let msg = format!("{err}");
-    assert!(msg.contains("sumhash512") || msg.contains("v13"), "{msg}");
+fn sumhash512_rejected_in_v12_and_v13_programs_at_parse() {
+    for version in [12u8, 13] {
+        let raw = build_program(version, &[0x86, 0x43]);
+        let err = parse(&raw).expect_err("a pre-v14 program with sumhash512 must fail parse");
+        let msg = format!("{err}");
+        assert!(msg.contains("sumhash512") || msg.contains("v14"), "{msg}");
+    }
 }
 
 #[test]
@@ -123,9 +134,15 @@ fn sha512_accepted_in_v13_program_at_parse() {
 }
 
 #[test]
-fn sumhash512_accepted_in_v13_program_at_parse() {
-    let raw = build_program(13, &[0x80, 0x00, 0x86, 0x43]);
-    parse(&raw).expect("v13 program with sumhash512 must parse");
+fn sumhash512_accepted_in_v14_program_at_parse() {
+    let raw = build_program(14, &[0x80, 0x00, 0x86, 0x43]);
+    parse(&raw).expect("v14 program with sumhash512 must parse");
+}
+
+#[test]
+fn v14_program_header_parses_and_v15_does_not() {
+    assert!(parse(&[14u8]).is_ok());
+    assert!(parse(&[15u8]).is_err());
 }
 
 #[test]
@@ -177,6 +194,21 @@ fn v13_program_rejected_under_v41_consensus() {
     let v41 = v41_params();
     assert_eq!(v41.logic_sig_version, 12);
     assert!(check_program_version_allowed(13, v41.logic_sig_version).is_err());
+}
+
+#[test]
+fn v14_program_gated_by_the_protocol_ceiling_like_go() {
+    // go (`eval.go:1606-1611`): version > LogicVersion(14) is rejected outright,
+    // then version > proto.LogicSigVersion. Released v42/v43 carry 13; vFuture 14.
+    for released in [CONSENSUS_V42, CONSENSUS_V43] {
+        let p = consensus_params_for_version(released).expect("released params");
+        assert_eq!(p.logic_sig_version, 13, "{released}");
+        assert!(check_program_version_allowed(14, p.logic_sig_version).is_err());
+        assert!(check_program_version_allowed(13, p.logic_sig_version).is_ok());
+    }
+    let future = consensus_params_for_version(CONSENSUS_FUTURE).expect("vFuture params");
+    assert_eq!(future.logic_sig_version, 14);
+    assert!(check_program_version_allowed(14, future.logic_sig_version).is_ok());
 }
 
 #[test]
@@ -287,11 +319,42 @@ fn run_approval_program_accepts_v12_under_v41_ceiling() {
 }
 
 #[test]
-fn v13_sumhash512_program_executes() {
+fn run_logicsig_program_rejects_v14_sumhash512_under_released_ceiling_13() {
+    use algo_avm::eval::run_logicsig_program;
+    use algo_avm::group::GroupBudget;
+
+    // pushbytes "", sumhash512: rejected before any opcode runs on v42/v43.
+    let raw = build_program(14, &[0x80, 0x00, 0x86]);
+    let mut ctx = CeilingOnlyContext { ceiling: 13 };
+    let mut budget = GroupBudget::for_logicsig(1);
+    let err = run_logicsig_program(&raw, &mut ctx, &mut budget)
+        .expect_err("a v14 program must be rejected under a v13 ceiling");
+    assert!(
+        format!("{err}").contains("exceeds consensus LogicSigVersion ceiling"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn run_logicsig_program_accepts_v14_sumhash512_under_vfuture_ceiling_14() {
+    use algo_avm::eval::run_logicsig_program;
+    use algo_avm::group::GroupBudget;
+
+    // pushbytes "", sumhash512, len, pushint 64, ==  (v14 on vFuture, full eval)
+    let raw = build_program(14, &[0x80, 0x00, 0x86, 0x15, 0x81, 64, 0x12]);
+    let mut ctx = CeilingOnlyContext { ceiling: 14 };
+    let mut budget = GroupBudget::for_logicsig(1);
+    let result = run_logicsig_program(&raw, &mut ctx, &mut budget)
+        .expect("v14 sumhash512 program must evaluate on vFuture");
+    assert!(result, "sumhash512 must push 64 bytes");
+}
+
+#[test]
+fn v14_sumhash512_program_executes() {
     let mut code = vec![0x80, 0x05]; // pushbytes 5 bytes
     code.extend_from_slice(b"hello");
     code.push(0x86); // sumhash512
-    let raw = build_program(13, &code);
+    let raw = build_program(14, &code);
     let program = parse(&raw).expect("parse");
 
     let mut machine = AvmMachine::new(program, ExecMode::LogicSig, 100_000);
@@ -301,7 +364,7 @@ fn v13_sumhash512_program_executes() {
     while !machine.finished && machine.pc < machine.program.instructions.len() {
         machine
             .step(&mut NullContext)
-            .expect("v13 sumhash512 program must execute");
+            .expect("v14 sumhash512 program must execute");
     }
 
     let top = machine.pop_bytes().expect("stack top");

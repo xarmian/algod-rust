@@ -18,16 +18,17 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Byte-exact parity tests for the `sumhash512` opcode (0x86, TEAL v13).
+//! Byte-exact parity tests for the `sumhash512` opcode (0x86, TEAL v14: go
+//! `sumhashVersion = 14`, issue #2255).
 //!
 //! Consumes vectors captured from go-algorand's upstream
 //! `github.com/algorand/go-sumhash` package (the same one
 //! `data/transactions/logic/crypto.go:120` calls via `sumhash.New512(nil)`)
 //! and drives them through the Rust AVM opcode handler directly.
 //!
-//! The opcode is dispatched from the bytecode when running a v13 program;
-//! until TASK-49 bumps `MAX_AVM_VERSION` to 13, these tests exercise the
-//! handler directly with a pre-pushed stack.
+//! These tests exercise the handler directly with a pre-pushed stack; the
+//! end-to-end v14 program path (parse, ceiling gates, full evaluation on
+//! vFuture) is covered by `v13_gating_matrix.rs`.
 
 use algo_avm::bytecode::{Immediates, Instruction};
 use algo_avm::machine::ExecMode;
