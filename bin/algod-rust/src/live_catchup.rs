@@ -968,7 +968,7 @@ impl LiveCatchupManager {
             );
             return;
         }
-        let mut task = ResumeTask {
+        let task = ResumeTask {
             manager: Arc::clone(self),
             generation,
             who: who.to_string(),
