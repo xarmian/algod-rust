@@ -83,6 +83,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math/big"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -542,6 +543,56 @@ func generate() []Vector {
 		))
 		rec("recid4_with_short_data", "recid 4 and 31 data bytes: which error first",
 			cat(msgB[:31]), 4, cat(rb), cat(sb))
+		// libsecp256k1 edge cases (issue #2253 review): go parses R || S || recid
+		// with libsecp256k1 (RecoverPubkey), algod-rust with k256. For every case
+		// the recovered key (when go recovers one) is compared to the key
+		// secp256k1.RecoverPubkey itself returns, so the vector pins pass/fail,
+		// the error text AND the recovered X||Y.
+		curveN, _ := new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)
+		fieldP, _ := new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16)
+		max256 := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
+		b32 := func(v *big.Int) []byte { return v.FillBytes(make([]byte, 32)) }
+		edge := func(name, desc string, recidArg byte, r, sv []byte) {
+			sig := append(append(append([]byte{}, r...), sv...), recidArg)
+			prefix := fmt.Sprintf("%s; int %d; %s; %s; ecdsa_pk_recover Secp256k1",
+				opaque(hex.EncodeToString(msgB)), recidArg, opaque(hex.EncodeToString(r)), opaque(hex.EncodeToString(sv)))
+			program := prefix + "; pop; pop; int 1"
+			if pk, err := secp256k1.RecoverPubkey(msgB, sig); err == nil {
+				program = prefix + fmt.Sprintf("; concat; byte 0x%s; ==", hex.EncodeToString(pk[1:65]))
+			}
+			out = append(out, mkVector("ecdsa_pk_recover/secp256k1/edge_"+name, desc, program, 7, nil))
+		}
+		sMinus := new(big.Int).Sub(curveN, new(big.Int).SetBytes(sb))
+		for rid := byte(0); rid < 4; rid++ {
+			edge(fmt.Sprintf("real_sig_recid%d", rid), "valid signature with each recovery id", rid, rb, sb)
+		}
+		edge("high_s_same_recid", "s replaced by n-s, same recovery id", recid, rb, b32(sMinus))
+		edge("high_s_flipped_recid", "s replaced by n-s, recovery id flipped (recovers the signer's key)", recid^1, rb, b32(sMinus))
+		rBig := new(big.Int).SetBytes(rb)
+		edge("r_eq_n", "r = n", recid, b32(curveN), sb)
+		edge("r_eq_n_plus_1", "r = n+1", recid, b32(new(big.Int).Add(curveN, big.NewInt(1))), sb)
+		edge("r_max256", "r = 2^256-1", recid, b32(max256), sb)
+		edge("r_eq_n_minus_1", "r = n-1", recid, b32(new(big.Int).Sub(curveN, big.NewInt(1))), sb)
+		edge("s_eq_n", "s = n", recid, rb, b32(curveN))
+		edge("s_eq_n_plus_1", "s = n+1", recid, rb, b32(new(big.Int).Add(curveN, big.NewInt(1))))
+		edge("s_max256", "s = 2^256-1", recid, rb, b32(max256))
+		edge("s_eq_n_minus_1", "s = n-1", recid, rb, b32(new(big.Int).Sub(curveN, big.NewInt(1))))
+		edge("r_zero", "r = 0", recid, b32(big.NewInt(0)), sb)
+		edge("s_zero", "s = 0", recid, rb, b32(big.NewInt(0)))
+		edge("r_zero_s_zero", "r = 0, s = 0", recid, b32(big.NewInt(0)), b32(big.NewInt(0)))
+		_ = rBig
+		for rv := int64(1); rv <= 6; rv++ {
+			for rid := byte(0); rid < 4; rid++ {
+				edge(fmt.Sprintf("small_r%d_s1_recid%d", rv, rid), "small r, s = 1: recid 2/3 use x = r+n", rid, b32(big.NewInt(rv)), b32(big.NewInt(1)))
+			}
+		}
+		pMinusN := new(big.Int).Sub(fieldP, curveN)
+		for _, d := range []int64{-1, 0, 1} {
+			for rid := byte(2); rid < 4; rid++ {
+				rv := new(big.Int).Add(pMinusN, big.NewInt(d))
+				edge(fmt.Sprintf("r_p_minus_n_%+d_recid%d", d, rid), "recid 2/3 with r+n around the field prime p", rid, b32(rv), b32(big.NewInt(1)))
+			}
+		}
 		// go's own TestEcdsaEthAddress program (crypto_test.go:841-851).
 		out = append(out, mkVector(
 			"ecdsa_pk_recover/secp256k1/eth_address_go_test_program",

@@ -1143,13 +1143,15 @@ fn ecdsa_recover_secp256k1(
     sig_bytes[..sig_r.len()].copy_from_slice(sig_r);
     sig_bytes[sig_r.len()..].copy_from_slice(sig_s);
 
+    // Every libsecp256k1 failure (r or s zero / not below n, no curve point for
+    // r (+ n), ...) is go's `ErrRecoverFailed`, "recovery failed".
     let sig = k256::ecdsa::Signature::from_slice(&sig_bytes)
-        .map_err(|e| avm_err(format!("pubkey recover failed: {e}")))?;
+        .map_err(|_| avm_err("pubkey recover failed: recovery failed"))?;
 
     let recovery_id = RecoveryId::new(recid & 1 != 0, recid & 2 != 0);
 
     let vk = VerifyingKey::recover_from_prehash(data, &sig, recovery_id)
-        .map_err(|e| avm_err(format!("pubkey recover failed: {e}")))?;
+        .map_err(|_| avm_err("pubkey recover failed: recovery failed"))?;
 
     let encoded = vk.to_sec1_point(false);
     let x = encoded
@@ -3304,6 +3306,46 @@ mod tests {
                 .contains("ecdsa_pk_recover arg 1 wanted uint64 but got []byte"),
             "{err}"
         );
+    }
+
+    /// libsecp256k1 edge cases (go-captured vectors `ecdsa_pk_recover/secp256k1/edge_*`
+    /// are replayed by `avm_opcode_conformance`, which compares pass/fail and the
+    /// recovered key): every failure reports go's `pubkey recover failed: recovery failed`.
+    #[test]
+    fn test_ecdsa_pk_recover_libsecp_failures_report_go_text() {
+        let n = hex_decode("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
+        let one = {
+            let mut v = vec![0u8; 32];
+            v[31] = 1;
+            v
+        };
+        let zero = vec![0u8; 32];
+        let cases: [(&[u8], &[u8], u8); 5] = [
+            (&zero, &one, 0), // r = 0
+            (&one, &zero, 0), // s = 0
+            (&n, &one, 0),    // r = n
+            (&one, &n, 0),    // s = n
+            (&one, &one, 2),  // r + n is not a curve x (go: recovery failed)
+        ];
+        for (r, s, recid) in cases {
+            let mut code = Vec::new();
+            pushbytes(&mut code, &[0x11u8; 32]);
+            code.push(0x81);
+            code.push(recid);
+            pushbytes(&mut code, r);
+            pushbytes(&mut code, s);
+            code.push(0x07);
+            code.push(0x00);
+            code.push(0x43);
+            let Err(e) = run_prog(5, &code) else {
+                panic!("go fails for r={r:02x?} s={s:02x?} recid={recid}");
+            };
+            assert!(
+                e.to_string()
+                    .contains("pubkey recover failed: recovery failed"),
+                "{e}"
+            );
+        }
     }
 
     /// Run `ecdsa_pk_recover <curve>` on `data, recid, R, S` and return the
