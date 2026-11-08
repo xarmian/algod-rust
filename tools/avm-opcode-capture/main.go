@@ -83,6 +83,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math/big"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -221,7 +222,13 @@ func mkVector(name, desc, source string, version uint64, args [][]byte) Vector {
 // type tracker would itself refuse to assemble as source, so it can only be
 // reached by a raw/malicious on-chain program.
 func mkVectorRawAppend(name, desc, source string, version uint64, rawOpcode byte, args [][]byte) Vector {
-	program := append(assemble(source, version), rawOpcode)
+	return mkVectorRawAppendBytes(name, desc, source, version, []byte{rawOpcode}, args)
+}
+
+// mkVectorRawAppendBytes is mkVectorRawAppend for an opcode with immediates:
+// every byte of `raw` (opcode then immediates) is appended verbatim.
+func mkVectorRawAppendBytes(name, desc, source string, version uint64, raw []byte, args [][]byte) Vector {
+	program := append(assemble(source, version), raw...)
 	pass, errStr, stack := evalSig(program, args)
 	argsHex := make([]string, len(args))
 	for i, a := range args {
@@ -416,6 +423,181 @@ func generate() []Vector {
 			"ecdsa_verify/secp256k1/wrong_msg",
 			"signature is over \"testdata\", program hashes \"testdata1\" -> reject",
 			source("testdata1", hex.EncodeToString(r), hex.EncodeToString(s)), 7,
+			nil,
+		))
+	}
+
+	// =======================================================================
+	// ecdsa_pk_recover Secp256k1 (0x07, v5+). Stack: data, recovery id, R, S
+	// (bottom to top; go `proto("b{32}ib{32}b{32}:b{32}b{32}")`, issue #2253).
+	// Pushes X then Y (Y on top).
+	// =======================================================================
+	{
+		var sk [32]byte
+		copy(sk[:], []byte("avm-opcode-capture/secp256k1-key"))
+		curve := secp256k1.S256()
+		px, py := curve.ScalarBaseMult(sk[:])
+		x := px.FillBytes(make([]byte, 32))
+		y := py.FillBytes(make([]byte, 32))
+
+		msg := sha512.Sum512_256([]byte("testdata"))
+		sign, err := secp256k1.Sign(msg[:], sk[:])
+		if err != nil {
+			panic(fmt.Sprintf("secp256k1 sign: %v", err))
+		}
+		rHex := hex.EncodeToString(sign[:32])
+		sHex := hex.EncodeToString(sign[32:64])
+		recid := sign[64]
+
+		// Compare the recovered key to the signer's public key.
+		check := fmt.Sprintf("byte 0x%s; ==; swap; byte 0x%s; ==; &&", hex.EncodeToString(y), hex.EncodeToString(x))
+		out = append(out, mkVector(
+			"ecdsa_pk_recover/secp256k1/valid_go_order",
+			"go order data, recid, R, S: recovers the signer's X,Y",
+			fmt.Sprintf("byte \"testdata\"; sha512_256; int %d; byte 0x%s; byte 0x%s; ecdsa_pk_recover Secp256k1; %s", recid, rHex, sHex, check), 7,
+			nil,
+		))
+		// The assembler's static type tracker refuses this order, so append
+		// the opcode (0x07) and its curve immediate (0x00) raw.
+		out = append(out, mkVectorRawAppendBytes(
+			"ecdsa_pk_recover/secp256k1/old_rust_order_rejected",
+			"data, R, S, recid (the pre-fix algod-rust order): go rejects with an argument-type error",
+			fmt.Sprintf("byte \"testdata\"; sha512_256; byte 0x%s; byte 0x%s; int %d", rHex, sHex, recid), 7,
+			[]byte{0x07, 0x00},
+			nil,
+		))
+		out = append(out, mkVector(
+			"ecdsa_pk_recover/secp256k1/invalid_recid",
+			"recovery id 4 -> go errors 'invalid recovery id: 4'",
+			fmt.Sprintf("byte \"testdata\"; sha512_256; int 4; byte 0x%s; byte 0x%s; ecdsa_pk_recover Secp256k1; pop; pop; int 1", rHex, sHex), 7,
+			nil,
+		))
+		// Length handling (issue #2253 review): go concatenates R || S || recid
+		// and requires the 64 signature bytes in total (secp256k1.checkSignature,
+		// len(sig) == 65) and exactly 32 data bytes, so the split between R and
+		// S is NOT enforced per argument.
+		rb, sb := sign[:32], sign[32:64]
+		cat := func(parts ...[]byte) string {
+			var b []byte
+			for _, p := range parts {
+				b = append(b, p...)
+			}
+			return hex.EncodeToString(b)
+		}
+		msgB := msg[:]
+		// The assembler tracks constant lengths (b{N}) statically, so build each
+		// byte argument as the concat of two halves to keep it plain `bytes`.
+		opaque := func(h string) string {
+			m := (len(h) / 4) * 2
+			return fmt.Sprintf("byte 0x%s; byte 0x%s; concat", h[:m], h[m:])
+		}
+		rec := func(name, desc, dataHex string, recidArg uint64, rHex, sHex string) {
+			out = append(out, mkVector(
+				"ecdsa_pk_recover/secp256k1/"+name, desc,
+				fmt.Sprintf("%s; int %d; %s; %s; ecdsa_pk_recover Secp256k1; %s", opaque(dataHex), recidArg, opaque(rHex), opaque(sHex), check), 7,
+				nil,
+			))
+		}
+		rec("r31_s33_same_concat", "R 31 bytes, S 33 bytes, R||S unchanged: go recovers the key",
+			hex.EncodeToString(msgB), uint64(recid), cat(rb[:31]), cat(rb[31:], sb))
+		rec("r33_s31_same_concat", "R 33 bytes, S 31 bytes, R||S unchanged: go recovers the key",
+			hex.EncodeToString(msgB), uint64(recid), cat(rb, sb[:1]), cat(sb[1:]))
+		rec("r_empty_s64", "R empty, S = R||S (64 bytes): go recovers the key",
+			hex.EncodeToString(msgB), uint64(recid), "", cat(rb, sb))
+		rec("r64_s_empty", "R = R||S (64 bytes), S empty: go recovers the key",
+			hex.EncodeToString(msgB), uint64(recid), cat(rb, sb), "")
+		rec("r_empty_s_empty", "both empty: signature length 0",
+			hex.EncodeToString(msgB), uint64(recid), "", "")
+		rec("r31_s32", "R 31 + S 32 = 63 signature bytes",
+			hex.EncodeToString(msgB), uint64(recid), cat(rb[:31]), cat(sb))
+		rec("r33_s32", "R 33 + S 32 = 65 signature bytes",
+			hex.EncodeToString(msgB), uint64(recid), cat(rb, []byte{0}), cat(sb))
+		rec("data31", "31 data bytes: invalid message length",
+			cat(msgB[:31]), uint64(recid), cat(rb), cat(sb))
+		rec("data33", "33 data bytes: invalid message length",
+			cat(msgB, []byte{0}), uint64(recid), cat(rb), cat(sb))
+		rec("data_empty", "empty data: invalid message length",
+			"", uint64(recid), cat(rb), cat(sb))
+		// recovery id 4+ and a wrong-typed argument together (raw: the
+		// assembler's type tracker refuses the wrong type).
+		out = append(out, mkVectorRawAppendBytes(
+			"ecdsa_pk_recover/secp256k1/recid4_and_wrong_typed_s",
+			"recid 4 and S given as uint64: which error does go report",
+			fmt.Sprintf("byte 0x%s; int 4; byte 0x%s; int 7", cat(msgB), cat(rb)), 7,
+			[]byte{0x07, 0x00},
+			nil,
+		))
+		out = append(out, mkVectorRawAppendBytes(
+			"ecdsa_pk_recover/secp256k1/recid4_and_wrong_typed_data",
+			"recid 4 and data given as uint64",
+			fmt.Sprintf("int 9; int 4; byte 0x%s; byte 0x%s", cat(rb), cat(sb)), 7,
+			[]byte{0x07, 0x00},
+			nil,
+		))
+		out = append(out, mkVectorRawAppendBytes(
+			"ecdsa_pk_recover/secp256k1/recid4_and_bytes_recid",
+			"recid slot holds bytes (and would be >3 as a number)",
+			fmt.Sprintf("byte 0x%s; byte 0x04; byte 0x%s; byte 0x%s", cat(msgB), cat(rb), cat(sb)), 7,
+			[]byte{0x07, 0x00},
+			nil,
+		))
+		rec("recid4_with_short_data", "recid 4 and 31 data bytes: which error first",
+			cat(msgB[:31]), 4, cat(rb), cat(sb))
+		// libsecp256k1 edge cases (issue #2253 review): go parses R || S || recid
+		// with libsecp256k1 (RecoverPubkey), algod-rust with k256. For every case
+		// the recovered key (when go recovers one) is compared to the key
+		// secp256k1.RecoverPubkey itself returns, so the vector pins pass/fail,
+		// the error text AND the recovered X||Y.
+		curveN, _ := new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)
+		fieldP, _ := new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16)
+		max256 := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
+		b32 := func(v *big.Int) []byte { return v.FillBytes(make([]byte, 32)) }
+		edge := func(name, desc string, recidArg byte, r, sv []byte) {
+			sig := append(append(append([]byte{}, r...), sv...), recidArg)
+			prefix := fmt.Sprintf("%s; int %d; %s; %s; ecdsa_pk_recover Secp256k1",
+				opaque(hex.EncodeToString(msgB)), recidArg, opaque(hex.EncodeToString(r)), opaque(hex.EncodeToString(sv)))
+			program := prefix + "; pop; pop; int 1"
+			if pk, err := secp256k1.RecoverPubkey(msgB, sig); err == nil {
+				program = prefix + fmt.Sprintf("; concat; byte 0x%s; ==", hex.EncodeToString(pk[1:65]))
+			}
+			out = append(out, mkVector("ecdsa_pk_recover/secp256k1/edge_"+name, desc, program, 7, nil))
+		}
+		sMinus := new(big.Int).Sub(curveN, new(big.Int).SetBytes(sb))
+		for rid := byte(0); rid < 4; rid++ {
+			edge(fmt.Sprintf("real_sig_recid%d", rid), "valid signature with each recovery id", rid, rb, sb)
+		}
+		edge("high_s_same_recid", "s replaced by n-s, same recovery id", recid, rb, b32(sMinus))
+		edge("high_s_flipped_recid", "s replaced by n-s, recovery id flipped (recovers the signer's key)", recid^1, rb, b32(sMinus))
+		rBig := new(big.Int).SetBytes(rb)
+		edge("r_eq_n", "r = n", recid, b32(curveN), sb)
+		edge("r_eq_n_plus_1", "r = n+1", recid, b32(new(big.Int).Add(curveN, big.NewInt(1))), sb)
+		edge("r_max256", "r = 2^256-1", recid, b32(max256), sb)
+		edge("r_eq_n_minus_1", "r = n-1", recid, b32(new(big.Int).Sub(curveN, big.NewInt(1))), sb)
+		edge("s_eq_n", "s = n", recid, rb, b32(curveN))
+		edge("s_eq_n_plus_1", "s = n+1", recid, rb, b32(new(big.Int).Add(curveN, big.NewInt(1))))
+		edge("s_max256", "s = 2^256-1", recid, rb, b32(max256))
+		edge("s_eq_n_minus_1", "s = n-1", recid, rb, b32(new(big.Int).Sub(curveN, big.NewInt(1))))
+		edge("r_zero", "r = 0", recid, b32(big.NewInt(0)), sb)
+		edge("s_zero", "s = 0", recid, rb, b32(big.NewInt(0)))
+		edge("r_zero_s_zero", "r = 0, s = 0", recid, b32(big.NewInt(0)), b32(big.NewInt(0)))
+		_ = rBig
+		for rv := int64(1); rv <= 6; rv++ {
+			for rid := byte(0); rid < 4; rid++ {
+				edge(fmt.Sprintf("small_r%d_s1_recid%d", rv, rid), "small r, s = 1: recid 2/3 use x = r+n", rid, b32(big.NewInt(rv)), b32(big.NewInt(1)))
+			}
+		}
+		pMinusN := new(big.Int).Sub(fieldP, curveN)
+		for _, d := range []int64{-1, 0, 1} {
+			for rid := byte(2); rid < 4; rid++ {
+				rv := new(big.Int).Add(pMinusN, big.NewInt(d))
+				edge(fmt.Sprintf("r_p_minus_n_%+d_recid%d", d, rid), "recid 2/3 with r+n around the field prime p", rid, b32(rv), b32(big.NewInt(1)))
+			}
+		}
+		// go's own TestEcdsaEthAddress program (crypto_test.go:841-851).
+		out = append(out, mkVector(
+			"ecdsa_pk_recover/secp256k1/eth_address_go_test_program",
+			"go TestEcdsaEthAddress program verbatim (keccak256, recid 0, r, s, concat, keccak256, substring 12 32)",
+			`byte "hello from ethereum"; keccak256; int 0; byte 0x745e8f55ac6189ee89ed707c36694868e3903988fbf776c8096c45da2e60c638; byte 0x30c8e4a9b5d2eb53ddc6294587dd00bed8afe2c45dd72f6b4cf752e46d5ba681; ecdsa_pk_recover Secp256k1; concat; keccak256; substring 12 32; byte 0x5ce9454909639d2d17a3f753ce7d93fa0b9ab12e; ==`, 7,
 			nil,
 		))
 	}

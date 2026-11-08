@@ -34,6 +34,7 @@ pub(super) static TABLE: [Option<&[ArgType]>; 256] = {
     t[0x04] = Some(&[BYTES, BYTES64, BYTES32]); // ed25519verify
     t[0x05] = Some(&[BYTES32, BYTES32, BYTES32, BYTES32, BYTES32]); // ecdsa_verify
     t[0x06] = Some(&[BYTES33]); // ecdsa_pk_decompress
+    t[0x07] = Some(&[BYTES32, UINT, BYTES32, BYTES32]); // ecdsa_pk_recover
     t[0x08] = Some(&[UINT, UINT]); // +
     t[0x09] = Some(&[UINT, UINT]); // -
     t[0x0a] = Some(&[UINT, UINT]); // /

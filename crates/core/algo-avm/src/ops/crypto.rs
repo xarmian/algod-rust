@@ -907,7 +907,9 @@ pub fn op_ecdsa_pk_decompress(
 
 /// `ecdsa_pk_recover` (0x07): recover public key from ECDSA signature.
 /// Immediate: curve index (Secp256k1 only).
-/// Stack: pop recovery_id (uint64, 0-3), S (bytes), R (bytes), data (32 bytes).
+/// Stack (bottom to top): data (32 bytes), recovery_id (uint64, 0-3), R, S,
+/// i.e. go's `proto("b{32}ib{32}b{32}:b{32}b{32}")` (`opcodes.go:562`);
+/// the handler pops S, R, recovery_id, data (`crypto.go:395-403`).
 /// Push X then Y (Y on top), matching go's `opEcdsaPkRecover`
 /// (`data/transactions/logic/crypto.go`), which writes X into the lower
 /// stack slot and Y into the higher one before truncating. Cost: 2000
@@ -923,21 +925,14 @@ pub fn op_ecdsa_pk_recover(
         return Err(avm_err(format!("unsupported curve {curve_byte}")));
     }
 
-    // Pop stack: recovery_id, S, R, data
-    let recid = machine.pop_uint()?;
+    // Pop stack: S, R, recovery_id, data (go: crypto.go:395-403)
     let sig_s = machine.pop_bytes()?;
     let sig_r = machine.pop_bytes()?;
+    let recid = machine.pop_uint()?;
     let data = machine.pop_bytes()?;
 
     if recid > 3 {
         return Err(avm_err(format!("invalid recovery id: {recid}")));
-    }
-
-    if data.len() != 32 {
-        return Err(avm_err(format!(
-            "the signed data must be 32 bytes long, not {}",
-            data.len()
-        )));
     }
 
     let (x, y) = ecdsa_recover_secp256k1(&data, &sig_r, &sig_s, recid as u8)?;
@@ -1131,19 +1126,32 @@ fn ecdsa_recover_secp256k1(
 ) -> Result<(Vec<u8>, Vec<u8>), AlgoError> {
     use k256::ecdsa::{RecoveryId, VerifyingKey};
 
-    let r_padded = pad_to_32(sig_r).ok_or_else(|| avm_err("pubkey recover failed: r too long"))?;
-    let s_padded = pad_to_32(sig_s).ok_or_else(|| avm_err("pubkey recover failed: s too long"))?;
+    // go (`opEcdsaPkRecover`, crypto.go:410-418) concatenates R || S || recid
+    // and `secp256k1.RecoverPubkey` requires exactly 32 data bytes
+    // (`ErrInvalidMsgLen`) and 65 signature bytes (`checkSignature`,
+    // `ErrInvalidSignatureLen`): the split between R and S is not enforced,
+    // so a 31-byte R with a 33-byte S recovers like the 32/32 pair.
+    if data.len() != 32 {
+        return Err(avm_err(
+            "pubkey recover failed: invalid message length, need 32 bytes",
+        ));
+    }
+    if sig_r.len() + sig_s.len() != 64 {
+        return Err(avm_err("pubkey recover failed: invalid signature length"));
+    }
     let mut sig_bytes = [0u8; 64];
-    sig_bytes[..32].copy_from_slice(&r_padded);
-    sig_bytes[32..].copy_from_slice(&s_padded);
+    sig_bytes[..sig_r.len()].copy_from_slice(sig_r);
+    sig_bytes[sig_r.len()..].copy_from_slice(sig_s);
 
+    // Every libsecp256k1 failure (r or s zero / not below n, no curve point for
+    // r (+ n), ...) is go's `ErrRecoverFailed`, "recovery failed".
     let sig = k256::ecdsa::Signature::from_slice(&sig_bytes)
-        .map_err(|e| avm_err(format!("pubkey recover failed: {e}")))?;
+        .map_err(|_| avm_err("pubkey recover failed: recovery failed"))?;
 
     let recovery_id = RecoveryId::new(recid & 1 != 0, recid & 2 != 0);
 
     let vk = VerifyingKey::recover_from_prehash(data, &sig, recovery_id)
-        .map_err(|e| avm_err(format!("pubkey recover failed: {e}")))?;
+        .map_err(|_| avm_err("pubkey recover failed: recovery failed"))?;
 
     let encoded = vk.to_sec1_point(false);
     let x = encoded
@@ -3186,11 +3194,10 @@ mod tests {
 
         let mut code = Vec::new();
         pushbytes(&mut code, &msg); // data (32 bytes)
+        code.push(0x81); // pushint: recovery id (go order: data, recid, R, S)
+        code.push(recid_val as u8);
         pushbytes(&mut code, r); // R
         pushbytes(&mut code, s); // S
-                                 // push recovery_id as uint64
-        code.push(0x81); // pushint
-        code.push(recid_val as u8);
         code.push(0x07); // ecdsa_pk_recover
         code.push(0x00); // Secp256k1
                          // Stack: [X, Y] with Y on top
@@ -3209,109 +3216,168 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_ecdsa_eth_address_ported_from_go() {
-        // TestEcdsaEthAddress (crypto_test.go#L825): a real-world
-        // ethereum-address-derivation composite program -- recover a
-        // secp256k1 public key from a signature, concat its X||Y bytes,
-        // keccak256 the result, take the last 20 bytes (substring 12 32),
-        // and compare against the address independently derived the same
-        // way (keccak256(X||Y)[12..32], the standard Ethereum address
-        // derivation), not just the raw recovery result.
-        //
-        // go's `opEcdsaPkRecover` (crypto.go:384-434) leaves the recovered
-        // key as `[..., X, Y]` (X below, Y on top), so its own `concat`
-        // (no `swap`) computes `X || Y` directly -- this is a ported,
-        // unmodified copy of go's exact opcode sequence (issue #1371).
-        use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
-        use sha3::{Digest, Keccak256};
-
-        let sk = SigningKey::from_bytes(&[7u8; 32].into()).unwrap();
-        let vk = sk.verifying_key();
-        let msg = Keccak256::digest(b"hello from ethereum");
-
-        let (sig, recid) = sk.sign_prehash(&msg).unwrap();
-        let sig_bytes = sig.to_bytes();
-        let r = &sig_bytes[..32];
-        let s = &sig_bytes[32..];
-
-        let expected = vk.to_sec1_point(false);
-        let expected_x = expected.x().unwrap();
-        let expected_y = expected.y().unwrap();
-
-        // Independently derive the Ethereum address the same way the AVM
-        // program will: keccak256(X || Y), last 20 bytes.
-        let mut xy = Vec::new();
-        xy.extend_from_slice(expected_x.as_slice());
-        xy.extend_from_slice(expected_y.as_slice());
-        let addr_hash = Keccak256::digest(&xy);
-        let eth_addr = &addr_hash[12..32];
-
-        let recid_val = recid.to_byte() as u64;
-
+    /// Assemble the `TestEcdsaEthAddress` opcode sequence
+    /// (`crypto_test.go:841-851`) in go's argument order: data, recovery id,
+    /// R, S (`opcodes.go:562`). `concat` takes the recovered `[X, Y]` directly
+    /// (Y on top, no `swap`), as go's own program does.
+    fn eth_address_program(r: &[u8], s: &[u8], recid: u8, eth_addr: &[u8]) -> Vec<u8> {
         let mut code = Vec::new();
         pushbytes(&mut code, b"hello from ethereum");
         code.push(0x02); // keccak256
+        code.push(0x81); // pushint: recovery id / "v"
+        code.push(recid);
         pushbytes(&mut code, r);
         pushbytes(&mut code, s);
-        code.push(0x81); // pushint (recovery id / "v")
-        code.push(recid_val as u8);
         code.push(0x07); // ecdsa_pk_recover
         code.push(0x00); // Secp256k1
-                         // Stack here is [X, Y] (Y on top), matching go's real order --
-                         // concat directly, no swap needed.
         code.push(0x50); // concat
         code.push(0x02); // keccak256
-        code.push(0x51); // substring
+        code.push(0x51); // substring 12 32
         code.push(12);
         code.push(32);
         pushbytes(&mut code, eth_addr);
         code.push(0x12); // ==
         code.push(0x43); // return
-
-        let m = run_prog(5, &code).unwrap();
-        assert!(
-            m.pass,
-            "eth-address derivation composite program should accept"
-        );
+        code
     }
 
+    /// Ports go's `TestEcdsaEthAddress` (crypto_test.go#L825): recover a
+    /// secp256k1 public key, derive the Ethereum address
+    /// (keccak256(X||Y)[12..32]) and compare. Run twice through one builder:
+    /// with go's own literal constants (issue #2253: the program in go's
+    /// argument order, which algod-rust used to reject), and with a signature
+    /// freshly produced by `k256` whose address is derived independently.
     #[test]
-    fn test_ecdsa_pk_recover_invalid_recid() {
+    fn test_ecdsa_eth_address_ported_from_go() {
+        use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
+        use sha3::{Digest, Keccak256};
+
+        // 1. go's literal vector.
+        let code = eth_address_program(
+            &hex_decode("745e8f55ac6189ee89ed707c36694868e3903988fbf776c8096c45da2e60c638"),
+            &hex_decode("30c8e4a9b5d2eb53ddc6294587dd00bed8afe2c45dd72f6b4cf752e46d5ba681"),
+            0,
+            &hex_decode("5ce9454909639d2d17a3f753ce7d93fa0b9ab12e"),
+        );
+        let m = run_prog(5, &code).expect("go accepts its own program at v5..v14");
+        assert!(m.pass, "go's TestEcdsaEthAddress program must accept");
+
+        // 2. a fresh signature, address derived independently.
+        let sk = SigningKey::from_bytes(&[7u8; 32].into()).unwrap();
+        let msg = Keccak256::digest(b"hello from ethereum");
+        let (sig, recid) = sk.sign_prehash(&msg).unwrap();
+        let sig_bytes = sig.to_bytes();
+        let expected = sk.verifying_key().to_sec1_point(false);
+        let mut xy = Vec::new();
+        xy.extend_from_slice(expected.x().unwrap().as_slice());
+        xy.extend_from_slice(expected.y().unwrap().as_slice());
+        let addr_hash = Keccak256::digest(&xy);
+        let code = eth_address_program(
+            &sig_bytes[..32],
+            &sig_bytes[32..],
+            recid.to_byte(),
+            &addr_hash[12..32],
+        );
+        let m = run_prog(5, &code).unwrap();
+        assert!(m.pass, "eth-address derivation must accept");
+    }
+
+    /// Issue #2253: the pre-fix (wrong) argument order, data, R, S, recovery id,
+    /// is rejected exactly as go rejects it: the argument gate reports slot 1
+    /// (the recovery id) as `[]byte` where go's proto wants `uint64`
+    /// (go: `ecdsa_pk_recover arg 1 wanted uint64 but got []byte`).
+    #[test]
+    fn test_ecdsa_pk_recover_rejects_the_old_argument_order_with_gos_message() {
         let mut code = Vec::new();
         pushbytes(&mut code, &[0u8; 32]); // data
         pushbytes(&mut code, &[1u8; 32]); // R
         pushbytes(&mut code, &[1u8; 32]); // S
-        code.push(0x81); // pushint
-        code.push(4); // recovery id = 4 (invalid, must be 0-3)
+        code.push(0x81); // pushint recovery id (wrong place)
+        code.push(0);
         code.push(0x07);
         code.push(0x00);
         code.push(0x43);
 
-        let result = run_prog(5, &code);
+        let Err(err) = run_prog(5, &code) else {
+            panic!("go rejects this order");
+        };
         assert!(
-            result.is_err(),
-            "ecdsa_pk_recover should error on recovery id > 3"
+            err.to_string()
+                .contains("ecdsa_pk_recover arg 1 wanted uint64 but got []byte"),
+            "{err}"
         );
+    }
+
+    /// libsecp256k1 edge cases (go-captured vectors `ecdsa_pk_recover/secp256k1/edge_*`
+    /// are replayed by `avm_opcode_conformance`, which compares pass/fail and the
+    /// recovered key): every failure reports go's `pubkey recover failed: recovery failed`.
+    #[test]
+    fn test_ecdsa_pk_recover_libsecp_failures_report_go_text() {
+        let n = hex_decode("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
+        let one = {
+            let mut v = vec![0u8; 32];
+            v[31] = 1;
+            v
+        };
+        let zero = vec![0u8; 32];
+        let cases: [(&[u8], &[u8], u8); 5] = [
+            (&zero, &one, 0), // r = 0
+            (&one, &zero, 0), // s = 0
+            (&n, &one, 0),    // r = n
+            (&one, &n, 0),    // s = n
+            (&one, &one, 2),  // r + n is not a curve x (go: recovery failed)
+        ];
+        for (r, s, recid) in cases {
+            let mut code = Vec::new();
+            pushbytes(&mut code, &[0x11u8; 32]);
+            code.push(0x81);
+            code.push(recid);
+            pushbytes(&mut code, r);
+            pushbytes(&mut code, s);
+            code.push(0x07);
+            code.push(0x00);
+            code.push(0x43);
+            let Err(e) = run_prog(5, &code) else {
+                panic!("go fails for r={r:02x?} s={s:02x?} recid={recid}");
+            };
+            assert!(
+                e.to_string()
+                    .contains("pubkey recover failed: recovery failed"),
+                "{e}"
+            );
+        }
+    }
+
+    /// Run `ecdsa_pk_recover <curve>` on `data, recid, R, S` and return the
+    /// error text (panics if the program does not error).
+    fn pk_recover_error(version: u8, curve: u8, recid: u8) -> String {
+        let mut code = Vec::new();
+        pushbytes(&mut code, &[0u8; 32]); // data
+        code.push(0x81); // pushint
+        code.push(recid);
+        pushbytes(&mut code, &[1u8; 32]); // R
+        pushbytes(&mut code, &[1u8; 32]); // S
+        code.push(0x07);
+        code.push(curve);
+        code.push(0x43);
+        match run_prog(version, &code) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("ecdsa_pk_recover should have errored"),
+        }
+    }
+
+    #[test]
+    fn test_ecdsa_pk_recover_invalid_recid() {
+        // go: `invalid recovery id: 4` (crypto.go:405), checked before anything else.
+        let e = pk_recover_error(5, 0x00, 4);
+        assert!(e.contains("invalid recovery id: 4"), "{e}");
     }
 
     #[test]
     fn test_ecdsa_pk_recover_secp256r1_unsupported() {
-        let mut code = Vec::new();
-        pushbytes(&mut code, &[0u8; 32]); // data
-        pushbytes(&mut code, &[1u8; 32]); // R
-        pushbytes(&mut code, &[1u8; 32]); // S
-        code.push(0x81); // pushint
-        code.push(0); // recovery id
-        code.push(0x07);
-        code.push(0x01); // Secp256r1
-        code.push(0x43);
-
-        let result = run_prog(7, &code);
-        assert!(
-            result.is_err(),
-            "ecdsa_pk_recover should error for secp256r1"
-        );
+        // go: `unsupported curve 1` (crypto.go:392) for a known-but-not-k1 curve.
+        let e = pk_recover_error(7, 0x01, 0);
+        assert!(e.contains("unsupported curve 1"), "{e}");
     }
 
     // -----------------------------------------------------------------------
