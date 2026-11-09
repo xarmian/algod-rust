@@ -84,7 +84,9 @@ PQ_CONFIRM_POLLS = 45
 # goal gave up waiting for a round although the transaction was submitted
 # (issue #2192): `Transaction <id> still pending as of round N` and/or
 # `timeout waiting for round`. Poll budget (x 2 s) to ask the ledger.
-WAIT_TIMEOUT_RE = re.compile(r"still pending as of round|timeout waiting for round")
+# `Env.sh`'s hard timeout (rc 124) reads "timeout after <N>s: <cmd>" and also
+# leaves the transaction's fate open.
+WAIT_TIMEOUT_RE = re.compile(r"still pending as of round|timeout waiting for round|timeout after \d+s:")
 WAIT_TIMEOUT_CONFIRM_POLLS = 10
 
 # Order of the first pass.  Every scenario runs once, in this order, before
@@ -201,8 +203,12 @@ class Env:
                 check=False,
             )
             return p.returncode, p.stdout.decode("utf-8", "replace")
-        except subprocess.TimeoutExpired:
-            return 124, "timeout after {}s: {}".format(timeout, cmd)
+        except subprocess.TimeoutExpired as e:
+            # Keep what the command printed before it was killed: goal prints a
+            # submitted transaction's id first, which is what a wait-timeout
+            # lookup (issue #2192/#2268) needs.
+            partial = e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, (bytes, bytearray)) else (e.stdout or "")
+            return 124, "timeout after {}s: {}\n{}".format(timeout, cmd, partial)
 
     def goal(self, args: str, timeout=180):
         w = " -w {}".format(self.wallet) if self.wallet else ""
@@ -336,29 +342,60 @@ class Workload:
 
         Confirmed means goal said so, or goal gave up waiting (its block-wait
         timeout can fire on a young chain while the transaction is already
-        committed, issue #2192) and the ledger has EVERY transaction goal
-        printed. Anything else, a real refusal included, is rejected: the
-        ledger is only asked when goal's own output says its wait timed out."""
+        committed, issue #2192; `Env.sh`'s hard timeout is the same case) and
+        the ledger has EVERY transaction goal printed. A creation step then
+        still gets its `app_id` / `asset_id` from the pending-transaction
+        response (issue #2268). Anything else, a real refusal included, is
+        rejected: the ledger is only asked when the output says the wait timed
+        out AND goal had printed a transaction id (a timeout before goal printed
+        one leaves nothing to look up, so it stays rejected)."""
         if rc == 0 and parsed["round"] is not None:
             return "confirmed", out
-        rnd = self.confirm_after_wait_timeout(out, parsed)
-        if rnd is not None:
+        found = self.confirm_after_wait_timeout(out, parsed)
+        if found is not None:
+            rnd, infos = found
             parsed["round"] = rnd
+            for info in infos:
+                if parsed["app_id"] is None and info.get("application-index"):
+                    parsed["app_id"] = int(info["application-index"])
+                if parsed["asset_id"] is None and info.get("asset-index"):
+                    parsed["asset_id"] = int(info["asset-index"])
             return "confirmed", "{}\n[ledger-confirmed after goal's wait timeout: round {}]".format(out, rnd)
         return "rejected", out
 
+    def pending_info(self, txid, node="go-node-1"):
+        """One lookup of `txid`: its pending-transaction response when it is
+        confirmed, else None (also when the node cannot answer)."""
+        try:
+            info = self.env.rest_json("/v2/transactions/pending/{}".format(txid), node=node)
+        except (urllib.error.URLError, OSError, ValueError):
+            return None
+        if int(info.get("confirmed-round") or 0) > 0:
+            return info
+        return None
+
     def confirm_after_wait_timeout(self, out, parsed):
-        """The highest confirmed round when goal's wait timed out and every
-        transaction id in its output is committed on go-node-1, else None."""
+        """(highest confirmed round, the txids' responses) when goal's wait
+        timed out and every transaction id in its output is committed on
+        go-node-1, else None. ONE budget of WAIT_TIMEOUT_CONFIRM_POLLS polls
+        (2 s apart, none after the last) is shared by all the txids."""
         if not parsed["txids"] or not WAIT_TIMEOUT_RE.search(out):
             return None
-        rounds = []
-        for t in parsed["txids"]:
-            r = self.pq_confirmed_round(t, "go-node-1", polls=WAIT_TIMEOUT_CONFIRM_POLLS)
-            if r is None:
-                return None
-            rounds.append(r)
-        return max(rounds)
+        waiting = list(parsed["txids"])
+        infos = {}
+        for i in range(WAIT_TIMEOUT_CONFIRM_POLLS):
+            for t in list(waiting):
+                info = self.pending_info(t)
+                if info is not None:
+                    infos[t] = info
+                    waiting.remove(t)
+            if not waiting:
+                break
+            if i < WAIT_TIMEOUT_CONFIRM_POLLS - 1:
+                self.env.sleep(2)
+        if waiting:
+            return None
+        return max(int(i["confirmed-round"]) for i in infos.values()), list(infos.values())
 
     def run(self, op, args, expect="confirmed", must=False):
         """Run a goal command that submits one transaction and waits."""
@@ -829,15 +866,13 @@ class Workload:
         submitted to, then on go-node-1 (a node that lags or cannot answer must
         not make a committed payment look rejected).  Its round, else None."""
         nodes = [node] + (["go-node-1"] if node != "go-node-1" else [])
-        for _ in range(polls):
+        for i in range(polls):
             for n in nodes:
-                try:
-                    info = self.env.rest_json("/v2/transactions/pending/{}".format(txid), node=n)
-                except (urllib.error.URLError, OSError, ValueError):
-                    continue
-                if int(info.get("confirmed-round") or 0) > 0:
+                info = self.pending_info(txid, node=n)
+                if info is not None:
                     return int(info["confirmed-round"])
-            self.env.sleep(2)
+            if i < polls - 1:
+                self.env.sleep(2)
         return None
 
     def pq_fee(self):

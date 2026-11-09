@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import unittest
+import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -830,6 +831,157 @@ class WaitTimeoutTest(unittest.TestCase):
         w, out = make(env)
         parsed, rec = w.run_shell("grp", "goal clerk rawsend -f g.stx", must=True)
         self.assertEqual((rec["outcome"], rec["ok"]), ("confirmed", True))
+
+
+class LeftoversTest(unittest.TestCase):
+    """Issue #2268: review leftovers of the wait-timeout handling."""
+
+    def _timeout_env(self, info, goal_prefix=("clerk send",), rc=1, header=None):
+        """An env whose goal commands matching `goal_prefix` time out with the
+        transaction submitted, and whose pending endpoint answers `info`."""
+
+        class E(FakeEnv):
+            sleeps = 0
+
+            def goal(self, args, timeout=180):
+                if args.startswith(goal_prefix):
+                    self.cmds.append("goal {} -d /algod/data".format(args))
+                    t = self._next_tx()
+                    body = TIMEOUT_OUT.format(t=t)
+                    if header:
+                        body = header + body
+                    return rc, body
+                return super().goal(args, timeout)
+
+            def rest_json(self, path, node="go-node-1"):
+                if "/v2/transactions/pending/" in path:
+                    self.rest_calls.append((node, path))
+                    if callable(info):
+                        return info(path)
+                    return dict(info)
+                return super().rest_json(path, node)
+
+            def sleep(self, s):
+                self.sleeps += 1
+
+        return E()
+
+    def test_a_created_asset_after_a_goal_timeout_still_has_its_id(self):
+        env = self._timeout_env({"confirmed-round": 11, "asset-index": 777}, goal_prefix=("asset create",))
+        w, out = make(env)
+        parsed, rec = w.run("asset create", "asset create --creator {} --total 1 --unitname X".format(ADDR), must=True)
+        self.assertEqual((rec["outcome"], rec["ok"]), ("confirmed", True))
+        self.assertEqual(parsed["asset_id"], 777)
+        self.assertEqual(parsed["round"], 11)
+
+    def test_a_created_app_after_a_goal_timeout_still_has_its_id(self):
+        env = self._timeout_env({"confirmed-round": 11, "application-index": 888}, goal_prefix=("app create",))
+        w, out = make(env)
+        parsed, rec = w.run("app create", "app create --creator {} --approval-prog a --clear-prog c".format(ADDR), must=True)
+        self.assertEqual(parsed["app_id"], 888)
+
+    def test_the_hard_shell_timeout_looks_up_the_txids_goal_had_printed(self):
+        class T(FakeEnv):
+            def goal(self, args, timeout=180):
+                if args.startswith("clerk send"):
+                    t = self._next_tx()
+                    return 124, "timeout after 180s: goal clerk send\nIssued transaction, txid {}\n".format(t)
+                return super().goal(args, timeout)
+
+        env = T()
+        w, out = make(env)
+        parsed, rec = w.run("fund", "clerk send -f {} -t {} -a 1".format(ADDR, ADDR), must=True)
+        self.assertEqual((rec["outcome"], rec["ok"]), ("confirmed", True))
+
+    def test_the_hard_shell_timeout_with_no_txid_printed_is_rejected_without_a_lookup(self):
+        class T(FakeEnv):
+            def goal(self, args, timeout=180):
+                if args.startswith("clerk send"):
+                    return 124, "timeout after 180s: goal clerk send -f {}".format(ADDR)
+                return super().goal(args, timeout)
+
+        env = T()
+        w, out = make(env)
+        parsed, rec = w.run("fund", "clerk send -f {} -t {} -a 1".format(ADDR, ADDR), expect="rejected")
+        self.assertEqual(rec["outcome"], "rejected")
+        self.assertEqual([c for c in env.rest_calls if "/pending/" in c[1]], [])
+
+    def test_env_sh_keeps_the_partial_output_of_a_timed_out_command(self):
+        import subprocess
+
+        def fake_run(*a, **k):
+            raise subprocess.TimeoutExpired(a[0], 5, output=b"Issued transaction, txid " + b"A" * 52 + b"\n")
+
+        real = wl.subprocess.run
+        wl.subprocess.run = fake_run
+        try:
+            rc, out = wl.Env().sh("goal clerk send", timeout=5)
+        finally:
+            wl.subprocess.run = real
+        self.assertEqual(rc, 124)
+        self.assertIn("timeout after 5s", out)
+        self.assertIn("A" * 52, out)
+
+    def test_the_timeout_phrase_with_no_txid_is_rejected_without_a_lookup(self):
+        class E(FakeEnv):
+            def goal(self, args, timeout=180):
+                if args.startswith("clerk send"):
+                    return 1, "Error processing command: timeout waiting for round\n"
+                return super().goal(args, timeout)
+
+        env = E()
+        w, out = make(env)
+        parsed, rec = w.run("fund", "clerk send -f {} -t {} -a 1".format(ADDR, ADDR), expect="rejected")
+        self.assertEqual(rec["outcome"], "rejected")
+        self.assertEqual([c for c in env.rest_calls if "/pending/" in c[1]], [])
+
+    def test_a_url_error_during_the_lookup_is_a_rejection_not_a_crash(self):
+        def boom(path):
+            raise urllib.error.URLError("connection refused")
+
+        env = self._timeout_env(boom)
+        w, out = make(env)
+        parsed, rec = w.run("fund", "clerk send -f {} -t {} -a 1".format(ADDR, ADDR), expect="rejected")
+        self.assertEqual(rec["outcome"], "rejected")
+
+    def test_the_lookup_budget_is_shared_by_the_whole_group_and_never_sleeps_after_the_last_poll(self):
+        class G(FakeEnv):
+            sleeps = 0
+
+            def sh(self, cmd, timeout=180):
+                if "rawsend" in cmd:
+                    self.cmds.append(cmd)
+                    ids = [self._next_tx() for _ in range(3)]
+                    return 1, "".join("Issued transaction, txid {}\n".format(i) for i in ids) + (
+                        "Transaction {} still pending as of round 2\nError processing command: timeout waiting for round\n".format(ids[0])
+                    )
+                return super().sh(cmd, timeout)
+
+            def rest_json(self, path, node="go-node-1"):
+                if "/v2/transactions/pending/" in path:
+                    self.rest_calls.append((node, path))
+                    return {"confirmed-round": 0}
+                return super().rest_json(path, node)
+
+            def sleep(self, s):
+                self.sleeps += 1
+
+        env = G()
+        w, out = make(env)
+        parsed, rec = w.run_shell("grp", "goal clerk rawsend -f g.stx", expect="rejected")
+        self.assertEqual(rec["outcome"], "rejected")
+        lookups = [c for c in env.rest_calls if "/pending/" in c[1]]
+        self.assertLessEqual(len(lookups), wl.WAIT_TIMEOUT_CONFIRM_POLLS * 3)
+        self.assertEqual(env.sleeps, wl.WAIT_TIMEOUT_CONFIRM_POLLS - 1)
+
+    def test_pq_confirmation_does_not_sleep_after_its_last_poll(self):
+        env = FakeEnv()
+        env.pending_confirmed = False
+        env.sleeps = 0
+        env.sleep = lambda s: setattr(env, "sleeps", env.sleeps + 1)
+        w, out = make(env)
+        self.assertIsNone(w.pq_confirmed_round(txid(1), "go-node-1", polls=4))
+        self.assertEqual(env.sleeps, 3)
 
 
 if __name__ == "__main__":
