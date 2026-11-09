@@ -1089,10 +1089,10 @@ class MockMonotoneTest(unittest.TestCase):
     (issue filed from the PR #2168 CI run)."""
 
     def test_mock_last_round_never_decreases_for_either_side(self):
-        import catchup as tier
+        import _catchup_mock as mock
         for impl in ("go", "rust"):
-            chain = tier.MockChain()
-            node = tier.MockNode(impl, chain, {"mock_fault": "none"})
+            chain = mock.MockChain()
+            node = mock.MockNode(impl, chain, {"mock_fault": "none"})
             node.trigger = chain.t0 - 10  # the catchup finished long ago: following the tip
             prev = 0
             for i in range(600):
@@ -1102,11 +1102,11 @@ class MockMonotoneTest(unittest.TestCase):
                 prev = cur
 
     def test_a_round_agreed_earlier_is_served_by_both_nodes_later(self):
-        import catchup as tier
-        chain = tier.MockChain()
+        import _catchup_mock as mock
+        chain = mock.MockChain()
         nodes = {}
         for impl in ("go", "rust"):
-            nodes[impl] = tier.MockNode(impl, chain, {"mock_fault": "none"})
+            nodes[impl] = mock.MockNode(impl, chain, {"mock_fault": "none"})
             nodes[impl].trigger = chain.t0 - 10
         for i in range(300):
             t = chain.t0 + i * 0.0211
@@ -1114,6 +1114,48 @@ class MockMonotoneTest(unittest.TestCase):
             for later in (t + 0.001, t + 0.13):
                 for x in nodes:
                     self.assertLessEqual(agreed, nodes[x].status(later)["last-round"], (i, x))
+
+
+class MockModuleSplitTest(unittest.TestCase):
+    """The mock network lives in `_catchup_mock` and is imported only in mock
+    mode (issue #2167)."""
+
+    def _fresh_tier(self):
+        import importlib
+        sys.modules.pop("_catchup_mock", None)
+        sys.modules.pop("catchup", None)
+        return importlib.import_module("catchup")
+
+    def test_importing_the_tier_does_not_load_the_mock(self):
+        self._fresh_tier()
+        self.assertNotIn("_catchup_mock", sys.modules)
+
+    def test_a_live_mode_label_resolution_does_not_load_the_mock(self):
+        tier = self._fresh_tier()
+        self.assertEqual(tier.resolve_label({"label": "123#" + "A" * 52, "mode": "live"}),
+                         "123#" + "A" * 52)
+        self.assertNotIn("_catchup_mock", sys.modules)
+
+    def test_mock_mode_loads_it_lazily(self):
+        tier = self._fresh_tier()
+        label = tier.resolve_label({"label": "", "mode": "mock"})
+        self.assertIn("_catchup_mock", sys.modules)
+        self.assertEqual(label, sys.modules["_catchup_mock"].MOCK_LABEL)
+
+    def test_the_tier_script_no_longer_carries_the_mock(self):
+        with open(os.path.join(HERE, "tiers", "catchup.py"), encoding="utf-8") as f:
+            text = f.read()
+        for name in ("MockChain", "MockNode", "mock_hash", "MOCK_LABEL", "MOCK_ROUND0",
+                     "MOCK_RETENTION"):
+            self.assertNotIn(name, text)
+        self.assertNotIn("import bench_schema", text)
+
+    def test_tier_discovery_does_not_list_the_mock_module(self):
+        import run
+        tiers = run.discover_tiers()
+        self.assertIn("catchup", tiers)
+        self.assertNotIn("_catchup_mock", tiers)
+        self.assertFalse([t for t in tiers if t.startswith("_")])
 
 
 if __name__ == "__main__":
