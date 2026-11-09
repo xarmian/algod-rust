@@ -1,0 +1,18 @@
+# HELP algod_agreement_handled_vote Number of agreement vote messages handled
+# TYPE algod_agreement_handled_vote counter
+algod_agreement_handled_vote 641
+# HELP algod_tx_pool_reeval_cap Number of transaction groups removed from pool during re-evaluation due to cap.
+# TYPE algod_tx_pool_reeval_cap counter
+algod_tx_pool_reeval_cap 0
+# HELP algod_transaction_messages_txpool_remember_err_fee Number of transaction messages not remembered by txpool b/c of fee.
+# TYPE algod_transaction_messages_txpool_remember_err_fee counter
+algod_transaction_messages_txpool_remember_err_fee 4
+# HELP algod_transaction_messages_txpool_remember_err_cap Number of transaction messages not remembered by txpool b/c of cap.
+# TYPE algod_transaction_messages_txpool_remember_err_cap counter
+algod_transaction_messages_txpool_remember_err_cap 0
+# HELP algod_transaction_messages_txpool_check_err_txid Number of transaction messages that didn't pass check by txpool b/c of txid.
+# TYPE algod_transaction_messages_txpool_check_err_txid counter
+algod_transaction_messages_txpool_check_err_txid 9
+# HELP algod_tx_pool_count current number of available transactions in pool
+# TYPE algod_tx_pool_count gauge
+algod_tx_pool_count 21

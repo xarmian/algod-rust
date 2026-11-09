@@ -1190,12 +1190,46 @@ Per step, the rows `<step>/<metric>`:
 | `cpu_cores` | cores | Sum over the five containers of the mean CPU% / 100 (`docker stats`, sampled about every 2 s) over the same submission interval. |
 | `rss_mb_peak` | MB | Sum of every container's peak memory usage. |
 | `blockio_write_mb` | MB | Block-device bytes written by the five containers in the step. |
+| `pool_size_end` | txns | The largest `algod_tx_pool_count` of the five nodes, scraped from `/metrics` right after the step (see "Paired `/metrics` series"). |
+| `pool_rejected_remember` | txns | Groups the nodes' pools refused to remember from gossip: the sum over the nodes of the `algod_transaction_messages_txpool_remember_err_*` counters, as a delta between a scrape before the generator starts and one after it ends. |
+| `pool_rejected_check` | txns | The same for the `algod_transaction_messages_txpool_check_err_*` counters (groups that failed the pool's check). |
 
 The `fixed` step also reports how fast the whole set was committed, measured on
 the chain and not by polling: `commit_rounds` and `commit_time_s` are the rounds
 and block-header seconds from the block before the first submission to the block
 holding the last transaction (one-second timestamp resolution), and `set_tps` is
 the set size over that time. `commit_rounds` is the most robust of the three.
+
+### Paired `/metrics` series
+
+Both implementations serve an unauthenticated Prometheus `GET /metrics`, but the
+two expositions are different sets. The tier pairs only what both expose under
+the same name (issue #2151); each node is scraped once before the generator starts
+and once after it ends (the window therefore includes the confirmation tail, unlike
+`confirmed_tps`).
+
+| Series | Row | go-algorand | algod-rust |
+|---|---|---|---|
+| `algod_tx_pool_count` (gauge) | `pool_size_end` | `node/node.go` `txPoolGauge`, refreshed every 10 s | the same series, current at scrape time (added for this tier) |
+| `algod_transaction_messages_txpool_remember_err_{tag}` (counter) | `pool_rejected_remember` | `data/txHandler.go`, a tag appears on its first event | every tag always present |
+| `algod_transaction_messages_txpool_check_err_{tag}` (counter) | `pool_rejected_check` | `data/txHandler.go`, a tag appears on its first event | every tag always present |
+
+A counter family that is absent from a node that answered counts as zero; a series
+that goes down between the scrapes means the node restarted and counts from its
+current value; a node whose scrape failed is left out of that step's rows (the step
+never fails on a scrape). Go refreshes the pool-size gauge only every 10 s, so
+`pool_size_end` on go can lag the real pool by up to that long; read it as an
+order of magnitude, not an exact count. The `max` step reports no
+`pool_rejected_*` rows (an unbounded offer rejects by design, as for `rejected_groups`).
+
+**Not paired** (present on one side only, or under different names, so a
+comparison would be of two different quantities): algod-rust's
+`algod_rust_*` series (follow-path timing histograms, pool evaluation lock
+counters, agreement participation counters, process start time); go's
+`algod_agreement_*` timings and network, ledger and crypto-pool series, which
+algod-rust does not expose under the same names; the pool re-evaluation counters
+`algod_tx_pool_reeval_*` (they describe block assembly, not admission); and the process CPU and memory series,
+which the tier takes from `docker stats` for both instead.
 
 The raw generator reports, the stats samples (`*-samples.jsonl`) and, on a
 failure, each node's last 3,000 log lines land in `logs/localnet/` of the run

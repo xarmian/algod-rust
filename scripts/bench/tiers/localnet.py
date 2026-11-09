@@ -29,8 +29,9 @@ driving the same steps:
 
 Per step: confirmed TPS (txns committed between two block headers over their
 chain time), submit TPS, submit->commit latency p50/p95/p99 (sampled by the
-generator), mean round time, rejected groups, and the cluster's CPU cores,
-peak RSS and block-device writes (`docker stats`). Results are schema-v1 rows
+generator), mean round time, rejected groups, the cluster's CPU cores,
+peak RSS and block-device writes (`docker stats`), and the pool series both
+nodes expose on `/metrics` (peak pool size, pool rejections; issue #2151). Results are schema-v1 rows
 named `<step>/<metric>`; one sample per run, the report adds the Rust/Go ratio.
 A diverging txid set is a parity bug, not a benchmark result: the tier fails.
 
@@ -302,6 +303,7 @@ class Cluster:
         with open(self.compose, "w", encoding="utf-8", newline="\n") as f:
             f.write(ll.render_compose(top))
         self.samples = []
+        self.last_pool_metrics = {}
         self._stop = threading.Event()
         self._thread = None
 
@@ -319,6 +321,22 @@ class Cluster:
                 return json.loads(r.read().decode("utf-8"))
 
         return ll.with_retry(call, attempts=attempts)
+
+    def scrape_metrics(self):
+        """{node: parsed `GET /metrics`} for every node, None for one that did
+        not answer (the endpoint is unauthenticated on both implementations; a
+        failed scrape drops that node from the paired rows, it never fails the
+        step)."""
+        out = {}
+        for svc in ll.SERVICES:
+            url = f"http://127.0.0.1:{ll.host_port(self.cfg['port_base'], svc)}/metrics"
+            try:
+                out[svc] = ll.parse_metrics(ll.with_retry(
+                    lambda u=url: urllib.request.urlopen(u, timeout=8).read().decode(
+                        "utf-8", "replace"), attempts=2))
+            except (urllib.error.URLError, OSError, ValueError):
+                out[svc] = None
+        return out
 
     def round_of(self, svc, attempts=4):
         try:
@@ -438,6 +456,7 @@ class Cluster:
             log(f"{self.impl}: WARNING: {name} starts with {backlog} txns still pooled "
                 "(recorded as start_backlog_txns)")
         r_before = ll.require_round(self.round_of("relay"), "relay")
+        metrics_before = self.scrape_metrics()
         t_before = time.time()
         rep = self.loadgen(work, name, extra, timeout)
         t_after = time.time()
@@ -453,6 +472,9 @@ class Cluster:
         else:
             ll.wait_for_round(lambda: self.round_of("relay"), end_r, 120)
         p0, p1 = self.point(start_r), self.point(end_r)
+        # Issue #2151: the paired `/metrics` series of the step (pool size and
+        # pool rejections), read from the nodes themselves.
+        self.last_pool_metrics = ll.pool_metrics(metrics_before, self.scrape_metrics())
         window = ll.window_stats(p0, p1)
         res = ll.resource_summary(self.samples, w["t0"] or t_before, w["t1"] or t_after)
         return rep, window, res, p0, p1, backlog
@@ -499,6 +521,7 @@ def run_cluster(impl, cfg, work, shared, genesis_id, partkeys, addrs, raw_dir, r
         p_last = cl.point(last) if last is not None else p1
         steps["fixed"] = ll.fixed_metrics(rep, window, res, ll.commit_span(p0, p_last))
         steps["fixed"].update(ll.backlog_metrics(backlog))
+        steps["fixed"].update(cl.last_pool_metrics)
         fixed_window, fixed_res = window, res
         side = final_state(cl, addrs)
         # Transactions the chain committed since before the first submission:
@@ -524,8 +547,11 @@ def run_cluster(impl, cfg, work, shared, genesis_id, partkeys, addrs, raw_dir, r
                 timeout=cfg["step_secs"] + 300)
             m = ll.step_metrics(rep2, window, res)
             m.update(ll.backlog_metrics(backlog))
+            m.update(cl.last_pool_metrics)
             if name == "max":
-                m.pop("rejected_groups", None)  # an unbounded offer rejects by design
+                # an unbounded offer rejects by design
+                for k in ("rejected_groups", "pool_rejected_remember", "pool_rejected_check"):
+                    m.pop(k, None)
             steps[name] = m
             with open(os.path.join(raw_dir, f"{impl}-run{run_no}-{name}.json"), "w",
                       encoding="utf-8", newline="\n") as f:
