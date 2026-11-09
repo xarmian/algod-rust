@@ -124,9 +124,11 @@ pub fn op_eq(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(),
         (AvmValue::Uint64(va), AvmValue::Uint64(vb)) => va == vb,
         (AvmValue::Bytes(va), AvmValue::Bytes(vb)) => va == vb,
         _ => {
-            return Err(avm_err(
-                "== type mismatch: both operands must be the same type",
-            ))
+            return Err(avm_err(format!(
+                "cannot compare ({} to {})",
+                machine.stack[len - 2].type_name(),
+                machine.stack[len - 1].type_name()
+            )))
         }
     };
     machine.stack.truncate(len - 1);
@@ -147,9 +149,11 @@ pub fn op_neq(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<()
         (AvmValue::Uint64(va), AvmValue::Uint64(vb)) => va != vb,
         (AvmValue::Bytes(va), AvmValue::Bytes(vb)) => va != vb,
         _ => {
-            return Err(avm_err(
-                "!= type mismatch: both operands must be the same type",
-            ))
+            return Err(avm_err(format!(
+                "cannot compare ({} to {})",
+                machine.stack[len - 2].type_name(),
+                machine.stack[len - 1].type_name()
+            )))
         }
     };
     machine.stack.truncate(len - 1);

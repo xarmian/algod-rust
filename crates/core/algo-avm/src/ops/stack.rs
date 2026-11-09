@@ -56,7 +56,7 @@ pub fn op_dig(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(),
     let len = machine.stack.len();
     if n >= len {
         return Err(AlgoError::Avm {
-            message: format!("dig {n}: stack underflow (stack depth {len})"),
+            message: format!("dig {n} with stack size = {len}"),
         });
     }
     let val = machine.stack[len - 1 - n].clone();
@@ -95,7 +95,7 @@ pub fn op_cover(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(
     let len = machine.stack.len();
     if n >= len {
         return Err(AlgoError::Avm {
-            message: format!("cover {n}: stack underflow (stack depth {len})"),
+            message: format!("cover {n} with stack size = {len}"),
         });
     }
     // Remove top and insert at position len-1-n.
@@ -111,7 +111,7 @@ pub fn op_uncover(machine: &mut AvmMachine, instruction: &Instruction) -> Result
     let len = machine.stack.len();
     if n >= len {
         return Err(AlgoError::Avm {
-            message: format!("uncover {n}: stack underflow (stack depth {len})"),
+            message: format!("uncover {n} with stack size = {len}"),
         });
     }
     // Remove element at position len-1-n and push it on top.
@@ -128,7 +128,7 @@ pub fn op_bury(machine: &mut AvmMachine, instruction: &Instruction) -> Result<()
     let len = machine.stack.len();
     if n == 0 || n > len {
         return Err(AlgoError::Avm {
-            message: format!("bury {n}: invalid depth (remaining stack depth {len})"),
+            message: "bury outside stack".to_string(),
         });
     }
     machine.stack[len - n] = val;
@@ -141,7 +141,7 @@ pub fn op_popn(machine: &mut AvmMachine, instruction: &Instruction) -> Result<()
     let len = machine.stack.len();
     if n > len {
         return Err(AlgoError::Avm {
-            message: format!("popn {n}: stack underflow (stack depth {len})"),
+            message: format!("popn {n} while stack contains {len}"),
         });
     }
     machine.stack.truncate(len - n);
@@ -184,10 +184,7 @@ pub fn op_stores(machine: &mut AvmMachine, _instruction: &Instruction) -> Result
     let idx = machine.pop_uint()? as usize;
     if idx >= machine.scratch.len() {
         return Err(AlgoError::Avm {
-            message: format!(
-                "stores: index {idx} out of range (scratch has {} slots)",
-                machine.scratch.len()
-            ),
+            message: format!("invalid Scratch index {idx}"),
         });
     }
     machine.scratch[idx] = val;
@@ -199,10 +196,7 @@ pub fn op_loads(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<
     let idx = machine.pop_uint()? as usize;
     if idx >= machine.scratch.len() {
         return Err(AlgoError::Avm {
-            message: format!(
-                "loads: index {idx} out of range (scratch has {} slots)",
-                machine.scratch.len()
-            ),
+            message: format!("invalid Scratch index {idx}"),
         });
     }
     let val = machine.scratch[idx].clone();

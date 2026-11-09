@@ -127,7 +127,7 @@ pub fn op_concat(machine: &mut AvmMachine, _instruction: &Instruction) -> Result
     let total = a.len() + b.len();
     if total > MAX_BYTES_LEN {
         return Err(avm_err(format!(
-            "concat: result length {total} exceeds maximum {MAX_BYTES_LEN}"
+            "concat produced a too big ({total}) byte-array"
         )));
     }
     let mut result = a;
@@ -181,21 +181,56 @@ pub fn op_extract(machine: &mut AvmMachine, instruction: &Instruction) -> Result
         _ => return Err(avm_err("extract: expected Uint8Pair immediate")),
     };
     let a = machine.pop_bytes()?;
-    if s > a.len() {
-        return Err(avm_err(format!("extract: start {s} > length {}", a.len())));
-    }
     if l == 0 {
+        if s > a.len() {
+            return Err(extraction_start_error(s, a.len()));
+        }
         machine.push(crate::machine::AvmValue::Bytes(a[s..].to_vec()))
     } else {
-        let end = s + l;
-        if end > a.len() {
-            return Err(avm_err(format!(
-                "extract: start {s} + length {l} > byte length {}",
-                a.len()
-            )));
-        }
+        let end = check_extract(a.len(), s, l)?;
         machine.push(crate::machine::AvmValue::Bytes(a[s..end].to_vec()))
     }
+}
+
+/// go's `extractCarefully` bounds checks (`eval.go`), in go's order and with
+/// go's texts: start beyond the length, end overflowing uint64, end beyond the
+/// length. Returns the exclusive end offset.
+fn check_extract(len: usize, start: usize, length: usize) -> Result<usize, AlgoError> {
+    if start > len {
+        return Err(extraction_start_error(start, len));
+    }
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| avm_err("extraction end exceeds uint64"))?;
+    if end > len {
+        return Err(avm_err(format!(
+            "extraction end {end} is beyond length: {len}"
+        )));
+    }
+    Ok(end)
+}
+
+fn extraction_start_error(start: usize, len: usize) -> AlgoError {
+    avm_err(format!("extraction start {start} is beyond length: {len}"))
+}
+
+/// go's `opReplace` bounds checks (`eval.go`), in go's order and with go's
+/// texts. Returns the exclusive end offset of the replaced range.
+fn check_replace(len: usize, start: usize, replacement_len: usize) -> Result<usize, AlgoError> {
+    if start > len {
+        return Err(avm_err(format!(
+            "replacement start {start} beyond length: {len}"
+        )));
+    }
+    let end = start
+        .checked_add(replacement_len)
+        .ok_or_else(|| avm_err("replacement end exceeds uint64"))?;
+    if end > len {
+        return Err(avm_err(format!(
+            "replacement end {end} beyond original length: {len}"
+        )));
+    }
+    Ok(end)
 }
 
 /// `extract3` (0x58): pop l, pop s, pop a, push a[s..s+l].
@@ -203,15 +238,7 @@ pub fn op_extract3(machine: &mut AvmMachine, _instruction: &Instruction) -> Resu
     let l = machine.pop_uint()? as usize;
     let s = machine.pop_uint()? as usize;
     let a = machine.pop_bytes()?;
-    let end = s
-        .checked_add(l)
-        .ok_or_else(|| avm_err(format!("extract3: start {s} + length {l} overflows")))?;
-    if end > a.len() {
-        return Err(avm_err(format!(
-            "extract3: start {s} + length {l} > byte length {}",
-            a.len()
-        )));
-    }
+    let end = check_extract(a.len(), s, l)?;
     machine.push(crate::machine::AvmValue::Bytes(a[s..end].to_vec()))
 }
 
@@ -222,12 +249,7 @@ pub fn op_extract_uint16(
 ) -> Result<(), AlgoError> {
     let s = machine.pop_uint()? as usize;
     let a = machine.pop_bytes()?;
-    if s.checked_add(2).is_none_or(|end| end > a.len()) {
-        return Err(avm_err(format!(
-            "extract_uint16: offset {s} + 2 > length {}",
-            a.len()
-        )));
-    }
+    check_extract(a.len(), s, 2)?;
     let val = u16::from_be_bytes([a[s], a[s + 1]]);
     machine.push(crate::machine::AvmValue::Uint64(val as u64))
 }
@@ -239,12 +261,7 @@ pub fn op_extract_uint32(
 ) -> Result<(), AlgoError> {
     let s = machine.pop_uint()? as usize;
     let a = machine.pop_bytes()?;
-    if s.checked_add(4).is_none_or(|end| end > a.len()) {
-        return Err(avm_err(format!(
-            "extract_uint32: offset {s} + 4 > length {}",
-            a.len()
-        )));
-    }
+    check_extract(a.len(), s, 4)?;
     let val = u32::from_be_bytes([a[s], a[s + 1], a[s + 2], a[s + 3]]);
     machine.push(crate::machine::AvmValue::Uint64(val as u64))
 }
@@ -256,12 +273,7 @@ pub fn op_extract_uint64(
 ) -> Result<(), AlgoError> {
     let s = machine.pop_uint()? as usize;
     let a = machine.pop_bytes()?;
-    if s.checked_add(8).is_none_or(|end| end > a.len()) {
-        return Err(avm_err(format!(
-            "extract_uint64: offset {s} + 8 > length {}",
-            a.len()
-        )));
-    }
+    check_extract(a.len(), s, 8)?;
     let val = u64::from_be_bytes([
         a[s],
         a[s + 1],
@@ -283,19 +295,7 @@ pub fn op_replace2(machine: &mut AvmMachine, instruction: &Instruction) -> Resul
     };
     let b = machine.pop_bytes()?;
     let mut a = machine.pop_bytes()?;
-    let end = s.checked_add(b.len()).ok_or_else(|| {
-        avm_err(format!(
-            "replace2: start {s} + replacement length {} overflows",
-            b.len()
-        ))
-    })?;
-    if end > a.len() {
-        return Err(avm_err(format!(
-            "replace2: start {s} + replacement length {} > byte length {}",
-            b.len(),
-            a.len()
-        )));
-    }
+    let end = check_replace(a.len(), s, b.len())?;
     a[s..end].copy_from_slice(&b);
     machine.push(crate::machine::AvmValue::Bytes(a))
 }
@@ -305,19 +305,7 @@ pub fn op_replace3(machine: &mut AvmMachine, _instruction: &Instruction) -> Resu
     let b = machine.pop_bytes()?;
     let s = machine.pop_uint()? as usize;
     let mut a = machine.pop_bytes()?;
-    let end = s.checked_add(b.len()).ok_or_else(|| {
-        avm_err(format!(
-            "replace3: start {s} + replacement length {} overflows",
-            b.len()
-        ))
-    })?;
-    if end > a.len() {
-        return Err(avm_err(format!(
-            "replace3: start {s} + replacement length {} > byte length {}",
-            b.len(),
-            a.len()
-        )));
-    }
+    let end = check_replace(a.len(), s, b.len())?;
     a[s..end].copy_from_slice(&b);
     machine.push(crate::machine::AvmValue::Bytes(a))
 }
