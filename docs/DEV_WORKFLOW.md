@@ -1605,6 +1605,35 @@ written, so the repair retries on the next open. Downgrade-then-upgrade is an
 unsupported flow: rows written by the older build after the marker was set are
 not repaired again.
 
+## Abandoning a stuck cut-over catchup (issue #2181)
+
+algod-rust cuts the live ledger over to the catchpoint snapshot early (#2121),
+so once a catchup has passed the import (verification, lookback or replay) a
+request for a DIFFERENT catchpoint is refused with go's `unable to start
+catchpoint catchup for 'B' - already catching up 'A'` (followed by a pointer to
+this section), and aborting a cut-over run keeps its marker. go has no such
+state (its live ledger is untouched until the final Switch stage). A request
+for the same catchpoint as the marker, or without one, still resumes it.
+
+If catchup A can never finish (peers stopped serving it, its file is gone,
+verification keeps failing), abandon it by discarding the ledger:
+
+1. Stop the node.
+2. In the node's ledger directory (`<data-dir>/<genesis-id>/`), delete
+   `ledger.tracker.sqlite` and `ledger.block.sqlite` with their `-wal` and
+   `-shm` files, and every `catchpoint-*.tar.gz` and `catchpoint-*.tmp`. This
+   discards the node's whole ledger, not only the stuck snapshot: move the
+   files elsewhere instead if you want to keep them.
+3. Start the node and request catchup B (`PUT /v2/catchup/<B>`, or
+   `catchpoint-sync --catchpoint <B>`).
+
+There is deliberately no automated in-place escape. Discarding only what the
+stuck catchup wrote would have to remove its block, `txtail`, voters-snapshot
+and other tracker rows from a live ledger before B is downloaded and verified;
+a failure in between (no peer for B, a failed import) would leave a node whose
+tables and block rows disagree, while deleting the whole ledger has no partial
+state.
+
 ## Divergence hunts: diffing against public nodes
 
 `scripts/state_diff.py` compares one round (and any number of addresses)

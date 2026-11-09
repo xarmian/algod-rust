@@ -1302,6 +1302,11 @@ impl SyncOrchestrator {
     /// Refuse a catchup for another label than the verified-or-later marker's
     /// (see [`Self::classify_marker`]) with go's
     /// `MakeCatchpointUnableToStartError` text. Nothing on disk is touched.
+    ///
+    /// go's text is kept as the prefix; the hint after it is algod-rust's own
+    /// (go has no cut-over state): this ledger already holds a snapshot of the
+    /// other catchpoint, and the only way out is to discard the ledger (issue
+    /// #2181, `docs/DEV_WORKFLOW.md`, "Abandoning a stuck cut-over catchup").
     fn reject_other_label(&mut self, persisted: &PersistedSyncState) -> AlgoError {
         // Past the import the ledger is cut over: report it as such.
         self.ledger_cut_over = true;
@@ -1312,7 +1317,10 @@ impl SyncOrchestrator {
             .unwrap_or_default();
         AlgoError::Ledger {
             message: format!(
-                "unable to start catchpoint catchup for '{}' - already catching up '{running}'",
+                "unable to start catchpoint catchup for '{}' - already catching up '{running}' \
+                 (this ledger already holds a cut-over snapshot of that catchpoint; to abandon \
+                 it, stop the node, delete the ledger and catchpoint files and restart: see \
+                 \"Abandoning a stuck cut-over catchup\" in docs/DEV_WORKFLOW.md)",
                 self.config.catchpoint_label.as_deref().unwrap_or_default()
             ),
         }
@@ -5654,16 +5662,19 @@ mod tests {
         {
             let r =
                 run_over_marker_for_a(state.clone(), Some(STALE_LABEL_B), line!() + i as u32).await;
-            assert_eq!(
-                r.err.as_deref(),
-                Some(
-                    format!(
-                        "ledger error: unable to start catchpoint catchup for \
-                         '{STALE_LABEL_B}' - already catching up '{STALE_LABEL_A}'"
-                    )
-                    .as_str()
-                ),
-                "{state}"
+            let err = r.err.as_deref().expect("the request is refused");
+            // go's text first, then algod-rust's recovery hint (issue #2181).
+            assert!(
+                err.starts_with(&format!(
+                    "ledger error: unable to start catchpoint catchup for \
+                     '{STALE_LABEL_B}' - already catching up '{STALE_LABEL_A}' ("
+                )),
+                "{state}: {err}"
+            );
+            assert!(
+                err.contains("stop the node, delete the ledger and catchpoint files")
+                    && err.contains("Abandoning a stuck cut-over catchup"),
+                "{state}: {err}"
             );
             assert!(r.cut_over, "{state}");
             assert_marker_a_untouched(&r, &state);
