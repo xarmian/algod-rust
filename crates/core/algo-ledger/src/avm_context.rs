@@ -3883,10 +3883,9 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         // `family_shared` is true when the box behaves like family-shared
         // state: owned by a same-creator app that has opted into
         // `FamilyBoxAccess`.
-        let family_shared;
-        if owner_app_id == self.app_id {
+        let family_shared = if owner_app_id == self.app_id {
             // An app may always access its own boxes.
-            family_shared = owner_params.family_box_access;
+            owner_params.family_box_access
         } else {
             // Resolve whether the calling app shares a creator with the
             // owner, but only pay the cost of the lookup when
@@ -3916,8 +3915,8 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                     ),
                 });
             }
-            family_shared = in_family;
-        }
+            in_family
+        };
 
         if !family_shared {
             return Ok(());

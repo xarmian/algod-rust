@@ -211,6 +211,7 @@ fn err_response(status: StatusCode, message: impl Into<String>) -> Response {
 /// 400 on parse failure.  Used by every POST handler — Go has the
 /// same boilerplate (`json.NewDecoder(r.Body).Decode(&req)` →
 /// `errorResponse(w, StatusBadRequest, errCouldNotDecode)`).
+#[allow(clippy::result_large_err)] // the error is the HTTP response itself, built only on the error path
 async fn decode_body<T>(req: axum::extract::Request) -> Result<T, Response>
 where
     T: serde::de::DeserializeOwned,
@@ -305,6 +306,7 @@ fn generate_wallet_id() -> Result<String, Error> {
 /// Run a synchronous closure on a blocking worker.  SQLite + scrypt
 /// are CPU-bound and would otherwise stall the tokio runtime if
 /// invoked directly from a handler.
+#[allow(clippy::result_large_err)] // the error is the HTTP response itself, built only on the error path
 async fn blocking<T, F>(f: F) -> Result<T, Response>
 where
     F: FnOnce() -> Result<T, Error> + Send + 'static,
@@ -326,6 +328,7 @@ where
 /// Like [`blocking`] but with a caller-supplied status code override
 /// (used by init-wallet, which converts a `Decrypt` error from a
 /// password check into 401 instead of the default 400).
+#[allow(clippy::result_large_err)] // the error is the HTTP response itself, built only on the error path
 async fn blocking_with_status<T, F>(f: F, error_status: StatusCode) -> Result<T, Response>
 where
     F: FnOnce() -> Result<T, Error> + Send + 'static,
