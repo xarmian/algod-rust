@@ -5905,6 +5905,9 @@ pub(crate) fn open_and_configure_participate_ledger(
         }
     }
 
+    // Issue #2210: archived rounds above the tracker round are replayed first.
+    super::node::replay_archive_at_startup(&mut sqlite_ledger);
+
     Ok(sqlite_ledger)
 }
 
