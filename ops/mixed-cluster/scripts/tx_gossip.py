@@ -79,8 +79,10 @@ def run_check(net, *, nodes, sources, count, within_s, build, poll_s=0.1,
     document (see `pass`, `pairs`, `sources`)."""
     pairs, source_rows = [], []
     for src in sources:
-        round_before = net.round_of(src)
         raws = [build(src, i) for i in range(count)]
+        # After the (slow, goal-in-docker) build: commit_rounds counts from the
+        # moment the first payment is submitted.
+        round_before = net.round_of(src)
         t0 = net.now()
         txids = []
         for raw in raws:
