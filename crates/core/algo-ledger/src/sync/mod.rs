@@ -203,6 +203,41 @@ pub fn cancelled_error() -> AlgoError {
 /// The text of [`cancelled_error`].
 const CANCELLED_MESSAGE: &str = "sync cancelled by user";
 
+/// A catchpoint import's failure as the orchestrator reports it: a cancellation
+/// (the token fired between chunks, issue #2142) is the ordinary
+/// [`cancelled_error`], so the abort/shutdown handling applies to it; anything
+/// else is a real failure and keeps its text.
+fn import_failure(e: crate::catchpoint::CatchpointError) -> AlgoError {
+    match e {
+        crate::catchpoint::CatchpointError::Cancelled => cancelled_error(),
+        e => AlgoError::Ledger {
+            message: format!("catchpoint import failed: {e}"),
+        },
+    }
+}
+
+#[cfg(test)]
+mod import_failure_tests {
+    use super::*;
+    use crate::catchpoint::CatchpointError;
+
+    /// Issue #2142: an import cancelled between chunks is the ordinary
+    /// cancellation (abort/shutdown handling applies); any other failure keeps
+    /// its text.
+    #[test]
+    fn a_cancelled_import_is_the_ordinary_cancellation() {
+        assert!(is_cancelled_error(&import_failure(
+            CatchpointError::Cancelled
+        )));
+        let other = import_failure(CatchpointError::IntegrityError("truncated".to_string()));
+        assert!(!is_cancelled_error(&other));
+        assert!(
+            other.to_string().contains("catchpoint import failed"),
+            "{other}"
+        );
+    }
+}
+
 /// Whether `e` is [`cancelled_error`], i.e. the operation really ended
 /// because its token fired. Cancellation handling (an abort's discard, a
 /// shutdown's checkpoint) applies only to this error: any other error is real
@@ -1815,10 +1850,9 @@ impl SyncOrchestrator {
                     notify_progress_fields(progress, on_progress);
                 }),
                 Some(&in_cutover),
+                Some(&self.cancel),
             )
-            .map_err(|e| AlgoError::Ledger {
-                message: format!("catchpoint import failed: {e}"),
-            })?
+            .map_err(import_failure)?
         };
 
         self.accounts_imported = import_result.stats.accounts;

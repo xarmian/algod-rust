@@ -36,9 +36,9 @@ use algo_ledger::catchpoint::verify::{
     calculate_sp_verification_hash, rebuild_trie_from_db,
 };
 use algo_ledger::catchpoint::{
-    export_catchpoint_file, import_catchpoint_file, import_catchpoint_file_with_progress,
-    verify_catchpoint, CatchpointEntry, ExportOptions, ImportProgressUpdate,
-    CATCHPOINT_FILE_VERSION_V8,
+    export_catchpoint_file, import_catchpoint_file, import_catchpoint_file_with_cancel,
+    import_catchpoint_file_with_progress, verify_catchpoint, CatchpointEntry, ExportOptions,
+    ImportProgressUpdate, CATCHPOINT_FILE_VERSION_V8,
 };
 use algo_ledger::rewards::REWARD_UNITS;
 
@@ -634,6 +634,61 @@ fn import_with_progress_reports_monotonic_counters_reaching_final_totals() {
     assert_eq!(last.processed_kvs, import.stats.kvs);
     assert_eq!(import.stats.accounts, 5);
     assert_eq!(import.stats.kvs, 4);
+}
+
+/// Issue #2142: the streaming import stops between chunks once its token
+/// fires, rolls back, and cuts nothing over (so a shutdown does not abandon it
+/// mid-way); the uncancelled import of the same file still succeeds.
+#[test]
+fn import_stops_between_chunks_when_cancelled_and_cuts_nothing_over() {
+    use algo_ledger::catchpoint::CatchpointError;
+    use tokio_util::sync::CancellationToken;
+
+    let src = build_source_db();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catchpoint.tar.gz");
+    let result = export_catchpoint_file(&src, &path, &export_options()).unwrap();
+    assert!(result.total_chunks >= 3, "{:?}", result);
+
+    let dst = Connection::open_in_memory().unwrap();
+    let token = CancellationToken::new();
+    let mut chunks_seen = 0u64;
+    let err = import_catchpoint_file_with_cancel(
+        &dst,
+        &path,
+        REWARD_UNITS,
+        Some(&mut |_u: &ImportProgressUpdate| {
+            chunks_seen += 1;
+            if chunks_seen == 1 {
+                token.cancel(); // fires after the first chunk
+            }
+        }),
+        Some(&token),
+    )
+    .expect_err("a cancelled import is an error");
+    assert!(matches!(err, CatchpointError::Cancelled), "{err:?}");
+    assert_eq!(chunks_seen, 1, "no chunk is imported after the token fired");
+    let live: i64 = dst
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('accountbase', 'acctrounds')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(live, 0, "nothing was cut over");
+    assert!(dst.is_autocommit(), "the open transaction was rolled back");
+
+    // The same file imports fine without a fired token.
+    let dst = Connection::open_in_memory().unwrap();
+    let ok = import_catchpoint_file_with_cancel(
+        &dst,
+        &path,
+        REWARD_UNITS,
+        None,
+        Some(&CancellationToken::new()),
+    )
+    .unwrap();
+    assert_eq!(ok.stats.accounts, 5);
 }
 
 /// `import_catchpoint_file` (the callback-free entry point every existing
