@@ -101,7 +101,7 @@ pub fn reject_on_curve_logic_sig_programs(txgroup: &[SignedTransaction]) -> Resu
             Ok(p) => p.version,
             Err(_) => continue,
         };
-        if version < LOGIC_SIG_OFF_CURVE_VERSION || version > algo_avm::MAX_AVM_VERSION {
+        if !(LOGIC_SIG_OFF_CURVE_VERSION..=algo_avm::MAX_AVM_VERSION).contains(&version) {
             continue;
         }
         if is_escrow_logic_sig(stxn) && program_hash_is_edwards25519_point(&lsig.logic) {

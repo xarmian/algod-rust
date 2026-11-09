@@ -1386,7 +1386,8 @@ fn parse_field_elements<F: ark_ff::PrimeField>(data: &[u8]) -> Result<Vec<F>, Al
     // No num-bigint value is handed to arkworks, which still depends on
     // num-bigint 0.4 (issue #1876).
     let modulus = F::MODULUS.to_bytes_be();
-    for chunk in data.chunks_exact(32) {
+    // Whole 32-byte elements only (a short tail is ignored, as `chunks_exact`).
+    for chunk in data.as_chunks::<32>().0 {
         if !be_lt(chunk, &modulus) {
             return Err(avm_err("invalid mimc input: element exceeds modulus"));
         }

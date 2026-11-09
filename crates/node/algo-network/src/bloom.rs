@@ -220,7 +220,8 @@ impl Filter {
         let n = self.num_hashes as usize;
         let groups = n.div_ceil(4);
         let mut out = vec![0u32; groups * 4];
-        for (i, chunk) in out.chunks_exact_mut(4).enumerate() {
+        // `out` is exactly `groups * 4` long, so there is no remainder.
+        for (i, chunk) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let (h1, h2) = siphash_hash128(i as u64, 666_666, &preimage);
             chunk[0] = h1 as u32;
             chunk[1] = (h1 >> 32) as u32;
@@ -277,16 +278,15 @@ fn siphash_hash128(k0: u64, k1: u64, p: &[u8]) -> (u64, u64) {
         *v2 = v2.rotate_left(32);
     }
 
-    let mut chunks = p.chunks_exact(8);
-    for block in &mut chunks {
-        let m = u64::from_le_bytes(block.try_into().expect("chunks_exact(8) yields 8 bytes"));
+    let (blocks, remainder) = p.as_chunks::<8>();
+    for block in blocks {
+        let m = u64::from_le_bytes(*block);
         v3 ^= m;
         round(&mut v0, &mut v1, &mut v2, &mut v3);
         round(&mut v0, &mut v1, &mut v2, &mut v3);
         v0 ^= m;
     }
 
-    let remainder = chunks.remainder();
     let mut last = t;
     for (i, &b) in remainder.iter().enumerate() {
         last |= (b as u64) << (8 * i);
