@@ -1618,10 +1618,18 @@ its file is gone, verification keeps failing), restart the node with
 ALGOD_RUST_DISCARD_CUT_OVER_CATCHUP=1 algod-rust ...   # or catchpoint-sync
 ```
 
+The accepted values are exactly `1`, `true` or `yes` (any case, surrounding
+whitespace ignored); anything else, or unset, leaves the escape off. The
+variable is process-global and is read on every orchestrator construction (each
+live-catchup request and each retry of a run, and each `catchpoint-sync` run),
+so changing it takes effect only by restarting the node.
+
 and request catchup B. The stuck catchup is then abandoned (destructive: its
 staging tables, file and partial progress are discarded, a warning is logged)
 and B starts over the cut-over ledger exactly like a request over an import-state
-marker: the marker is rewritten as "cut over" for B, so an abort still cannot
+marker, after everything the abandoned catchup wrote beyond its snapshot (its
+`txtail`, voters-snapshot and every `blockdb.blocks` row) is removed, so B's
+import starts from the same state a fresh import would (register: DIV-011): the marker is rewritten as "cut over" for B, so an abort still cannot
 strand the unverified snapshot without a marker. A request for the same label
 as the marker, or a run with no label, still resumes; unset the variable again
 afterwards. go has no equivalent (its ledger is untouched until the final

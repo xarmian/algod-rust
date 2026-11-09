@@ -62,6 +62,7 @@ consensus-compatible. It exists for three readers:
 | DIV-008 | The ledger checkpoints the tracker WAL (PASSIVE, `main` only) every time it opens a `ReadSnapshot`, under the ledger lock, and sets `journal_size_limit` (64 MiB) on the connections that write the tracker WAL so a long read pin leaves no peak-size WAL file behind; go has no long-lived read snapshot and sets no limit | ledger SQLite WAL maintenance (pool evaluator snapshot) | landed | 2026-11-02 | none (a checkpoint only copies committed pages from the WAL into the database file, `journal_size_limit` only truncates the WAL file after a restart; durability settings unchanged) | `crates/core/algo-ledger/src/sqlite.rs` (`SqliteLedger::open_read_snapshot`, `checkpoint_tracker_wal_for_snapshot`, `DEFAULT_TRACKER_WAL_SIZE_LIMIT`, `SqliteLedger::set_tracker_wal_size_limit`, `open_ledger_connection_with_sync_mode`), `crates/core/algo-ledger/src/follow_timing.rs` (metrics) | `util/db/dbutil.go` (`_journal_mode=wal`, default `wal_autocheckpoint`) | `wal_overlapping_reader_test.rs` (WAL bound, foreign-reader limit, 40 randomized kills, cost benchmark), live betanet follow, replay-corpus final-state equality (#2166); `sqlite::tests::the_tracker_wal_file_returns_to_its_limit_after_a_pinning_export_snapshot_ends`, `opening_a_file_backed_ledger_sets_the_default_tracker_wal_size_limit`, `a_negative_tracker_wal_size_limit_is_rejected` (#2206) |
 | DIV-009 | A block's archive rows (`put_block` / `put_block_cert`) are buffered during the block span and committed to the block file on a second connection BEFORE the tracker transaction commits (go: blockdb commit, then trackers lag); a ledger crash leaves the archive at most one block ahead of the tracker | ledger SQLite commit order (`commit_block`) | landed | 2026-11-02 | none (same files, schema and rows; the archive rows become durable one commit earlier, durability settings unchanged) | `crates/core/algo-ledger/src/sqlite.rs` (`PendingArchive`, `SqliteLedger::flush_pending_archive`, `reconcile_orphans`, `begin_block`, `put_block`, `put_block_cert`, `forget_before`, `open_split`), `crates/core/algo-ledger/src/read_pool.rs` (`ArchiveInflight`, `in_flight`) | `ledger/ledger.go` (`AddValidatedBlock`: `blockQ.putBlock` before `trackers.newBlock`), `ledger/tracker.go` (`loadFromDisk`) | `wal_overlapping_reader_test.rs` (failpoint crash at every commit step in both write orders, randomized hard kills, abort/sync-ahead/savepoint tests, cost benchmark) (#2209) |
 | DIV-010 | The catchup pass's fetch window is `CatchupParallelBlocks + min(CatchupParallelBlocks, 32)` rounds ahead of the apply cursor (in flight plus fetched and waiting; `1` stays 1, deliberately no prefetch for the serial setting) with at most `CatchupParallelBlocks` fetches in flight, and once a round's fetch has finally failed new claims are bounded by the apply cursor plus the started workers (rounds already claimed stay claimed); go's window holds `limitedParallelRequests` rounds in total | block catchup / replay scheduling (`CatchupService::sync_pass_core`) | landed | 2026-11-07 | none (the same blocks are fetched, authenticated and applied in round order; only how many fetched blocks may wait for an earlier slow round differs) | `crates/core/algo-ledger/src/catchup_service.rs` (`FETCH_AHEAD_MAX_EXTRA`, `fetch_window`, `sync_pass_core`) | `catchup/service.go` (`pipelinedFetch`, `limitedParallelRequests`, `fetchAndWrite`) | `catchup_service` tests (`a_slow_round_does_not_idle_the_other_workers`, `sync_range_fetch_window_never_exceeds_the_parallel_budget`, `the_tip_probe_is_not_multiplied_by_the_window`, `past_the_tip_no_round_beyond_the_cursor_plus_the_workers_is_requested`, `the_tip_gate_claims_exactly_up_to_the_limit_however_many_workers_race`, `the_fetch_window_is_exact_for_one_worker_and_capped_for_many`), live betanet replay with the block-hash gate (PR #2236, evidence in the entry) |
+| DIV-011 | An explicit operator escape (`ALGOD_RUST_DISCARD_CUT_OVER_CATCHUP` set to `1`, `true` or `yes`, off by default) lets a catchup request for ANOTHER label replace a catchup stuck past its cut-over (marker at `VerifyingLedger`, `DownloadingLookback` or `ReplayingBlocks`): the abandoned catchup's `txtail`, voters-snapshot and `blockdb.blocks` rows are deleted and the new label starts over the cut-over ledger; without the escape the request is refused with go's unable-to-start error; go has no such state (its live ledger is untouched until the final Switch stage) | live catchpoint catchup / `catchpoint-sync` marker handling (`SyncOrchestrator::classify_marker`) | landed | 2026-11-09 | none (a local, operator-triggered decision about the node's own catchup state; no block, vote, transaction or program evaluation is touched, and a catchup that completes imports the same catchpoint file as go) | `crates/core/algo-ledger/src/sync/mod.rs` (`classify_marker`, `start_over_for_requested_label`, `discard_cut_over_leftovers`, `cleanup_pending_discard_rows`, `DISCARD_CUT_OVER_CATCHUP_ENV`), `bin/algod-rust/src/live_catchup.rs`, `bin/algod-rust/src/commands/catchpoint_sync.rs` | `catchup/catchpointService.go` (`MakeNewCatchpointCatchupService`, `processStageSwitch`), `ledger/catchupaccessor.go` (`BlockDb` swap on completion), `daemon/algod/api/server/v2/handlers.go` (`StartCatchup`: `MakeCatchpointUnableToStartError`) | `sync::tests::the_escape_*` and `without_the_escape_*` (all three past-import states, same label, default), `cutover_marker_tests::abandoning_a_replayed_catchup_leaves_nothing_above_the_new_round` (a REAL import of a lower-round catchpoint over a ledger that really imported A and was then replayed: no blocks/`txtail`/voters row above the new round survives), `a_failed_import_of_the_new_label_leaves_a_marker_that_resumes_it` (a failed import before or after its cutover commit leaves a marker that resumes B, never A), `a_discard_interrupted_before_the_block_rows_are_deleted_is_finished_next_run` (#2181) |
 
 ## Entries
 
@@ -691,3 +692,65 @@ source, not run.
 bound on the number of rounds fetched ahead of the write cursor, keep the
 worker count at `limitedParallelRequests`, and stop claiming beyond
 `limitedParallelRequests` after the first failure.
+
+### DIV-011 — an explicit escape to abandon a catchup stuck past its cut-over
+
+**Status:** landed (#2181, 2026-11-09).
+
+**What go-algorand does.** `catchup/catchpointService.go` keeps the live ledger
+untouched during a catchpoint catchup: it downloads into staging tables and
+swaps them in at the final `Switch` stage (`processStageSwitch`, which also
+replaces the block database, `ledger/catchupaccessor.go`). There is therefore
+no persistent "the live ledger already is a half-finished snapshot" state: a
+request for another catchpoint while a service exists is refused with
+`MakeCatchpointUnableToStartError`, and a catchup that cannot finish is
+aborted (`Abort`) with the ledger as it was.
+
+**What algod-rust does instead, and why.** algod-rust cuts the live ledger
+over to the snapshot early (the import's atomic cutover, #2121/#2141), so a
+marker at `VerifyingLedger`, `DownloadingLookback` or `ReplayingBlocks` means
+the live tables are a verified or partly replayed snapshot of that catchpoint,
+and an abort keeps the marker. A catchup that can never finish (peers stopped
+serving it, its file is gone, verification keeps failing) then had no way out
+short of deleting the ledger by hand. The escape (`ALGOD_RUST_DISCARD_CUT_OVER_CATCHUP`
+= `1`, `true` or `yes`, read on every orchestrator construction by the live
+catchup and by `catchpoint-sync`, process-global, effective only after a
+restart; off by default) changes only what happens to a request for ANOTHER
+label over such a marker: instead of the unable-to-start refusal, the new label
+starts over a cut-over ledger exactly as for a marker at `ImportingLedger`,
+after what the abandoned catchup wrote beyond its snapshot is removed
+(`txtail`, `votersnapshot`, `votersparticipants`, every `blockdb.blocks` row;
+go's catchup replaces the block database wholesale on completion too). The
+marker rewrite and the tracker-table deletes are one transaction, which also
+records the pending `blockdb.blocks` delete (another file); the next run
+finishes it after a crash. The marker stays "cut over" for the new label, so an
+abort still cannot strand the unverified snapshot without a marker. A request
+for the SAME label, a run with no label and every other marker state behave as
+before.
+
+**Wire / consensus impact.** None: a local, operator-triggered decision about
+the node's own catchup state. No block, vote, transaction or program
+evaluation is touched; a catchup that completes imports the same catchpoint
+file as go and is verified the same way.
+
+**How parity is proven.** The default is unchanged and pinned
+(`without_the_escape_a_stuck_cut_over_catchup_still_rejects_another_label`);
+the escape's behaviour for each past-import state, for the same label and for
+no label is pinned in `sync::tests`; and the data safety is proven against a
+real import: `cutover_marker_tests::abandoning_a_replayed_catchup_leaves_nothing_above_the_new_round`
+really imports catchpoint A (round 600), adds the rows its lookback and replay
+write beyond the snapshot, then runs a catchup for a LOWER-round catchpoint B
+(round 500) with the escape and asserts no blocks, `txtail` or voters row above
+B's round survives and B's snapshot is live;
+`a_failed_import_of_the_new_label_leaves_a_marker_that_resumes_it` injects a
+failure before and after B's cutover commit and asserts the marker names B (a
+later run resumes B, never A) and A's leftovers stay gone;
+`a_discard_interrupted_before_the_block_rows_are_deleted_is_finished_next_run`
+covers the crash window. Mutation check: making `discard_cut_over_leftovers` a
+no-op fails all three.
+
+**How to switch back.** Leave the variable unset (the default).
+
+**How go-algorand could port it.** Not applicable as is (go has no such
+state); the analogue would be a way to drop a stuck staging catchup, which
+`Abort` already is.

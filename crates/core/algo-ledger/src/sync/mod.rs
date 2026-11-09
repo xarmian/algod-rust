@@ -418,14 +418,20 @@ pub const DEFAULT_HANDOFF_MIN_LAG_ROUNDS: u64 = 64;
 pub const HANDOFF_MIN_LAG_ROUNDS_ENV: &str = "ALGOD_RUST_HANDOFF_MIN_LAG_ROUNDS";
 
 /// Environment variable that enables the explicit, destructive escape for a
-/// catchup stuck past its cut-over (issue #2181): with `1`/`true`, a catchup
+/// catchup stuck past its cut-over (issue #2181, DIV-011): with `1`, `true` or
+/// `yes` (any case, surrounding whitespace ignored; nothing else), a catchup
 /// request for another label abandons the stuck one instead of being refused
-/// with "unable to start ... already catching up". Off when unset. Read once at
-/// startup by the live catchup and by `catchpoint-sync`.
+/// with "unable to start ... already catching up". Off when unset.
+///
+/// It is read on every `SyncOrchestrator` construction by the live catchup
+/// (each `PUT /v2/catchup` request and each retry of a run) and by each
+/// `catchpoint-sync` run, from the process environment, so it is
+/// process-global and changing it takes effect only by restarting the node.
 pub const DISCARD_CUT_OVER_CATCHUP_ENV: &str = "ALGOD_RUST_DISCARD_CUT_OVER_CATCHUP";
 
-/// Interpret the raw value of [`DISCARD_CUT_OVER_CATCHUP_ENV`]: `1`, `true`
-/// or `yes` (any case) enable it; anything else, or unset, disables it.
+/// Interpret the raw value of [`DISCARD_CUT_OVER_CATCHUP_ENV`]: exactly `1`,
+/// `true` or `yes` (any case, trimmed) enable it; anything else, or unset,
+/// disables it.
 pub fn parse_discard_cut_over_catchup(raw: Option<&str>) -> bool {
     raw.is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
@@ -464,6 +470,62 @@ const SYNC_CUT_OVER_KEY: &str = "algod_rust_sync_cut_over";
 /// rows are gone, so a crash in between is finished by the next run
 /// ([`cleanup_pending_header_rows`], issue #2141).
 const SYNC_HEADER_CLEANUP_KEY: &str = "algod_rust_sync_header_cleanup";
+/// 1 while `blockdb.blocks` still holds the rows of an ABANDONED cut-over
+/// catchup that [`discard_cut_over_leftovers`] must delete. Written in the same
+/// transaction as the marker rewrite that abandons it, removed once the rows
+/// are gone, so a crash in between is finished by the next run
+/// ([`cleanup_pending_discard_rows`], issue #2181).
+const SYNC_DISCARD_BLOCKS_KEY: &str = "algod_rust_sync_discard_blocks";
+
+/// Whether table `name` (in `schema`, `main` or `blockdb`) exists.
+fn table_exists_in(conn: &Connection, schema: &str, name: &str) -> Result<bool, AlgoError> {
+    conn.query_row(
+        &format!("SELECT COUNT(*) > 0 FROM {schema}.sqlite_master WHERE type='table' AND name=?1"),
+        [name],
+        |row| row.get(0),
+    )
+    .map_err(|e| AlgoError::Ledger {
+        message: format!("check {schema}.{name} existence: {e}"),
+    })
+}
+
+/// DIVERGENCE DIV-011: delete what an abandoned cut-over catchup wrote BEYOND
+/// its snapshot in the tracker database (the snapshot's own live tables are
+/// replaced by the next import): the lookback window's and the replay's
+/// `txtail` rows and state-proof voter snapshots. Runs inside the marker
+/// rewrite's transaction. The rows of `blockdb.blocks` (another file) are
+/// recorded for [`cleanup_pending_discard_rows`] instead.
+fn discard_cut_over_leftovers(conn: &Connection) -> Result<(), AlgoError> {
+    for table in ["txtail", "votersnapshot", "votersparticipants"] {
+        if table_exists_in(conn, "main", table)? {
+            conn.execute(&format!("DELETE FROM main.{table}"), [])
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("discard the abandoned catchup's {table} rows: {e}"),
+                })?;
+        }
+    }
+    set_sync_int(conn, SYNC_DISCARD_BLOCKS_KEY, 1)
+}
+
+/// DIVERGENCE DIV-011: finish [`discard_cut_over_leftovers`]: delete every row
+/// of `blockdb.blocks` (the abandoned catchup's synthesized header rows,
+/// lookback window and replayed blocks; go's catchup likewise replaces the
+/// block database wholesale when it completes), then clear the record.
+/// Idempotent, and retried by the next run after a failure or a crash.
+fn cleanup_pending_discard_rows(conn: &Connection) -> Result<(), AlgoError> {
+    if !table_exists_in(conn, "main", "catchpointstate")?
+        || get_sync_int(conn, SYNC_DISCARD_BLOCKS_KEY)?.is_none()
+    {
+        return Ok(());
+    }
+    if table_exists_in(conn, "blockdb", "blocks")? {
+        conn.execute("DELETE FROM blockdb.blocks", [])
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("discard the abandoned catchup's block rows: {e}"),
+            })?;
+    }
+    delete_sync_row(conn, SYNC_DISCARD_BLOCKS_KEY)
+}
 
 /// Delete the catchup's synthesized header rows a committed rollback recorded
 /// in [`SYNC_HEADER_CLEANUP_KEY`], then clear the record. Idempotent: every
@@ -1287,7 +1349,7 @@ impl SyncOrchestrator {
     /// |-----------------------------------------------|------------|----------|-------------|
     /// | `Idle`, `DownloadingLedger` (not cut over)    | resume     | resume   | start over: clear marker, drop staging and file |
     /// | `ImportingLedger` (cut over, UNVERIFIED)      | resume     | resume   | start over, still cut over: marker rewritten for the new label with no file, so B is downloaded and imported over it and verified |
-    /// | `VerifyingLedger`, `DownloadingLookback`, `ReplayingBlocks` | resume | resume | reject with go's unable-to-start error; marker, staging and file untouched |
+    /// | `VerifyingLedger`, `DownloadingLookback`, `ReplayingBlocks` | resume | resume | reject with go's unable-to-start error; marker, staging and file untouched, UNLESS the operator's escape is on ([`DISCARD_CUT_OVER_CATCHUP_ENV`], issue #2181, DIV-011): then start over, still cut over, as for `ImportingLedger`, after the abandoned catchup's leftovers beyond its snapshot are removed ([`discard_cut_over_leftovers`], [`cleanup_pending_discard_rows`]) |
     ///
     /// A marker with no label (or an unparseable one) is compared by its
     /// recorded round (or the `catchpoint-<round>` file name): the same round
@@ -1324,26 +1386,36 @@ impl SyncOrchestrator {
             return Ok(MarkerAction::Resume);
         }
         Ok(match phase_ordinal(&persisted.state) {
-            0 | 1 => MarkerAction::StartOver { cut_over: false },
+            0 | 1 => MarkerAction::StartOver {
+                cut_over: false,
+                discard_past_import: false,
+            },
             // At the import state the recorded flag decides: a shutdown
             // inside the import persists this state before any cutover.
             2 => MarkerAction::StartOver {
                 cut_over: persisted.is_cut_over(),
+                discard_past_import: false,
             },
             // A marker past the import: the live ledger holds a verified or
             // partly replayed snapshot of the other catchpoint. Refused (go's
             // unable-to-start error) unless the operator explicitly chose to
-            // abandon it (issue #2181): then the new label starts over a
-            // cut-over ledger exactly like the import-state case above, whose
-            // marker stays "cut over" so an abort never strands the snapshot.
+            // abandon it (issue #2181, DIVERGENCE DIV-011: go has no such
+            // state, its live ledger is untouched until the final Switch):
+            // then the new label starts over a cut-over ledger exactly like
+            // the import-state case above, after everything the abandoned
+            // catchup wrote beyond its snapshot is removed too.
             _ if self.discard_cut_over_catchup => {
                 tracing::warn!(
                     persisted_state = %persisted.state,
                     persisted_label = ?persisted.catchpoint_label,
                     requested = ?self.config.catchpoint_label,
-                    "DISCARDING a stuck cut-over catchup in favour of the requested one                      (explicit operator escape): its partial progress is lost"
+                    "DISCARDING a stuck cut-over catchup in favour of the requested one \
+                     (explicit operator escape): its partial progress is lost"
                 );
-                MarkerAction::StartOver { cut_over: true }
+                MarkerAction::StartOver {
+                    cut_over: true,
+                    discard_past_import: true,
+                }
             }
             _ => MarkerAction::Reject,
         })
@@ -1387,6 +1459,7 @@ impl SyncOrchestrator {
         conn: &Connection,
         persisted: &PersistedSyncState,
         cut_over: bool,
+        discard_past_import: bool,
     ) -> Result<SyncState, AlgoError> {
         tracing::warn!(
             persisted_state = %persisted.state,
@@ -1403,14 +1476,40 @@ impl SyncOrchestrator {
                 .as_deref()
                 .and_then(|l| parse_catchpoint_label(l.trim()).ok())
                 .map(|p| p.round);
-            persist_sync_state_with_cut_over(
-                conn,
-                &SyncState::ImportingLedger,
-                requested.as_deref(),
-                round,
-                None,
-                Some(true),
-            )?;
+            if discard_past_import {
+                // DIVERGENCE DIV-011: one transaction makes the marker rewrite
+                // and the removal of the abandoned catchup's tracker rows (and
+                // the record that its block rows are still to go) atomic, so
+                // there is never a marker for B next to A's leftovers without
+                // the record that removes them, nor the reverse.
+                let tx = conn
+                    .unchecked_transaction()
+                    .map_err(|e| AlgoError::Ledger {
+                        message: format!("begin the discard transaction: {e}"),
+                    })?;
+                persist_sync_state_with_cut_over(
+                    &tx,
+                    &SyncState::ImportingLedger,
+                    requested.as_deref(),
+                    round,
+                    None,
+                    Some(true),
+                )?;
+                discard_cut_over_leftovers(&tx)?;
+                tx.commit().map_err(|e| AlgoError::Ledger {
+                    message: format!("commit the discard transaction: {e}"),
+                })?;
+                cleanup_pending_discard_rows(conn)?;
+            } else {
+                persist_sync_state_with_cut_over(
+                    conn,
+                    &SyncState::ImportingLedger,
+                    requested.as_deref(),
+                    round,
+                    None,
+                    Some(true),
+                )?;
+            }
             SyncState::ImportingLedger
         } else {
             clear_sync_state(conn)?;
@@ -3440,6 +3539,9 @@ impl SyncOrchestrator {
             if let Err(e) = cleanup_pending_header_rows(&conn) {
                 tracing::warn!(error = %e, "could not remove leftover catchup header rows");
             }
+            // Finish abandoning a catchup (issue #2181) whose block rows a
+            // crash or a failure left behind.
+            cleanup_pending_discard_rows(&conn)?;
             if let Ok(Some(persisted)) = restore_sync_state(&conn) {
                 if persisted.state.is_terminal() {
                     completed_round = persisted.catchpoint_round;
@@ -3453,9 +3555,17 @@ impl SyncOrchestrator {
                 };
                 if matches!(action, MarkerAction::Reject) {
                     return Err(self.reject_other_label(&persisted));
-                } else if let MarkerAction::StartOver { cut_over } = action {
-                    resume_state =
-                        self.start_over_for_requested_label(&conn, &persisted, cut_over)?;
+                } else if let MarkerAction::StartOver {
+                    cut_over,
+                    discard_past_import,
+                } = action
+                {
+                    resume_state = self.start_over_for_requested_label(
+                        &conn,
+                        &persisted,
+                        cut_over,
+                        discard_past_import,
+                    )?;
                 } else if !persisted.state.is_terminal() {
                     tracing::info!(
                         persisted_state = %persisted.state,
@@ -4047,7 +4157,12 @@ fn sleep_unless_cancelled(delay: std::time::Duration, cancel: &CancellationToken
 /// see `SyncOrchestrator::classify_marker`).
 enum MarkerAction {
     Resume,
-    StartOver { cut_over: bool },
+    StartOver {
+        cut_over: bool,
+        /// The marker was past the import and the operator's escape abandons
+        /// it (issue #2181): its leftovers beyond the snapshot go too.
+        discard_past_import: bool,
+    },
     Reject,
 }
 
