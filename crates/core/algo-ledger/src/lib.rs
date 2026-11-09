@@ -25,6 +25,7 @@ pub mod agreement_key_manager;
 pub mod apply;
 pub mod apply_stall;
 pub mod apply_stateproof;
+pub mod archive_replay;
 pub mod avm_context;
 pub mod block_entry;
 pub mod block_header;
@@ -80,6 +81,7 @@ pub use apply::{
     apply_transaction_with_budget, apply_transaction_with_tracer, ApplyContext, ApplyData,
     ApplyMode, BoxBudgetState, GroupCreatedResources, GroupInfo, InnerApplyData,
 };
+pub use archive_replay::{replay_archived_tail, ArchiveReplay};
 pub use avm_context::{type_enum, GroupTxidCache, LedgerAvmContext};
 pub use block_header::{
     compute_load, make_next_block_header, next_block_protocol, next_bonus, next_congestion_tax,

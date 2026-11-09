@@ -724,6 +724,9 @@ pub async fn run(
         }
     }
 
+    // Issue #2210: archived rounds above the tracker round are replayed first.
+    super::node::replay_archive_at_startup(&mut sqlite_ledger);
+
     let latest = sqlite_ledger.current_round().0;
     info!(path = %ledger_path.display(), latest_round = latest, "opened ledger database");
 

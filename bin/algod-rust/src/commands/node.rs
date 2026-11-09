@@ -101,6 +101,28 @@ fn follower_devmode_warning_needed(follower_mode: bool, genesis_devmode: bool) -
     follower_mode && genesis_devmode
 }
 
+/// Issue #2210: replay the archived rounds above the tracker round into the
+/// trackers (go `trackerRegistry.loadFromDisk`) before the node reads its
+/// round. Only for a seeded ledger; never fatal, what cannot be replayed is
+/// left for catchup. Call after `set_devmode_chain`.
+pub(crate) fn replay_archive_at_startup(ledger: &mut SqliteLedger) {
+    if !ledger.has_account_totals().unwrap_or(false) {
+        return;
+    }
+    match algo_ledger::replay_archived_tail(ledger) {
+        Ok(report) if report.applied > 0 || report.stopped.is_some() => {
+            info!(
+                from_round = report.from_round,
+                applied = report.applied,
+                stopped = ?report.stopped,
+                "startup archive replay"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "startup archive replay failed; continuing"),
+    }
+}
+
 /// Open `node start`'s ledger, applying `config.json`'s per-resource
 /// directory overrides (`HotDataDir`/`ColdDataDir`/`TrackerDBDir`/
 /// `BlockDBDir`) via [`crate::commands::participate::resolve_resource_paths`]
@@ -296,10 +318,16 @@ async fn run_start(
         .upgrade_legacy_online_history()
         .map_err(|e| anyhow::anyhow!("upgrading legacy online-account history: {e}"))?;
 
-    let latest = sqlite_ledger.current_round().0;
     // A go devmode chain's blocks have no proposer, so sync-applied blocks
     // cannot be held to `validateForPayouts` (issue #1803).
     sqlite_ledger.set_devmode_chain(genesis.devmode);
+    // Issue #2210: the block archive commits before the tracker, so a crash
+    // (or a sync that wrote blocks ahead) leaves archived rounds the tracker
+    // has not applied. go replays them at open (`trackerRegistry.loadFromDisk`);
+    // so does this, before anything reads the round. Not fatal: what cannot
+    // be replayed is left for catchup.
+    replay_archive_at_startup(&mut sqlite_ledger);
+    let latest = sqlite_ledger.current_round().0;
     // "Already seeded" is the presence of the accounttotals row, not nonzero
     // online stake (a network with every allocation offline legitimately has
     // online=0 after seeding). Mirrors the relay command's check.

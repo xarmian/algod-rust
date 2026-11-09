@@ -6580,6 +6580,14 @@ impl SqliteLedger {
     ///     lost as a warning but `commit_block` succeeded, this
     ///     restores the gap with the in-memory state we are about
     ///     to lose.
+    ///
+    /// Issue #2210: this synthesized row is written together with the
+    /// tracker (tracker-first), unlike a real block's archive row (archive
+    /// first, #2209), and that is deliberate: a kill while seeding round 0
+    /// leaves a tracker at round 0 with no block rows, which
+    /// `reconcile_cross_file` reads as `Empty` (not the #1633 gap), and the
+    /// defensive path never runs in a production commit. The startup replay
+    /// ([`crate::archive_replay`]) only applies real archived blocks.
     fn flush_chain_state(&mut self) -> Result<(), AlgoError> {
         self.conn
             .execute_cached(
