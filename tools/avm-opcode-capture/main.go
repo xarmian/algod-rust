@@ -211,6 +211,55 @@ func mkVector(name, desc, source string, version uint64, args [][]byte) Vector {
 	}
 }
 
+// mkVectorTail is mkVector for a program whose final instruction the assembler
+// would refuse on its static stack-type check (an underflow, a wrong-typed
+// argument): everything before the last `;`-separated instruction is
+// assembled normally and the last instruction's bytes are appended raw, the
+// technique go-algorand's own TestWrongStackTypeRuntime uses to reach the
+// runtime gate. The tail bytes are taken from the same instruction assembled
+// behind enough padding for the type tracker to accept it.
+func mkVectorTail(name, desc, source string, version uint64, args [][]byte) Vector {
+	prefix, last := "", source
+	if i := strings.LastIndex(source, ";"); i >= 0 {
+		prefix, last = source[:i], strings.TrimSpace(source[i+1:])
+	}
+	var tail []byte
+	for _, unit := range []string{"int 0; ", "byte 0x00; ", "byte 0x00; int 0; int 0; ", "byte 0x00; int 0; byte 0x00; ", "int 0; byte 0x00; ", "byte 0x00; int 0; ", "int 0; byte 0x00; int 0; "} {
+		pad := strings.Repeat(unit, 4)
+		ops, err := logic.AssembleStringWithVersion(pad+last, version)
+		if err != nil {
+			continue
+		}
+		padOnly := assemble(strings.TrimSuffix(pad, "; "), version)
+		tail = ops.Program[len(padOnly):]
+		break
+	}
+	if tail == nil {
+		panic(fmt.Sprintf("mkVectorTail: cannot assemble %q behind int or byte padding", last))
+	}
+	head := []byte{byte(version)}
+	if prefix != "" {
+		head = assemble(prefix, version)
+	}
+	program := append(append([]byte{}, head...), tail...)
+	pass, errStr, stack := evalSig(program, args)
+	argsHex := make([]string, len(args))
+	for i, a := range args {
+		argsHex[i] = hex.EncodeToString(a)
+	}
+	return Vector{
+		Name:         name,
+		Description:  desc,
+		Proto:        string(protoVersion),
+		ProgramHex:   hex.EncodeToString(program),
+		ArgsHex:      argsHex,
+		Pass:         pass,
+		Error:        errStr,
+		FinalStack:   stack,
+		CompareStack: !sourceEndsWithReturn(source),
+	}
+}
+
 // mkVectorRawAppend assembles `source`, then appends `rawOpcode` directly to
 // the compiled program bytes (bypassing the assembler's own static type
 // tracker for the appended opcode), evaluates the result, and returns a
@@ -235,14 +284,14 @@ func mkVectorRawAppendBytes(name, desc, source string, version uint64, raw []byt
 		argsHex[i] = hex.EncodeToString(a)
 	}
 	return Vector{
-		Name:         name,
-		Description:  desc,
-		Proto:        string(protoVersion),
-		ProgramHex:   hex.EncodeToString(program),
-		ArgsHex:      argsHex,
-		Pass:         pass,
-		Error:        errStr,
-		FinalStack:   stack,
+		Name:        name,
+		Description: desc,
+		Proto:       string(protoVersion),
+		ProgramHex:  hex.EncodeToString(program),
+		ArgsHex:     argsHex,
+		Pass:        pass,
+		Error:       errStr,
+		FinalStack:  stack,
 		// The appended raw opcode always errors here (a runtime type-gate
 		// rejection), so there is no successful final stack to compare.
 		CompareStack: false,
@@ -745,6 +794,329 @@ func generate() []Vector {
 		"arith/plus_rejects_empty_bytes_arg",
 		"byte \"\"; int 1; <raw 0x08 (+)> -> runtime type-gate error, not coercion to 0",
 		"byte \"\"; int 1", 7, 0x08,
+		nil,
+	))
+
+	// =======================================================================
+	// Error text and pc parity (issues #2200 / #2225): runtime errors across the
+	// opcode families, replayed with go's text and pc compared.
+	// =======================================================================
+	out = append(out, mkVectorTail(
+		"errtext/mod_by_zero",
+		"go EvalError text and pc for: int 10; int 0; %",
+		"int 10; int 0; %", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/divmodw_by_zero",
+		"go EvalError text and pc for: int 1; int 2; int 0; int 0; divmodw",
+		"int 1; int 2; int 0; int 0; divmodw", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/divw_by_zero",
+		"go EvalError text and pc for: int 1; int 2; int 0; divw",
+		"int 1; int 2; int 0; divw", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/divw_overflow",
+		"go EvalError text and pc for: int 5; int 2; int 1; divw",
+		"int 5; int 2; int 1; divw", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/add_overflow",
+		"go EvalError text and pc for: int 18446744073709551615; int 1; +",
+		"int 18446744073709551615; int 1; +", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/sub_underflow",
+		"go EvalError text and pc for: int 1; int 2; -",
+		"int 1; int 2; -", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mul_overflow",
+		"go EvalError text and pc for: int 18446744073709551615; int 2; *",
+		"int 18446744073709551615; int 2; *", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/exp_zero_zero",
+		"go EvalError text and pc for: int 0; int 0; exp",
+		"int 0; int 0; exp", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/exp_overflow",
+		"go EvalError text and pc for: int 2; int 64; exp",
+		"int 2; int 64; exp", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/shl_over_63",
+		"go EvalError text and pc for: int 1; int 64; shl",
+		"int 1; int 64; shl", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/shr_over_63",
+		"go EvalError text and pc for: int 1; int 64; shr",
+		"int 1; int 64; shr", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/err_opcode",
+		"go EvalError text and pc for: err",
+		"err", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/assert_zero",
+		"go EvalError text and pc for: int 0; assert",
+		"int 0; assert", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/dig_too_deep",
+		"go EvalError text and pc for: int 1; dig 1",
+		"int 1; dig 1", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/cover_too_deep",
+		"go EvalError text and pc for: int 1; cover 1",
+		"int 1; cover 1", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/uncover_too_deep",
+		"go EvalError text and pc for: int 1; uncover 1",
+		"int 1; uncover 1", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/bury_too_deep",
+		"go EvalError text and pc for: int 1; bury 1",
+		"int 1; bury 1", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/popn_too_many",
+		"go EvalError text and pc for: int 1; popn 2",
+		"int 1; popn 2", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/dupn_empty",
+		"go EvalError text and pc for: dupn 1",
+		"dupn 1", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/pop_empty",
+		"go EvalError text and pc for: pop",
+		"pop", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/dup_empty",
+		"go EvalError text and pc for: dup",
+		"dup", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/swap_one",
+		"go EvalError text and pc for: int 1; swap",
+		"int 1; swap", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/select_empty",
+		"go EvalError text and pc for: select",
+		"select", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/loads_oob",
+		"go EvalError text and pc for: int 256; loads",
+		"int 256; loads", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/load_unset_ok",
+		"go EvalError text and pc for: load 0; pop; int 1",
+		"load 0; pop; int 1", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/stores_oob",
+		"go EvalError text and pc for: int 256; int 1; stores",
+		"int 256; int 1; stores", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/substring_oob",
+		"go EvalError text and pc for: byte 0x010203; substring 0 4",
+		"byte 0x010203; substring 0 4", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/substring3_oob",
+		"go EvalError text and pc for: byte 0x010203; int 0; int 4; substring3",
+		"byte 0x010203; int 0; int 4; substring3", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/extract_oob",
+		"go EvalError text and pc for: byte 0x010203; extract 1 5",
+		"byte 0x010203; extract 1 5", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/extract3_oob",
+		"go EvalError text and pc for: byte 0x010203; int 1; int 5; extract3",
+		"byte 0x010203; int 1; int 5; extract3", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/extract_uint16_oob",
+		"go EvalError text and pc for: byte 0x01; int 0; extract_uint16",
+		"byte 0x01; int 0; extract_uint16", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/extract_uint32_oob",
+		"go EvalError text and pc for: byte 0x010203; int 0; extract_uint32",
+		"byte 0x010203; int 0; extract_uint32", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/extract_uint64_oob",
+		"go EvalError text and pc for: byte 0x01020304; int 0; extract_uint64",
+		"byte 0x01020304; int 0; extract_uint64", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/replace2_oob",
+		"go EvalError text and pc for: byte 0x010203; byte 0x0405; replace2 2",
+		"byte 0x010203; byte 0x0405; replace2 2", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/replace3_oob",
+		"go EvalError text and pc for: byte 0x010203; int 2; byte 0x0405; replace3",
+		"byte 0x010203; int 2; byte 0x0405; replace3", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/getbit_oob_bytes",
+		"go EvalError text and pc for: byte 0x01; int 8; getbit",
+		"byte 0x01; int 8; getbit", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/getbyte_oob",
+		"go EvalError text and pc for: byte 0x01; int 1; getbyte",
+		"byte 0x01; int 1; getbyte", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/setbit_oob_bytes",
+		"go EvalError text and pc for: byte 0x01; int 8; int 1; setbit",
+		"byte 0x01; int 8; int 1; setbit", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/setbit_bad_value",
+		"go EvalError text and pc for: int 1; int 0; int 2; setbit",
+		"int 1; int 0; int 2; setbit", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/setbyte_oob",
+		"go EvalError text and pc for: byte 0x01; int 1; int 1; setbyte",
+		"byte 0x01; int 1; int 1; setbyte", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/bzero_too_big",
+		"go EvalError text and pc for: int 4097; bzero",
+		"int 4097; bzero", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/concat_too_long",
+		"go EvalError text and pc for: byte 0x00; int 4096; bzero; concat",
+		"byte 0x00; int 4096; bzero; concat", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/b_plus_too_long",
+		"go EvalError text and pc for: byte 0x00; int 65; bzero; byte 0x01; b+",
+		"byte 0x00; int 65; bzero; byte 0x01; b+", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/b_minus_negative",
+		"go EvalError text and pc for: byte 0x01; byte 0x02; b-",
+		"byte 0x01; byte 0x02; b-", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/b_div_by_zero",
+		"go EvalError text and pc for: byte 0x01; byte 0x00; b/",
+		"byte 0x01; byte 0x00; b/", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/b_mod_by_zero",
+		"go EvalError text and pc for: byte 0x01; byte 0x00; b%",
+		"byte 0x01; byte 0x00; b%", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/btoi_too_long",
+		"go EvalError text and pc for: byte 0x010203040506070809; btoi",
+		"byte 0x010203040506070809; btoi", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/bsqrt_too_long",
+		"go EvalError text and pc for: byte 0x00; int 65; bzero; bsqrt",
+		"byte 0x00; int 65; bzero; bsqrt", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/itxn_field_no_begin",
+		"go EvalError text and pc for: int 1; itxn_field Amount",
+		"int 1; itxn_field Amount", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/callsub_stack_underflow_retsub",
+		"go EvalError text and pc for: retsub",
+		"retsub", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/pushbytes_len_cmp_type",
+		"go EvalError text and pc for: int 1; byte 0x01; ==",
+		"int 1; byte 0x01; ==", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/log_in_logicsig",
+		"go EvalError text and pc for: byte 0x01; log",
+		"byte 0x01; log", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/global_group_size_ok",
+		"go EvalError text and pc for: global GroupSize; int 1; ==",
+		"global GroupSize; int 1; ==", 8,
 		nil,
 	))
 

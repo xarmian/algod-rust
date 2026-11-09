@@ -25,9 +25,11 @@
 //! AVM as a LogicSig and asserts the result matches go-algorand's
 //! authoritative `logic.EvalSignatureFull` output:
 //!
-//!   - **error category**: errored vs. did-not-error (go and Rust error
-//!     *strings* differ — go embeds `pc=`/`Details:` — so matching the
-//!     boolean errored category is what is meaningful).
+//!   - **error category**: errored vs. did-not-error.
+//!   - **error text and pc** (issues #2200 / #2225): when both errored, go's
+//!     `rejected by logic err=<text>. Details: pc=<byte offset>` is compared
+//!     to the Rust AVM error message and byte-offset pc, for every vector not
+//!     listed in `KNOWN_TEXT_DIVERGENCES` (each entry names the open issue).
 //!   - **pass**: program-approved flag (only when neither side errored).
 //!   - **final stack**: value-for-value, bottom-to-top (only when neither
 //!     side errored).
@@ -109,8 +111,38 @@ fn decode_hex(name: &str, field: &str, s: &str) -> Vec<u8> {
         .unwrap_or_else(|e| panic!("fixture {name:?}: {field} is not valid hex: {e} (value={s:?})"))
 }
 
+/// Vectors whose go error text or pc the Rust AVM does not match yet, each with
+/// the issue that tracks it. The list may only shrink: a vector listed here
+/// that now matches fails the test (remove it).
+const KNOWN_TEXT_DIVERGENCES: &[(&str, &str)] = &[];
+
+/// A failed Rust run: the AVM's own message (go's `err=` part) and the byte
+/// offset of the failing opcode (go's `pc=`), or the whole text for an error
+/// raised before evaluation (parse, version ceiling).
+#[derive(Debug)]
+struct RustError {
+    message: String,
+    pc: Option<usize>,
+}
+
+/// go's `EvalError.Error()` split: `rejected by logic err=<M>. Details: pc=<P>`
+/// gives `(M, Some(P))`; anything else (a version-ceiling error and the like)
+/// is `(whole text, None)`.
+fn split_go_error(error: &str) -> (String, Option<usize>) {
+    let Some(rest) = error.strip_prefix("rejected by logic err=") else {
+        return (error.to_string(), None);
+    };
+    match rest.rsplit_once(". Details: pc=") {
+        Some((message, pc)) => {
+            let pc: String = pc.chars().take_while(char::is_ascii_digit).collect();
+            (message.to_string(), pc.parse().ok())
+        }
+        None => (rest.to_string(), None),
+    }
+}
+
 /// Run a LogicSig program (with args) through the Rust AVM, returning
-/// `Ok((pass, final_stack))` on success or `Err(message)` on a hard AVM error
+/// `Ok((pass, final_stack))` on success or `Err(RustError)` on a hard AVM error
 /// — mirroring `algo_avm::run_logicsig_program` but keeping the machine so the
 /// final stack can be compared against go's.
 fn run_rust(
@@ -118,7 +150,7 @@ fn run_rust(
     program: &[u8],
     args: Vec<Vec<u8>>,
     proto: &str,
-) -> Result<(bool, Vec<AvmValue>), String> {
+) -> Result<(bool, Vec<AvmValue>), RustError> {
     let consensus = consensus_params_for_version(proto)
         .unwrap_or_else(|| panic!("fixture {name:?}: unknown consensus version {proto:?}"));
 
@@ -135,20 +167,32 @@ fn run_rust(
     let ceiling = consensus.logic_sig_version;
     if let Some(&version) = program.first() {
         if u64::from(version) > ceiling {
-            return Err(format!(
-                "program version {version} greater than protocol supported version {ceiling}"
-            ));
+            return Err(RustError {
+                message: format!(
+                    "program version {version} greater than protocol supported version {ceiling}"
+                ),
+                pc: None,
+            });
         }
     }
 
     let mut ctx = LogicSigAvmContext::new(&group, 0, program, args, consensus);
 
-    let parsed = parse(program).map_err(|e| e.to_string())?;
+    let parsed = parse(program).map_err(|e| RustError {
+        message: e.to_string(),
+        pc: None,
+    })?;
     let budget = algo_avm::LOGICSIG_BUDGET;
     let mut machine = AvmMachine::new(parsed, ExecMode::LogicSig, budget);
     match machine.run(&mut ctx) {
         Ok(pass) => Ok((pass, machine.stack.clone())),
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(RustError {
+            message: match e {
+                algo_error::AlgoError::Avm { message } => message,
+                other => other.to_string(),
+            },
+            pc: Some(machine.byte_pc()),
+        }),
     }
 }
 
@@ -175,6 +219,8 @@ fn avm_opcode_conformance_vs_go_algorand() {
     let mut total = 0usize;
     let mut crypto_verify_seen = 0usize;
     let mut bt294_guard_passed = false;
+    // Text/pc mismatches are collected so one run lists every divergence.
+    let mut text_failures: Vec<String> = Vec::new();
 
     for (line_no, line) in BufReader::new(file).lines().enumerate() {
         let line = line.expect("read fixture line");
@@ -196,9 +242,28 @@ fn avm_opcode_conformance_vs_go_algorand() {
         let result = run_rust(&rec.name, &program, args, &rec.proto);
 
         match (&result, go_errored) {
-            // Both errored: error category matches. We do NOT compare error
-            // strings (go embeds pc=/Details:, Rust does not).
-            (Err(_), true) => {}
+            // Both errored: the category matches; compare go's text and pc too
+            // (issues #2200 / #2225), except for the listed known divergences.
+            (Err(rust_err), true) => {
+                let (go_message, go_pc) = split_go_error(&rec.error);
+                let matches =
+                    rust_err.message == go_message && (go_pc.is_none() || go_pc == rust_err.pc);
+                let known = KNOWN_TEXT_DIVERGENCES
+                    .iter()
+                    .find(|(name, _)| *name == rec.name);
+                match (matches, known) {
+                    (true, None) => {}
+                    (true, Some((_, issue))) => text_failures.push(format!(
+                        "{:?} now matches go but is still in KNOWN_TEXT_DIVERGENCES ({issue}): remove it",
+                        rec.name
+                    )),
+                    (false, Some(_)) => {}
+                    (false, None) => text_failures.push(format!(
+                        "{:?}: {}\n    go:   err={go_message:?} pc={go_pc:?}\n    rust: err={:?} pc={:?}",
+                        rec.name, rec.description, rust_err.message, rust_err.pc
+                    )),
+                }
+            }
             // Both succeeded: compare pass + final stack.
             (Ok((rust_pass, rust_stack)), false) => {
                 assert_eq!(
@@ -281,6 +346,12 @@ fn avm_opcode_conformance_vs_go_algorand() {
         total += 1;
     }
 
+    assert!(
+        text_failures.is_empty(),
+        "{} AVM error text/pc divergences from go-algorand (issues #2200 / #2225):\n  {}",
+        text_failures.len(),
+        text_failures.join("\n  ")
+    );
     assert!(
         bt294_guard_passed,
         "BT-294 guard fixture (ed25519verify/valid) is missing from the corpus"

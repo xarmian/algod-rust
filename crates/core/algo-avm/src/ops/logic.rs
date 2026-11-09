@@ -91,7 +91,7 @@ pub fn op_getbit(machine: &mut AvmMachine, _instruction: &Instruction) -> Result
         AvmValue::Uint64(v) => {
             if n >= 64 {
                 return Err(AlgoError::Avm {
-                    message: format!("getbit: bit index {n} >= 64 for uint64"),
+                    message: "getbit index > 63 with Uint".to_string(),
                 });
             }
             (v >> n) & 1
@@ -100,10 +100,7 @@ pub fn op_getbit(machine: &mut AvmMachine, _instruction: &Instruction) -> Result
             let total_bits = (bytes.len() as u64) * 8;
             if n >= total_bits {
                 return Err(AlgoError::Avm {
-                    message: format!(
-                        "getbit: bit index {n} >= {total_bits} for bytes of length {}",
-                        bytes.len()
-                    ),
+                    message: "getbit index beyond byteslice".to_string(),
                 });
             }
             let byte_idx = (n / 8) as usize;
@@ -125,7 +122,7 @@ pub fn op_setbit(machine: &mut AvmMachine, _instruction: &Instruction) -> Result
 
     if v > 1 {
         return Err(AlgoError::Avm {
-            message: format!("setbit: value {v} is not 0 or 1"),
+            message: "setbit value > 1".to_string(),
         });
     }
 
@@ -133,7 +130,7 @@ pub fn op_setbit(machine: &mut AvmMachine, _instruction: &Instruction) -> Result
         AvmValue::Uint64(val) => {
             if n >= 64 {
                 return Err(AlgoError::Avm {
-                    message: format!("setbit: bit index {n} >= 64 for uint64"),
+                    message: "setbit index > 63 with Uint".to_string(),
                 });
             }
             let result = if v == 1 {
@@ -147,10 +144,7 @@ pub fn op_setbit(machine: &mut AvmMachine, _instruction: &Instruction) -> Result
             let total_bits = (bytes.len() as u64) * 8;
             if n >= total_bits {
                 return Err(AlgoError::Avm {
-                    message: format!(
-                        "setbit: bit index {n} >= {total_bits} for bytes of length {}",
-                        bytes.len()
-                    ),
+                    message: "setbit index beyond byteslice".to_string(),
                 });
             }
             let byte_idx = (n / 8) as usize;
@@ -189,13 +183,13 @@ pub fn op_setbyte(machine: &mut AvmMachine, _instruction: &Instruction) -> Resul
 
     if v > 255 {
         return Err(AlgoError::Avm {
-            message: format!("setbyte: value {v} > 255"),
+            message: "setbyte value > 255".to_string(),
         });
     }
 
     if n >= bytes.len() as u64 {
         return Err(AlgoError::Avm {
-            message: format!("setbyte: index {n} >= length {} of bytes", bytes.len()),
+            message: "setbyte index beyond array length".to_string(),
         });
     }
 

@@ -66,12 +66,12 @@ fn check_runtime_mode(machine: &AvmMachine, opcode_byte: u8) -> Result<(), AlgoE
             (_, Mode::Any) | (ExecMode::Application, Mode::Application) => {}
             (ExecMode::LogicSig, Mode::Application) => {
                 return Err(AlgoError::Avm {
-                    message: format!("opcode {} not allowed in LogicSig mode", spec.name),
+                    message: format!("{} not allowed in current mode", spec.name),
                 });
             }
             (ExecMode::Application, Mode::LogicSig) => {
                 return Err(AlgoError::Avm {
-                    message: format!("opcode {} not allowed in Application mode", spec.name),
+                    message: format!("{} not allowed in current mode", spec.name),
                 });
             }
             (ExecMode::LogicSig, Mode::LogicSig) => {}
@@ -423,8 +423,8 @@ mod tests {
         );
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("not allowed in LogicSig mode"),
-            "expected 'not allowed in LogicSig mode', got: {msg}"
+            msg.contains("not allowed in current mode"),
+            "expected 'not allowed in current mode', got: {msg}"
         );
     }
 
@@ -445,8 +445,8 @@ mod tests {
         assert!(result.is_err(), "log should fail in LogicSig mode");
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("not allowed in LogicSig mode"),
-            "expected 'not allowed in LogicSig mode', got: {msg}"
+            msg.contains("not allowed in current mode"),
+            "expected 'not allowed in current mode', got: {msg}"
         );
     }
 
@@ -460,8 +460,8 @@ mod tests {
         assert!(result.is_err(), "itxn_begin should fail in LogicSig mode");
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("not allowed in LogicSig mode"),
-            "expected 'not allowed in LogicSig mode', got: {msg}"
+            msg.contains("not allowed in current mode"),
+            "expected 'not allowed in current mode', got: {msg}"
         );
     }
 
@@ -475,8 +475,8 @@ mod tests {
         assert!(result.is_err(), "balance should fail in LogicSig mode");
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("not allowed in LogicSig mode"),
-            "expected 'not allowed in LogicSig mode', got: {msg}"
+            msg.contains("not allowed in current mode"),
+            "expected 'not allowed in current mode', got: {msg}"
         );
     }
 
@@ -490,8 +490,8 @@ mod tests {
         assert!(result.is_err(), "gload should fail in LogicSig mode");
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("not allowed in LogicSig mode"),
-            "expected 'not allowed in LogicSig mode', got: {msg}"
+            msg.contains("not allowed in current mode"),
+            "expected 'not allowed in current mode', got: {msg}"
         );
     }
 
