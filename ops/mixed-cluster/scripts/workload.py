@@ -81,6 +81,11 @@ PQ_FEE_FACTOR = 20
 PQ_PAY_AMOUNT = 123456
 # Poll budget (x 2 s) for a submitted PQ payment to be confirmed.
 PQ_CONFIRM_POLLS = 45
+# goal gave up waiting for a round although the transaction was submitted
+# (issue #2192): `Transaction <id> still pending as of round N` and/or
+# `timeout waiting for round`. Poll budget (x 2 s) to ask the ledger.
+WAIT_TIMEOUT_RE = re.compile(r"still pending as of round|timeout waiting for round")
+WAIT_TIMEOUT_CONFIRM_POLLS = 10
 
 # Order of the first pass.  Every scenario runs once, in this order, before
 # the seeded random mix starts, so even a 20-round smoke covers each op.
@@ -326,12 +331,41 @@ class Workload:
     def note(self, op):
         return "w{}-{}".format(self.seq + 1, op)
 
+    def goal_outcome(self, rc, out, parsed):
+        """(outcome, detail) of a goal command that submits and waits.
+
+        Confirmed means goal said so, or goal gave up waiting (its block-wait
+        timeout can fire on a young chain while the transaction is already
+        committed, issue #2192) and the ledger has EVERY transaction goal
+        printed. Anything else, a real refusal included, is rejected: the
+        ledger is only asked when goal's own output says its wait timed out."""
+        if rc == 0 and parsed["round"] is not None:
+            return "confirmed", out
+        rnd = self.confirm_after_wait_timeout(out, parsed)
+        if rnd is not None:
+            parsed["round"] = rnd
+            return "confirmed", "{}\n[ledger-confirmed after goal's wait timeout: round {}]".format(out, rnd)
+        return "rejected", out
+
+    def confirm_after_wait_timeout(self, out, parsed):
+        """The highest confirmed round when goal's wait timed out and every
+        transaction id in its output is committed on go-node-1, else None."""
+        if not parsed["txids"] or not WAIT_TIMEOUT_RE.search(out):
+            return None
+        rounds = []
+        for t in parsed["txids"]:
+            r = self.pq_confirmed_round(t, "go-node-1", polls=WAIT_TIMEOUT_CONFIRM_POLLS)
+            if r is None:
+                return None
+            rounds.append(r)
+        return max(rounds)
+
     def run(self, op, args, expect="confirmed", must=False):
         """Run a goal command that submits one transaction and waits."""
         self.gate()
         rc, out = self.env.goal("{} --note {}".format(args, self.note(op)))
         parsed = parse_goal_output(out)
-        outcome = "confirmed" if rc == 0 and parsed["round"] is not None else "rejected"
+        outcome, out = self.goal_outcome(rc, out, parsed)
         rec = self.record_step(op, outcome, expect, parsed, out)
         if must and not rec["ok"]:
             raise ScenarioAbort("{} did not {}: {}".format(op, expect, out[-200:]))
@@ -342,7 +376,7 @@ class Workload:
         self.gate()
         rc, out = self.env.sh(cmd)
         parsed = parse_goal_output(out)
-        outcome = "confirmed" if rc == 0 and parsed["round"] is not None else "rejected"
+        outcome, out = self.goal_outcome(rc, out, parsed)
         rec = self.record_step(op, outcome, expect, parsed, out)
         if must and not rec["ok"]:
             raise ScenarioAbort("{} did not {}: {}".format(op, expect, out[-200:]))
@@ -790,12 +824,12 @@ class Workload:
         self.run("account_close", "clerk send -f {} -t {} -a 0 --close-to {}".format(x, b, b), must=True)
         self.run("send_from_closed_account", "clerk send -f {} -t {} -a 1".format(x, b), expect="rejected")
 
-    def pq_confirmed_round(self, txid, node):
+    def pq_confirmed_round(self, txid, node, polls=PQ_CONFIRM_POLLS):
         """Poll `txid` until it is confirmed: first on the node it was
         submitted to, then on go-node-1 (a node that lags or cannot answer must
         not make a committed payment look rejected).  Its round, else None."""
         nodes = [node] + (["go-node-1"] if node != "go-node-1" else [])
-        for _ in range(PQ_CONFIRM_POLLS):
+        for _ in range(polls):
             for n in nodes:
                 try:
                     info = self.env.rest_json("/v2/transactions/pending/{}".format(txid), node=n)
