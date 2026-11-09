@@ -31,8 +31,8 @@ Tracking epic: [#830](https://github.com/xarmian/algod-rust/issues/830).
 
 Raw generated inputs (kept for reproducibility, not hand-edited):
 [`docs/phase17/go_tests.tsv`](phase17/go_tests.tsv) (3,177 go-algorand
-tests), [`docs/phase17/rust_tests.tsv`](phase17/rust_tests.tsv) (6,644
-algod-rust tests), [`docs/phase17/batches/`](phase17/batches/) (the
+tests), [`docs/phase17/rust_tests.tsv`](phase17/rust_tests.tsv) (10,889
+algod-rust tests, sorted by crate, file and line), [`docs/phase17/batches/`](phase17/batches/) (the
 per-area split of the former).
 
 ## Keeping this map current across version upgrades
