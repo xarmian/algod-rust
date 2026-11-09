@@ -727,5 +727,110 @@ class DriverTest(unittest.TestCase):
         self.assertTrue(w.should_stop())
 
 
+TIMEOUT_OUT = (
+    "Attempting to send\nIssued transaction from account X, txid {t} (fee 1000)\n"
+    "Transaction {t} still pending as of round 2\n"
+    "Error processing command: timeout waiting for round\n"
+)
+
+
+class WaitTimeoutEnv(FakeEnv):
+    """goal sends fail with goal's wait timeout (the transaction itself was
+    submitted), the way a young chain makes goal give up at round 2 (issue
+    #2192).  Whether it is committed is what /v2/transactions/pending says."""
+
+    def goal(self, args, timeout=180):
+        if args.startswith("clerk send"):
+            self.cmds.append("goal {} -d /algod/data".format(args))
+            return 1, TIMEOUT_OUT.format(t=self._next_tx())
+        return super().goal(args, timeout)
+
+    def sh(self, cmd, timeout=180):
+        if "rawsend" in cmd:
+            self.cmds.append(cmd)
+            return 1, TIMEOUT_OUT.format(t=self._next_tx())
+        return super().sh(cmd, timeout)
+
+
+class WaitTimeoutTest(unittest.TestCase):
+    """Issue #2192: a goal wait timeout is not a rejection when the ledger
+    has the transaction."""
+
+    def test_a_timed_out_wait_for_a_committed_txn_is_recorded_confirmed(self):
+        env = WaitTimeoutEnv()
+        w, out = make(env)
+        w.funder = ADDR
+        w.run("fund", "clerk send -f {} -t {} -a 1".format(ADDR, ADDR), must=True)
+        rec = [r for r in records(out) if r["kind"] == "workload_step"][0]
+        self.assertEqual((rec["outcome"], rec["ok"]), ("confirmed", True))
+        self.assertEqual(rec["round"], env.round + 1)
+        self.assertIn("ledger-confirmed", rec["detail"])
+        self.assertEqual(w.counters["unexpected"], 0)
+        self.assertTrue(any("/v2/transactions/pending/" in p for _, p in env.rest_calls))
+
+    def test_a_timed_out_wait_for_an_uncommitted_txn_is_still_rejected(self):
+        env = WaitTimeoutEnv()
+        env.pending_confirmed = False
+        w, out = make(env)
+        with self.assertRaises(wl.ScenarioAbort):
+            w.run("fund", "clerk send -f {} -t {} -a 1".format(ADDR, ADDR), must=True)
+        rec = [r for r in records(out) if r["kind"] == "workload_step"][0]
+        self.assertEqual((rec["outcome"], rec["ok"]), ("rejected", False))
+        self.assertLessEqual(env.pending_polls, wl.WAIT_TIMEOUT_CONFIRM_POLLS)
+
+    def test_a_real_rejection_is_not_looked_up_nor_confirmed(self):
+        # goal reports the node's refusal: no "still pending"/timeout text, so
+        # the pending endpoint must not even be asked (a txid is in the text).
+        class Refused(FakeEnv):
+            def goal(self, args, timeout=180):
+                if args.startswith("clerk send"):
+                    self.cmds.append("goal " + args)
+                    return 1, "Issued transaction, txid {}\ntransaction rejected: overspend\n".format(self._next_tx())
+                return super().goal(args, timeout)
+
+        env = Refused()
+        w, out = make(env)
+        parsed, rec = w.run("send", "clerk send -f {} -t {} -a 1".format(ADDR, ADDR), expect="rejected")
+        self.assertEqual((rec["outcome"], rec["ok"]), ("rejected", True))
+        self.assertEqual([c for c in env.rest_calls if "/v2/transactions/pending/" in c[1]], [])
+
+    def test_a_group_confirms_only_when_every_txid_is_committed(self):
+        class GroupTimeout(WaitTimeoutEnv):
+            commit = (True, True)  # which of the group's txids the ledger has
+
+            def sh(self, cmd, timeout=180):
+                if "rawsend" in cmd:
+                    self.cmds.append(cmd)
+                    a, b = self._next_tx(), self._next_tx()
+                    self.group = (a, b)
+                    return 1, (
+                        "Issued transaction, txid {a}\nIssued transaction, txid {b}\n"
+                        "Transaction {a} still pending as of round 2\n"
+                        "Error processing command: timeout waiting for round\n"
+                    ).format(a=a, b=b)
+                return FakeEnv.sh(self, cmd, timeout)
+
+            def rest_json(self, path, node="go-node-1"):
+                if "/v2/transactions/pending/" in path:
+                    self.rest_calls.append((node, path))
+                    i = self.group.index(path.rsplit("/", 1)[-1])
+                    return {"confirmed-round": 11 + i if self.commit[i] else 0}
+                return super().rest_json(path, node)
+
+        for commit, outcome, rnd in (((True, True), "confirmed", 12), ((True, False), "rejected", None)):
+            env = GroupTimeout()
+            env.commit = commit
+            w, out = make(env)
+            parsed, rec = w.run_shell("grp", "goal clerk rawsend -f g.stx")
+            self.assertEqual(rec["outcome"], outcome, commit)
+            self.assertEqual(rec["round"], rnd, commit)
+
+    def test_run_shell_applies_the_same_rule(self):
+        env = WaitTimeoutEnv()
+        w, out = make(env)
+        parsed, rec = w.run_shell("grp", "goal clerk rawsend -f g.stx", must=True)
+        self.assertEqual((rec["outcome"], rec["ok"]), ("confirmed", True))
+
+
 if __name__ == "__main__":
     unittest.main()
