@@ -8,6 +8,7 @@
 #   crate<TAB>test_name<TAB>file<TAB>line
 #
 # Usage: scripts/list_rust_tests.sh > docs/phase17/rust_tests.tsv
+# (LF line endings; the output is deterministic for a given tree)
 #
 # Used by Phase 17 (docs/PHASE17_PROPOSAL.md) to build the go-algorand <->
 # algod-rust test parity table. Re-run any time to regenerate it from
@@ -18,6 +19,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 printf 'crate\ttest_name\tfile\tline\n'
+
+# Rows are sorted (crate, file, numeric line, name; byte order) so a
+# regeneration diffs small and the file stays reviewable (issue #2183).
+export LC_ALL=C
 
 # Find files containing #[test]/#[tokio::test] attributes, then within each
 # file pair the attribute with the following `fn` line.
@@ -40,4 +45,5 @@ find crates bin tests tools -name '*.rs' -type f 2>/dev/null \
         /^[[:space:]]*#\[/ { next } # allow stacked attributes between #[test] and fn
         { pending=0 }
       ' "$file"
-    done
+    done \
+  | sort -t "$(printf '\t')" -k1,1 -k3,3 -k4,4n -k2,2
