@@ -354,11 +354,13 @@ enum ResumeSkip {
     NewerGeneration,
 }
 
-/// How long a guard-spawned `resume()` may hold the `running` slot (which
-/// serialises it against `start_catchup`, and which `GET /v2/status` and
-/// `abort_catchup` also take) before the slot is released and the resume task
-/// left to finish on its own: a hung `resume()` must not freeze the status
-/// endpoint. Only the guard path holds the slot; the hand-back does not.
+/// How long the guard-spawned task WAITS for its `resume()` while holding the
+/// `running` slot (which serialises it against `start_catchup`, and which
+/// `GET /v2/status` and `abort_catchup` also take): a slow `resume()` must not
+/// freeze the status endpoint. When it elapses the slot is released and the
+/// resume is NOT cancelled: it runs on its own task, finishes, and its outcome
+/// (a panic or cancellation) is still counted and logged. Only the guard path
+/// holds the slot; the hand-back does not.
 const GUARD_RESUME_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// What a drop guard decided or did (tests only; recorded by
@@ -376,6 +378,9 @@ enum ResumeDecision {
     TaskSkipped(ResumeSkip),
     /// The spawned task attempted `resume()` (it may have panicked: counted).
     TaskAttempted,
+    /// The spawned task released the slot because `resume()` outlived the
+    /// timeout; the resume itself keeps running.
+    TaskTimedOut,
 }
 
 /// Resume normal sync from a drop guard (which cannot await), unless the node
@@ -441,20 +446,30 @@ fn resume_after_abnormal_exit(manager: &Arc<LiveCatchupManager>, generation: u64
                     manager.record_decision(ResumeDecision::TaskSkipped(skip));
                     return;
                 }
-                if tokio::time::timeout(
-                    GUARD_RESUME_LOCK_TIMEOUT,
-                    manager.resume_catching_panics(generation, &who),
-                )
-                .await
-                .is_err()
+                // The resume (with its panic/cancel accounting) runs on a task
+                // of its own; only the WAIT for it is bounded. Timing out
+                // releases the slot but never cancels the resume: dropping a
+                // `JoinHandle` detaches the task, which runs to completion and
+                // records its outcome as usual.
+                let mut resume = tokio::spawn({
+                    let manager = Arc::clone(&manager);
+                    let who = who.clone();
+                    async move { manager.resume_catching_panics(generation, &who).await }
+                });
+                if tokio::time::timeout(GUARD_RESUME_LOCK_TIMEOUT, &mut resume)
+                    .await
+                    .is_err()
                 {
                     tracing::error!(
                         generation,
-                        "{who}: resume() is still running after {GUARD_RESUME_LOCK_TIMEOUT:?}: releasing the catchup slot"
+                        "{who}: resume() is still running after {GUARD_RESUME_LOCK_TIMEOUT:?}: releasing the catchup slot; it keeps running to completion"
                     );
+                    #[cfg(test)]
+                    manager.record_decision(ResumeDecision::TaskTimedOut);
+                } else {
+                    #[cfg(test)]
+                    manager.record_decision(ResumeDecision::TaskAttempted);
                 }
-                #[cfg(test)]
-                manager.record_decision(ResumeDecision::TaskAttempted);
             });
         }
         Err(_) => {
@@ -2992,6 +3007,70 @@ mod tests {
             control.log.lock().unwrap()[..3],
             ["resume_start", "resume_end", "pause"]
         );
+    }
+
+    /// Like [`OrderedGatedControl`], but `resume` PANICS after its gate.
+    struct GatedPanickingControl {
+        log: StdMutex<Vec<&'static str>>,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl NormalSyncControl for GatedPanickingControl {
+        async fn pause(&self) {
+            self.log.lock().unwrap().push("pause");
+        }
+        async fn resume(&self) {
+            self.log.lock().unwrap().push("resume_start");
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.log.lock().unwrap().push("resume_end");
+            panic!("resume bug after the slot was released");
+        }
+    }
+
+    /// Issue #2262 (review): a guard's `resume()` that outlives
+    /// `GUARD_RESUME_LOCK_TIMEOUT` releases the slot (a newer catchup proceeds
+    /// meanwhile) but is NOT abandoned: it runs to completion on its own task
+    /// and its outcome is still observed (a panic after the timeout is counted).
+    #[tokio::test(start_paused = true)]
+    async fn a_guard_resume_that_outlives_the_slot_timeout_still_completes_and_is_observed() {
+        let control = Arc::new(GatedPanickingControl {
+            log: StdMutex::new(Vec::new()),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
+        drop(ClearRunningOnDrop {
+            manager: Arc::clone(&manager),
+            generation: 1,
+            armed: true,
+        });
+        control.entered.notified().await; // inside the stale resume, holding the slot
+        let start = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.start_catchup("2000#bbbb").await })
+        };
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!start.is_finished(), "the newer catchup waits for the slot");
+        // The resume outlives the timeout: the slot is released.
+        tokio::time::advance(GUARD_RESUME_LOCK_TIMEOUT + Duration::from_secs(1)).await;
+        assert_eq!(start.await.unwrap(), CatchupStartResult::Created);
+        assert!(manager.decisions().contains(&ResumeDecision::TaskTimedOut));
+        assert_eq!(
+            control.log.lock().unwrap()[..2],
+            ["resume_start", "pause"],
+            "the newer catchup paused while the slow resume is still running"
+        );
+        assert_eq!(manager.resume_panics(), 0, "not finished yet");
+        // The slow resume finishes (and panics) AFTER the timeout: it was not
+        // cancelled, and the failure is still counted.
+        control.release.notify_one();
+        wait_until("the late panic is counted", || manager.resume_panics() == 1).await;
+        assert!(control.log.lock().unwrap().contains(&"resume_end"));
     }
 
     /// A runner whose first run completes at once and whose later runs wait
