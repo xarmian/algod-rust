@@ -339,6 +339,81 @@ class DrainTest(unittest.TestCase):
         self.assertEqual(ll.backlog_metrics(None), {})
 
 
+class PoolCountersTest(unittest.TestCase):
+    """Issue #2151: the `/metrics` series both implementations expose (pool size
+    and the pool's rejection counters) paired per step. The fixtures are the
+    exposition formats of go (`util/metrics`: bare `name value` lines, tag
+    counters only once a tag was seen) and of algod-rust (every tag always)."""
+
+    def test_the_parser_reads_bare_and_labelled_samples_and_skips_the_rest(self):
+        text = "\n".join([
+            "# HELP a h", "# TYPE a gauge", "a 3", 'b{host="x"} 4.5', 'b{host="y"} 1',
+            "broken line", "c notanumber", "", "d 7"])
+        self.assertEqual(ll.parse_metrics(text), {"a": 3.0, "b": 5.5, "d": 7.0})
+
+    def test_both_implementations_expose_the_paired_series(self):
+        for name, size in (("metrics-go.txt", 37.0), ("metrics-rust.txt", 21.0)):
+            m = ll.parse_metrics(read(name))
+            self.assertEqual(m[ll.POOL_SIZE_METRIC], size, name)
+            self.assertTrue(any(k.startswith(ll.REMEMBER_ERR_PREFIX) for k in m), name)
+            self.assertTrue(any(k.startswith(ll.CHECK_ERR_PREFIX) for k in m), name)
+
+    def test_counters_are_summed_as_deltas_over_the_nodes_and_pool_size_is_the_peak(self):
+        go = ll.parse_metrics(read("metrics-go.txt"))
+        before = {"relay": go, "part1": dict(go, algod_tx_pool_count=2.0)}
+        after = {
+            "relay": dict(go, **{ll.REMEMBER_ERR_PREFIX + "fee": 9.0,
+                                 ll.REMEMBER_ERR_PREFIX + "cap": 12.0,
+                                 ll.CHECK_ERR_PREFIX + "txid": 10.0,
+                                 ll.POOL_SIZE_METRIC: 4.0}),
+            "part1": dict(go, **{ll.POOL_SIZE_METRIC: 40.0,
+                                 ll.REMEMBER_ERR_PREFIX + "newtag": 6.0}),
+        }
+        m = ll.pool_metrics(before, after)
+        self.assertEqual(m["pool_size_end"], ("txns", "lower", 40.0))
+        # relay: fee +4; part1: the new tag counts from zero (+6).
+        self.assertEqual(m["pool_rejected_remember"], ("txns", "lower", 10.0))
+        self.assertEqual(m["pool_rejected_check"], ("txns", "lower", 7.0))
+
+    def test_a_restarted_node_counts_what_it_has_since_its_restart(self):
+        b = {"relay": {ll.REMEMBER_ERR_PREFIX + "fee": 50.0, ll.POOL_SIZE_METRIC: 1.0}}
+        a = {"relay": {ll.REMEMBER_ERR_PREFIX + "fee": 3.0, ll.POOL_SIZE_METRIC: 1.0}}
+        self.assertEqual(ll.pool_metrics(b, a)["pool_rejected_remember"][2], 3.0)
+
+    def test_an_absent_counter_family_is_zero_where_the_node_answered(self):
+        quiet = {ll.POOL_SIZE_METRIC: 0.0}
+        m = ll.pool_metrics({"relay": quiet}, {"relay": quiet})
+        self.assertEqual(m["pool_rejected_remember"][2], 0.0)
+        self.assertEqual(m["pool_rejected_check"][2], 0.0)
+        self.assertEqual(m["pool_size_end"][2], 0.0)
+
+    def test_nothing_is_reported_for_nodes_that_never_answered(self):
+        self.assertEqual(ll.pool_metrics({"relay": None}, {"relay": None}), {})
+        self.assertEqual(ll.pool_metrics({}, {}), {})
+        # A node whose "after" scrape failed does not count; the others do.
+        go = ll.parse_metrics(read("metrics-go.txt"))
+        m = ll.pool_metrics({"relay": go, "p": go}, {"relay": go, "p": None})
+        self.assertEqual(m["pool_rejected_remember"][2], 0.0)
+        self.assertEqual(m["pool_size_end"][2], 37.0)
+
+    def test_a_missing_pool_size_series_leaves_that_row_out(self):
+        only = {ll.CHECK_ERR_PREFIX + "txid": 1.0}
+        m = ll.pool_metrics({"relay": {}}, {"relay": only})
+        self.assertNotIn("pool_size_end", m)
+        self.assertEqual(m["pool_rejected_check"][2], 1.0)
+
+    def test_the_rows_pair_across_implementations_in_the_result(self):
+        go = ll.parse_metrics(read("metrics-go.txt"))
+        rust = ll.parse_metrics(read("metrics-rust.txt"))
+        run = {"go": {"fixed": ll.pool_metrics({"relay": {}}, {"relay": go})},
+               "rust": {"fixed": ll.pool_metrics({"relay": {}}, {"relay": rust})}}
+        rows = ll.result_rows([run], "localnet", {})
+        names = {(r["impl"], r["name"]) for r in rows}
+        for impl in ("go", "rust"):
+            for metric in ("pool_size_end", "pool_rejected_remember", "pool_rejected_check"):
+                self.assertIn((impl, f"fixed/{metric}"), names)
+
+
 class MetricsTest(unittest.TestCase):
     def test_latency_percentiles_tps_and_resources(self):
         window = {"confirmed_tps": 450.0, "round_time_s": 2.8}

@@ -395,6 +395,79 @@ def backlog_metrics(pending):
     return {"start_backlog_txns": ("txns", "lower", float(pending))}
 
 
+# ---- /metrics counters (issue #2151) -----------------------------------------
+#
+# Both implementations serve `GET /metrics` in the Prometheus text format with
+# the same names for the series paired here (go-algorand: `node/node.go`
+# `txPoolGauge`, `data/txHandler.go` `transactionMessageTxPool{Remember,Check}
+# Counter`). Everything else in the two expositions is implementation specific
+# and is not paired (docs/BENCHMARK_COMPARISON.md lists which).
+
+POOL_SIZE_METRIC = "algod_tx_pool_count"
+REMEMBER_ERR_PREFIX = "algod_transaction_messages_txpool_remember_err_"
+CHECK_ERR_PREFIX = "algod_transaction_messages_txpool_check_err_"
+
+
+def parse_metrics(text):
+    """{series name: value} of a Prometheus text exposition. Comment lines and
+    lines that are not `name value` are skipped; a labelled series
+    (`name{l="v"} 1`) is keyed by its bare name and its samples are summed."""
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        series, _, value = line.rpartition(" ")
+        if not series:
+            continue
+        try:
+            v = float(value)
+        except ValueError:
+            continue
+        name = series.split("{", 1)[0].strip()
+        if name:
+            out[name] = out.get(name, 0.0) + v
+    return out
+
+
+def _counter_delta(before, after, prefix):
+    """Events of the counter family `prefix*` between two scrapes of one node.
+    A series that is new in `after` counts from zero (go creates a tag counter
+    on its first event); one that went down means the node restarted, so its
+    current value is what it has since."""
+    total = 0.0
+    for name, a in after.items():
+        if name.startswith(prefix):
+            b = before.get(name, 0.0)
+            total += a - b if a >= b else a
+    return total
+
+
+def pool_metrics(before, after):
+    """{metric: (unit, better, value)} of the paired `/metrics` series over one
+    step. `before` / `after` map each node to its parsed scrape (None when the
+    scrape failed); only nodes that answered both times count.
+
+    * `pool_size_end`: the largest pool at the end of the step (txns);
+    * `pool_rejected_remember` / `pool_rejected_check`: groups the pool refused
+      to remember / failed to check from gossip, summed over the nodes (a
+      counter family absent from a node that answered is zero).
+
+    Returns {} when no node answered both scrapes."""
+    nodes = [n for n in after if before.get(n) is not None and after[n] is not None]
+    if not nodes:
+        return {}
+    m = {}
+    sizes = [after[n][POOL_SIZE_METRIC] for n in nodes if POOL_SIZE_METRIC in after[n]]
+    if sizes:
+        m["pool_size_end"] = ("txns", "lower", float(max(sizes)))
+    for name, prefix in (("pool_rejected_remember", REMEMBER_ERR_PREFIX),
+                         ("pool_rejected_check", CHECK_ERR_PREFIX)):
+        m[name] = ("txns", "lower",
+                   float(sum(_counter_delta(before[n], after[n], prefix) for n in nodes)))
+    return m
+
+
 def submit_window(rep):
     """The interval a load step actually offered transactions, from the
     generator's report: the rounds around it and its wall-clock instants in

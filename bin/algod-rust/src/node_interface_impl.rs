@@ -2804,6 +2804,15 @@ impl NodeInterface for AlgodNodeInterface {
         text.push_str(&algo_ledger::proposal_eval::proposal_metrics_prometheus_text());
         if let Some(pool) = self.pool.as_ref() {
             text.push_str(&pool.reeval_counter().to_prometheus_text());
+            // Issue #2151: go's `algod_tx_pool_count` gauge (`node/node.go`
+            // `txPoolGauge`, `PendingCount()`), read at scrape time here
+            // where go refreshes it every 10 s.
+            text.push_str(&format!(
+                "# HELP algod_tx_pool_count current number of available transactions in pool\n\
+                 # TYPE algod_tx_pool_count gauge\n\
+                 algod_tx_pool_count {}\n",
+                pool.pending_count()
+            ));
         }
         if let Some(counter) = self.tx_pool_remember_counter.as_ref() {
             text.push_str(&counter.to_prometheus_text());
@@ -4396,6 +4405,32 @@ mod tests {
         assert!(text.contains("algod_tx_pool_reeval_"));
         assert!(text.contains("algod_transaction_messages_txpool_remember_err_"));
         assert!(text.contains("algod_transaction_messages_txpool_check_err_"));
+    }
+
+    /// Issue #2151: go exposes the pool size as the `algod_tx_pool_count`
+    /// gauge (`node/node.go` `txPoolGauge`, set from `PendingCount()`); the
+    /// localnet benchmark pairs it, so the same series is part of this node's
+    /// exposition, current at scrape time, and absent without a pool.
+    #[test]
+    fn the_tx_pool_size_gauge_is_exposed_like_gos() {
+        let adapter = make_adapter();
+        let text = adapter.metrics_exposition().expect("exposition");
+        assert!(!text.contains("algod_tx_pool_count"), "no pool, no gauge");
+
+        let pool = Arc::new(algo_pool::TransactionPool::new(
+            algo_pool::PoolConfig::default(),
+            Arc::new(PoolLedgerStub),
+        ));
+        let adapter = make_adapter().with_pool(pool);
+        let text = adapter.metrics_exposition().expect("exposition");
+        assert!(
+            text.contains(
+                "# HELP algod_tx_pool_count current number of available transactions in pool\n\
+                 # TYPE algod_tx_pool_count gauge\n\
+                 algod_tx_pool_count 0\n"
+            ),
+            "{text}"
+        );
     }
 
     /// Evaluator that holds one transaction group per "block" and then
