@@ -41,6 +41,7 @@ use std::time::Instant;
 
 use algo_types::AccountStatus;
 use rusqlite::{Connection, OptionalExtension};
+use tokio_util::sync::CancellationToken;
 
 use super::checkpoint::ImportCheckpoint;
 use super::msgp_compat::{decode_base_account_data, decode_resources_data};
@@ -1165,7 +1166,23 @@ pub fn import_catchpoint_file_with_progress(
     reward_unit: u64,
     on_progress: Option<&mut dyn FnMut(&ImportProgressUpdate)>,
 ) -> Result<ImportResult, CatchpointError> {
-    import_catchpoint_file_with_cutover_hook(conn, path, reward_unit, on_progress, None)
+    import_catchpoint_file_with_cutover_hook(conn, path, reward_unit, on_progress, None, None)
+}
+
+/// [`import_catchpoint_file_with_progress`] that stops between chunks once
+/// `cancel` fires (issue #2142): the long streaming phase of a catchpoint
+/// import (minutes on a large state) must end within a shutdown's deadline,
+/// not be abandoned mid-way by the process exit. The open transaction is rolled
+/// back and [`CatchpointError::Cancelled`] returned; nothing was cut over, and
+/// the next run starts the import over (it is single-pass).
+pub fn import_catchpoint_file_with_cancel(
+    conn: &Connection,
+    path: &Path,
+    reward_unit: u64,
+    on_progress: Option<&mut dyn FnMut(&ImportProgressUpdate)>,
+    cancel: Option<&CancellationToken>,
+) -> Result<ImportResult, CatchpointError> {
+    import_catchpoint_file_with_cutover_hook(conn, path, reward_unit, on_progress, None, cancel)
 }
 
 /// A write that runs inside a cutover or rollback transaction (see
@@ -1174,13 +1191,15 @@ pub type CutoverHook<'a> = &'a dyn Fn(&Connection) -> Result<(), CatchpointError
 
 /// [`import_catchpoint_file_with_progress`] whose atomic cutover also runs
 /// `in_cutover` inside its transaction (issue #2141): the hook's writes commit
-/// with the live-table replacement or not at all.
+/// with the live-table replacement or not at all. `cancel` is checked before
+/// every chunk (see [`import_catchpoint_file_with_cancel`]).
 pub fn import_catchpoint_file_with_cutover_hook(
     conn: &Connection,
     path: &Path,
     reward_unit: u64,
     mut on_progress: Option<&mut dyn FnMut(&ImportProgressUpdate)>,
     in_cutover: Option<CutoverHook<'_>>,
+    cancel: Option<&CancellationToken>,
 ) -> Result<ImportResult, CatchpointError> {
     let start = Instant::now();
 
@@ -1247,6 +1266,11 @@ pub fn import_catchpoint_file_with_cutover_hook(
                     match item? {
                         CatchpointEntry::Header(_) => { /* already extracted */ }
                         CatchpointEntry::Chunk(chunk) => {
+                            // Between chunks, not inside one: a chunk is a short,
+                            // bounded unit of work (issue #2142).
+                            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                                return Err(CatchpointError::Cancelled);
+                            }
                             chunk_ordinal += 1;
 
                             if !in_txn {
