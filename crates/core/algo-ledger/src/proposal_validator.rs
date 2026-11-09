@@ -114,6 +114,10 @@ pub struct PayoutCheckingValidator<V: BlockValidator> {
     inner: V,
     ledger: Arc<Mutex<SqliteLedger>>,
     budget: Duration,
+    /// Proposals THIS validator accepted on the stateless verdict alone (the
+    /// process-wide [`payout_check_fallbacks`] sums every validator's, so a
+    /// test that asserts on a delta must read its own validator's counter).
+    fallbacks: AtomicU64,
 }
 
 enum Attempt {
@@ -133,7 +137,14 @@ impl<V: BlockValidator> PayoutCheckingValidator<V> {
             inner,
             ledger,
             budget,
+            fallbacks: AtomicU64::new(0),
         }
+    }
+
+    /// Number of proposals this validator accepted on the stateless verdict
+    /// alone because the proposal check could not be evaluated.
+    pub fn fallbacks(&self) -> u64 {
+        self.fallbacks.load(Ordering::Relaxed)
     }
 
     fn attempt(&self, block: &Block) -> Attempt {
@@ -298,6 +309,7 @@ impl<V: BlockValidator> BlockValidator for PayoutCheckingValidator<V> {
                         );
                         return Err(AgreementError::ValidationFailed(violation));
                     }
+                    self.fallbacks.fetch_add(1, Ordering::Relaxed);
                     FALLBACKS.fetch_add(1, Ordering::Relaxed);
                     warn!(
                         round = block.round.0,
@@ -371,12 +383,35 @@ mod tests {
     fn open_lease_journal_does_not_stop_the_overlay_check() {
         let ledger = ledger_at(0);
         let _leaked = ledger.lock().unwrap().save_scratch_state().expect("open");
-        let before = payout_check_fallbacks();
         let v = validator(&ledger, Duration::from_millis(100));
         let err = v.validate(&proposal(1, 5)).err().expect("over allowance");
         assert!(err.to_string().contains("5 payout, 0 is allowed"), "{err}");
         v.validate(&proposal(1, 0)).map(|_| ()).expect("payout 0");
-        assert_eq!(payout_check_fallbacks(), before);
+        // This validator's own counter: the process-wide one moves whenever a
+        // neighbouring test falls back (issue #2233).
+        assert_eq!(v.fallbacks(), 0);
+    }
+
+    /// Issue #2233: a fallback in ANOTHER validator (here, deterministically
+    /// between the two reads, as a parallel test would) moves neither this
+    /// validator's counter nor an assertion on it.
+    #[test]
+    fn another_validators_fallback_does_not_move_this_validators_counter() {
+        let ledger = ledger_at(0);
+        let quiet = validator(&ledger, Duration::from_millis(100));
+        let before = quiet.fallbacks();
+        let other_ledger = ledger_at(0);
+        let noisy = validator(&other_ledger, Duration::from_millis(60));
+        noisy
+            .validate(&proposal(5, 5))
+            .map(|_| ())
+            .expect("fallback");
+        assert_eq!(noisy.fallbacks(), 1);
+        assert_eq!(quiet.fallbacks(), before, "an instance counter is isolated");
+        assert!(
+            payout_check_fallbacks() >= 1,
+            "the process-wide sum still counts it"
+        );
     }
 
     /// A proposal for a round past the next one waits for the ledger to reach
@@ -405,10 +440,9 @@ mod tests {
     #[test]
     fn ledger_that_never_catches_up_falls_back() {
         let ledger = ledger_at(0);
-        let before = payout_check_fallbacks();
         let v = validator(&ledger, Duration::from_millis(60));
         v.validate(&proposal(5, 5)).map(|_| ()).expect("fallback");
-        assert!(payout_check_fallbacks() > before);
+        assert_eq!(v.fallbacks(), 1);
     }
 
     /// A round at or below the committed one is already final.
