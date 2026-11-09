@@ -36,7 +36,9 @@ Regenerate the blocks below with `report.py --publish` (see
   pending, so it is not available as a release asset and no large-corpus numbers
   are reported. The small corpus is committed in the repository.
 - Post-optimization numbers (epic acceptance criterion, issue #2110) are not
-  here yet; they will be added next to this baseline.
+  here yet; they will be added next to this baseline. The per-hotspot
+  before/after measurements gathered so far, with their hosts and n, are in
+  [PERF_PHASE23.md](PERF_PHASE23.md).
 
 ## Headline
 
