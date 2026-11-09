@@ -1610,30 +1610,29 @@ not repaired again.
 algod-rust cuts the live ledger over to the catchpoint snapshot early (#2121),
 so once a catchup has passed the import (verification, lookback or replay) a
 request for a DIFFERENT catchpoint is refused with go's `unable to start
-catchpoint catchup for 'B' - already catching up 'A'`, and aborting a cut-over
-run keeps its marker. If catchup A can never finish (peers stopped serving it,
-its file is gone, verification keeps failing), restart the node with
+catchpoint catchup for 'B' - already catching up 'A'` (followed by a pointer to
+this section), and aborting a cut-over run keeps its marker. go has no such
+state (its live ledger is untouched until the final Switch stage). A request
+for the same catchpoint as the marker, or without one, still resumes it.
 
-```bash
-ALGOD_RUST_DISCARD_CUT_OVER_CATCHUP=1 algod-rust ...   # or catchpoint-sync
-```
+If catchup A can never finish (peers stopped serving it, its file is gone,
+verification keeps failing), abandon it by discarding the ledger:
 
-The accepted values are exactly `1`, `true` or `yes` (any case, surrounding
-whitespace ignored); anything else, or unset, leaves the escape off. The
-variable is process-global and is read on every orchestrator construction (each
-live-catchup request and each retry of a run, and each `catchpoint-sync` run),
-so changing it takes effect only by restarting the node.
+1. Stop the node.
+2. In the node's ledger directory (`<data-dir>/<genesis-id>/`), delete
+   `ledger.tracker.sqlite` and `ledger.block.sqlite` with their `-wal` and
+   `-shm` files, and every `catchpoint-*.tar.gz` and `catchpoint-*.tmp`. This
+   discards the node's whole ledger, not only the stuck snapshot: move the
+   files elsewhere instead if you want to keep them.
+3. Start the node and request catchup B (`PUT /v2/catchup/<B>`, or
+   `catchpoint-sync --catchpoint <B>`).
 
-and request catchup B. The stuck catchup is then abandoned (destructive: its
-staging tables, file and partial progress are discarded, a warning is logged)
-and B starts over the cut-over ledger exactly like a request over an import-state
-marker, after everything the abandoned catchup wrote beyond its snapshot (its
-`txtail`, voters-snapshot and every `blockdb.blocks` row) is removed, so B's
-import starts from the same state a fresh import would (register: DIV-011): the marker is rewritten as "cut over" for B, so an abort still cannot
-strand the unverified snapshot without a marker. A request for the same label
-as the marker, or a run with no label, still resumes; unset the variable again
-afterwards. go has no equivalent (its ledger is untouched until the final
-Switch), so this is an algod-rust-only escape.
+There is deliberately no automated in-place escape. Discarding only what the
+stuck catchup wrote would have to remove its block, `txtail`, voters-snapshot
+and other tracker rows from a live ledger before B is downloaded and verified;
+a failure in between (no peer for B, a failed import) would leave a node whose
+tables and block rows disagree, while deleting the whole ledger has no partial
+state.
 
 ## Divergence hunts: diffing against public nodes
 

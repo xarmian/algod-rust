@@ -1615,11 +1615,6 @@ impl CatchupRunner for OrchestratorCatchupRunner {
             );
             orchestrator.set_cancel(cancel.clone());
             orchestrator.set_abort(abort.clone());
-            // Issue #2181: the operator's explicit escape for a catchup stuck
-            // past its cut-over (off unless the env var enables it).
-            orchestrator.set_discard_cut_over_catchup(
-                algo_ledger::sync::discard_cut_over_catchup_from_env(),
-            );
             // Mirror the eight `catchpoint_*` counters from `SyncProgress` into
             // the shared sink `LiveCatchupManager::catchpoint_counters()` reads
             // (issue #941), on every progress notification (state transitions

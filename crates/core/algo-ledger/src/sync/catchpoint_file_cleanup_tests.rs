@@ -302,7 +302,7 @@ fn a_stale_restart_refuses_marker_paths_that_are_not_catchpoint_files() {
         let conn = orchestrator.open_db().unwrap();
         let persisted = restore_sync_state(&conn).unwrap().unwrap();
         orchestrator
-            .start_over_for_requested_label(&conn, &persisted, false, false)
+            .start_over_for_requested_label(&conn, &persisted, false)
             .unwrap();
         assert!(
             victim.exists(),
