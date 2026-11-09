@@ -75,6 +75,11 @@
 #                         PHASE6_GO_ARCHIVAL=1 so the Go nodes keep every
 #                         block for the post-hoc verifiers.
 #   WORKLOAD_SEED         seed of the rich workload schedule (default 1674)
+#   TX_GOSSIP_CHECK       1 (default) = issue #2154 stage after the other
+#                         checks: TX gossip must reach every node's pool in
+#                         both directions (go-node-1 -> others, rust-node-4
+#                         -> others); TX_GOSSIP_COUNT (12) payments per
+#                         source, TX_GOSSIP_WITHIN_S (6) seconds budget
 #   CERT_WINDOW           opt-in (default 0 = off): restrict the cert
 #                         cross-verify to the last N rounds. Independently, a
 #                         non-archival Rust ledger is clamped to its retained
@@ -625,6 +630,27 @@ for c in s['checks']:
     else
         record "negative_conformance" fail \
             "negative-conformance.sh exited $negative_rc with no summary — see $OUT_DIR/negative.log"
+    fi
+fi
+
+# -- 7d. TX gossip reaches every node, both directions — issue #2154 ----
+# Payments submitted to go-node-1 must appear in the pools of the other three
+# nodes (the Rust participation node included: #2150), and payments submitted
+# to the Rust node in every Go node's pool. Runs after every other stage so
+# its transactions cannot touch the soak, block-comparison or cert checks.
+# TX_GOSSIP_CHECK=0 skips it.
+if [ "${TX_GOSSIP_CHECK:-1}" = "1" ]; then
+    echo "==> tx gossip check (issue #2154)"
+    gossip_rc=0
+    python3 "$HERE/tx_gossip.py" --out "$OUT_DIR/tx-gossip.json" \
+        --count "${TX_GOSSIP_COUNT:-12}" --within-s "${TX_GOSSIP_WITHIN_S:-6}" \
+        > "$OUT_DIR/tx-gossip.log" 2>&1 || gossip_rc=$?
+    tail -20 "$OUT_DIR/tx-gossip.log" || true
+    if [ "$gossip_rc" -eq 0 ]; then
+        record "tx_gossip" pass "$(tail -1 "$OUT_DIR/tx-gossip.log")"
+    else
+        record "tx_gossip" fail \
+            "tx_gossip.py exited $gossip_rc — see $OUT_DIR/tx-gossip.log / tx-gossip.json"
     fi
 fi
 
