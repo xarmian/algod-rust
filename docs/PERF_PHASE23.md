@@ -23,7 +23,7 @@ Evidence map per acceptance criterion: [`PHASE23_VALIDATION.md`](PHASE23_VALIDAT
 - **Parity first.** An optimization that changes a verdict, a byte, an error
   text or a response is a bug however fast it is. Each row names its guard.
 - **Where an optimization showed no gain it was not kept** (or not opened as a
-  PR): rows 2 and 7 are measured "not worth it" results, recorded so nobody
+  PR): rows 2 and 6 are measured "not worth it" results, recorded so nobody
   repeats them.
 
 ## Ranked hotspots
