@@ -4391,6 +4391,84 @@ fn a_degraded_admission_with_a_short_app_call_marks_its_access_list() {
     }
 }
 
+/// Issue #2246 (a): only a call that was ITSELF admitted on a shortfall marks
+/// what it references. A call sent from an address that is merely unknown (and
+/// can pay) is an ordinary degraded-mode call: its references keep their
+/// known balances, so a later honest group of a referenced account is judged
+/// on them (its shortfall is refused, not taken for a creditable one).
+#[test]
+fn an_unknown_sender_app_call_without_a_shortfall_does_not_mark_its_references() {
+    let mut eval = degraded_evaluator();
+    let f = key(7);
+    let r = key(4);
+    let named = key(9);
+    // R (funded with 1_000_000) is made unknown by F's short payment to it,
+    // and keeps a real balance it can pay from.
+    let group = call_then(vec![(pay_txn(&f, r.0, 1_000, 1), &f)], 2);
+    eval.transaction_group(&group).expect("admitted");
+    assert!(unknown_of(&eval).contains(&r.0));
+    assert!(!unknown_of(&eval).contains(&named.0));
+    let mut call = base_txn(r.0, TxnType::Appl);
+    call.application_id = 905;
+    call.accounts = Some(vec![named.0]);
+    call.foreign_apps = Some(vec![906]);
+    eval.transaction_group(&[sign(call, &r.1)])
+        .expect("R can pay the fee");
+    let unknown = unknown_of(&eval);
+    for who in [
+        named.0,
+        Address(algo_ledger::avm_context::app_address(905)),
+        Address(algo_ledger::avm_context::app_address(906)),
+    ] {
+        assert!(!unknown.contains(&who), "{who} must stay known");
+    }
+    // The verdict that follows: a referenced account's overspend is refused.
+    let err = eval
+        .transaction_group(&[pay(&named, r.0, 1 << 60, None)])
+        .expect_err("named is known, its overspend is refused");
+    assert!(err.to_string().contains("overspend"), "{err}");
+}
+
+/// Issue #2246 (b): when the evaluator turns incomplete WHILE a group is being
+/// admitted (here the admission budget is spent, so `exec_group` gives up on
+/// that group), the group's application call was admitted without the real
+/// apply: what it references may have been credited by inner transactions, and
+/// is marked unknown like the references of any other unmodelled call.
+#[test]
+fn an_evaluator_that_turns_incomplete_mid_group_marks_the_calls_references() {
+    let mut eval = two_app_evaluator();
+    eval.exec.as_mut().unwrap().spent = EXEC_ADMISSION_BUDGET;
+    assert!(!eval.exec.as_ref().unwrap().incomplete);
+    let f = key(3);
+    let named = key(9);
+    let mut call = base_txn(f.0, TxnType::Appl);
+    call.application_id = 905;
+    call.accounts = Some(vec![named.0]);
+    call.foreign_apps = Some(vec![906]);
+    eval.transaction_group(&[sign(call, &f.1)])
+        .expect("admitted on the cheap checks");
+    assert!(
+        eval.exec.as_ref().unwrap().incomplete,
+        "the spent budget turned the evaluator incomplete"
+    );
+    let unknown = unknown_of(&eval);
+    for who in [
+        named.0,
+        Address(algo_ledger::avm_context::app_address(905)),
+        Address(algo_ledger::avm_context::app_address(906)),
+    ] {
+        assert!(unknown.contains(&who), "{who} should be unknown");
+    }
+    // A group of a complete evaluator that stays complete marks nothing.
+    let mut eval = two_app_evaluator();
+    let mut call = base_txn(f.0, TxnType::Appl);
+    call.application_id = 905;
+    call.accounts = Some(vec![named.0]);
+    eval.transaction_group(&[sign(call, &f.1)])
+        .expect("admitted");
+    assert!(unknown_of(&eval).is_empty());
+}
+
 /// Issue #2217 review: an evaluator with no exec state (a unit-test fake: the
 /// only production constructor, `make_evaluator`, always builds `exec:
 /// Some(..)`) cannot carry unknown marks, so it keeps the behaviour from before

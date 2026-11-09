@@ -1990,14 +1990,14 @@ struct ExecState {
     /// fails, so this costs evaluation budget, never an invalid block. Only
     /// filled while the evaluator is incomplete; bounded by the block's size.
     ///
-    /// Known limits (follow-up issue): an address merely REFERENCED by a short
-    /// application call becomes unknown too and the set spreads transitively
-    /// (every unknown sender's payments mark their receivers), so one cap slot
-    /// can make later honest groups be judged on unknown balances, where
-    /// requiring an actual shortfall before marking references would not; and
-    /// a group during which the evaluator itself turns incomplete is not
-    /// tracked (the flag is read once per group). Both only weaken degraded
-    /// admission verdicts, never block assembly.
+    /// What an application call REFERENCES is marked only when the call itself
+    /// was admitted on a shortfall, or when the evaluator turned incomplete
+    /// while the call's own group was admitted (issue #2246): a call from a
+    /// merely unknown sender that can pay marks its touched balances (sender,
+    /// fee sink, payment targets) and nothing it references. Payments by an
+    /// unknown sender still mark their receivers transitively (their moves are
+    /// not kept), which only weakens degraded admission verdicts, never block
+    /// assembly.
     unknown_balances: Arc<HashSet<Address>>,
     /// Set once a group was admitted without being evaluated (stale base or
     /// spent budget): the overlay no longer matches the admitted set, so
@@ -2622,11 +2622,9 @@ impl SimpleBlockEvaluator {
     ///    (`DegradedMoves`): `transaction_group` applies its moves and then
     ///    restores the balances it touched, and the addresses it touches become
     ///    unknown in turn (#2217, tests
-    ///    `a_degraded_admission_*`). Known limits of the heuristic: references
-    ///    of a short application call are marked unknown without an actual
-    ///    shortfall and the marks spread transitively, and a group during
-    ///    which the evaluator turns incomplete is not tracked (see
-    ///    `ExecState::unknown_balances`). A known residual: a later member's
+    ///    `a_degraded_admission_*`); what a call references is marked only for
+    ///    an actual shortfall or an evaluator that turns incomplete during the
+    ///    group (#2246, see `ExecState::unknown_balances`). A known residual: a later member's
     ///    outright failure is reported instead of the deferred member's
     ///    overspend that go would name first.
     ///
@@ -2869,25 +2867,16 @@ impl SimpleBlockEvaluator {
                         touched.push(addr);
                     }
                 }
-                let mut referenced: Vec<Address> = Vec::new();
-                if stx.txn.txn_type == TxnType::Appl {
-                    // Inner transactions can pay anyone: what a call
-                    // references (accounts, applications, the V41 access
-                    // list) is all that is known of its targets.
-                    let mut app_ids = vec![stx.txn.application_id];
-                    app_ids.extend(stx.txn.foreign_apps.iter().flatten().copied());
-                    referenced.extend(stx.txn.accounts.iter().flatten().copied());
-                    for r in stx.txn.access.iter().flatten() {
-                        referenced.push(r.address);
-                        app_ids.push(r.app);
-                    }
-                    referenced.extend(
-                        app_ids
-                            .into_iter()
-                            .filter(|&id| id != 0)
-                            .map(|id| Address(algo_ledger::avm_context::app_address(id))),
-                    );
-                }
+                // Issue #2246: what a call references is unknown only when the
+                // call itself was admitted on a shortfall (its inner
+                // transactions may be what funds it). A call from an address
+                // that is merely unknown, and can pay, is an ordinary
+                // degraded-mode call: its references keep their balances.
+                let referenced = if shortfall_credited {
+                    Self::app_call_references(&stx.txn)
+                } else {
+                    Vec::new()
+                };
                 for addr in touched.iter().chain(&referenced) {
                     if !addr.is_zero()
                         && !known.as_ref().is_some_and(|k| k.contains(addr))
@@ -2960,6 +2949,32 @@ impl SimpleBlockEvaluator {
         }
 
         Ok(txids)
+    }
+
+    /// Every account and application account an application call can reach
+    /// (the legacy `accounts` / `foreign_apps`, the V41 `access` list, the
+    /// called application's own account): the addresses its inner
+    /// transactions can pay, and so the ones whose balance a call admitted
+    /// without the real apply leaves unknown (issues #2217, #2246).
+    fn app_call_references(call: &algo_types::Transaction) -> Vec<Address> {
+        let mut referenced: Vec<Address> = Vec::new();
+        if call.txn_type != TxnType::Appl {
+            return referenced;
+        }
+        let mut app_ids = vec![call.application_id];
+        app_ids.extend(call.foreign_apps.iter().flatten().copied());
+        referenced.extend(call.accounts.iter().flatten().copied());
+        for r in call.access.iter().flatten() {
+            referenced.push(r.address);
+            app_ids.push(r.app);
+        }
+        referenced.extend(
+            app_ids
+                .into_iter()
+                .filter(|&id| id != 0)
+                .map(|id| Address(algo_ledger::avm_context::app_address(id))),
+        );
+        referenced
     }
 
     /// Could the application call `call` (an earlier member) have credited a
@@ -4019,6 +4034,9 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         let mut degraded_sender: Option<Address> = None;
         // Issue #2217: the members whose balance moves are not applied.
         let mut moves = DegradedMoves::default();
+        // Issue #2246: whether the evaluator already had no usable real apply
+        // when the group was validated (`validate_group` reads it once).
+        let was_incomplete = self.exec.as_ref().is_none_or(|exec| exec.incomplete);
         let txids = match self.validate_group(txgroup, &mut moves) {
             Ok(txids) => txids,
             // `Ok`: the real apply accepts what the precheck refused, so the
@@ -4579,7 +4597,19 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             Ok(Some(fees)) => {
                 self.fees_collected = fees_collected_checkpoint.saturating_add(fees);
             }
-            Ok(None) => {}
+            Ok(None) => {
+                // Issue #2246: the evaluator turned incomplete during THIS
+                // group (stale base, spent budget): it was validated as a
+                // complete one, so nothing is tracked yet, and its calls were
+                // admitted without the real apply. What they reference may be
+                // credited by inner transactions: unknown, as for any
+                // unmodelled call.
+                if !was_incomplete && self.exec.as_ref().is_some_and(|exec| exec.incomplete) {
+                    for stx in txgroup {
+                        moves.unknown.extend(Self::app_call_references(&stx.txn));
+                    }
+                }
+            }
             Err(e) => {
                 self.overlay.restore(checkpoint);
                 self.fees_collected = fees_collected_checkpoint;
