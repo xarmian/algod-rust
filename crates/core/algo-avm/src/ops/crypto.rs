@@ -1286,7 +1286,7 @@ pub fn op_falcon_verify(
     // returns fmt.Errorf("invalid public key size %d != %d", ...).
     if pubkey.len() != falcon::FALCON_DET1024_PUBKEY_SIZE {
         return Err(avm_err(format!(
-            "invalid falcon pubkey size {} != {}",
+            "invalid public key size {} != {}",
             pubkey.len(),
             falcon::FALCON_DET1024_PUBKEY_SIZE,
         )));
@@ -3877,7 +3877,7 @@ mod tests {
             Err(e) => {
                 let err_msg = e.to_string();
                 assert!(
-                    err_msg.contains("invalid falcon pubkey size"),
+                    err_msg.contains("invalid public key size"),
                     "error should mention invalid pubkey size: {err_msg}"
                 );
             }
@@ -3910,7 +3910,7 @@ mod tests {
             Err(e) => {
                 let err_msg = e.to_string();
                 assert!(
-                    err_msg.contains("invalid falcon pubkey size"),
+                    err_msg.contains("invalid public key size"),
                     "error should mention invalid pubkey size: {err_msg}"
                 );
             }
