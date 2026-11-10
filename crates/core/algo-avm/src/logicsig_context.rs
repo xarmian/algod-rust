@@ -62,7 +62,7 @@ const PROGRAM_PREFIX: &[u8] = b"Program";
 /// NumLogs (59), CreatedAssetID (60), CreatedApplicationID (61), and
 /// LastLog (62) -- fields sourced from a transaction's `ApplyData`, which a
 /// LogicSig (never applied by an app call) can never legitimately read.
-fn is_effects_field(field: u8) -> bool {
+pub fn is_effects_field(field: u8) -> bool {
     matches!(field, 58..=62)
 }
 

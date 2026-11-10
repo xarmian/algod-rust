@@ -1803,7 +1803,8 @@ mod tests {
             CommitStage::Apply,
             AlgoError::ApprovalRejected {
                 app_id: 7,
-                reason: None
+                reason: None,
+                opcodes: None
             }
         ));
         assert!(!f(

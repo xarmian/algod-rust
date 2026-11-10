@@ -9,13 +9,15 @@
 Input: `crates/core/algo-avm/tests/fixtures/go_op_protos.jsonl`, go-algorand's
 per-opcode `proto` argument types dumped by `tools/avm-op-protos` (pinned
 v5.0.4-stable) across EVERY AVM version. A row is gated here only when go gates
-it the same way for every run mode (`modes == 3`) and the opcode byte is not
-shared by a prefix family. An opcode whose mode set or argument types CHANGE
+it the same way for every run mode (`modes == 3`), or when it is
+application-only (`modes == 2`, listed in `APP_ONLY`: go checks the mode before
+the gate, so a LogicSig meets `<op> not allowed in current mode` first), and the
+opcode byte is not shared by a prefix family. An opcode whose mode set or argument types CHANGE
 between versions (`stable` false: `ed25519verify` is LogicSig-only before v5) is
 gated only for programs of the version its final spec starts at
 (`MIN_VERSION`); older programs keep the lazy pops, and a changed mode set gets
 a version-dependent mode check (`MODE_VARIANTS`, below), which go runs BEFORE
-the argument gate. Mode-restricted opcodes keep their own mode handling.
+the argument gate. LogicSig-only opcodes keep their own mode handling.
 
     python3 scripts/gen_arg_gate_table.py            # rewrite the table
     python3 scripts/gen_arg_gate_table.py --check    # exit 1 if it is stale
@@ -49,6 +51,8 @@ KINDS = {
     ("[]byte", "[33]byte"): "BYTES33",
     ("[]byte", "[80]byte"): "BYTES80",
     ("[]byte", "[1793]byte"): "BYTES1793",
+    ("[]byte", "boxName"): "BOXNAME",
+    ("[]byte", "stateKey"): "STATEKEY",
 }
 
 HEADER = """// Copyright (C) 2019-2026 Algorand Foundation Ltd.
@@ -94,7 +98,7 @@ def rows():
     per_byte = Counter(r["opcode"] for r in lines)
     excluded = excluded_bytes()
     for r in lines:
-        if r["modes"] != 3 or not r["args"] or per_byte[r["opcode"]] != 1:
+        if r["modes"] not in (2, 3) or not r["args"] or per_byte[r["opcode"]] != 1:
             continue
         if r["opcode"] in excluded:
             continue
@@ -103,6 +107,12 @@ def rows():
             (r["opcode"], r["name"], [KINDS[(a["avm"], a["name"])] for a in r["args"]], first)
         )
     return sorted(out)
+
+
+def app_only_bytes(table):
+    """Opcode bytes of `table` that go runs in application mode only."""
+    app = {r["opcode"] for r in fixture() if r["modes"] == 2}
+    return sorted(op for op, _, _, _ in table if op in app)
 
 
 def mode_variants():
@@ -118,23 +128,35 @@ def mode_variants():
     return sorted(out)
 
 
-def render(table, variants):
+def render(table, variants, app_only):
     nl = "\n"
     body = [HEADER]
     body.append("use super::arg_gate::ArgType;" + nl)
     body.append(
-        "use super::arg_gate::{ANY, BIGINT, BYTES, BYTES1793, BYTES32, BYTES33, BYTES64, BYTES80, UINT};"
+        "use super::arg_gate::{"
+        + nl
+        + "    ANY, BIGINT, BOXNAME, BYTES, BYTES1793, BYTES32, BYTES33, BYTES64, BYTES80, STATEKEY, UINT,"
+        + nl
+        + "};"
         + nl
     )
     body.append("/// go's `proto` argument types by opcode byte, for every opcode go gates the" + nl)
     body.append(
-        "/// same way in every run mode and every version (`arg_gate::arg_types` reads this table)."
+        "/// same way in every run mode they run in, and every version (`arg_gate::arg_types` reads this table)."
         + nl
     )
     body.append("pub(super) static TABLE: [Option<&[ArgType]>; 256] = {" + nl)
     body.append("    let mut t: [Option<&[ArgType]>; 256] = [None; 256];" + nl)
     for op, name, args, _ in table:
         body.append(f"    t[0x{op:02x}] = Some(&[{', '.join(args)}]); // {name}" + nl)
+    body.append("    t" + nl + "};" + nl)
+    body.append(nl)
+    body.append("/// The opcodes of `TABLE` go runs in application mode only: a LogicSig meets" + nl)
+    body.append("/// `<op> not allowed in current mode` BEFORE the argument gate." + nl)
+    body.append("pub(super) static APP_ONLY: [bool; 256] = {" + nl)
+    body.append("    let mut t = [false; 256];" + nl)
+    for op in app_only:
+        body.append(f"    t[0x{op:02x}] = true;" + nl)
     body.append("    t" + nl + "};" + nl)
     body.append(nl)
     body.append("/// The first program version an opcode of `TABLE` is gated for (go's spec for" + nl)
@@ -161,7 +183,7 @@ def render(table, variants):
 def main():
     table = rows()
     variants = mode_variants()
-    text = render(table, variants)
+    text = render(table, variants, app_only_bytes(table))
     if "--check" in sys.argv:
         # Compare with line endings normalised, so a CRLF checkout of the
         # generated file is not "stale".

@@ -96,7 +96,17 @@ VoteLastValid:{vlv} VoteKeyDilution:{vkd}}}}}",
 /// `transaction <txid>: overspend (account <addr>, data {...}, tried to spend <A>)`.
 pub fn overspend_message(txid: &str, account: &Address, data: &AccountData, tried: u64) -> String {
     format!(
-        "transaction {txid}: overspend (account {}, data {}, tried to spend {})",
+        "transaction {txid}: {}",
+        overspend_error_text(account, data, tried)
+    )
+}
+
+/// go's `ledgercore.OverspendError.Error` alone, without a `transaction <txid>: `
+/// frame (an inner transaction reports it as `inner tx <i> failed: <this>`):
+/// `overspend (account <addr>, data {...}, tried to spend <A>)`.
+pub fn overspend_error_text(account: &Address, data: &AccountData, tried: u64) -> String {
+    format!(
+        "overspend (account {}, data {}, tried to spend {})",
         account.to_algorand_string(),
         format_account_data(data),
         format_micro_algos(tried),

@@ -194,10 +194,11 @@ fn attach_eval_error_details(
     app_index: Option<u64>,
 ) -> AlgoError {
     let message = err.to_string();
+    let pc = machine.byte_pc();
     AlgoError::AvmLogicSig {
         source: Box::new(err),
         message,
-        pc: machine.byte_pc(),
+        pc,
         group_index,
         app_index,
         eval_states: logicsig_eval_states(machine, group_index),
@@ -218,9 +219,13 @@ fn app_call_error_detail(
 ) -> (String, AvmErrorDetail) {
     let wrapped = attach_eval_error_details(err, machine, group_index, Some(app_index));
     let message = wrapped.to_string();
-    let detail = wrapped
+    let mut detail = wrapped
         .avm_eval_detail()
         .expect("attach_eval_error_details always produces AlgoError::AvmLogicSig");
+    // go's simulate prints the opcodes around the failing pc (`pcDetails`) in
+    // an app call's failure details.
+    detail.opcodes =
+        Some(crate::disassembler::pc_details(&machine.program, detail.pc).into_boxed_str());
     (message, detail)
 }
 
