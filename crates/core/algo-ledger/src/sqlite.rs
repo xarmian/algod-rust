@@ -7239,9 +7239,21 @@ CREATE TABLE IF NOT EXISTS catchpointstateproofverification (
 /// 3358 for `pending_totals_delta` alone; that manual workaround becomes
 /// redundant once this snapshot/restore path covers it and is removed).
 pub struct SqliteSnapshot {
-    savepoint: String,
+    scope: SnapshotScope,
     totals_delta: AccountTotalsDelta,
     online_touched: std::collections::HashSet<Address>,
+}
+
+/// What a [`SqliteSnapshot`] undoes with (issue #2162).
+enum SnapshotScope {
+    /// Taken inside an open transaction (the block-apply path): a SAVEPOINT,
+    /// rolled back to and released, leaving the enclosing transaction open.
+    Savepoint(String),
+    /// Taken in autocommit mode (a simulate request): the snapshot opened the
+    /// transaction itself and `restore_snapshot` ROLLS IT BACK. Releasing an
+    /// outermost SAVEPOINT instead would COMMIT the rolled-back pages to the
+    /// WAL and sync it, on every read-only request.
+    Transaction,
 }
 
 /// DIVERGENCE DIV-009: one block archive write buffered in a block span, in
@@ -8995,16 +9007,24 @@ impl LedgerStore for SqliteLedger {
 
     fn snapshot(&self, _addrs: &[Address]) -> SqliteSnapshot {
         let _st = crate::follow_timing::StateTimer::write();
-        let n = self.savepoint_counter.fetch_add(1, Ordering::Relaxed);
-        let name = format!("sp_{n}");
-        self.conn
-            .execute_batch(&format!("SAVEPOINT {name}"))
-            .expect("savepoint");
+        // Issue #2162: outside any transaction (simulate) a plain BEGIN, whose
+        // ROLLBACK writes nothing; inside one, a nested SAVEPOINT.
+        let scope = if self.conn.is_autocommit() {
+            self.conn.execute_batch("BEGIN").expect("begin snapshot");
+            SnapshotScope::Transaction
+        } else {
+            let n = self.savepoint_counter.fetch_add(1, Ordering::Relaxed);
+            let name = format!("sp_{n}");
+            self.conn
+                .execute_batch(&format!("SAVEPOINT {name}"))
+                .expect("savepoint");
+            SnapshotScope::Savepoint(name)
+        };
         // Issue #1521: capture the in-memory totals-delta state alongside the
         // SQL SAVEPOINT so `restore_snapshot` can revert it too -- see
         // `SqliteSnapshot`'s doc comment for why this is necessary.
         SqliteSnapshot {
-            savepoint: name,
+            scope,
             totals_delta: self.pending_totals_delta,
             online_touched: self.pending_online_touched.clone(),
         }
@@ -9040,12 +9060,20 @@ impl LedgerStore for SqliteLedger {
         // (ledger/simulation/simulator.go) evaluates against an eval snapshot
         // and never mutates the real ledger; this keeps the SQLite ledger
         // exactly as simulate found it, with no open transaction left behind.
-        let sp = &snapshot.savepoint;
-        self.conn
-            .execute_batch(&format!(
-                "ROLLBACK TO SAVEPOINT {sp}; RELEASE SAVEPOINT {sp};"
-            ))
-            .expect("rollback to and release savepoint");
+        match &snapshot.scope {
+            SnapshotScope::Savepoint(sp) => self
+                .conn
+                .execute_batch(&format!(
+                    "ROLLBACK TO SAVEPOINT {sp}; RELEASE SAVEPOINT {sp};"
+                ))
+                .expect("rollback to and release savepoint"),
+            // The snapshot opened the transaction: discard it whole (issue
+            // #2162), nothing reaches the WAL.
+            SnapshotScope::Transaction => self
+                .conn
+                .execute_batch("ROLLBACK")
+                .expect("rollback snapshot transaction"),
+        }
         // Issue #1521: also revert the in-memory totals-delta state to what
         // it was at the matching `snapshot()` call, undoing any speculative
         // `set_account`/`remove_account` folds the rolled-back writes made.
