@@ -195,7 +195,7 @@ pub enum CatchpointError {
     #[error("catchpoint checkpoint error: {0}")]
     CheckpointError(String),
 
-    #[error("catchpoint sqlite error")]
+    #[error("catchpoint sqlite error: {0}")]
     SqliteError(#[from] rusqlite::Error),
 
     #[error("catchpoint label parsing failed: {0}")]
@@ -793,6 +793,25 @@ pub const RESOURCE_FLAGS_EMPTY_APP: u8 = algo_codec::resource_flags::EMPTY_APP;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #2113: a SQLite failure during a catchpoint import (the nightly
+    /// mainnet soak lost two runs to `catchpoint import failed: catchpoint
+    /// sqlite error`, which was `SQLITE_FULL` on a RAM-backed `/tmp`) must
+    /// carry its cause in the message: the bare text hid it behind
+    /// `Error::source()`, which the log line does not print.
+    #[test]
+    fn a_sqlite_failure_names_its_cause_in_the_message() {
+        let full = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            Some("database or disk is full".to_string()),
+        );
+        let text = CatchpointError::SqliteError(full).to_string();
+        assert!(
+            text.contains("database or disk is full"),
+            "the SQLite cause is part of the message: {text}"
+        );
+        assert!(text.starts_with("catchpoint sqlite error"), "{text}");
+    }
 
     /// Build a msgpack map manually using rmpv for known values, mirroring
     /// go's map-encoded (non-array) `codec` output for these record types.

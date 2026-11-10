@@ -92,7 +92,7 @@ class ReusableWorkflowTest(unittest.TestCase):
 
     def test_artifacts_and_temp_dirs_are_network_scoped(self):
         self.assertIn("${{ inputs.network }}-soak-artifacts", self.text)
-        self.assertIn("/tmp/${NET}-soak-", self.text)
+        self.assertIn("${SOAK_ROOT}/${NET}-soak-", self.text)
         self.assertIn("name: ${{ inputs.network }}-node-soak-${{ github.run_id }}", self.text)
         self.assertIn('--network "$NET"', self.text)
 

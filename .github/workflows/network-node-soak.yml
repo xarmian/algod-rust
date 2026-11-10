@@ -141,7 +141,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Self-test the monitor/issue-filer before trusting them
-        run: python3 ops/mainnet-soak/monitor.py self-test
+        run: |
+          python3 ops/mainnet-soak/monitor.py self-test
+          python3 ops/mainnet-soak/soak_workflow_test.py
 
       - name: Build algod-rust (release)
         run: cargo build --release --bin algod-rust
@@ -412,14 +414,31 @@ jobs:
             echo "RUST_LOG=$RUST_LOG"
           fi
           mkdir -p ${ART}
-          mkdir -p /tmp/${NET}-soak-ledger /tmp/${NET}-soak-partkeys /tmp/${NET}-soak-data
+
+          # Issue #2113: the node's working set (the downloaded catchpoint
+          # file, the imported ledger and its WAL: about 8 GB for mainnet)
+          # lives on the runner's DISK. Some runner images mount /tmp as a
+          # RAM-backed tmpfs of about 7.7 GB; there the import filled it and
+          # SQLite answered SQLITE_FULL (two nightly runs lost, 2026-10-28
+          # and 2026-11-05). RUNNER_TEMP is always on the disk. Fail early,
+          # with the reason, on a volume that is RAM-backed or too small.
+          SOAK_ROOT="${RUNNER_TEMP:?RUNNER_TEMP is not set}/soak"
+          mkdir -p "$SOAK_ROOT"
+          FS_TYPE="$(stat -f -c %T "$SOAK_ROOT")"
+          AVAIL_GB="$(df -BG --output=avail "$SOAK_ROOT" | tail -n 1 | tr -dc '0-9')"
+          echo "==> soak working dir $SOAK_ROOT: filesystem ${FS_TYPE}, ${AVAIL_GB} GB free"
+          if [ "$FS_TYPE" = "tmpfs" ] || [ "${AVAIL_GB:-0}" -lt 30 ]; then
+            echo "error: the soak working dir needs a disk-backed volume with at least 30 GB free (the catchpoint file, ledger and WAL are about 8 GB for a full-size network); got ${FS_TYPE} with ${AVAIL_GB} GB free (issue #2113)" >&2
+            exit 1
+          fi
+          mkdir -p "${SOAK_ROOT}/${NET}-soak-ledger" "${SOAK_ROOT}/${NET}-soak-partkeys" "${SOAK_ROOT}/${NET}-soak-data"
 
           # Without --data-dir the REST server generates a random ephemeral
           # token we'd never see, and every curl call below would 401 --
           # seed known algod.token/algod.admin.token files instead, the
           # same pattern ops/mixed-cluster-p2p/scripts/start.sh uses.
-          printf '%s' "$ALGOD_TOKEN" > /tmp/${NET}-soak-data/algod.token
-          printf '%s' "$ALGOD_TOKEN" > /tmp/${NET}-soak-data/algod.admin.token
+          printf '%s' "$ALGOD_TOKEN" > ${SOAK_ROOT}/${NET}-soak-data/algod.token
+          printf '%s' "$ALGOD_TOKEN" > ${SOAK_ROOT}/${NET}-soak-data/algod.admin.token
 
           # Issue #1600 (fixed by PR #1610): real mainnet DNS-SRV bootstrap
           # discovery used to hit hickory-resolver's DNSSEC validator
@@ -461,11 +480,11 @@ jobs:
           # LATEST_VERSION`) entirely. LATEST_VERSION is 38 as of this
           # comment (crates/node/algo-config/src/lib.rs) -- update this if
           # that constant changes.
-          echo "{\"Version\": ${CONFIG_VERSION}}" > /tmp/${NET}-soak-data/config.json
+          echo "{\"Version\": ${CONFIG_VERSION}}" > ${SOAK_ROOT}/${NET}-soak-data/config.json
           # Optional custom consensus table (e.g. aramidmain); the node
           # merges <data_dir>/consensus.json on top of its built-ins.
           if [ -n "$CONSENSUS_JSON" ]; then
-            cp "$CONSENSUS_JSON" /tmp/${NET}-soak-data/consensus.json
+            cp "$CONSENSUS_JSON" ${SOAK_ROOT}/${NET}-soak-data/consensus.json
           fi
 
           # Network genesis (mainnet: the same fixture `make replay-mainnet*`
@@ -492,9 +511,9 @@ jobs:
             --genesis-id "$GENESIS_ID" \
             --genesis-json "$GENESIS_PATH" \
             --genesis-path "$GENESIS_PATH" \
-            --ledger-path /tmp/${NET}-soak-ledger/ledger \
-            --partkey-path /tmp/${NET}-soak-partkeys/partkeys.sqlite \
-            --data-dir /tmp/${NET}-soak-data \
+            --ledger-path ${SOAK_ROOT}/${NET}-soak-ledger/ledger \
+            --partkey-path ${SOAK_ROOT}/${NET}-soak-partkeys/partkeys.sqlite \
+            --data-dir ${SOAK_ROOT}/${NET}-soak-data \
             --rest-listen 127.0.0.1:8180 \
             --catchup-peer "$CATCHUP_PEER_URL" \
             --catchup-peer-token "" \
