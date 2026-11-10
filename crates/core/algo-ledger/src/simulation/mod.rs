@@ -1091,7 +1091,12 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     // Record failure. Collect any partial trace data before
                     // stopping (the tracer may have captured events up to
                     // the point of failure).
-                    failure_message = Some(e.to_string());
+                    failure_message = Some(
+                        algo_error::go_app_failure_message(&e, || {
+                            algo_codec::compute_txn_id(&eval_group[i].txn).to_string()
+                        })
+                        .unwrap_or_else(|| e.to_string()),
+                    );
                     // The tracer descended into this top-level transaction's
                     // own inner-txn tree (if any) and, on the first failure
                     // anywhere in it, recorded the path relative to this

@@ -580,7 +580,8 @@ fn pool_reason_maps_typed_apply_errors_to_go_wording() {
     assert_eq!(
         pool_reason(&AlgoError::ApprovalRejected {
             app_id: 7,
-            reason: None
+            reason: None,
+            opcodes: None
         }),
         (
             "transaction rejected by ApprovalProgram".to_string(),
@@ -590,7 +591,8 @@ fn pool_reason_maps_typed_apply_errors_to_go_wording() {
     assert_eq!(
         pool_reason(&AlgoError::ApprovalRejected {
             app_id: 7,
-            reason: Some("AVM: assert failed".into())
+            reason: Some("AVM: assert failed".into()),
+            opcodes: None
         }),
         (
             "logic eval error: assert failed. Details: app=7, pc=0".to_string(),

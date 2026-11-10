@@ -373,6 +373,16 @@ impl AvmMachine {
         true
     }
 
+    /// Whether go lets `opcode` run in this machine's mode: the version-dependent
+    /// mode sets (`ed25519verify`) and the opcodes the argument gate lists as
+    /// application-only, whose mode error precedes their argument gate in a
+    /// LogicSig.
+    #[inline(always)]
+    fn mode_permits(&self, opcode: u8) -> bool {
+        crate::arg_gate::mode_allows(opcode, self.version, self.mode)
+            && !(self.mode == ExecMode::LogicSig && crate::arg_gate::app_only(opcode))
+    }
+
     /// go's `<op> not allowed in current mode` for the instruction being
     /// executed (`EvalContext.step`).
     #[cold]
@@ -448,7 +458,7 @@ impl AvmMachine {
         // go checks the opcode's run mode for the program's version first
         // (`<op> not allowed in current mode`), then the arguments, both
         // before the cost is charged.
-        if !crate::arg_gate::mode_allows(instr.opcode, self.version, self.mode) {
+        if !self.mode_permits(instr.opcode) {
             return Err(self.mode_error());
         }
         if !self.arg_gate_passes(&instr) {
@@ -534,7 +544,7 @@ impl AvmMachine {
         tracer.before_opcode(old_byte_pc, instr.opcode);
 
         // Mode, then arguments, both before the cost (see `step_inner`).
-        if !crate::arg_gate::mode_allows(instr.opcode, self.version, self.mode) {
+        if !self.mode_permits(instr.opcode) {
             let e = self.mode_error();
             let msg = e.to_string();
             tracer.after_opcode(
@@ -1482,25 +1492,22 @@ mod tests {
 
     /// A typed pop in an opcode outside the arg-gate table carries no
     /// positional `arg N`: popping top-first it could name the wrong argument
-    /// (issue #2200). `box_replace` (application-only, so not in the table)
-    /// with two wrong arguments (go: arg 0).
+    /// (issue #2200). `args` (LogicSig-only, so not in the table) pops a
+    /// wrong-typed value.
     #[test]
     fn an_ungated_opcode_has_no_positional_arg_index() {
         use crate::arg_gate::arg_types;
         assert!(
-            arg_types(0xbb).is_none(),
-            "box_replace must stay ungated for this test"
+            arg_types(0xc3).is_none(),
+            "args must stay ungated for this test"
         );
         let program = Program {
             version: 8,
             instructions: vec![],
         };
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
-        // box_replace(A, B, C): A bytes, B uint, C bytes. Both A and C wrong.
-        m.push(AvmValue::Uint64(1)).unwrap();
-        m.push(AvmValue::Uint64(1)).unwrap();
         m.push(AvmValue::Bytes(vec![1])).unwrap();
-        m.current_instr = Some((0xbb, None));
+        m.current_instr = Some((0xc3, None));
         let err = m.pop_uint().unwrap_err().to_string();
         assert_eq!(err, "AVM: expected uint64 on stack, got []byte");
         assert!(!err.contains("arg "));

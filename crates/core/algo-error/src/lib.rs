@@ -134,7 +134,15 @@ pub enum AlgoError {
     /// error that ended the program, `None` for a clean reject (go:
     /// `ledgercore.ApprovalProgramRejectedError` vs `logic.EvalError`).
     #[error("appl execute: app {app_id} approval program rejected transaction{}", .reason.as_ref().map(|r| format!(": {r}")).unwrap_or_default())]
-    ApprovalRejected { app_id: u64, reason: Option<String> },
+    ApprovalRejected {
+        app_id: u64,
+        reason: Option<String>,
+        /// go's `pcDetails` (`data/transactions/logic/eval.go`) for a
+        /// runtime error: the failing instruction and up to two before it,
+        /// disassembled and joined with `; `. Simulate prints it as
+        /// `opcodes=...` in the `Details` of the failure message.
+        opcodes: Option<Box<str>>,
+    },
 
     /// The pool/proposer evaluator refused a transaction. `message` is go's
     /// `transaction <txid>: <reason>` text verbatim; `class` is the pool
@@ -276,6 +284,54 @@ pub fn frame_min_balance(err: AlgoError, txid: impl FnOnce() -> String) -> AlgoE
             }
         }
         other => other,
+    }
+}
+
+/// go's text for a failed application call as simulate reports it
+/// (`FailureMessage`): the transaction failure `transaction <txid>: <err>`
+/// where `<err>` is go's `logic.EvalError` (`logic eval error: <reason>.
+/// Details: app=<id>, pc=<pc>, opcodes=<pcDetails>`; simulate's tracer asks for
+/// the detailed form), `transaction rejected by ApprovalProgram` for a clean
+/// reject, or `only ClearState is supported for an application (<id>) that does
+/// not exist`. `None` for any other error, which keeps its own text. `txid` is
+/// only evaluated for the failure.
+pub fn go_app_failure_message(err: &AlgoError, txid: impl FnOnce() -> String) -> Option<String> {
+    match err {
+        AlgoError::AvmLogicSig {
+            source,
+            pc,
+            app_index: Some(app),
+            ..
+        } => {
+            let Some(AlgoError::ApprovalRejected {
+                reason: Some(reason),
+                opcodes,
+                ..
+            }) = source.downcast_ref::<AlgoError>()
+            else {
+                return None;
+            };
+            // The AVM layer prints its own category frame in front of the
+            // runtime error; go prints the bare reason.
+            let reason = reason.strip_prefix("AVM: ").unwrap_or(reason);
+            let details = match opcodes {
+                Some(opcodes) => format!("app={app}, pc={pc}, opcodes={opcodes}"),
+                None => format!("app={app}, pc={pc}"),
+            };
+            Some(format!(
+                "transaction {}: logic eval error: {reason}. Details: {details}",
+                txid()
+            ))
+        }
+        AlgoError::ApprovalRejected { reason: None, .. } => Some(format!(
+            "transaction {}: transaction rejected by ApprovalProgram",
+            txid()
+        )),
+        AlgoError::AppDoesNotExist { app_id } => Some(format!(
+            "transaction {}: only ClearState is supported for an application ({app_id}) that does not exist",
+            txid()
+        )),
+        _ => None,
     }
 }
 
@@ -424,6 +480,9 @@ pub struct AvmErrorDetail {
     pub app_index: Option<u64>,
     /// Scratch/stack dumps for transactions `0..=group_index`.
     pub eval_states: Vec<AvmEvalStateDump>,
+    /// The failing instruction and up to two before it, disassembled (go's
+    /// `pcDetails`); app-call failures only.
+    pub opcodes: Option<Box<str>>,
 }
 
 /// go-algorand's `crypto.ErrBatchHasFailedSigs` text
@@ -461,6 +520,7 @@ impl AlgoError {
                     group_index: *group_index,
                     app_index: *app_index,
                     eval_states: eval_states.clone(),
+                    opcodes: None,
                 });
             }
             cur = cur.source()?;

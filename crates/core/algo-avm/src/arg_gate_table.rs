@@ -23,9 +23,11 @@
 //! tables, dumped by `tools/avm-op-protos`). Do not edit by hand.
 
 use super::arg_gate::ArgType;
-use super::arg_gate::{ANY, BIGINT, BYTES, BYTES1793, BYTES32, BYTES33, BYTES64, BYTES80, UINT};
+use super::arg_gate::{
+    ANY, BIGINT, BOXNAME, BYTES, BYTES1793, BYTES32, BYTES33, BYTES64, BYTES80, STATEKEY, UINT,
+};
 /// go's `proto` argument types by opcode byte, for every opcode go gates the
-/// same way in every run mode and every version (`arg_gate::arg_types` reads this table).
+/// same way in every run mode they run in, and every version (`arg_gate::arg_types` reads this table).
 pub(super) static TABLE: [Option<&[ArgType]>; 256] = {
     let mut t: [Option<&[ArgType]>; 256] = [None; 256];
     t[0x01] = Some(&[BYTES]); // sha256
@@ -62,6 +64,8 @@ pub(super) static TABLE: [Option<&[ArgType]>; 256] = {
     t[0x35] = Some(&[ANY]); // store
     t[0x38] = Some(&[UINT]); // gtxns
     t[0x39] = Some(&[UINT]); // gtxnsa
+    t[0x3b] = Some(&[UINT]); // gloads
+    t[0x3d] = Some(&[UINT]); // gaids
     t[0x3e] = Some(&[UINT]); // loads
     t[0x3f] = Some(&[UINT, ANY]); // stores
     t[0x40] = Some(&[UINT]); // bnz
@@ -94,6 +98,23 @@ pub(super) static TABLE: [Option<&[ArgType]>; 256] = {
     t[0x5d] = Some(&[BYTES, UINT, BYTES]); // replace3
     t[0x5e] = Some(&[BYTES]); // base64_decode
     t[0x5f] = Some(&[BYTES, BYTES]); // json_ref
+    t[0x60] = Some(&[ANY]); // balance
+    t[0x61] = Some(&[ANY, UINT]); // app_opted_in
+    t[0x62] = Some(&[ANY, STATEKEY]); // app_local_get
+    t[0x63] = Some(&[ANY, UINT, STATEKEY]); // app_local_get_ex
+    t[0x64] = Some(&[STATEKEY]); // app_global_get
+    t[0x65] = Some(&[UINT, STATEKEY]); // app_global_get_ex
+    t[0x66] = Some(&[ANY, STATEKEY, ANY]); // app_local_put
+    t[0x67] = Some(&[STATEKEY, ANY]); // app_global_put
+    t[0x68] = Some(&[ANY, STATEKEY]); // app_local_del
+    t[0x69] = Some(&[STATEKEY]); // app_global_del
+    t[0x70] = Some(&[ANY, UINT]); // asset_holding_get
+    t[0x71] = Some(&[UINT]); // asset_params_get
+    t[0x72] = Some(&[UINT]); // app_params_get
+    t[0x73] = Some(&[ANY]); // acct_params_get
+    t[0x74] = Some(&[ANY]); // voter_params_get
+    t[0x76] = Some(&[UINT]); // app_params_set
+    t[0x78] = Some(&[ANY]); // min_balance
     t[0x84] = Some(&[BYTES, BYTES64, BYTES32]); // ed25519verify_bare
     t[0x85] = Some(&[BYTES, BYTES, BYTES1793]); // falcon_verify
     t[0x86] = Some(&[BYTES]); // sumhash512
@@ -126,11 +147,25 @@ pub(super) static TABLE: [Option<&[ArgType]>; 256] = {
     t[0xad] = Some(&[BYTES, BYTES]); // b^
     t[0xae] = Some(&[BYTES]); // b~
     t[0xaf] = Some(&[UINT]); // bzero
+    t[0xb0] = Some(&[BYTES]); // log
+    t[0xb2] = Some(&[ANY]); // itxn_field
+    t[0xb9] = Some(&[BOXNAME, UINT]); // box_create
+    t[0xba] = Some(&[BOXNAME, UINT, UINT]); // box_extract
+    t[0xbb] = Some(&[BOXNAME, UINT, BYTES]); // box_replace
+    t[0xbc] = Some(&[BOXNAME]); // box_del
+    t[0xbd] = Some(&[BOXNAME]); // box_len
+    t[0xbe] = Some(&[BOXNAME]); // box_get
+    t[0xbf] = Some(&[BOXNAME, BYTES]); // box_put
     t[0xc0] = Some(&[UINT]); // txnas
     t[0xc1] = Some(&[UINT]); // gtxnas
     t[0xc2] = Some(&[UINT, UINT]); // gtxnsas
+    t[0xc4] = Some(&[UINT, UINT]); // gloadss
+    t[0xc5] = Some(&[UINT]); // itxnas
+    t[0xc6] = Some(&[UINT]); // gitxnas
     t[0xd0] = Some(&[BYTES, BYTES80, BYTES32]); // vrf_verify
     t[0xd1] = Some(&[UINT]); // block
+    t[0xd2] = Some(&[BOXNAME, UINT, UINT, BYTES]); // box_splice
+    t[0xd3] = Some(&[BOXNAME, UINT]); // box_resize
     t[0xe0] = Some(&[BYTES, BYTES]); // ec_add
     t[0xe1] = Some(&[BYTES, BYTES]); // ec_scalar_mul
     t[0xe2] = Some(&[BYTES, BYTES]); // ec_pairing_check
@@ -142,11 +177,59 @@ pub(super) static TABLE: [Option<&[ArgType]>; 256] = {
     t
 };
 
+/// The opcodes of `TABLE` go runs in application mode only: a LogicSig meets
+/// `<op> not allowed in current mode` BEFORE the argument gate.
+pub(super) static APP_ONLY: [bool; 256] = {
+    let mut t = [false; 256];
+    t[0x3b] = true;
+    t[0x3d] = true;
+    t[0x60] = true;
+    t[0x61] = true;
+    t[0x62] = true;
+    t[0x63] = true;
+    t[0x64] = true;
+    t[0x65] = true;
+    t[0x66] = true;
+    t[0x67] = true;
+    t[0x68] = true;
+    t[0x69] = true;
+    t[0x70] = true;
+    t[0x71] = true;
+    t[0x72] = true;
+    t[0x73] = true;
+    t[0x74] = true;
+    t[0x76] = true;
+    t[0x78] = true;
+    t[0xb0] = true;
+    t[0xb2] = true;
+    t[0xb9] = true;
+    t[0xba] = true;
+    t[0xbb] = true;
+    t[0xbc] = true;
+    t[0xbd] = true;
+    t[0xbe] = true;
+    t[0xbf] = true;
+    t[0xc4] = true;
+    t[0xc5] = true;
+    t[0xc6] = true;
+    t[0xd2] = true;
+    t[0xd3] = true;
+    t
+};
+
 /// The first program version an opcode of `TABLE` is gated for (go's spec for
 /// the opcode changed at that version; `0` = every version).
 pub(super) static MIN_VERSION: [u8; 256] = {
     let mut t = [0u8; 256];
     t[0x04] = 5; // ed25519verify
+    t[0x60] = 4; // balance
+    t[0x61] = 4; // app_opted_in
+    t[0x62] = 4; // app_local_get
+    t[0x63] = 4; // app_local_get_ex
+    t[0x66] = 4; // app_local_put
+    t[0x68] = 4; // app_local_del
+    t[0x70] = 4; // asset_holding_get
+    t[0x78] = 4; // min_balance
     t
 };
 

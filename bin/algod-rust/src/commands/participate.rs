@@ -1737,6 +1737,7 @@ fn reason_of(e: &algo_error::AlgoError, pc: usize) -> (String, algo_error::Rejec
         AlgoError::ApprovalRejected {
             app_id,
             reason: Some(err),
+            ..
         } => {
             // The AVM layer prints its own category frame in front of the
             // runtime error; go prints the bare reason.

@@ -7075,6 +7075,12 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 seed_avm_scratch_from_group(&mut avm_ctx, group_info);
                 seed_avm_txid_cache_from_group(&mut avm_ctx, group_info);
                 seed_avm_created_resources_from_group(&mut avm_ctx, group_info);
+                // go `StatefulEval`: the app this very transaction creates is
+                // added to `createdApps` before its program runs, so the
+                // sender's local state of it (and a box of it) is available.
+                if is_create && !avm_ctx.created_apps.contains(&app_id) {
+                    avm_ctx.created_apps.push(app_id);
+                }
                 if let Some(ref mut t) = tracer {
                     avm_ctx.tracer_ptr = Some(*t as *mut dyn EvalTracer);
                 }
@@ -7179,6 +7185,10 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     let rejected = AlgoError::ApprovalRejected {
                         app_id,
                         reason: result.error.clone(),
+                        opcodes: result
+                            .error_detail
+                            .as_ref()
+                            .and_then(|detail| detail.opcodes.clone()),
                     };
                     // When the approval program actually errored (as opposed
                     // to a clean reject), preserve the structured

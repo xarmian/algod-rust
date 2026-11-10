@@ -205,7 +205,7 @@ impl InnerTxnBuilder {
     fn validate_field_type(field: u8, value: &TealValue, version: u8) -> Result<(), AlgoError> {
         fn not_a_uint64(b: &[u8]) -> AlgoError {
             AlgoError::Avm {
-                message: format!("{b:?} is not a uint64"),
+                message: format!("{} is not a uint64", go_bytes_literal(b)),
             }
         }
         fn not_an_address() -> AlgoError {
@@ -5291,6 +5291,13 @@ use txn_fields::check_available_round;
 // Helpers for reading transaction fields
 // ---------------------------------------------------------------------------
 
+/// go's `%#v` of a `[]byte`: `[]byte{0x78, 0x79}` (`[]byte{}` when empty), as
+/// in `stackValue.uint`'s `%#v is not a uint64`.
+fn go_bytes_literal(b: &[u8]) -> String {
+    let items: Vec<String> = b.iter().map(|x| format!("0x{x:02x}")).collect();
+    format!("[]byte{{{}}}", items.join(", "))
+}
+
 /// Read a transaction field from a `SignedTransaction`.
 ///
 /// Delegates to the shared `algo_avm::txn_fields::read_txn_field` for most
@@ -5483,6 +5490,17 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 ),
             });
         }
+        // go's `opTxnImpl` (srcGroup): an "effects" field (Logs, NumLogs,
+        // CreatedAssetID, CreatedApplicationID, LastLog) of the current or a
+        // later transaction has no effects yet.
+        if algo_avm::logicsig_context::is_effects_field(field) && group_index >= self.group_index {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "txn effects can only be read from past txns {} {}",
+                    group_index, self.group_index
+                ),
+            });
+        }
         let stxn = &self.group[group_index];
         // FirstValidTime (field 3): timestamp of block(FirstValid-1), which
         // requires block-history access via block_field -- not reachable
@@ -5657,9 +5675,9 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         } else {
             Err(AlgoError::Avm {
                 message: format!(
-                    "resolve_account: index {} out of range (accounts len={})",
+                    "invalid Account reference {} exceeds length of tx.Accounts {}",
                     index,
-                    accounts.len() + 1
+                    accounts.len()
                 ),
             })
         }
@@ -5783,10 +5801,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             .store
             .get_app_local_state(&addr, app_id)
             .ok_or_else(|| AlgoError::Avm {
-                // Matches go-algorand's `roundCowState.setKey`
-                // (`ledger/eval/appcow.go`): "cannot set key, <addr> has not
-                // opted in to app <id>".
-                message: format!("cannot set key, {addr} has not opted in to app {app_id}"),
+                // go's `opAppLocalPut` reads the key (`GetLocal`) before it
+                // writes, so a missing opt-in reports the read's text
+                // (`ledger/eval/appcow.go`): "cannot fetch key, <addr> has
+                // not opted in to app <id>".
+                message: format!("cannot fetch key, {addr} has not opted in to app {app_id}"),
             })?;
         let pre = local.key_value.get(key).cloned();
         self.record_app_state_access(
@@ -6321,7 +6340,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         if group_index >= self.group.len() {
             return Err(AlgoError::Avm {
                 message: format!(
-                    "gaid: group_index {} out of range (group size={})",
+                    "gaid lookup TxnGroup[{}] but it only has {}",
                     group_index,
                     self.group.len()
                 ),
@@ -6330,14 +6349,13 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         if group_index > self.group_index {
             return Err(AlgoError::Avm {
                 message: format!(
-                    "gaid: can't get creatable ID of txn ahead of the current one (index {} > current {})",
-                    group_index, self.group_index
+                    "gaid can't get creatable ID of txn ahead of the current one (index {group_index}) in the transaction group"
                 ),
             });
         }
         if group_index == self.group_index {
             return Err(AlgoError::Avm {
-                message: "gaid: is only for accessing creatable IDs of previous txns, use `global CurrentApplicationID` instead".to_string(),
+                message: "gaid is only for accessing creatable IDs of previous txns, use `global CurrentApplicationID` instead to access the current app's creatable ID".to_string(),
             });
         }
         let stxn = &self.group[group_index];
@@ -6437,7 +6455,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             .inner_building
             .last_mut()
             .ok_or_else(|| AlgoError::Avm {
-                message: "itxn_field: no inner txn being built".to_string(),
+                message: "itxn_field without itxn_begin".to_string(),
             })?;
         // Type check first, then bounds -- matches go's `stackIntoTxnField`
         // per-field order (e.g. `sv.Bytes == nil` checked before length/count
@@ -6688,7 +6706,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 }
                 _ => {
                     return Err(AlgoError::Avm {
-                        message: format!("unsupported inner transaction type: {}", tt),
+                        message: format!("unknown tx type {}", tt),
                     });
                 }
             }
@@ -7037,11 +7055,20 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                         &extra_created_asset_ids,
                         &extra_created_app_ids,
                     );
+                    // go: the fee `Move` of `takeFee` fails with a
+                    // `ledgercore.OverspendError`, reported by the inner group
+                    // as `inner tx <i> failed: <err>`.
                     let err_msg = format!(
-                        "inner tx {}: sender {} has insufficient balance {} for fee {}",
-                        i, sender, sender_acct.micro_algos, fee,
+                        "inner tx {} failed: {}",
+                        i,
+                        algo_validate::overspend::overspend_error_text(&sender, &sender_acct, fee),
                     );
                     if let Some(p) = self.tracer_ptr {
+                        // go takes the fee inside the transaction's own
+                        // before/after-txn frame, so `failed-at` names the
+                        // inner transaction's path; then the group.
+                        unsafe { &mut *p }.before_txn(i);
+                        unsafe { &mut *p }.after_txn(i, Some(&err_msg));
                         unsafe { &mut *p }.after_txn_group(Some(&err_msg));
                     }
                     return Err(AlgoError::Avm { message: err_msg });
@@ -7406,11 +7433,13 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         field: u8,
         array_index: Option<usize>,
     ) -> Result<TealValue, AlgoError> {
+        // go's `opTxnImpl` over `getLastInner()`: an empty slice reads as
+        // `txn index 0, len(group) is 0`.
         let last_group = self.inner_txns.last().ok_or_else(|| AlgoError::Avm {
-            message: "last_itxn_field: no inner txns submitted".to_string(),
+            message: "txn index 0, len(group) is 0".to_string(),
         })?;
         let last_txn = last_group.last().ok_or_else(|| AlgoError::Avm {
-            message: "last_itxn_field: empty inner txn group".to_string(),
+            message: "txn index 0, len(group) is 0".to_string(),
         })?;
         // TxID (field 23) goes through `inner_read_txid` (go `getTxID`
         // inner=true).
@@ -7434,12 +7463,12 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         array_index: Option<usize>,
     ) -> Result<TealValue, AlgoError> {
         let last_group = self.inner_txns.last().ok_or_else(|| AlgoError::Avm {
-            message: "last_itxn_group_field: no inner txns submitted".to_string(),
+            message: format!("txn index {group_index}, len(group) is 0"),
         })?;
         if group_index >= last_group.len() {
             return Err(AlgoError::Avm {
                 message: format!(
-                    "last_itxn_group_field: index {} out of range (group size={})",
+                    "txn index {}, len(group) is {}",
                     group_index,
                     last_group.len()
                 ),
@@ -10022,7 +10051,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             put_err.to_string(),
-            format!("AVM: cannot set key, {addr_str} has not opted in to app 42")
+            format!("AVM: cannot fetch key, {addr_str} has not opted in to app 42")
         );
 
         let del_err = ctx.app_local_del(&sender, 42, b"x").unwrap_err();

@@ -373,6 +373,7 @@ mod tests {
             pc: 7,
             group_index: 0,
             app_index: Some(1234),
+            opcodes: None,
             eval_states: vec![AvmEvalStateDump {
                 scratch: vec![AvmDiagnosticValue::Uint(5)],
                 stack: vec![
@@ -413,6 +414,7 @@ mod tests {
             pc: 3,
             group_index: 0,
             app_index: None,
+            opcodes: None,
             eval_states: vec![AvmEvalStateDump::default()],
         };
 

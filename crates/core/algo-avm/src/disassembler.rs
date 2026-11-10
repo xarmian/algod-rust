@@ -39,14 +39,51 @@ pub fn disassemble(program: &[u8]) -> Result<String, String> {
     }
 
     let parsed = bytecode::parse(program).map_err(|e| e.to_string())?;
+    disassemble_parsed(&parsed, Some(program)).map(|(text, _)| text)
+}
+
+/// go's `pcDetails` (`data/transactions/logic/eval.go`): the disassembly of
+/// the instruction at byte offset `pc` (the version byte counts) and of up to
+/// two instructions before it, with newlines turned into `; `. This is the
+/// `opcodes=` of the `Details` go prints for a failed application call in
+/// simulate. Empty when `pc` is not the start of an instruction.
+pub fn pc_details(parsed: &Program, pc: usize) -> String {
+    let Ok((text, offsets)) = disassemble_parsed(parsed, None) else {
+        return String::new();
+    };
+    const MAX_ADDITIONAL_OPCODES: usize = 2;
+    for (i, (opc, _)) in offsets.iter().enumerate() {
+        if *opc != pc {
+            continue;
+        }
+        let start = i.saturating_sub(MAX_ADDITIONAL_OPCODES);
+        let start_text = offsets[start].1;
+        let end_text = offsets.get(i + 1).map_or(text.len(), |(_, off)| *off);
+        return text[start_text..end_text]
+            .trim_end_matches('\n')
+            .replace('\n', "; ");
+    }
+    String::new()
+}
+
+/// The disassembly of `parsed`, and for every instruction the pair `(byte
+/// offset with the version byte, offset of its text)` (go's `pcOffset`: after
+/// the label line that precedes it). `program` is only needed for the
+/// `autosalt` pragma line, which a `pc_details` caller does not use.
+fn disassemble_parsed(
+    parsed: &Program,
+    program: Option<&[u8]>,
+) -> Result<(String, Vec<(usize, usize)>), String> {
+    let header = if parsed.version < 128 { 1 } else { 2 };
+    let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(parsed.instructions.len());
 
     // Two-pass disassembly:
     // Pass 1: identify branch targets and assign labels
     // Pass 2: emit TEAL text
 
-    let labels = collect_labels(&parsed);
-    let intc = collect_intc_block(&parsed);
-    let bytec = collect_bytec_block(&parsed);
+    let labels = collect_labels(parsed);
+    let intc = collect_intc_block(parsed);
+    let bytec = collect_bytec_block(parsed);
 
     let mut out = String::new();
     out.push_str(&format!("#pragma version {}\n", parsed.version));
@@ -61,8 +98,10 @@ pub fn disassemble(program: &[u8]) -> Result<String, String> {
     let has_stateful_ops = parsed.instructions.iter().any(|instr| {
         opcode::lookup(instr.opcode).is_some_and(|spec| spec.mode == opcode::Mode::Application)
     });
-    if crate::assembler::default_auto_salt_applies(parsed.version, has_stateful_ops, program) {
-        out.push_str("#pragma autosalt false\n");
+    if let Some(program) = program {
+        if crate::assembler::default_auto_salt_applies(parsed.version, has_stateful_ops, program) {
+            out.push_str("#pragma autosalt false\n");
+        }
     }
 
     for instr in &parsed.instructions {
@@ -218,6 +257,7 @@ pub fn disassemble(program: &[u8]) -> Result<String, String> {
             }
         }
 
+        offsets.push((header + instr.offset, out.len()));
         out.push_str(&line);
         out.push('\n');
     }
@@ -232,7 +272,7 @@ pub fn disassemble(program: &[u8]) -> Result<String, String> {
         out.push_str(&format!("{}:\n", label));
     }
 
-    Ok(out)
+    Ok((out, offsets))
 }
 
 /// Compute the branch target (offset within the code section) for a branch instruction.

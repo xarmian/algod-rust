@@ -378,4 +378,6 @@ func main() {
 	checkDupOracle()
 	// The issue #2127 oracle (blockdup.go) too.
 	blockDupOracle()
+	// The issue #2225 app-mode error text oracle (apperr.go) too.
+	appErrOracle()
 }

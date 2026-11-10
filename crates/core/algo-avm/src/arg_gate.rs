@@ -94,6 +94,8 @@ pub(crate) const BYTES33: ArgType = ArgType::new(ArgKind::Bytes, "[33]byte");
 pub(crate) const BYTES64: ArgType = ArgType::new(ArgKind::Bytes, "[64]byte");
 pub(crate) const BYTES80: ArgType = ArgType::new(ArgKind::Bytes, "[80]byte");
 pub(crate) const BYTES1793: ArgType = ArgType::new(ArgKind::Bytes, "[1793]byte");
+pub(crate) const BOXNAME: ArgType = ArgType::new(ArgKind::Bytes, "boxName");
+pub(crate) const STATEKEY: ArgType = ArgType::new(ArgKind::Bytes, "stateKey");
 
 /// Whether `value` satisfies go's `opCompat` for an argument of type `want`.
 #[inline(always)]
@@ -125,6 +127,13 @@ pub(crate) fn mode_allows(opcode: u8, version: u8, mode: crate::machine::ExecMod
         .find(|(from, _)| *from <= version)
         .map_or(0, |(_, modes)| *modes);
     modes & bit != 0
+}
+
+/// Whether go runs `opcode` in application mode only: in a LogicSig the mode
+/// error comes before the argument gate (and before the cost).
+#[inline(always)]
+pub(crate) fn app_only(opcode: u8) -> bool {
+    crate::arg_gate_table::APP_ONLY[opcode as usize]
 }
 
 /// go's argument types for the single-byte opcode `opcode`, if this table
@@ -210,7 +219,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for op in &ops {
             let shared = ops.iter().filter(|o| o.opcode == op.opcode).count() > 1;
-            let gated = op.modes == 3
+            let gated = (op.modes == 3 || op.modes == 2)
                 && !op.args.is_empty()
                 && !shared
                 && !gate_excluded.contains(&op.opcode);
@@ -218,13 +227,20 @@ mod tests {
             if !gated {
                 assert!(
                     row.is_none(),
-                    "0x{:02x} {} is mode-restricted, argument-less or shared by a prefix family: no row",
+                    "0x{:02x} {} is LogicSig-only, argument-less or shared by a prefix family: no row",
                     op.opcode,
                     op.name
                 );
                 continue;
             }
             seen.insert(op.opcode);
+            assert_eq!(
+                app_only(op.opcode),
+                op.modes == 2,
+                "0x{:02x} {}: APP_ONLY",
+                op.opcode,
+                op.name
+            );
             let row = row.unwrap_or_else(|| panic!("0x{:02x} {} has no row", op.opcode, op.name));
             let want: Vec<(&str, &str)> = op
                 .args
