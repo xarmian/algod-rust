@@ -217,41 +217,139 @@ fn the_rewards_state_comes_from_the_header_of_the_past_round() {
     );
 }
 
-/// Cost of retaining undo data on the block-apply write path (issue #2148):
+fn rss_bytes() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        return status
+            .lines()
+            .find_map(|l| l.strip_prefix("VmRSS:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .map_or(0, |kb| kb * 1024);
+    }
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("(Get-Process -Id {}).WorkingSet64", std::process::id()),
+            ])
+            .output()
+            .expect("powershell");
+        return String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0);
+    }
+    #[allow(unreachable_code)]
+    0
+}
+
+fn key(i: u32) -> Address {
+    let mut a = [0u8; 32];
+    a[..4].copy_from_slice(&i.to_be_bytes());
+    Address(a)
+}
+
+/// Memory and lock cost of the undo journal (issue #2148):
 /// `cargo test -p algo-ledger --release --test simulate_past_round_test -- --ignored --nocapture`.
-/// Each round writes 2 000 accounts (a typical busy block touches far fewer)
-/// in its own commit span; the journal adds one read and one clone per first
-/// touch. Prints the median of three runs per window.
+///
+/// `TOUCHED` accounts are written per round (a busy mainnet round touches
+/// 1 000 - 5 000), for 400 rounds, each in its own commit span, on a ledger of
+/// 20 000 plain accounts. Prints, per setting, the journal's own estimate of
+/// its retained bytes and rounds and the RSS delta over the same run without a
+/// journal, then the time a rewind to the earliest servable round (writes every
+/// touched key, twice) holds the ledger for.
 #[test]
-#[ignore = "benchmark: prints timings"]
-fn undo_journal_cost_on_the_apply_path() {
-    fn run(window: u64) -> std::time::Duration {
+#[ignore = "benchmark: prints measurements"]
+fn undo_journal_memory_and_rewind_cost() {
+    fn run(
+        touched: u32,
+        window: u64,
+        budget: usize,
+    ) -> (
+        u64,
+        (usize, usize),
+        std::time::Duration,
+        std::time::Duration,
+        std::time::Duration,
+    ) {
         let mut l = SqliteLedger::open_in_memory().expect("ledger");
-        for i in 0..2000u32 {
-            let mut a = [0u8; 32];
-            a[..4].copy_from_slice(&i.to_be_bytes());
-            l.set_account(&Address(a), sender_with(1_000_000, 0));
+        l.set_protocol(algo_types::consensus::CONSENSUS_V41.to_string());
+        l.set_genesis_hash(TEST_GENESIS_HASH);
+        l.set_fee_sink(FEE_SINK);
+        l.set_rewards_pool(POOL);
+        for i in 0..20_000u32 {
+            l.set_account(&key(i), sender_with(10_000_000, 0));
         }
+        l.set_account(&SENDER, sender_with(50_000_000, 0));
+        l.set_account(&POOL, sender_with(1_000_000_000_000, 0));
+        l.set_account(&FEE_SINK, sender_with(1_000_000, 0));
         l.set_undo_window(window);
-        let start = std::time::Instant::now();
-        for round in 1..=200u64 {
+        l.set_undo_budget_bytes(budget);
+        let rss0 = rss_bytes();
+        let apply = std::time::Instant::now();
+        for round in 1..=400u64 {
             l.begin_block().expect("begin");
-            for i in 0..2000u32 {
-                let mut a = [0u8; 32];
-                a[..4].copy_from_slice(&i.to_be_bytes());
-                l.set_account(&Address(a), sender_with(1_000_000 + round, round));
+            for k in 0..touched {
+                let i = ((round as u32).wrapping_mul(7919) + k * 3) % 20_000;
+                // apply reads an account before it writes it back
+                let _ = l.get_account(&key(i));
+                l.set_account(&key(i), sender_with(10_000_000 + round, round));
             }
+            let hdr = header(round, round, 500_000);
+            let bytes = algo_codec::canonical_encode_block_header(&hdr);
+            l.put_block(round, &hdr.current_protocol, &bytes, &[])
+                .expect("put_block");
             l.set_current_round(Round(round));
             l.commit_block().expect("commit");
         }
-        start.elapsed()
+        let apply = apply.elapsed();
+        let rss = rss_bytes().saturating_sub(rss0);
+        let retained = l.undo_retained();
+        let (mut rewind_near, mut rewind_far) =
+            (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        if window > 0 {
+            let earliest = l.earliest_simulate_round();
+            let t = std::time::Instant::now();
+            simulate_at(&mut l, 399).expect("latest - 1");
+            rewind_near = t.elapsed();
+            let t = std::time::Instant::now();
+            simulate_at(&mut l, earliest.0).expect("earliest");
+            rewind_far = t.elapsed();
+        }
+        (rss, retained, apply, rewind_near, rewind_far)
     }
-    for window in [0u64, 320] {
-        let mut runs: Vec<_> = (0..3).map(|_| run(window)).collect();
-        runs.sort();
-        println!(
-            "undo window {window:>3}: median {:?} of {:?}",
-            runs[1], runs
-        );
+    for touched in [500u32, 2000] {
+        for (name, window, budget) in [
+            ("off", 0u64, 0usize),
+            ("320 rounds, no budget", 320, usize::MAX),
+            (
+                "320 rounds, 16 MiB budget",
+                320,
+                algo_ledger::undo_journal::DEFAULT_UNDO_BUDGET_BYTES,
+            ),
+        ] {
+            let runs: Vec<_> = (0..3).map(|_| run(touched, window, budget)).collect();
+            let mut rss: Vec<u64> = runs.iter().map(|r| r.0).collect();
+            rss.sort();
+            let mut apply: Vec<_> = runs.iter().map(|r| r.2).collect();
+            apply.sort();
+            let mut far: Vec<_> = runs.iter().map(|r| r.4).collect();
+            far.sort();
+            let mut near: Vec<_> = runs.iter().map(|r| r.3).collect();
+            near.sort();
+            println!(
+                "touched {touched:>4}/round, {name:<26}: rss delta median {:>7.1} MiB (runs {:?}), journal est {:>6.1} MiB / {} rounds, apply median {:?}, rewind to latest-1 {:?}, to earliest {:?}",
+                rss[1] as f64 / 1048576.0,
+                rss.iter().map(|b| (*b as f64 / 1048576.0).round()).collect::<Vec<_>>(),
+                runs[0].1 .0 as f64 / 1048576.0,
+                runs[0].1 .1,
+                apply[1],
+                near[1],
+                far[1],
+            );
+        }
     }
 }

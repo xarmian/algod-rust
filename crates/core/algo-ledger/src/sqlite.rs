@@ -9111,6 +9111,14 @@ impl LedgerStore for SqliteLedger {
         self.undo.window()
     }
 
+    fn undo_retained(&self) -> (usize, usize) {
+        self.undo.retained()
+    }
+
+    fn set_undo_budget_bytes(&mut self, budget: usize) {
+        self.undo.set_budget_bytes(budget);
+    }
+
     fn set_undo_window(&mut self, window: u64) {
         self.undo.set_window(window);
         if window == 0 {

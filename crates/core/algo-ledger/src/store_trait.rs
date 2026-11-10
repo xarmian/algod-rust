@@ -388,6 +388,15 @@ pub trait LedgerStore {
         0
     }
 
+    /// The estimated bytes and the number of rounds of undo data retained.
+    fn undo_retained(&self) -> (usize, usize) {
+        (0, 0)
+    }
+
+    /// Set the memory budget of the undo data (oldest rounds are evicted
+    /// beyond it). A store without a journal ignores it.
+    fn set_undo_budget_bytes(&mut self, _budget: usize) {}
+
     /// Set how many recent rounds of undo data are retained; `0` turns the
     /// journal off. A store without a journal ignores it.
     fn set_undo_window(&mut self, _window: u64) {}
