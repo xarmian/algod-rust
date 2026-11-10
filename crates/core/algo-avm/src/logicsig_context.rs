@@ -261,7 +261,7 @@ impl<'a> AvmContext for LogicSigAvmContext<'a> {
         if group_index >= self.group.len() {
             return Err(AlgoError::Avm {
                 message: format!(
-                    "group_index {} out of range (group size={})",
+                    "txn index {}, len(group) is {}",
                     group_index,
                     self.group.len()
                 ),

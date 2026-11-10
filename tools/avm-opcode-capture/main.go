@@ -224,7 +224,7 @@ func mkVectorTail(name, desc, source string, version uint64, args [][]byte) Vect
 		prefix, last = source[:i], strings.TrimSpace(source[i+1:])
 	}
 	var tail []byte
-	for _, unit := range []string{"int 0; ", "byte 0x00; ", "byte 0x00; int 0; int 0; ", "byte 0x00; int 0; byte 0x00; ", "int 0; byte 0x00; ", "byte 0x00; int 0; ", "int 0; byte 0x00; int 0; "} {
+	for _, unit := range []string{"int 0; ", "byte 0x00; ", "byte 0x00; int 0; int 0; ", "byte 0x00; int 0; byte 0x00; ", "int 0; byte 0x00; ", "byte 0x00; int 0; ", "int 0; byte 0x00; int 0; ", "byte 0x00; int 0; int 0; byte 0x00; ", "int 0; int 0; byte 0x00; ", "int 0; int 0; byte 0x00; int 0; ", "int 0; byte 0x00; byte 0x00; "} {
 		pad := strings.Repeat(unit, 4)
 		ops, err := logic.AssembleStringWithVersion(pad+last, version)
 		if err != nil {
@@ -1117,6 +1117,431 @@ func generate() []Vector {
 		"errtext/global_group_size_ok",
 		"go EvalError text and pc for: global GroupSize; int 1; ==",
 		"global GroupSize; int 1; ==", 8,
+		nil,
+	))
+
+	// =======================================================================
+	// Error text parity, slice 2 (issue #2225): the mode gates of the
+	// application-only opcodes and fields, and the array/group index errors.
+	// =======================================================================
+	out = append(out, mkVectorTail(
+		"errtext/mode_balance",
+		"go EvalError text and pc for: balance",
+		"balance", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_min_balance",
+		"go EvalError text and pc for: min_balance",
+		"min_balance", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_app_opted_in",
+		"go EvalError text and pc for: app_opted_in",
+		"app_opted_in", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_app_local_get",
+		"go EvalError text and pc for: app_local_get",
+		"app_local_get", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_app_local_get_ex",
+		"go EvalError text and pc for: app_local_get_ex",
+		"app_local_get_ex", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_app_global_get",
+		"go EvalError text and pc for: app_global_get",
+		"app_global_get", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_app_global_get_ex",
+		"go EvalError text and pc for: app_global_get_ex",
+		"app_global_get_ex", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_app_local_put",
+		"go EvalError text and pc for: app_local_put",
+		"app_local_put", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_app_global_put",
+		"go EvalError text and pc for: app_global_put",
+		"app_global_put", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_app_local_del",
+		"go EvalError text and pc for: app_local_del",
+		"app_local_del", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_app_global_del",
+		"go EvalError text and pc for: app_global_del",
+		"app_global_del", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_asset_holding_get",
+		"go EvalError text and pc for: asset_holding_get AssetBalance",
+		"asset_holding_get AssetBalance", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_asset_params_get",
+		"go EvalError text and pc for: asset_params_get AssetTotal",
+		"asset_params_get AssetTotal", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_app_params_get",
+		"go EvalError text and pc for: app_params_get AppCreator",
+		"app_params_get AppCreator", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_acct_params_get",
+		"go EvalError text and pc for: acct_params_get AcctBalance",
+		"acct_params_get AcctBalance", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_box_create",
+		"go EvalError text and pc for: box_create",
+		"box_create", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_box_extract",
+		"go EvalError text and pc for: box_extract",
+		"box_extract", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_box_replace",
+		"go EvalError text and pc for: box_replace",
+		"box_replace", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_box_del",
+		"go EvalError text and pc for: box_del",
+		"box_del", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_box_len",
+		"go EvalError text and pc for: box_len",
+		"box_len", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_box_get",
+		"go EvalError text and pc for: box_get",
+		"box_get", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_box_put",
+		"go EvalError text and pc for: box_put",
+		"box_put", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_box_splice",
+		"go EvalError text and pc for: box_splice",
+		"box_splice", 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_box_resize",
+		"go EvalError text and pc for: box_resize",
+		"box_resize", 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_itxn_begin",
+		"go EvalError text and pc for: itxn_begin",
+		"itxn_begin", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_itxn_next",
+		"go EvalError text and pc for: itxn_next",
+		"itxn_next", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_itxn_submit",
+		"go EvalError text and pc for: itxn_submit",
+		"itxn_submit", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_itxn",
+		"go EvalError text and pc for: itxn Fee",
+		"itxn Fee", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_itxna",
+		"go EvalError text and pc for: itxna ApplicationArgs 0",
+		"itxna ApplicationArgs 0", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_itxnas",
+		"go EvalError text and pc for: itxnas ApplicationArgs",
+		"itxnas ApplicationArgs", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_gitxn",
+		"go EvalError text and pc for: gitxn 0 Fee",
+		"gitxn 0 Fee", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_gitxna",
+		"go EvalError text and pc for: gitxna 0 ApplicationArgs 0",
+		"gitxna 0 ApplicationArgs 0", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_gitxnas",
+		"go EvalError text and pc for: gitxnas 0 ApplicationArgs",
+		"gitxnas 0 ApplicationArgs", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_gload",
+		"go EvalError text and pc for: gload 0 0",
+		"gload 0 0", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_gloads",
+		"go EvalError text and pc for: gloads 0",
+		"gloads 0", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_gloadss",
+		"go EvalError text and pc for: gloadss",
+		"gloadss", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_gaid",
+		"go EvalError text and pc for: gaid 0",
+		"gaid 0", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_gaids",
+		"go EvalError text and pc for: gaids",
+		"gaids", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/mode_block",
+		"go EvalError text and pc for: block BlkTimestamp",
+		"block BlkTimestamp", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/global_round",
+		"go EvalError text and pc for: global Round",
+		"global Round", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/global_latest_timestamp",
+		"go EvalError text and pc for: global LatestTimestamp",
+		"global LatestTimestamp", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/global_current_application_id",
+		"go EvalError text and pc for: global CurrentApplicationID",
+		"global CurrentApplicationID", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/global_creator_address",
+		"go EvalError text and pc for: global CreatorAddress",
+		"global CreatorAddress", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/global_current_application_address",
+		"go EvalError text and pc for: global CurrentApplicationAddress",
+		"global CurrentApplicationAddress", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/global_caller_application_id",
+		"go EvalError text and pc for: global CallerApplicationID",
+		"global CallerApplicationID", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/global_caller_application_address",
+		"go EvalError text and pc for: global CallerApplicationAddress",
+		"global CallerApplicationAddress", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/txn_num_logs",
+		"go EvalError text and pc for: txn NumLogs",
+		"txn NumLogs", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/txn_created_asset_id",
+		"go EvalError text and pc for: txn CreatedAssetID",
+		"txn CreatedAssetID", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/txn_created_application_id",
+		"go EvalError text and pc for: txn CreatedApplicationID",
+		"txn CreatedApplicationID", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/txn_last_log",
+		"go EvalError text and pc for: txn LastLog",
+		"txn LastLog", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/txna_logs",
+		"go EvalError text and pc for: txna Logs 0",
+		"txna Logs 0", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/txnas_logs",
+		"go EvalError text and pc for: int 0; txnas Logs",
+		"int 0; txnas Logs", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/gtxn_num_logs",
+		"go EvalError text and pc for: gtxn 0 NumLogs",
+		"gtxn 0 NumLogs", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/gtxna_logs",
+		"go EvalError text and pc for: gtxna 0 Logs 0",
+		"gtxna 0 Logs 0", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/gtxns_num_logs",
+		"go EvalError text and pc for: int 0; gtxns NumLogs",
+		"int 0; gtxns NumLogs", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/txna_args_oob",
+		"go EvalError text and pc for: txna ApplicationArgs 5",
+		"txna ApplicationArgs 5", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/txna_accounts_oob",
+		"go EvalError text and pc for: txna Accounts 3",
+		"txna Accounts 3", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/txna_assets_oob",
+		"go EvalError text and pc for: txna Assets 0",
+		"txna Assets 0", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/txna_applications_oob",
+		"go EvalError text and pc for: txna Applications 2",
+		"txna Applications 2", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/txna_approval_pages_oob",
+		"go EvalError text and pc for: txna ApprovalProgramPages 0",
+		"txna ApprovalProgramPages 0", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/txna_clear_pages_oob",
+		"go EvalError text and pc for: txna ClearStateProgramPages 0",
+		"txna ClearStateProgramPages 0", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/txnas_args_oob",
+		"go EvalError text and pc for: int 9; txnas ApplicationArgs",
+		"int 9; txnas ApplicationArgs", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/txnas_accounts_oob",
+		"go EvalError text and pc for: int 9; txnas Accounts",
+		"int 9; txnas Accounts", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/gtxn_group_oob",
+		"go EvalError text and pc for: gtxn 3 TxID",
+		"gtxn 3 TxID", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/gtxn_sender_group_oob",
+		"go EvalError text and pc for: gtxn 2 Sender",
+		"gtxn 2 Sender", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/gtxns_group_oob",
+		"go EvalError text and pc for: int 4; gtxns Sender",
+		"int 4; gtxns Sender", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/gtxna_args_oob",
+		"go EvalError text and pc for: gtxna 0 ApplicationArgs 3",
+		"gtxna 0 ApplicationArgs 3", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/gtxnas_args_oob",
+		"go EvalError text and pc for: int 3; gtxnas 0 ApplicationArgs",
+		"int 3; gtxnas 0 ApplicationArgs", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/gtxnsa_args_oob",
+		"go EvalError text and pc for: int 0; gtxnsa ApplicationArgs 2",
+		"int 0; gtxnsa ApplicationArgs 2", 8,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/gtxnsas_args_oob",
+		"go EvalError text and pc for: int 0; int 2; gtxnsas ApplicationArgs",
+		"int 0; int 2; gtxnsas ApplicationArgs", 8,
 		nil,
 	))
 

@@ -156,11 +156,7 @@ pub fn read_txn_field(
                 Some(i) => {
                     if i >= args.len() {
                         Err(AlgoError::Avm {
-                            message: format!(
-                                "ApplicationArgs index {} out of range (len={})",
-                                i,
-                                args.len()
-                            ),
+                            message: format!("invalid ApplicationArgs index {}", i),
                         })
                     } else {
                         let val = args[i].as_ref().map(|b| b.to_vec()).unwrap_or_default();
@@ -184,11 +180,7 @@ pub fn read_txn_field(
                     let idx = i - 1;
                     if idx >= accts.len() {
                         Err(AlgoError::Avm {
-                            message: format!(
-                                "Accounts index {} out of range (len={})",
-                                i,
-                                accts.len()
-                            ),
+                            message: format!("invalid Accounts index {}", i),
                         })
                     } else {
                         Ok(TealValue::Bytes(accts[idx].0.to_vec()))
@@ -322,11 +314,7 @@ pub fn read_txn_field(
                 Some(i) => {
                     if i >= assets.len() {
                         Err(AlgoError::Avm {
-                            message: format!(
-                                "Assets index {} out of range (len={})",
-                                i,
-                                assets.len()
-                            ),
+                            message: format!("invalid Assets index {}", i),
                         })
                     } else {
                         Ok(TealValue::Uint(assets[i]))
@@ -349,11 +337,7 @@ pub fn read_txn_field(
                     let idx = i - 1;
                     if idx >= apps.len() {
                         Err(AlgoError::Avm {
-                            message: format!(
-                                "Applications index {} out of range (len={})",
-                                i,
-                                apps.len()
-                            ),
+                            message: format!("invalid Applications index {}", i),
                         })
                     } else {
                         Ok(TealValue::Uint(apps[idx]))
@@ -403,7 +387,7 @@ pub fn read_txn_field(
         // Callers with eval delta access should override txn_field for these.
         58 => match array_index {
             Some(i) => Err(AlgoError::Avm {
-                message: format!("Logs index {} out of range (len=0)", i),
+                message: format!("invalid Logs index {}", i),
             }),
             None => Ok(TealValue::Uint(0)),
         },
