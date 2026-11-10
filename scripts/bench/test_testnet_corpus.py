@@ -672,5 +672,98 @@ class VoteCorruptionTests(unittest.TestCase):
                 replay.corrupt_corpus(SMALL, os.path.join(d, "c"), "vote")
 
 
+LABEL = "10000#" + "A" * 52
+
+
+@contextlib.contextmanager
+def catchpoint_endpoint(served, genesis_hash="GH", label=LABEL):
+    """An algod endpoint serving a block response for every round in `served`,
+    the genesis hash and the channel's latest catchpoint label."""
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def reply(self, body):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            m = re.fullmatch(r"/v2/blocks/(\d+)\?format=msgpack", self.path)
+            if self.path == "/v2/transactions/params":
+                return self.reply(json.dumps({"genesis-hash": genesis_hash}).encode())
+            if self.path == "/channel/latest.catchpoint":
+                return self.reply(label.encode() + b"\n")
+            if m and int(m.group(1)) in served:
+                n = int(m.group(1))
+                return self.reply(ft._mp_map({
+                    "block": ft._mp_map({"rnd": ft._mp_uint(n)}), "cert": ft._mp_map({})}))
+            self.send_error(404)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+class PlanCatchpointTests(unittest.TestCase):
+    """The catchpoint-start corpus plan (issue #2146)."""
+
+    def test_label_parsing(self):
+        self.assertEqual(ft.parse_catchpoint_label(LABEL + "\n"), (10000, "A" * 52))
+        for bad in ("", "10000", "0#" + "A" * 52, "x#" + "A" * 52, "10000#" + "A" * 51,
+                    "10000#" + "a" * 52, "10000#" + "1" * 52, "10001#" + "A" * 52):
+            with self.assertRaises(ft.FetchError, msg=bad):
+                ft.parse_catchpoint_label(bad)
+
+    def test_plan_resolves_the_channel_label_and_checks_the_range(self):
+        with tempfile.TemporaryDirectory() as t, \
+                catchpoint_endpoint({10001, 10050}) as url:
+            ref = os.path.join(t, "in.ref")
+            with open(ref, "w", encoding="utf-8") as f:
+                f.write("genesis_hash=GH\n")
+            out = os.path.join(t, "out.ref")
+            rc = ft.main(["plan-catchpoint", "--ref", ref, "--endpoint", url, "--rounds", "50",
+                          "--channel-url", url + "/channel/latest.catchpoint",
+                          "--out", out, "--retries", "1"])
+            self.assertEqual(rc, 0)
+            got = ft.read_ref(out)
+            self.assertEqual(got["catchpoint"], LABEL)
+            self.assertEqual((got["catchpoint_round"], got["rounds"]), ("10000", "50"))
+            self.assertEqual((got["endpoint"], got["genesis_hash"]), (url, "GH"))
+
+    def test_plan_refuses_an_endpoint_that_does_not_serve_the_range(self):
+        with tempfile.TemporaryDirectory() as t, catchpoint_endpoint({10001}) as url:
+            out = os.path.join(t, "out.ref")
+            rc = ft.main(["plan-catchpoint", "--ref", os.path.join(t, "none"), "--endpoint", url,
+                          "--rounds", "50", "--label", LABEL, "--out", out, "--retries", "1"])
+            self.assertEqual(rc, 1)
+            self.assertFalse(os.path.exists(out))
+
+    def test_plan_refuses_another_network(self):
+        with tempfile.TemporaryDirectory() as t, \
+                catchpoint_endpoint({10001, 10050}, genesis_hash="OTHER") as url:
+            ref = os.path.join(t, "in.ref")
+            with open(ref, "w", encoding="utf-8") as f:
+                f.write("genesis_hash=GH\n")
+            out = os.path.join(t, "out.ref")
+            rc = ft.main(["plan-catchpoint", "--ref", ref, "--endpoint", url, "--rounds", "50",
+                          "--label", LABEL, "--out", out, "--retries", "1"])
+            self.assertEqual(rc, 1)
+            self.assertFalse(os.path.exists(out))
+
+    def test_the_committed_plan_is_well_formed(self):
+        ref = ft.read_ref(os.path.join(REPO, "benchmarks", "corpus", "testnet-catchpoint.ref"))
+        rnd, _ = ft.parse_catchpoint_label(ref["catchpoint"])
+        self.assertEqual(int(ref["catchpoint_round"]), rnd)
+        self.assertGreaterEqual(int(ref["rounds"]), 1)
+        self.assertEqual(ref["genesis_hash"], ft.read_ref(REF)["genesis_hash"])
+        self.assertTrue(os.path.isfile(os.path.join(REPO, "docs", "BENCH_CATCHPOINT_REPLAY.md")))
+
+
 if __name__ == "__main__":
     unittest.main()

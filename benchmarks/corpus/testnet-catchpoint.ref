@@ -1,0 +1,8 @@
+# The catchpoint-start replay corpus plan (issue #2146): written by
+# scripts/bench/corpus/fetch_testnet.py plan-catchpoint, see
+# docs/BENCH_CATCHPOINT_REPLAY.md.
+endpoint=https://testnet-api.algonode.cloud
+genesis_hash=SGO1GKSzyE7IEPItTxCByw9x8FmnrCDexi9/cOUJOiI=
+catchpoint=69120000#HV3VUPYHFFFV5DQ4KAJ7UL7KU7SB5TV2W4TMITNE65XTR7IKBKLQ
+catchpoint_round=69120000
+rounds=200
