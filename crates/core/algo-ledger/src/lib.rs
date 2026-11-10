@@ -70,6 +70,7 @@ pub mod sync;
 pub mod trie_hash;
 pub mod txn_group_delta_tracer;
 pub mod txtail_cache;
+pub mod undo_journal;
 pub mod voters;
 pub mod voters_tracker;
 

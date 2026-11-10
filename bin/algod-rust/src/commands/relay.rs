@@ -763,6 +763,9 @@ pub async fn run(
     // (`algo_ledger::apply`). A no-op (identical to pre-#1354 behavior)
     // when `config.json` leaves all three at their stock defaults.
     sqlite_ledger.configure_retention(resolve_retention_config(node_config));
+    // Issue #2148: undo data of the last rounds, so simulate serves a past
+    // `Request.Round` as go does back to its `dbRound`.
+    sqlite_ledger.set_undo_window(algo_ledger::undo_journal::NODE_UNDO_WINDOW_ROUNDS);
 
     // Optional: bootstrap genesis state when the ledger is fresh.
     // Without this the relay's accountbase + accounttotals stay empty

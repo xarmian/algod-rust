@@ -58,7 +58,7 @@ consensus-compatible. It exists for three readers:
 | DIV-004 | Hand-written msgpack struct readers decode the map form only (go also decodes struct-from-array) and replace, rather than merge into, a struct/array on a duplicated key | wire decoding of non-canonical msgpack (blocks, transactions, heartbeat, state proof, PQ structs) | landed | 2026-10-24 | none for canonical encodings (go's encoder never emits the array form or duplicate keys; hashes are over the canonical re-encode); only non-canonical input go accepts is rejected or decoded differently | `crates/core/algo-types/src/rmp_decode.rs` (`read_map_len`), the `decode_from_reader` struct readers in `crates/core/algo-types/src/{transaction,block,header,pq}.rs` | `data/transactions/msgp_gen.go` (`SignedTxn.UnmarshalMsgWithState` struct-from-array branch and key loop), algorand/msgp `msgp/read_bytes.go` | `docs/BYTES_DECODE_PARITY.md` "Issue #2065: final disposition"; `go_msgp_nil_scalars_test.rs` pins the parts that were implemented (nil -> zero) |
 | DIV-005 | `algokey keyreg` and the `--network` presets accept `voimain` (Voi mainnet) and `aramidmain` (Aramid mainnet), networks absent from go-algorand's `validNetworks` map | network presets / algokey genesis-hash table | landed | 2026-10-25 | none (additive preset; the four go networks resolve exactly as before) | `crates/core/algo-types/src/networks.rs`, `bin/algod-rust/src/commands/network_common.rs` | `cmd/algokey/keyreg.go` (`validNetworks`) | genesis-hash pin tests (`networks_parity`, `genesis_test::test_voimain_genesis_hash_matches_fixture`) against the live Voi `/genesis` and `/versions` (epic #2068, #2069, #2070) |
 | DIV-006 | A network preset's bundled `consensus.json` (aramidmain) contributes only protocol versions the binary does not already define; go loads every entry of a `consensus.json` wholesale | `--network aramidmain` consensus table | landed | 2026-10-25 | none (the aramidmain chain only ever uses `aramidmain-v1.0/1..3`, which are loaded exactly as go loads them; the file's stale copies of `future`/`v7`..`v12`/spec-URL protocols are never used by that chain) | `crates/core/algo-types/src/consensus.rs` (`preload_consensus_protocols_with_bundle`), `bin/algod-rust/src/commands/network_common.rs` | `config/config.go` (`PreloadConfigurableConsensusProtocols`), `config/consensus.go` (`ConsensusProtocols.Merge`) | `aramidmain_consensus_test.rs` (`custom_protocols_merge_like_go`, `bundle_adds_only_unknown_protocols`, `data_dir_file_overrides_bundle`) and the live aramidmain catchup + follow (#2070) |
-| DIV-007 | `simulate` serves only `Request.Round` = the latest round; an earlier round is rejected with go's `round %d before dbRound %d` (dbRound = latest), where go serves any round back to its tracker `dbRound` | simulate (`POST /v2/transactions/simulate` with `round`) | landed | 2026-10-31 | none (affects only whether a simulate request with a past round is served; no block, state or consensus path) | `crates/core/algo-ledger/src/simulation/mod.rs` (`Simulator::simulate`) | `ledger/simulation/simulator.go` (`Simulate`, `simulatorLedger.start`), `ledger/acctupdates.go` (`RoundOffsetError`) | `simulation_gaps_test.rs` (`start_round_selection`, `simulate_at_a_past_round_is_rejected_not_evaluated_on_latest_state`, `simulate_round_before_db_round_is_rejected`); the latest-round path stays proven by the #2118 go oracle (`simulation_rewards_oracle_test.rs`) |
+| DIV-007 | `simulate` serves a past `Request.Round` only from undo data held in memory for at most the last 320 rounds and at most a 16 MiB budget (whichever is fewer rounds), which starts empty at every node start; go serves back to its tracker `dbRound` (about `MaxAcctLookback` behind the latest round) at once after a restart | simulate (`POST /v2/transactions/simulate` with `round`) | landed | 2026-10-31 | none (affects only whether a simulate request with a past round is served; no block, state or consensus path) | `crates/core/algo-ledger/src/undo_journal.rs` (`UndoJournal`), `crates/core/algo-ledger/src/simulation/mod.rs` (`Simulator::rewind`), `crates/core/algo-ledger/src/sqlite.rs` (`undo_note_*`) | `ledger/simulation/simulator.go` (`Simulate`, `simulatorLedger.start`), `ledger/acctupdates.go` (`RoundOffsetError`) | `simulate_past_round_oracle_test.rs` (go oracle: rounds 1, 2 and the latest on a rewards-accruing chain), `simulate_past_round_test.rs` (state, window edge, header rewards state incl. a recalculation round), `undo_journal` unit tests, `simulation_gaps_test.rs` (store without undo data); the latest-round path stays proven by the #2118 go oracle (`simulation_rewards_oracle_test.rs`) |
 | DIV-008 | The ledger checkpoints the tracker WAL (PASSIVE, `main` only) every time it opens a `ReadSnapshot`, under the ledger lock, and sets `journal_size_limit` (64 MiB) on the connections that write the tracker WAL so a long read pin leaves no peak-size WAL file behind; go has no long-lived read snapshot and sets no limit | ledger SQLite WAL maintenance (pool evaluator snapshot) | landed | 2026-11-02 | none (a checkpoint only copies committed pages from the WAL into the database file, `journal_size_limit` only truncates the WAL file after a restart; durability settings unchanged) | `crates/core/algo-ledger/src/sqlite.rs` (`SqliteLedger::open_read_snapshot`, `checkpoint_tracker_wal_for_snapshot`, `DEFAULT_TRACKER_WAL_SIZE_LIMIT`, `SqliteLedger::set_tracker_wal_size_limit`, `open_ledger_connection_with_sync_mode`), `crates/core/algo-ledger/src/follow_timing.rs` (metrics) | `util/db/dbutil.go` (`_journal_mode=wal`, default `wal_autocheckpoint`) | `wal_overlapping_reader_test.rs` (WAL bound, foreign-reader limit, 40 randomized kills, cost benchmark), live betanet follow, replay-corpus final-state equality (#2166); `sqlite::tests::the_tracker_wal_file_returns_to_its_limit_after_a_pinning_export_snapshot_ends`, `opening_a_file_backed_ledger_sets_the_default_tracker_wal_size_limit`, `a_negative_tracker_wal_size_limit_is_rejected` (#2206) |
 | DIV-009 | A block's archive rows (`put_block` / `put_block_cert`) are buffered during the block span and committed to the block file on a second connection BEFORE the tracker transaction commits (go: blockdb commit, then trackers lag); a ledger crash leaves the archive at most one block ahead of the tracker | ledger SQLite commit order (`commit_block`) | landed | 2026-11-02 | none (same files, schema and rows; the archive rows become durable one commit earlier, durability settings unchanged) | `crates/core/algo-ledger/src/sqlite.rs` (`PendingArchive`, `SqliteLedger::flush_pending_archive`, `reconcile_orphans`, `begin_block`, `put_block`, `put_block_cert`, `forget_before`, `open_split`), `crates/core/algo-ledger/src/read_pool.rs` (`ArchiveInflight`, `in_flight`) | `ledger/ledger.go` (`AddValidatedBlock`: `blockQ.putBlock` before `trackers.newBlock`), `ledger/tracker.go` (`loadFromDisk`) | `wal_overlapping_reader_test.rs` (failpoint crash at every commit step in both write orders, randomized hard kills, abort/sync-ahead/savepoint tests, cost benchmark) (#2209) |
 | DIV-010 | The catchup pass's fetch window is `CatchupParallelBlocks + min(CatchupParallelBlocks, 32)` rounds ahead of the apply cursor (in flight plus fetched and waiting; `1` stays 1, deliberately no prefetch for the serial setting) with at most `CatchupParallelBlocks` fetches in flight, and once a round's fetch has finally failed new claims are bounded by the apply cursor plus the started workers (rounds already claimed stay claimed); go's window holds `limitedParallelRequests` rounds in total | block catchup / replay scheduling (`CatchupService::sync_pass_core`) | landed | 2026-11-07 | none (the same blocks are fetched, authenticated and applied in round order; only how many fetched blocks may wait for an earlier slow round differs) | `crates/core/algo-ledger/src/catchup_service.rs` (`FETCH_AHEAD_MAX_EXTRA`, `fetch_window`, `sync_pass_core`) | `catchup/service.go` (`pipelinedFetch`, `limitedParallelRequests`, `fetchAndWrite`) | `catchup_service` tests (`a_slow_round_does_not_idle_the_other_workers`, `sync_range_fetch_window_never_exceeds_the_parallel_budget`, `the_tip_probe_is_not_multiplied_by_the_window`, `past_the_tip_no_round_beyond_the_cursor_plus_the_workers_is_requested`, `the_tip_gate_claims_exactly_up_to_the_limit_however_many_workers_race`, `the_fetch_window_is_exact_for_one_worker_and_capped_for_many`), live betanet replay with the block-hash gate (PR #2236, evidence in the entry) |
@@ -313,45 +313,75 @@ follow against the public aramidmain network with zero apply failures.
 
 **How go-algorand could port it.** Not applicable (go has no network presets).
 
-### DIV-007 — simulate serves only the latest round
+### DIV-007 — simulate serves a past round only from in-memory undo data
 
-**Status:** landed (#2123).
+**Status:** landed (#2123 latest round only; #2148 undo data).
 
 **What go-algorand does.** `Simulator.Simulate` sets `simulatorLedger.start =
 Request.Round`, and every account, app, asset and box read, plus `Totals`, is
 served as of `start` from the tracker's in-memory deltas. Any round back to
 `dbRound` works; older rounds fail with `round %d before dbRound %d`
-(`RoundOffsetError`).
+(`RoundOffsetError`). After a restart the tracker rebuilds its deltas from the
+blocks after the committed round, so the window is there again at once.
 
-**What algod-rust does instead.** The ledger store keeps only the latest state
-(no per-round account history), so `Simulator::simulate` treats the latest round
-as the effective `dbRound`: `Request.Round` below it is rejected with go's
-error text (an internal error, so a 500 like go's), and a round above it fails
-with `ledger does not have entry N` as in go.
+**What algod-rust does instead.** The ledger store keeps only the latest state.
+With the undo journal on (`LedgerStore::set_undo_window`, 320 rounds on a
+node, go's default `MaxAcctLookback`, and `set_undo_budget_bytes`, 16 MiB), `SqliteLedger` records, for every
+account, holding, asset/app param, local state and box a block writes, its
+value before the block first touched it, plus the account totals before the
+block (`UndoJournal`). `Simulator::simulate` rewinds the store to `start` by
+writing the earliest pre-image after `start` of each touched key, takes the
+rewards state and the transaction counter from the header of `start` and the
+reward units from the totals before round `start + 1`, runs the simulation in
+one SQL transaction, and puts the latest values back. A round older than the
+journal fails with go's `round %d before dbRound %d`, `dbRound` being the oldest
+retained round minus one.
 
-**Client-visible consequence.** A client that reads `round = N` from `/status`
-and passes it as `Request.Round` gets a 500 if block `N + 1` lands first; go
-would still serve it (its `dbRound` is typically the latest round minus the
-account lookback). The rejection text appends "this node serves simulate only
-at its latest round, so its effective dbRound is the latest round" to go's
-`round %d before dbRound %d`. The window is deliberately not widened (see #2148).
+**Where it differs.** The journal is memory-only: after a restart it is empty
+and grows back one round per block, so until 320 blocks are applied the
+earliest servable round is later than go's `dbRound`. It is also bounded by an
+estimated 16 MiB (`DEFAULT_UNDO_BUDGET_BYTES`): the oldest rounds are evicted
+beyond it (the newest round is always kept), so on a busy chain the window is
+shorter than 320 rounds (measured below). The in-memory test backend
+`LedgerState` keeps no journal and serves only its latest round.
 
-**What is identical.** Omitting the round, or giving the latest round, behaves
-exactly as go, including the block-start rewards (proven by the #2118 oracle).
-The error text and error class for an unservable round are go's.
+**Measured cost** (synthetic worst case: 400 rounds of pure account writes on a
+20 000-account ledger, release build, median of 3, ignored test
+`undo_journal_memory_and_rewind_cost`; real blocks do far more work per touched
+account, so the apply overhead there is smaller):
 
-**Why.** Evaluating a past round against the latest state under an older header
-returns wrong balances and, on rewards-accruing chains, an inconsistent rewards
-level; failing loudly is closer to go than a silently wrong result. Serving past
-rounds needs undo data for every account, app, asset and box the evaluator can
-read; that is tracked in #2148.
+| touched accounts per round | retention | journal estimate | RSS delta (n=3) | rewind to `latest - 1` | rewind to the earliest round |
+|---|---|---|---|---|---|
+| 500 | off | - | 0.7 MiB | - | - |
+| 500 | 320 rounds, no budget | 72 MiB / 320 rounds | 140 MiB | 6 ms | 331 ms |
+| 500 | 320 rounds, 16 MiB | 15.8 MiB / 70 rounds | 32 MiB | 6 ms | 152 ms |
+| 2 000 | off | - | 0.5 MiB | - | - |
+| 2 000 | 320 rounds, no budget | 288 MiB / 320 rounds | 553 MiB | 23 ms | 359 ms |
+| 2 000 | 320 rounds, 16 MiB | 15.3 MiB / 17 rounds | 33 MiB | 20 ms | 139 ms |
+
+Without the budget memory grows with how busy the chain is (a 5 000-account
+round gave 1.1 GiB), hence the budget; with it the RSS cost is about twice the
+estimate (allocator and map overhead), a flat ~32 MiB. The account-write apply
+path went from 2.87 s to 3.67 s (500/round) and 15.2 s to 14.9 s (2 000/round)
+in the same runs (noise is of that order). A rewind holds the ledger mutex (as
+every simulate already does) for as long as it writes the touched keys twice:
+at most about 150 ms for the earliest retained round under the 16 MiB budget,
+20 ms or less for `latest - 1`; that is the limit of this design, a larger
+budget raises it proportionally.
+
+**What is identical.** The simulated state, rewards and failure texts for every
+retained round (proven by the go oracle), and the text and class of the
+`before dbRound` and `does not have entry` errors.
+
+**Why.** Persisting the pre-images would double the write volume of block apply;
+go rebuilds its deltas by replaying blocks, which needs the same old values we
+do not keep.
 
 **How parity is proven.** The tests listed in the table row; the error text is
 from `ledger/acctupdates.go`.
 
-**How to switch back.** In `Simulator::simulate`, make `floor` just
-`self.store.earliest_round()` (drop the `.max(self.store.current_round())`) once
-the store can serve historical state, and drop the error-text suffix.
+**How to switch back.** Not applicable (a node with `set_undo_window(0)` serves
+only its latest round, as before #2148).
 
 **How go-algorand could port it.** Not applicable (go already serves history).
 

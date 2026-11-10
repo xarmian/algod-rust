@@ -226,7 +226,7 @@ pub mod test_hooks {
     }
 
     /// Guard that lets this thread's simulates take a `Request.Round` below
-    /// the latest round (issue #2123, DIV-007) until it is dropped. Only for
+    /// the latest round (issue #2123) without rewinding, until it is dropped. Only for
     /// oracle tests whose scenarios read no account state that changed after
     /// `Request.Round` (the duplicate-transaction checks of #2125, which read
     /// the txtail and the lease table), so their go parity stays pinned.
@@ -264,7 +264,7 @@ pub mod test_hooks {
     }
 }
 
-/// Whether a test hook has opened the past-round window (DIV-007); always
+/// Whether a test hook has opened the past-round window; always
 /// false outside tests.
 fn past_rounds_allowed() -> bool {
     #[cfg(any(test, feature = "test-hooks"))]
@@ -327,6 +327,21 @@ pub struct Simulator<'a, L: LedgerStore> {
     store: &'a mut L,
     /// Whether the developer API is enabled (allows extra trace features).
     pub developer_api: bool,
+    /// The store while it is rewound to a past `Request.Round` (issue #2148).
+    rewound: Option<Rewound>,
+}
+
+/// What [`Simulator::rewind`] changed, to put back afterwards.
+struct Rewound {
+    /// The values the rewound keys held in the latest state.
+    redo: crate::undo_journal::Rewind,
+    rewards_level: u64,
+    rewards_rate: u64,
+    rewards_residue: u64,
+    rewards_recalculation_round: u64,
+    txn_counter: u64,
+    /// go `Totals(start).RewardUnits()`.
+    reward_units: u64,
 }
 
 impl<'a, L: LedgerStore> Simulator<'a, L> {
@@ -335,6 +350,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         Simulator {
             store,
             developer_api: false,
+            rewound: None,
         }
     }
 
@@ -343,6 +359,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         Simulator {
             store,
             developer_api: true,
+            rewound: None,
         }
     }
 
@@ -395,11 +412,12 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
     /// Only reads: the withdrawal itself is applied after `check`.
     ///
     /// The rewards inputs (the previous rewards state, the pool, the reward
-    /// units) come from the latest state, not from a header: the store's
-    /// rewards fields, its pool account and its totals. For `start` = latest
-    /// that is exactly go's `BlockHdr(start)` / `Totals(start)`. `simulate`
-    /// rejects any earlier `start` (issue #2123, DIV-007), so an older
-    /// header's level is never paired with the latest account state.
+    /// units) come from the store: its rewards fields, its pool account and
+    /// its totals. For `start` = latest that is exactly go's
+    /// `BlockHdr(start)` / `Totals(start)`; for an earlier `start`,
+    /// [`Self::rewind`] has put the rewards fields of that header, the pool
+    /// as of `start` and its reward units in their place (issue #2148), so an
+    /// older header's level is never paired with the latest account state.
     ///
     /// Without a header for `start` (unit-test stores only; a real ledger
     /// always has its latest header) the store's protocol stands in.
@@ -441,7 +459,10 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             Some(acct) => balance_with_rewards(&acct, prev.rewards_level)?,
             None => 0,
         };
-        let reward_units = store.total_reward_units()?;
+        let reward_units = match &self.rewound {
+            Some(r) => r.reward_units,
+            None => store.total_reward_units()?,
+        };
         let next = next_rewards_state(prev, round, &consensus, pool_balance, reward_units);
         let withdrawal = BlockRewardsWithdrawal {
             round,
@@ -475,6 +496,168 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
     /// The ledger store is left unchanged after simulation completes
     /// (all state changes are rolled back via snapshot/restore).
     pub fn simulate(
+        &mut self,
+        request: SimulationRequest,
+    ) -> Result<SimulationResult, SimulatorError> {
+        // A past `Request.Round` rewinds the store for the duration of the
+        // simulation; it is put back on every exit, a panic included.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.simulate_at_round(request)
+        }));
+        self.unwind();
+        match outcome {
+            Ok(outcome) => outcome,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    /// Rewind the store to the end of round `start` from the retained undo
+    /// data (issue #2148): every account, holding, asset/app param, local
+    /// state and box written after `start` gets its value as of `start`, and
+    /// the rewards state and transaction counter come from the header of
+    /// `start`, as go's `simulatorLedger` serves `BlockHdr(start)`, `Totals(start)`
+    /// and the tracker lookups at `start`.
+    fn rewind(&mut self, start: Round) -> Result<(), SimulatorError> {
+        let Some(rewind) = self.store.rewind_to(start) else {
+            return Err(SimulatorError::Internal(AlgoError::Ledger {
+                message: format!(
+                    "round {} before dbRound {}",
+                    start.0,
+                    self.store.earliest_simulate_round().0
+                ),
+            }));
+        };
+        let hdr = self.store.get_block_header(start.0)?.ok_or_else(|| {
+            SimulatorError::InvalidRequest(InvalidRequestError {
+                message: format!("ledger does not have entry {}", start.0),
+            })
+        })?;
+        self.store.begin_scratch_writes();
+        let mut redo = crate::undo_journal::Rewind {
+            round: start,
+            ..Default::default()
+        };
+        {
+            let store = &mut *self.store;
+            for (addr, to) in &rewind.accounts {
+                redo.accounts.insert(*addr, store.get_account(addr));
+                match to {
+                    Some(a) => store.set_account(addr, a.clone()),
+                    None => store.remove_account(addr),
+                }
+            }
+            for (&(addr, id), to) in &rewind.asset_holdings {
+                redo.asset_holdings
+                    .insert((addr, id), store.get_asset_holding(&addr, id));
+                match to {
+                    Some(h) => store.set_asset_holding(&addr, id, h.clone()),
+                    None => store.remove_asset_holding(&addr, id),
+                }
+            }
+            for (&id, to) in &rewind.asset_params {
+                redo.asset_params.insert(id, store.get_asset_params(id));
+                match to {
+                    Some(r) => store.set_asset_params(id, r.clone()),
+                    None => store.remove_asset_params(id),
+                }
+            }
+            for (&id, to) in &rewind.app_params {
+                redo.app_params.insert(id, store.get_app_params(id));
+                match to {
+                    Some(r) => store.set_app_params(id, r.clone()),
+                    None => store.remove_app_params(id),
+                }
+            }
+            for (&(addr, id), to) in &rewind.app_local_states {
+                redo.app_local_states
+                    .insert((addr, id), store.get_app_local_state(&addr, id));
+                match to {
+                    Some(l) => store.set_app_local_state(&addr, id, l.clone()),
+                    None => store.remove_app_local_state(&addr, id),
+                }
+            }
+            for ((id, name), to) in &rewind.boxes {
+                redo.boxes
+                    .insert((*id, name.clone()), store.get_box(*id, name));
+                match to {
+                    Some(v) => store.set_box(*id, name, v.clone()),
+                    None => {
+                        store.delete_box(*id, name);
+                    }
+                }
+            }
+        }
+        let store = &mut *self.store;
+        self.rewound = Some(Rewound {
+            redo,
+            rewards_level: store.rewards_level(),
+            rewards_rate: store.rewards_rate(),
+            rewards_residue: store.rewards_residue(),
+            rewards_recalculation_round: store.rewards_recalculation_round(),
+            txn_counter: store.txn_counter(),
+            reward_units: rewind.totals_before.reward_units(),
+        });
+        store.set_rewards_level(hdr.rewards_level);
+        store.set_rewards_rate(hdr.rewards_rate);
+        store.set_rewards_residue(hdr.rewards_residue);
+        store.set_rewards_recalculation_round(hdr.rewards_recalculation_round.0);
+        store.set_txn_counter(hdr.txn_counter);
+        Ok(())
+    }
+
+    /// Put back what [`Self::rewind`] changed (a no-op when nothing was).
+    fn unwind(&mut self) {
+        let Some(r) = self.rewound.take() else {
+            return;
+        };
+        let store = &mut *self.store;
+        store.set_rewards_level(r.rewards_level);
+        store.set_rewards_rate(r.rewards_rate);
+        store.set_rewards_residue(r.rewards_residue);
+        store.set_rewards_recalculation_round(r.rewards_recalculation_round);
+        store.set_txn_counter(r.txn_counter);
+        for (addr, to) in &r.redo.accounts {
+            match to {
+                Some(a) => store.set_account(addr, a.clone()),
+                None => store.remove_account(addr),
+            }
+        }
+        for (&(addr, id), to) in &r.redo.asset_holdings {
+            match to {
+                Some(h) => store.set_asset_holding(&addr, id, h.clone()),
+                None => store.remove_asset_holding(&addr, id),
+            }
+        }
+        for (&id, to) in &r.redo.asset_params {
+            match to {
+                Some(p) => store.set_asset_params(id, p.clone()),
+                None => store.remove_asset_params(id),
+            }
+        }
+        for (&id, to) in &r.redo.app_params {
+            match to {
+                Some(p) => store.set_app_params(id, p.clone()),
+                None => store.remove_app_params(id),
+            }
+        }
+        for (&(addr, id), to) in &r.redo.app_local_states {
+            match to {
+                Some(l) => store.set_app_local_state(&addr, id, l.clone()),
+                None => store.remove_app_local_state(&addr, id),
+            }
+        }
+        for ((id, name), to) in &r.redo.boxes {
+            match to {
+                Some(v) => store.set_box(*id, name, v.clone()),
+                None => {
+                    store.delete_box(*id, name);
+                }
+            }
+        }
+        store.end_scratch_writes();
+    }
+
+    fn simulate_at_round(
         &mut self,
         request: SimulationRequest,
     ) -> Result<SimulationResult, SimulatorError> {
@@ -554,21 +737,23 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // headers (`forget_before` isn't wired into the normal apply path),
         // so the header would otherwise still resolve.
         if let Some(requested_round) = request.round {
-            // DIVERGENCE DIV-007: the store keeps only the latest account,
-            // app, asset and box state, so the earliest round simulate can
-            // serve is the latest round (go serves back to its `dbRound`).
+            // DIVERGENCE DIV-007: go serves back to its `dbRound`; here that is the oldest round
+            // whose undo data is retained (issue #2148), the latest round
+            // when none is.
             let floor = if past_rounds_allowed() {
                 self.store.earliest_round()
             } else {
-                self.store.earliest_round().max(self.store.current_round())
+                self.store
+                    .earliest_round()
+                    .max(self.store.earliest_simulate_round())
             };
             if requested_round < floor {
                 return Err(SimulatorError::Internal(AlgoError::Ledger {
-                    message: format!(
-                        "round {} before dbRound {} (this node serves simulate only at its                          latest round, so its effective dbRound is the latest round)",
-                        requested_round.0, floor.0
-                    ),
+                    message: format!("round {} before dbRound {}", requested_round.0, floor.0),
                 }));
+            }
+            if requested_round < self.store.current_round() && !past_rounds_allowed() {
+                self.rewind(requested_round)?;
             }
         }
 

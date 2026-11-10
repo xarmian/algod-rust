@@ -2477,6 +2477,11 @@ pub struct SqliteLedger {
     /// `SetSyncRound` on every startup, matching go's own
     /// process-lifetime-only `disableSyncRound` state.
     earliest_round: Round,
+    /// Retained pre-images of the last rounds, for `simulate` at a past round
+    /// (issue #2148). Memory-only; empty after a restart.
+    undo: crate::undo_journal::UndoJournal,
+    /// The round being applied, not yet complete (see `undo`).
+    undo_capture: Option<crate::undo_journal::RoundUndo>,
     rewards_level: u64,
     rewards_rate: u64,
     rewards_residue: u64,
@@ -3355,6 +3360,8 @@ impl SqliteLedger {
             fail_rollback_count: 0,
             current_round,
             earliest_round: Round(0),
+            undo: crate::undo_journal::UndoJournal::default(),
+            undo_capture: None,
             rewards_level,
             rewards_rate,
             rewards_residue,
@@ -7459,6 +7466,153 @@ struct Failpoint {
 }
 
 impl SqliteLedger {
+    /// Start (or continue) the undo capture of the round being applied
+    /// (`current_round + 1`), issue #2148. A capture of an earlier round is
+    /// retired into the journal first.
+    fn undo_capture_for_next_round(&mut self) -> &mut crate::undo_journal::RoundUndo {
+        let round = Round(self.current_round.0 + 1);
+        if self.undo_capture.as_ref().is_some_and(|c| c.round != round) {
+            if let Some(done) = self.undo_capture.take() {
+                self.undo.push(done);
+            }
+        }
+        if self.undo_capture.is_none() {
+            let totals_before = self.account_totals();
+            self.undo_capture = Some(crate::undo_journal::RoundUndo {
+                round,
+                totals_before,
+                ..Default::default()
+            });
+        }
+        self.undo_capture.as_mut().expect("capture just created")
+    }
+
+    /// A block that touched nothing still is a round of the journal: make
+    /// sure round `round` has its (possibly empty) capture before
+    /// `current_round` reaches it.
+    fn undo_note_round(&mut self, round: Round) {
+        if round.0 != self.current_round.0 + 1 {
+            return;
+        }
+        self.undo_capture_for_next_round();
+    }
+
+    /// Retire the capture of the latest round into the journal: it is complete
+    /// once `current_round` has reached it.
+    fn undo_flush_complete_round(&mut self) {
+        if self
+            .undo_capture
+            .as_ref()
+            .is_some_and(|c| c.round == self.current_round)
+        {
+            if let Some(done) = self.undo_capture.take() {
+                self.undo.push(done);
+            }
+        }
+    }
+
+    fn undo_note_account(&mut self, addr: &Address) {
+        if self.undo.window() == 0 || !self.in_block {
+            return;
+        }
+        if self
+            .undo_capture_for_next_round()
+            .accounts
+            .contains_key(addr)
+        {
+            return;
+        }
+        let pre = LedgerStore::get_account(self, addr);
+        self.undo_capture_for_next_round()
+            .accounts
+            .insert(*addr, pre);
+    }
+
+    fn undo_note_holding(&mut self, addr: &Address, asset_id: u64) {
+        if self.undo.window() == 0 || !self.in_block {
+            return;
+        }
+        if self
+            .undo_capture_for_next_round()
+            .asset_holdings
+            .contains_key(&(*addr, asset_id))
+        {
+            return;
+        }
+        let pre = LedgerStore::get_asset_holding(self, addr, asset_id);
+        self.undo_capture_for_next_round()
+            .asset_holdings
+            .insert((*addr, asset_id), pre);
+    }
+
+    fn undo_note_asset_params(&mut self, asset_id: u64) {
+        if self.undo.window() == 0 || !self.in_block {
+            return;
+        }
+        if self
+            .undo_capture_for_next_round()
+            .asset_params
+            .contains_key(&asset_id)
+        {
+            return;
+        }
+        let pre = LedgerStore::get_asset_params(self, asset_id);
+        self.undo_capture_for_next_round()
+            .asset_params
+            .insert(asset_id, pre);
+    }
+
+    fn undo_note_app_params(&mut self, app_id: u64) {
+        if self.undo.window() == 0 || !self.in_block {
+            return;
+        }
+        if self
+            .undo_capture_for_next_round()
+            .app_params
+            .contains_key(&app_id)
+        {
+            return;
+        }
+        let pre = LedgerStore::get_app_params(self, app_id);
+        self.undo_capture_for_next_round()
+            .app_params
+            .insert(app_id, pre);
+    }
+
+    fn undo_note_local_state(&mut self, addr: &Address, app_id: u64) {
+        if self.undo.window() == 0 || !self.in_block {
+            return;
+        }
+        if self
+            .undo_capture_for_next_round()
+            .app_local_states
+            .contains_key(&(*addr, app_id))
+        {
+            return;
+        }
+        let pre = LedgerStore::get_app_local_state(self, addr, app_id);
+        self.undo_capture_for_next_round()
+            .app_local_states
+            .insert((*addr, app_id), pre);
+    }
+
+    fn undo_note_box(&mut self, app_id: u64, key: &[u8]) {
+        if self.undo.window() == 0 || !self.in_block {
+            return;
+        }
+        if self
+            .undo_capture_for_next_round()
+            .boxes
+            .contains_key(&(app_id, key.to_vec()))
+        {
+            return;
+        }
+        let pre = LedgerStore::get_box(self, app_id, key);
+        self.undo_capture_for_next_round()
+            .boxes
+            .insert((app_id, key.to_vec()), pre);
+    }
+
     /// Test hook: abort the process (no cleanup, like a SIGKILL) the
     /// `after`-th (0 = first) time this ledger's commit path reaches the
     /// failpoint `name`: `before_archive_commit`, `after_archive_commit`
@@ -8441,6 +8595,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn set_account(&mut self, addr: &Address, account: AccountData) {
+        self.undo_note_account(addr);
         let _st = crate::follow_timing::StateTimer::write();
         // Write-through with exactly what a read of the stored blob returns.
         let stored = self
@@ -8454,6 +8609,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn remove_account(&mut self, addr: &Address) {
+        self.undo_note_account(addr);
         let _st = crate::follow_timing::StateTimer::write();
         self.remove_account_sql(addr);
         self.read_cache.clear();
@@ -8472,12 +8628,14 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn set_asset_holding(&mut self, addr: &Address, asset_id: u64, holding: AssetHolding) {
+        self.undo_note_holding(addr, asset_id);
         let _st = crate::follow_timing::StateTimer::write();
         self.set_asset_holding_sql(addr, asset_id, holding);
         self.read_cache.inv_resource(addr, asset_id);
     }
 
     fn remove_asset_holding(&mut self, addr: &Address, asset_id: u64) {
+        self.undo_note_holding(addr, asset_id);
         let _st = crate::follow_timing::StateTimer::write();
         self.remove_asset_holding_sql(addr, asset_id);
         self.read_cache.inv_resource(addr, asset_id);
@@ -8507,6 +8665,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn set_asset_params(&mut self, asset_id: u64, record: AssetParamsRecord) {
+        self.undo_note_asset_params(asset_id);
         let _st = crate::follow_timing::StateTimer::write();
         let owner = record.creator;
         self.set_asset_params_sql(asset_id, record);
@@ -8514,6 +8673,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn remove_asset_params(&mut self, asset_id: u64) {
+        self.undo_note_asset_params(asset_id);
         let _st = crate::follow_timing::StateTimer::write();
         self.remove_asset_params_sql(asset_id);
         self.read_cache.clear();
@@ -8545,6 +8705,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn set_app_params(&mut self, app_id: u64, params: AppParams) {
+        self.undo_note_app_params(app_id);
         let _st = crate::follow_timing::StateTimer::write();
         let owner = params.creator;
         self.set_app_params_sql(app_id, params);
@@ -8552,6 +8713,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn remove_app_params(&mut self, app_id: u64) {
+        self.undo_note_app_params(app_id);
         let _st = crate::follow_timing::StateTimer::write();
         self.remove_app_params_sql(app_id);
         self.read_cache.clear();
@@ -8615,12 +8777,14 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn set_app_local_state(&mut self, addr: &Address, app_id: u64, local_state: AppLocalState) {
+        self.undo_note_local_state(addr, app_id);
         let _st = crate::follow_timing::StateTimer::write();
         self.set_app_local_state_sql(addr, app_id, local_state);
         self.read_cache.inv_resource(addr, app_id);
     }
 
     fn remove_app_local_state(&mut self, addr: &Address, app_id: u64) {
+        self.undo_note_local_state(addr, app_id);
         let _st = crate::follow_timing::StateTimer::write();
         self.remove_app_local_state_sql(addr, app_id);
         self.read_cache.inv_resource(addr, app_id);
@@ -8793,6 +8957,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn set_box(&mut self, app_id: u64, key: &[u8], value: Vec<u8>) {
+        self.undo_note_box(app_id, key);
         let _st = crate::follow_timing::StateTimer::write();
         let stored = self.cache_active().then(|| value.clone());
         self.set_box_sql(app_id, key, value);
@@ -8803,6 +8968,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn delete_box(&mut self, app_id: u64, key: &[u8]) -> bool {
+        self.undo_note_box(app_id, key);
         let _st = crate::follow_timing::StateTimer::write();
         let result = self.delete_box_sql(app_id, key);
         if self.cache_active() {
@@ -8935,7 +9101,52 @@ impl LedgerStore for SqliteLedger {
     // ---- Chain-level state (setters) ----
 
     fn set_current_round(&mut self, round: Round) {
+        if self.undo.window() != 0 && self.in_block {
+            self.undo_note_round(round);
+        }
         self.current_round = round;
+    }
+
+    fn undo_window(&self) -> u64 {
+        self.undo.window()
+    }
+
+    fn undo_retained(&self) -> (usize, usize) {
+        self.undo.retained()
+    }
+
+    fn set_undo_budget_bytes(&mut self, budget: usize) {
+        self.undo.set_budget_bytes(budget);
+    }
+
+    fn set_undo_window(&mut self, window: u64) {
+        self.undo.set_window(window);
+        if window == 0 {
+            self.undo_capture = None;
+        }
+    }
+
+    fn earliest_simulate_round(&mut self) -> Round {
+        self.undo_flush_complete_round();
+        self.undo.earliest_start(self.current_round)
+    }
+
+    fn rewind_to(&mut self, start: Round) -> Option<crate::undo_journal::Rewind> {
+        self.undo_flush_complete_round();
+        self.undo.rewind_to(start, self.current_round)
+    }
+
+    fn begin_scratch_writes(&mut self) {
+        // Autocommit only: a block span is already one transaction.
+        if self.conn.is_autocommit() {
+            let _ = self.conn.execute_batch("BEGIN DEFERRED");
+        }
+    }
+
+    fn end_scratch_writes(&mut self) {
+        if !self.conn.is_autocommit() && !self.in_block {
+            let _ = self.conn.execute_batch("COMMIT");
+        }
     }
 
     fn set_earliest_round(&mut self, round: Round) {
@@ -18443,6 +18654,8 @@ mod tests {
             fail_rollback_count: _,         // test-only injection flag
             current_round: _,               // ChainSnapshot
             earliest_round: _,              // not block-scoped (see above)
+            undo: _,         // memory-only journal, validated lazily against current_round
+            undo_capture: _, // idem
             rewards_level: _,               // ChainSnapshot
             rewards_rate: _,                // ChainSnapshot
             rewards_residue: _,             // ChainSnapshot

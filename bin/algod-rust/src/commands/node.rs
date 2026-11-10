@@ -158,6 +158,12 @@ fn open_resource_ledger(
         &resolved.block_path,
         Some(ledger_prefix.to_path_buf()),
     )
+    .map(|mut ledger| {
+        // Issue #2148: undo data of the last rounds, so simulate serves a
+        // past `Request.Round` as go does back to its `dbRound`.
+        ledger.set_undo_window(algo_ledger::undo_journal::NODE_UNDO_WINDOW_ROUNDS);
+        ledger
+    })
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
