@@ -6233,6 +6233,25 @@ impl ApplErrorContext {
     }
 }
 
+/// go's `checkPrograms` (`ledger/apply/application.go`): the static check of an
+/// application's programs when it is created or updated, approval first. Only
+/// the constructs `algo_avm::check` ports are rejected (issue #2286).
+fn check_programs<A: AsRef<[u8]>, C: AsRef<[u8]>>(
+    approval: Option<&A>,
+    clear: Option<&C>,
+) -> Result<(), AlgoError> {
+    let programs = [
+        ("ApprovalProgram", approval.map(|p| p.as_ref())),
+        ("ClearStateProgram", clear.map(|p| p.as_ref())),
+    ];
+    for (which, program) in programs {
+        if let Some(err) = program.and_then(algo_avm::check::contract_static_check) {
+            return Err(algo_error::program_check_rejected(which, err));
+        }
+    }
+    Ok(())
+}
+
 /// Create a new application in the store.
 ///
 /// Writes `AppParams`, increments the creator's counters, and returns the
@@ -6251,6 +6270,12 @@ pub(crate) fn create_application<L: crate::store_trait::LedgerStore>(
             err_ctx.prefix()
         )));
     }
+
+    // go's `ApplicationCall` runs `checkPrograms` before `createApplication`.
+    check_programs(
+        txn.approval_program.as_ref(),
+        txn.clear_state_program.as_ref(),
+    )?;
 
     // go-algorand's `createApplication` (`ledger/apply/application.go`):
     // `maxAppsCreated := balances.ConsensusParams().MaxAppsCreated`
@@ -6533,6 +6558,12 @@ pub(crate) fn apply_appl_on_completion<L: crate::store_trait::LedgerStore>(
                         )));
                     }
                 }
+
+                // `checkPrograms` follows `CheckContractVersions`.
+                check_programs(
+                    txn.approval_program.as_ref(),
+                    txn.clear_state_program.as_ref(),
+                )?;
 
                 // go-algorand `ledger/apply/application.go`'s
                 // `updateApplication`: `sizeChange := ac.UpdatingSizes()`,
@@ -18239,6 +18270,105 @@ return
 
         apply_block_with_delta_mode(&mut state, &block2, ApplyMode::Execute)
             .expect("upgrading the approval program version must be allowed");
+    }
+
+    // ---- Issue #2286: go's `checkPrograms` (static check of the programs of
+    // an app create / update) ----
+
+    fn apps_check_block(
+        round: u64,
+        fee_sink: Address,
+        rewards_pool: Address,
+        payset: Vec<SignedTransaction>,
+    ) -> Block {
+        Block {
+            round: Round(round),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset,
+            ..Block::default()
+        }
+    }
+
+    fn app_call(
+        creator: Address,
+        app_id: u64,
+        oc: u64,
+        approval: Vec<u8>,
+        clear: Vec<u8>,
+    ) -> SignedTransaction {
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "appl".into();
+        stx.txn.sender = creator;
+        stx.txn.fee = 10_000;
+        stx.txn.application_id = app_id;
+        stx.txn.on_completion = oc;
+        stx.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        stx.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        stx
+    }
+
+    #[test]
+    fn issue_2286_app_create_with_a_malformed_program_is_rejected_with_go_s_text() {
+        let creator = Address([8u8; 32]);
+        let fee_sink = Address([0xFEu8; 32]);
+        let rewards_pool = Address([0xFDu8; 32]);
+        let good = trivial_clear_program();
+        // v10: `txn` without its field immediate.
+        let bad = vec![10u8, 0x31];
+        for (which, approval, clear) in [
+            ("ApprovalProgram", bad.clone(), good.clone()),
+            ("ClearStateProgram", good.clone(), bad.clone()),
+        ] {
+            let mut state = make_state_with_accounts(&[(creator, 10_000_000)], fee_sink);
+            let create = app_call(creator, 0, 0, approval, clear);
+            let txid = algo_codec::compute_txn_id(&create.txn).to_string();
+            let block = apps_check_block(1, fee_sink, rewards_pool, vec![create]);
+            fund_test_block_rewards_pool(&mut state, &block);
+            let err = apply_block_with_delta_mode(&mut state, &block, ApplyMode::Execute)
+                .expect_err("a program go's static check rejects must not create an app");
+            let text = err.to_string();
+            assert!(
+                text.contains(&format!(
+                    "transaction {txid}: check failed on {which}: pc=  1 program ends without immediate value(s)"
+                )),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_2286_app_update_with_a_malformed_program_is_rejected_and_a_good_one_is_not() {
+        let creator = Address([8u8; 32]);
+        let fee_sink = Address([0xFEu8; 32]);
+        let rewards_pool = Address([0xFDu8; 32]);
+        let mut state = make_state_with_accounts(&[(creator, 10_000_000)], fee_sink);
+        let good = trivial_clear_program();
+        let create = app_call(creator, 0, 0, good.clone(), good.clone());
+        let block1 = apps_check_block(1, fee_sink, rewards_pool, vec![create]);
+        fund_test_block_rewards_pool(&mut state, &block1);
+        let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
+        let &app_id = delta1.creatables.keys().next().expect("app created");
+
+        // v6: a branch target past the end of the program.
+        let bad = vec![6u8, 0x42, 0x00, 0x09];
+        let update = app_call(creator, app_id, ON_COMPLETION_UPDATE, bad, good.clone());
+        let block2 = apps_check_block(2, fee_sink, rewards_pool, vec![update]);
+        let err = apply_block_with_delta_mode(&mut state, &block2, ApplyMode::Execute)
+            .expect_err("a malformed update must be rejected");
+        assert!(
+            err.to_string().contains(
+                "check failed on ApprovalProgram: pc=  1 branch target 13 outside of program"
+            ),
+            "{err}"
+        );
+
+        // The same update with a program go's check accepts goes through.
+        let update = app_call(creator, app_id, ON_COMPLETION_UPDATE, good.clone(), good);
+        let block2 = apps_check_block(2, fee_sink, rewards_pool, vec![update]);
+        apply_block_with_delta_mode(&mut state, &block2, ApplyMode::Execute)
+            .expect("a statically valid update is applied");
     }
 
     // ---- Issue #1309: a non-resizing app update must recheck program sizes

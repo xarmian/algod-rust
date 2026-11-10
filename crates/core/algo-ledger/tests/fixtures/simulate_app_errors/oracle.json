@@ -605,6 +605,175 @@
       "group_msgpack": "gaN0eG6LpGFwYXDEDAogAQExGEAAAiJDIqRhcHN1xAMKgQGjZmVlzQPoomZ2AaNnZW69c2ltdWxhdGUtYXBwLWVycm9ycy1vcmFjbGUtdjGiZ2jEICD4sQKQ9cygbhJxR2mnoLQsHmo8eBzSBNq3StZ8wzBro2dycMQgH+nru+zc5pvtaO+sn1HPzWP4bxe3HKlJd7stiTRqsyOibHbNA+ikbm90ZcQZaW5uZXJfYXBwX2NhbGxfc3VjY2VlZHMtMKNzbmTEIAoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKpHR5cGWkYXBwbIGjdHhui6RhcGFwxBIKsYEGshCB6QeyGIEAsgGzgQGkYXBzdcQDCoEBo2ZlZc0H0KJmdgGjZ2VuvXNpbXVsYXRlLWFwcC1lcnJvcnMtb3JhY2xlLXYxomdoxCAg+LECkPXMoG4ScUdpp6C0LB5qPHgc0gTat0rWfMMwa6NncnDEIB/p67vs3Oab7WjvrJ9Rz81j+G8XtxypSXe7LYk0arMjomx2zQPopG5vdGXEGWlubmVyX2FwcF9jYWxsX3N1Y2NlZWRzLTGjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGw=",
       "failure_message": "",
       "failed_at": []
+    },
+    {
+      "name": "raw_check_txn_no_immediate",
+      "source": "raw approval=0a31 clear=0a8101",
+      "group_msgpack": "gaN0eG6KpGFwYXDEAgoxpGFwc3XEAwqBAaNmZWXNA+iiZnYBo2dlbr1zaW11bGF0ZS1hcHAtZXJyb3JzLW9yYWNsZS12MaJnaMQgIPixApD1zKBuEnFHaaegtCweajx4HNIE2rdK1nzDMGuibHbNA+ikbm90ZcQacmF3X2NoZWNrX3R4bl9ub19pbW1lZGlhdGWjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGw=",
+      "failure_message": "transaction WKWDFUO6MT2GPLUFQQKFGKUKWRPBLC6S6UZLMKBJ2TVNJX4VYULA: check failed on ApprovalProgram: pc=  1 program ends without immediate value(s)",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "raw_check_clear_txn_no_immediate",
+      "source": "raw approval=0a8101 clear=0a31",
+      "group_msgpack": "gaN0eG6KpGFwYXDEAwqBAaRhcHN1xAIKMaNmZWXNA+iiZnYBo2dlbr1zaW11bGF0ZS1hcHAtZXJyb3JzLW9yYWNsZS12MaJnaMQgIPixApD1zKBuEnFHaaegtCweajx4HNIE2rdK1nzDMGuibHbNA+ikbm90ZcQgcmF3X2NoZWNrX2NsZWFyX3R4bl9ub19pbW1lZGlhdGWjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGw=",
+      "failure_message": "transaction Q6NVTH6S3GW366ALON27BTKUGLG32TKSTX5AQOGLE6PUCFD3SF4A: check failed on ClearStateProgram: pc=  1 program ends without immediate value(s)",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "raw_check_lsig_only_opcode",
+      "source": "raw approval=0a2d clear=0a8101",
+      "group_msgpack": "gaN0eG6KpGFwYXDEAgotpGFwc3XEAwqBAaNmZWXNA+iiZnYBo2dlbr1zaW11bGF0ZS1hcHAtZXJyb3JzLW9yYWNsZS12MaJnaMQgIPixApD1zKBuEnFHaaegtCweajx4HNIE2rdK1nzDMGuibHbNA+ikbm90ZcQacmF3X2NoZWNrX2xzaWdfb25seV9vcGNvZGWjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGw=",
+      "failure_message": "transaction YM4GQBVMPY3X6AAOBN5PONTTPCY7NO4TN2E2AOTDUN2U3FPX26QA: check failed on ApprovalProgram: pc=  1 arg_0 not allowed in current mode",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "raw_check_illegal_opcode",
+      "source": "raw approval=0aff clear=0a8101",
+      "group_msgpack": "gaN0eG6KpGFwYXDEAgr/pGFwc3XEAwqBAaNmZWXNA+iiZnYBo2dlbr1zaW11bGF0ZS1hcHAtZXJyb3JzLW9yYWNsZS12MaJnaMQgIPixApD1zKBuEnFHaaegtCweajx4HNIE2rdK1nzDMGuibHbNA+ikbm90ZcQYcmF3X2NoZWNrX2lsbGVnYWxfb3Bjb2Rlo3NuZMQgCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgqkdHlwZaRhcHBs",
+      "failure_message": "transaction RQHOFRECDIKUDMNQVVUDZ2QMN4NGIRRH23CD32MMPDDVNV4DIFDQ: check failed on ApprovalProgram: pc=  1 illegal opcode 0xff",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "raw_check_branch_outside",
+      "source": "raw approval=0a8101420005 clear=0a8101",
+      "group_msgpack": "gaN0eG6KpGFwYXDEBgqBAUIABaRhcHN1xAMKgQGjZmVlzQPoomZ2AaNnZW69c2ltdWxhdGUtYXBwLWVycm9ycy1vcmFjbGUtdjGiZ2jEICD4sQKQ9cygbhJxR2mnoLQsHmo8eBzSBNq3StZ8wzBromx2zQPopG5vdGXEGHJhd19jaGVja19icmFuY2hfb3V0c2lkZaNzbmTEIAoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKpHR5cGWkYXBwbA==",
+      "failure_message": "transaction YPDJ5GBEVGBA3EEQSUSJUXOEBSHP37UT6X6SK5LBKYMNHUNWRD2A: check failed on ApprovalProgram: pc=  3 branch target 11 outside of program",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "raw_check_back_branch_unaligned",
+      "source": "raw approval=0a810142fffc clear=0a8101",
+      "group_msgpack": "gaN0eG6KpGFwYXDEBgqBAUL//KRhcHN1xAMKgQGjZmVlzQPoomZ2AaNnZW69c2ltdWxhdGUtYXBwLWVycm9ycy1vcmFjbGUtdjGiZ2jEICD4sQKQ9cygbhJxR2mnoLQsHmo8eBzSBNq3StZ8wzBromx2zQPopG5vdGXEH3Jhd19jaGVja19iYWNrX2JyYW5jaF91bmFsaWduZWSjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGw=",
+      "failure_message": "transaction XKBFP5RA5HKQ4UKBZTWJ2OKOJML262FZ3YAGDUX6DFIQLGVEDKSQ: check failed on ApprovalProgram: pc=  3 back branch target 2 is not an aligned instruction",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "raw_check_forward_branch_unaligned",
+      "source": "raw approval=0a42000181018101 clear=0a8101",
+      "group_msgpack": "gaN0eG6KpGFwYXDECApCAAGBAYEBpGFwc3XEAwqBAaNmZWXNA+iiZnYBo2dlbr1zaW11bGF0ZS1hcHAtZXJyb3JzLW9yYWNsZS12MaJnaMQgIPixApD1zKBuEnFHaaegtCweajx4HNIE2rdK1nzDMGuibHbNA+ikbm90ZcQicmF3X2NoZWNrX2ZvcndhcmRfYnJhbmNoX3VuYWxpZ25lZKNzbmTEIAoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKpHR5cGWkYXBwbA==",
+      "failure_message": "transaction LGLVTBSUGCKU5ATYUGAAKBWOUZS6AAT47ZNSXT55ZELMCXSYDB3A: check failed on ApprovalProgram: pc=  6 branch target 5 is not an aligned instruction",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "raw_check_switch_beyond_program",
+      "source": "raw approval=0a81018d05 clear=0a8101",
+      "group_msgpack": "gaN0eG6KpGFwYXDEBQqBAY0FpGFwc3XEAwqBAaNmZWXNA+iiZnYBo2dlbr1zaW11bGF0ZS1hcHAtZXJyb3JzLW9yYWNsZS12MaJnaMQgIPixApD1zKBuEnFHaaegtCweajx4HNIE2rdK1nzDMGuibHbNA+ikbm90ZcQfcmF3X2NoZWNrX3N3aXRjaF9iZXlvbmRfcHJvZ3JhbaNzbmTEIAoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKpHR5cGWkYXBwbA==",
+      "failure_message": "transaction 6EPIKZNJN4IHAJKODSFVUQ4HGZIXG4ID6NHFJNOYLMVMRQWJHPFQ: check failed on ApprovalProgram: pc=  3 switch opcode claims to extend beyond program",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "raw_check_switch_bare",
+      "source": "raw approval=0a81018d clear=0a8101",
+      "group_msgpack": "gaN0eG6KpGFwYXDEBAqBAY2kYXBzdcQDCoEBo2ZlZc0D6KJmdgGjZ2VuvXNpbXVsYXRlLWFwcC1lcnJvcnMtb3JhY2xlLXYxomdoxCAg+LECkPXMoG4ScUdpp6C0LB5qPHgc0gTat0rWfMMwa6Jsds0D6KRub3RlxBVyYXdfY2hlY2tfc3dpdGNoX2JhcmWjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGw=",
+      "failure_message": "transaction SZ5HMHJZJGGBFG3R4CMQFJG2AZMURGGCNETCGNPV72KGWX3ID3LQ: check failed on ApprovalProgram: pc=  3 bare switch opcode at end of program",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "raw_check_switch_target_outside",
+      "source": "raw approval=0a81018d010009 clear=0a8101",
+      "group_msgpack": "gaN0eG6KpGFwYXDEBwqBAY0BAAmkYXBzdcQDCoEBo2ZlZc0D6KJmdgGjZ2VuvXNpbXVsYXRlLWFwcC1lcnJvcnMtb3JhY2xlLXYxomdoxCAg+LECkPXMoG4ScUdpp6C0LB5qPHgc0gTat0rWfMMwa6Jsds0D6KRub3RlxB9yYXdfY2hlY2tfc3dpdGNoX3RhcmdldF9vdXRzaWRlo3NuZMQgCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgqkdHlwZaRhcHBs",
+      "failure_message": "transaction EALZ374YIN2HBDTU4PKP422RRWCFVKPKIDEZK7XXJHPW4YWADTQA: check failed on ApprovalProgram: pc=  3 branch target 16 outside of program",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "raw_check_match_beyond_program",
+      "source": "raw approval=0a81018e0300 clear=0a8101",
+      "group_msgpack": "gaN0eG6KpGFwYXDEBgqBAY4DAKRhcHN1xAMKgQGjZmVlzQPoomZ2AaNnZW69c2ltdWxhdGUtYXBwLWVycm9ycy1vcmFjbGUtdjGiZ2jEICD4sQKQ9cygbhJxR2mnoLQsHmo8eBzSBNq3StZ8wzBromx2zQPopG5vdGXEHnJhd19jaGVja19tYXRjaF9iZXlvbmRfcHJvZ3JhbaNzbmTEIAoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKpHR5cGWkYXBwbA==",
+      "failure_message": "transaction R34JZSWKWBBQNYUXA3FYW6ABCOCD6BRYGQ5MOGCSB523UEQTV6BA: check failed on ApprovalProgram: pc=  3 match opcode claims to extend beyond program",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "raw_check_switch_back_unaligned",
+      "source": "raw approval=0a81018d01fffb clear=0a8101",
+      "group_msgpack": "gaN0eG6KpGFwYXDEBwqBAY0B//ukYXBzdcQDCoEBo2ZlZc0D6KJmdgGjZ2VuvXNpbXVsYXRlLWFwcC1lcnJvcnMtb3JhY2xlLXYxomdoxCAg+LECkPXMoG4ScUdpp6C0LB5qPHgc0gTat0rWfMMwa6Jsds0D6KRub3RlxB9yYXdfY2hlY2tfc3dpdGNoX2JhY2tfdW5hbGlnbmVko3NuZMQgCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgqkdHlwZaRhcHBs",
+      "failure_message": "transaction XTNKSK2N3C4YERPFZKJCRAICTPTPHL2DTE6GRJC4EBCJ4AOUM6YA: check failed on ApprovalProgram: pc=  3 back branch target 2 is not an aligned instruction",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "raw_check_switch_ok",
+      "source": "raw approval=0a81018d010000 clear=0a8101",
+      "group_msgpack": "gaN0eG6KpGFwYXDEBwqBAY0BAACkYXBzdcQDCoEBo2ZlZc0D6KJmdgGjZ2VuvXNpbXVsYXRlLWFwcC1lcnJvcnMtb3JhY2xlLXYxomdoxCAg+LECkPXMoG4ScUdpp6C0LB5qPHgc0gTat0rWfMMwa6Jsds0D6KRub3RlxBNyYXdfY2hlY2tfc3dpdGNoX29ro3NuZMQgCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgqkdHlwZaRhcHBs",
+      "failure_message": "transaction MGF5YI2SPZKJQATWMRHUASZP5F6OHGQIX6J43B3QSFTEZ4AGXHJQ: logic eval error: stack len is 0 instead of 1. Details: app=1001, pc=7, opcodes=",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "raw_check_branch_varint_overflow",
+      "source": "raw approval=0d42ffffffffffffffffffff01 clear=0d8101",
+      "group_msgpack": "gaN0eG6KpGFwYXDEDQ1C/////////////wGkYXBzdcQDDYEBo2ZlZc0D6KJmdgGjZ2VuvXNpbXVsYXRlLWFwcC1lcnJvcnMtb3JhY2xlLXYxomdoxCAg+LECkPXMoG4ScUdpp6C0LB5qPHgc0gTat0rWfMMwa6Jsds0D6KRub3RlxCByYXdfY2hlY2tfYnJhbmNoX3ZhcmludF9vdmVyZmxvd6NzbmTEIAoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKpHR5cGWkYXBwbA==",
+      "failure_message": "transaction S6I3BHT2ZBVGIODYKTJCOZZNAKT2DHIBVBHXV6T6D4COYYAXW2EA: check failed on ApprovalProgram: pc=  1 branch offset varint overflows int64",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "raw_check_branch_varint_no_target",
+      "source": "raw approval=0d42 clear=0d8101",
+      "group_msgpack": "gaN0eG6KpGFwYXDEAg1CpGFwc3XEAw2BAaNmZWXNA+iiZnYBo2dlbr1zaW11bGF0ZS1hcHAtZXJyb3JzLW9yYWNsZS12MaJnaMQgIPixApD1zKBuEnFHaaegtCweajx4HNIE2rdK1nzDMGuibHbNA+ikbm90ZcQhcmF3X2NoZWNrX2JyYW5jaF92YXJpbnRfbm9fdGFyZ2V0o3NuZMQgCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgqkdHlwZaRhcHBs",
+      "failure_message": "transaction NK2EQ7HVODVDXNTL4OOGOIS3H5TMMMKIMHZMKV33ND6FMOTH6H7Q: check failed on ApprovalProgram: pc=  1 program ends without branch target",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "raw_check_branch_varint_outside",
+      "source": "raw approval=0d4214 clear=0d8101",
+      "group_msgpack": "gaN0eG6KpGFwYXDEAw1CFKRhcHN1xAMNgQGjZmVlzQPoomZ2AaNnZW69c2ltdWxhdGUtYXBwLWVycm9ycy1vcmFjbGUtdjGiZ2jEICD4sQKQ9cygbhJxR2mnoLQsHmo8eBzSBNq3StZ8wzBromx2zQPopG5vdGXEH3Jhd19jaGVja19icmFuY2hfdmFyaW50X291dHNpZGWjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGw=",
+      "failure_message": "transaction 6RDYRT4EP7ZYTJWMCDXKJDUFKQ66XPITYTNUFSYUSLM2JT3U4XBQ: check failed on ApprovalProgram: pc=  1 branch target 13 outside of program",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "raw_check_negative_branch_v3",
+      "source": "raw approval=0342fffd clear=038101",
+      "group_msgpack": "gaN0eG6KpGFwYXDEBANC//2kYXBzdcQDA4EBo2ZlZc0D6KJmdgGjZ2VuvXNpbXVsYXRlLWFwcC1lcnJvcnMtb3JhY2xlLXYxomdoxCAg+LECkPXMoG4ScUdpp6C0LB5qPHgc0gTat0rWfMMwa6Jsds0D6KRub3RlxBxyYXdfY2hlY2tfbmVnYXRpdmVfYnJhbmNoX3Yzo3NuZMQgCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgqkdHlwZaRhcHBs",
+      "failure_message": "transaction 5LW7PTHXS5GZA4LTVD77RJWYUZPXRAUEDH7G4KQS47HXBTBTFRMA: check failed on ApprovalProgram: pc=  1 negative branch offset -3",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "raw_check_pushbytes_too_long",
+      "source": "raw approval=0a800501 clear=0a8101",
+      "group_msgpack": "gaN0eG6KpGFwYXDEBAqABQGkYXBzdcQDCoEBo2ZlZc0D6KJmdgGjZ2VuvXNpbXVsYXRlLWFwcC1lcnJvcnMtb3JhY2xlLXYxomdoxCAg+LECkPXMoG4ScUdpp6C0LB5qPHgc0gTat0rWfMMwa6Jsds0D6KRub3RlxBxyYXdfY2hlY2tfcHVzaGJ5dGVzX3Rvb19sb25no3NuZMQgCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgqkdHlwZaRhcHBs",
+      "failure_message": "transaction TADP5PZQEMIJ2EREJRKGFRWMPKC3L23XGUX66JQILMDNZG6EJXWQ: check failed on ApprovalProgram: pc=  1 pushbytes too long at program[3]",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "raw_check_ok_branch_to_end",
+      "source": "raw approval=0a8101420000 clear=0a8101",
+      "group_msgpack": "gaN0eG6KpGFwYXDEBgqBAUIAAKRhcHN1xAMKgQGjZmVlzQPoomZ2AaNnZW69c2ltdWxhdGUtYXBwLWVycm9ycy1vcmFjbGUtdjGiZ2jEICD4sQKQ9cygbhJxR2mnoLQsHmo8eBzSBNq3StZ8wzBromx2zQPopG5vdGXEGnJhd19jaGVja19va19icmFuY2hfdG9fZW5ko3NuZMQgCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgqkdHlwZaRhcHBs",
+      "failure_message": "",
+      "failed_at": []
     }
   ]
 }

@@ -2090,6 +2090,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "mkdir: %v\n", err)
 		os.Exit(1)
 	}
+	if err := writeCheckCorpus(filepath.Join(filepath.Dir(*outPath), "check_corpus.jsonl")); err != nil {
+		fmt.Fprintf(os.Stderr, "check corpus: %v\n", err)
+		os.Exit(1)
+	}
 	f, err := os.Create(*outPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "create %s: %v\n", *outPath, err)
