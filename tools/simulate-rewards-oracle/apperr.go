@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/algorand/go-algorand/agreement"
 	"github.com/algorand/go-algorand/config"
@@ -133,6 +134,9 @@ ident: retsub`},
 	{"gload_self", `gload 0 0; pop; int 1`},
 	{"gloads_self", `int 0; gloads 0; pop; int 1`},
 	{"gaid_self", `gaid 0; pop; int 1`},
+	{"gaids_self", `int 0; gaids; pop; int 1`},
+	{"gaids_out_of_group", `int 5; gaids; pop; int 1`},
+	{"gaid_out_of_group", `gaid 5; pop; int 1`},
 	{"log_too_many", `byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; byte "x"; log; int 1`},
 	{"log_too_large", `int 1025; bzero; log; int 1`},
 	{"block_unavailable_round", `int 9999; block BlkSeed; pop; int 1`},
@@ -140,6 +144,47 @@ ident: retsub`},
 	{"arg_gate_box_create_wrong_type", `int 5; callsub ident; int 10; box_create; pop; int 1; return
 ident: retsub`},
 }
+
+// appErrGroups: atomic groups of application creation calls (app ids 1001,
+// 1002, ...). Each member has its own approval program and a fee multiple of the
+// minimum fee (a caller pays its inner transactions' fee from the pool).
+var appErrGroups = []struct {
+	name   string
+	bodies []string
+	fees   []uint64
+}{
+	{"gaid_ahead_of_current", []string{`gaid 1; pop; int 1`, `int 1`}, []uint64{1, 1}},
+	{"inner_app_call_errors", []string{whenCalled(`err`), innerCall1001}, []uint64{1, 2}},
+	{"inner_app_call_assert_fails", []string{whenCalled(`int 0; assert; int 1`), innerCall1001}, []uint64{1, 2}},
+	{"inner_app_call_rejects", []string{whenCalled(`int 0`), innerCall1001}, []uint64{1, 2}},
+	{"inner_app_call_global_put_too_long", []string{whenCalled(`int 65; bzero; int 1; app_global_put; int 1`), innerCall1001}, []uint64{1, 2}},
+	{"inner_app_call_div_by_zero", []string{whenCalled(`int 1; int 0; /`), innerCall1001}, []uint64{1, 2}},
+	{"inner_app_call_succeeds", []string{whenCalled(`int 1`), innerCall1001}, []uint64{1, 2}},
+}
+
+// whenCalled makes a program that approves its creation and runs `body` on every
+// later call, so an inner call to it reaches `body`.
+func whenCalled(body string) string {
+	head := `txn ApplicationID
+bnz called
+int 1
+return
+called:
+`
+	return head + strings.ReplaceAll(body, "; ", `
+`)
+}
+
+// innerCall1001 calls the application the previous group member created.
+const innerCall1001 = `itxn_begin
+int appl
+itxn_field TypeEnum
+int 1001
+itxn_field ApplicationID
+int 0
+itxn_field Fee
+itxn_submit
+int 1`
 
 func appErrOracle() {
 	proto := protocol.ConsensusCurrentVersion
@@ -241,6 +286,65 @@ func appErrOracle() {
 			FailedAt:       []uint64{},
 		}
 		for _, pos := range g.FailedAt {
+			out.FailedAt = append(out.FailedAt, uint64(pos))
+		}
+		f.Scenarios = append(f.Scenarios, out)
+	}
+
+	for _, g := range appErrGroups {
+		var txns []transactions.Transaction
+		var srcs []string
+		var hashes []crypto.Digest
+		for i, body := range g.bodies {
+			src := "#pragma version 10\n" + body
+			approval, err := logic.AssembleString(src)
+			if err != nil {
+				panic(fmt.Sprintf("scenario %s member %d does not assemble: %v", g.name, i, err))
+			}
+			srcs = append(srcs, src)
+			t := transactions.Transaction{
+				Type: protocol.ApplicationCallTx,
+				Header: transactions.Header{
+					Sender:      acctA,
+					Fee:         basics.MicroAlgos{Raw: params.MinTxnFee * g.fees[i]},
+					FirstValid:  1,
+					LastValid:   1000,
+					Note:        []byte(fmt.Sprintf("%s-%d", g.name, i)),
+					GenesisID:   appErrGenesisID,
+					GenesisHash: genesisHash,
+				},
+				ApplicationCallTxnFields: transactions.ApplicationCallTxnFields{
+					OnCompletion:      transactions.NoOpOC,
+					ApprovalProgram:   approval.Program,
+					ClearStateProgram: clear.Program,
+				},
+			}
+			txns = append(txns, t)
+			hashes = append(hashes, crypto.Digest(t.ID()))
+		}
+		gid := crypto.HashObj(transactions.TxGroup{TxGroupHashes: hashes})
+		var group []transactions.SignedTxn
+		var enc []byte
+		for i := range txns {
+			txns[i].Group = gid
+			stxn := transactions.SignedTxn{Txn: txns[i]}
+			group = append(group, stxn)
+			enc = append(enc, protocol.Encode(&stxn)...)
+		}
+		res, err := sim.Simulate(simulation.Request{
+			TxnGroups:            [][]transactions.SignedTxn{group},
+			AllowEmptySignatures: true,
+		})
+		must(err)
+		tg := res.TxnGroups[0]
+		out := appErrScenario{
+			Name:           g.name,
+			Source:         strings.Join(srcs, "\n---\n"),
+			GroupMsgpack:   b64(enc),
+			FailureMessage: tg.FailureMessage,
+			FailedAt:       []uint64{},
+		}
+		for _, pos := range tg.FailedAt {
 			out.FailedAt = append(out.FailedAt, uint64(pos))
 		}
 		f.Scenarios = append(f.Scenarios, out)

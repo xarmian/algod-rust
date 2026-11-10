@@ -469,6 +469,33 @@
       ]
     },
     {
+      "name": "gaids_self",
+      "source": "#pragma version 10\nint 0; gaids; pop; int 1",
+      "group_msgpack": "gaN0eG6KpGFwYXDEBwqBAD1IgQGkYXBzdcQDCoEBo2ZlZc0D6KJmdgGjZ2VuvXNpbXVsYXRlLWFwcC1lcnJvcnMtb3JhY2xlLXYxomdoxCAg+LECkPXMoG4ScUdpp6C0LB5qPHgc0gTat0rWfMMwa6Jsds0D6KRub3RlxApnYWlkc19zZWxmo3NuZMQgCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgqkdHlwZaRhcHBs",
+      "failure_message": "transaction Z6NQDCNU7HEWF24YSXUHTHHMS5FBOFCKTQBBLH2VWVABBJOKEJ3A: logic eval error: gaids is only for accessing creatable IDs of previous txns, use `global CurrentApplicationID` instead to access the current app's creatable ID. Details: app=1001, pc=3, opcodes=pushint 0; gaids",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "gaids_out_of_group",
+      "source": "#pragma version 10\nint 5; gaids; pop; int 1",
+      "group_msgpack": "gaN0eG6KpGFwYXDEBwqBBT1IgQGkYXBzdcQDCoEBo2ZlZc0D6KJmdgGjZ2VuvXNpbXVsYXRlLWFwcC1lcnJvcnMtb3JhY2xlLXYxomdoxCAg+LECkPXMoG4ScUdpp6C0LB5qPHgc0gTat0rWfMMwa6Jsds0D6KRub3RlxBJnYWlkc19vdXRfb2ZfZ3JvdXCjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGw=",
+      "failure_message": "transaction IPTUGML5N3MVQC4O7TTSVAC3RSL5QAUSMBRRCHNP6XOB5R3QKB7A: logic eval error: gaids lookup TxnGroup[5] but it only has 1. Details: app=1001, pc=3, opcodes=pushint 5; gaids",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "gaid_out_of_group",
+      "source": "#pragma version 10\ngaid 5; pop; int 1",
+      "group_msgpack": "gaN0eG6KpGFwYXDEBgo8BUiBAaRhcHN1xAMKgQGjZmVlzQPoomZ2AaNnZW69c2ltdWxhdGUtYXBwLWVycm9ycy1vcmFjbGUtdjGiZ2jEICD4sQKQ9cygbhJxR2mnoLQsHmo8eBzSBNq3StZ8wzBromx2zQPopG5vdGXEEWdhaWRfb3V0X29mX2dyb3Vwo3NuZMQgCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgqkdHlwZaRhcHBs",
+      "failure_message": "transaction GTSEA2TYMS7NZCHNWLGK2MINWJCZD4MB32VDKZVUZXTGOEALA2OA: logic eval error: gaid lookup TxnGroup[5] but it only has 1. Details: app=1001, pc=1, opcodes=gaid 5",
+      "failed_at": [
+        0
+      ]
+    },
+    {
       "name": "log_too_many",
       "source": "#pragma version 10\nbyte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; byte \"x\"; log; int 1",
       "group_msgpack": "gaN0eG6KpGFwYXDETQomAQF4KLAosCiwKLAosCiwKLAosCiwKLAosCiwKLAosCiwKLAosCiwKLAosCiwKLAosCiwKLAosCiwKLAosCiwKLAosCiwKLAosIEBpGFwc3XEAwqBAaNmZWXNA+iiZnYBo2dlbr1zaW11bGF0ZS1hcHAtZXJyb3JzLW9yYWNsZS12MaJnaMQgIPixApD1zKBuEnFHaaegtCweajx4HNIE2rdK1nzDMGuibHbNA+ikbm90ZcQMbG9nX3Rvb19tYW55o3NuZMQgCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgqkdHlwZaRhcHBs",
@@ -512,6 +539,72 @@
       "failed_at": [
         0
       ]
+    },
+    {
+      "name": "gaid_ahead_of_current",
+      "source": "#pragma version 10\ngaid 1; pop; int 1\n---\n#pragma version 10\nint 1",
+      "group_msgpack": "gaN0eG6LpGFwYXDEBgo8AUiBAaRhcHN1xAMKgQGjZmVlzQPoomZ2AaNnZW69c2ltdWxhdGUtYXBwLWVycm9ycy1vcmFjbGUtdjGiZ2jEICD4sQKQ9cygbhJxR2mnoLQsHmo8eBzSBNq3StZ8wzBro2dycMQgAp5/w2zCxO+N6xuVwBZVRDS6L6ZaM+ZMxlofq84qbdGibHbNA+ikbm90ZcQXZ2FpZF9haGVhZF9vZl9jdXJyZW50LTCjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGyBo3R4boukYXBhcMQDCoEBpGFwc3XEAwqBAaNmZWXNA+iiZnYBo2dlbr1zaW11bGF0ZS1hcHAtZXJyb3JzLW9yYWNsZS12MaJnaMQgIPixApD1zKBuEnFHaaegtCweajx4HNIE2rdK1nzDMGujZ3JwxCACnn/DbMLE743rG5XAFlVENLovploz5kzGWh+rzipt0aJsds0D6KRub3RlxBdnYWlkX2FoZWFkX29mX2N1cnJlbnQtMaNzbmTEIAoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKpHR5cGWkYXBwbA==",
+      "failure_message": "transaction NGSLCEMJUBSMGXF4DW7AKWV4WOLXPKNDFPXZJPPR3NDNBMH6JHCA: logic eval error: gaid can't get creatable ID of txn ahead of the current one (index 1) in the transaction group. Details: app=1001, pc=1, opcodes=gaid 1",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "inner_app_call_errors",
+      "source": "#pragma version 10\ntxn ApplicationID\nbnz called\nint 1\nreturn\ncalled:\nerr\n---\n#pragma version 10\nitxn_begin\nint appl\nitxn_field TypeEnum\nint 1001\nitxn_field ApplicationID\nint 0\nitxn_field Fee\nitxn_submit\nint 1",
+      "group_msgpack": "gaN0eG6LpGFwYXDECgoxGEAAA4EBQwCkYXBzdcQDCoEBo2ZlZc0D6KJmdgGjZ2VuvXNpbXVsYXRlLWFwcC1lcnJvcnMtb3JhY2xlLXYxomdoxCAg+LECkPXMoG4ScUdpp6C0LB5qPHgc0gTat0rWfMMwa6NncnDEIGMFYtMUvrUVnx6KjMj+HKu9WBz65dC7k/sDDl21JHlVomx2zQPopG5vdGXEF2lubmVyX2FwcF9jYWxsX2Vycm9ycy0wo3NuZMQgCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgqkdHlwZaRhcHBsgaN0eG6LpGFwYXDEEgqxgQayEIHpB7IYgQCyAbOBAaRhcHN1xAMKgQGjZmVlzQfQomZ2AaNnZW69c2ltdWxhdGUtYXBwLWVycm9ycy1vcmFjbGUtdjGiZ2jEICD4sQKQ9cygbhJxR2mnoLQsHmo8eBzSBNq3StZ8wzBro2dycMQgYwVi0xS+tRWfHoqMyP4cq71YHPrl0LuT+wMOXbUkeVWibHbNA+ikbm90ZcQXaW5uZXJfYXBwX2NhbGxfZXJyb3JzLTGjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGw=",
+      "failure_message": "transaction OQNVDFTAV3DVBSHQFZTMCEBXBM3PEP5MVRB227XDYURPV6L5ALSA: logic eval error: inner tx 0 failed: logic eval error: err opcode executed. Details: app=1001, pc=9, opcodes=pushint 1; return; label1:; err. Details: app=1002, pc=15, opcodes=pushint 0; itxn_field Fee; itxn_submit",
+      "failed_at": [
+        1,
+        0
+      ]
+    },
+    {
+      "name": "inner_app_call_assert_fails",
+      "source": "#pragma version 10\ntxn ApplicationID\nbnz called\nint 1\nreturn\ncalled:\nint 0\nassert\nint 1\n---\n#pragma version 10\nitxn_begin\nint appl\nitxn_field TypeEnum\nint 1001\nitxn_field ApplicationID\nint 0\nitxn_field Fee\nitxn_submit\nint 1",
+      "group_msgpack": "gaN0eG6LpGFwYXDEDwogAQExGEAAAiJDgQBEIqRhcHN1xAMKgQGjZmVlzQPoomZ2AaNnZW69c2ltdWxhdGUtYXBwLWVycm9ycy1vcmFjbGUtdjGiZ2jEICD4sQKQ9cygbhJxR2mnoLQsHmo8eBzSBNq3StZ8wzBro2dycMQgAHU0DFygmnfTg/fjnJxMgf0ZrLyhCyR9augnbwn1rTuibHbNA+ikbm90ZcQdaW5uZXJfYXBwX2NhbGxfYXNzZXJ0X2ZhaWxzLTCjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGyBo3R4boukYXBhcMQSCrGBBrIQgekHshiBALIBs4EBpGFwc3XEAwqBAaNmZWXNB9CiZnYBo2dlbr1zaW11bGF0ZS1hcHAtZXJyb3JzLW9yYWNsZS12MaJnaMQgIPixApD1zKBuEnFHaaegtCweajx4HNIE2rdK1nzDMGujZ3JwxCAAdTQMXKCad9OD9+OcnEyB/RmsvKELJH1q6CdvCfWtO6Jsds0D6KRub3RlxB1pbm5lcl9hcHBfY2FsbF9hc3NlcnRfZmFpbHMtMaNzbmTEIAoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKpHR5cGWkYXBwbA==",
+      "failure_message": "transaction NJ7T4IF55NC3Y7DMI2OV2B37KJEUVTDZCFEZZHQZIDWGNJWRSAFQ: logic eval error: inner tx 0 failed: logic eval error: assert failed pc=13. Details: app=1001, pc=13, opcodes=return; label1:; pushint 0; assert. Details: app=1002, pc=15, opcodes=pushint 0; itxn_field Fee; itxn_submit",
+      "failed_at": [
+        1,
+        0
+      ]
+    },
+    {
+      "name": "inner_app_call_rejects",
+      "source": "#pragma version 10\ntxn ApplicationID\nbnz called\nint 1\nreturn\ncalled:\nint 0\n---\n#pragma version 10\nitxn_begin\nint appl\nitxn_field TypeEnum\nint 1001\nitxn_field ApplicationID\nint 0\nitxn_field Fee\nitxn_submit\nint 1",
+      "group_msgpack": "gaN0eG6LpGFwYXDECwoxGEAAA4EBQ4EApGFwc3XEAwqBAaNmZWXNA+iiZnYBo2dlbr1zaW11bGF0ZS1hcHAtZXJyb3JzLW9yYWNsZS12MaJnaMQgIPixApD1zKBuEnFHaaegtCweajx4HNIE2rdK1nzDMGujZ3JwxCBegxKNl4dVBPJaCBcrirQDZfJ9sm/jW3TqN6b897anAqJsds0D6KRub3RlxBhpbm5lcl9hcHBfY2FsbF9yZWplY3RzLTCjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGyBo3R4boukYXBhcMQSCrGBBrIQgekHshiBALIBs4EBpGFwc3XEAwqBAaNmZWXNB9CiZnYBo2dlbr1zaW11bGF0ZS1hcHAtZXJyb3JzLW9yYWNsZS12MaJnaMQgIPixApD1zKBuEnFHaaegtCweajx4HNIE2rdK1nzDMGujZ3JwxCBegxKNl4dVBPJaCBcrirQDZfJ9sm/jW3TqN6b897anAqJsds0D6KRub3RlxBhpbm5lcl9hcHBfY2FsbF9yZWplY3RzLTGjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGw=",
+      "failure_message": "transaction NDZFS2BYOA4ZTJYVLL532SCNCSF3LBGIP5TJJPY4DSXER3OLST4Q: logic eval error: inner tx 0 failed: transaction rejected by ApprovalProgram. Details: app=1002, pc=15, opcodes=pushint 0; itxn_field Fee; itxn_submit",
+      "failed_at": [
+        1,
+        0
+      ]
+    },
+    {
+      "name": "inner_app_call_global_put_too_long",
+      "source": "#pragma version 10\ntxn ApplicationID\nbnz called\nint 1\nreturn\ncalled:\nint 65\nbzero\nint 1\napp_global_put\nint 1\n---\n#pragma version 10\nitxn_begin\nint appl\nitxn_field TypeEnum\nint 1001\nitxn_field ApplicationID\nint 0\nitxn_field Fee\nitxn_submit\nint 1",
+      "group_msgpack": "gaN0eG6LpGFwYXDEEQogAQExGEAAAiJDgUGvImcipGFwc3XEAwqBAaNmZWXNA+iiZnYBo2dlbr1zaW11bGF0ZS1hcHAtZXJyb3JzLW9yYWNsZS12MaJnaMQgIPixApD1zKBuEnFHaaegtCweajx4HNIE2rdK1nzDMGujZ3JwxCDG4bRdteKJske+68lA6m5Q1j36CYFXE7io/3W1efLyyaJsds0D6KRub3RlxCRpbm5lcl9hcHBfY2FsbF9nbG9iYWxfcHV0X3Rvb19sb25nLTCjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGyBo3R4boukYXBhcMQSCrGBBrIQgekHshiBALIBs4EBpGFwc3XEAwqBAaNmZWXNB9CiZnYBo2dlbr1zaW11bGF0ZS1hcHAtZXJyb3JzLW9yYWNsZS12MaJnaMQgIPixApD1zKBuEnFHaaegtCweajx4HNIE2rdK1nzDMGujZ3JwxCDG4bRdteKJske+68lA6m5Q1j36CYFXE7io/3W1efLyyaJsds0D6KRub3RlxCRpbm5lcl9hcHBfY2FsbF9nbG9iYWxfcHV0X3Rvb19sb25nLTGjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGw=",
+      "failure_message": "transaction GMGADWRHJVTEWJYDMULOTJRDXIJ3XH7HBCZENGMHQAOEP2OQC5MA: logic eval error: inner tx 0 failed: logic eval error: key too long: length was 65, maximum is 64. Details: app=1001, pc=15, opcodes=bzero; intc_0 // 1; app_global_put. Details: app=1002, pc=15, opcodes=pushint 0; itxn_field Fee; itxn_submit",
+      "failed_at": [
+        1,
+        0
+      ]
+    },
+    {
+      "name": "inner_app_call_div_by_zero",
+      "source": "#pragma version 10\ntxn ApplicationID\nbnz called\nint 1\nreturn\ncalled:\nint 1\nint 0\n/\n---\n#pragma version 10\nitxn_begin\nint appl\nitxn_field TypeEnum\nint 1001\nitxn_field ApplicationID\nint 0\nitxn_field Fee\nitxn_submit\nint 1",
+      "group_msgpack": "gaN0eG6LpGFwYXDEDwogAQExGEAAAiJDIoEACqRhcHN1xAMKgQGjZmVlzQPoomZ2AaNnZW69c2ltdWxhdGUtYXBwLWVycm9ycy1vcmFjbGUtdjGiZ2jEICD4sQKQ9cygbhJxR2mnoLQsHmo8eBzSBNq3StZ8wzBro2dycMQgu/jv2fnT4R+uWTnR8TAnuhdpwgSvQKq/aqBv00VcV62ibHbNA+ikbm90ZcQcaW5uZXJfYXBwX2NhbGxfZGl2X2J5X3plcm8tMKNzbmTEIAoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKpHR5cGWkYXBwbIGjdHhui6RhcGFwxBIKsYEGshCB6QeyGIEAsgGzgQGkYXBzdcQDCoEBo2ZlZc0H0KJmdgGjZ2VuvXNpbXVsYXRlLWFwcC1lcnJvcnMtb3JhY2xlLXYxomdoxCAg+LECkPXMoG4ScUdpp6C0LB5qPHgc0gTat0rWfMMwa6NncnDEILv479n50+Efrlk50fEwJ7oXacIEr0Cqv2qgb9NFXFetomx2zQPopG5vdGXEHGlubmVyX2FwcF9jYWxsX2Rpdl9ieV96ZXJvLTGjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGw=",
+      "failure_message": "transaction BLKGHZLJILXMZEI3DMXSHXPNULNMMJ2WTOLCSRXBQ3M7GFKT7VVA: logic eval error: inner tx 0 failed: logic eval error: / 0. Details: app=1001, pc=14, opcodes=intc_0 // 1; pushint 0; /. Details: app=1002, pc=15, opcodes=pushint 0; itxn_field Fee; itxn_submit",
+      "failed_at": [
+        1,
+        0
+      ]
+    },
+    {
+      "name": "inner_app_call_succeeds",
+      "source": "#pragma version 10\ntxn ApplicationID\nbnz called\nint 1\nreturn\ncalled:\nint 1\n---\n#pragma version 10\nitxn_begin\nint appl\nitxn_field TypeEnum\nint 1001\nitxn_field ApplicationID\nint 0\nitxn_field Fee\nitxn_submit\nint 1",
+      "group_msgpack": "gaN0eG6LpGFwYXDEDAogAQExGEAAAiJDIqRhcHN1xAMKgQGjZmVlzQPoomZ2AaNnZW69c2ltdWxhdGUtYXBwLWVycm9ycy1vcmFjbGUtdjGiZ2jEICD4sQKQ9cygbhJxR2mnoLQsHmo8eBzSBNq3StZ8wzBro2dycMQgH+nru+zc5pvtaO+sn1HPzWP4bxe3HKlJd7stiTRqsyOibHbNA+ikbm90ZcQZaW5uZXJfYXBwX2NhbGxfc3VjY2VlZHMtMKNzbmTEIAoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKpHR5cGWkYXBwbIGjdHhui6RhcGFwxBIKsYEGshCB6QeyGIEAsgGzgQGkYXBzdcQDCoEBo2ZlZc0H0KJmdgGjZ2VuvXNpbXVsYXRlLWFwcC1lcnJvcnMtb3JhY2xlLXYxomdoxCAg+LECkPXMoG4ScUdpp6C0LB5qPHgc0gTat0rWfMMwa6NncnDEIB/p67vs3Oab7WjvrJ9Rz81j+G8XtxypSXe7LYk0arMjomx2zQPopG5vdGXEGWlubmVyX2FwcF9jYWxsX3N1Y2NlZWRzLTGjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGw=",
+      "failure_message": "",
+      "failed_at": []
     }
   ]
 }

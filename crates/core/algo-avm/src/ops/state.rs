@@ -701,7 +701,14 @@ pub fn op_gaids(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let group_index = machine.pop_uint()? as usize;
-    let id = ctx.created_id(group_index)?;
+    // The context words its errors for `gaid`; go's `opGaidImpl` prints the
+    // opcode's own name (`gaids ...`).
+    let id = ctx.created_id(group_index).map_err(|e| match e {
+        AlgoError::Avm { message } => AlgoError::Avm {
+            message: message.replace("gaid", "gaids"),
+        },
+        other => other,
+    })?;
     machine.push(AvmValue::Uint64(id))
 }
 

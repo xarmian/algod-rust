@@ -224,10 +224,12 @@ func mkVectorTail(name, desc, source string, version uint64, args [][]byte) Vect
 		prefix, last = source[:i], strings.TrimSpace(source[i+1:])
 	}
 	var tail []byte
-	for _, unit := range []string{"int 0; ", "byte 0x00; ", "byte 0x00; int 0; int 0; ", "byte 0x00; int 0; byte 0x00; ", "int 0; byte 0x00; ", "byte 0x00; int 0; ", "int 0; byte 0x00; int 0; ", "byte 0x00; int 0; int 0; byte 0x00; ", "int 0; int 0; byte 0x00; ", "int 0; int 0; byte 0x00; int 0; ", "int 0; byte 0x00; byte 0x00; "} {
+	var lastErr error
+	for _, unit := range []string{"int 0; ", "byte 0x00; ", "byte 0x00; int 0; int 0; ", "byte 0x00; int 0; byte 0x00; ", "int 0; byte 0x00; ", "byte 0x00; int 0; ", "int 0; byte 0x00; int 0; ", "byte 0x00; int 0; int 0; byte 0x00; ", "int 0; int 0; byte 0x00; ", "int 0; int 0; byte 0x00; int 0; ", "int 0; byte 0x00; byte 0x00; ", "byte 0x00; byte 0x00; byte 0x00; byte 0x00; byte 0x00; ", "int 1; bzero; int 0; int 1; bzero; int 1; bzero; ", "int 1; bzero; ", "int 1; bzero; int 1; bzero; int 1; bzero; int 1; bzero; int 1; bzero; "} {
 		pad := strings.Repeat(unit, 4)
 		ops, err := logic.AssembleStringWithVersion(pad+last, version)
 		if err != nil {
+			lastErr = err
 			continue
 		}
 		padOnly := assemble(strings.TrimSuffix(pad, "; "), version)
@@ -235,7 +237,7 @@ func mkVectorTail(name, desc, source string, version uint64, args [][]byte) Vect
 		break
 	}
 	if tail == nil {
-		panic(fmt.Sprintf("mkVectorTail: cannot assemble %q behind int or byte padding", last))
+		panic(fmt.Sprintf("mkVectorTail: cannot assemble %q behind int or byte padding: %v", last, lastErr))
 	}
 	head := []byte{byte(version)}
 	if prefix != "" {
@@ -1542,6 +1544,221 @@ func generate() []Vector {
 		"errtext/gtxnsas_args_oob",
 		"go EvalError text and pc for: int 0; int 2; gtxnsas ApplicationArgs",
 		"int 0; int 2; gtxnsas ApplicationArgs", 8,
+		nil,
+	))
+
+	// =======================================================================
+	// Error text parity, slice 3 (issue #2225): the crypto opcodes' argument
+	// and length errors (ec_*, ecdsa_*, vrf_verify, ed25519verify*, falcon_verify).
+	// =======================================================================
+	out = append(out, mkVectorTail(
+		"errtext/ec_add_bn254g1_short",
+		`go EvalError text and pc for: byte 0x01; byte 0x02; ec_add BN254g1`,
+		`byte 0x01; byte 0x02; ec_add BN254g1`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_scalar_mul_bn254g1_short",
+		`go EvalError text and pc for: byte 0x01; byte 0x02; ec_scalar_mul BN254g1`,
+		`byte 0x01; byte 0x02; ec_scalar_mul BN254g1`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_multi_scalar_mul_bn254g1_short",
+		`go EvalError text and pc for: byte 0x01; byte 0x02; ec_multi_scalar_mul BN254g1`,
+		`byte 0x01; byte 0x02; ec_multi_scalar_mul BN254g1`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_subgroup_check_bn254g1_short",
+		`go EvalError text and pc for: byte 0x01; ec_subgroup_check BN254g1`,
+		`byte 0x01; ec_subgroup_check BN254g1`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_map_to_bn254g1_short",
+		`go EvalError text and pc for: byte 0x01; ec_map_to BN254g1`,
+		`byte 0x01; ec_map_to BN254g1`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_add_bn254g2_short",
+		`go EvalError text and pc for: byte 0x01; byte 0x02; ec_add BN254g2`,
+		`byte 0x01; byte 0x02; ec_add BN254g2`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_scalar_mul_bn254g2_short",
+		`go EvalError text and pc for: byte 0x01; byte 0x02; ec_scalar_mul BN254g2`,
+		`byte 0x01; byte 0x02; ec_scalar_mul BN254g2`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_multi_scalar_mul_bn254g2_short",
+		`go EvalError text and pc for: byte 0x01; byte 0x02; ec_multi_scalar_mul BN254g2`,
+		`byte 0x01; byte 0x02; ec_multi_scalar_mul BN254g2`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_subgroup_check_bn254g2_short",
+		`go EvalError text and pc for: byte 0x01; ec_subgroup_check BN254g2`,
+		`byte 0x01; ec_subgroup_check BN254g2`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_map_to_bn254g2_short",
+		`go EvalError text and pc for: byte 0x01; ec_map_to BN254g2`,
+		`byte 0x01; ec_map_to BN254g2`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_add_bls12_381g1_short",
+		`go EvalError text and pc for: byte 0x01; byte 0x02; ec_add BLS12_381g1`,
+		`byte 0x01; byte 0x02; ec_add BLS12_381g1`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_scalar_mul_bls12_381g1_short",
+		`go EvalError text and pc for: byte 0x01; byte 0x02; ec_scalar_mul BLS12_381g1`,
+		`byte 0x01; byte 0x02; ec_scalar_mul BLS12_381g1`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_multi_scalar_mul_bls12_381g1_short",
+		`go EvalError text and pc for: byte 0x01; byte 0x02; ec_multi_scalar_mul BLS12_381g1`,
+		`byte 0x01; byte 0x02; ec_multi_scalar_mul BLS12_381g1`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_subgroup_check_bls12_381g1_short",
+		`go EvalError text and pc for: byte 0x01; ec_subgroup_check BLS12_381g1`,
+		`byte 0x01; ec_subgroup_check BLS12_381g1`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_map_to_bls12_381g1_short",
+		`go EvalError text and pc for: byte 0x01; ec_map_to BLS12_381g1`,
+		`byte 0x01; ec_map_to BLS12_381g1`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_add_bls12_381g2_short",
+		`go EvalError text and pc for: byte 0x01; byte 0x02; ec_add BLS12_381g2`,
+		`byte 0x01; byte 0x02; ec_add BLS12_381g2`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_scalar_mul_bls12_381g2_short",
+		`go EvalError text and pc for: byte 0x01; byte 0x02; ec_scalar_mul BLS12_381g2`,
+		`byte 0x01; byte 0x02; ec_scalar_mul BLS12_381g2`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_multi_scalar_mul_bls12_381g2_short",
+		`go EvalError text and pc for: byte 0x01; byte 0x02; ec_multi_scalar_mul BLS12_381g2`,
+		`byte 0x01; byte 0x02; ec_multi_scalar_mul BLS12_381g2`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_subgroup_check_bls12_381g2_short",
+		`go EvalError text and pc for: byte 0x01; ec_subgroup_check BLS12_381g2`,
+		`byte 0x01; ec_subgroup_check BLS12_381g2`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_map_to_bls12_381g2_short",
+		`go EvalError text and pc for: byte 0x01; ec_map_to BLS12_381g2`,
+		`byte 0x01; ec_map_to BLS12_381g2`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_pairing_check_bn254g1_short",
+		`go EvalError text and pc for: byte 0x01; byte 0x02; ec_pairing_check BN254g1`,
+		`byte 0x01; byte 0x02; ec_pairing_check BN254g1`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_pairing_check_bn254g2_short",
+		`go EvalError text and pc for: byte 0x01; byte 0x02; ec_pairing_check BN254g2`,
+		`byte 0x01; byte 0x02; ec_pairing_check BN254g2`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_pairing_check_bls12_381g1_short",
+		`go EvalError text and pc for: byte 0x01; byte 0x02; ec_pairing_check BLS12_381g1`,
+		`byte 0x01; byte 0x02; ec_pairing_check BLS12_381g1`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ec_pairing_check_bls12_381g2_short",
+		`go EvalError text and pc for: byte 0x01; byte 0x02; ec_pairing_check BLS12_381g2`,
+		`byte 0x01; byte 0x02; ec_pairing_check BLS12_381g2`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ecdsa_verify_secp256r1_short",
+		`go EvalError text and pc for: byte "d"; byte 0x01; byte 0x02; byte 0x03; byte 0x04; ecdsa_verify Secp256r1`,
+		`byte "d"; byte 0x01; byte 0x02; byte 0x03; byte 0x04; ecdsa_verify Secp256r1`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ecdsa_verify_secp256k1_short",
+		`go EvalError text and pc for: byte "d"; byte 0x01; byte 0x02; byte 0x03; byte 0x04; ecdsa_verify Secp256k1`,
+		`byte "d"; byte 0x01; byte 0x02; byte 0x03; byte 0x04; ecdsa_verify Secp256k1`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ecdsa_pk_decompress_k1_short",
+		`go EvalError text and pc for: byte 0x01; ecdsa_pk_decompress Secp256k1`,
+		`byte 0x01; ecdsa_pk_decompress Secp256k1`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ecdsa_pk_decompress_r1_short",
+		`go EvalError text and pc for: byte 0x01; ecdsa_pk_decompress Secp256r1`,
+		`byte 0x01; ecdsa_pk_decompress Secp256r1`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ecdsa_pk_recover_r1_not_supported",
+		`go EvalError text and pc for: byte "d"; int 0; byte 0x01; byte 0x02; ecdsa_pk_recover Secp256r1`,
+		`byte "d"; int 0; byte 0x01; byte 0x02; ecdsa_pk_recover Secp256r1`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/vrf_verify_short",
+		`go EvalError text and pc for: byte 0x01; byte 0x02; byte 0x03; vrf_verify VrfAlgorand`,
+		`byte 0x01; byte 0x02; byte 0x03; vrf_verify VrfAlgorand`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ed25519verify_short_key",
+		`go EvalError text and pc for: byte "m"; int 64; bzero; byte 0x01; ed25519verify`,
+		`byte "m"; int 64; bzero; byte 0x01; ed25519verify`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ed25519verify_bare_short_key",
+		`go EvalError text and pc for: byte "m"; int 64; bzero; byte 0x01; ed25519verify_bare`,
+		`byte "m"; int 64; bzero; byte 0x01; ed25519verify_bare`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/ed25519verify_short_sig_and_key",
+		`go EvalError text and pc for: byte "m"; byte 0x01; byte 0x02; ed25519verify`,
+		`byte "m"; byte 0x01; byte 0x02; ed25519verify`, 10,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/falcon_verify_short",
+		`go EvalError text and pc for: byte 0x01; byte 0x02; byte 0x03; falcon_verify`,
+		`byte 0x01; byte 0x02; byte 0x03; falcon_verify`, 12,
+		nil,
+	))
+	out = append(out, mkVectorTail(
+		"errtext/sha3_256_empty_ok",
+		`go EvalError text and pc for: byte ""; sha3_256; pop; int 1`,
+		`byte ""; sha3_256; pop; int 1`, 10,
 		nil,
 	))
 

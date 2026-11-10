@@ -4856,12 +4856,30 @@ fn execute_inner_appl<L: LedgerStore>(
     // ── Check approval ──
     if on_completion != ON_COMPLETION_CLEAR_STATE && !avm_result.approved {
         // Non-ClearState programs must approve.
-        let err_msg = avm_result
-            .error
-            .unwrap_or_else(|| "program rejected".to_string());
-        return Err(AlgoError::Avm {
-            message: format!("inner appl: {}", err_msg),
-        });
+        // go reports the callee's own `logic.EvalError` (with its `Details:
+        // app=, pc=, opcodes=`) or `transaction rejected by ApprovalProgram`;
+        // the caller's `inner tx <i> failed: ` frame is added by the submit.
+        let message = match (&avm_result.error, &avm_result.error_detail) {
+            (Some(err), Some(detail)) => {
+                let err = err.strip_prefix("AVM: ").unwrap_or(err);
+                match &detail.opcodes {
+                    Some(opcodes) => format!(
+                        "logic eval error: {err}. Details: app={}, pc={}, opcodes={opcodes}",
+                        detail.app_index.unwrap_or(effective_app_id),
+                        detail.pc
+                    ),
+                    None => format!(
+                        "logic eval error: {err}. Details: app={}, pc={}",
+                        detail.app_index.unwrap_or(effective_app_id),
+                        detail.pc
+                    ),
+                }
+            }
+            (Some(err), None) => err.strip_prefix("AVM: ").unwrap_or(err).to_string(),
+            (None, _) => "transaction rejected by ApprovalProgram".to_string(),
+        };
+        // `Eval` prints the text as is (no `AVM: ` category frame), as go does.
+        return Err(AlgoError::Eval { message });
     }
 
     // ── Collect fee_credit and txn_counter from child ──
@@ -6362,8 +6380,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         if stxn.txn.txn_type != "appl" && stxn.txn.txn_type != "acfg" {
             return Err(AlgoError::Avm {
                 message: format!(
-                    "gaid: txn at index {} is not an app call or asset config (type='{}')",
-                    group_index, stxn.txn.txn_type
+                    "can't use gaid on txn that is not an app call nor an asset config txn with index {group_index}"
                 ),
             });
         }
@@ -6376,7 +6393,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             return Ok(stxn.apply_data_application_id);
         }
         Err(AlgoError::Avm {
-            message: format!("gaid: txn at index {} did not create anything", group_index),
+            message: format!("gaid: index {group_index} did not create anything"),
         })
     }
 
@@ -8339,7 +8356,7 @@ mod tests {
         let err = ctx.created_id(0).unwrap_err();
         assert!(
             err.to_string()
-                .contains("is not an app call or asset config"),
+                .contains("not an app call nor an asset config txn"),
             "got: {err}"
         );
     }
