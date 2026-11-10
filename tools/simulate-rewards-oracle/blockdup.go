@@ -38,6 +38,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -781,6 +782,44 @@ func blockDupOracle() {
 	}
 	for _, e := range lsigErrorSources {
 		wfSpecs = append(wfSpecs, lsigRow("verify_logicsig_err_"+e.name, "#pragma version 8\n"+e.src))
+	}
+	// Issue #2225: a malformed LogicSig program never reaches evaluation; go's
+	// static check (`logic.CheckSignature`) rejects it with `pc=%3d <err>`.
+	// The programs are those of the `check/` opcode vectors.
+	for _, m := range []struct{ name, hexProgram string }{
+		{"txn_no_immediate", "08810131"},
+		{"gtxn_one_immediate", "0881013300"},
+		{"gtxn_no_immediate", "08810133"},
+		{"global_no_immediate", "08810132"},
+		{"load_no_immediate", "08810134"},
+		{"store_no_immediate", "08810135"},
+		{"substring_one_immediate", "088001015100"},
+		{"extract_no_immediate", "0880010157"},
+		{"bnz_no_offset", "08810140"},
+		{"bnz_half_offset", "0881014000"},
+		{"bz_no_offset", "08810141"},
+		{"b_no_offset", "08810142"},
+		{"pushint_no_value", "08810181"},
+		{"pushint_truncated_varuint", "08810181ac"},
+		{"pushbytes_no_length", "08810180"},
+		{"pushbytes_short_data", "0881018002"},
+		{"pushbytes_half_data", "088101800301"},
+		{"intcblock_no_count", "08810120"},
+		{"intcblock_short", "088101200201"},
+		{"bytecblock_no_count", "08810126"},
+		{"bytecblock_short", "088101260201"},
+		{"invalid_opcode_ff", "088101ff"},
+		{"opcode_newer_than_program", "088101d2"},
+		{"app_only_opcode_in_logicsig", "08810160"},
+	} {
+		prog, err := hex.DecodeString(m.hexProgram)
+		must(err)
+		t := payTxn("wf-malformed-"+m.name, [32]byte{})
+		t.Sender = basics.Address(logic.HashProgram(prog))
+		wfSpecs = append(wfSpecs, orderSpec{name: "verify_logicsig_malformed_" + m.name, group: one(transactions.SignedTxn{
+			Txn:  t,
+			Lsig: transactions.LogicSig{Logic: prog},
+		})})
 	}
 	wfSpecs = append(wfSpecs,
 		lsigRow("verify_logicsig_rejects", "#pragma version 8\nint 0"),

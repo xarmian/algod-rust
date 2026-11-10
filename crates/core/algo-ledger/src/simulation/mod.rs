@@ -1572,7 +1572,9 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     || message.contains("signedtxn has no sig")
                     || message.contains("signedtxn should have only one type of signature")
                     || message.contains(": rejected by logic")
-                    || message.contains("LogicSig program error:");
+                    || message.contains("LogicSig program error:")
+                    // go's static check (`pc=%3d <err>`, issue #2225).
+                    || message.contains("validation error: pc=");
                 if is_format_failure {
                     return Ok(CheckOutcome::RecoverableFailure {
                         index: i,

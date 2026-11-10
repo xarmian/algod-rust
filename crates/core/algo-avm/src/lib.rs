@@ -27,6 +27,7 @@ pub(crate) mod arg_gate;
 pub(crate) mod arg_gate_table;
 pub mod assembler;
 pub mod bytecode;
+pub mod check;
 pub mod context;
 pub mod disassembler;
 pub mod eval;

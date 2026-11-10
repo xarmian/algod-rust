@@ -144,7 +144,7 @@ fn get_int_constant(machine: &AvmMachine, idx: usize) -> Result<u64, AlgoError> 
         .copied()
         .ok_or_else(|| AlgoError::Avm {
             message: format!(
-                "intc: index {idx} out of range (pool has {} entries)",
+                "intc {idx} beyond {} constants",
                 machine.int_constants.len()
             ),
         })
@@ -157,7 +157,7 @@ fn get_byte_constant(machine: &AvmMachine, idx: usize) -> Result<Vec<u8>, AlgoEr
         .cloned()
         .ok_or_else(|| AlgoError::Avm {
             message: format!(
-                "bytec: index {idx} out of range (pool has {} entries)",
+                "bytec {idx} beyond {} constants",
                 machine.byte_constants.len()
             ),
         })

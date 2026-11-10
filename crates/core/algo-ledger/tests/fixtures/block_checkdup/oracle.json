@@ -1864,6 +1864,222 @@
       "verify_framed": true
     },
     {
+      "name": "verify_logicsig_malformed_txn_no_immediate",
+      "group": [
+        "gqRsc2lngaFsxAQIgQExo3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxB13Zi1tYWxmb3JtZWQtdHhuX25vX2ltbWVkaWF0ZaNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgQC3vLD/fcej7A/7p83sHrsEh3W4/3O68IV/MhZET6f2kdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 program ends without immediate value(s)",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_gtxn_one_immediate",
+      "group": [
+        "gqRsc2lngaFsxAUIgQEzAKN0eG6Ko2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQfd2YtbWFsZm9ybWVkLWd0eG5fb25lX2ltbWVkaWF0ZaNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQguAC6Z90TOTQTA2vcx1exh796ehK8i8y/yczlx3aLrrOkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 program ends without immediate value(s)",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_gtxn_no_immediate",
+      "group": [
+        "gqRsc2lngaFsxAQIgQEzo3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxB53Zi1tYWxmb3JtZWQtZ3R4bl9ub19pbW1lZGlhdGWjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIGo5N4W+lwV0Ae0+PyytSXb/FU4JYIBJkiqsJeb16tIzpHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 program ends without immediate value(s)",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_global_no_immediate",
+      "group": [
+        "gqRsc2lngaFsxAQIgQEyo3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxCB3Zi1tYWxmb3JtZWQtZ2xvYmFsX25vX2ltbWVkaWF0ZaNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgRM5H3NBGJvZVDz70KzZLNSjpzYHjXyZMr7apOwd6bMCkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 program ends without immediate value(s)",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_load_no_immediate",
+      "group": [
+        "gqRsc2lngaFsxAQIgQE0o3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxB53Zi1tYWxmb3JtZWQtbG9hZF9ub19pbW1lZGlhdGWjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIPKpiSW/PRav8bI94eoEAHdSONbOCO+bZFv2ZuHwXAaRpHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 program ends without immediate value(s)",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_store_no_immediate",
+      "group": [
+        "gqRsc2lngaFsxAQIgQE1o3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxB93Zi1tYWxmb3JtZWQtc3RvcmVfbm9faW1tZWRpYXRlo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCD80CJKSOKhzmNJsD5TQrP01c27zceUiqF6BlFjznYUY6R0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 program ends without immediate value(s)",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_substring_one_immediate",
+      "group": [
+        "gqRsc2lngaFsxAYIgAEBUQCjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEJHdmLW1hbGZvcm1lZC1zdWJzdHJpbmdfb25lX2ltbWVkaWF0ZaNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQg4J1UgPFMFMD+5+jaS6KVBTneI4IeNsguRJqjjoFURuukdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  4 program ends without immediate value(s)",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_extract_no_immediate",
+      "group": [
+        "gqRsc2lngaFsxAUIgAEBV6N0eG6Ko2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQhd2YtbWFsZm9ybWVkLWV4dHJhY3Rfbm9faW1tZWRpYXRlo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCAROBhS/33DLusdZ4sph4KGGzQV28uUnVFEqDPtgXvma6R0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  4 program ends without immediate value(s)",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_bnz_no_offset",
+      "group": [
+        "gqRsc2lngaFsxAQIgQFAo3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxBp3Zi1tYWxmb3JtZWQtYm56X25vX29mZnNldKNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgiNCYhvstfIO7XFrvE7rj/U5b0C0ke4eQ7PK3DvKybKikdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 program ends without immediate value(s)",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_bnz_half_offset",
+      "group": [
+        "gqRsc2lngaFsxAUIgQFAAKN0eG6Ko2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQcd2YtbWFsZm9ybWVkLWJuel9oYWxmX29mZnNldKNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgca1FFlMcKYw0no4SxaN4fYs3ebxLmvL7219ZlF+NcuWkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 program ends without immediate value(s)",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_bz_no_offset",
+      "group": [
+        "gqRsc2lngaFsxAQIgQFBo3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxBl3Zi1tYWxmb3JtZWQtYnpfbm9fb2Zmc2V0o3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCAPcpwDcHfJpUoRvoQHi9gxL1m8COKWf+w8Z6pv6T6kWaR0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 program ends without immediate value(s)",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_b_no_offset",
+      "group": [
+        "gqRsc2lngaFsxAQIgQFCo3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxBh3Zi1tYWxmb3JtZWQtYl9ub19vZmZzZXSjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIDyAai4ooJLS/huhozli6nsJY1tHB8PIAyctYO+PZYKSpHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 program ends without immediate value(s)",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_pushint_no_value",
+      "group": [
+        "gqRsc2lngaFsxAQIgQGBo3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxB13Zi1tYWxmb3JtZWQtcHVzaGludF9ub192YWx1ZaNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgHibOGQ/8o0eDFyiT59PNBTw+2BZHUt1vbyCUK66liqikdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 could not decode int at program[4]",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_pushint_truncated_varuint",
+      "group": [
+        "gqRsc2lngaFsxAUIgQGBrKN0eG6Ko2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQmd2YtbWFsZm9ybWVkLXB1c2hpbnRfdHJ1bmNhdGVkX3ZhcnVpbnSjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIOorS+sBJx64REP+qq1TdPK58x/JM6USSTiEK6qrKD/epHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 could not decode int at program[4]",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_pushbytes_no_length",
+      "group": [
+        "gqRsc2lngaFsxAQIgQGAo3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxCB3Zi1tYWxmb3JtZWQtcHVzaGJ5dGVzX25vX2xlbmd0aKNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgeBCS6qN8MZTfcq1f7fYOY7i3XHPZhaLCK7m2CncwZcOkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 could not decode length at program[4]",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_pushbytes_short_data",
+      "group": [
+        "gqRsc2lngaFsxAUIgQGAAqN0eG6Ko2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQhd2YtbWFsZm9ybWVkLXB1c2hieXRlc19zaG9ydF9kYXRho3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCCS4OCyBliFtdEOwj/z0hXK2pO7EKgHsZM6c0dJs6G6t6R0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 pushbytes too long at program[5]",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_pushbytes_half_data",
+      "group": [
+        "gqRsc2lngaFsxAYIgQGAAwGjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEIHdmLW1hbGZvcm1lZC1wdXNoYnl0ZXNfaGFsZl9kYXRho3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCA0tcMe0/kt7sjPkL8FgYtVYo398Z99Bj9U9e5w4yPVyKR0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 pushbytes too long at program[5]",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_intcblock_no_count",
+      "group": [
+        "gqRsc2lngaFsxAQIgQEgo3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxB93Zi1tYWxmb3JtZWQtaW50Y2Jsb2NrX25vX2NvdW50o3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCA5Q3Pz4gMxkzZDlMgPJWLnhfDrS9afEA0u+3VV52GTaKR0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 could not decode length of int list at pc=4",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_intcblock_short",
+      "group": [
+        "gqRsc2lngaFsxAYIgQEgAgGjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEHHdmLW1hbGZvcm1lZC1pbnRjYmxvY2tfc2hvcnSjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEICJXv1qC+mUhg32W63HA8DewKR8k9Hps75lVYFTlaINapHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 const int list ran past end of program",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_bytecblock_no_count",
+      "group": [
+        "gqRsc2lngaFsxAQIgQEmo3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxCB3Zi1tYWxmb3JtZWQtYnl0ZWNibG9ja19ub19jb3VudKNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgrEm2GvXVtINTIL570iOIQnh+5y9jG/3DF824mceFWTCkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 could not decode length of bytes list at pc=4",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_bytecblock_short",
+      "group": [
+        "gqRsc2lngaFsxAYIgQEmAgGjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEHXdmLW1hbGZvcm1lZC1ieXRlY2Jsb2NrX3Nob3J0o3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCBsM30o515Hxcq/wOEnTQEwn4R3HH4NK6PLlizqW/41y6R0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 const bytes list ran past end of program",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_invalid_opcode_ff",
+      "group": [
+        "gqRsc2lngaFsxAQIgQH/o3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxB53Zi1tYWxmb3JtZWQtaW52YWxpZF9vcGNvZGVfZmajcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIHjbl4zWtAJp0aqK8Vi5WpxpxLHqVHtUZYmirzkZh4UYpHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 illegal opcode 0xff",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_opcode_newer_than_program",
+      "group": [
+        "gqRsc2lngaFsxAQIgQHSo3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxCZ3Zi1tYWxmb3JtZWQtb3Bjb2RlX25ld2VyX3RoYW5fcHJvZ3JhbaNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgbgMOAX8oQa6z+TrYusz7HHARZyNSMffRkyTCFiZ9i0KkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 illegal opcode 0xd2",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_app_only_opcode_in_logicsig",
+      "group": [
+        "gqRsc2lngaFsxAQIgQFgo3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxCh3Zi1tYWxmb3JtZWQtYXBwX29ubHlfb3Bjb2RlX2luX2xvZ2ljc2lno3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCAKk7kqDK1SZsdtHQp808hRXCWPX7skR6gAd0ASODqePKR0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 balance not allowed in current mode",
+      "verify_framed": true
+    },
+    {
       "name": "verify_logicsig_rejects",
       "group": [
         "gqRsc2lngaFsxAMIgQCjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEGndmLXZlcmlmeV9sb2dpY3NpZ19yZWplY3Rzo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCAg0Be/QbaNPW4z+ZHYK4nVg62o2fo3pZLDZd37gLnLYaR0eXBlo3BheQ=="

@@ -89,6 +89,11 @@ struct Record {
     /// is implementation-defined). When false, only (errored, pass) is
     /// compared, not the final stack.
     compare_stack: bool,
+    /// go's `logic.CheckSignature` error (the static pass a node runs before
+    /// evaluating a LogicSig); empty when go's check passes. Only the
+    /// `check/` vectors are compared against it (issue #2225).
+    #[serde(default)]
+    check_error: String,
 }
 
 /// Deserialize a JSON `null` final_stack (go's omitempty on the error path)
@@ -237,6 +242,24 @@ fn avm_opcode_conformance_vs_go_algorand() {
             .iter()
             .map(|a| decode_hex(&rec.name, "arg", a))
             .collect();
+
+        // `check/` vectors: go's static check decides. A program it rejects is
+        // never evaluated by a node, so only the check text is compared.
+        if rec.name.starts_with("check/") {
+            let rust_check = algo_avm::check::logicsig_static_check(&program).unwrap_or_default();
+            if rust_check != rec.check_error {
+                text_failures.push(format!(
+                    "{}: {}
+    go check:   {:?}
+    rust check: {:?}",
+                    rec.name, rec.description, rec.check_error, rust_check
+                ));
+            }
+            if !rec.check_error.is_empty() {
+                total += 1;
+                continue;
+            }
+        }
 
         let go_errored = !rec.error.is_empty();
         let result = run_rust(&rec.name, &program, args, &rec.proto);
