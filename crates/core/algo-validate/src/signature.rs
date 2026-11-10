@@ -834,6 +834,14 @@ pub fn verify_logicsig_with_tracer(
         verify_logicsig_multisig(stx, lmsig, &lmsig_msg)?;
     }
 
+    // go's `logic.CheckSignature` (`verify.logicSigSanityCheck`): the static
+    // pass over the program that precedes evaluation, so a malformed program is
+    // rejected with `pc=%3d <err>` and never reaches the runtime texts
+    // (issue #2225).
+    if let Some(message) = algo_avm::check::logicsig_static_check(&lsig.logic) {
+        return Err(AlgoError::Validation { message });
+    }
+
     // ── TEAL program execution ──
     // Build LogicSig arguments from the lsig.args field.
     let args: Vec<Vec<u8>> = lsig

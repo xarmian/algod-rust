@@ -134,6 +134,11 @@ type Vector struct {
 	// only (errored, pass) for those. It is true for the common case where a
 	// program halts by running off the end with its result on top.
 	CompareStack bool `json:"compare_stack"`
+	// CheckError is go's `logic.CheckSignature` verdict (the static pass every
+	// LogicSig meets BEFORE evaluation: `verify.logicSigSanityCheck`), empty
+	// when the program passes. Only the `check/` vectors are replayed against
+	// it; every other vector is evaluated regardless.
+	CheckError string `json:"check_error,omitempty"`
 }
 
 // detRand is a deterministic io.Reader for crypto key generation, so the
@@ -182,6 +187,68 @@ func evalSig(program []byte, args [][]byte) (bool, string, []stackEntry) {
 		}
 	}
 	return pass, errStr, stack
+}
+
+// checkSig is go's static check of a LogicSig program (what a node runs before
+// it evaluates the program): the error text, empty when the program passes.
+func checkSig(program []byte) string {
+	proto := config.Consensus[protoVersion]
+	var txn transactions.SignedTxn
+	txn.Lsig.Logic = program
+	ep := logic.NewSigEvalParams([]transactions.SignedTxn{txn}, &proto, &logic.NoHeaderLedger{})
+	if err := logic.CheckSignature(0, ep); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// tailOf is the bytes of the single instruction `last` (assembled behind enough
+// padding for the assembler's stack tracking to accept it), as in mkVectorTail.
+func tailOf(last string, version uint64) []byte {
+	for _, unit := range []string{"int 0; ", "byte 0x00; ", "byte 0x00; int 0; ", "int 0; byte 0x00; ", "byte 0x00; int 0; int 0; byte 0x00; "} {
+		pad := strings.Repeat(unit, 4)
+		ops, err := logic.AssembleStringWithVersion(pad+last, version)
+		if err != nil {
+			continue
+		}
+		padOnly := assemble(strings.TrimSuffix(pad, "; "), version)
+		return ops.Program[len(padOnly):]
+	}
+	panic(fmt.Sprintf("tailOf: cannot assemble %q", last))
+}
+
+// mkVectorMalformed builds a program that goes' static check rejects: the
+// program assembled from `prefix` (the version header alone when empty, at
+// `version`) followed by the first `keep` bytes of the instruction `last`
+// assembled at `lastVersion` (so a newer opcode can sit in an older program),
+// or by `raw` when `last` is empty. The vector keeps go's check error AND its
+// evaluation outcome.
+func mkVectorMalformed(name, desc, prefix, last string, version, lastVersion uint64, keep int, raw []byte) Vector {
+	head := []byte{byte(version)}
+	if prefix != "" {
+		head = assemble(prefix, version)
+	}
+	tail := raw
+	if last != "" {
+		tail = tailOf(last, lastVersion)
+		if keep >= 0 && keep < len(tail) {
+			tail = tail[:keep]
+		}
+	}
+	program := append(append([]byte{}, head...), tail...)
+	pass, errStr, stack := evalSig(program, nil)
+	return Vector{
+		Name:         name,
+		Description:  desc,
+		Proto:        string(protoVersion),
+		ProgramHex:   hex.EncodeToString(program),
+		ArgsHex:      []string{},
+		Pass:         pass,
+		Error:        errStr,
+		FinalStack:   stack,
+		CompareStack: true,
+		CheckError:   checkSig(program),
+	}
 }
 
 // mkVector assembles a TEAL source, evaluates it, and returns a fully
@@ -1762,6 +1829,148 @@ func generate() []Vector {
 		nil,
 	))
 
+	// =======================================================================
+	// Static check parity (issue #2225): go runs logic.CheckSignature before it
+	// evaluates a LogicSig, so a malformed program never reaches the runtime
+	// `step` texts ("program ends without immediate value(s)"); the node reports
+	// the check's `pc=%3d <err>`. Replayed against go's check error.
+	// =======================================================================
+	out = append(out, mkVectorMalformed(
+		"check/txn_no_immediate",
+		`go static check of a malformed program: txn_no_immediate`,
+		`int 1`, `txn Fee`, 8, 8, 1, nil,
+	))
+	out = append(out, mkVectorMalformed(
+		"check/gtxn_one_immediate",
+		`go static check of a malformed program: gtxn_one_immediate`,
+		`int 1`, `gtxn 0 Fee`, 8, 8, 2, nil,
+	))
+	out = append(out, mkVectorMalformed(
+		"check/gtxn_no_immediate",
+		`go static check of a malformed program: gtxn_no_immediate`,
+		`int 1`, `gtxn 0 Fee`, 8, 8, 1, nil,
+	))
+	out = append(out, mkVectorMalformed(
+		"check/global_no_immediate",
+		`go static check of a malformed program: global_no_immediate`,
+		`int 1`, `global GroupSize`, 8, 8, 1, nil,
+	))
+	out = append(out, mkVectorMalformed(
+		"check/load_no_immediate",
+		`go static check of a malformed program: load_no_immediate`,
+		`int 1`, `load 0`, 8, 8, 1, nil,
+	))
+	out = append(out, mkVectorMalformed(
+		"check/store_no_immediate",
+		`go static check of a malformed program: store_no_immediate`,
+		`int 1`, `store 0`, 8, 8, 1, nil,
+	))
+	out = append(out, mkVectorMalformed(
+		"check/substring_one_immediate",
+		`go static check of a malformed program: substring_one_immediate`,
+		`byte 0x01`, `substring 0 1`, 8, 8, 2, nil,
+	))
+	out = append(out, mkVectorMalformed(
+		"check/extract_no_immediate",
+		`go static check of a malformed program: extract_no_immediate`,
+		`byte 0x01`, `extract 0 1`, 8, 8, 1, nil,
+	))
+	out = append(out, mkVectorMalformed(
+		"check/intc_no_immediate",
+		`go static check of a malformed program: intc_no_immediate`,
+		`int 1`, `intc 0`, 8, 8, 1, nil,
+	))
+	out = append(out, mkVectorMalformed(
+		"check/bnz_no_offset",
+		`go static check of a malformed program: bnz_no_offset`,
+		`int 1`, ``, 8, 8, -1, []byte{0x40},
+	))
+	out = append(out, mkVectorMalformed(
+		"check/bnz_half_offset",
+		`go static check of a malformed program: bnz_half_offset`,
+		`int 1`, ``, 8, 8, -1, []byte{0x40, 0x00},
+	))
+	out = append(out, mkVectorMalformed(
+		"check/bz_no_offset",
+		`go static check of a malformed program: bz_no_offset`,
+		`int 1`, ``, 8, 8, -1, []byte{0x41},
+	))
+	out = append(out, mkVectorMalformed(
+		"check/b_no_offset",
+		`go static check of a malformed program: b_no_offset`,
+		`int 1`, ``, 8, 8, -1, []byte{0x42},
+	))
+	out = append(out, mkVectorMalformed(
+		"check/pushint_no_value",
+		`go static check of a malformed program: pushint_no_value`,
+		`int 1`, `pushint 300`, 8, 8, 1, nil,
+	))
+	out = append(out, mkVectorMalformed(
+		"check/pushint_truncated_varuint",
+		`go static check of a malformed program: pushint_truncated_varuint`,
+		`int 1`, `pushint 300`, 8, 8, 2, nil,
+	))
+	out = append(out, mkVectorMalformed(
+		"check/pushbytes_no_length",
+		`go static check of a malformed program: pushbytes_no_length`,
+		`int 1`, `pushbytes 0x0102`, 8, 8, 1, nil,
+	))
+	out = append(out, mkVectorMalformed(
+		"check/pushbytes_short_data",
+		`go static check of a malformed program: pushbytes_short_data`,
+		`int 1`, `pushbytes 0x0102`, 8, 8, 2, nil,
+	))
+	out = append(out, mkVectorMalformed(
+		"check/pushbytes_half_data",
+		`go static check of a malformed program: pushbytes_half_data`,
+		`int 1`, `pushbytes 0x010203`, 8, 8, 3, nil,
+	))
+	out = append(out, mkVectorMalformed(
+		"check/intcblock_no_count",
+		`go static check of a malformed program: intcblock_no_count`,
+		`int 1`, `intcblock 1 2`, 8, 8, 1, nil,
+	))
+	out = append(out, mkVectorMalformed(
+		"check/intcblock_short",
+		`go static check of a malformed program: intcblock_short`,
+		`int 1`, `intcblock 1 2`, 8, 8, 3, nil,
+	))
+	out = append(out, mkVectorMalformed(
+		"check/bytecblock_no_count",
+		`go static check of a malformed program: bytecblock_no_count`,
+		`int 1`, `bytecblock 0x01`, 8, 8, 1, nil,
+	))
+	out = append(out, mkVectorMalformed(
+		"check/bytecblock_short",
+		`go static check of a malformed program: bytecblock_short`,
+		`int 1`, `bytecblock 0x01 0x0203`, 8, 8, 3, nil,
+	))
+	out = append(out, mkVectorMalformed(
+		"check/invalid_opcode_ff",
+		`go static check of a malformed program: invalid_opcode_ff`,
+		`int 1`, ``, 8, 8, -1, []byte{0xff},
+	))
+	out = append(out, mkVectorMalformed(
+		"check/opcode_newer_than_program",
+		`go static check of a malformed program: opcode_newer_than_program`,
+		`int 1`, `box_splice`, 8, 10, -1, nil,
+	))
+	out = append(out, mkVectorMalformed(
+		"check/app_only_opcode_in_logicsig",
+		`go static check of a malformed program: app_only_opcode_in_logicsig`,
+		`int 1`, `balance`, 8, 8, -1, nil,
+	))
+	out = append(out, mkVectorMalformed(
+		"check/version_too_new",
+		`go static check of a malformed program: version_too_new`,
+		``, ``, 99, 99, -1, []byte{},
+	))
+	out = append(out, mkVectorMalformed(
+		"check/empty_program_after_header",
+		`go static check of a malformed program: empty_program_after_header`,
+		``, ``, 8, 8, -1, []byte{},
+	))
+
 	return out
 }
 
@@ -1865,6 +2074,17 @@ func main() {
 	}
 
 	vectors := generate()
+	for i := range vectors {
+		if vectors[i].CheckError != "" {
+			continue
+		}
+		program, err := hex.DecodeString(vectors[i].ProgramHex)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "decode %s: %v\n", vectors[i].Name, err)
+			os.Exit(1)
+		}
+		vectors[i].CheckError = checkSig(program)
+	}
 
 	if err := os.MkdirAll(filepath.Dir(*outPath), 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "mkdir: %v\n", err)
