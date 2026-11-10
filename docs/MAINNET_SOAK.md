@@ -315,6 +315,22 @@ the workflow — the summary records `reached_tip: false` and whatever
 definition above) this alone is never classified as a halt as long as the
 node kept making progress.
 
+### The working directory is on the runner's disk, never `/tmp` (issue #2113)
+
+The catchpoint file, the imported ledger and its WAL are about 8 GB for
+mainnet. Some GitHub runner images mount `/tmp` as a RAM-backed tmpfs of about
+7.7 GB (others have no separate `/tmp`; it sits on the 145 GB root disk), and
+on those the import ran the tmpfs out of space: SQLite answered `SQLITE_FULL`
+and the soak reported `catchpoint import failed: catchpoint sqlite error` with
+the node at round 0 (nightly runs of 2026-10-28 and 2026-11-05; the memory
+`used` column of `resource-log.csv` climbed by about 5 GB during the import in
+those runs and stayed flat in the others). The soak now puts the ledger,
+partkeys and data directories under `$RUNNER_TEMP/soak` and refuses to start
+on a RAM-backed volume or with less than 30 GB free
+(`ops/mainnet-soak/soak_workflow_test.py` pins this). A SQLite failure in the
+importer now prints its cause (`catchpoint sqlite error: database or disk is
+full`).
+
 ## Baseline
 
 First live full-budget baseline, recorded per issue #1598's acceptance
