@@ -382,6 +382,38 @@ pub trait LedgerStore {
         Round(0)
     }
 
+    /// How many recent rounds of undo data (pre-images, issue #2148) this
+    /// store retains for `simulate` at a past round; `0` = none.
+    fn undo_window(&self) -> u64 {
+        0
+    }
+
+    /// Set how many recent rounds of undo data are retained; `0` turns the
+    /// journal off. A store without a journal ignores it.
+    fn set_undo_window(&mut self, _window: u64) {}
+
+    /// The earliest `Request.Round` simulate can serve given the retained
+    /// undo data (go's `dbRound`): the latest round when nothing is retained.
+    fn earliest_simulate_round(&mut self) -> Round {
+        self.current_round()
+    }
+
+    /// The state of every key touched after round `start`, as of `start`
+    /// (see [`crate::undo_journal::UndoJournal::rewind_to`]); `None` when
+    /// `start` is not retained.
+    fn rewind_to(&mut self, _start: Round) -> Option<crate::undo_journal::Rewind> {
+        None
+    }
+
+    /// Open a transaction around a burst of scratch writes (a rewound
+    /// simulation) so they are one commit, not one per row, and a crash
+    /// leaves nothing behind. The writes are undone by the caller before
+    /// [`Self::end_scratch_writes`]. No-op by default.
+    fn begin_scratch_writes(&mut self) {}
+
+    /// Close the transaction of [`Self::begin_scratch_writes`].
+    fn end_scratch_writes(&mut self) {}
+
     /// Advance the earliest round this store can serve historical queries
     /// for. See [`Self::earliest_round`].
     fn set_earliest_round(&mut self, round: Round) {

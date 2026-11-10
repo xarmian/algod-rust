@@ -3063,8 +3063,8 @@ int 1
         round: Some(round),
         ..Default::default()
     };
-    // go's `RoundOffsetError` text leads the message; the rest says why the
-    // effective dbRound is the latest round here (DIV-007).
+    // go's `RoundOffsetError` text; a store without undo data has the latest
+    // round as its effective dbRound.
     let assert_rejected = |state: &mut LedgerState, round: u64, db_round: u64| match simulate(
         state,
         request_at(Round(round)),
@@ -3072,12 +3072,8 @@ int 1
         Err(SimulatorError::Internal(e)) => {
             let msg = e.to_string();
             assert!(
-                msg.contains(&format!("round {round} before dbRound {db_round}")),
+                msg.ends_with(&format!("round {round} before dbRound {db_round}")),
                 "expected go's error text, got {msg:?}"
-            );
-            assert!(
-                msg.contains("effective dbRound is the latest round"),
-                "{msg}"
             );
         }
         other => panic!("expected SimulatorError::Internal, got {other:?}"),
@@ -3106,7 +3102,7 @@ int 1
     assert_rejected(&mut state, 5, 6);
 }
 
-/// The past-round test hook (DIV-007) is scoped to its guard: dropping it
+/// The past-round test hook is scoped to its guard: dropping it
 /// closes the window again, so it cannot leak into another test that runs on
 /// the same thread.
 #[test]

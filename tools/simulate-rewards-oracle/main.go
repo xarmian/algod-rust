@@ -380,4 +380,6 @@ func main() {
 	blockDupOracle()
 	// The issue #2225 app-mode error text oracle (apperr.go) too.
 	appErrOracle()
+	// The issue #2148 oracle (pastround.go) too.
+	pastRoundOracle()
 }
