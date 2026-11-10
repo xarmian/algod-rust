@@ -428,7 +428,7 @@ jobs:
           AVAIL_GB="$(df -BG --output=avail "$SOAK_ROOT" | tail -n 1 | tr -dc '0-9')"
           echo "==> soak working dir $SOAK_ROOT: filesystem ${FS_TYPE}, ${AVAIL_GB} GB free"
           if [ "$FS_TYPE" = "tmpfs" ] || [ "${AVAIL_GB:-0}" -lt 30 ]; then
-            echo "error: the soak working dir needs a disk-backed volume with at least 30 GB free (the catchpoint file, ledger and WAL are about 8 GB for mainnet); got ${FS_TYPE} with ${AVAIL_GB} GB free (issue #2113)" >&2
+            echo "error: the soak working dir needs a disk-backed volume with at least 30 GB free (the catchpoint file, ledger and WAL are about 8 GB for a full-size network); got ${FS_TYPE} with ${AVAIL_GB} GB free (issue #2113)" >&2
             exit 1
           fi
           mkdir -p "${SOAK_ROOT}/${NET}-soak-ledger" "${SOAK_ROOT}/${NET}-soak-partkeys" "${SOAK_ROOT}/${NET}-soak-data"
