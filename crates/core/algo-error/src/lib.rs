@@ -283,7 +283,33 @@ pub fn frame_min_balance(err: AlgoError, txid: impl FnOnce() -> String) -> AlgoE
                 class: RejectClass::Framed(FramedKind::MinBalance),
             }
         }
+        // go's `checkPrograms` text (`ledger/apply/application.go`), also
+        // returned bare from the apply and framed by `BlockEvaluator.transaction`.
+        AlgoError::Rejected {
+            source,
+            message,
+            class: RejectClass::Other,
+        } if message.starts_with(CHECK_FAILED_PREFIX) => AlgoError::Rejected {
+            source,
+            message: format!("transaction {}: {message}", txid()),
+            class: RejectClass::Framed(FramedKind::Other),
+        },
         other => other,
+    }
+}
+
+/// The start of go's `checkPrograms` failure text.
+pub const CHECK_FAILED_PREFIX: &str = "check failed on ";
+
+/// go's `checkPrograms` failure (`ledger/apply/application.go`) for the
+/// program named `which` (`ApprovalProgram` / `ClearStateProgram`): the static
+/// check's `pc=%3d <err>` text, without the `transaction <txid>: ` frame
+/// ([`frame_min_balance`] adds it).
+pub fn program_check_rejected(which: &str, check_error: impl std::fmt::Display) -> AlgoError {
+    AlgoError::Rejected {
+        source: None,
+        message: format!("{CHECK_FAILED_PREFIX}{which}: {check_error}"),
+        class: RejectClass::Other,
     }
 }
 

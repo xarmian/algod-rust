@@ -162,6 +162,33 @@ var appErrGroups = []struct {
 	{"inner_app_call_succeeds", []string{whenCalled(`int 1`), innerCall1001}, []uint64{1, 2}},
 }
 
+// appErrRawPrograms: hand-built programs go's static check rejects (nil keeps
+// the default `int 1` program of that slot). Version 10 throughout.
+var appErrRawPrograms = []struct {
+	name            string
+	approval, clear []byte
+}{
+	{"raw_check_txn_no_immediate", []byte{10, 0x31}, nil},
+	{"raw_check_clear_txn_no_immediate", nil, []byte{10, 0x31}},
+	{"raw_check_lsig_only_opcode", []byte{10, 0x2d}, nil},
+	{"raw_check_illegal_opcode", []byte{10, 0xff}, nil},
+	{"raw_check_branch_outside", []byte{10, 0x81, 0x01, 0x42, 0x00, 0x05}, nil},
+	{"raw_check_back_branch_unaligned", []byte{10, 0x81, 0x01, 0x42, 0xff, 0xfc}, nil},
+	{"raw_check_forward_branch_unaligned", []byte{10, 0x42, 0x00, 0x01, 0x81, 0x01, 0x81, 0x01}, nil},
+	{"raw_check_switch_beyond_program", []byte{10, 0x81, 0x01, 0x8d, 0x05}, nil},
+	{"raw_check_switch_bare", []byte{10, 0x81, 0x01, 0x8d}, nil},
+	{"raw_check_switch_target_outside", []byte{10, 0x81, 0x01, 0x8d, 0x01, 0x00, 0x09}, nil},
+	{"raw_check_match_beyond_program", []byte{10, 0x81, 0x01, 0x8e, 0x03, 0x00}, nil},
+	{"raw_check_switch_back_unaligned", []byte{10, 0x81, 0x01, 0x8d, 0x01, 0xff, 0xfb}, nil},
+	{"raw_check_switch_ok", []byte{10, 0x81, 0x01, 0x8d, 0x01, 0x00, 0x00}, nil},
+	{"raw_check_branch_varint_overflow", []byte{13, 0x42, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01}, []byte{13, 0x81, 0x01}},
+	{"raw_check_branch_varint_no_target", []byte{13, 0x42}, []byte{13, 0x81, 0x01}},
+	{"raw_check_branch_varint_outside", []byte{13, 0x42, 0x14}, []byte{13, 0x81, 0x01}},
+	{"raw_check_negative_branch_v3", []byte{3, 0x42, 0xff, 0xfd}, []byte{3, 0x81, 0x01}},
+	{"raw_check_pushbytes_too_long", []byte{10, 0x80, 0x05, 0x01}, nil},
+	{"raw_check_ok_branch_to_end", []byte{10, 0x81, 0x01, 0x42, 0x00, 0x00}, nil},
+}
+
 // whenCalled makes a program that approves its creation and runs `body` on every
 // later call, so an inner call to it reaches `body`.
 func whenCalled(body string) string {
@@ -345,6 +372,55 @@ func appErrOracle() {
 			FailedAt:       []uint64{},
 		}
 		for _, pos := range tg.FailedAt {
+			out.FailedAt = append(out.FailedAt, uint64(pos))
+		}
+		f.Scenarios = append(f.Scenarios, out)
+	}
+
+	// Raw programs the node's static check (logic.CheckContract, run by
+	// ledger/apply checkPrograms) rejects before any evaluation (issue #2286).
+	okApproval, err := logic.AssembleString("#pragma version 10\nint 1")
+	must(err)
+	for _, p := range appErrRawPrograms {
+		approval, clearProg := okApproval.Program, clear.Program
+		if p.approval != nil {
+			approval = p.approval
+		}
+		if p.clear != nil {
+			clearProg = p.clear
+		}
+		t := transactions.Transaction{
+			Type: protocol.ApplicationCallTx,
+			Header: transactions.Header{
+				Sender:      acctA,
+				Fee:         basics.MicroAlgos{Raw: params.MinTxnFee},
+				FirstValid:  1,
+				LastValid:   1000,
+				Note:        []byte(p.name),
+				GenesisID:   appErrGenesisID,
+				GenesisHash: genesisHash,
+			},
+			ApplicationCallTxnFields: transactions.ApplicationCallTxnFields{
+				OnCompletion:      transactions.NoOpOC,
+				ApprovalProgram:   approval,
+				ClearStateProgram: clearProg,
+			},
+		}
+		stxn := transactions.SignedTxn{Txn: t}
+		res, err := sim.Simulate(simulation.Request{
+			TxnGroups:            [][]transactions.SignedTxn{{stxn}},
+			AllowEmptySignatures: true,
+		})
+		must(err)
+		g := res.TxnGroups[0]
+		out := appErrScenario{
+			Name:           p.name,
+			Source:         fmt.Sprintf("raw approval=%x clear=%x", approval, clearProg),
+			GroupMsgpack:   b64(protocol.Encode(&stxn)),
+			FailureMessage: g.FailureMessage,
+			FailedAt:       []uint64{},
+		}
+		for _, pos := range g.FailedAt {
 			out.FailedAt = append(out.FailedAt, uint64(pos))
 		}
 		f.Scenarios = append(f.Scenarios, out)

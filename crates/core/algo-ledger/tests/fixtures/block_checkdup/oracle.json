@@ -2080,6 +2080,78 @@
       "verify_framed": true
     },
     {
+      "name": "verify_logicsig_malformed_branch_outside_program",
+      "group": [
+        "gqRsc2lngaFsxAYIgQFCAP+jdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEI3dmLW1hbGZvcm1lZC1icmFuY2hfb3V0c2lkZV9wcm9ncmFto3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCDo20eGK7qMwBisR31e3CowzqgechoNntzFqz28nZ3/+aR0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 branch target 261 outside of program",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_back_branch_unaligned",
+      "group": [
+        "gqRsc2lngaFsxAYIgQFC//yjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEIndmLW1hbGZvcm1lZC1iYWNrX2JyYW5jaF91bmFsaWduZWSjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIGpm9xVs8+WJL6JGLWprtK6pxlZg5B7a7kN2Udx4sR4VpHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 back branch target 2 is not an aligned instruction",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_forward_branch_unaligned",
+      "group": [
+        "gqRsc2lngaFsxAgIQgABgQGBAaN0eG6Ko2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQld2YtbWFsZm9ybWVkLWZvcndhcmRfYnJhbmNoX3VuYWxpZ25lZKNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQg7N66qzETwewp0BVfehbNsuBwrBFcNsbrnGr6ETR5eSekdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  6 branch target 5 is not an aligned instruction",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_switch_beyond_program",
+      "group": [
+        "gqRsc2lngaFsxAUIgQGNBaN0eG6Ko2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGibHbNA+ikbm90ZcQid2YtbWFsZm9ybWVkLXN3aXRjaF9iZXlvbmRfcHJvZ3JhbaNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgAQp328l8uFgYAW2REpfZlFg8GWRkrFXSsknWklSbUcqkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 switch opcode claims to extend beyond program",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_switch_bare",
+      "group": [
+        "gqRsc2lngaFsxAQIgQGNo3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxBh3Zi1tYWxmb3JtZWQtc3dpdGNoX2JhcmWjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIJNZhl0QMMCa2XOF4VZKNNU+XpItxyU0iQCLVBXuaosDpHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 bare switch opcode at end of program",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_match_beyond_program",
+      "group": [
+        "gqRsc2lngaFsxAYIgQGOAwCjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEIXdmLW1hbGZvcm1lZC1tYXRjaF9iZXlvbmRfcHJvZ3JhbaNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgL+yocfYmR5rdiNQqzKOMC9YW7T7ClzxvjnPiha0NxySkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  3 match opcode claims to extend beyond program",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_varint_branch_outside_program",
+      "group": [
+        "gqRsc2lngaFsxAMNQhSjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEKndmLW1hbGZvcm1lZC12YXJpbnRfYnJhbmNoX291dHNpZGVfcHJvZ3JhbaNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgCCmpK7SY4MNSdYCX96ozEf5bIvj1vHDt7CgBwcu2GCqkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  1 branch target 13 outside of program",
+      "verify_framed": true
+    },
+    {
+      "name": "verify_logicsig_malformed_negative_branch_offset_v3",
+      "group": [
+        "gqRsc2lngaFsxAQDQv/9o3R4boqjYW10zgAPQkCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxCZ3Zi1tYWxmb3JtZWQtbmVnYXRpdmVfYnJhbmNoX29mZnNldF92M6NyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQg7kOsFL+jww2OXSjgs8VeVO5cS5zx9xLWZLNwAWMQKSCkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "verify_error": "pc=  1 negative branch offset -3",
+      "verify_framed": true
+    },
+    {
       "name": "verify_logicsig_rejects",
       "group": [
         "gqRsc2lngaFsxAMIgQCjdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEGndmLXZlcmlmeV9sb2dpY3NpZ19yZWplY3Rzo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCAg0Be/QbaNPW4z+ZHYK4nVg62o2fo3pZLDZd37gLnLYaR0eXBlo3BheQ=="

@@ -538,6 +538,25 @@ checkout. Do not edit `vectors.jsonl` by hand — it is a build artifact.
 cargo test -p algo-conformance --test avm_opcode_conformance
 ```
 
+### Static-check corpus (#2286)
+
+`algo_avm::check` ports go's static program check (`logic.CheckSignature` for a
+LogicSig, `logic.CheckContract` for the approval / clear-state programs of an
+application create or update, `checkPrograms`). The port is **conservative**:
+a construct it does not port makes the check return `None`, so it never rejects
+a program go accepts. The tool therefore also writes
+`tests/fixtures/avm/check_corpus.jsonl` (about 3.5k seeded programs: random
+instruction streams plus every opcode byte at several versions) with go's
+verdict of BOTH checks, and `cargo test -p algo-conformance --test
+avm_check_corpus` requires that (a) no program go accepts is rejected here and
+(b) every rejection carries go's exact `pc=%3d <err>` text. Not ported (the
+check passes where go rejects): the pre-v4 static cost bound, the immediates of
+prefix families (`app_box_*`), instructions whose cost is looked up by an
+immediate field (`ecdsa_*`, `ec_*`, `vrf_verify`, `mimc`, ...), the protocol
+version ceiling text and the group-dependent minimum version of a LogicSig.
+The app-create rows live in `tools/simulate-rewards-oracle/apperr.go`
+(`appErrRawPrograms`).
+
 ### When to regenerate
 
 - go-algorand pin bump touching `data/transactions/logic/crypto.go`,

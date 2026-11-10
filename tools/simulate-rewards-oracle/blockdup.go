@@ -811,6 +811,15 @@ func blockDupOracle() {
 		{"invalid_opcode_ff", "088101ff"},
 		{"opcode_newer_than_program", "088101d2"},
 		{"app_only_opcode_in_logicsig", "08810160"},
+		// Issue #2286: the branch / switch checks of the static pass.
+		{"branch_outside_program", "0881014200ff"},
+		{"back_branch_unaligned", "088101" + "42fffc"},
+		{"forward_branch_unaligned", "08420001" + "81018101"},
+		{"switch_beyond_program", "0881018d05"},
+		{"switch_bare", "0881018d"},
+		{"match_beyond_program", "0881018e0300"},
+		{"varint_branch_outside_program", "0d4214"},
+		{"negative_branch_offset_v3", "0342fffd"},
 	} {
 		prog, err := hex.DecodeString(m.hexProgram)
 		must(err)
