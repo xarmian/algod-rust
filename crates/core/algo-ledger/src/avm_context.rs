@@ -5310,7 +5310,7 @@ fn read_txn_field(
                 Some(i) => {
                     if i >= logs.len() {
                         Err(AlgoError::Avm {
-                            message: format!("Logs index {} out of range (len={})", i, logs.len()),
+                            message: format!("invalid Logs index {}", i),
                         })
                     } else {
                         Ok(TealValue::Bytes(logs[i].clone()))
@@ -5477,7 +5477,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         if group_index >= self.group.len() {
             return Err(AlgoError::Avm {
                 message: format!(
-                    "group_index {} out of range (group size={})",
+                    "txn index {}, len(group) is {}",
                     group_index,
                     self.group.len()
                 ),
@@ -8363,8 +8363,8 @@ mod tests {
         let err = ctx.txn_field(1, 1, None).unwrap_err(); // gtxn 1 Fee
         let msg = err.to_string();
         assert!(
-            msg.contains('1') && msg.to_lowercase().contains("out of range"),
-            "expected an out-of-range group-index error, got: {msg}"
+            msg.contains("txn index 1, len(group) is 1"),
+            "expected go's group-index error, got: {msg}"
         );
     }
 

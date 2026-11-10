@@ -70,7 +70,7 @@ pub fn op_global(
     // Enforce per-field mode restrictions (Go: `if (cx.runMode & fs.mode) == 0`).
     if is_app_mode_only(field) && machine.mode == ExecMode::LogicSig {
         return Err(AlgoError::Avm {
-            message: format!("global[{field_byte}] not allowed in LogicSig mode"),
+            message: format!("global[{field:?}] not allowed in current mode"),
         });
     }
 
@@ -257,7 +257,7 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("not allowed in LogicSig"),
+            msg.contains("not allowed in current mode"),
             "expected mode restriction error: {msg}"
         );
     }
@@ -272,7 +272,7 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("not allowed in LogicSig"),
+            msg.contains("not allowed in current mode"),
             "expected mode restriction error: {msg}"
         );
     }
