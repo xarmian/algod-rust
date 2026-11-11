@@ -48,6 +48,11 @@ Inputs (environment):
   BENCH_CATCHUP_MIN_GATE_ROUNDS  fewest rounds the gate may compare (default 100)
   BENCH_CATCHUP_CPUS, BENCH_CATCHUP_MEM   per-container limits (default 2 / 3g)
   BENCH_CATCHUP_PORT_BASE     first published REST port (default 4500)
+  BENCH_CATCHUP_DATA_MOUNT    auto (default) | bind | volume: where the nodes keep /data.
+                              auto = a Docker named volume off Linux (a Docker Desktop
+                              bind mount costs ~2 ms per SQLite commit and made algod-rust
+                              replay 4x slower than on a volume, issue #2204), a bind
+                              mount on Linux
   BENCH_CATCHUP_GO_IMAGE      default algorand/algod:<pinned tag without `v`>
   BENCH_CATCHUP_RUST_IMAGE    a prebuilt algod-rust image (default: build
                               docker/Dockerfile's `runtime` target)
@@ -194,12 +199,22 @@ def seed_data_dir(path, genesis_path):
     rest.make_writable(path)
 
 
+def seed_volume(volume, seed_dir, image):
+    """Copy the seeded directory `seed_dir` into the named volume `volume` with a
+    throw-away container of `image` (already local), and make it writable for the
+    node's user."""
+    localnet.docker("run", "--rm", "-v", f"{volume}:/data", "-v", f"{localnet.posix(seed_dir)}:/seed",
+                    "--entrypoint", "sh", image, "-c",
+                    "cp -a /seed/. /data/ && chmod -R a+rwX /data", timeout=120)
+
+
 class DockerNode:
-    def __init__(self, impl, image, data_dir, port, cfg):
+    def __init__(self, impl, image, data_dir, port, cfg, volume=None):
         self.impl = impl
         self.name = f"bench-catchup-{impl}-{os.getpid()}"
+        self.volume = volume
         self.args = container_args(impl, name=self.name, image=image,
-                                   data_dir=localnet.posix(data_dir), port=port,
+                                   data_dir=volume or localnet.posix(data_dir), port=port,
                                    cpus=cfg["cpus"], mem=cfg["mem"])
         self.base = f"http://127.0.0.1:{port}"
         self.data_dir = data_dir
@@ -239,6 +254,8 @@ class DockerNode:
         if self.sampler:
             self.sampler.stop()
         localnet.docker("rm", "-f", self.name, check=False)
+        if self.volume:
+            localnet.docker("volume", "rm", "-f", self.volume, check=False)
 
 
 def pid_alive(pid):
@@ -528,7 +545,13 @@ def run_tier():
                     for k, s in enumerate(SIDES):
                         d = os.path.join(work, f"run{i}-{s}")
                         seed_data_dir(d, genesis)
-                        nodes[s] = DockerNode(s, cfg[f"{s}_image"], d, cfg["port_base"] + k, cfg)
+                        vol = None
+                        if cl.resolve_data_mount(cfg["data_mount"], sys.platform) == "volume":
+                            vol = f"bench-catchup-{s}-{os.getpid()}-run{i}"
+                            localnet.docker("volume", "rm", "-f", vol, check=False)
+                            seed_volume(vol, d, cfg["go_image"])
+                        nodes[s] = DockerNode(s, cfg[f"{s}_image"], d, cfg["port_base"] + k, cfg,
+                                              volume=vol)
                     try:
                         rl.require_same_limits(nodes["go"].args, nodes["rust"].args)
                     except ValueError as e:
@@ -551,6 +574,7 @@ def run_tier():
             "mode": cfg["mode"], "profile": cfg["profile"], "follow_secs": cfg["follow_secs"],
             "poll_s": cfg["poll_s"], "head_slack_s": cfg["head_slack_s"],
             "hash_cap": cfg["hash_cap"], "cpus": cfg["cpus"], "mem": cfg["mem"],
+            "data_mount": cl.resolve_data_mount(cfg["data_mount"], sys.platform),
             "agreed_block_hash": details[0]["agreed_block_hash"], "runs_detail": details,
             "go_image": cfg["go_image"], "go_image_id": cfg.get("go_image_id", ""),
             "rust_image": cfg["rust_image"], "rust_image_id": cfg.get("rust_image_id", ""),

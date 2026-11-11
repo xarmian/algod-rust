@@ -76,6 +76,21 @@ PROFILES = {
     "smoke": {"follow_secs": 10.0},
 }
 MODES = ("live", "mock")
+DATA_MOUNTS = ("auto", "bind", "volume")
+
+
+def resolve_data_mount(setting, platform):
+    """`bind` or `volume`: where the nodes keep their data directory (issue #2204).
+    `auto` is a Docker named volume everywhere but on a Linux host: on Docker
+    Desktop (Windows, macOS) a bind mount goes through a VM file-sharing layer
+    that costs about 2 ms per SQLite write commit and 0.3 ms per read
+    transaction (a named volume: 0.01 ms), and a node's replay rate then
+    measures that layer, not the node."""
+    if setting not in DATA_MOUNTS:
+        raise CatchupError(f"BENCH_CATCHUP_DATA_MOUNT={setting!r}: want {', '.join(DATA_MOUNTS)}")
+    if setting == "auto":
+        return "bind" if platform.startswith("linux") else "volume"
+    return setting
 MOCK_FAULTS = ("none", "diverge", "stall", "die", "abort")
 
 
@@ -127,6 +142,7 @@ def parse_settings(env):
         "cpus": num("BENCH_CATCHUP_CPUS", 2.0),
         "mem": env.get("BENCH_CATCHUP_MEM") or "6g",
         "port_base": num("BENCH_CATCHUP_PORT_BASE", 4500, int),
+        "data_mount": env.get("BENCH_CATCHUP_DATA_MOUNT") or "auto",
         "go_image": env.get("BENCH_CATCHUP_GO_IMAGE") or "",
         "rust_image": env.get("BENCH_CATCHUP_RUST_IMAGE") or "",
     }
@@ -137,6 +153,7 @@ def parse_settings(env):
                            ("BENCH_CATCHUP_CPUS", "cpus", 0)):
         if not s[key] > low:
             raise CatchupError(f"{name} must be > {low}, got {s[key]}")
+    resolve_data_mount(s["data_mount"], "linux")   # validates the choice
     if s["hash_cap"] < 1:
         raise CatchupError(f"BENCH_CATCHUP_HASH_CAP must be >= 1, got {s['hash_cap']}")
     if s["min_gate_rounds"] < 1:

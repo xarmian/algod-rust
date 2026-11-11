@@ -884,6 +884,61 @@ class PollTest(unittest.TestCase):
         self.assertLess(lag, 10)
 
 
+class DataMountTest(unittest.TestCase):
+    """Issue #2204: on a Docker Desktop host (Windows / macOS) a bind-mounted data
+    directory costs about 2 ms per SQLite write commit and 0.3 ms per read
+    transaction (measured; a named volume: 0.01 ms), which made algod-rust replay at
+    26 blocks/s there and 113 on a volume. The tier therefore keeps the data of
+    both nodes in a named volume unless the host is Linux (native bind mounts)."""
+
+    def test_auto_is_a_volume_off_linux_and_a_bind_mount_on_linux(self):
+        self.assertEqual(cl.resolve_data_mount("auto", "linux"), "bind")
+        for plat in ("win32", "darwin"):
+            self.assertEqual(cl.resolve_data_mount("auto", plat), "volume")
+
+    def test_an_explicit_choice_wins_and_garbage_is_rejected(self):
+        self.assertEqual(cl.resolve_data_mount("bind", "win32"), "bind")
+        self.assertEqual(cl.resolve_data_mount("volume", "linux"), "volume")
+        with self.assertRaises(cl.CatchupError):
+            cl.resolve_data_mount("tmpfs", "linux")
+
+    def test_the_setting_is_read_from_the_environment(self):
+        self.assertEqual(cl.parse_settings({})["data_mount"], "auto")
+        self.assertEqual(
+            cl.parse_settings({"BENCH_CATCHUP_DATA_MOUNT": "volume"})["data_mount"], "volume")
+        with self.assertRaisesRegex(cl.CatchupError, "BENCH_CATCHUP_DATA_MOUNT"):
+            cl.parse_settings({"BENCH_CATCHUP_DATA_MOUNT": "nfs"})
+
+    def test_a_volume_node_mounts_its_volume_and_removes_it_on_stop(self):
+        import catchup as tier
+        cfg = {"cpus": 1, "mem": "1g"}
+        node = tier.DockerNode("go", "img", "/tmp/d", 4500, cfg, volume="vol-x")
+        self.assertIn("vol-x:/data", node.args)
+        self.assertNotIn(f"{tier.localnet.posix('/tmp/d')}:/data", node.args)
+        calls = []
+        with mock.patch.object(tier.localnet, "docker",
+                               side_effect=lambda *a, **k: calls.append(a) or mock.Mock(stdout="")):
+            node.stop()
+        self.assertIn(("volume", "rm", "-f", "vol-x"), calls)
+
+    def test_a_bind_node_keeps_the_host_directory(self):
+        import catchup as tier
+        node = tier.DockerNode("go", "img", "/tmp/d", 4500, {"cpus": 1, "mem": "1g"})
+        self.assertIn(f"{tier.localnet.posix('/tmp/d')}:/data", node.args)
+
+    def test_seeding_a_volume_copies_the_seeded_directory_into_it(self):
+        import catchup as tier
+        calls = []
+        with mock.patch.object(tier.localnet, "docker",
+                               side_effect=lambda *a, **k: calls.append(a) or mock.Mock(stdout="")):
+            tier.seed_volume("vol-x", "/tmp/seed", "go-image")
+        run = [c for c in calls if c[0] == "run"][0]
+        self.assertIn("vol-x:/data", run)
+        self.assertIn(f"{tier.localnet.posix('/tmp/seed')}:/seed", run)
+        self.assertIn("go-image", run)
+        self.assertTrue(any("cp -a /seed/. /data/" in part for part in run))
+
+
 class DiskMbTest(unittest.TestCase):
     """Y2: a failing `du` skips the metric instead of discarding the run."""
 

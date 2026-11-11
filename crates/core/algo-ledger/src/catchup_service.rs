@@ -1573,6 +1573,13 @@ impl CatchupService {
         let mut stopped = false;
         let recv_started = std::time::Instant::now();
         let mut first_result_logged = false;
+        // Issue #2204: where the apply thread spends a pass (diagnostic).
+        let mut t_wait = Duration::ZERO;
+        let mut t_auth = Duration::ZERO;
+        let mut t_contents = Duration::ZERO;
+        let mut t_ensure = Duration::ZERO;
+        let mut last_timing_log = std::time::Instant::now();
+        let mut timing_blocks = 0u64;
 
         loop {
             // A `sync_now` that arrives while this pass is still making
@@ -1586,7 +1593,10 @@ impl CatchupService {
                     }
                 }
             }
-            let (round, outcome) = match result_rx.recv_timeout(Duration::from_millis(100)) {
+            let wait_started = std::time::Instant::now();
+            let received = result_rx.recv_timeout(Duration::from_millis(100));
+            t_wait += wait_started.elapsed();
+            let (round, outcome) = match received {
                 Ok(r) => r,
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     // The round the apply cursor waits for may take a while
@@ -1690,6 +1700,7 @@ impl CatchupService {
                         // next live run names the culprit.
                         let step_started = std::time::Instant::now();
                         let auth_result = ledger.authenticate_block(&block, &cert);
+                        t_auth += step_started.elapsed();
                         if step_started.elapsed() > Duration::from_secs(1) {
                             warn!(
                                 round = %expected_round,
@@ -1715,6 +1726,7 @@ impl CatchupService {
                             &block,
                             fetched_block.raw_payset_blobs.as_deref(),
                         );
+                        t_contents += step_started.elapsed();
                         if step_started.elapsed() > Duration::from_secs(1) {
                             warn!(
                                 round = %expected_round,
@@ -1751,6 +1763,7 @@ impl CatchupService {
 
                         let step_started = std::time::Instant::now();
                         ledger.ensure_block(&block, &cert);
+                        t_ensure += step_started.elapsed();
                         if step_started.elapsed() > Duration::from_secs(1) {
                             warn!(
                                 round = %expected_round,
@@ -1759,6 +1772,24 @@ impl CatchupService {
                             );
                         }
                         fetched += 1;
+                        timing_blocks += 1;
+                        if last_timing_log.elapsed() >= Duration::from_secs(30) {
+                            info!(
+                                blocks = timing_blocks,
+                                elapsed_ms = last_timing_log.elapsed().as_millis() as u64,
+                                wait_ms = t_wait.as_millis() as u64,
+                                authenticate_ms = t_auth.as_millis() as u64,
+                                contents_ms = t_contents.as_millis() as u64,
+                                ensure_block_ms = t_ensure.as_millis() as u64,
+                                "catchup service: apply thread time split (waiting for a fetch vs authenticate vs apply)"
+                            );
+                            t_wait = Duration::ZERO;
+                            t_auth = Duration::ZERO;
+                            t_contents = Duration::ZERO;
+                            t_ensure = Duration::ZERO;
+                            timing_blocks = 0;
+                            last_timing_log = std::time::Instant::now();
+                        }
 
                         // `ensure_block` is best-effort; if the ledger did
                         // not actually advance there is no point spinning
