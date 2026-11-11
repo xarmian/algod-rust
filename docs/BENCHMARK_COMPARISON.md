@@ -1587,7 +1587,16 @@ spread (n and the range / 95% CI of the median) is part of every row.
    algod-rust's go-compatible `algod -d /data`. The tier requests the catchup
    itself with `POST /v2/catchup/<label>` (the `#` percent-encoded), the same
    REST call for both, instead of an image entrypoint: the official Go image
-   cannot be told a label.
+   cannot be told a label. **Where `/data` lives** (`BENCH_CATCHUP_DATA_MOUNT=auto|bind|volume`,
+   issue #2204): off Linux (Docker Desktop on Windows or macOS) `auto` is a Docker named
+   volume, seeded from the host directory and removed after the run, on Linux a bind mount.
+   A Docker Desktop bind mount goes through a VM file-sharing layer that costs about 2 ms per
+   SQLite write commit (even with `synchronous=0`) and 0.3 ms per read transaction (a named
+   volume: 0.01 ms; measured with a 300-transaction loop on both), and algod-rust makes
+   several more SQLite transactions per replayed block than go (its tracker and block
+   archive commit per block; go batches), so on a bind mount it replayed at 26 blocks/s
+   against go's 107 while on a volume it replayed at 113. A comparison made on a bind mount
+   on such a host measures that layer, not the nodes.
 3. **Phases**, from `GET /v2/status` polled every `BENCH_CATCHUP_POLL_S`
    (default 1 s), using the counters both nodes fill identically and
    `goal node status` prints:
