@@ -38,3 +38,7 @@ __pycache__/
 # Fetched testnet-head replay corpus (issue #2119, scripts/bench/corpus/fetch_testnet.py).
 /benchmarks/corpus/testnet-head/
 /benchmarks/corpus/testnet-head.partial/
+# Fetched testnet-catchpoint corpus (issue #2293, fetch_testnet.py fetch-catchpoint).
+/benchmarks/corpus/testnet-catchpoint/
+/benchmarks/corpus/testnet-catchpoint.partial/
+/benchmarks/corpus/testnet-catchpoint.old/

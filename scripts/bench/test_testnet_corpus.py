@@ -765,5 +765,183 @@ class PlanCatchpointTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(REPO, "docs", "BENCH_CATCHPOINT_REPLAY.md")))
 
 
+SMALL_CP = os.path.join(REPO, "benchmarks", "corpus", "small-catchpoint")
+GO_TESTDATA = os.path.join(REPO, "benchmarks", "go-replay", "testdata")
+CP_LABEL = read(os.path.join(GO_TESTDATA, "small-catchpoint-1500.label")).decode().strip()
+CP_TAR = os.path.join(GO_TESTDATA, "small-catchpoint-1500.tar")
+
+
+@contextlib.contextmanager
+def slice_endpoint(corpus, round_):
+    """An algod endpoint serving the rounds of a catchpoint corpus, the header of
+    the catchpoint round (no state proof tracking: a DevMode chain) and the
+    attested last block."""
+    cj = ct.load_corpus_json(corpus)
+    blocks = records(os.path.join(corpus, "blocks.bin"))
+    last = cj["rounds"]["last"]
+    fs = cj["final_state"]
+    genesis = read(os.path.join(corpus, "genesis.json"))
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def reply(self, body):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            m = re.fullmatch(r"/v2/blocks/(\d+)\?format=msgpack", self.path)
+            if self.path == "/genesis":
+                return self.reply(genesis)
+            if self.path == "/v2/transactions/params":
+                return self.reply(json.dumps({
+                    "genesis-id": cj["network"]["genesis_id"],
+                    "genesis-hash": cj["network"]["genesis_hash"]}).encode())
+            if m and int(m.group(1)) in blocks:
+                return self.reply(blocks[int(m.group(1))])
+            if self.path == f"/v2/blocks/{round_}?header-only=true":
+                return self.reply(json.dumps({"block": {"rnd": round_}}).encode())
+            if self.path == f"/v2/blocks/{last}/hash":
+                return self.reply(json.dumps({"blockHash": fs["block_hash"][len("blk-"):]}).encode())
+            if self.path == f"/v2/blocks/{last}?header-only=true":
+                return self.reply(json.dumps(
+                    {"block": {"rnd": last, "tc": fs["txn_counter"]}}).encode())
+            self.send_error(404)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+class CatchpointCorpusTests(unittest.TestCase):
+    """The catchpoint-start corpus (issue #2293)."""
+
+    def test_the_committed_small_catchpoint_corpus_is_valid(self):
+        self.assertEqual(ct.verify(SMALL_CP, coverage=False), [])
+        cj = ct.load_corpus_json(SMALL_CP)
+        self.assertEqual(cj["start"]["catchpoint"], CP_LABEL)
+        self.assertEqual(cj["rounds"], {"first": 179, "last": 2000, "count": 1822})
+        self.assertEqual(sorted(records(os.path.join(SMALL_CP, "blocks.bin")))[:2], [179, 180])
+
+    def test_validate_start_refuses_inconsistent_starts(self):
+        base = ct.load_corpus_json(SMALL_CP)
+        for patch in ({"round": 1499}, {"catchpoint": "1500#short"}, {"file": "other.tar"}):
+            cj = json.loads(json.dumps(base))
+            cj["start"].update(patch)
+            self.assertTrue(ct.validate_corpus_json(cj, coverage=False), patch)
+        cj = json.loads(json.dumps(base))
+        cj["rounds"]["first"], cj["rounds"]["count"] = 1600, 401
+        self.assertTrue(ct.validate_corpus_json(cj, coverage=False))
+
+    def test_derive_reproduces_the_committed_corpus(self):
+        with tempfile.TemporaryDirectory() as t:
+            dest = os.path.join(t, "d")
+            ct.derive_catchpoint_corpus(SMALL, dest, CP_TAR, CP_LABEL, 179)
+            for name in ("blocks.bin", "catchpoint.tar", "genesis.json", "consensus.json"):
+                self.assertEqual(read(os.path.join(dest, name)),
+                                 read(os.path.join(SMALL_CP, name)), name)
+            a, b = ct.load_corpus_json(dest), ct.load_corpus_json(SMALL_CP)
+            for k in ("rounds", "start", "files", "network"):
+                self.assertEqual(a[k], b[k], k)
+            # the account digest of a cut corpus is its own (finalize-known)
+            self.assertNotEqual(a["final_state"]["accounts_sha256"],
+                                b["final_state"]["accounts_sha256"])
+        with self.assertRaises(ValueError):
+            ct.derive_catchpoint_corpus(SMALL, os.path.join(t, "x"), CP_TAR, CP_LABEL, 0)
+
+    def test_lookback_matches_gos_formula(self):
+        # no state proofs pending: go's MaxTxnLife + DeeperBlockHeaderHistory +
+        # CatchpointLookback = 1321
+        self.assertEqual(ft.catchpoint_lookback(69120000, 69120000), 1321)
+        self.assertEqual(ft.catchpoint_lookback(1500, 0), 1321)
+        # a state proof ten intervals behind needs more than that
+        self.assertEqual(ft.catchpoint_lookback(69120000, 69110000), 2832)
+        # trimmed to round - 1 when the chain is shorter
+        self.assertEqual(ft.catchpoint_lookback(1000, 0), 999)
+
+    def test_block_coverage_counts_payouts_state_proofs_and_apps(self):
+        small = records(os.path.join(SMALL, "blocks.bin"))
+        cov = ft.range_coverage(os.path.join(SMALL, "blocks.bin"), 0)
+        self.assertEqual((cov["proposer_payouts"], cov["state_proofs"]), (0, 0))
+        self.assertGreater(cov["app_calls"], 0)
+        self.assertEqual(ft.block_coverage(small[1])[1:], (0, cov["app_calls"] and ft.block_coverage(small[1])[2]))
+        with self.assertRaises(ft.FetchError):
+            ft.coverage_gate(cov)
+        ft.coverage_gate({"proposer_payouts": 1, "state_proofs": 1, "app_calls": 1})
+
+    def _ref(self, t, url):
+        ref = os.path.join(t, "cp.ref")
+        with open(ref, "w", encoding="utf-8") as f:
+            f.write(f"endpoint={url}\ncatchpoint={CP_LABEL}\ncatchpoint_round=1500\nrounds=500\n"
+                    f"genesis_hash={ct.load_corpus_json(SMALL_CP)['network']['genesis_hash']}\n")
+        return ref
+
+    def test_fetch_catchpoint_builds_the_corpus_the_ref_describes(self):
+        cj0 = ct.load_corpus_json(SMALL_CP)
+        with tempfile.TemporaryDirectory() as t, slice_endpoint(SMALL_CP, 1500) as url:
+            dest = os.path.join(t, "c")
+            rc = ft.main(["fetch-catchpoint", "--ref", self._ref(t, url), "--dest", dest,
+                          "--catchpoint-file", CP_TAR, "--allow-uncovered",
+                          "--final-state", final_state_file(t, SMALL_CP), "--workers", "4",
+                          "--name", "small-catchpoint"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(ct.verify(dest, coverage=False), [])
+            for name in ("blocks.bin", "catchpoint.tar", "genesis.json"):
+                self.assertEqual(read(os.path.join(dest, name)),
+                                 read(os.path.join(SMALL_CP, name)), name)
+            cj = ct.load_corpus_json(dest)
+            self.assertEqual(cj["rounds"], cj0["rounds"])
+            self.assertEqual(cj["start"]["catchpoint"], CP_LABEL)
+            self.assertEqual(cj["start"]["coverage"]["state_proofs"], 0)
+            self.assertEqual(cj["final_state"], cj0["final_state"])
+
+    def test_fetch_catchpoint_refuses_a_range_without_state_proofs_or_payouts(self):
+        with tempfile.TemporaryDirectory() as t, slice_endpoint(SMALL_CP, 1500) as url:
+            dest = os.path.join(t, "c")
+            rc = ft.main(["fetch-catchpoint", "--ref", self._ref(t, url), "--dest", dest,
+                          "--catchpoint-file", CP_TAR, "--workers", "4", "--retries", "1"])
+            self.assertEqual(rc, 1)
+            self.assertFalse(os.path.exists(dest))
+            self.assertFalse(os.path.exists(dest + ".partial"))
+
+    def test_fetch_catchpoint_refuses_a_file_of_another_catchpoint(self):
+        with tempfile.TemporaryDirectory() as t, slice_endpoint(SMALL_CP, 1500) as url:
+            ref = self._ref(t, url)
+            text = read(ref).decode().replace(CP_LABEL, "1000#" + CP_LABEL.split("#")[1])
+            with open(ref, "w", encoding="utf-8") as f:
+                f.write(text)
+            rc = ft.main(["fetch-catchpoint", "--ref", ref, "--dest", os.path.join(t, "c"),
+                          "--catchpoint-file", CP_TAR, "--allow-uncovered", "--workers", "2",
+                          "--retries", "1"])
+            self.assertEqual(rc, 1)
+
+    def test_the_tier_fetches_a_missing_testnet_catchpoint_corpus(self):
+        with tempfile.TemporaryDirectory() as t:
+            calls = []
+
+            class P:
+                returncode = 0
+
+            def fake_run(cmd, *a, **k):
+                calls.append(cmd)
+                return P()
+
+            with mock.patch.object(replay, "REPO", t), \
+                    mock.patch.dict(os.environ, {"BENCH_CORPUS": "testnet-catchpoint"}), \
+                    mock.patch.object(replay.subprocess, "run", fake_run):
+                os.environ.pop("BENCH_CORPUS_DIR", None)
+                with self.assertRaises(replay.TierError):  # the fake fetched nothing
+                    replay.resolve_corpus()
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][-1], "fetch-catchpoint")
+
+
 if __name__ == "__main__":
     unittest.main()

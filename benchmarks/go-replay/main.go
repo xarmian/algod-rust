@@ -94,8 +94,16 @@ type corpusMeta struct {
 		NodeConfig string `json:"node_config"`
 	} `json:"files"`
 	Rounds struct {
-		Last uint64 `json:"last"`
+		First uint64 `json:"first"`
+		Last  uint64 `json:"last"`
 	} `json:"rounds"`
+	// Start is set by a catchpoint-start corpus (issue #2293): blocks.bin then
+	// holds the rounds Rounds.First (the lookback before the catchpoint round)
+	// to Rounds.Last, and the replay starts from the catchpoint file.
+	Start *struct {
+		Catchpoint string `json:"catchpoint"`
+		File       string `json:"file"`
+	} `json:"start"`
 	Final map[string]any `json:"final_state"`
 }
 
@@ -208,21 +216,21 @@ func countInner(ad transactions.ApplyData) uint64 {
 
 // prepass decodes every record once, untimed: it checks the stream, counts
 // the work (top-level + inner txns) and collects the corpus.json account set.
-func prepass(path string, last, from uint64, g bookkeeping.Genesis) (blocks, txns, inner uint64, known []basics.Address, err error) {
+func prepass(path string, first, last, from uint64, g bookkeeping.Genesis) (blocks, txns, inner uint64, known []basics.Address, err error) {
 	br, err := openBlocks(path)
 	if err != nil {
 		return
 	}
 	defer br.close()
 	ks := newKnownSet(g)
-	for want := uint64(0); want <= last; want++ {
+	for want := first; want <= last; want++ {
 		rec, rerr := br.next()
 		if rerr != nil {
 			err = fmt.Errorf("blocks.bin ends before round %d: %v", want, rerr)
 			return
 		}
 		if rec.round != want {
-			err = fmt.Errorf("blocks.bin: record %d holds round %d", want, rec.round)
+			err = fmt.Errorf("blocks.bin: the record of round %d holds round %d", want, rec.round)
 			return
 		}
 		if want == 0 {
@@ -294,6 +302,13 @@ func main() {
 	if meta.Schema != "algod-corpus/v1" {
 		die("corpus.json: schema %q, want algod-corpus/v1", meta.Schema)
 	}
+	if *fromCP == "" && meta.Start != nil {
+		*fromCP = filepath.Join(*corpusDir, meta.Start.File)
+		*cpLabel = meta.Start.Catchpoint
+	}
+	if *fromCP == "" && meta.Rounds.First != 0 {
+		die("corpus.json: rounds.first %d needs a catchpoint start", meta.Rounds.First)
+	}
 	var fromRound uint64
 	if *fromCP != "" {
 		if *cpLabel == "" {
@@ -362,7 +377,7 @@ func main() {
 	log.SetOutput(os.Stderr)
 
 	blocksPath := filepath.Join(*corpusDir, meta.Files.Blocks)
-	nBlocks, nTxns, nInner, known, err := prepass(blocksPath, last, fromRound, genesis)
+	nBlocks, nTxns, nInner, known, err := prepass(blocksPath, meta.Rounds.First, last, fromRound, genesis)
 	if err != nil {
 		die("%v", err)
 	}
@@ -391,20 +406,26 @@ func main() {
 		die("%v", err)
 	}
 	defer br.close()
-	rec0, err := br.next()
-	if err != nil {
-		die("%v", err)
-	}
-	blk0, _, err := processBlockBytes(rec0.payload, 0)
-	if err != nil {
-		die("%v", err)
-	}
-	ours, err := l.Block(0)
-	if err != nil {
-		die("%v", err)
-	}
-	if ours.Hash() != blk0.Hash() {
-		die("the ledger's genesis block %s differs from the corpus's round 0 %s", ours.Hash(), blk0.Hash())
+	// The corpus's first record: round 0 (the genesis block, checked against
+	// the ledger's) or, for a catchpoint corpus, the first lookback round.
+	held := map[uint64]record{}
+	if meta.Rounds.First == 0 {
+		rec0, err := br.next()
+		if err != nil {
+			die("%v", err)
+		}
+		blk0, _, err := processBlockBytes(rec0.payload, 0)
+		if err != nil {
+			die("%v", err)
+		}
+		ours, err := l.Block(0)
+		if err != nil {
+			die("%v", err)
+		}
+		if ours.Hash() != blk0.Hash() {
+			die("the ledger's genesis block %s differs from the corpus's round 0 %s", ours.Hash(), blk0.Hash())
+		}
+		held[0] = rec0
 	}
 	var avv *agreement.AsyncVoteVerifier
 	if !meta.Network.DevMode && cfg.CatchupVerifyCertificate() {
@@ -417,8 +438,11 @@ func main() {
 	// ledger is restored from the file, and the replay goes on after it.
 	var restoreS float64
 	if *fromCP != "" {
-		held := map[uint64]record{0: rec0}
-		for r := uint64(1); r <= fromRound; r++ {
+		next := meta.Rounds.First
+		if next == 0 {
+			next = 1
+		}
+		for r := next; r <= fromRound; r++ {
 			rec, err := br.next()
 			if err != nil {
 				die("blocks.bin ends before the catchpoint round %d: %v", fromRound, err)

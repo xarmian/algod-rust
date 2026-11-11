@@ -30,8 +30,16 @@ Inputs (environment):
                             authenticate every certificate; fetched with
                             scripts/bench/corpus/fetch_testnet.py into
                             benchmarks/corpus/testnet-head when missing, issue
-                            #2119) or `testnet-prefix50` (its committed
-                            50-round slice)
+                            #2119), `testnet-prefix50` (its committed
+                            50-round slice), `testnet-catchpoint` (a real
+                            testnet catchpoint plus the rounds after it, so
+                            the replay holds proposer payouts, state proofs
+                            and apps: both sides start from the catchpoint
+                            file; fetched with fetch_testnet.py
+                            fetch-catchpoint when missing, issue #2293, see
+                            docs/BENCH_CATCHPOINT_REPLAY.md) or
+                            `small-catchpoint` (the small corpus cut at a
+                            catchpoint go generated, committed)
   BENCH_CORPUS_DIR          an explicit corpus directory (overrides the name)
   BENCH_REPLAY_WARMUP       discarded warm-up runs per side (default 1)
   BENCH_REPLAY_ROUNDS       replay only rounds 1..N (bisecting; no corpus gate)
@@ -238,6 +246,15 @@ def resolve_corpus():
             raise TierError(f"fetch_testnet.py exited {rc}: the testnet endpoint must be "
                             "reachable once (docs/BENCHMARK_COMPARISON.md, \"The testnet-head "
                             "corpus\"), or pass BENCH_CORPUS_DIR")
+    if name == "testnet-catchpoint" and not os.path.isfile(os.path.join(d, "corpus.json")):
+        print("replay: fetching the testnet-catchpoint corpus "
+              "(scripts/bench/corpus/fetch_testnet.py fetch-catchpoint)", flush=True)
+        rc = subprocess.run([sys.executable, os.path.join(BENCH, "corpus", "fetch_testnet.py"),
+                             "fetch-catchpoint"]).returncode
+        if rc != 0:
+            raise TierError(f"fetch_testnet.py fetch-catchpoint exited {rc}: the testnet "
+                            "endpoint and a catchpoint relay must be reachable once "
+                            "(docs/BENCH_CATCHPOINT_REPLAY.md), or pass BENCH_CORPUS_DIR")
     if not os.path.isfile(os.path.join(d, "corpus.json")):
         raise TierError(f"no corpus at {d}")
     check_cache_pin(d, name)

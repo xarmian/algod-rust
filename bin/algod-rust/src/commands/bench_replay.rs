@@ -269,8 +269,11 @@ pub struct ReplayResult {
 /// (`participate::fetch_block_via_unicast_peers`).
 pub struct CorpusBlockFetcher {
     file: Mutex<File>,
-    /// `(offset, len)` of the payload of round `i`.
+    /// `(offset, len)` of the payload of round `first + i`.
     index: Vec<(u64, u32)>,
+    /// The first round of the corpus: 0, or the first lookback round of a
+    /// catchpoint corpus (issue #2293).
+    first: u64,
     last: u64,
     /// The last fetch failure of a round the replay needs (the catchup
     /// service only logs those at debug level), for the error message.
@@ -279,7 +282,7 @@ pub struct CorpusBlockFetcher {
 
 impl CorpusBlockFetcher {
     fn read(&self, round: u64) -> std::io::Result<Vec<u8>> {
-        let (off, len) = self.index[round as usize];
+        let (off, len) = self.index[(round - self.first) as usize];
         let mut buf = vec![0u8; len as usize];
         let mut f = self
             .file
@@ -322,7 +325,11 @@ impl CorpusBlockFetcher {
 impl BlockFetcher for CorpusBlockFetcher {
     fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
         // Past the last round is the normal end of a sync pass, not an error.
-        if round.0 == 0 || round.0 > self.last || round.0 as usize >= self.index.len() {
+        if round.0 == 0
+            || round.0 < self.first
+            || round.0 > self.last
+            || ((round.0 - self.first) as usize) >= self.index.len()
+        {
             return Err(FetchError::NoBlockForRound { round });
         }
         let res = self.fetch(round);
@@ -477,13 +484,15 @@ struct Prepass {
     txns: u64,
     inner: u64,
     known: Vec<algo_types::Address>,
-    block0: Block,
+    /// The genesis block (round 0), when the corpus starts there.
+    block0: Option<Block>,
 }
 
 /// Decode every record once (untimed): index `blocks.bin`, count the work
 /// and collect `corpus.json`'s account set.
 fn prepass(
     blocks_path: &Path,
+    first: u64,
     last: u64,
     from: u64,
     genesis: &algo_ledger::genesis::GenesisJson,
@@ -500,20 +509,20 @@ fn prepass(
         bail!("{}: bad magic", blocks_path.display());
     }
     let mut offset = magic.len() as u64;
-    let mut index = Vec::with_capacity(last as usize + 1);
+    let mut index = Vec::with_capacity((last - first) as usize + 1);
     let mut hist = Histogram::default();
     let mut known = KnownSet::new(genesis).map_err(|e| anyhow!(e))?;
     let mut txns = 0u64;
     let mut block0 = None;
     let mut payload = Vec::new();
-    for i in 0..=last {
+    for i in first..=last {
         let mut hdr = [0u8; 12];
         r.read_exact(&mut hdr)
             .with_context(|| format!("blocks.bin ends before round {i}"))?;
         let round = u64::from_be_bytes(hdr[..8].try_into().expect("8 bytes"));
         let len = u32::from_be_bytes(hdr[8..].try_into().expect("4 bytes"));
         if round != i {
-            bail!("blocks.bin record {i} holds round {round}");
+            bail!("blocks.bin: the record of round {i} holds round {round}");
         }
         payload.resize(len as usize, 0);
         r.read_exact(&mut payload)
@@ -541,7 +550,7 @@ fn prepass(
         txns,
         inner: hist.features.get("inner_txns").copied().unwrap_or(0),
         known: known.addresses().to_vec(),
-        block0: block0.ok_or_else(|| anyhow!("blocks.bin has no round 0"))?,
+        block0,
     })
 }
 
@@ -603,7 +612,27 @@ pub fn replay_corpus(args: &ReplayCorpusArgs) -> anyhow::Result<ReplayResult> {
     crate::falcon_backend::apply_falcon_backend(&node_config)?;
 
     let blocks_path = file("blocks")?;
-    let from_round = match &args.from_catchpoint {
+    let corpus_first = meta["rounds"]["first"].as_u64().unwrap_or(0);
+    // A catchpoint corpus carries its start; an explicit argument overrides it.
+    let from_catchpoint = match (&args.from_catchpoint, meta.get("start")) {
+        (Some(c), _) => Some(c.clone()),
+        (None, Some(st)) if st.is_object() => Some(CatchpointStart {
+            file: args.corpus.join(
+                st["file"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("corpus.json: start.file missing"))?,
+            ),
+            label: st["catchpoint"]
+                .as_str()
+                .ok_or_else(|| anyhow!("corpus.json: start.catchpoint missing"))?
+                .to_string(),
+        }),
+        (None, _) => None,
+    };
+    if from_catchpoint.is_none() && corpus_first != 0 {
+        bail!("corpus.json: rounds.first {corpus_first} needs a catchpoint start");
+    }
+    let from_round = match &from_catchpoint {
         Some(c) => {
             algo_ledger::catchpoint::parse_catchpoint_label(&c.label)
                 .map_err(|e| anyhow!("--catchpoint-label {}: {e}", c.label))?
@@ -611,10 +640,10 @@ pub fn replay_corpus(args: &ReplayCorpusArgs) -> anyhow::Result<ReplayResult> {
         }
         None => 0,
     };
-    if args.from_catchpoint.is_some() && from_round >= last {
+    if from_catchpoint.is_some() && from_round >= last {
         bail!("the catchpoint is for round {from_round}, nothing to replay up to round {last}");
     }
-    let pre = prepass(&blocks_path, last, from_round, &genesis)?;
+    let pre = prepass(&blocks_path, corpus_first, last, from_round, &genesis)?;
 
     // participate's ledger open + genesis seed, then node.rs's devmode flag.
     let ledger_path = args.data_dir.join(&genesis_id).join("ledger");
@@ -635,11 +664,12 @@ pub fn replay_corpus(args: &ReplayCorpusArgs) -> anyhow::Result<ReplayResult> {
     let corpus_fetcher = Arc::new(CorpusBlockFetcher {
         file: Mutex::new(File::open(&blocks_path)?),
         index: pre.index.clone(),
+        first: corpus_first,
         last,
         last_error: Mutex::new(None),
     });
     let mut catchpoint_restore_s = None;
-    let ledger = if let Some(c) = &args.from_catchpoint {
+    let ledger = if let Some(c) = &from_catchpoint {
         // A catchpoint start (issue #2292): the production catchup flow with
         // the corpus as the network; the timed replay begins after it.
         let t0 = Instant::now();
@@ -671,7 +701,11 @@ pub fn replay_corpus(args: &ReplayCorpusArgs) -> anyhow::Result<ReplayResult> {
             let hdr = ledger
                 .get_block_header_data(0)?
                 .ok_or_else(|| anyhow!("no genesis block after seeding"))?;
-            let ours = algo_codec::canonical_encode_block_header_from_block(&pre.block0);
+            let block0 = pre
+                .block0
+                .as_ref()
+                .ok_or_else(|| anyhow!("blocks.bin has no round 0"))?;
+            let ours = algo_codec::canonical_encode_block_header_from_block(block0);
             if hdr != ours {
                 bail!("algod-rust's genesis block differs from the corpus's round 0 block");
             }
@@ -800,7 +834,7 @@ pub fn replay_corpus(args: &ReplayCorpusArgs) -> anyhow::Result<ReplayResult> {
         ("DevMode".into(), genesis.devmode.into()),
     ]);
     let mut config = config;
-    if let (Some(c), Some(s)) = (&args.from_catchpoint, catchpoint_restore_s) {
+    if let (Some(c), Some(s)) = (&from_catchpoint, catchpoint_restore_s) {
         config.insert("from_catchpoint".into(), c.label.clone().into());
         config.insert("catchpoint_restore_s".into(), s.into());
     }
@@ -960,6 +994,42 @@ mod tests {
         );
     }
 
+    /// A catchpoint corpus (issue #2293) carries its start: blocks.bin holds
+    /// the lookback before the catchpoint round and the rounds after it, and
+    /// the replay needs no extra argument. Both harnesses reach the state go
+    /// recorded for it, replaying only rounds 1501..2000.
+    #[test]
+    fn a_catchpoint_corpus_starts_from_its_catchpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmarks/corpus/small-catchpoint");
+        let res = replay_corpus(&ReplayCorpusArgs {
+            corpus,
+            data_dir: tmp.path().join("node"),
+            config: None,
+            rounds: None,
+            dump_state: None,
+            from_catchpoint: None,
+        })
+        .unwrap();
+        assert_eq!(
+            res.corpus_mismatches,
+            Vec::<String>::new(),
+            "differs from corpus.json"
+        );
+        assert_eq!(res.corpus_match, Some(true));
+        assert_eq!(res.metrics.blocks, 500);
+        let recorded: FinalState = serde_json::from_slice(
+            &std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../benchmarks/go-replay/testdata/small-catchpoint-final-state.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(res.final_state, recorded);
+    }
+
     /// The label authenticates the file: a changed hash is refused.
     #[test]
     fn a_wrong_catchpoint_label_is_refused() {
@@ -1023,6 +1093,7 @@ mod tests {
         let f = CorpusBlockFetcher {
             file: Mutex::new(File::open(&path).unwrap()),
             index: vec![(0, 0), (0, 4)],
+            first: 0,
             last: 1,
             last_error: Mutex::new(None),
         };

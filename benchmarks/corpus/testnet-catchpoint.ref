@@ -3,6 +3,10 @@
 # docs/BENCH_CATCHPOINT_REPLAY.md.
 endpoint=https://testnet-api.algonode.cloud
 genesis_hash=SGO1GKSzyE7IEPItTxCByw9x8FmnrCDexi9/cOUJOiI=
+# A relay serving the catchpoint file (GET /v1/<genesis id>/ledger/<round in base 36>);
+# the file is checked against the label above, and both harnesses check the state
+# against the label again, so which relay served it does not matter.
+catchpoint_source=http://r-5i.algorand-testnet.network:4161
 catchpoint=69120000#HV3VUPYHFFFV5DQ4KAJ7UL7KU7SB5TV2W4TMITNE65XTR7IKBKLQ
 catchpoint_round=69120000
 rounds=200
