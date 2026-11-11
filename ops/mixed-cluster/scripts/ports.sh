@@ -113,6 +113,32 @@ phase6_check_ports_free() {
     return 0
 }
 
+# Wait until none of the given host ports is bound any more (issue #2280
+# follow-up). `docker compose down` returns once the containers are removed,
+# but on a CI runner the published ports can stay bound for a moment after it
+# (the next start then fails the bound-port check above); callers that stop a
+# cluster and start another one wait here in between.
+#   phase6_wait_ports_free <timeout seconds> <port>...
+# Returns 0 as soon as all are free, 1 after the timeout (naming the ports
+# that are still bound, on stderr).
+phase6_wait_ports_free() {
+    local timeout="$1" port waited=0 busy
+    shift
+    while :; do
+        busy=""
+        for port in "$@"; do
+            if phase6_port_in_use "$port"; then busy="$busy $port"; fi
+        done
+        [ -z "$busy" ] && return 0
+        if [ "$waited" -ge "$timeout" ]; then
+            echo "error: host port(s)$busy still bound after ${timeout}s" >&2
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
 # The cluster's own nodes: a port is only exempt from the probe when the
 # node's own container (phase6-<name>) is running and publishes exactly that
 # host port -- `docker compose up` then leaves it alone. A running cluster on

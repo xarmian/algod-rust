@@ -812,6 +812,7 @@ consensus-cluster-analyzer: ## Unit-test the #470 soak-analyzer logic (no Docker
 	bash $(PHASE6_CLUSTER)/scripts/cert_window_shell_test.sh
 	bash $(PHASE6_CLUSTER)/scripts/db_snapshot_shell_test.sh
 	bash $(PHASE6_CLUSTER)/scripts/ports_shell_test.sh
+	bash $(PHASE6_CLUSTER)/scripts/tx_gossip_topology_shell_test.sh
 	python3 ops/mixed-cluster-p2p/scripts/archival_wiring_test.py
 	bash ops/mixed-cluster-p2p/scripts/verify_soak_cert_latest_shell_test.sh
 	bash $(PHASE6_CLUSTER)/scripts/restart_rejoin_kill_shell_test.sh
