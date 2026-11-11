@@ -310,7 +310,7 @@ pub const DEFAULT_LEDGER_SYNCHRONOUS_MODE: i64 = 2;
 /// [`open_ledger_connection_with_sync_mode`] (catchpoint import/verify and
 /// other bulk-loading maintenance). Not applied to read-only connections
 /// (snapshots, the lazy trie loader, the read pool), which never restart the
-/// WAL, nor to the block archive file. No `config.json` field: the value is a
+/// WAL. The block archive file has its own limit, [`DEFAULT_BLOCK_WAL_SIZE_LIMIT`]. No `config.json` field: the value is a
 /// disk-space safety net far above any working set, not a tuning knob.
 // DIVERGENCE DIV-008: journal_size_limit on the tracker, go sets none (issue #2206).
 pub const DEFAULT_TRACKER_WAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
@@ -329,6 +329,38 @@ fn apply_tracker_wal_size_limit(conn: &Connection, bytes: i64) -> Result<(), Alg
     conn.execute_batch(&format!("PRAGMA main.journal_size_limit={bytes};"))
         .map_err(|e| AlgoError::Ledger {
             message: format!("journal_size_limit pragma error: {e}"),
+        })
+}
+
+/// Default `journal_size_limit` of the block archive file, in bytes (issue
+/// #2205). The Docker `catchup` tier left `ledger.block.sqlite-wal` at 248 MB
+/// beside a 4 MB block file after a betanet catchup (60 KB block bodies): a
+/// reader (or the lookback import's one large transaction) had let the WAL
+/// grow, and SQLite keeps a WAL file at its peak size after the restart unless
+/// this limit cuts it back. Same reasoning and same marker as
+/// [`DEFAULT_TRACKER_WAL_SIZE_LIMIT`]; 32 MiB is far above the WAL of a normal
+/// block commit (about 60 KB).
+// DIVERGENCE DIV-008: journal_size_limit on the block archive, go sets none (issue #2205).
+pub const DEFAULT_BLOCK_WAL_SIZE_LIMIT: i64 = 32 * 1024 * 1024;
+
+/// `PRAGMA <schema>.journal_size_limit` on a connection that writes the block
+/// archive file (`blockdb` on the ledger connection, `main` on the archive
+/// writer). A negative value would mean "no limit" and is rejected.
+fn apply_block_wal_size_limit(
+    conn: &Connection,
+    schema: &str,
+    bytes: i64,
+) -> Result<(), AlgoError> {
+    if bytes < 0 {
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "journal_size_limit must not be negative (SQLite reads that as 'no limit'), got {bytes}"
+            ),
+        });
+    }
+    conn.execute_batch(&format!("PRAGMA {schema}.journal_size_limit={bytes};"))
+        .map_err(|e| AlgoError::Ledger {
+            message: format!("block journal_size_limit pragma error: {e}"),
         })
 }
 
@@ -2439,6 +2471,8 @@ pub struct SqliteLedger {
     archive_writer: Option<Connection>,
     /// The `synchronous` level the archive writer was last configured with.
     archive_writer_sync: i64,
+    /// The block archive file's `journal_size_limit` (issue #2205).
+    block_wal_limit: i64,
     /// Current `synchronous` level (shared by the main connection, both
     /// schemas, and the archive writer).
     synchronous_mode: std::sync::atomic::AtomicI64,
@@ -3107,6 +3141,8 @@ impl SqliteLedger {
         crate::follow_timing::install_wal_checkpoint_hook(&conn);
         // Issue #2206: cut the tracker WAL file back after a long pin.
         apply_tracker_wal_size_limit(&conn, DEFAULT_TRACKER_WAL_SIZE_LIMIT)?;
+        // Issue #2205: and the block archive file attached as `blockdb`.
+        apply_block_wal_size_limit(&conn, "blockdb", DEFAULT_BLOCK_WAL_SIZE_LIMIT)?;
 
         // G12 (TASK-109): refuse pre-v3 tracker DBs cleanly before
         // schema creation. Go's `performResourceTableMigration`
@@ -3345,6 +3381,7 @@ impl SqliteLedger {
             pending_archive: PendingArchive::default(),
             archive_writer: None,
             archive_writer_sync: DEFAULT_LEDGER_SYNCHRONOUS_MODE,
+            block_wal_limit: DEFAULT_BLOCK_WAL_SIZE_LIMIT,
             synchronous_mode: std::sync::atomic::AtomicI64::new(DEFAULT_LEDGER_SYNCHRONOUS_MODE),
             archive_inflight: std::sync::Arc::new(crate::read_pool::ArchiveInflight::default()),
             block_path: None,
@@ -4102,6 +4139,18 @@ impl SqliteLedger {
     /// would disable the limit).
     pub fn set_tracker_wal_size_limit(&self, bytes: i64) -> Result<(), AlgoError> {
         apply_tracker_wal_size_limit(&self.conn, bytes)
+    }
+
+    /// Set the block archive file's `journal_size_limit` (issue #2205), on the
+    /// ledger connection's `blockdb` schema and on the archive writer. See
+    /// [`DEFAULT_BLOCK_WAL_SIZE_LIMIT`]. A negative value is rejected.
+    pub fn set_block_wal_size_limit(&mut self, bytes: i64) -> Result<(), AlgoError> {
+        apply_block_wal_size_limit(&self.conn, "blockdb", bytes)?;
+        if let Some(w) = self.archive_writer.as_ref() {
+            apply_block_wal_size_limit(w, "main", bytes)?;
+        }
+        self.block_wal_limit = bytes;
+        Ok(())
     }
 
     /// Override the SQLite `synchronous` pragma on the main ledger
@@ -7679,6 +7728,7 @@ impl SqliteLedger {
                 .map_err(|e| AlgoError::Ledger {
                     message: format!("archive writer configure: {e}"),
                 })?;
+            apply_block_wal_size_limit(&conn, "main", self.block_wal_limit)?;
             self.archive_writer_sync = mode;
             self.archive_writer = Some(conn);
         }
@@ -18643,6 +18693,7 @@ mod tests {
             pending_archive: _,             // dropped by abort_block_state
             archive_writer: _,              // connection, no chain state
             archive_writer_sync: _,         // connection setting
+            block_wal_limit: _,             // connection setting
             synchronous_mode: _,            // connection setting
             archive_inflight: _,            // read-pool visibility flag
             block_path: _,                  // attached file
