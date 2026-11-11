@@ -1174,3 +1174,101 @@ fn bench_block_commit_archive_first() {
         }
     }
 }
+
+/// Issue #2205: the block archive's WAL stays bounded over a replay. The
+/// Docker `catchup` tier (betanet, Linux) left `ledger.block.sqlite-wal` at
+/// 248 MB next to a 4 MB block file after ~15,000 blocks (60 KB bodies): inside
+/// the span the ledger connection reads `blockdb`, and its read mark meets the
+/// archive writer's commit, so SQLite never restarts the WAL (76 MB over the 600
+/// blocks of this test without the between-blocks truncate, 4 MB with it).
+#[test]
+fn the_block_archive_wal_stays_bounded_over_a_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = dir.path().join("ledger");
+    let mut ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+    ledger.set_synchronous_mode(1).unwrap();
+    let block_db = algo_ledger::block_path_for_prefix(&prefix);
+    let blk = vec![0xAB; 60_000];
+    let mut peak = 0u64;
+    for round in 1..=600u64 {
+        ledger.begin_block().unwrap();
+        // apply reads the previous header (`blockdb`) inside the span: the main
+        // connection then holds a read mark on the block WAL, which the archive
+        // writer's commit (same span) meets, so SQLite cannot restart the WAL.
+        let _ = ledger.get_block_header_data(round - 1);
+        ledger
+            .put_block(round, "test", &test_header(round), &blk)
+            .unwrap();
+        ledger.put_block_cert(round, &test_cert(round)).unwrap();
+        ledger.set_current_round(Round(round));
+        ledger.commit_block().unwrap();
+        peak = peak.max(wal_len(&block_db));
+    }
+    println!("block WAL peak over 600 blocks of 60 KB: {peak} B");
+    assert!(
+        peak < 16 * 1024 * 1024,
+        "the block archive WAL grew to {peak} B over 600 blocks (36 MB of bodies)"
+    );
+}
+
+/// Issue #2205: a reader that pins the block archive WAL for a while (the
+/// catchup lookback import writes ~1000 blocks in one transaction; a REST
+/// reader can overlap commits) leaves a WAL file at its peak size for good:
+/// SQLite restarts the WAL but never shortens the file without
+/// `journal_size_limit`. With the limit the next restart cuts it back.
+#[test]
+fn the_block_archive_wal_file_returns_to_its_limit_after_a_pin_ends() {
+    const LIMIT: i64 = 1024 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = dir.path().join("ledger");
+    let mut ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+    ledger.set_synchronous_mode(1).unwrap();
+    ledger.set_block_wal_size_limit(LIMIT).unwrap();
+    let block_db = algo_ledger::block_path_for_prefix(&prefix);
+    let blk = vec![0xAB; 60_000];
+    let commit = |ledger: &mut SqliteLedger, round: u64| {
+        ledger.begin_block().unwrap();
+        ledger
+            .put_block(round, "test", &test_header(round), &blk)
+            .unwrap();
+        ledger.put_block_cert(round, &test_cert(round)).unwrap();
+        ledger.set_current_round(Round(round));
+        ledger.commit_block().unwrap();
+    };
+    commit(&mut ledger, 1);
+
+    // A reader pins the block WAL while 200 blocks (12 MB) are committed.
+    let reader = Connection::open(&block_db).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM blocks", [], |r| r.get(0))
+        .unwrap();
+    for round in 2..=200u64 {
+        commit(&mut ledger, round);
+    }
+    let pinned = wal_len(&block_db);
+    assert!(
+        pinned > 8 * 1024 * 1024,
+        "the pin should have grown the WAL: {pinned} B"
+    );
+    drop(reader);
+
+    // The next commits restart the WAL; the file is cut back to the limit.
+    for round in 201..=203u64 {
+        commit(&mut ledger, round);
+    }
+    let after = wal_len(&block_db);
+    assert!(
+        after <= LIMIT as u64,
+        "the block WAL file must shrink to journal_size_limit ({LIMIT} B), but it is {after} B (it was {pinned} B pinned)"
+    );
+}
+
+/// A negative limit would mean "no limit" in SQLite and is rejected.
+#[test]
+fn a_negative_block_wal_limit_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ledger = SqliteLedger::open_with_prefix(&dir.path().join("ledger")).unwrap();
+    assert!(ledger.set_block_wal_size_limit(-1).is_err());
+    assert!(ledger.set_block_wal_size_limit(0).is_ok());
+}
