@@ -763,6 +763,14 @@ class PlanCatchpointTests(unittest.TestCase):
         self.assertGreaterEqual(int(ref["rounds"]), 1)
         self.assertEqual(ref["genesis_hash"], ft.read_ref(REF)["genesis_hash"])
         self.assertTrue(os.path.isfile(os.path.join(REPO, "docs", "BENCH_CATCHPOINT_REPLAY.md")))
+        # the committed final state (derived from the go replay, identical to
+        # the Rust one) is for the last round of the planned range
+        with open(os.path.join(REPO, ref["final_state"]), encoding="utf-8") as f:
+            fs = json.load(f)
+        self.assertEqual(fs["round"], rnd + int(ref["rounds"]))
+        self.assertEqual(sorted(fs), sorted(ft.STATE_KEYS + ("round", "block_hash",
+                                                             "txn_counter")))
+        self.assertTrue(ref["catchpoint_source"].startswith("http"))
 
 
 SMALL_CP = os.path.join(REPO, "benchmarks", "corpus", "small-catchpoint")
