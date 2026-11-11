@@ -458,6 +458,12 @@ func TestCatchpointStartMatchesStraightReplay(t *testing.T) {
 	if st, err := os.Stat(cpFile); err != nil || st.Size() == 0 {
 		t.Fatalf("catchpoint file: %v", err)
 	}
+	// testdata/small-catchpoint-1000.{tar,label} is this catchpoint, kept for
+	// the Rust replay's test (bin/algod-rust bench_replay, issue #2292): if go
+	// now generates another one, regenerate it.
+	if want, err := os.ReadFile("testdata/small-catchpoint-1000.label"); err != nil || strings.TrimSpace(string(want)) != label {
+		t.Fatalf("testdata/small-catchpoint-1000.label (%v) is not the generated catchpoint %s; regenerate the fixture", err, label)
+	}
 
 	out := filepath.Join(dir, "from.json")
 	code, stderr = runReplay(t, "-corpus", smallCorpus, "-data", filepath.Join(dir, "from"),
