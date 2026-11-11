@@ -26,6 +26,11 @@
 #   5. docker compose up -d --build rust-node-4 (or, with
 #      PHASE6_SKIP_BUILD=1, reuse a pre-built algod-rust-phase6:local).
 #
+# Env: PHASE6_TOPOLOGY=default|rust-relay|go-relay (issue #2280; default
+# `default` = the historical topology, unchanged) isolates go-node-3 (a Go
+# PARTICIPATION node, 30% of the stake) behind ONE relay: rust-node-4 (a Rust
+# relay) or, as the control, go-node-1 (a Go relay). See topology.py.
+#
 # Env: PHASE6_GO_ARCHIVAL=1 sets Archival=true on the three Go relays AND the
 # Rust node so a long soak can still be verified after the fact (issues
 # #1674, #1777); the default keeps go-algorand's non-archival block pruning.
@@ -36,6 +41,17 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=ports.sh
 source "$HERE/ports.sh"  # PHASE6_HOST_PORT_BASE -> PHASE6_*_PORT (issue #1956)
 ROOT="$(cd "$HERE/.." && pwd)"
+
+# Peer graph (issue #2280): the PHASE6_*_PEERS the compose file interpolates,
+# go-node-3's NetAddress and whether the Rust node force-relays gossip.
+PHASE6_TOPOLOGY="${PHASE6_TOPOLOGY:-default}"
+if ! TOPOLOGY_ENV="$(python3 "$HERE/topology.py" env "$PHASE6_TOPOLOGY" | tr -d '\r')"; then
+    echo "error: PHASE6_TOPOLOGY='$PHASE6_TOPOLOGY' is not a topology (default, rust-relay, go-relay)" >&2
+    exit 1
+fi
+while IFS= read -r topo_line; do
+    [ -n "$topo_line" ] && export "$topo_line"
+done <<< "$TOPOLOGY_ENV"
 
 NETROOT="$ROOT/netroot"
 TEMPLATE="$ROOT/template.json"
@@ -74,6 +90,7 @@ host_path() {
 }
 
 echo "==> phase6 mixed-cluster start"
+echo "    topology: $PHASE6_TOPOLOGY (go-node-3 peers: $PHASE6_GO3_PEERS)"
 echo "    netroot:  $NETROOT"
 echo "    template: $TEMPLATE"
 
@@ -170,6 +187,10 @@ for node in Node1 Node2 Node3 Node4Rust Node5Go; do
     # endpoint — it accepts no inbound peers either.
     if [ "$node" = "Node4Rust" ] || [ "$node" = "Node5Go" ]; then
         NET_ADDRESS=""
+    elif [ "$node" = "Node3" ]; then
+        # go-node-3's own NetAddress: the relay's 0.0.0.0:4161 by default, ""
+        # (a non-relay that only dials out) in the isolated topologies.
+        NET_ADDRESS="$PHASE6_GO3_NET_ADDRESS"
     else
         NET_ADDRESS="0.0.0.0:4161"
     fi
@@ -178,7 +199,7 @@ for node in Node1 Node2 Node3 Node4Rust Node5Go; do
     # Issue #1674: a non-archival go-algorand node prunes blocks older than
     # ~MaxTxnLife (1000) rounds, which breaks any post-hoc verification
     # (fork detector, block-byte comparison) of a long soak. Opt in per run.
-    if [ "${PHASE6_GO_ARCHIVAL:-0}" = "1" ] && [ -n "$NET_ADDRESS" ]; then
+    if [ "${PHASE6_GO_ARCHIVAL:-0}" = "1" ] && { [ -n "$NET_ADDRESS" ] || [ "$node" = "Node3" ]; }; then
         CFG_KVS+=("Archival=true")
     fi
     for kv in "${CFG_KVS[@]}"; do
@@ -340,6 +361,29 @@ print(json.dumps(cfg))
     mv "$RUST_DATA_DIR/config.json.new" "$RUST_DATA_DIR/config.json"
 fi
 
+# -- 4g. Rust relay (issue #2280) --------------------------------------------
+# In the rust-relay topology go-node-3's only peer is rust-node-4, which must
+# then forward gossip between it and go-node-1/go-node-2 like a go relay does:
+# ForceRelayMessages (go's key; "effective relay" in `participate`). Set or
+# REMOVED on every start, so a config.json kept by REUSE_NETROOT=1 cannot carry
+# a stale value.
+EXISTING_CFG="{}"
+[ -f "$RUST_DATA_DIR/config.json" ] && EXISTING_CFG="$(cat "$RUST_DATA_DIR/config.json")"
+if [ "$PHASE6_RUST_FORCE_RELAY" = "1" ] || [ -f "$RUST_DATA_DIR/config.json" ]; then
+    [ "$PHASE6_RUST_FORCE_RELAY" = "1" ] && echo "==> rust-node-4 ForceRelayMessages=true (topology $PHASE6_TOPOLOGY)"
+    python3 -c "
+import json, sys
+text = sys.argv[1].strip()
+cfg = json.loads(text) if text else {}
+if sys.argv[2] == '1':
+    cfg['ForceRelayMessages'] = True
+else:
+    cfg.pop('ForceRelayMessages', None)
+print(json.dumps(cfg))
+" "$EXISTING_CFG" "$PHASE6_RUST_FORCE_RELAY" | tr -d '\r' > "$RUST_DATA_DIR/config.json.new"
+    mv "$RUST_DATA_DIR/config.json.new" "$RUST_DATA_DIR/config.json"
+fi
+
 # -- 5. Start the Go nodes, then the Rust node -----------------------------
 cd "$ROOT"
 export PHASE6_GENESIS_ID="$GENESIS_ID"
@@ -373,6 +417,7 @@ cat > "$ENV_FILE" <<EOF
 PHASE6_GENESIS_ID=$GENESIS_ID
 PHASE6_GENESIS_HASH=$GENESIS_HASH
 PHASE6_HOST_PORT_BASE=$PHASE6_HOST_PORT_BASE
+$TOPOLOGY_ENV
 EOF
 
 # PHASE6_SKIP_BUILD=1 uses whatever `algod-rust-phase6:local` already

@@ -548,6 +548,37 @@ mount, read, and serve the Rust-written rounds without schema errors
 handoff (Go advances atop Rust-written state, Rust verifies, etc.)
 is Phase C / PLAN-37 territory.
 
+## Isolated Go participation node (issue #2280)
+
+The default topology is unchanged. `PHASE6_TOPOLOGY=rust-relay|go-relay` (read by
+`scripts/start.sh`, peer graphs in `scripts/topology.py`) isolates **go-node-3**, a Go
+participation node holding 30 % of the stake, behind ONE relay:
+
+| topology | go-node-3's only peer | who else peers with whom |
+| --- | --- | --- |
+| `default` | (all three Go relays) | unchanged |
+| `rust-relay` | `rust-node-4:4162` (Rust relay, `ForceRelayMessages`) | go-node-1 <-> go-node-2, rust-node-4 dials go-node-1/2; nobody dials go-node-3 |
+| `go-relay` (control) | `go-node-1:4161` (Go relay) | the same graph with a Go relay where the Rust relay was |
+
+In `rust-relay` the chain only reaches certification quorum if the Rust relay forwards go-node-3's
+votes (go-node-1 + go-node-2 + rust-node-4 hold 70 % of the stake, below the 74.1 % threshold).
+
+    PHASE6_TOPOLOGY=rust-relay OUT_DIR=./out scripts/tx-gossip-topology.sh   # exit 0 = every pair ok
+
+`tx-gossip-topology.sh` starts the cluster, waits for every node to pass round 12, runs
+`tx_gossip.py --topology ...` (sources go-node-3, go-node-1, rust-node-4; every other node is a
+target) and then verifies from the Go nodes' own `ConnectedOut` / `ConnectedIn` log events that
+go-node-3 dialed only its planned relay, accepted nothing and was dialed by nobody
+(`topology.py verify`, written to `topology-check.log`). CI: the dispatch-only workflow
+`Mixed-cluster TX gossip topology`. Unit tests: `topology_test.py`, `tx_gossip_test.py` (no Docker).
+
+Local result (Docker Desktop, 7 runs per topology, 12 payments per source, 2.7 s rounds): all 14
+runs pass, every pair got all 12 payments in its pool with `absent = 0`, the topology check passed
+14 of 14, commit rounds 2 (3 in two rust-relay runs). Typical first-sighting latency 0.15 to 0.5 s
+in both topologies; occasionally a whole payment set takes one round (2.4 to 3.8 s, still inside the
+6 s budget): Rust-originated sets in 4 of 7 `go-relay` and 2 of 7 `rust-relay` runs, go-node-3's sets
+through the Rust relay in 2 of 7 (none in the Go-relay control): issue #2301.
+
 ## Host ports
 
 All bindings are on `127.0.0.1` — the harness never listens on a

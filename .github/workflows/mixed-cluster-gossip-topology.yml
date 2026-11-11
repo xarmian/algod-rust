@@ -1,0 +1,99 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Mixed-cluster TX gossip topology
+
+# Issue #2280 (follow-up of #2154): transaction gossip when a Go PARTICIPATION
+# node (go-node-3, 30 % of the stake) is connected to the rest of the mixed
+# cluster through ONE relay only:
+#
+#   rust-relay   its only peer is rust-node-4 (a Rust relay)
+#   go-relay     the control: its only peer is go-node-1 (a Go relay)
+#
+# `ops/mixed-cluster/scripts/tx-gossip-topology.sh` starts the cluster with
+# PHASE6_TOPOLOGY, waits for every node to pass round 12, runs `tx_gossip.py`
+# (sources go-node-3, go-node-1, rust-node-4, targets every other node), and
+# checks from the Go nodes' own connection logs that go-node-3 really was
+# isolated as planned. Dispatch-only: it is not part of the nightly until it
+# has proven stable (the default topology and its tx_gossip stage are
+# unchanged).
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Repetitions per topology"
+        default: "3"
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  PHASE6_SKIP_BUILD: "1"
+
+jobs:
+  gossip:
+    name: TX gossip (${{ matrix.topology }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        topology: [go-relay, rust-relay]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Pull algorand/algod
+        run: |
+          docker pull algorand/algod:5.0.4-stable
+          docker pull algorand/algod:5.0.1-stable
+
+      - name: Build algod-rust node image (layer-cached)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime
+          tags: algod-rust-phase6:local
+          load: true
+          cache-from: type=gha,scope=consensus-cluster
+          cache-to: type=gha,mode=max,scope=consensus-cluster
+
+      - name: Unit tests (no cluster)
+        run: |
+          python3 ops/mixed-cluster/scripts/topology_test.py
+          python3 ops/mixed-cluster/scripts/tx_gossip_test.py
+
+      - name: TX gossip, ${{ matrix.topology }}
+        env:
+          RUNS: ${{ github.event.inputs.runs }}
+        run: |
+          set -euo pipefail
+          case "${RUNS:-3}" in ''|*[!0-9]*) echo "runs must be a number" >&2; exit 1 ;; esac
+          rc=0
+          for i in $(seq 1 "${RUNS:-3}"); do
+            echo "=== run $i ==="
+            PHASE6_TOPOLOGY="${{ matrix.topology }}" \
+              OUT_DIR="$GITHUB_WORKSPACE/gossip-artifacts/run$i" \
+              bash ops/mixed-cluster/scripts/tx-gossip-topology.sh || rc=1
+          done
+          exit "$rc"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tx-gossip-${{ matrix.topology }}-${{ github.run_id }}
+          path: gossip-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Tear down (safety net)
+        if: always()
+        run: bash ops/mixed-cluster/scripts/stop.sh --purge || true

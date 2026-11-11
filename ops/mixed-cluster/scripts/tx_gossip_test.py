@@ -127,6 +127,42 @@ class PerNodeTest(unittest.TestCase):
         self.assertIn("txn rejected", str(cm.exception))
 
 
+class TopologyOptionsTest(unittest.TestCase):
+    """Issue #2280: the sources come from the cluster topology, and the result
+    says which topology produced it."""
+
+    def test_sources_default_to_the_historical_pair(self):
+        a = tg.parse_args(["--out", "x.json"])
+        self.assertEqual(tg.resolve_sources(a), ("go-node-1", "rust-node-4"))
+        self.assertEqual(a.topology, "default")
+
+    def test_an_isolated_topology_adds_the_node_behind_the_relay_as_a_source(self):
+        for topo in ("rust-relay", "go-relay"):
+            a = tg.parse_args(["--out", "x.json", "--topology", topo])
+            self.assertEqual(tg.resolve_sources(a), ("go-node-3", "go-node-1", "rust-node-4"))
+
+    def test_explicit_sources_win_and_must_be_cluster_nodes(self):
+        a = tg.parse_args(["--out", "x.json", "--sources", "go-node-2,rust-node-4"])
+        self.assertEqual(tg.resolve_sources(a), ("go-node-2", "rust-node-4"))
+        a = tg.parse_args(["--out", "x.json", "--sources", "go-node-9"])
+        with self.assertRaises(tg.CheckError):
+            tg.resolve_sources(a)
+
+    def test_the_result_names_its_topology(self):
+        net = FakeNet()
+        res = tg.run_check(net, nodes=NODES, sources=("go-node-1",), count=2, within_s=6.0,
+                           build=lambda s, i: b"x", poll_s=0.05, topology="rust-relay")
+        self.assertEqual(res["topology"], "rust-relay")
+
+    def test_a_source_behind_the_relay_is_checked_against_every_other_node(self):
+        net = FakeNet()
+        res = run(net, sources=("go-node-3", "go-node-1", "rust-node-4"))
+        self.assertTrue(res["pass"], res)
+        self.assertEqual({(p["source"], p["target"]) for p in res["pairs"]
+                          if p["source"] == "go-node-3"},
+                         {("go-node-3", t) for t in NODES if t != "go-node-3"})
+
+
 class ParsingTest(unittest.TestCase):
     def test_the_txid_is_read_from_the_submit_response(self):
         self.assertEqual(tg.parse_txid('{"txId":"ABC"}'), "ABC")

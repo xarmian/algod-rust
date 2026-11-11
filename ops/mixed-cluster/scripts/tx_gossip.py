@@ -28,8 +28,16 @@ recorded: the round the set was submitted in and the rounds it took to commit
 Needs the cluster from start.sh, Docker on PATH and python3 (standard library
 only). Exit 0 when every pair passes.
 
+With --topology rust-relay / go-relay (issue #2280, scripts/topology.py) the
+cluster has one Go participation node (go-node-3) whose only peer is a Rust
+relay / a Go relay (the control): sources are then go-node-3, go-node-1 and
+rust-node-4, so a payment submitted to the isolated Go node must reach every
+other node and a payment submitted anywhere must reach it, all through that one
+relay. `--sources a,b` overrides the topology's choice.
+
 Usage:
   tx_gossip.py --out tx-gossip.json [--count 12] [--within-s 6]
+               [--topology default|rust-relay|go-relay] [--sources a,b]
 """
 import argparse
 import base64
@@ -41,6 +49,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import topology  # noqa: E402
 
 NODES = ("go-node-1", "go-node-2", "go-node-3", "rust-node-4")
 SOURCES = ("go-node-1", "rust-node-4")
@@ -71,7 +80,7 @@ def pending_state(status, confirmed_round):
 
 
 def run_check(net, *, nodes, sources, count, within_s, build, poll_s=0.1,
-              settle_s=10.0, commit_wait_s=90.0):
+              settle_s=10.0, commit_wait_s=90.0, topology="default"):
     """Submit `count` transactions to each source node and watch every other
     node. `net` provides now(), sleep(s), round_of(node), submit(node, raw) ->
     (status, body) and pending(node, txid) -> (status, confirmed_round);
@@ -141,8 +150,8 @@ def run_check(net, *, nodes, sources, count, within_s, build, poll_s=0.1,
             "commit_rounds": (rounds[-1] - round_before)
             if rounds and round_before is not None else None,
         })
-    return {"pass": all(p["ok"] for p in pairs), "within_s": within_s,
-            "count": count, "pairs": pairs, "sources": source_rows}
+    return {"pass": all(p["ok"] for p in pairs), "topology": topology,
+            "within_s": within_s, "count": count, "pairs": pairs, "sources": source_rows}
 
 
 # ── the real cluster ───────────────────────────────────────────────────
@@ -228,20 +237,42 @@ class ClusterNet:
         return base64.b64decode(b64)
 
 
-def main(argv=None):
+def parse_args(argv):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", required=True, help="result JSON")
     ap.add_argument("--count", type=int, default=12, help="payments per source node")
     ap.add_argument("--within-s", type=float, default=6.0,
                     help="every txn must be in each target within this many seconds (~2 rounds)")
-    args = ap.parse_args(argv)
+    ap.add_argument("--topology", default="default", choices=topology.TOPOLOGIES,
+                    help="the cluster topology start.sh was run with (selects the sources)")
+    ap.add_argument("--sources", default="",
+                    help="comma-separated source nodes (default: the topology's)")
+    return ap.parse_args(argv)
+
+
+def resolve_sources(args):
+    """The nodes payments are submitted to: --sources, else the topology's."""
+    if not args.sources:
+        return topology.plan(args.topology).sources
+    sources = tuple(x for x in args.sources.split(",") if x)
+    for x in sources:
+        if x not in NODES:
+            raise CheckError("--sources: {!r} is not a cluster node ({})".format(
+                x, ", ".join(NODES)))
+    return sources
+
+
+def main(argv=None):
+    args = parse_args(argv)
     net = ClusterNet()
     try:
+        sources = resolve_sources(args)
         net.warm()
-        res = run_check(net, nodes=NODES, sources=SOURCES, count=args.count,
-                        within_s=args.within_s, build=net.build)
+        res = run_check(net, nodes=NODES, sources=sources, count=args.count,
+                        within_s=args.within_s, build=net.build, topology=args.topology)
     except CheckError as e:
-        res = {"pass": False, "error": str(e), "pairs": [], "sources": []}
+        res = {"pass": False, "error": str(e), "topology": args.topology,
+               "pairs": [], "sources": []}
     with open(args.out, "w", encoding="utf-8", newline="\n") as f:
         json.dump(res, f, indent=1)
         f.write("\n")
