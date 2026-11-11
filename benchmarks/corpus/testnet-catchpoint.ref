@@ -10,3 +10,4 @@ catchpoint_source=http://r-5i.algorand-testnet.network:4161
 catchpoint=69120000#HV3VUPYHFFFV5DQ4KAJ7UL7KU7SB5TV2W4TMITNE65XTR7IKBKLQ
 catchpoint_round=69120000
 rounds=200
+final_state=benchmarks/corpus/testnet-catchpoint.final.json
