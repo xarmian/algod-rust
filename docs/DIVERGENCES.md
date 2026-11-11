@@ -430,7 +430,17 @@ archive file got the same treatment in #2205 (`DEFAULT_BLOCK_WAL_SIZE_LIMIT`,
 32 MiB, `blockdb` on the ledger connection and `main` on the archive writer;
 `SqliteLedger::set_block_wal_size_limit`): the Docker `catchup` tier measured
 `ledger.block.sqlite-wal` at 248 MB beside a 4 MB block file after a betanet
-catchup, the high-water mark of an earlier long transaction. The limit bounds only the residual file, not growth during
+catchup. That one is not a high-water mark: inside a block span the ledger
+connection reads the attached `blockdb` (the previous header), so it holds a
+read mark on the block WAL when the archive writer commits the span's blocks,
+and SQLite can neither backfill past the mark nor restart the WAL. A PASSIVE
+checkpoint from another connection at the end backfilled all 80,638 frames, and
+`/proc/locks` showed no reader on the block file's shared memory, so nothing
+was blocking it between spans. `commit_block` therefore runs a non-waiting
+`PRAGMA blockdb.wal_checkpoint(TRUNCATE)` between blocks once the file is at
+least 4 MiB (`BLOCK_WAL_RESTART_BYTES`), retried after the next block if a pooled
+reader holds it; `journal_size_limit` is the safety net for the other pins. The
+limit bounds only the residual file, not growth during
 the pin. There is no `config.json` field: it is a disk-space safety net far
 above any working set, and a negative value (SQLite's "no limit") is rejected
 by `SqliteLedger::set_tracker_wal_size_limit`. Wire and consensus impact: none

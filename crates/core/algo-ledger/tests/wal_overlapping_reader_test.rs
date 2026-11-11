@@ -1177,8 +1177,10 @@ fn bench_block_commit_archive_first() {
 
 /// Issue #2205: the block archive's WAL stays bounded over a replay. The
 /// Docker `catchup` tier (betanet, Linux) left `ledger.block.sqlite-wal` at
-/// 248 MB next to a 4 MB block file after ~15,000 blocks (60 KB bodies): the
-/// archive writer's commits never let SQLite restart the WAL.
+/// 248 MB next to a 4 MB block file after ~15,000 blocks (60 KB bodies): inside
+/// the span the ledger connection reads `blockdb`, and its read mark meets the
+/// archive writer's commit, so SQLite never restarts the WAL (76 MB over the 600
+/// blocks of this test without the between-blocks truncate, 4 MB with it).
 #[test]
 fn the_block_archive_wal_stays_bounded_over_a_replay() {
     let dir = tempfile::tempdir().unwrap();
@@ -1190,6 +1192,10 @@ fn the_block_archive_wal_stays_bounded_over_a_replay() {
     let mut peak = 0u64;
     for round in 1..=600u64 {
         ledger.begin_block().unwrap();
+        // apply reads the previous header (`blockdb`) inside the span: the main
+        // connection then holds a read mark on the block WAL, which the archive
+        // writer's commit (same span) meets, so SQLite cannot restart the WAL.
+        let _ = ledger.get_block_header_data(round - 1);
         ledger
             .put_block(round, "test", &test_header(round), &blk)
             .unwrap();
@@ -1254,7 +1260,7 @@ fn the_block_archive_wal_file_returns_to_its_limit_after_a_pin_ends() {
     let after = wal_len(&block_db);
     assert!(
         after <= LIMIT as u64,
-        "the block WAL file must shrink to journal_size_limit ({LIMIT} B), but it is {after} B          (it was {pinned} B pinned)"
+        "the block WAL file must shrink to journal_size_limit ({LIMIT} B), but it is {after} B (it was {pinned} B pinned)"
     );
 }
 

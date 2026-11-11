@@ -27,7 +27,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use algo_error::AlgoError;
 use algo_types::{
@@ -331,6 +331,15 @@ fn apply_tracker_wal_size_limit(conn: &Connection, bytes: i64) -> Result<(), Alg
             message: format!("journal_size_limit pragma error: {e}"),
         })
 }
+
+/// The block archive WAL size from which [`SqliteLedger::commit_block`]
+/// truncates it between blocks (issue #2205); about the size SQLite's own
+/// auto-checkpoint (1000 pages) lets it reach.
+const BLOCK_WAL_RESTART_BYTES: u64 = 4 * 1024 * 1024;
+
+/// rusqlite's default busy timeout, restored after the non-waiting block WAL
+/// checkpoint.
+const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
 
 /// Default `journal_size_limit` of the block archive file, in bytes (issue
 /// #2205). The Docker `catchup` tier left `ledger.block.sqlite-wal` at 248 MB
@@ -4697,7 +4706,54 @@ impl SqliteLedger {
                 }
             }
         }
+        if result.is_ok() {
+            self.restart_block_wal_if_large();
+        }
         result
+    }
+
+    /// DIVERGENCE DIV-008: truncate the block archive's WAL between blocks
+    /// (issue #2205); go sets no such thing. Inside a block span the ledger
+    /// connection reads the attached `blockdb` (the previous header), so it
+    /// holds a read mark on the block WAL when the archive writer commits the
+    /// span's blocks; SQLite can then neither backfill past that mark nor
+    /// restart the WAL, and the file grows with every block (a betanet catchup in
+    /// the Docker `catchup` tier: 332 MB of WAL beside a 4 MB block file). Here, the
+    /// span is over and the connection holds no mark, so a `TRUNCATE`
+    /// checkpoint can backfill everything and cut the file to zero. It only
+    /// runs once the file is at least [`BLOCK_WAL_RESTART_BYTES`], and without
+    /// waiting: if a pooled reader holds the WAL the call returns busy and is
+    /// retried after the next block.
+    fn restart_block_wal_if_large(&self) {
+        let Some(block_path) = self.block_path.as_ref() else {
+            return;
+        };
+        let mut wal = block_path.as_os_str().to_owned();
+        wal.push("-wal");
+        if std::fs::metadata(&wal).map_or(0, |m| m.len()) < BLOCK_WAL_RESTART_BYTES {
+            return;
+        }
+        let _ = self.conn.busy_timeout(Duration::ZERO);
+        let res = self
+            .conn
+            .query_row("PRAGMA blockdb.wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            });
+        let _ = self.conn.busy_timeout(DEFAULT_BUSY_TIMEOUT);
+        match res {
+            Ok((0, _, _)) => {}
+            Ok((busy, log, ckpt)) => tracing::debug!(
+                busy,
+                log,
+                ckpt,
+                "block WAL truncate checkpoint incomplete (a reader holds it); retrying after the next block"
+            ),
+            Err(e) => tracing::debug!("block WAL truncate checkpoint failed: {e}"),
+        }
     }
 
     /// The wall-clock instant of the most recent successful [`Self::commit_block`]
