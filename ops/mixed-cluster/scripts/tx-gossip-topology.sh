@@ -74,4 +74,12 @@ python3 "$HERE/tx_gossip.py" --out "$OUT_DIR/tx-gossip.json" --topology "$TOPOLO
     --count "${TX_GOSSIP_COUNT:-12}" --within-s "${TX_GOSSIP_WITHIN_S:-6}" \
     > "$OUT_DIR/tx-gossip.log" 2>&1 || rc=$?
 cat "$OUT_DIR/tx-gossip.log"
+
+# The topology is checked from the Go nodes' own connection logs, not assumed
+# from the configuration: go-node-3 must have dialed only its planned relay,
+# accepted nothing, and nobody may have dialed it.
+for n in go-node-1 go-node-2 go-node-3 rust-node-4; do
+    docker logs "phase6-$n" > "$OUT_DIR/$n.log" 2>&1 || true
+done
+python3 "$HERE/topology.py" verify "$TOPOLOGY" "$OUT_DIR" | tee "$OUT_DIR/topology-check.log" || rc=1
 exit "$rc"
