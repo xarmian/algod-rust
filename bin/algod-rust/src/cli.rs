@@ -1388,5 +1388,15 @@ pub enum BenchAction {
         /// divergence against go's `goreplay -dump-state`.
         #[arg(long)]
         dump_state: Option<PathBuf>,
+
+        /// Start the fresh ledger from this catchpoint file (as go-replay's
+        /// `-from-catchpoint`, issue #2292) and replay only the rounds after
+        /// the catchpoint round. Needs `--catchpoint-label`.
+        #[arg(long, requires = "catchpoint_label")]
+        from_catchpoint: Option<PathBuf>,
+
+        /// The label of `--from-catchpoint` (`<round>#<hash>`).
+        #[arg(long, requires = "from_catchpoint")]
+        catchpoint_label: Option<String>,
     },
 }

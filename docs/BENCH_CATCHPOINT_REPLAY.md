@@ -49,7 +49,16 @@ The tier cannot run on this range until:
    relay (`_algobootstrap._tcp.testnet.algorand.network`), not from the algod REST API.
 2. **Each harness starts from it.** The Rust side has catchpoint apply
    (`algo_ledger::catchpoint`); `bench_replay` has to open a ledger from it and
-   replay the range with certificate verification on (#2292). The go side is
+   replay the range with certificate verification on. The Rust side is done
+   (#2292): `algod-rust bench replay-corpus --from-catchpoint FILE
+   --catchpoint-label L` runs the production `SyncOrchestrator` (import, verify,
+   lookback blocks, window replay) with the corpus as its backend, stopped at the
+   catchpoint round, then replays the rest through the same catchup path as the
+   genesis replay (certificates, apply, commit); the timed section starts after
+   the catchpoint start. `bench_replay::tests::small_corpus_catchpoint_start_reaches_the_go_final_state`
+   starts from the catchpoint go generated at round 1000 of the small corpus
+   (`benchmarks/go-replay/testdata/small-catchpoint-1000.{tar,label}`, 14 KB) and
+   reaches the recorded go final state; a wrong label is refused. The go side is
    done (#2291): `benchmarks/go-replay -from-catchpoint FILE -catchpoint-label L`
    runs go's catchpoint catchup (`CatchpointCatchupAccessor`: stage the file's
    chunks, build the trie, `VerifyCatchpoint` against the catchpoint block, store

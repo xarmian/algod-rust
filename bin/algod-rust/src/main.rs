@@ -472,6 +472,8 @@ async fn async_main() -> anyhow::Result<std::process::ExitCode> {
                 config,
                 rounds,
                 dump_state,
+                from_catchpoint,
+                catchpoint_label,
             } => {
                 let args = commands::bench_replay::ReplayCorpusArgs {
                     corpus,
@@ -479,6 +481,9 @@ async fn async_main() -> anyhow::Result<std::process::ExitCode> {
                     config,
                     rounds,
                     dump_state,
+                    from_catchpoint: from_catchpoint.zip(catchpoint_label).map(|(file, label)| {
+                        commands::bench_replay::CatchpointStart { file, label }
+                    }),
                 };
                 tokio::task::spawn_blocking(move || {
                     commands::bench_replay::run_replay_corpus(&args, &output)
