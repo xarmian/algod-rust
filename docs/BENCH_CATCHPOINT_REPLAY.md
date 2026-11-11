@@ -49,9 +49,21 @@ The tier cannot run on this range until:
    relay (`_algobootstrap._tcp.testnet.algorand.network`), not from the algod REST API.
 2. **Each harness starts from it.** The Rust side has catchpoint apply
    (`algo_ledger::catchpoint`); `bench_replay` has to open a ledger from it and
-   replay the range with certificate verification on. The go side
-   (`benchmarks/go-replay`) has to restore the same catchpoint through go's
-   `CatchpointCatchupAccessor` and then feed the blocks.
+   replay the range with certificate verification on (#2292). The go side is
+   done (#2291): `benchmarks/go-replay -from-catchpoint FILE -catchpoint-label L`
+   runs go's catchpoint catchup (`CatchpointCatchupAccessor`: stage the file's
+   chunks, build the trie, `VerifyCatchpoint` against the catchpoint block, store
+   that block and the lookback before it from the corpus, `CompleteCatchup`) and
+   replays only the rounds after the catchpoint round, as a non-archival node
+   (an archival ledger resets itself when its blocks database does not start at
+   round 0). `-export-catchpoint FILE` writes the newest catchpoint go generated
+   during a replay (set `CatchpointInterval` in the config). Proven on a small
+   generated catchpoint: `TestCatchpointStartMatchesStraightReplay` replays rounds
+   1..1200 of the small corpus with a catchpoint every 500 rounds, exports the
+   round-1000 catchpoint, starts a fresh ledger from it, replays 1001..2000 and
+   reaches exactly `corpus.json`'s and the recorded full final state;
+   `TestCatchpointStartRefusesAWrongLabel` shows the label authenticates the
+   file. The testnet catchpoint (GBs) was not fetched here.
 3. **A final-state definition** for the range: the corpus's `final_state`
    (round, block hash, txn counter, totals, account digest) derived by the go
    replay and attested by the endpoint, as `finalize` does for `testnet-head`.

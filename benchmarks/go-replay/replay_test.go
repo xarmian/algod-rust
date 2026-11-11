@@ -401,3 +401,119 @@ func TestCompareWithCorpusIsExactAbove2Pow53(t *testing.T) {
 		t.Fatalf("a one-unit difference above 2^53 must be caught, got %v", mm)
 	}
 }
+
+// readResult decodes a goreplay result file's final state, config and corpus
+// match, with exact numbers.
+func readResult(t *testing.T, path string) (finalState map[string]any, config map[string]any, match *bool) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var res struct {
+		FinalState  map[string]any `json:"final_state"`
+		Config      map[string]any `json:"config"`
+		CorpusMatch *bool          `json:"corpus_match"`
+	}
+	if err := decodeJSON(raw, &res); err != nil {
+		t.Fatal(err)
+	}
+	return res.FinalState, res.Config, res.CorpusMatch
+}
+
+// A ledger started from a catchpoint go generated reaches the same final state
+// as the straight replay (issue #2291): the first run replays rounds 1..1200 of
+// the small corpus with catchpoints every 500 rounds and exports the newest
+// catchpoint file; the second starts a fresh ledger from that file through go's
+// catchpoint catchup (CatchpointCatchupAccessor), replays only the rounds after
+// the catchpoint round and must match corpus.json and the full recorded state.
+func TestCatchpointStartMatchesStraightReplay(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := os.ReadFile(filepath.Join(smallCorpus, "node-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "node-config.json")
+	patched := strings.Replace(string(cfg), `"Archival": true,`, `"Archival": true,
+	"CatchpointInterval": 500,`, 1)
+	if patched == string(cfg) {
+		t.Fatal("could not set CatchpointInterval in the node config")
+	}
+	if err := os.WriteFile(cfgPath, []byte(patched), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cpFile := filepath.Join(dir, "catchpoint.tar")
+	code, stderr := runReplay(t, "-corpus", smallCorpus, "-data", filepath.Join(dir, "gen"),
+		"-out", filepath.Join(dir, "gen.json"), "-config", cfgPath, "-rounds", "1200",
+		"-export-catchpoint", cpFile)
+	if code != 0 {
+		t.Fatalf("generating replay exited %d:\n%s", code, stderr)
+	}
+	_, genCfg, _ := readResult(t, filepath.Join(dir, "gen.json"))
+	label, _ := genCfg["exported_catchpoint"].(string)
+	if !strings.HasPrefix(label, "1000#") {
+		t.Fatalf("exported catchpoint %q, want the one of round 1000", label)
+	}
+	if st, err := os.Stat(cpFile); err != nil || st.Size() == 0 {
+		t.Fatalf("catchpoint file: %v", err)
+	}
+
+	out := filepath.Join(dir, "from.json")
+	code, stderr = runReplay(t, "-corpus", smallCorpus, "-data", filepath.Join(dir, "from"),
+		"-out", out, "-from-catchpoint", cpFile, "-catchpoint-label", label)
+	if code != 0 {
+		t.Fatalf("catchpoint-start replay exited %d:\n%s", code, stderr)
+	}
+	got, startCfg, match := readResult(t, out)
+	if match == nil || !*match {
+		t.Fatalf("final state does not match corpus.json")
+	}
+	if startCfg["from_catchpoint"] != label {
+		t.Fatalf("result does not record the catchpoint start: %v", startCfg)
+	}
+	var want map[string]any
+	rec, err := os.ReadFile("testdata/small-final-state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := decodeJSON(rec, &want); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		g, _ := json.MarshalIndent(got, "", "  ")
+		t.Fatalf("catchpoint-start final state differs from testdata/small-final-state.json:\n%s", g)
+	}
+}
+
+// The start is authenticated by the label: a label of another catchpoint
+// (here with one hash character changed) is refused, not replayed from.
+func TestCatchpointStartRefusesAWrongLabel(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := os.ReadFile(filepath.Join(smallCorpus, "node-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "node-config.json")
+	if err := os.WriteFile(cfgPath, []byte(strings.Replace(string(cfg), `"Archival": true,`, `"Archival": true,
+	"CatchpointInterval": 500,`, 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cpFile := filepath.Join(dir, "catchpoint.tar")
+	if code, stderr := runReplay(t, "-corpus", smallCorpus, "-data", filepath.Join(dir, "gen"),
+		"-out", filepath.Join(dir, "gen.json"), "-config", cfgPath, "-rounds", "1200",
+		"-export-catchpoint", cpFile); code != 0 {
+		t.Fatalf("generating replay exited %d:\n%s", code, stderr)
+	}
+	_, genCfg, _ := readResult(t, filepath.Join(dir, "gen.json"))
+	label := genCfg["exported_catchpoint"].(string)
+	bad := label[:len(label)-1] + map[bool]string{true: "B", false: "A"}[!strings.HasSuffix(label, "B")]
+	code, stderr := runReplay(t, "-corpus", smallCorpus, "-data", filepath.Join(dir, "from"),
+		"-out", filepath.Join(dir, "from.json"), "-from-catchpoint", cpFile, "-catchpoint-label", bad)
+	if code == 0 {
+		t.Fatalf("a wrong catchpoint label was accepted:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "catchpoint") {
+		t.Fatalf("the refusal does not name the catchpoint:\n%s", stderr)
+	}
+}
