@@ -45,7 +45,7 @@ ROOT="$(cd "$HERE/.." && pwd)"
 # Peer graph (issue #2280): the PHASE6_*_PEERS the compose file interpolates,
 # go-node-3's NetAddress and whether the Rust node force-relays gossip.
 PHASE6_TOPOLOGY="${PHASE6_TOPOLOGY:-default}"
-if ! TOPOLOGY_ENV="$(python3 "$HERE/topology.py" env "$PHASE6_TOPOLOGY" | tr -d '')"; then
+if ! TOPOLOGY_ENV="$(python3 "$HERE/topology.py" env "$PHASE6_TOPOLOGY" | tr -d '\r')"; then
     echo "error: PHASE6_TOPOLOGY='$PHASE6_TOPOLOGY' is not a topology (default, rust-relay, go-relay)" >&2
     exit 1
 fi
@@ -380,7 +380,7 @@ if sys.argv[2] == '1':
 else:
     cfg.pop('ForceRelayMessages', None)
 print(json.dumps(cfg))
-" "$EXISTING_CFG" "$PHASE6_RUST_FORCE_RELAY" | tr -d '' > "$RUST_DATA_DIR/config.json.new"
+" "$EXISTING_CFG" "$PHASE6_RUST_FORCE_RELAY" | tr -d '\r' > "$RUST_DATA_DIR/config.json.new"
     mv "$RUST_DATA_DIR/config.json.new" "$RUST_DATA_DIR/config.json"
 fi
 

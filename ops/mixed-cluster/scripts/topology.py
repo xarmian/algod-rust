@@ -26,7 +26,12 @@ PHASE6_RUST_FORCE_RELAY variables docker-compose.yml interpolates; the
 Usage:
   topology.py env <topology>       KEY=VALUE lines for start.sh
   topology.py sources <topology>   comma-separated tx_gossip.py sources
+  topology.py verify <topology> <dir>
+                                   check the Go nodes' logs (<dir>/go-node-N.log)
+                                   show go-node-3 connected only as planned
 """
+import json
+import os
 import sys
 from collections import namedtuple
 
@@ -81,9 +86,55 @@ def env_lines(p):
     ]
 
 
+def go_connections(log_text):
+    """(outgoing remotes, number of inbound peers) from a go-algorand log: its
+    wsNetwork logs a `ConnectedOut` / `ConnectedIn` event per connection."""
+    outgoing, incoming = [], 0
+    for line in log_text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if ev.get("event") == "ConnectedOut":
+            outgoing.append(str(ev.get("remote", "")))
+        elif ev.get("event") == "ConnectedIn":
+            incoming += 1
+    return outgoing, incoming
+
+
+def isolation_problems(p, logs):
+    """What the Go nodes' logs (`logs`: node name -> log text) say about the
+    isolated topologies that contradicts the plan; [] when go-node-3 was
+    connected only as planned (and, for the default topology, always)."""
+    if p.name == "default":
+        return []
+    problems = []
+    planned = sorted(p.peers["go-node-3"])
+    outgoing, incoming = go_connections(logs.get("go-node-3", ""))
+    if not outgoing:
+        problems.append("go-node-3 never connected to {}".format(", ".join(planned)))
+    extra = sorted(set(outgoing) - set(planned))
+    if extra:
+        problems.append("go-node-3 also connected to {}".format(", ".join(extra)))
+    if outgoing and not set(planned) <= set(outgoing):
+        problems.append("go-node-3 never connected to {}".format(
+            ", ".join(sorted(set(planned) - set(outgoing)))))
+    if incoming:
+        problems.append("go-node-3 accepted {} inbound connection(s)".format(incoming))
+    for node in ("go-node-1", "go-node-2"):
+        dialed = [r for r in go_connections(logs.get(node, ""))[0] if r.startswith("go-node-3")]
+        if dialed:
+            problems.append("{} dialed go-node-3 ({})".format(node, ", ".join(dialed)))
+    return problems
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if len(argv) != 2 or argv[0] not in ("env", "sources"):
+    if (len(argv) != 2 or argv[0] not in ("env", "sources")) and not (
+            len(argv) == 3 and argv[0] == "verify"):
         print(__doc__.split("Usage:")[1].strip(), file=sys.stderr)
         return 2
     try:
@@ -91,6 +142,22 @@ def main(argv=None):
     except ValueError as e:
         print("error: {}".format(e), file=sys.stderr)
         return 2
+    if argv[0] == "verify":
+        logs = {}
+        for node in ("go-node-1", "go-node-2", "go-node-3"):
+            try:
+                with open(os.path.join(argv[2], node + ".log"), encoding="utf-8",
+                          errors="replace") as f:
+                    logs[node] = f.read()
+            except OSError:
+                logs[node] = ""
+        problems = isolation_problems(p, logs)
+        for line in problems:
+            print("topology {}: {}".format(p.name, line))
+        if not problems:
+            print("topology {}: go-node-3 isolated as planned (peers {})".format(
+                p.name, ", ".join(p.peers["go-node-3"])))
+        return 1 if problems else 0
     if argv[0] == "env":
         print("\n".join(env_lines(p)))
     else:

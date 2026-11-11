@@ -117,6 +117,58 @@ class IsolatedGoNodeTest(unittest.TestCase):
                              {"go-node-1", "go-node-2", "rust-node-4"}, name)
 
 
+def go_line(event, **kw):
+    import json
+    d = {"event": event, "msg": "x", "level": "info"}
+    d.update(kw)
+    return json.dumps(d)
+
+
+NL = chr(10)
+OUT = lambda remote: go_line("ConnectedOut", remote=remote)  # noqa: E731
+IN = lambda remote: go_line("ConnectedIn", remote=remote)    # noqa: E731
+
+
+class ConnectionLogTest(unittest.TestCase):
+    """The topology is checked from the Go nodes' own connection log lines
+    (wsNetwork ConnectedOut / ConnectedIn), not assumed from the configuration."""
+
+    def test_connections_reads_the_events_of_a_go_log(self):
+        text = NL.join(["plain line", OUT("rust-node-4:4162"), IN("172.21.0.5:37234"),
+                          '{"not json', go_line("Other", remote="y")])
+        outgoing, incoming = tp.go_connections(text)
+        self.assertEqual(outgoing, ["rust-node-4:4162"])
+        self.assertEqual(incoming, 1)
+
+    def test_a_go_node_3_that_dials_only_its_planned_relay_passes(self):
+        logs = {"go-node-3": OUT("rust-node-4:4162"),
+                "go-node-1": OUT("go-node-2:4161") + NL + IN("172.21.0.5:1"),
+                "go-node-2": IN("172.21.0.3:2")}
+        self.assertEqual(tp.isolation_problems(tp.plan("rust-relay"), logs), [])
+
+    def test_an_extra_peer_of_go_node_3_is_reported(self):
+        logs = {"go-node-3": OUT("rust-node-4:4162") + NL + OUT("go-node-1:4161")}
+        problems = tp.isolation_problems(tp.plan("rust-relay"), logs)
+        self.assertTrue(any("go-node-1:4161" in p for p in problems), problems)
+
+    def test_an_inbound_connection_to_go_node_3_is_reported(self):
+        logs = {"go-node-3": OUT("rust-node-4:4162") + NL + IN("172.21.0.2:9")}
+        problems = tp.isolation_problems(tp.plan("rust-relay"), logs)
+        self.assertTrue(any("inbound" in p for p in problems), problems)
+
+    def test_a_go_node_that_dials_go_node_3_is_reported(self):
+        logs = {"go-node-3": OUT("rust-node-4:4162"), "go-node-1": OUT("go-node-3:4161")}
+        problems = tp.isolation_problems(tp.plan("rust-relay"), logs)
+        self.assertTrue(any("go-node-1" in p and "go-node-3" in p for p in problems), problems)
+
+    def test_a_missing_go_node_3_connection_is_reported(self):
+        problems = tp.isolation_problems(tp.plan("go-relay"), {"go-node-3": "no events"})
+        self.assertTrue(any("never connected" in p for p in problems), problems)
+
+    def test_the_default_topology_has_nothing_to_isolate(self):
+        self.assertEqual(tp.isolation_problems(tp.plan("default"), {}), [])
+
+
 class CliTest(unittest.TestCase):
     def test_an_unknown_topology_is_rejected_naming_the_choices(self):
         with self.assertRaises(ValueError) as cm:
@@ -142,6 +194,24 @@ class CliTest(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             self.assertEqual(tp.main(["sources", "rust-relay"]), 0)
         self.assertEqual(buf.getvalue().strip(), "go-node-3,go-node-1,rust-node-4")
+
+    def test_the_cli_verifies_a_directory_of_go_logs(self):
+        import io
+        import contextlib
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "go-node-3.log"), "w") as f:
+                f.write(OUT("rust-node-4:4162") + NL)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(tp.main(["verify", "rust-relay", d]), 0)
+            self.assertIn("isolated", buf.getvalue())
+            with open(os.path.join(d, "go-node-3.log"), "a") as f:
+                f.write(OUT("go-node-1:4161") + NL)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(tp.main(["verify", "rust-relay", d]), 1)
+            self.assertIn("go-node-1:4161", buf.getvalue())
 
 
 if __name__ == "__main__":
