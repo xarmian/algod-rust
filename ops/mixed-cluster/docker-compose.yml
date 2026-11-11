@@ -60,7 +60,7 @@ services:
       - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       # Semicolon-separated peer list passed through to `algod -p`.
       # See the algorand/algod entrypoint's `start_public_network` path.
-      - PEER_ADDRESS=go-node-2:4161;go-node-3:4161
+      - PEER_ADDRESS=${PHASE6_GO1_PEERS:-go-node-2:4161;go-node-3:4161}
     ports:
       # Bound to 127.0.0.1 so the harness REST stays local-only even
       # though the committed token is the trivial "aaaa..." value. Use
@@ -101,7 +101,7 @@ services:
       - ALGOD_PORT=8080
       - TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - PEER_ADDRESS=go-node-1:4161;go-node-3:4161
+      - PEER_ADDRESS=${PHASE6_GO2_PEERS:-go-node-1:4161;go-node-3:4161}
     ports:
       - "127.0.0.1:${PHASE6_GO2_PORT:-4002}:8080"
     volumes:
@@ -129,7 +129,7 @@ services:
       - ALGOD_PORT=8080
       - TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - PEER_ADDRESS=go-node-1:4161;go-node-2:4161
+      - PEER_ADDRESS=${PHASE6_GO3_PEERS:-go-node-1:4161;go-node-2:4161}
     ports:
       - "127.0.0.1:${PHASE6_GO3_PORT:-4003}:8080"
     volumes:
@@ -220,7 +220,10 @@ services:
       - --genesis-id=${PHASE6_GENESIS_ID:-phase6net-v1}
       - --genesis-hash=${PHASE6_GENESIS_HASH:-}
       - --network=phase6net
-      - --peers=go-node-1:4161,go-node-2:4161,go-node-3:4161
+      - --peers=${PHASE6_RUST_PEERS:-go-node-1:4161,go-node-2:4161,go-node-3:4161}
+      # The peer lists above are the default topology's; start.sh's opt-in
+      # PHASE6_TOPOLOGY (issue #2280, scripts/topology.py) overrides every
+      # node's through PHASE6_GO{1,2,3}_PEERS / PHASE6_RUST_PEERS.
       # Issue #955 catchpoint-interop harness: an inbound WS-gossip
       # listener so a real go-algorand node (go-node-5, opt-in via the
       # `catchpoint-interop` compose profile) can reach this node's
