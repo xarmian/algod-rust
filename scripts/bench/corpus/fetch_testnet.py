@@ -47,6 +47,13 @@ Usage:
                             state and pin then apply only if given explicitly)
                             [--final-state FILE] [--dest DIR] [--force]
                             [--name NAME] [--workers K] [--retries K]
+  fetch_testnet.py plan-catchpoint [--label LABEL] [--rounds N] [--out FILE]
+                            [--endpoint URL] [--channel-url URL]
+      the catchpoint-start corpus plan (issue #2146): resolve the catchpoint
+      the replay starts from (the channel's latest, or --label), check that
+      the endpoint serves the N rounds after it with certificates, and write
+      the ref (`catchpoint=`, `rounds=`, `endpoint=`, `genesis_hash=`).
+      See docs/BENCH_CATCHPOINT_REPLAY.md.
   fetch_testnet.py finalize --corpus DIR --replay-result FILE --out FILE
       derive the committed final-state file from a go replay result
       (benchmarks/go-replay `-out` JSON) after checking its round, block
@@ -93,12 +100,38 @@ NODE_CONFIG = {
 }
 
 
+# Where algorand publishes the label of each network's latest catchpoint, and
+# the rounds between two catchpoints on the public testnet (go
+# `config.Local.CatchpointInterval` of a catchpoint-serving node).
+CATCHPOINT_CHANNEL = ("https://algorand-catchpoints.s3.us-east-2.amazonaws.com"
+                      "/channel/testnet/latest.catchpoint")
+CATCHPOINT_INTERVAL = 10000
+DEFAULT_CATCHPOINT_REF = os.path.join(REPO, "benchmarks", "corpus", "testnet-catchpoint.ref")
+BASE32 = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
+
+
 class FetchError(Exception):
     pass
 
 
 class Unreachable(FetchError):
     pass
+
+
+def parse_catchpoint_label(label):
+    """(round, hash) of a catchpoint label `<round>#<52 base32 chars>` (go
+    `ledgercore.ParseCatchpointLabel`: a positive round on a catchpoint
+    boundary and the base32 of a 32-byte digest); FetchError otherwise."""
+    label = label.strip()
+    rnd, sep, digest = label.partition("#")
+    if not sep or not rnd.isdigit() or int(rnd) == 0:
+        raise FetchError(f"not a catchpoint label: {label!r} (want <round>#<hash>)")
+    if len(digest) != 52 or not set(digest) <= BASE32:
+        raise FetchError(f"catchpoint label {label!r}: the hash is not 52 base32 characters")
+    if int(rnd) % CATCHPOINT_INTERVAL:
+        raise FetchError(f"catchpoint label {label!r}: round {rnd} is not a multiple of "
+                         f"{CATCHPOINT_INTERVAL}")
+    return int(rnd), digest
 
 
 def read_ref(path):
@@ -411,6 +444,46 @@ def cmd_fetch(args):
     return 0
 
 
+def cmd_plan_catchpoint(args):
+    ref = read_ref(args.ref) if os.path.isfile(args.ref) else {}
+    endpoint = args.endpoint or os.environ.get("TESTNET_ENDPOINT") or ref.get("endpoint")
+    if not endpoint:
+        raise FetchError(f"no endpoint (set endpoint= in {args.ref}, TESTNET_ENDPOINT or --endpoint)")
+    rounds = args.rounds if args.rounds is not None else int(ref.get("rounds", 200))
+    if rounds < 1:
+        raise FetchError("--rounds must be at least 1")
+    label = args.label
+    if not label:
+        label = Endpoint(args.channel_url, retries=3).get("").decode("ascii", "replace")
+    rnd, digest = parse_catchpoint_label(label)
+    label = f"{rnd}#{digest}"
+    ep = Endpoint(endpoint, retries=args.retries)
+    genesis_hash = ref.get("genesis_hash")
+    if genesis_hash:
+        got = ep.json("/v2/transactions/params")["genesis-hash"]
+        if got != genesis_hash:
+            raise FetchError(f"{endpoint} serves genesis {got}, {args.ref} pins {genesis_hash}")
+    # The replay reads every block of the range back from an archival node, so
+    # the first and the last must be served, with their certificates (block()
+    # refuses a reply that is not a block response of that round).
+    for r in (rnd + 1, rnd + rounds):
+        ep.block(r)
+    lines = [
+        "# The catchpoint-start replay corpus plan (issue #2146): written by",
+        "# scripts/bench/corpus/fetch_testnet.py plan-catchpoint, see",
+        "# docs/BENCH_CATCHPOINT_REPLAY.md.",
+        f"endpoint={endpoint}",
+    ]
+    if genesis_hash:
+        lines.append(f"genesis_hash={genesis_hash}")
+    lines += [f"catchpoint={label}", f"catchpoint_round={rnd}", f"rounds={rounds}"]
+    with open(args.out, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"fetch_testnet: catchpoint {label}: replay rounds {rnd + 1}..{rnd + rounds} "
+          f"(served, with certificates) -> {args.out}")
+    return 0
+
+
 def cmd_finalize(args):
     cj = corpus_tool.load_corpus_json(args.corpus)
     with open(args.replay_result, encoding="utf-8") as f:
@@ -445,13 +518,22 @@ def main(argv=None):
     f.add_argument("--workers", type=int, default=16)
     f.add_argument("--retries", type=int, default=6)
     f.add_argument("--force", action="store_true")
+    c = sub.add_parser("plan-catchpoint")
+    c.add_argument("--ref", default=DEFAULT_REF)
+    c.add_argument("--label")
+    c.add_argument("--rounds", type=int)
+    c.add_argument("--out", default=DEFAULT_CATCHPOINT_REF)
+    c.add_argument("--endpoint")
+    c.add_argument("--channel-url", default=CATCHPOINT_CHANNEL)
+    c.add_argument("--retries", type=int, default=6)
     z = sub.add_parser("finalize")
     z.add_argument("--corpus", required=True)
     z.add_argument("--replay-result", required=True)
     z.add_argument("--out", required=True)
     args = ap.parse_args(argv)
     try:
-        return cmd_fetch(args) if args.cmd == "fetch" else cmd_finalize(args)
+        return {"fetch": cmd_fetch, "finalize": cmd_finalize,
+                "plan-catchpoint": cmd_plan_catchpoint}[args.cmd](args)
     except Unreachable as e:
         print(f"fetch_testnet: endpoint not reachable: {e}", file=sys.stderr)
         return 3

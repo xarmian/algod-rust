@@ -1,0 +1,72 @@
+# Catchpoint-start replay corpus (issue #2146)
+
+Part of the benchmark epic #2101; follow-up of #2119 (`testnet-head`).
+
+## Why
+
+`testnet-head` replays rounds 0..20000 of the public testnet from genesis. That
+range holds 425 transactions: no applications, no boxes, no proposer payouts, no
+state proofs (they arrived in later consensus versions). A node cannot start
+at a later round without a snapshot, so a corpus that exercises those features
+has to start from a **catchpoint**: the ledger state at a catchpoint round,
+authenticated by the catchpoint label `<round>#<hash>`, followed by the real
+blocks and certificates of the rounds after it.
+
+## The range
+
+`benchmarks/corpus/testnet-catchpoint.ref` pins one such range (written by
+`scripts/bench/corpus/fetch_testnet.py plan-catchpoint`):
+
+| | |
+|---|---|
+| network | public testnet (genesis hash pinned in the ref) |
+| catchpoint | `69120000#HV3VUPYHFFFV5DQ4KAJ7UL7KU7SB5TV2W4TMITNE65XTR7IKBKLQ` (the channel's latest at the time of writing) |
+| replayed rounds | 69 120 001 ..= 69 120 200 (200 rounds) |
+| source of the blocks | an archival algod, `GET /v2/blocks/{r}?format=msgpack` (certificate included), as for `testnet-head` |
+
+Scanned for this issue (`GET /v2/blocks/{r}` for each round of the range): every
+block carries a proposer payout (`prp`), round 69 120 131 holds a state proof
+transaction (`stpf`), and 257 application calls are spread over the range. So the
+range exercises exactly what `testnet-head` cannot.
+
+`plan-catchpoint` resolves the label (the channel's `latest.catchpoint`, or
+`--label`), checks it (positive round on a 10 000-round boundary, 52 base32
+characters of hash), checks that the endpoint is on the pinned network and
+serves the first and the last block of the range with certificates, and writes
+the ref. It touches no ledger. `scripts/bench/test_testnet_corpus.py`
+(`PlanCatchpointTests`) covers it against a local endpoint.
+
+## What is not built yet, and why
+
+Both harnesses start from genesis today (`benchmarks/go-replay`,
+`bin/algod-rust/src/commands/bench_replay.rs`, `scripts/bench/tiers/replay.py`).
+The tier cannot run on this range until:
+
+1. **A pinned catchpoint file** is fetched and cached (like `testnet-head`, outside git, never
+   published from CI). A testnet catchpoint is the whole ledger state at round
+   69 120 000; its size was not measured here and is expected to be in the
+   gigabytes, so the fetch is a deliberate, cached, manual step. It comes from a
+   relay (`_algobootstrap._tcp.testnet.algorand.network`), not from the algod REST API.
+2. **Each harness starts from it.** The Rust side has catchpoint apply
+   (`algo_ledger::catchpoint`); `bench_replay` has to open a ledger from it and
+   replay the range with certificate verification on. The go side
+   (`benchmarks/go-replay`) has to restore the same catchpoint through go's
+   `CatchpointCatchupAccessor` and then feed the blocks.
+3. **A final-state definition** for the range: the corpus's `final_state`
+   (round, block hash, txn counter, totals, account digest) derived by the go
+   replay and attested by the endpoint, as `finalize` does for `testnet-head`.
+   The start state needs no separate gate: the catchpoint label's hash pins it,
+   and both sides must accept the same label.
+4. **Corpus coverage gate**: the range must keep its payouts and state proof
+   (a re-planned range with none fails the build).
+
+Items 1 to 3 are GB-scale downloads and hours of catchpoint apply on each side,
+and the go side needs the go-algorand build (libsodium) the WSL/CI environments
+provide; they are tracked as follow-up issues of #2146 rather than done in one
+change.
+
+## Cost
+
+Planning is 3 small requests. The replay itself is 200 blocks; the dominant cost
+is the one-off catchpoint download and apply (not measured here), cached
+outside git like `testnet-head`.
