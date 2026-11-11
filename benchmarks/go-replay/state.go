@@ -35,6 +35,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -295,7 +297,11 @@ func ledgerAddresses(l *data.Ledger, trackerDB string) ([]basics.Address, error)
 // the live ones are exactly those the in-memory deltas after the tracker
 // database round leave set.
 func boxKeys(l *data.Ledger, latest basics.Round, trackerDB string) ([]string, error) {
-	keys, err := l.LookupKeysByPrefix(latest, boxPrefix, 0)
+	// maxKeyNum 0 is not "all": go's scan stops at once while it holds no
+	// box set from the in-memory deltas, leaves the database round it learns
+	// from the rows at 0, and reports a stale round (seen on a catchpoint-started
+	// testnet ledger of 18 million boxes, issue #2293).
+	keys, err := l.LookupKeysByPrefix(latest, boxPrefix, math.MaxUint64)
 	var stale *ledger.StaleDatabaseRoundError
 	if err == nil || !errors.As(err, &stale) {
 		return keys, err
@@ -452,7 +458,13 @@ func computeFinalState(l *data.Ledger, trackerDB string, known []basics.Address,
 		return fs, err
 	}
 	sort.Strings(keys)
-	lines.Reset()
+	// The digest is streamed: the boxes of a real ledger (millions, up to 32 KB
+	// each) do not fit in a buffer. The lines are only kept for -dump-state.
+	kvHash := sha256.New()
+	var kvLines *bytes.Buffer
+	if dumpDir != "" {
+		kvLines = &bytes.Buffer{}
+	}
 	for _, k := range keys {
 		v, err := l.LookupKv(latest, k)
 		if err != nil {
@@ -462,11 +474,17 @@ func computeFinalState(l *data.Ledger, trackerDB string, known []basics.Address,
 			continue
 		}
 		fs.KV.Count++
-		fmt.Fprintf(&lines, "%x %x\n", k, v)
+		line := fmt.Sprintf("%x %x\n", k, v)
+		io.WriteString(kvHash, line)
+		if kvLines != nil {
+			kvLines.WriteString(line)
+		}
 	}
-	fs.KV.SHA256 = sha(lines.Bytes())
-	if err := dump("kv.txt", lines.Bytes()); err != nil {
-		return fs, err
+	fs.KV.SHA256 = hex.EncodeToString(kvHash.Sum(nil))
+	if kvLines != nil {
+		if err := dump("kv.txt", kvLines.Bytes()); err != nil {
+			return fs, err
+		}
 	}
 	return fs, nil
 }
