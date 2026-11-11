@@ -1,0 +1,54 @@
+{
+  "schema": "algod-corpus/v1",
+  "name": "small-catchpoint",
+  "generator": {
+    "name": "benchmarks/go-corpus",
+    "version": "1",
+    "seed": "algod-rust-bench-corpus",
+    "accounts": 64,
+    "txns_per_round": 5,
+    "timestamp_offset_s": 3
+  },
+  "go_algorand": {
+    "tag": "v5.0.4-stable",
+    "commit": "927ae0863cbb4cf29c6845c088a4ea4c439b10bb"
+  },
+  "network": {
+    "genesis_id": "benchcorpus-v1",
+    "genesis_hash": "fkDjWbnfVl9FiCYk1BWj4TnGBnvEhSfpS4e/OFEHqbc=",
+    "consensus_version": "https://github.com/algorandfoundation/specs/tree/73c43b4a9699390884c51e2a9598d49e28373d10",
+    "devmode": true,
+    "genesis_timestamp": 1767225600
+  },
+  "files": {
+    "blocks": "blocks.bin",
+    "consensus": "consensus.json",
+    "genesis": "genesis.json",
+    "node_config": "node-config.json",
+    "catchpoint": "catchpoint.tar"
+  },
+  "rounds": {
+    "first": 179,
+    "last": 2000,
+    "count": 1822
+  },
+  "final_state": {
+    "round": 2000,
+    "block_hash": "blk-UWDNW4AWC4S7X3SFTXZ6WD3F43ARU2JS76L2QZ7DLISXMQARV43Q",
+    "txn_counter": 13332,
+    "total_money": 464399979197438,
+    "online_money": 400344800000000,
+    "accounts": 158,
+    "accounts_microalgos": 563989992018969,
+    "accounts_sha256": "e2a0a9872971f7fda2bdaed522b3a4f55adbfd076a6de151189a089b8462cb83"
+  },
+  "start": {
+    "catchpoint": "1500#SQONCPK5LUUBGOSWIT5E265GZHKKNJWRX6YFT634GTOAAU6EWU5A",
+    "file": "catchpoint.tar",
+    "round": 1500
+  },
+  "source": {
+    "kind": "catchpoint-slice",
+    "note": "corpus small cut to rounds 179..2000 with the catchpoint 1500#SQONCPK5LUUBGOSWIT5E265GZHKKNJWRX6YFT634GTOAAU6EWU5A; its final state is the full replay's"
+  }
+}
