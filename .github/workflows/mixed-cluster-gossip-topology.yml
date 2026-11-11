@@ -69,6 +69,8 @@ jobs:
         run: |
           python3 ops/mixed-cluster/scripts/topology_test.py
           python3 ops/mixed-cluster/scripts/tx_gossip_test.py
+          bash ops/mixed-cluster/scripts/ports_shell_test.sh
+          bash ops/mixed-cluster/scripts/tx_gossip_topology_shell_test.sh
 
       - name: TX gossip, ${{ matrix.topology }}
         env:

@@ -31,18 +31,38 @@ WARMUP_TIMEOUT_S="${WARMUP_TIMEOUT_S:-300}"
 ALGOD_TOKEN="${ALGOD_TOKEN:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
 mkdir -p "$OUT_DIR"
 
+PORTS_FREE_TIMEOUT_S="${PORTS_FREE_TIMEOUT_S:-60}"
+NODE_PORTS=("$PHASE6_GO1_PORT" "$PHASE6_GO2_PORT" "$PHASE6_GO3_PORT" "$PHASE6_RUST_PORT")
+
+# Stop the cluster (and purge netroot/) and wait until its host ports are free:
+# `docker compose down` returns when the containers are removed, but on a CI
+# runner the published ports can stay bound for a moment, which made the next
+# repetition's start.sh refuse to start (issue #2280 follow-up).
+teardown() {
+    "$HERE/stop.sh" --purge > "$OUT_DIR/stop.log" 2>&1 || true
+    # belt and braces: a container compose lost track of still holds its ports
+    docker rm -f phase6-go-node-1 phase6-go-node-2 phase6-go-node-3 phase6-rust-node-4         >> "$OUT_DIR/stop.log" 2>&1 || true
+    if ! phase6_wait_ports_free "$PORTS_FREE_TIMEOUT_S" "${NODE_PORTS[@]}"; then
+        { docker ps -a; ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null; } > "$OUT_DIR/ports-diag.txt" 2>&1 || true
+        return 1
+    fi
+}
+
 cleanup() {
     if [ "${KEEP_CLUSTER:-0}" != "1" ]; then
         for n in go-node-1 go-node-2 go-node-3 rust-node-4; do
             docker logs "phase6-$n" > "$OUT_DIR/$n.log" 2>&1 || true
         done
-        "$HERE/stop.sh" --purge >/dev/null 2>&1 || true
+        teardown || true
     fi
 }
 trap cleanup EXIT
 
 export PHASE6_TOPOLOGY="$TOPOLOGY"
-"$HERE/stop.sh" --purge >/dev/null 2>&1 || true
+if ! teardown; then
+    echo "error: a previous cluster's host ports are still bound; not starting" >&2
+    exit 1
+fi
 "$HERE/start.sh" > "$OUT_DIR/start.log" 2>&1 || { tail -30 "$OUT_DIR/start.log"; exit 1; }
 
 round_of() {
