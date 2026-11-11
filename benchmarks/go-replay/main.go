@@ -23,6 +23,7 @@
 // writes fetched blocks (issue #2105, epic #2101):
 //
 //	goreplay -corpus DIR -data FRESHDIR -out RESULT.json [-config FILE] [-rounds N]
+//	         [-export-catchpoint FILE] [-from-catchpoint FILE -catchpoint-label L]
 //
 // It opens a fresh on-disk ledger exactly like node.MakeFull (config.json in
 // the data directory, EnsureAndResolveGenesisDirs, data.LoadLedger), then for
@@ -37,6 +38,12 @@
 //
 // Exit status: 0 ok, 1 replay/setup error, 3 the final state differs from
 // the corpus's corpus.json final_state.
+//
+// -from-catchpoint starts the fresh ledger from a catchpoint file through go's
+// catchpoint catchup (catchpoint.go) instead of from genesis, and replays only
+// the rounds after the catchpoint round; -export-catchpoint writes the newest
+// catchpoint go generated during a replay (set CatchpointInterval in the
+// config). Issue #2291, docs/BENCH_CATCHPOINT_REPLAY.md.
 package main
 
 import (
@@ -60,6 +67,7 @@ import (
 	"github.com/algorand/go-algorand/data/bookkeeping"
 	"github.com/algorand/go-algorand/data/transactions"
 	"github.com/algorand/go-algorand/ledger"
+	"github.com/algorand/go-algorand/ledger/ledgercore"
 	"github.com/algorand/go-algorand/logging"
 	"github.com/algorand/go-algorand/protocol"
 	"github.com/algorand/go-algorand/rpcs"
@@ -200,7 +208,7 @@ func countInner(ad transactions.ApplyData) uint64 {
 
 // prepass decodes every record once, untimed: it checks the stream, counts
 // the work (top-level + inner txns) and collects the corpus.json account set.
-func prepass(path string, last uint64, g bookkeeping.Genesis) (blocks, txns, inner uint64, known []basics.Address, err error) {
+func prepass(path string, last, from uint64, g bookkeeping.Genesis) (blocks, txns, inner uint64, known []basics.Address, err error) {
 	br, err := openBlocks(path)
 	if err != nil {
 		return
@@ -230,10 +238,14 @@ func prepass(path string, last uint64, g bookkeeping.Genesis) (blocks, txns, inn
 			err = fmt.Errorf("round %d: %v", want, derr)
 			return
 		}
-		blocks++
-		txns += uint64(len(payset))
-		for i := range payset {
-			inner += countInner(payset[i].ApplyData)
+		// The corpus.json account set covers the whole stream; the work counts
+		// only what the replay does itself (the rounds after a catchpoint).
+		if want > from {
+			blocks++
+			txns += uint64(len(payset))
+			for i := range payset {
+				inner += countInner(payset[i].ApplyData)
+			}
 		}
 		ks.addBlock(payset)
 	}
@@ -262,6 +274,9 @@ func main() {
 	cfgFile := flag.String("config", "", "config.json for the node (default: the corpus's node-config.json)")
 	rounds := flag.Uint64("rounds", 0, "replay only rounds 1..N (0: the whole corpus); for bisecting")
 	dumpDir := flag.String("dump-state", "", "also write the digested final-state lines into this directory")
+	exportCP := flag.String("export-catchpoint", "", "after the replay, write the newest catchpoint go generated to this file (CatchpointInterval > 0 in the config)")
+	fromCP := flag.String("from-catchpoint", "", "start the fresh ledger from this catchpoint file instead of genesis (needs -catchpoint-label)")
+	cpLabel := flag.String("catchpoint-label", "", "the label of -from-catchpoint")
 	flag.Parse()
 	if *corpusDir == "" || *dataDir == "" || *out == "" {
 		die("usage: goreplay -corpus DIR -data FRESHDIR -out RESULT.json [-config FILE] [-rounds N]")
@@ -279,12 +294,28 @@ func main() {
 	if meta.Schema != "algod-corpus/v1" {
 		die("corpus.json: schema %q, want algod-corpus/v1", meta.Schema)
 	}
+	var fromRound uint64
+	if *fromCP != "" {
+		if *cpLabel == "" {
+			die("-from-catchpoint needs -catchpoint-label")
+		}
+		r, _, perr := ledgercore.ParseCatchpointLabel(*cpLabel)
+		if perr != nil {
+			die("-catchpoint-label: %v", perr)
+		}
+		fromRound = uint64(r)
+	}
 	last := meta.Rounds.Last
 	if *rounds != 0 {
 		if *rounds > last {
 			die("-rounds %d beyond the corpus's last round %d", *rounds, last)
 		}
 		last = *rounds
+	}
+	if fromRound >= last {
+		if *fromCP != "" {
+			die("the catchpoint is for round %d, nothing to replay up to round %d", fromRound, last)
+		}
 	}
 
 	genesis, err := bookkeeping.LoadGenesisFromFile(filepath.Join(*corpusDir, meta.Files.Genesis))
@@ -318,13 +349,20 @@ func main() {
 	if err != nil {
 		die("config: %v", err)
 	}
+	if *fromCP != "" {
+		// An archival ledger keeps every block from round 0 and resets itself on
+		// open when the blocks database starts later; a catchpoint-started
+		// ledger holds only the lookback before the catchpoint, so it runs as a
+		// non-archival node, as go's catchpoint catchup requires.
+		cfg.Archival = false
+	}
 
 	log := logging.NewLogger()
 	log.SetLevel(logging.Warn)
 	log.SetOutput(os.Stderr)
 
 	blocksPath := filepath.Join(*corpusDir, meta.Files.Blocks)
-	nBlocks, nTxns, nInner, known, err := prepass(blocksPath, last, genesis)
+	nBlocks, nTxns, nInner, known, err := prepass(blocksPath, last, fromRound, genesis)
 	if err != nil {
 		die("%v", err)
 	}
@@ -374,9 +412,41 @@ func main() {
 		defer avv.Quit()
 	}
 
+	// A catchpoint start: the records up to the catchpoint round are read
+	// into memory (the catchpoint block and the lookback before it), the
+	// ledger is restored from the file, and the replay goes on after it.
+	var restoreS float64
+	if *fromCP != "" {
+		held := map[uint64]record{0: rec0}
+		for r := uint64(1); r <= fromRound; r++ {
+			rec, err := br.next()
+			if err != nil {
+				die("blocks.bin ends before the catchpoint round %d: %v", fromRound, err)
+			}
+			held[rec.round] = rec
+		}
+		t0 := time.Now()
+		got, err := restoreFromCatchpoint(context.Background(), l, log, *cpLabel, *fromCP, func(round uint64) (record, error) {
+			if rec, ok := held[round]; ok {
+				return rec, nil
+			}
+			return record{}, fmt.Errorf("the corpus has no block for round %d (the catchpoint needs it)", round)
+		})
+		if err != nil {
+			die("catchpoint start: %v", err)
+		}
+		restoreS = time.Since(t0).Seconds()
+		if uint64(got) != fromRound {
+			die("restored round %d, expected %d", got, fromRound)
+		}
+		if uint64(l.Latest()) != fromRound {
+			die("the ledger's latest round is %d after the catchpoint start, expected %d", l.Latest(), fromRound)
+		}
+	}
+
 	before := readProcStats()
 	start := time.Now()
-	for r := uint64(1); r <= last; r++ {
+	for r := fromRound + 1; r <= last; r++ {
 		rec, err := br.next()
 		if err != nil {
 			die("%v", err)
@@ -394,6 +464,17 @@ func main() {
 	// flushes (balancesFlushInterval) and rebuilds them from the blocks on
 	// restart, which the reopen below does too.
 	l.WaitForCommit(basics.Round(last))
+	exportedLabel := ""
+	if *exportCP != "" {
+		lbl, err := exportCatchpoint(l, *exportCP)
+		if err != nil {
+			die("export catchpoint: %v", err)
+		}
+		if lbl == "" {
+			die("no catchpoint was generated (CatchpointInterval %d, replayed up to round %d)", cfg.CatchpointInterval, last)
+		}
+		exportedLabel = lbl
+	}
 	l.Close()
 	end := time.Now()
 	after := readProcStats()
@@ -417,6 +498,25 @@ func main() {
 	}
 	if m.DBBytes, err = dirSize(*dataDir); err != nil {
 		die("%v", err)
+	}
+
+	// A catchpoint-generating run only exports the file: reopening a ledger that
+	// was closed right after a catchpoint round races the tracker's pending
+	// first-stage records, and the state is the straight replay's anyway.
+	if exportedLabel != "" {
+		res := result{
+			Schema:  resultSchema,
+			Impl:    "go",
+			Corpus:  meta.Name,
+			Rounds:  last,
+			Metrics: m,
+			Config:  map[string]any{"exported_catchpoint": exportedLabel},
+		}
+		if err := writeResult(*out, res); err != nil {
+			die("%v", err)
+		}
+		fmt.Fprintf(os.Stderr, "goreplay: exported catchpoint %s to %s\n", exportedLabel, *exportCP)
+		return
 	}
 
 	// The final state is read from the reopened ledger: what survived the
@@ -454,6 +554,13 @@ func main() {
 			"tracker_db_round":         uint64(dbRound),
 		},
 		FinalState: fs,
+	}
+	if *fromCP != "" {
+		res.Config["from_catchpoint"] = *cpLabel
+		res.Config["catchpoint_restore_s"] = restoreS
+	}
+	if exportedLabel != "" {
+		res.Config["exported_catchpoint"] = exportedLabel
 	}
 	if last == meta.Rounds.Last {
 		mm := compareWithCorpus(fs, meta.Final)
