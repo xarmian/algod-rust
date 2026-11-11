@@ -977,6 +977,20 @@ the Rust state against Go's without Go installed. The `algo-bench` test
   `scripts/bench/test_replay.py` / `test_testnet_corpus.py` cover the same
   paths per side.
 
+### Catchpoint corpora (payouts, state proofs, apps)
+
+```bash
+make bench-compare TIERS=replay CORPUS=small-catchpoint RUNS=3     # committed, seconds
+make bench-compare TIERS=replay CORPUS=testnet-catchpoint RUNS=3   # real testnet, fetched once
+```
+
+`testnet-head` starts at genesis, so it holds no applications, boxes, proposer
+payouts or state proofs. A catchpoint corpus starts both sides from a catchpoint
+and replays the rounds after it with real certificates; the final state compared
+is the whole ledger. The mode, its source, its cost (a 2.5 GB catchpoint, about
+20 to 30 minutes per side) and its measured numbers are in
+[BENCH_CATCHPOINT_REPLAY.md](BENCH_CATCHPOINT_REPLAY.md).
+
 ### The `testnet-head` corpus (real certificates)
 
 ```bash

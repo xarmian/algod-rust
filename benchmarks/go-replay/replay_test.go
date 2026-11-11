@@ -523,3 +523,70 @@ func TestCatchpointStartRefusesAWrongLabel(t *testing.T) {
 		t.Fatalf("the refusal does not name the catchpoint:\n%s", stderr)
 	}
 }
+
+const smallCatchpointCorpus = "../corpus/small-catchpoint"
+
+// A catchpoint corpus (issue #2293) carries its start: blocks.bin holds the
+// lookback before the catchpoint round and the rounds after it, corpus.json
+// names the catchpoint file, and the replay needs no extra argument. It reaches
+// the state recorded for it and replays only the rounds after the catchpoint
+// round (1501..2000).
+func TestCatchpointCorpusStartsFromItsCatchpoint(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "result.json")
+	code, stderr := runReplay(t, "-corpus", smallCatchpointCorpus, "-data", filepath.Join(dir, "node"), "-out", out)
+	if code != 0 {
+		t.Fatalf("goreplay exited %d:\n%s", code, stderr)
+	}
+	got, cfg, match := readResult(t, out)
+	if match == nil || !*match {
+		t.Fatalf("final state does not match corpus.json")
+	}
+	if !strings.HasPrefix(cfg["from_catchpoint"].(string), "1500#") {
+		t.Fatalf("result does not record the catchpoint start: %v", cfg)
+	}
+	var want map[string]any
+	rec, err := os.ReadFile("testdata/small-catchpoint-final-state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := decodeJSON(rec, &want); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		g, _ := json.MarshalIndent(got, "", "  ")
+		t.Fatalf("final state differs from testdata/small-catchpoint-final-state.json:\n%s", g)
+	}
+	raw, _ := os.ReadFile(out)
+	var res struct {
+		Metrics struct {
+			Blocks uint64 `json:"blocks"`
+		} `json:"metrics"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil || res.Metrics.Blocks != 500 {
+		t.Fatalf("replayed blocks %d (%v), want 500", res.Metrics.Blocks, err)
+	}
+}
+
+// A corpus whose first round is not 0 but has no catchpoint start is refused.
+func TestFirstRoundWithoutAStartIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	corpus := copyCorpusFrom(t, smallCatchpointCorpus)
+	raw, err := os.ReadFile(filepath.Join(corpus, "corpus.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cj map[string]any
+	if err := json.Unmarshal(raw, &cj); err != nil {
+		t.Fatal(err)
+	}
+	delete(cj, "start")
+	patched, _ := json.Marshal(cj)
+	if err := os.WriteFile(filepath.Join(corpus, "corpus.json"), patched, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, stderr := runReplay(t, "-corpus", corpus, "-data", filepath.Join(dir, "node"), "-out", filepath.Join(dir, "r.json"))
+	if code == 0 || !strings.Contains(stderr, "needs a catchpoint start") {
+		t.Fatalf("exit %d, stderr:\n%s", code, stderr)
+	}
+}

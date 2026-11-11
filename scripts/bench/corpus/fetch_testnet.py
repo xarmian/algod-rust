@@ -54,6 +54,17 @@ Usage:
       the endpoint serves the N rounds after it with certificates, and write
       the ref (`catchpoint=`, `rounds=`, `endpoint=`, `genesis_hash=`).
       See docs/BENCH_CATCHPOINT_REPLAY.md.
+  fetch_testnet.py fetch-catchpoint [--ref FILE] [--dest DIR] [--rounds N]
+                            [--final-state FILE] [--catchpoint-file FILE]
+                            [--allow-uncovered] [--force]
+      build the catchpoint-start corpus the ref (plan-catchpoint) describes
+      (issue #2293): blocks.bin of the lookback before the catchpoint round and
+      the rounds after it, the catchpoint file (from `catchpoint_source=`, a
+      relay, or --catchpoint-file), a corpus.json with `rounds.first` and
+      `start`. Refuses a range without proposer payouts, state proofs and app
+      calls. Without a final state the corpus is provisional: replay it with
+      go, then `finalize`, commit the final-state file and set `final_state=`
+      in the ref.
   fetch_testnet.py finalize --corpus DIR --replay-result FILE --out FILE
       derive the committed final-state file from a go replay result
       (benchmarks/go-replay `-out` JSON) after checking its round, block
@@ -71,6 +82,7 @@ import os
 import struct
 import sys
 import time
+import shutil
 import urllib.error
 import urllib.request
 
@@ -107,6 +119,7 @@ CATCHPOINT_CHANNEL = ("https://algorand-catchpoints.s3.us-east-2.amazonaws.com"
                       "/channel/testnet/latest.catchpoint")
 CATCHPOINT_INTERVAL = 10000
 DEFAULT_CATCHPOINT_REF = os.path.join(REPO, "benchmarks", "corpus", "testnet-catchpoint.ref")
+DEFAULT_CATCHPOINT_DEST = os.path.join(REPO, "benchmarks", "corpus", "testnet-catchpoint")
 BASE32 = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
 
 
@@ -118,7 +131,7 @@ class Unreachable(FetchError):
     pass
 
 
-def parse_catchpoint_label(label):
+def parse_catchpoint_label(label, interval=CATCHPOINT_INTERVAL):
     """(round, hash) of a catchpoint label `<round>#<52 base32 chars>` (go
     `ledgercore.ParseCatchpointLabel`: a positive round on a catchpoint
     boundary and the base32 of a 32-byte digest); FetchError otherwise."""
@@ -128,9 +141,9 @@ def parse_catchpoint_label(label):
         raise FetchError(f"not a catchpoint label: {label!r} (want <round>#<hash>)")
     if len(digest) != 52 or not set(digest) <= BASE32:
         raise FetchError(f"catchpoint label {label!r}: the hash is not 52 base32 characters")
-    if int(rnd) % CATCHPOINT_INTERVAL:
+    if interval and int(rnd) % interval:
         raise FetchError(f"catchpoint label {label!r}: round {rnd} is not a multiple of "
-                         f"{CATCHPOINT_INTERVAL}")
+                         f"{interval}")
     return int(rnd), digest
 
 
@@ -484,6 +497,282 @@ def cmd_plan_catchpoint(args):
     return 0
 
 
+# ---- catchpoint-start corpus (issue #2293) ---------------------------------
+
+# The consensus parameters the catchup lookback depends on (go
+# catchup/catchpointService.go processStageBlocksDownload), identical on every
+# protocol since the state proofs of v34.
+MAX_TXN_LIFE = 1000
+DEEPER_BLOCK_HEADER_HISTORY = 1
+CATCHPOINT_LOOKBACK = 320
+MAX_BAL_LOOKBACK = 320
+STATE_PROOF_INTERVAL = 256
+STATE_PROOF_VOTERS_LOOKBACK = 16
+STATE_PROOF_MAX_RECOVERY_INTERVALS = 10
+
+
+def catchpoint_lookback(round_, next_state_proof_round):
+    """How many blocks before the catchpoint round the replay needs: go's
+    lookback (MaxTxnLife + DeeperBlockHeaderHistory + CatchpointLookback, at
+    least MaxBalLookback, at least what a pending state proof needs), trimmed
+    to round - 1. algod-rust's own lookback (MaxTxnLife, or the state-proof
+    one) is never larger."""
+    sp = 0  # no state proof tracking (go: StateProofInterval == 0)
+    if next_state_proof_round:
+        recent = round_ - round_ % STATE_PROOF_INTERVAL
+        oldest_recovery = max(0, recent - STATE_PROOF_INTERVAL * STATE_PROOF_MAX_RECOVERY_INTERVALS)
+        oldest = (next_state_proof_round if next_state_proof_round > oldest_recovery
+                  else oldest_recovery)
+        sp = round_ - max(0, max(0, oldest - STATE_PROOF_INTERVAL) - STATE_PROOF_VOTERS_LOOKBACK)
+    lookback = max(MAX_TXN_LIFE + DEEPER_BLOCK_HEADER_HISTORY + CATCHPOINT_LOOKBACK,
+                   MAX_BAL_LOOKBACK, sp, MAX_TXN_LIFE)
+    return min(lookback, round_ - 1)
+
+
+def block_coverage(payload):
+    """(payout, state_proofs, app_calls) of a block response record: whether the
+    header names a proposer payout (`prp`), and how many state proof and
+    application call transactions the payset holds."""
+    top = corpus_tool._mp_map(payload, 0)
+    blk = corpus_tool._mp_map(payload, top["block"][0])
+    payout = "prp" in blk
+    stpf = appl = 0
+    if "txns" in blk:
+        kind, n, j = corpus_tool._mp_item(payload, blk["txns"][0])
+        if kind != "array":
+            raise FetchError("block txns is not an array")
+        for _ in range(n):
+            signed = corpus_tool._mp_map(payload, j)
+            txn = corpus_tool._mp_map(payload, signed["txn"][0])
+            _, t, _ = corpus_tool._mp_item(payload, txn["type"][0])
+            t = t.decode("utf-8", "replace")
+            stpf += t == "stpf"
+            appl += t == "appl"
+            j = corpus_tool._mp_skip(payload, j)
+    return payout, stpf, appl
+
+
+def range_coverage(blocks_path, after_round):
+    """What the rounds after `after_round` of blocks.bin exercise."""
+    with open(blocks_path, "rb") as f:
+        raw = f.read()
+    cov = {"proposer_payouts": 0, "state_proofs": 0, "app_calls": 0}
+    for rnd, off, n in corpus_tool.parse_records(raw):
+        if rnd <= after_round:
+            continue
+        payout, stpf, appl = block_coverage(raw[off:off + n])
+        cov["proposer_payouts"] += payout
+        cov["state_proofs"] += stpf
+        cov["app_calls"] += appl
+    return cov
+
+
+def coverage_gate(cov):
+    """FetchError unless the range exercises what testnet-head cannot."""
+    missing = [k for k in ("proposer_payouts", "state_proofs", "app_calls") if not cov[k]]
+    if missing:
+        raise FetchError("the replayed range has no " + ", no ".join(missing)
+                         + f" ({cov}); pick a catchpoint whose following rounds hold them, or "
+                           "more rounds (--rounds), or pass --allow-uncovered")
+
+
+def b36(n):
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    out = ""
+    while n:
+        n, r = divmod(n, 36)
+        out = digits[r] + out
+    return out or "0"
+
+
+def download_catchpoint_file(source, genesis_id, round_, label, dest, retries=3):
+    """GET {source}/v1/{genesis_id}/ledger/{round in base 36} into `dest`, and
+    check that the file's header names `label`. The relays send it chunked, so
+    the size is only known at the end."""
+    url = f"{source.rstrip('/')}/v1/{genesis_id}/ledger/{b36(round_)}"
+    last = None
+    for attempt in range(retries):
+        tmp = dest + ".partial"
+        try:
+            with urllib.request.urlopen(url, timeout=120) as r, open(tmp, "wb") as f:
+                total, mark = 0, time.time()
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    total += len(chunk)
+                    if time.time() - mark > 30:
+                        print(f"fetch_testnet: catchpoint file: {total / 1e6:.0f} MB", flush=True)
+                        mark = time.time()
+            got = catchpoint_file_label(tmp)
+            if got != label:
+                os.remove(tmp)
+                raise FetchError(f"{url} serves the catchpoint {got!r}, not {label!r}")
+            os.replace(tmp, dest)
+            print(f"fetch_testnet: catchpoint file {total / 1e6:.0f} MB -> {dest}", flush=True)
+            return total
+        except FetchError:
+            raise
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+            last = f"{type(e).__name__}: {e}"
+            time.sleep(min(2 ** attempt, 15))
+    raise Unreachable(f"GET {url}: {last}")
+
+
+def catchpoint_file_label(path):
+    """The label in the content header (first tar entry) of a catchpoint file."""
+    import tarfile
+    with tarfile.open(path, "r:*") as tf:
+        m = tf.next()
+        if m is None or m.name != "content.msgpack":
+            raise FetchError(f"{path}: not a catchpoint file (first entry {m and m.name!r})")
+        head, _ = corpus_tool.mp_decode(tf.extractfile(m).read(), 0)
+    return head.get("catchpoint", "")
+
+
+def write_blocks_range(ep, first, last, path, workers):
+    """Fetch rounds first..last in order into `path`, `workers` at a time."""
+    with open(path, "wb") as f:
+        f.write(MAGIC)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            window = max(workers * 4, 8)
+            pending = {}
+            nxt = first
+            for r in range(first, last + 1):
+                while nxt <= last and nxt < r + window:
+                    pending[nxt] = pool.submit(ep.block, nxt)
+                    nxt += 1
+                f.write(record(r, pending.pop(r).result()))
+                if (r - first) and (r - first) % 500 == 0:
+                    print(f"fetch_testnet: round {r}/{last}", flush=True)
+
+
+def build_catchpoint_corpus(ep, ref, dest, name, final_state, workers, catchpoint_file=None,
+                            allow_uncovered=False):
+    """Write the catchpoint-start corpus `dest` (which must not exist)."""
+    label = ref["catchpoint"]
+    rnd, _ = parse_catchpoint_label(label, interval=0)
+    rounds = int(ref["rounds"])
+    last = rnd + rounds
+    os.makedirs(dest)
+    try:
+        gen_raw = ep.get("/genesis")
+        params = ep.json("/v2/transactions/params")
+        got = genesis_hash_b64(gen_raw)
+        if got != params["genesis-hash"]:
+            raise FetchError(f"the endpoint's /genesis hashes to {got}, but it reports "
+                             f"genesis-hash {params['genesis-hash']}")
+        if ref.get("genesis_hash") and got != ref["genesis_hash"]:
+            raise FetchError(f"wrong network: the endpoint's genesis hashes to {got}, "
+                             f"the ref pins {ref['genesis_hash']}")
+        with open(os.path.join(dest, "genesis.json"), "wb") as f:
+            f.write(gen_raw)
+        with open(os.path.join(dest, "node-config.json"), "w", encoding="utf-8",
+                  newline="\n") as f:
+            json.dump(NODE_CONFIG, f, indent="\t")
+        hdr = ep.json(f"/v2/blocks/{rnd}?header-only=true")["block"]
+        spt = (hdr.get("spt") or {}).get("0") or {}
+        first = rnd - catchpoint_lookback(rnd, int(spt.get("n") or 0))
+        print(f"fetch_testnet: lookback {rnd - first} blocks: rounds {first}..{last}", flush=True)
+        write_blocks_range(ep, first, last, os.path.join(dest, "blocks.bin"), workers)
+        cov = range_coverage(os.path.join(dest, "blocks.bin"), rnd)
+        print(f"fetch_testnet: the replayed rounds exercise {cov}", flush=True)
+        if not allow_uncovered:
+            coverage_gate(cov)
+        if catchpoint_file:
+            shutil.copyfile(catchpoint_file, os.path.join(dest, "catchpoint.tar"))
+            got_label = catchpoint_file_label(os.path.join(dest, "catchpoint.tar"))
+            if got_label != label:
+                raise FetchError(f"{catchpoint_file} is the catchpoint {got_label!r}, not {label!r}")
+        else:
+            source = ref.get("catchpoint_source")
+            if not source:
+                raise FetchError("no catchpoint_source= in the ref (a relay such as "
+                                 "http://r-5i.algorand-testnet.network:4161) and no --catchpoint-file")
+            download_catchpoint_file(source, params["genesis-id"], rnd, label,
+                                     os.path.join(dest, "catchpoint.tar"))
+        att = attested(ep, last)
+        fs = dict(att)
+        if final_state is not None:
+            for k in ("round", "block_hash", "txn_counter"):
+                if final_state.get(k) != att[k]:
+                    raise FetchError(f"final-state file says {k} {final_state.get(k)!r} at round "
+                                     f"{last}, the endpoint attests {att[k]!r}")
+            fs.update({k: final_state[k] for k in STATE_KEYS})
+        cj = {
+            "schema": corpus_tool.SCHEMA,
+            "name": name,
+            "source": {
+                "kind": "testnet-catchpoint",
+                "note": f"rounds {first}..{last} of the public testnet (blocks and certificates "
+                        "verbatim from an archival algod) and the catchpoint of round "
+                        f"{rnd} from a relay; the replay starts from the catchpoint",
+            },
+            "network": {"genesis_id": params["genesis-id"],
+                        "genesis_hash": params["genesis-hash"], "devmode": False},
+            "files": {"blocks": "blocks.bin", "genesis": "genesis.json",
+                      "node_config": "node-config.json", "catchpoint": "catchpoint.tar"},
+            "rounds": {"first": first, "last": last, "count": last - first + 1},
+            "start": {"catchpoint": label, "file": "catchpoint.tar", "round": rnd,
+                      "coverage": cov},
+            "final_state": fs,
+        }
+        with open(os.path.join(dest, "corpus.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(cj, f, indent=2)
+            f.write("\n")
+        corpus_tool.write_manifest(dest)
+    except BaseException:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+    return dest
+
+
+def cmd_fetch_catchpoint(args):
+    ref = read_ref(args.ref) if os.path.isfile(args.ref) else {}
+    if args.endpoint:
+        ref["endpoint"] = args.endpoint
+    if args.rounds is not None:
+        ref["rounds"] = str(args.rounds)
+    endpoint = os.environ.get("TESTNET_ENDPOINT") or ref.get("endpoint")
+    if not endpoint:
+        raise FetchError(f"no endpoint (set endpoint= in {args.ref}, TESTNET_ENDPOINT or --endpoint)")
+    for k in ("catchpoint", "rounds"):
+        if not ref.get(k):
+            raise FetchError(f"no {k}= in {args.ref} (run plan-catchpoint)")
+    parse_catchpoint_label(ref["catchpoint"], interval=0)
+    final_state = None
+    fs_path = args.final_state if args.final_state is not None else ref.get("final_state")
+    if fs_path:
+        p = fs_path if os.path.isabs(fs_path) else os.path.join(REPO, fs_path)
+        with open(p, encoding="utf-8") as f:
+            final_state = json.load(f)
+    if os.path.exists(args.dest) and not args.force:
+        raise FetchError(f"{args.dest} already exists (pass --force to replace it)")
+    tmp = args.dest + ".partial"
+    shutil.rmtree(tmp, ignore_errors=True)
+    print(f"fetch_testnet: catchpoint {ref['catchpoint']} + {ref['rounds']} rounds from "
+          f"{endpoint} -> {args.dest}", flush=True)
+    build_catchpoint_corpus(Endpoint(endpoint, retries=args.retries), ref, tmp, args.name,
+                            final_state, args.workers, args.catchpoint_file, args.allow_uncovered)
+    old = args.dest + ".old"
+    had_old = os.path.exists(args.dest)
+    if had_old:
+        shutil.rmtree(old, ignore_errors=True)
+        os.replace(args.dest, old)
+    try:
+        os.replace(tmp, args.dest)
+    except BaseException:
+        if had_old:
+            os.replace(old, args.dest)
+        raise
+    if had_old:
+        shutil.rmtree(old, ignore_errors=True)
+    print(f"fetch_testnet: installed {args.dest}"
+          + ("" if final_state else " (provisional: no final state yet, run `finalize`)"))
+    return 0
+
+
 def cmd_finalize(args):
     cj = corpus_tool.load_corpus_json(args.corpus)
     with open(args.replay_result, encoding="utf-8") as f:
@@ -518,6 +807,19 @@ def main(argv=None):
     f.add_argument("--workers", type=int, default=16)
     f.add_argument("--retries", type=int, default=6)
     f.add_argument("--force", action="store_true")
+    fc = sub.add_parser("fetch-catchpoint")
+    fc.add_argument("--ref", default=DEFAULT_CATCHPOINT_REF)
+    fc.add_argument("--endpoint")
+    fc.add_argument("--rounds", type=int)
+    fc.add_argument("--final-state")
+    fc.add_argument("--dest", default=DEFAULT_CATCHPOINT_DEST)
+    fc.add_argument("--name", default="testnet-catchpoint")
+    fc.add_argument("--workers", type=int, default=16)
+    fc.add_argument("--retries", type=int, default=6)
+    fc.add_argument("--catchpoint-file", help="use this catchpoint file instead of downloading it")
+    fc.add_argument("--allow-uncovered", action="store_true",
+                    help="do not require payouts, state proofs and app calls in the range")
+    fc.add_argument("--force", action="store_true")
     c = sub.add_parser("plan-catchpoint")
     c.add_argument("--ref", default=DEFAULT_REF)
     c.add_argument("--label")
@@ -533,7 +835,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     try:
         return {"fetch": cmd_fetch, "finalize": cmd_finalize,
-                "plan-catchpoint": cmd_plan_catchpoint}[args.cmd](args)
+                "plan-catchpoint": cmd_plan_catchpoint,
+                "fetch-catchpoint": cmd_fetch_catchpoint}[args.cmd](args)
     except Unreachable as e:
         print(f"fetch_testnet: endpoint not reachable: {e}", file=sys.stderr)
         return 3

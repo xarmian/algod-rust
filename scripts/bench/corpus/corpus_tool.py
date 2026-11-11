@@ -27,6 +27,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import sys
 import tarfile
 
@@ -135,11 +136,39 @@ def _counts(obj, key, errors):
     return v
 
 
+def validate_start(cj):
+    """A catchpoint-start corpus (issue #2293): blocks.bin holds rounds
+    `rounds.first` (the lookback before the catchpoint round) to `rounds.last`,
+    the replay starts from `start.file`, a catchpoint of round `start.round`."""
+    errors = []
+    start, r, files = cj["start"], cj.get("rounds", {}), cj.get("files", {})
+    if not (isinstance(r.get("first"), int) and isinstance(r.get("last"), int)
+            and r.get("count") == r["last"] - r["first"] + 1):
+        errors.append(f"rounds: inconsistent {r}")
+        return errors
+    label = str(start.get("catchpoint", ""))
+    rnd, sep, digest = label.partition("#")
+    if not sep or not rnd.isdigit() or len(digest) != 52:
+        errors.append(f"start.catchpoint: not a catchpoint label: {label!r}")
+    elif start.get("round") != int(rnd):
+        errors.append(f"start.round {start.get('round')} is not the label's round {rnd}")
+    elif not r["first"] <= int(rnd) < r["last"]:
+        errors.append(f"the catchpoint round {rnd} is not inside rounds {r['first']}..{r['last']} "
+                      "(the lookback blocks, then at least one round to replay)")
+    if start.get("file") != files.get("catchpoint") or not start.get("file"):
+        errors.append("start.file must be files.catchpoint")
+    if cj.get("final_state", {}).get("round") != r["last"]:
+        errors.append("final_state.round != rounds.last")
+    return errors
+
+
 def validate_corpus_json(cj, coverage=True):
     """Structural and arithmetic consistency of corpus.json (no block decoding)."""
     errors = []
     if cj.get("schema") != SCHEMA:
         return [f"schema is {cj.get('schema')!r}, expected {SCHEMA!r}"]
+    if "start" in cj:
+        return validate_start(cj)
     for key in ("name", "generator", "go_algorand", "network", "files", "rounds", "txns",
                 "txids_sha256", "histogram", "final_state"):
         if key not in cj:
@@ -513,6 +542,75 @@ def corrupt_vote(blocks_path, rnd=None):
     return r, pos
 
 
+def derive_catchpoint_corpus(src, dest, catchpoint_file, label, first):
+    """A catchpoint-start corpus (issue #2293) from the corpus `src` that holds
+    every round: `dest` gets `src`'s files, a blocks.bin of rounds
+    `first`..last (the lookback before the catchpoint round, then the rounds to
+    replay), the catchpoint file, and a corpus.json with `rounds.first` and
+    `start`. `src`'s final state is the one the replay must reach (the rounds
+    after the catchpoint are the same blocks)."""
+    cj = load_corpus_json(src)
+    rnd, sep, digest = label.partition("#")
+    if not sep or not rnd.isdigit() or len(digest) != 52:
+        raise ValueError(f"not a catchpoint label: {label!r}")
+    rnd = int(rnd)
+    last = cj["rounds"]["last"]
+    if not 0 < first <= rnd < last:
+        raise ValueError(f"need 0 < first <= catchpoint round {rnd} < last {last}, got first {first}")
+    os.makedirs(dest)
+    blocks_name = cj["files"]["blocks"]
+    for n in corpus_files(src):
+        if n not in (blocks_name, "corpus.json"):
+            shutil.copyfile(os.path.join(src, n), os.path.join(dest, n))
+    with open(os.path.join(src, blocks_name), "rb") as f:
+        raw = f.read()
+    out = bytearray(BLOCKS_MAGIC)
+    for r, off, n in parse_records(raw):
+        if r >= first:
+            out += raw[off - 12:off + n]
+    with open(os.path.join(dest, blocks_name), "wb") as f:
+        f.write(out)
+    shutil.copyfile(catchpoint_file, os.path.join(dest, "catchpoint.tar"))
+    d = dict(cj)
+    d["name"] = cj["name"] + "-catchpoint"
+    d["files"] = dict(cj["files"], catchpoint="catchpoint.tar")
+    d["rounds"] = {"first": first, "last": last, "count": last - first + 1}
+    d["start"] = {"catchpoint": label, "file": "catchpoint.tar", "round": rnd}
+    d["source"] = {"kind": "catchpoint-slice",
+                   "note": f"corpus {cj['name']} cut to rounds {first}..{last} with the "
+                           f"catchpoint {label}; its final state is the full replay's"}
+    for k in ("txns", "txids_sha256", "histogram"):
+        d.pop(k, None)  # they describe the whole of the source corpus
+    with open(os.path.join(dest, "corpus.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump(d, f, indent=2)
+        f.write("\n")
+    write_manifest(dest)
+    return dest
+
+
+def finalize_known_accounts(corpus, replay_result):
+    """Set the account digest of a catchpoint corpus's final_state from a go
+    replay result (`goreplay -out`). The digest covers the accounts the corpus's
+    own blocks name plus the genesis accounts, a smaller set than the whole
+    stream's, so a corpus cut from a longer one cannot inherit it; the round,
+    block hash, txn counter and totals must already agree with the result."""
+    cj = load_corpus_json(corpus)
+    with open(replay_result, encoding="utf-8") as f:
+        st = json.load(f)["final_state"]
+    fs = cj["final_state"]
+    for k in ("round", "block_hash", "txn_counter", "total_money", "online_money"):
+        if st[k] != fs[k]:
+            raise ValueError(f"the replay's {k} {st[k]!r} differs from corpus.json's {fs[k]!r}")
+    known = st["known_accounts"]
+    fs.update(accounts=known["count"], accounts_microalgos=known["microalgos"],
+              accounts_sha256=known["sha256"])
+    with open(os.path.join(corpus, "corpus.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump(cj, f, indent=2)
+        f.write("\n")
+    write_manifest(corpus)
+    return corpus
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -527,6 +625,15 @@ def main(argv=None):
     p.add_argument("dir")
     p.add_argument("out")
     sub.add_parser("summary").add_argument("dir")
+    f = sub.add_parser("finalize-known")
+    f.add_argument("--corpus", required=True)
+    f.add_argument("--replay-result", required=True)
+    d = sub.add_parser("derive-catchpoint")
+    d.add_argument("--src", required=True)
+    d.add_argument("--dest", required=True)
+    d.add_argument("--catchpoint-file", required=True)
+    d.add_argument("--label", required=True)
+    d.add_argument("--first", type=int, required=True)
     args = ap.parse_args(argv)
     if args.cmd == "manifest":
         print(write_manifest(args.dir))
@@ -537,7 +644,9 @@ def main(argv=None):
             print(f"corpus: {args.dir}: {e}", file=sys.stderr)
         if not errors:
             cj = load_corpus_json(args.dir)
-            print(f"corpus: {args.dir} OK ({cj['txns']} txns, rounds 0..{cj['rounds']['last']})")
+            r = cj["rounds"]
+            what = f"{cj['txns']} txns" if "txns" in cj else "catchpoint start"
+            print(f"corpus: {args.dir} OK ({what}, rounds {r['first']}..{r['last']})")
         return 1 if errors else 0
     if args.cmd == "compare":
         diffs = compare(args.a, args.b)
@@ -549,6 +658,13 @@ def main(argv=None):
     if args.cmd == "pack":
         print(pack(args.dir, args.out))
         print(f"sha256 {sha256_file(args.out)}")
+        return 0
+    if args.cmd == "finalize-known":
+        print(finalize_known_accounts(args.corpus, args.replay_result))
+        return 0
+    if args.cmd == "derive-catchpoint":
+        print(derive_catchpoint_corpus(args.src, args.dest, args.catchpoint_file, args.label,
+                                       args.first))
         return 0
     if args.cmd == "summary":
         sys.stdout.write(summary(load_corpus_json(args.dir)))

@@ -1,6 +1,8 @@
 # Catchpoint-start replay corpus (issue #2146)
 
-Part of the benchmark epic #2101; follow-up of #2119 (`testnet-head`).
+Part of the benchmark epic #2101; follow-up of #2119 (`testnet-head`). Built by
+#2294 (plan), #2291 (go harness), #2292 (Rust harness) and #2293 (fetch, gates,
+tier wiring).
 
 ## Why
 
@@ -12,82 +14,106 @@ has to start from a **catchpoint**: the ledger state at a catchpoint round,
 authenticated by the catchpoint label `<round>#<hash>`, followed by the real
 blocks and certificates of the rounds after it.
 
-## The range
+## The corpora
 
-`benchmarks/corpus/testnet-catchpoint.ref` pins one such range (written by
-`scripts/bench/corpus/fetch_testnet.py plan-catchpoint`):
+| name | what | where |
+|---|---|---|
+| `testnet-catchpoint` | the public testnet's catchpoint of round 69 120 000 and rounds 69 120 001..=69 120 200 with real certificates | fetched once into `benchmarks/corpus/testnet-catchpoint` (git-ignored) |
+| `small-catchpoint` | the committed `small` corpus cut at the catchpoint go generated at its round 1500 | `benchmarks/corpus/small-catchpoint` (committed, 3.7 MB) |
 
-| | |
+A catchpoint corpus is an ordinary corpus directory (`blocks.bin` in the
+`ACRPBLK1` layout, `genesis.json`, `node-config.json`, `corpus.json`,
+`MANIFEST.sha256`) with two differences: `corpus.json` has `rounds.first > 0` and
+a `start` object (`catchpoint`: the label, `file`: `catchpoint.tar`, `round`,
+`coverage`), and `blocks.bin` holds the rounds `first..=last`, that is the
+lookback before the catchpoint round (go's `processStageBlocksDownload`:
+`MaxTxnLife + DeeperBlockHeaderHistory + CatchpointLookback = 1321`, or what a
+pending state proof needs, trimmed to `round - 1`) and then the rounds to replay.
+Both harnesses read `start` from `corpus.json`: no extra argument.
+
+`testnet-catchpoint` is pinned by `benchmarks/corpus/testnet-catchpoint.ref`
+(endpoint, relay, catchpoint label, round count, genesis hash, and
+`final_state=benchmarks/corpus/testnet-catchpoint.final.json`). It is not pinned
+by a manifest hash: a relay's tar file is not byte-stable, and the label (the hash
+of the whole state) is the pin, which both harnesses check against the restored
+state.
+
+## What the range exercises
+
+Scanned at fetch time and gated (`fetch-catchpoint` refuses a range without
+them, `--allow-uncovered` skips the gate): the 200 replayed blocks hold a
+proposer payout in every block, a state proof transaction (round 69 120 131) and
+257 application calls; the catchpoint itself holds 2 245 701 accounts and
+18 057 002 boxes. `testnet-head` holds none of these.
+
+## Running it
+
+```bash
+# once: the corpus (the endpoint serves the blocks, a relay the catchpoint file)
+python3 scripts/bench/corpus/fetch_testnet.py fetch-catchpoint
+# the comparison: both sides start from the catchpoint, replay 200 blocks with
+# certificate verification, and must reach the same final state
+make bench-compare TIERS=replay CORPUS=testnet-catchpoint RUNS=3
+```
+
+`make bench-compare ... CORPUS=small-catchpoint` runs the same on the committed
+small corpus (seconds). Each side's result records `from_catchpoint` and
+`catchpoint_restore_s`; the timed section (blocks/s, txns/s, CPU, I/O) starts
+after the catchpoint start, and the work counts cover only the replayed rounds.
+
+Making a new range: `fetch_testnet.py plan-catchpoint [--rounds N]` writes the
+ref (latest catchpoint of the channel, checked against the endpoint),
+`fetch-catchpoint` builds a provisional corpus (attested round, hash and txn
+counter only), a go replay of it gives the full state, `finalize` turns that into
+the final-state file, and `final_state=` in the ref makes the next fetch final.
+Rerun `fetch-catchpoint` after that.
+
+## How the start works
+
+- **go** (`benchmarks/go-replay`, `catchpoint.go`): go's catchpoint catchup with
+  the corpus as the network: `CatchpointCatchupAccessor` stages the file's chunks,
+  builds the trie, `VerifyCatchpoint` checks it against the catchpoint block (and so
+  the label), the block and its lookback are stored from the corpus,
+  `CompleteCatchup` switches the databases. It runs as a non-archival node (an
+  archival ledger resets itself when its blocks database does not start at
+  round 0).
+- **algod-rust** (`bench replay-corpus`): the production `SyncOrchestrator`
+  (import, verify, lookback blocks, window replay) with a corpus-backed
+  `SyncBackend`, stopped at the catchpoint round.
+- Then both replay the later rounds through their catchup path (certificate
+  authentication, payset checks, apply, commit) and compute the same canonical
+  final state: the whole ledger (every account and box), not a sample.
+
+## Measured (this machine, one run each, not a benchmark)
+
+| step | value |
 |---|---|
-| network | public testnet (genesis hash pinned in the ref) |
-| catchpoint | `69120000#HV3VUPYHFFFV5DQ4KAJ7UL7KU7SB5TV2W4TMITNE65XTR7IKBKLQ` (the channel's latest at the time of writing) |
-| replayed rounds | 69 120 001 ..= 69 120 200 (200 rounds) |
-| source of the blocks | an archival algod, `GET /v2/blocks/{r}?format=msgpack` (certificate included), as for `testnet-head` |
+| catchpoint file | 2 583 MB (2.4 GiB) from a relay at about 11 MB/s: about 4 minutes |
+| blocks (1 522 incl. lookback) | seconds, from the archival endpoint |
+| go: catchpoint restore | 1 002 s; whole run 26 min wall, 15.5 GB peak RSS, 8.5 GB database |
+| go: replay of 200 blocks (319 txns) | 0.67 s |
+| algod-rust: catchpoint restore | 365 s (Windows, release); whole run 32 min (the final-state read of 2.2 M accounts and 18 M boxes dominates), 8.7 GB database |
+| algod-rust: replay of 200 blocks | 1.65 s |
+| final state | identical on both sides: block hash `blk-PIV736MTN7...` (the endpoint's), txn counter 775 694 114, 2 245 701 accounts, 18 057 002 boxes, same digests |
 
-Scanned for this issue (`GET /v2/blocks/{r}` for each round of the range): every
-block carries a proposer payout (`prp`), round 69 120 131 holds a state proof
-transaction (`stpf`), and 257 application calls are spread over the range. So the
-range exercises exactly what `testnet-head` cannot.
+The full tier ran on this corpus (`BENCH_CORPUS=testnet-catchpoint BENCH_RUNS=1
+BENCH_REPLAY_WARMUP=0`, both sides on WSL/Linux, 33 minutes): go 0.74 s, algod-rust
+1.05 s for the 200 blocks, and the final-state gate passed against `corpus.json`
+(`state bdd2e051c1aaba02`, block `blk-PIV736MTN7...`). One run, so no ratio is
+claimed.
 
-`plan-catchpoint` resolves the label (the channel's `latest.catchpoint`, or
-`--label`), checks it (positive round on a 10 000-round boundary, 52 base32
-characters of hash), checks that the endpoint is on the pinned network and
-serves the first and the last block of the range with certificates, and writes
-the ref. It touches no ledger. `scripts/bench/test_testnet_corpus.py`
-(`PlanCatchpointTests`) covers it against a local endpoint.
+The replay itself is tiny next to the restore: this corpus tests that both nodes
+reach the same state and handle payouts, state proofs and apps correctly, and its
+timings are most useful as the restore cost. Use more rounds (`--rounds`) for a
+longer replay.
 
-## What is not built yet, and why
+## Limits
 
-Both harnesses start from genesis today (`benchmarks/go-replay`,
-`bin/algod-rust/src/commands/bench_replay.rs`, `scripts/bench/tiers/replay.py`).
-The tier cannot run on this range until:
-
-1. **A pinned catchpoint file** is fetched and cached (like `testnet-head`, outside git, never
-   published from CI). A testnet catchpoint is the whole ledger state at round
-   69 120 000; its size was not measured here and is expected to be in the
-   gigabytes, so the fetch is a deliberate, cached, manual step. It comes from a
-   relay (`_algobootstrap._tcp.testnet.algorand.network`), not from the algod REST API.
-2. **Each harness starts from it.** The Rust side has catchpoint apply
-   (`algo_ledger::catchpoint`); `bench_replay` has to open a ledger from it and
-   replay the range with certificate verification on. The Rust side is done
-   (#2292): `algod-rust bench replay-corpus --from-catchpoint FILE
-   --catchpoint-label L` runs the production `SyncOrchestrator` (import, verify,
-   lookback blocks, window replay) with the corpus as its backend, stopped at the
-   catchpoint round, then replays the rest through the same catchup path as the
-   genesis replay (certificates, apply, commit); the timed section starts after
-   the catchpoint start. `bench_replay::tests::small_corpus_catchpoint_start_reaches_the_go_final_state`
-   starts from the catchpoint go generated at round 1000 of the small corpus
-   (`benchmarks/go-replay/testdata/small-catchpoint-1000.{tar,label}`, 14 KB) and
-   reaches the recorded go final state; a wrong label is refused. The go side is
-   done (#2291): `benchmarks/go-replay -from-catchpoint FILE -catchpoint-label L`
-   runs go's catchpoint catchup (`CatchpointCatchupAccessor`: stage the file's
-   chunks, build the trie, `VerifyCatchpoint` against the catchpoint block, store
-   that block and the lookback before it from the corpus, `CompleteCatchup`) and
-   replays only the rounds after the catchpoint round, as a non-archival node
-   (an archival ledger resets itself when its blocks database does not start at
-   round 0). `-export-catchpoint FILE` writes the newest catchpoint go generated
-   during a replay (set `CatchpointInterval` in the config). Proven on a small
-   generated catchpoint: `TestCatchpointStartMatchesStraightReplay` replays rounds
-   1..1200 of the small corpus with a catchpoint every 500 rounds, exports the
-   round-1000 catchpoint, starts a fresh ledger from it, replays 1001..2000 and
-   reaches exactly `corpus.json`'s and the recorded full final state;
-   `TestCatchpointStartRefusesAWrongLabel` shows the label authenticates the
-   file. The testnet catchpoint (GBs) was not fetched here.
-3. **A final-state definition** for the range: the corpus's `final_state`
-   (round, block hash, txn counter, totals, account digest) derived by the go
-   replay and attested by the endpoint, as `finalize` does for `testnet-head`.
-   The start state needs no separate gate: the catchpoint label's hash pins it,
-   and both sides must accept the same label.
-4. **Corpus coverage gate**: the range must keep its payouts and state proof
-   (a re-planned range with none fails the build).
-
-Items 1 to 3 are GB-scale downloads and hours of catchpoint apply on each side,
-and the go side needs the go-algorand build (libsodium) the WSL/CI environments
-provide; they are tracked as follow-up issues of #2146 rather than done in one
-change.
-
-## Cost
-
-Planning is 3 small requests. The replay itself is 200 blocks; the dominant cost
-is the one-off catchpoint download and apply (not measured here), cached
-outside git like `testnet-head`.
+- The restore needs 10+ GB of RAM on go (15.5 GB peak seen) and 9+ GB of disk per
+  side.
+- The final-state digest streams the box digest on the go side (millions of
+  boxes up to 32 KB do not fit in a buffer); `-dump-state` keeps the lines in
+  memory and is only for the small corpora.
+- go's `LookupKeysByPrefix(maxKeyNum = 0)` is not "all keys": it stops at once
+  when the in-memory deltas hold no box set and then reports a stale database
+  round; the harness passes `MaxUint64`.
