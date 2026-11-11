@@ -96,6 +96,12 @@ Rerun `fetch-catchpoint` after that.
 | algod-rust: replay of 200 blocks | 1.65 s |
 | final state | identical on both sides: block hash `blk-PIV736MTN7...` (the endpoint's), txn counter 775 694 114, 2 245 701 accounts, 18 057 002 boxes, same digests |
 
+The full tier ran on this corpus (`BENCH_CORPUS=testnet-catchpoint BENCH_RUNS=1
+BENCH_REPLAY_WARMUP=0`, both sides on WSL/Linux, 33 minutes): go 0.74 s, algod-rust
+1.05 s for the 200 blocks, and the final-state gate passed against `corpus.json`
+(`state bdd2e051c1aaba02`, block `blk-PIV736MTN7...`). One run, so no ratio is
+claimed.
+
 The replay itself is tiny next to the restore: this corpus tests that both nodes
 reach the same state and handle payouts, state proofs and apps correctly, and its
 timings are most useful as the restore cost. Use more rounds (`--rounds`) for a
