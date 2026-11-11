@@ -205,7 +205,7 @@ class CliTest(unittest.TestCase):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 self.assertEqual(tp.main(["verify", "rust-relay", d]), 0)
-            self.assertIn("isolated", buf.getvalue())
+            self.assertIn("connected as planned", buf.getvalue())
             with open(os.path.join(d, "go-node-3.log"), "a") as f:
                 f.write(OUT("go-node-1:4161") + NL)
             buf = io.StringIO()

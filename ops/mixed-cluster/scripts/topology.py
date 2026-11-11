@@ -155,7 +155,7 @@ def main(argv=None):
         for line in problems:
             print("topology {}: {}".format(p.name, line))
         if not problems:
-            print("topology {}: go-node-3 isolated as planned (peers {})".format(
+            print("topology {}: go-node-3 connected as planned (peers {})".format(
                 p.name, ", ".join(p.peers["go-node-3"])))
         return 1 if problems else 0
     if argv[0] == "env":
