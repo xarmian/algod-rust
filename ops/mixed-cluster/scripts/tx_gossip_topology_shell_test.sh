@@ -21,7 +21,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+trap '[ -n "${KEEP_TMP:-}" ] || rm -rf "$TMP"' EXIT
 FAILS=0
 ok() { echo "ok   - $1"; }
 bad() { echo "FAIL - $1"; FAILS=$((FAILS + 1)); }
@@ -83,7 +83,12 @@ STUB
 cat > "$SC/tx_gossip.py" <<'STUB'
 import json, os, sys
 out = sys.argv[sys.argv.index("--out") + 1]
-open(os.environ["EVENTS"], "a").write("gossip\n")
+open(os.environ["EVENTS"], "a").write("gossip" + chr(10))
+calls = sum(1 for line in open(os.environ["EVENTS"]) if line.startswith("gossip"))
+if calls <= int(os.environ.get("TXG_SETUP_FAILS", "0")):
+    # a setup error: no verdict on gossip (e.g. kmd never became ready)
+    json.dump({"pass": False, "error": "kmd never became ready"}, open(out, "w"))
+    sys.exit(1)
 json.dump({"pass": os.environ.get("TXG_RC", "0") == "0"}, open(out, "w"))
 sys.exit(int(os.environ.get("TXG_RC", "0")))
 STUB
@@ -134,14 +139,28 @@ check "lingering port: second repetition exits 0" 0 "$rc2"
 check "lingering port: every start saw free ports" 0 "$(grep -c 'start bound=1' "$EVENTS")"
 check "lingering port: both repetitions started" 2 "$(grep -c '^start' "$EVENTS")"
 
-# 4. a port that never frees is reported (naming the port) instead of hanging
+# 4. a setup error of the check (no verdict) is retried once the nodes are back;
+#    a verdict is final
+: > "$EVENTS"
+run_script "$TMP/o5a" TXG_SETUP_FAILS=1; rc=$?
+check "setup error once: the run passes after the retry" 0 "$rc"
+check "setup error once: gossip ran twice" 2 "$(grep -c '^gossip' "$EVENTS")"
+: > "$EVENTS"
+run_script "$TMP/o5b" TXG_SETUP_FAILS=5; rc=$?
+check "setup error every time: fails after the attempts" 1 "$rc"
+check "setup error every time: bounded by TX_GOSSIP_ATTEMPTS (2)" 2 "$(grep -c '^gossip' "$EVENTS")"
+: > "$EVENTS"
+run_script "$TMP/o5c" TXG_RC=1; rc=$?
+check "a failed verdict is not retried" 1 "$(grep -c '^gossip' "$EVENTS")"
+
+# 6. a port that never frees is reported (naming the port) instead of hanging
 : > "$EVENTS"
 run_script "$TMP/o4" LINGER_S=30 PORTS_FREE_TIMEOUT_S=2; rc=$?
 check "stuck port: exits non-zero" 1 "$rc"
 check "stuck port: the cluster is not started" 0 "$(grep -c '^start' "$EVENTS")"
 check "stuck port: the message names the port" 1 "$([ "$(grep -c "$GO1_PORT" "$TMP/o4.log")" -ge 1 ] && echo 1 || echo 0)"
 
-# 5. phase6_wait_ports_free itself
+# 7. phase6_wait_ports_free itself
 source "$SC/ports.sh"
 PHASE6_HOST_PORT_BASE="$BASE" source "$SC/ports.sh"
 P5="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()' | tr -d '')"
