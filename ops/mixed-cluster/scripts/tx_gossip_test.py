@@ -22,9 +22,11 @@ class FakeNet:
     `commit_after` the seconds until it is confirmed everywhere."""
 
     def __init__(self, delay=None, commit_after=2.7, round0=100, round_s=2.7,
-                 bulk=True, pending_stall=0.0):
+                 bulk=True, pending_stall=0.0, post_stall=0.0):
         self.bulk = bulk                    # False: the bulk pool list is unavailable
         self.pending_stall = pending_stall  # seconds each per-txid lookup takes
+        self.post_stall = post_stall        # seconds each POST /v2/transactions takes
+        self.commit_nodes = []              # nodes committed_rounds was asked for
         self.pending_calls = 0
         self.t = 0.0
         self.delay = delay or {}
@@ -48,6 +50,7 @@ class FakeNet:
     def submit(self, node, raw):
         self.n += 1
         txid = "TX{:03d}".format(self.n)
+        self.t += self.post_stall   # the node answers, then gossips
         self.submitted[txid] = (node, self.t)
         self.posts.append((node, raw))
         self.raws[txid] = raw.decode()
@@ -73,6 +76,7 @@ class FakeNet:
 
     def committed_rounds(self, node, notes, from_round, wait_s):
         """note -> round it was committed in (what the blocks of `node` say)."""
+        self.commit_nodes.append(node)
         out = {}
         end = self.t + wait_s
         while len(out) < len(notes) and self.t < end:
@@ -207,6 +211,38 @@ class BulkPollTest(unittest.TestCase):
         res = run(net)
         self.assertTrue(res["pass"], res)
         self.assertGreater(net.pending_calls, 0)
+
+
+class LatencyBaselineTest(unittest.TestCase):
+    """A Go node's POST /v2/transactions can take seconds (its pool lock is held
+    while it assembles a proposal); the gossip latency starts when the node has
+    ANSWERED the submission, not when the request was sent."""
+
+    def test_a_slow_post_is_not_gossip_latency(self):
+        net = FakeNet(post_stall=3.0, commit_after=60.0)   # 3 payments: 9 s of POSTs
+        res = run(net, within=6.0)
+        self.assertTrue(res["pass"], res)
+        for pair in res["pairs"]:
+            self.assertLessEqual(pair["max_latency_s"], 1.0, pair)
+
+    def test_a_real_gossip_delay_after_a_fast_post_still_fails(self):
+        net = FakeNet(delay={("go-node-1", "go-node-3"): 7.0}, commit_after=60.0)
+        res = run(net, sources=("go-node-1",), within=6.0)
+        self.assertFalse(res["pass"])
+
+    def test_the_slowest_post_is_reported_per_source(self):
+        net = FakeNet(post_stall=2.0)
+        res = run(net)
+        for s in res["sources"]:
+            self.assertEqual(s["max_post_s"], 2.0, s)
+
+    def test_commit_rounds_are_read_from_the_reference_node(self):
+        net = FakeNet()
+        res = tg.run_check(net, nodes=NODES, sources=("go-node-3", "rust-node-4"), count=2,
+                           within_s=6.0, build=lambda s, i: ("raw-{}-{}".format(s, i)).encode(),
+                           poll_s=0.05, commit_node="go-node-1")
+        self.assertEqual(set(net.commit_nodes), {"go-node-1"})
+        self.assertTrue(all(s["confirmed"] == 2 for s in res["sources"]), res["sources"])
 
 
 class NoteDecodingTest(unittest.TestCase):

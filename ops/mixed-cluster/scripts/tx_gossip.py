@@ -113,7 +113,7 @@ def notes_of_block(doc):
 
 
 def run_check(net, *, nodes, sources, count, within_s, build, poll_s=0.1,
-              settle_s=10.0, commit_wait_s=90.0, topology="default"):
+              settle_s=10.0, commit_wait_s=90.0, topology="default", commit_node=None):
     """Submit `count` transactions to each source node and watch every other
     node. `net` provides now(), sleep(s), round_of(node), submit(node, raw) ->
     (status, body), note_of(raw), pool_notes(node) (the notes in the node's pool
@@ -137,12 +137,22 @@ def run_check(net, *, nodes, sources, count, within_s, build, poll_s=0.1,
         t0 = net.now()
         notes = [net.note_of(raw) for raw in raws]
         txids = []
+        answered = {}   # txid -> when the node answered its submission
+        max_post = 0.0
         for raw in raws:
+            posted = net.now()
             status, body = net.submit(src, raw)
             if status != 200:
                 raise CheckError("{} rejected a submitted payment ({}): {}".format(
                     src, status, body[:200]))
-            txids.append(parse_txid(body))
+            txid = parse_txid(body)
+            txids.append(txid)
+            answered[txid] = net.now()
+            max_post = max(max_post, answered[txid] - posted)
+        # Gossip latency counts from the moment the node has answered the LAST
+        # submission (the earlier ones had at least that long): a Go node's POST
+        # can itself take seconds while its pool lock is held.
+        submitted_at = max(answered.values())
         targets = [n for n in nodes if n != src]
         seen = {}  # (target, txid) -> (state, latency)
         deadline = t0 + within_s + settle_s
@@ -159,11 +169,11 @@ def run_check(net, *, nodes, sources, count, within_s, build, poll_s=0.1,
                             continue
                         state = pending_state(*net.pending(target, txid))
                         if state != "absent":
-                            seen[(target, txid)] = (state, net.now() - t0)
+                            seen[(target, txid)] = (state, max(0.0, net.now() - submitted_at))
                     continue
                 for txid, note in zip(txids, notes):
                     if (target, txid) not in seen and note in pool:
-                        seen[(target, txid)] = ("pool", net.now() - t0)
+                        seen[(target, txid)] = ("pool", max(0.0, net.now() - submitted_at))
             if len(seen) == len(targets) * len(txids) or net.now() >= deadline:
                 break
             net.sleep(poll_s)
@@ -176,7 +186,7 @@ def run_check(net, *, nodes, sources, count, within_s, build, poll_s=0.1,
                 if (target, txid) not in seen:
                     state = pending_state(*net.pending(target, txid))
                     if state != "absent":
-                        seen[(target, txid)] = (state, net.now() - t0)
+                        seen[(target, txid)] = (state, max(0.0, net.now() - submitted_at))
         for target in targets:
             states = [seen.get((target, x)) for x in txids]
             absent = sum(1 for s in states if s is None)
@@ -194,11 +204,13 @@ def run_check(net, *, nodes, sources, count, within_s, build, poll_s=0.1,
                 "min_latency_s": round(min(lat), 3) if lat else None,
             })
         # Commit rounds, read from the blocks of the source node.
-        found = net.committed_rounds(src, set(notes), round_before or 0, commit_wait_s)
+        found = net.committed_rounds(commit_node or src, set(notes), round_before or 0,
+                                     commit_wait_s)
         confirmed_rounds = {n: r for n, r in found.items() if n in notes}
         rounds = sorted(confirmed_rounds.values())
         source_rows.append({
             "source": src, "submitted": len(txids), "confirmed": len(rounds),
+            "max_post_s": round(max_post, 3),
             "round_before": round_before,
             "first_round": rounds[0] if rounds else None,
             "last_round": rounds[-1] if rounds else None,
@@ -366,7 +378,8 @@ def main(argv=None):
         sources = resolve_sources(args)
         net.warm()
         res = run_check(net, nodes=NODES, sources=sources, count=args.count,
-                        within_s=args.within_s, build=net.build, topology=args.topology)
+                        within_s=args.within_s, build=net.build, topology=args.topology,
+                        commit_node="go-node-1")
     except CheckError as e:
         res = {"pass": False, "error": str(e), "topology": args.topology,
                "pairs": [], "sources": []}
