@@ -58,7 +58,7 @@ jobs:
 
       - name: Pull algorand/algod
         run: |
-          docker pull algorand/algod:5.0.4-stable
+          docker pull algorand/algod:5.0.5-stable
           docker pull algorand/algod:5.0.1-stable
 
       - name: Build algod-rust node image (layer-cached)

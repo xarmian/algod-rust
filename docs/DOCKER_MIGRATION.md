@@ -64,16 +64,16 @@ Build it with `docker build -f docker/Dockerfile --target algod .`.
 ## Published tags
 
 The go-compatible image is published next to the `follow` image with go's tag
-scheme and an `-algod` suffix: `latest-algod`, `stable-algod`, `5.0.4-stable-algod`
+scheme and an `-algod` suffix: `latest-algod`, `stable-algod`, `5.0.5-stable-algod`
 (the pinned go-algorand version), `beta-algod`, `nightly-algod`, and
 `<X.Y.Z>-algod` for releases, on `ghcr.io/xarmian/algod-rust` (and Docker Hub when
-configured). To switch from go, change `algorand/algod:5.0.4-stable` to
-`ghcr.io/xarmian/algod-rust:5.0.4-stable-algod`.
+configured). To switch from go, change `algorand/algod:5.0.5-stable` to
+`ghcr.io/xarmian/algod-rust:5.0.5-stable-algod`.
 
 ## Network images: `-voimain` (issue #2074)
 
 `ghcr.io/xarmian/algod-rust:<tag>-voimain` (`latest-voimain`, `stable-voimain`,
-`5.0.4-stable-voimain`, `nightly-voimain`, ...; multi-arch, Docker Hub mirror when
+`5.0.5-stable-voimain`, `nightly-voimain`, ...; multi-arch, Docker Hub mirror when
 configured) is the `algod` image with Voi mainnet baked in: `NETWORK=voimain`, the
 vendored genesis (`voimain-v1.0`), `FAST_CATCHUP=1`. Same ports (8080 REST, 4160/4161
 gossip, 7833 kmd) and environment variables as the `-algod` image:
@@ -112,7 +112,7 @@ curl -H "X-Algo-API-Token: <token>" localhost:8080/v2/status
 ## Network images: `-aramidmain` (issue #2075)
 
 `ghcr.io/xarmian/algod-rust:<tag>-aramidmain` (`latest-aramidmain`, `stable-aramidmain`,
-`5.0.4-stable-aramidmain`, `nightly-aramidmain`, ...; multi-arch) is the same construction as
+`5.0.5-stable-aramidmain`, `nightly-aramidmain`, ...; multi-arch) is the same construction as
 `-voimain` for Aramid mainnet (`aramidmain-v1.0`): `NETWORK=aramidmain`, the vendored genesis
 (`/node/run/genesis/aramidmain/genesis.json`), `FAST_CATCHUP=1`. The custom consensus
 protocols (`aramidmain-v1.0/1..3`, DIV-006) and `DNSBootstrapID: aramidmain.a-wallet.net` are

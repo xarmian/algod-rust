@@ -1,6 +1,6 @@
 # Benchmarks
 
-Performance measurement for algod-rust and comparison against go-algorand (v5.0.4-stable, the repo-wide reference pin).
+Performance measurement for algod-rust and comparison against go-algorand (v5.0.5-stable, the repo-wide reference pin).
 
 > **Comparing Go and Rust?** Use `make bench-compare` and read
 > [`BENCHMARK_COMPARISON.md`](BENCHMARK_COMPARISON.md). It builds both

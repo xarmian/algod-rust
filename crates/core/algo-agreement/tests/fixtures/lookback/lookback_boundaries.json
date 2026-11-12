@@ -1,6 +1,6 @@
 {
   "source": "algod-rust/tools/lookback-vector-capture (TASK-57)",
-  "go_algorand_pin": "v5.0.4-stable",
+  "go_algorand_pin": "v5.0.5-stable",
   "vectors": [
     {
       "version": "v7",

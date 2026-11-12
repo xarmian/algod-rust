@@ -37,7 +37,7 @@ FILED_STATUSES = ("stuck", "node_failure", "invalid_block_stall")
 
 DEFAULT_NETWORK = "mainnet"
 DEDUP_LABEL = "mainnet-soak"
-ISSUE_LABELS = ["bug", "sync", "conformance", "mainnet-soak", "algod:v5.0.4-stable", "effort:medium"]
+ISSUE_LABELS = ["bug", "sync", "conformance", "mainnet-soak", "algod:v5.0.5-stable", "effort:medium"]
 
 
 def dedup_label(network: str = DEFAULT_NETWORK) -> str:

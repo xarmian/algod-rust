@@ -1,6 +1,6 @@
 # Account / asset / application roundtrip fixtures
 
-go-algorand v5.0.4-stable reference responses, used by
+go-algorand v5.0.5-stable reference responses, used by
 `tests/account_roundtrip_test.rs` to verify the Rust REST responses match Go.
 
 - `<name>.account.json` — `model.Account` via `AccountDataToAccount` +
@@ -20,12 +20,12 @@ JSON field-for-field (order-independent) and msgpack byte-for-byte.
 ## Regenerating
 
 The generators import go-algorand packages, so they must run inside a
-`../go-algorand` checkout at `v5.0.4-stable` (the repo's reference pin) with
+`../go-algorand` checkout at `v5.0.5-stable` (the repo's reference pin) with
 `make libsodium` done (cgo). Copy each into a scratch `main` package there:
 
     mkdir tmpgen && cp gen_accounts.go tmpgen/main.go && go run ./tmpgen <out-dir>
     mkdir tmpgen2 && cp gen_asset_app.go tmpgen2/main.go && go run ./tmpgen2 <out-dir>
 
-Last regenerated against `v5.0.4-stable` with Go 1.25.3 (#2156): the output is
+Last regenerated against `v5.0.5-stable` with Go 1.25.3 (#2156): the output is
 byte-identical to the committed files (`.gitattributes` pins them to LF; never
 let autocrlf rewrite them).

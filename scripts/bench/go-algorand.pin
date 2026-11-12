@@ -6,4 +6,4 @@
 # Read by build_both.sh and fingerprint.py: the first non-comment line is the
 # tag. Keep it equal to the repo-wide reference pin (CLAUDE.md); the
 # algod-version-upgrade pin sweep updates it with every other occurrence.
-v5.0.4-stable
+v5.0.5-stable

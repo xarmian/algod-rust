@@ -20,7 +20,7 @@
 
 //! Roundtrip conformance of account REST responses vs go-algorand (TASK-254).
 //!
-//! For each fixture, go-algorand v5.0.4-stable produced references from a
+//! For each fixture, go-algorand v5.0.5-stable produced references from a
 //! `basics.AccountData` (see `fixtures/account_roundtrip/`; regenerated with
 //! `gen_accounts.go` against that tag, byte-identical to what is committed):
 //!

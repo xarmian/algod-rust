@@ -7,7 +7,7 @@ name: Simulate rewards oracle drift check
 # Issue #2118: verifies that the checked-in go-algorand simulate oracle
 # fixture (crates/core/algo-ledger/tests/fixtures/simulate_rewards/oracle.json)
 # is not stale -- i.e. that running `tools/simulate-rewards-oracle` against a
-# real, freshly-built go-algorand v5.0.4-stable reproduces the committed file
+# real, freshly-built go-algorand v5.0.5-stable reproduces the committed file
 # byte-for-byte. `cargo test --workspace` reads only the committed fixture.
 # The same tool also writes the issue #2125 duplicate-txid / lease oracle
 # (crates/core/algo-ledger/tests/fixtures/simulate_checkdup/oracle.json,
@@ -42,7 +42,7 @@ concurrency:
 
 env:
   # Pin go-algorand to the same rev the rest of the repo references.
-  GO_ALGORAND_REV: "v5.0.4-stable"
+  GO_ALGORAND_REV: "v5.0.5-stable"
 
 jobs:
   oracle-drift-check:
