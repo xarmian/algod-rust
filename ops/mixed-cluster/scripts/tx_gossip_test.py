@@ -245,6 +245,48 @@ class LatencyBaselineTest(unittest.TestCase):
         self.assertTrue(all(s["confirmed"] == 2 for s in res["sources"]), res["sources"])
 
 
+class KmdPrepareTest(unittest.TestCase):
+    """`goal kmd start` kills the PID in kmd-v0.5/kmd.pid first (go
+    nodecontrol StopKMD). The file left by `goal network create` holds a pid of
+    ANOTHER container's process namespace; in go-node-1 it can be the entrypoint's
+    or algod's own pid, so the first `goal kmd start` SIGTERMed the node (docker
+    events: `container die exitCode=1` right after the exec, a crash loop)."""
+
+    class FakeEnv:
+        user = "root"
+
+        def __init__(self):
+            self.calls = []
+
+        def sh(self, cmd):
+            self.calls.append(("sh", cmd))
+            return 0, ""
+
+        def goal(self, cmd):
+            self.calls.append(("goal", cmd))
+            if cmd == "account list":
+                return 0, "[online]	AAA	" + "A" * 58 + "	1 microAlgos"
+            return 0, "wallets"
+
+    def warm(self):
+        net = tg.ClusterNet.__new__(tg.ClusterNet)
+        net.env = self.FakeEnv()
+        net.workload = type("W", (), {"DATA_DIR": "/algod/data"})
+        net.funder = None
+        net.warm()
+        return net.env.calls
+
+    def test_the_stale_kmd_pid_file_is_removed_before_kmd_is_started(self):
+        calls = self.warm()
+        first_goal = next(i for i, c in enumerate(calls) if c[0] == "goal")
+        before = " ".join(c[1] for c in calls[:first_goal] if c[0] == "sh")
+        self.assertIn("rm -f /algod/data/kmd-v0.5/kmd.pid", before)
+
+    def test_the_work_dir_is_prepared_too(self):
+        calls = self.warm()
+        self.assertTrue(any("mkdir -p /tmp/w" in c[1] for c in calls if c[0] == "sh"))
+
+
 class NoteDecodingTest(unittest.TestCase):
     def test_notes_are_read_from_go_and_rust_json_shapes(self):
         import base64

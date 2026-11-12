@@ -211,6 +211,7 @@ def run_check(net, *, nodes, sources, count, within_s, build, poll_s=0.1,
         source_rows.append({
             "source": src, "submitted": len(txids), "confirmed": len(rounds),
             "max_post_s": round(max_post, 3),
+            "block_scan": getattr(net, "last_scan", None),
             "round_before": round_before,
             "first_round": rounds[0] if rounds else None,
             "last_round": rounds[-1] if rounds else None,
@@ -286,6 +287,8 @@ class ClusterNet:
             for note in notes_of_block(doc) & set(notes):
                 found.setdefault(note, nxt)
             nxt += 1
+        self.last_scan = {"node": node, "from_round": int(from_round) + 1,
+                          "next_unread_round": nxt, "found": len(found), "wanted": len(notes)}
         return found
 
     def pending(self, node, txid):
@@ -307,15 +310,16 @@ class ClusterNet:
         """kmd up and a funder address (what workload.py's setup does)."""
         # WORK_DIR is created here as root but written by whichever user the
         # goal commands run as (the image's own user first), so open it up.
-        rc, out = self.env.sh("chmod 700 {}/kmd-v0.5; mkdir -p {w} && chmod 777 {w}".format(
-            self.workload.DATA_DIR, w=WORK_DIR))
+        # kmd.pid: `goal kmd start` first kills the pid in it, a stale one from the
+        # `goal network create` container that can be this container's own
+        # entrypoint or algod (it SIGTERMed go-node-1 in CI).
+        rc, out = self.env.sh(
+            "rm -f {d}/kmd-v0.5/kmd.pid; chmod 700 {d}/kmd-v0.5; mkdir -p {w} && chmod 777 {w}".format(
+                d=self.workload.DATA_DIR, w=WORK_DIR))
         if rc != 0:
             raise CheckError("cannot prepare {} in the container: {}".format(WORK_DIR, out))
         last = ""
-        # the data dir is owned by the image's own user: try it first (a root
-        # `goal kmd start` made the go-node-1 container die with exit code 1 in
-        # CI, which crash-looped it: docker events of the failed legs)
-        for user in ("algorand", "root"):
+        for user in ("root", "algorand"):
             self.env.user = user
             for _ in range(8):
                 self.env.goal("kmd start -t 0")
