@@ -17,13 +17,13 @@ See `docs/PHASE24_PROPOSAL.md`. Test-parity delta: 1 added / 0 removed /
 
 ## Stage 6 — Sub-issues (dependency order)
 
-- [ ] #2309 — generate-only decode-after-encode check for transactions in blocks
+- [x] #2309 — generate-only decode-after-encode check for transactions in blocks (PR #2312)
 
 ## Epic-level acceptance criteria
 
-- [ ] #2309 closed.
-- [ ] Pin swept to `v5.0.5-stable`.
-- [ ] `python3 scripts/phase17_parity_delta.py check --tag v5.0.5-stable --go-algorand ../go-algorand` exits 0.
-- [ ] Full gate + live mixed-cluster against v5.0.5-stable Go nodes.
-- [ ] `docs/PHASE24_VALIDATION.md` written.
-- [ ] Hard gate: `gh issue list --label "phase:24" --state open` empty before close.
+- [x] #2309 closed (PR #2312).
+- [x] Pin swept to `v5.0.5-stable` (PR #2311).
+- [x] `python3 scripts/phase17_parity_delta.py check --tag v5.0.5-stable --go-algorand ../go-algorand` exits 0 (with the standing `--allow-partial 3` sign-off; see `docs/PHASE24_VALIDATION.md`).
+- [x] Full gate + live mixed-cluster against v5.0.5-stable Go nodes (see `docs/PHASE24_VALIDATION.md`).
+- [x] `docs/PHASE24_VALIDATION.md` written.
+- [x] Hard gate: `gh issue list --label "phase:24" --state open` empty before close (checked 2026-11-12).
