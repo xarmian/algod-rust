@@ -311,7 +311,8 @@ func blockDupOracle() {
 		// the transactions.
 		size := 0
 		for _, txib := range blk.Payset {
-			size += txib.GetEncodedLength()
+			n, _ := txib.GetEncodedLength(false)
+			size += n
 		}
 		if params.LoadTracking {
 			blk.Load = eval.ComputeLoad(size, params.MaxTxnBytesPerBlock)

@@ -10,8 +10,8 @@
     "timestamp_offset_s": 3
   },
   "go_algorand": {
-    "tag": "v5.0.4-stable",
-    "commit": "927ae0863cbb4cf29c6845c088a4ea4c439b10bb"
+    "tag": "v5.0.5-stable",
+    "commit": "31186e99a69e74483ad95e9ce872903b74758abf"
   },
   "network": {
     "genesis_id": "benchcorpus-v1",

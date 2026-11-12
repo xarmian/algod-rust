@@ -210,7 +210,7 @@ mod tests {
 
     /// The table is exactly go's: every opcode byte go gates the same way in
     /// every mode has a row with go's type list (kind and printed name), and
-    /// no other byte has one. The fixture is go-algorand v5.0.4-stable's own
+    /// no other byte has one. The fixture is go-algorand v5.0.5-stable's own
     /// `proto` data, so a wrong or missing row fails here.
     #[test]
     fn the_table_equals_gos_proto_arguments() {

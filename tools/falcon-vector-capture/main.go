@@ -52,7 +52,7 @@ import (
 	"github.com/algorand/go-algorand/crypto"
 )
 
-const expectedGoAlgorandPin = "v5.0.4-stable"
+const expectedGoAlgorandPin = "v5.0.5-stable"
 
 // go-algorand data/transactions/logic/crypto_test.go, BenchmarkVerify,
 // "falcon_verify" case. The Go source's comments label the second and third

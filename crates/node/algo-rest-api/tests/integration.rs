@@ -6825,7 +6825,7 @@ async fn raw_transaction_in_block_only_field_returns_400() {
         assert_eq!(resp.status(), 400, "{field}");
         let json: serde_json::Value = resp.json().await.unwrap();
         let msg = json["message"].as_str().unwrap();
-        // go-algorand v5.0.4-stable answers `msgpack decode error [pos N]: no
+        // go-algorand v5.0.5-stable answers `msgpack decode error [pos N]: no
         // matching struct field found when decoding stream map with key hgi`
         // (captured live; issue #1962 corrected the wording of #1727).
         assert!(
@@ -6869,7 +6869,7 @@ async fn raw_transaction_async_in_block_only_field_returns_400() {
 }
 
 /// Issue #1962: a key the target struct lacks is a 400 with go's exact text and
-/// offset (captured from a go-algorand v5.0.4-stable node for these bytes: a
+/// offset (captured from a go-algorand v5.0.5-stable node for these bytes: a
 /// one-entry map `{"zzz": 1}` is `[pos 5]`; the same key as the third entry of
 /// a second transaction in a group counts from the start of the whole body).
 #[tokio::test]
@@ -8617,7 +8617,7 @@ async fn simulate_in_block_only_field_returns_400() {
 }
 
 /// Issue #1971: a JSON simulate body with a key go's structs lack is a 400
-/// with go's exact text and offset (captured from a go-algorand v5.0.4-stable
+/// with go's exact text and offset (captured from a go-algorand v5.0.5-stable
 /// node for these bodies: just after the colon that follows the key).
 #[tokio::test]
 async fn simulate_json_unknown_key_returns_go_text_with_offset() {
@@ -8661,7 +8661,7 @@ async fn simulate_json_unknown_key_returns_go_text_with_offset() {
 }
 
 /// Issue #1967: a msgpack simulate body with a key go's structs lack is a 400
-/// with go's fixed text (captured from a go-algorand v5.0.4-stable node).
+/// with go's fixed text (captured from a go-algorand v5.0.5-stable node).
 #[tokio::test]
 async fn simulate_msgpack_unknown_key_returns_gos_fixed_text() {
     use rmpv::Value;

@@ -1,7 +1,7 @@
 # Byte-field decode parity: go msgp vs `rmp_decode` (issue #2046)
 
 Audit of every byte-typed call site of the raw msgpack readers in
-`crates/core/algo-types` against go-algorand `v5.0.4-stable`'s generated
+`crates/core/algo-types` against go-algorand `v5.0.5-stable`'s generated
 decoders (`*_msgp.go`, algorand/msgp v1.1.64 `msgp/read_bytes.go`).
 `docs/DIVERGENCES.md` was consulted: no registered divergence covers byte
 decoding. Follow-up to PR #2044 (a blanket leniency in the shared readers
@@ -170,7 +170,7 @@ bin and str by design, internal blob).
 Every item left open by #2063 is resolved below; no follow-up issue is needed.
 Go side verified in algorand/msgp v1.1.64 `read_bytes.go` and the generated
 `data/transactions/msgp_gen.go` (`SignedTxn.UnmarshalMsgWithState`, line
-~5520 at `v5.0.4-stable`).
+~5520 at `v5.0.5-stable`).
 
 ### 1. nil -> zero, struct-from-array
 

@@ -36,7 +36,7 @@ class CatchupError(Exception):
 # ---- networks and catchpoint labels ------------------------------------------
 
 # Go-compatible public networks only. voimain / aramidmain run custom
-# consensus parameters that go-algorand v5.0.4 does not know, so there is no
+# consensus parameters that go-algorand v5.0.5 does not know, so there is no
 # Go side to compare against (docs/BENCHMARK_COMPARISON.md, "The catchup tier").
 # `genesis_rel` is the repo's vendored copy of go-algorand's
 # installer/genesis/<network>/genesis.json, so both sides get the same bytes.

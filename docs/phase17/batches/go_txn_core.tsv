@@ -98,6 +98,7 @@ data/transactions	TestDecodeNil	data/transactions/signedtxn_test.go	67
 data/transactions	TestSignedTxnInBlockHash	data/transactions/signedtxn_test.go	83
 data/transactions	TestSignedTxnHasSignature	data/transactions/signedtxn_test.go	94
 data/transactions	TestSignedTxnFeeFactorPQSignatureContribution	data/transactions/signedtxn_test.go	121
+data/transactions	TestGetEncodedLengthDecode	data/transactions/signedtxn_test.go	222
 data/transactions	TestUnsupportedStateProof	data/transactions/stateproof_test.go	61
 data/transactions	TestWellFormedStateProofTxn	data/transactions/stateproof_test.go	95
 data/transactions	TestStateProofTxnShouldBeZero	data/transactions/stateproof_test.go	139

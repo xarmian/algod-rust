@@ -39,7 +39,7 @@
 // (modes, args) from the version each starts at (`ed25519verify` is LogicSig
 // only before v5), because a program of an older version meets the older spec.
 //
-// Regenerate (go-algorand pin v5.0.4-stable, deterministic):
+// Regenerate (go-algorand pin v5.0.5-stable, deterministic):
 //
 //	cd tools/avm-op-protos && go run . > ../../crates/core/algo-avm/tests/fixtures/go_op_protos.jsonl
 package main
