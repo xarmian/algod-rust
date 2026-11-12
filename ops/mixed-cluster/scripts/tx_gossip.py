@@ -310,7 +310,10 @@ class ClusterNet:
         if rc != 0:
             raise CheckError("cannot prepare {} in the container: {}".format(WORK_DIR, out))
         last = ""
-        for user in ("root", "algorand"):
+        # the data dir is owned by the image's own user: try it first (a root
+        # `goal kmd start` made the go-node-1 container die with exit code 1 in
+        # CI, which crash-looped it: docker events of the failed legs)
+        for user in ("algorand", "root"):
             self.env.user = user
             for _ in range(8):
                 self.env.goal("kmd start -t 0")
