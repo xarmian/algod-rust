@@ -78,11 +78,11 @@ so the tables below never drift from what `main` actually covers.
 | `out-of-scope` | genuinely not applicable to algod-rust (Go-runtime specifics, CLI tooling with no Rust equivalent concept, structural differences that make the go test meaningless in Rust) |
 | `unclassified` | **transient only** — placeholder inserted by `scripts/phase17_parity_delta.py repin` for a test a go-algorand version bump added, pending classification by the upgrade epic's sub-issues; never a valid final state, and the summary tables below cannot be regenerated while any remain |
 
-## Aggregate totals (3,197 go-algorand tests)
+## Aggregate totals (3,198 go-algorand tests)
 
 | status | count | share |
 |---|---|---|
-| `matched-1:1` | 1,215 | 38% |
+| `matched-1:1` | 1,216 | 38% |
 | `matched-1:many` | 958 | 30% |
 | `out-of-scope` | 735 | 23% |
 | `matched-many:1` | 286 | 9% |
@@ -103,7 +103,7 @@ were triaged into tracked issues.
 | area | file | total | 1:1 | 1:many | many:1 | partial | not-impl | missing-test | out-of-scope |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
 | AVM/TEAL opcodes (`data/transactions/logic`) | [parity_txn_logic.md](phase17/parity_txn_logic.md) | 449 | 146 | 256 | 6 | 0 | 0 | 0 | 41 |
-| Transactions core (`data/transactions`) | [parity_txn_core.md](phase17/parity_txn_core.md) | 176 | 77 | 48 | 32 | 0 | 0 | 0 | 19 |
+| Transactions core (`data/transactions`) | [parity_txn_core.md](phase17/parity_txn_core.md) | 177 | 78 | 48 | 32 | 0 | 0 | 0 | 19 |
 | Ledger core (`ledger`, `ledger/eval`, `ledger/apply`, `ledger/ledgercore`, `ledger/store`, `ledger/encoded`) | [parity_ledger_core.md](phase17/parity_ledger_core.md) | 505 | 79 | 153 | 62 | 0 | 0 | 0 | 211 |
 | Ledger simulation (`ledger/simulation`) | [parity_ledger_sim.md](phase17/parity_ledger_sim.md) | 68 | 37 | 30 | 0 | 0 | 0 | 0 | 1 |
 | Agreement protocol (`agreement`) | [parity_agreement.md](phase17/parity_agreement.md) | 336 | 167 | 67 | 89 | 3 | 0 | 0 | 10 |
@@ -117,5 +117,5 @@ were triaged into tracked issues.
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 46 | 31 | 7 | 0 | 0 | 0 | 89 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 31 | 22 | 0 | 0 | 0 | 0 | 4 |
-| **Total** | | **3,197** | **1215** | **958** | **286** | **3** | **0** | **0** | **735** |
+| **Total** | | **3,198** | **1216** | **958** | **286** | **3** | **0** | **0** | **735** |
 

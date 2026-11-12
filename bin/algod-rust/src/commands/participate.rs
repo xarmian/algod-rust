@@ -4099,10 +4099,35 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
 
         // Use exact byte counting via canonical STIB encoding.
         let max_bytes = self.max_txn_bytes;
-        let exact_bytes: usize = stibs
-            .iter()
-            .map(|stib| canonical_encode_signed_txn_in_block(stib).len())
-            .sum();
+        // This evaluator only ever generates (pool admission, proposal
+        // assembly), so each transaction must also decode back from what is
+        // encoded: go `TransactionGroup` calls
+        // `GetEncodedLength(eval.generate)` (v5.0.5-stable, issue #2309) and
+        // fails the group with `transaction <id>: <decode error>`. Received
+        // blocks are validated elsewhere and never take this check.
+        let mut exact_bytes: usize = 0;
+        for (i, stib) in stibs.iter().enumerate() {
+            match algo_codec::signed_txn_in_block_encoded_len(stib, true) {
+                Ok(n) => exact_bytes += n,
+                Err(e) => {
+                    let txid = txids
+                        .get(i)
+                        .map(|d| d.to_string())
+                        .unwrap_or_else(|| {
+                            algo_types::Digest(compute_txid(&stib.txn)).to_string()
+                        });
+                    // `AlgoError::Codec`'s Display prints only its context;
+                    // the decoder's text ("missing required field ...") is
+                    // the source.
+                    let reason = std::error::Error::source(&e)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| e.to_string());
+                    return Err(algo_error::AlgoError::Validation {
+                        message: format!("transaction {txid}: {reason}"),
+                    });
+                }
+            }
+        }
 
         if self.txn_bytes + exact_bytes > max_bytes {
             return Err(algo_error::AlgoError::Ledger {
