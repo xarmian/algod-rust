@@ -7442,6 +7442,10 @@ async fn get_pending_transactions_returns_list() {
     assert_eq!(json["total-transactions"].as_u64().unwrap(), 2);
     let top = json["top-transactions"].as_array().unwrap();
     assert_eq!(top.len(), 2);
+    // issue #2304: go's JSON form, byte fields as base64 strings (never integer arrays)
+    let txn = &top[0]["txn"];
+    assert!(txn["gh"].is_string(), "gh must be base64: {txn}");
+    assert!(txn["snd"].is_string(), "snd must be an address string: {txn}");
 }
 
 #[tokio::test]

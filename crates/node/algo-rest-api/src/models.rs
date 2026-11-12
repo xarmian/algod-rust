@@ -1428,8 +1428,14 @@ pub struct PostTransactionsResponse {
 /// Matches go-algorand's inline response struct in `getPendingTransactions`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingTransactionsResponse {
-    /// An array of signed transaction objects.
-    #[serde(rename = "top-transactions")]
+    /// An array of signed transaction objects. In JSON each is go's
+    /// `transactions.SignedTxn` form (base64 byte fields, address strings; issue
+    /// #2304), in msgpack the plain struct.
+    #[serde(
+        rename = "top-transactions",
+        serialize_with = "serialize_signed_txns_go_json",
+        deserialize_with = "deserialize_signed_txns_go_json"
+    )]
     pub top_transactions: Vec<SignedTransaction>,
 
     /// Total number of transactions in the pool.
@@ -1597,6 +1603,44 @@ fn serialize_signed_txn_go_json<S: serde::Serializer>(
         });
     }
     serde::Serialize::serialize(&crate::block_json::signed_txn_go_json(txn), s)
+}
+
+/// A list of signed transactions in go's JSON form (issue #2304): each element as
+/// [`serialize_signed_txn_go_json`] renders it; binary formats keep the derive.
+fn serialize_signed_txns_go_json<S: serde::Serializer>(
+    txns: &[SignedTransaction],
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    if !s.is_human_readable() {
+        return serde::Serialize::serialize(txns, s);
+    }
+    let mut seq = s.serialize_seq(Some(txns.len()))?;
+    for txn in txns {
+        seq.serialize_element(&crate::block_json::signed_txn_go_json(txn))?;
+    }
+    seq.end()
+}
+
+/// Inverse of [`serialize_signed_txns_go_json`]: go's JSON form (or the older
+/// integer-array serde form) per element; binary formats use the derive.
+fn deserialize_signed_txns_go_json<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<SignedTransaction>, D::Error> {
+    use serde::Deserialize;
+    if !d.is_human_readable() {
+        return Vec::<SignedTransaction>::deserialize(d);
+    }
+    struct One(SignedTransaction);
+    impl<'de> Deserialize<'de> for One {
+        fn deserialize<D2: serde::Deserializer<'de>>(d: D2) -> Result<Self, D2::Error> {
+            deserialize_signed_txn_go_json(d).map(One)
+        }
+    }
+    Ok(Vec::<One>::deserialize(d)?
+        .into_iter()
+        .map(|o| o.0)
+        .collect())
 }
 
 /// Inverse of [`serialize_signed_txn_go_json`]: go's JSON form is converted back
