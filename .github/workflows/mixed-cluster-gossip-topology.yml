@@ -72,6 +72,13 @@ jobs:
           bash ops/mixed-cluster/scripts/ports_shell_test.sh
           bash ops/mixed-cluster/scripts/tx_gossip_topology_shell_test.sh
 
+      # Who stops a node container? (a Go node was found being SIGTERMed and
+      # restarted in repetition 2: `kill` events carry the signal)
+      - name: Record docker events
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/gossip-artifacts"
+          nohup docker events --format '{{.Time}} {{.Type}} {{.Action}} {{.Actor.Attributes.name}} {{.Actor.Attributes.signal}} {{.Actor.Attributes.exitCode}}'             > "$GITHUB_WORKSPACE/gossip-artifacts/docker-events.log" 2>&1 &
+
       - name: TX gossip, ${{ matrix.topology }}
         env:
           RUNS: ${{ github.event.inputs.runs }}
