@@ -641,6 +641,26 @@ pub fn canonical_encode_signed_txn_in_block(stx: &SignedTransaction) -> Vec<u8> 
     encode_signed_txn_apply_data(stx, true)
 }
 
+/// The encoded length of a `SignedTxnInBlock`, optionally also checking that
+/// the encoding decodes back (go `SignedTxnInBlock.GetEncodedLength(decode)`,
+/// `data/transactions/signedtxn.go`, v5.0.5-stable, issue #2309).
+///
+/// With `decode` set a transaction that encodes but cannot be read back (for
+/// example one without its required `type`/`snd`, which the encoder omits as
+/// zero) returns the decode error, so block assembly never emits a payset
+/// entry its peers would reject. go sets it only while generating (pool
+/// admission, block assembly), never for a received block.
+pub fn signed_txn_in_block_encoded_len(
+    stx: &SignedTransaction,
+    decode: bool,
+) -> Result<usize, algo_error::AlgoError> {
+    let enc = canonical_encode_signed_txn_in_block(stx);
+    if decode {
+        SignedTransaction::decode_from_bytes(&enc)?;
+    }
+    Ok(enc.len())
+}
+
 /// Canonically encode a `SignedTxnWithAD` (go `data/transactions/signedtxn.go`:
 /// `SignedTxn` + embedded `ApplyData`, `codec:",omitempty,omitemptyarray"`),
 /// the element type of `EvalDelta.InnerTxns` (`itx`). Identical to
@@ -4820,6 +4840,40 @@ mod tests {
                 .iter()
                 .any(|(k, _)| k.as_str() == Some("sig")),
             "an all-zero signature is encoded"
+        );
+    }
+
+    /// go `TestGetEncodedLengthDecode` (`data/transactions/signedtxn_test.go`,
+    /// v5.0.5-stable): the length matches the plain encoding with or without
+    /// the decode check, and a transaction missing its required sender still
+    /// encodes but no longer decodes.
+    #[test]
+    fn signed_txn_in_block_encoded_len_checks_decode_like_go() {
+        let mut stib = SignedTransaction {
+            txn: Transaction {
+                txn_type: "pay".into(),
+                sender: Address([1u8; 32]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let plain = signed_txn_in_block_encoded_len(&stib, false).unwrap();
+        assert_eq!(plain, canonical_encode_signed_txn_in_block(&stib).len());
+        let checked = signed_txn_in_block_encoded_len(&stib, true).unwrap();
+        assert_eq!(plain, checked);
+
+        // Without its required sender the transaction still encodes but no
+        // longer decodes.
+        stib.txn.sender = Address([0u8; 32]);
+        let plain = signed_txn_in_block_encoded_len(&stib, false).unwrap();
+        assert_eq!(plain, canonical_encode_signed_txn_in_block(&stib).len());
+        let err = signed_txn_in_block_encoded_len(&stib, true).unwrap_err();
+        let text = std::error::Error::source(&err)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        assert!(
+            text.contains("missing required field"),
+            "expected go's 'missing required field' text, got: {text}"
         );
     }
 }
