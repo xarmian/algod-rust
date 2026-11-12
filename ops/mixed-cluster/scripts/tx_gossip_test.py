@@ -21,7 +21,11 @@ class FakeNet:
     transaction submitted to `source` is in `target`'s pool (None: never), and
     `commit_after` the seconds until it is confirmed everywhere."""
 
-    def __init__(self, delay=None, commit_after=2.7, round0=100, round_s=2.7):
+    def __init__(self, delay=None, commit_after=2.7, round0=100, round_s=2.7,
+                 bulk=True, pending_stall=0.0):
+        self.bulk = bulk                    # False: the bulk pool list is unavailable
+        self.pending_stall = pending_stall  # seconds each per-txid lookup takes
+        self.pending_calls = 0
         self.t = 0.0
         self.delay = delay or {}
         self.commit_after = commit_after
@@ -30,6 +34,7 @@ class FakeNet:
         self.submitted = {}  # txid -> (source, t)
         self.n = 0
         self.posts = []
+        self.raws = {}  # txid -> note
 
     def now(self):
         return self.t
@@ -45,10 +50,44 @@ class FakeNet:
         txid = "TX{:03d}".format(self.n)
         self.submitted[txid] = (node, self.t)
         self.posts.append((node, raw))
+        self.raws[txid] = raw.decode()
         return 200, '{"txId":"%s"}' % txid
+
+    def note_of(self, raw):
+        return raw.decode()
+
+    def pool_notes(self, node):
+        """The notes in `node`'s pool as the bulk list (fast, never stalls);
+        None when the bulk list is unavailable."""
+        if not self.bulk:
+            return None
+        notes = set()
+        for n, (txid, (source, t0)) in enumerate(self.submitted.items()):
+            age = self.t - t0
+            if age >= self.commit_after:
+                continue
+            d = 0.0 if node == source else self.delay.get((source, node), 0.2)
+            if d is not None and age >= d:
+                notes.add(self.raws[txid])
+        return notes
+
+    def committed_rounds(self, node, notes, from_round, wait_s):
+        """note -> round it was committed in (what the blocks of `node` say)."""
+        out = {}
+        end = self.t + wait_s
+        while len(out) < len(notes) and self.t < end:
+            for txid, (source, t0) in self.submitted.items():
+                note = self.raws[txid]
+                if note in notes and self.t - t0 >= self.commit_after:
+                    out[note] = self.round0 + int((t0 + self.commit_after) / self.round_s)
+            if len(out) < len(notes):
+                self.t += 1.0
+        return out
 
     def pending(self, node, txid):
         """(status, confirmed_round) as /v2/transactions/pending/{txid}."""
+        self.pending_calls += 1
+        self.t += self.pending_stall
         if txid not in self.submitted:
             return 404, 0
         source, t0 = self.submitted[txid]
@@ -125,6 +164,68 @@ class PerNodeTest(unittest.TestCase):
         with self.assertRaises(tg.CheckError) as cm:
             run(Rejecting())
         self.assertIn("txn rejected", str(cm.exception))
+
+
+class BulkPollTest(unittest.TestCase):
+    """The first sighting is read from the bulk pool list, not per txid: a Go
+    node's GET /v2/transactions/pending/{txid} takes 0.1 to 2.5 s and stalls
+    (#2301), which made a Go-only control flake over the 6 s budget."""
+
+    def test_a_stalling_per_txid_endpoint_does_not_matter_while_the_bulk_list_is_fast(self):
+        net = FakeNet(pending_stall=8.0)
+        res = run(net)
+        self.assertTrue(res["pass"], res)
+        for pair in res["pairs"]:
+            self.assertLessEqual(pair["max_latency_s"], 1.0, pair)
+        self.assertEqual(net.pending_calls, 0)
+
+    def test_a_node_that_never_gets_the_txns_still_fails_with_a_fast_bulk_list(self):
+        net = FakeNet(delay={("go-node-1", "go-node-3"): None}, pending_stall=8.0)
+        res = run(net, sources=("go-node-1",))
+        self.assertFalse(res["pass"])
+        bad = [p for p in res["pairs"] if not p["ok"]]
+        self.assertEqual([(p["source"], p["target"]) for p in bad], [("go-node-1", "go-node-3")])
+        self.assertEqual(bad[0]["in_pool_first"], 0)  # never seen in its pool
+
+    def test_a_txn_that_arrives_late_via_the_bulk_list_is_late(self):
+        net = FakeNet(delay={("rust-node-4", "go-node-2"): 2.0}, commit_after=30.0)
+        res = run(net, within=1.0)
+        self.assertFalse(res["pass"])
+        bad = [p for p in res["pairs"] if not p["ok"]]
+        self.assertEqual([(p["source"], p["target"]) for p in bad], [("rust-node-4", "go-node-2")])
+
+    def test_commit_rounds_come_from_the_blocks_not_from_per_txid_lookups(self):
+        net = FakeNet(pending_stall=8.0)
+        res = run(net)
+        for s in res["sources"]:
+            self.assertEqual(s["confirmed"], 3, s)
+            self.assertGreaterEqual(s["commit_rounds"], 0, s)
+        self.assertEqual(net.pending_calls, 0)
+
+    def test_without_a_bulk_list_the_per_txid_path_still_works(self):
+        net = FakeNet(bulk=False)
+        res = run(net)
+        self.assertTrue(res["pass"], res)
+        self.assertGreater(net.pending_calls, 0)
+
+
+class NoteDecodingTest(unittest.TestCase):
+    def test_notes_are_read_from_go_and_rust_json_shapes(self):
+        import base64
+        go = {"top-transactions": [{"sig": "x", "txn": {"note": base64.b64encode(b"n-1").decode()}}]}
+        rust = {"top-transactions": [{"txn": {"note": list(b"n-2")}}]}
+        none = {"top-transactions": [{"txn": {"fee": 1}}]}
+        self.assertEqual(tg.notes_of_pending(go), {"n-1"})
+        self.assertEqual(tg.notes_of_pending(rust), {"n-2"})
+        self.assertEqual(tg.notes_of_pending(none), set())
+        self.assertEqual(tg.notes_of_pending({}), set())
+
+    def test_notes_of_a_block_are_read_from_its_txns(self):
+        import base64
+        block = {"block": {"txns": [{"txn": {"note": base64.b64encode(b"n-3").decode()}},
+                                    {"txn": {}}]}}
+        self.assertEqual(tg.notes_of_block(block), {"n-3"})
+        self.assertEqual(tg.notes_of_block({"block": {}}), set())
 
 
 class TopologyOptionsTest(unittest.TestCase):
