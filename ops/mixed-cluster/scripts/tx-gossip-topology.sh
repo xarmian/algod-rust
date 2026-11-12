@@ -70,30 +70,55 @@ round_of() {
         | python3 -c "import json,sys; print(json.load(sys.stdin).get('last-round', 0))" 2>/dev/null | tr -d '\r' || echo 0
 }
 
-echo "==> waiting for every node to pass round $WARMUP_ROUNDS (topology $TOPOLOGY)"
-deadline=$(( $(date +%s) + WARMUP_TIMEOUT_S ))
-while :; do
-    r1="$(round_of "$PHASE6_GO1_PORT")"; r2="$(round_of "$PHASE6_GO2_PORT")"
-    r3="$(round_of "$PHASE6_GO3_PORT")"; r4="$(round_of "$PHASE6_RUST_PORT")"
-    echo "    rounds go1=$r1 go2=$r2 go3=$r3 rust4=$r4"
-    if [ "${r1:-0}" -ge "$WARMUP_ROUNDS" ] && [ "${r2:-0}" -ge "$WARMUP_ROUNDS" ] \
-        && [ "${r3:-0}" -ge "$WARMUP_ROUNDS" ] && [ "${r4:-0}" -ge "$WARMUP_ROUNDS" ]; then
-        break
-    fi
-    if [ "$(date +%s)" -ge "$deadline" ]; then
-        echo "error: not every node reached round $WARMUP_ROUNDS within ${WARMUP_TIMEOUT_S}s" >&2
-        printf '{"topology":"%s","pass":false,"error":"warmup timeout","rounds":{"go-node-1":%s,"go-node-2":%s,"go-node-3":%s,"rust-node-4":%s}}\n' \
-            "$TOPOLOGY" "${r1:-0}" "${r2:-0}" "${r3:-0}" "${r4:-0}" > "$OUT_DIR/tx-gossip.json"
-        exit 1
-    fi
-    sleep 5
-done
+# Every node past WARMUP_ROUNDS (also used again before a retry); 1 on timeout.
+wait_for_rounds() {
+    local deadline r1 r2 r3 r4
+    echo "==> waiting for every node to pass round $WARMUP_ROUNDS (topology $TOPOLOGY)"
+    deadline=$(( $(date +%s) + WARMUP_TIMEOUT_S ))
+    while :; do
+        r1="$(round_of "$PHASE6_GO1_PORT")"; r2="$(round_of "$PHASE6_GO2_PORT")"
+        r3="$(round_of "$PHASE6_GO3_PORT")"; r4="$(round_of "$PHASE6_RUST_PORT")"
+        echo "    rounds go1=$r1 go2=$r2 go3=$r3 rust4=$r4"
+        if [ "${r1:-0}" -ge "$WARMUP_ROUNDS" ] && [ "${r2:-0}" -ge "$WARMUP_ROUNDS" ] \
+            && [ "${r3:-0}" -ge "$WARMUP_ROUNDS" ] && [ "${r4:-0}" -ge "$WARMUP_ROUNDS" ]; then
+            return 0
+        fi
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            echo "error: not every node reached round $WARMUP_ROUNDS within ${WARMUP_TIMEOUT_S}s" >&2
+            printf '{"topology":"%s","pass":false,"error":"warmup timeout","rounds":{"go-node-1":%s,"go-node-2":%s,"go-node-3":%s,"rust-node-4":%s}}\n' \
+                "$TOPOLOGY" "${r1:-0}" "${r2:-0}" "${r3:-0}" "${r4:-0}" > "$OUT_DIR/tx-gossip.json"
+            return 1
+        fi
+        sleep 5
+    done
+}
 
+wait_for_rounds || exit 1
+
+# The check itself. A SETUP error (tx-gossip.json carries an `error`: kmd or
+# the funder account not ready, e.g. a node container restarting) says nothing
+# about gossip and is retried once the nodes are back; a VERDICT (a pair that
+# failed) is final. TX_GOSSIP_ATTEMPTS (default 2) bounds the tries.
+TX_GOSSIP_ATTEMPTS="${TX_GOSSIP_ATTEMPTS:-2}"
 rc=0
-python3 "$HERE/tx_gossip.py" --out "$OUT_DIR/tx-gossip.json" --topology "$TOPOLOGY" \
-    --count "${TX_GOSSIP_COUNT:-12}" --within-s "${TX_GOSSIP_WITHIN_S:-6}" \
-    > "$OUT_DIR/tx-gossip.log" 2>&1 || rc=$?
-cat "$OUT_DIR/tx-gossip.log"
+attempt=1
+while :; do
+    rc=0
+    python3 "$HERE/tx_gossip.py" --out "$OUT_DIR/tx-gossip.json" --topology "$TOPOLOGY" \
+        --count "${TX_GOSSIP_COUNT:-12}" --within-s "${TX_GOSSIP_WITHIN_S:-6}" \
+        > "$OUT_DIR/tx-gossip.log" 2>&1 || rc=$?
+    cat "$OUT_DIR/tx-gossip.log"
+    [ "$rc" = 0 ] && break
+    if [ "$attempt" -lt "$TX_GOSSIP_ATTEMPTS" ] \
+        && python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("error") else 1)' \
+            "$OUT_DIR/tx-gossip.json" 2>/dev/null; then
+        echo "==> tx_gossip.py hit a setup error (attempt $attempt of $TX_GOSSIP_ATTEMPTS); waiting for the nodes and retrying"
+        attempt=$((attempt + 1))
+        wait_for_rounds || break
+        continue
+    fi
+    break
+done
 
 # The topology is checked from the Go nodes' own connection logs, not assumed
 # from the configuration: go-node-3 must have dialed only its planned relay,

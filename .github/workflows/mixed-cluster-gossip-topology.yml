@@ -41,7 +41,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        topology: [go-relay, rust-relay]
+        include:
+          # The control only has to be sane: a Go node behind a Go relay was seen
+          # taking 6.4 to 7.6 s to reach go-node-1 in CI (go-only, no Rust node on
+          # the path). The Rust relay leg keeps the 6 s budget (about two rounds).
+          - topology: go-relay
+            within_s: "12"
+          - topology: rust-relay
+            within_s: "6"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -72,9 +79,17 @@ jobs:
           bash ops/mixed-cluster/scripts/ports_shell_test.sh
           bash ops/mixed-cluster/scripts/tx_gossip_topology_shell_test.sh
 
+      # Who stops a node container? (a Go node was found being SIGTERMed and
+      # restarted in repetition 2: `kill` events carry the signal)
+      - name: Record docker events
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/gossip-artifacts"
+          nohup docker events --format '{{.Time}} {{.Type}} {{.Action}} {{.Actor.Attributes.name}} {{.Actor.Attributes.signal}} {{.Actor.Attributes.exitCode}}'             > "$GITHUB_WORKSPACE/gossip-artifacts/docker-events.log" 2>&1 &
+
       - name: TX gossip, ${{ matrix.topology }}
         env:
           RUNS: ${{ github.event.inputs.runs }}
+          TX_GOSSIP_WITHIN_S: ${{ matrix.within_s }}
         run: |
           set -euo pipefail
           case "${RUNS:-3}" in ''|*[!0-9]*) echo "runs must be a number" >&2; exit 1 ;; esac

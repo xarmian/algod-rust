@@ -79,13 +79,55 @@ def pending_state(status, confirmed_round):
     return "confirmed" if int(confirmed_round or 0) > 0 else "pool"
 
 
+def _note_text(value):
+    """A transaction note as text from the JSON of either implementation: go
+    emits base64, algod-rust a list of byte values."""
+    try:
+        if isinstance(value, str):
+            return base64.b64decode(value).decode("utf-8", "replace")
+        if isinstance(value, list):
+            return bytes(value).decode("utf-8", "replace")
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def notes_of_pending(doc):
+    """The notes of the transactions in a GET /v2/transactions/pending document."""
+    out = set()
+    for entry in (doc or {}).get("top-transactions") or []:
+        note = _note_text(((entry or {}).get("txn") or {}).get("note"))
+        if note is not None:
+            out.add(note)
+    return out
+
+
+def notes_of_block(doc):
+    """The notes of the transactions of a GET /v2/blocks/{round}?format=json document."""
+    out = set()
+    for entry in ((doc or {}).get("block") or {}).get("txns") or []:
+        note = _note_text(((entry or {}).get("txn") or {}).get("note"))
+        if note is not None:
+            out.add(note)
+    return out
+
+
 def run_check(net, *, nodes, sources, count, within_s, build, poll_s=0.1,
-              settle_s=10.0, commit_wait_s=90.0, topology="default"):
+              settle_s=10.0, commit_wait_s=90.0, topology="default", commit_node=None):
     """Submit `count` transactions to each source node and watch every other
     node. `net` provides now(), sleep(s), round_of(node), submit(node, raw) ->
-    (status, body) and pending(node, txid) -> (status, confirmed_round);
+    (status, body), note_of(raw), pool_notes(node) (the notes in the node's pool
+    from the bulk list, None when unavailable), committed_rounds(node, notes,
+    from_round, wait_s) and pending(node, txid) -> (status, confirmed_round);
     `build(source, i)` returns the raw signed transaction. Returns the result
-    document (see `pass`, `pairs`, `sources`)."""
+    document (see `pass`, `pairs`, `sources`).
+
+    A transaction is "seen" in a target's pool when its note is in the bulk
+    pending list (a few ms, never stalls): the per-txid
+    GET /v2/transactions/pending/{txid} of a Go node takes 0.1 to 2.5 s and
+    stalls (#2301). It is used only once, after the deadline, for what the list
+    did not show (to tell "confirmed first" from "absent"), and as the whole
+    method when the list is unavailable. The commit rounds come from the blocks."""
     pairs, source_rows = [], []
     for src in sources:
         raws = [build(src, i) for i in range(count)]
@@ -93,27 +135,58 @@ def run_check(net, *, nodes, sources, count, within_s, build, poll_s=0.1,
         # moment the first payment is submitted.
         round_before = net.round_of(src)
         t0 = net.now()
+        notes = [net.note_of(raw) for raw in raws]
         txids = []
+        answered = {}   # txid -> when the node answered its submission
+        max_post = 0.0
         for raw in raws:
+            posted = net.now()
             status, body = net.submit(src, raw)
             if status != 200:
                 raise CheckError("{} rejected a submitted payment ({}): {}".format(
                     src, status, body[:200]))
-            txids.append(parse_txid(body))
+            txid = parse_txid(body)
+            txids.append(txid)
+            answered[txid] = net.now()
+            max_post = max(max_post, answered[txid] - posted)
+        # Gossip latency counts from the moment the node has answered the LAST
+        # submission (the earlier ones had at least that long): a Go node's POST
+        # can itself take seconds while its pool lock is held.
+        submitted_at = max(answered.values())
         targets = [n for n in nodes if n != src]
         seen = {}  # (target, txid) -> (state, latency)
         deadline = t0 + within_s + settle_s
+        bulk_ok = {t: True for t in targets}
         while True:
             for target in targets:
-                for txid in txids:
-                    if (target, txid) in seen:
-                        continue
-                    state = pending_state(*net.pending(target, txid))
-                    if state != "absent":
-                        seen[(target, txid)] = (state, net.now() - t0)
+                if len(seen) == len(targets) * len(txids):
+                    break
+                pool = net.pool_notes(target) if bulk_ok[target] else None
+                if pool is None:
+                    bulk_ok[target] = False
+                    for txid in txids:
+                        if (target, txid) in seen:
+                            continue
+                        state = pending_state(*net.pending(target, txid))
+                        if state != "absent":
+                            seen[(target, txid)] = (state, max(0.0, net.now() - submitted_at))
+                    continue
+                for txid, note in zip(txids, notes):
+                    if (target, txid) not in seen and note in pool:
+                        seen[(target, txid)] = ("pool", max(0.0, net.now() - submitted_at))
             if len(seen) == len(targets) * len(txids) or net.now() >= deadline:
                 break
             net.sleep(poll_s)
+        # What the bulk list never showed: one per-txid lookup each, to tell
+        # "committed before it was ever seen in the pool" from "never there".
+        for target in targets:
+            if not bulk_ok[target]:
+                continue
+            for txid in txids:
+                if (target, txid) not in seen:
+                    state = pending_state(*net.pending(target, txid))
+                    if state != "absent":
+                        seen[(target, txid)] = (state, max(0.0, net.now() - submitted_at))
         for target in targets:
             states = [seen.get((target, x)) for x in txids]
             absent = sum(1 for s in states if s is None)
@@ -130,20 +203,15 @@ def run_check(net, *, nodes, sources, count, within_s, build, poll_s=0.1,
                 "max_latency_s": None if max_latency is None else round(max_latency, 3),
                 "min_latency_s": round(min(lat), 3) if lat else None,
             })
-        # Commit rounds, read from the source node.
-        confirmed_rounds = {}
-        end = net.now() + commit_wait_s
-        while len(confirmed_rounds) < len(txids) and net.now() < end:
-            for txid in txids:
-                if txid not in confirmed_rounds:
-                    status, rnd = net.pending(src, txid)
-                    if pending_state(status, rnd) == "confirmed":
-                        confirmed_rounds[txid] = int(rnd)
-            if len(confirmed_rounds) < len(txids):
-                net.sleep(1.0)
+        # Commit rounds, read from the blocks of the source node.
+        found = net.committed_rounds(commit_node or src, set(notes), round_before or 0,
+                                     commit_wait_s)
+        confirmed_rounds = {n: r for n, r in found.items() if n in notes}
         rounds = sorted(confirmed_rounds.values())
         source_rows.append({
             "source": src, "submitted": len(txids), "confirmed": len(rounds),
+            "max_post_s": round(max_post, 3),
+            "block_scan": getattr(net, "last_scan", None),
             "round_before": round_before,
             "first_round": rounds[0] if rounds else None,
             "last_round": rounds[-1] if rounds else None,
@@ -165,6 +233,7 @@ class ClusterNet:
         self.workload = workload
         self.env = workload.Env()
         self.funder = None
+        self.notes = {}  # raw signed payment -> its note
 
     def now(self):
         return time.monotonic()
@@ -180,6 +249,47 @@ class ClusterNet:
 
     def submit(self, node, raw):
         return self.env.post_txn(node, raw)
+
+    def _get_json(self, node, path, timeout=10):
+        import urllib.request
+        url = "http://127.0.0.1:{}{}".format(self.workload.NODE_PORTS[node], path)
+        req = urllib.request.Request(url, headers={"X-Algo-API-Token": self.workload.TOKEN})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    def note_of(self, raw):
+        return self.notes[raw]
+
+    def pool_notes(self, node):
+        """The notes in `node`'s pool from GET /v2/transactions/pending (the bulk
+        list); None when the node cannot serve it."""
+        try:
+            return notes_of_pending(self._get_json(node, "/v2/transactions/pending?max=0"))
+        except Exception:  # noqa: BLE001 - the per-txid path takes over
+            return None
+
+    def committed_rounds(self, node, notes, from_round, wait_s):
+        """note -> the round whose block (read from `node`) holds it: blocks
+        from_round+1.. are read as they appear, until all are found or wait_s ran out."""
+        found = {}
+        nxt = int(from_round) + 1
+        end = time.monotonic() + wait_s
+        while len(found) < len(notes) and time.monotonic() < end:
+            latest = self.round_of(node)
+            if latest is None or nxt > latest:
+                time.sleep(0.5)
+                continue
+            try:
+                doc = self._get_json(node, "/v2/blocks/{}?format=json".format(nxt), timeout=15)
+            except Exception:  # noqa: BLE001 - retry the same block
+                time.sleep(0.5)
+                continue
+            for note in notes_of_block(doc) & set(notes):
+                found.setdefault(note, nxt)
+            nxt += 1
+        self.last_scan = {"node": node, "from_round": int(from_round) + 1,
+                          "next_unread_round": nxt, "found": len(found), "wanted": len(notes)}
+        return found
 
     def pending(self, node, txid):
         import urllib.error
@@ -198,8 +308,14 @@ class ClusterNet:
 
     def warm(self):
         """kmd up and a funder address (what workload.py's setup does)."""
-        rc, out = self.env.sh("chmod 700 {}/kmd-v0.5; mkdir -p {}".format(
-            self.workload.DATA_DIR, WORK_DIR))
+        # WORK_DIR is created here as root but written by whichever user the
+        # goal commands run as (the image's own user first), so open it up.
+        # kmd.pid: `goal kmd start` first kills the pid in it, a stale one from the
+        # `goal network create` container that can be this container's own
+        # entrypoint or algod (it SIGTERMed go-node-1 in CI).
+        rc, out = self.env.sh(
+            "rm -f {d}/kmd-v0.5/kmd.pid; chmod 700 {d}/kmd-v0.5; mkdir -p {w} && chmod 777 {w}".format(
+                d=self.workload.DATA_DIR, w=WORK_DIR))
         if rc != 0:
             raise CheckError("cannot prepare {} in the container: {}".format(WORK_DIR, out))
         last = ""
@@ -234,7 +350,9 @@ class ClusterNet:
         rc, b64 = self.env.fetch_file_b64(WORK_DIR + "/tg.stxn")
         if rc != 0 or not b64:
             raise CheckError("could not read the signed payment")
-        return base64.b64decode(b64)
+        raw = base64.b64decode(b64)
+        self.notes[raw] = note
+        return raw
 
 
 def parse_args(argv):
@@ -269,7 +387,8 @@ def main(argv=None):
         sources = resolve_sources(args)
         net.warm()
         res = run_check(net, nodes=NODES, sources=sources, count=args.count,
-                        within_s=args.within_s, build=net.build, topology=args.topology)
+                        within_s=args.within_s, build=net.build, topology=args.topology,
+                        commit_node="go-node-1")
     except CheckError as e:
         res = {"pass": False, "error": str(e), "topology": args.topology,
                "pairs": [], "sources": []}
