@@ -44,12 +44,12 @@ test is appended after it; re-verified cosmetic). Both owned by #2309.
 
 ## Success criteria
 
-- [ ] #2309 closed.
-- [ ] Pin swept from `v5.0.4-stable` to `v5.0.5-stable` across the repo.
-- [ ] `python3 scripts/phase17_parity_delta.py check --tag v5.0.5-stable --go-algorand ../go-algorand` exits 0 (`not-implemented` = `missing-test` = `partial` = `unclassified` = 0).
-- [ ] Full gate green on `main` (fmt, clippy, workspace tests) and a live mixed-cluster run against v5.0.5-stable Go nodes.
-- [ ] `docs/PHASE24_VALIDATION.md` evidence map written at close-out.
-- [ ] `gh issue list --label "phase:24" --state open` empty before the epic closes.
+- [x] #2309 closed (PR #2312).
+- [x] Pin swept from `v5.0.4-stable` to `v5.0.5-stable` across the repo (PR #2311).
+- [x] `python3 scripts/phase17_parity_delta.py check --tag v5.0.5-stable --go-algorand ../go-algorand` exits 0 (`not-implemented` = `missing-test` = `partial` = `unclassified` = 0).
+- [x] Full gate green on `main` (fmt, clippy, workspace tests) and a live mixed-cluster run against v5.0.5-stable Go nodes.
+- [x] `docs/PHASE24_VALIDATION.md` evidence map written at close-out.
+- [x] `gh issue list --label "phase:24" --state open` empty before the epic closes.
 
 ## Non-goals
 
