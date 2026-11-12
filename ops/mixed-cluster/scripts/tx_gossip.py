@@ -305,8 +305,10 @@ class ClusterNet:
 
     def warm(self):
         """kmd up and a funder address (what workload.py's setup does)."""
-        rc, out = self.env.sh("chmod 700 {}/kmd-v0.5; mkdir -p {}".format(
-            self.workload.DATA_DIR, WORK_DIR))
+        # WORK_DIR is created here as root but written by whichever user the
+        # goal commands run as (the image's own user first), so open it up.
+        rc, out = self.env.sh("chmod 700 {}/kmd-v0.5; mkdir -p {w} && chmod 777 {w}".format(
+            self.workload.DATA_DIR, w=WORK_DIR))
         if rc != 0:
             raise CheckError("cannot prepare {} in the container: {}".format(WORK_DIR, out))
         last = ""
