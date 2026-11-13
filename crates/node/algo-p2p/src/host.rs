@@ -80,6 +80,14 @@
 //!   comparisons interoperable with a real go-algorand peer on the TX
 //!   topic.
 
+// `#[derive(NetworkBehaviour)]` on `P2pBehaviour` expands to a call the
+// compiler proves unreachable (the conversion of an uninhabited behaviour
+// event), which newer stable toolchains report as `unreachable_code`; with
+// `-D warnings` that fails the build (issue #2324). The code is libp2p's,
+// not ours, and a lint attribute on the struct does not reach the derive's
+// generated impls, so the lint is allowed for this module.
+#![allow(unreachable_code)]
+
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;

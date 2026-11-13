@@ -44,46 +44,61 @@ use serde_bytes::ByteBuf;
 
 /// A builder for canonical msgpack maps.
 ///
-/// Collects non-zero fields as (key, encoded_value) pairs,
-/// sorts by key, and writes a msgpack map.
+/// Collects non-zero fields, sorts them by key, and writes a msgpack map.
+///
+/// Every field value is appended to one shared `arena`; `fields` only records
+/// the key and the value's byte range. go-algorand's msgp `MarshalMsg` appends
+/// each field to one buffer as well, so encoding does not allocate per field
+/// (issue #2314: one `Vec` per field made encoding 1.6x to 2x slower than go).
 struct CanonicalMap {
-    fields: Vec<(&'static str, Vec<u8>)>,
+    arena: Vec<u8>,
+    fields: Vec<(&'static str, usize, usize)>,
 }
 
 impl CanonicalMap {
     fn new() -> Self {
-        Self { fields: Vec::new() }
+        Self {
+            arena: Vec::with_capacity(256),
+            fields: Vec::with_capacity(16),
+        }
+    }
+
+    /// Add a field whose value is already encoded.
+    fn push_encoded(&mut self, key: &'static str, val: &[u8]) {
+        let start = self.arena.len();
+        self.arena.extend_from_slice(val);
+        self.fields.push((key, start, self.arena.len()));
     }
 
     fn add_u64(&mut self, key: &'static str, val: u64) {
         if val != 0 {
-            let mut buf = Vec::new();
-            write_uint(&mut buf, val);
-            self.fields.push((key, buf));
+            let start = self.arena.len();
+            write_uint(&mut self.arena, val);
+            self.fields.push((key, start, self.arena.len()));
         }
     }
 
     fn add_i64(&mut self, key: &'static str, val: i64) {
         if val != 0 {
-            let mut buf = Vec::new();
-            write_int(&mut buf, val);
-            self.fields.push((key, buf));
+            let start = self.arena.len();
+            write_int(&mut self.arena, val);
+            self.fields.push((key, start, self.arena.len()));
         }
     }
 
     fn add_bool(&mut self, key: &'static str, val: bool) {
         if val {
-            let mut buf = Vec::new();
-            rmp::encode::write_bool(&mut buf, true).unwrap();
-            self.fields.push((key, buf));
+            let start = self.arena.len();
+            rmp::encode::write_bool(&mut self.arena, true).unwrap();
+            self.fields.push((key, start, self.arena.len()));
         }
     }
 
     fn add_string(&mut self, key: &'static str, val: &str) {
         if !val.is_empty() {
-            let mut buf = Vec::new();
-            rmp::encode::write_str(&mut buf, val).unwrap();
-            self.fields.push((key, buf));
+            let start = self.arena.len();
+            rmp::encode::write_str(&mut self.arena, val).unwrap();
+            self.fields.push((key, start, self.arena.len()));
         }
     }
 
@@ -91,9 +106,9 @@ impl CanonicalMap {
         // Go's omitempty for []byte: omit when len == 0 (nil or empty) OR
         // when all bytes are zero (for fixed-size [N]byte fields like digests).
         if !val.is_empty() && val.iter().any(|&b| b != 0) {
-            let mut buf = Vec::new();
-            rmp::encode::write_bin(&mut buf, val).unwrap();
-            self.fields.push((key, buf));
+            let start = self.arena.len();
+            rmp::encode::write_bin(&mut self.arena, val).unwrap();
+            self.fields.push((key, start, self.arena.len()));
         }
     }
 
@@ -105,9 +120,9 @@ impl CanonicalMap {
     /// must be preserved. PLAN-36 G8 (TASK-122).
     fn add_var_bytes(&mut self, key: &'static str, val: &[u8]) {
         if !val.is_empty() {
-            let mut buf = Vec::new();
-            rmp::encode::write_bin(&mut buf, val).unwrap();
-            self.fields.push((key, buf));
+            let start = self.arena.len();
+            rmp::encode::write_bin(&mut self.arena, val).unwrap();
+            self.fields.push((key, start, self.arena.len()));
         }
     }
 
@@ -118,18 +133,18 @@ impl CanonicalMap {
     /// `TealValue.Bytes` (`"tb"` field) which is `string` in Go, not `[]byte`.
     fn add_str_bytes(&mut self, key: &'static str, val: &[u8]) {
         if !val.is_empty() {
-            let mut buf = Vec::new();
-            rmp::encode::write_str_len(&mut buf, val.len() as u32).unwrap();
-            buf.extend_from_slice(val);
-            self.fields.push((key, buf));
+            let start = self.arena.len();
+            rmp::encode::write_str_len(&mut self.arena, val.len() as u32).unwrap();
+            self.arena.extend_from_slice(val);
+            self.fields.push((key, start, self.arena.len()));
         }
     }
 
     fn add_address(&mut self, key: &'static str, val: &Address) {
         if !val.is_zero() {
-            let mut buf = Vec::new();
-            rmp::encode::write_bin(&mut buf, &val.0).unwrap();
-            self.fields.push((key, buf));
+            let start = self.arena.len();
+            rmp::encode::write_bin(&mut self.arena, &val.0).unwrap();
+            self.fields.push((key, start, self.arena.len()));
         }
     }
 
@@ -141,19 +156,19 @@ impl CanonicalMap {
             [0x80] | [0xDE, 0x00, 0x00] | [0xDF, 0x00, 0x00, 0x00, 0x00]
         );
         if !is_empty {
-            self.fields.push((key, val));
+            self.push_encoded(key, &val);
         }
     }
 
     #[allow(dead_code)] // Will be used for payset encoding in Epic 5b
     fn add_array_of_maps(&mut self, key: &'static str, maps: &[Vec<u8>]) {
         if !maps.is_empty() {
-            let mut buf = Vec::new();
-            rmp::encode::write_array_len(&mut buf, maps.len() as u32).unwrap();
+            let start = self.arena.len();
+            rmp::encode::write_array_len(&mut self.arena, maps.len() as u32).unwrap();
             for m in maps {
-                buf.extend_from_slice(m);
+                self.arena.extend_from_slice(m);
             }
-            self.fields.push((key, buf));
+            self.fields.push((key, start, self.arena.len()));
         }
     }
 
@@ -175,9 +190,9 @@ impl CanonicalMap {
     fn add_option_rmpv(&mut self, key: &'static str, val: &Option<rmpv::Value>) {
         if let Some(v) = val {
             if !is_rmpv_empty(v) {
-                let mut buf = Vec::new();
-                write_value_str_preserving(&mut buf, v).unwrap();
-                self.fields.push((key, buf));
+                let start = self.arena.len();
+                write_value_str_preserving(&mut self.arena, v).unwrap();
+                self.fields.push((key, start, self.arena.len()));
             }
         }
     }
@@ -209,15 +224,15 @@ impl CanonicalMap {
     fn add_option_vec_bytes(&mut self, key: &'static str, val: &Option<Vec<Option<ByteBuf>>>) {
         if let Some(items) = val {
             if !items.is_empty() {
-                let mut buf = Vec::new();
-                rmp::encode::write_array_len(&mut buf, items.len() as u32).unwrap();
+                let start = self.arena.len();
+                rmp::encode::write_array_len(&mut self.arena, items.len() as u32).unwrap();
                 for item in items {
                     match item {
-                        Some(bytes) => rmp::encode::write_bin(&mut buf, bytes).unwrap(),
-                        None => rmp::encode::write_nil(&mut buf).unwrap(),
+                        Some(bytes) => rmp::encode::write_bin(&mut self.arena, bytes).unwrap(),
+                        None => rmp::encode::write_nil(&mut self.arena).unwrap(),
                     }
                 }
-                self.fields.push((key, buf));
+                self.fields.push((key, start, self.arena.len()));
             }
         }
     }
@@ -225,12 +240,12 @@ impl CanonicalMap {
     fn add_option_vec_address(&mut self, key: &'static str, val: &Option<Vec<Address>>) {
         if let Some(addrs) = val {
             if !addrs.is_empty() {
-                let mut buf = Vec::new();
-                rmp::encode::write_array_len(&mut buf, addrs.len() as u32).unwrap();
+                let start = self.arena.len();
+                rmp::encode::write_array_len(&mut self.arena, addrs.len() as u32).unwrap();
                 for addr in addrs {
-                    rmp::encode::write_bin(&mut buf, &addr.0).unwrap();
+                    rmp::encode::write_bin(&mut self.arena, &addr.0).unwrap();
                 }
-                self.fields.push((key, buf));
+                self.fields.push((key, start, self.arena.len()));
             }
         }
     }
@@ -238,12 +253,12 @@ impl CanonicalMap {
     fn add_option_vec_u64(&mut self, key: &'static str, val: &Option<Vec<u64>>) {
         if let Some(vals) = val {
             if !vals.is_empty() {
-                let mut buf = Vec::new();
-                rmp::encode::write_array_len(&mut buf, vals.len() as u32).unwrap();
+                let start = self.arena.len();
+                rmp::encode::write_array_len(&mut self.arena, vals.len() as u32).unwrap();
                 for &v in vals {
-                    write_uint(&mut buf, v);
+                    write_uint(&mut self.arena, v);
                 }
-                self.fields.push((key, buf));
+                self.fields.push((key, start, self.arena.len()));
             }
         }
     }
@@ -252,12 +267,12 @@ impl CanonicalMap {
         if let Some(refs) = val {
             if !refs.is_empty() {
                 let maps: Vec<Vec<u8>> = refs.iter().map(canonical_encode_box_ref).collect();
-                let mut buf = Vec::new();
-                rmp::encode::write_array_len(&mut buf, maps.len() as u32).unwrap();
+                let start = self.arena.len();
+                rmp::encode::write_array_len(&mut self.arena, maps.len() as u32).unwrap();
                 for m in &maps {
-                    buf.extend_from_slice(m);
+                    self.arena.extend_from_slice(m);
                 }
-                self.fields.push((key, buf));
+                self.fields.push((key, start, self.arena.len()));
             }
         }
     }
@@ -267,33 +282,33 @@ impl CanonicalMap {
     // meaning all fields are always present in the encoded output.
 
     fn add_u64_always(&mut self, key: &'static str, val: u64) {
-        let mut buf = Vec::new();
-        write_uint(&mut buf, val);
-        self.fields.push((key, buf));
+        let start = self.arena.len();
+        write_uint(&mut self.arena, val);
+        self.fields.push((key, start, self.arena.len()));
     }
 
     fn add_u32_always(&mut self, key: &'static str, val: u32) {
-        let mut buf = Vec::new();
-        write_uint(&mut buf, val as u64);
-        self.fields.push((key, buf));
+        let start = self.arena.len();
+        write_uint(&mut self.arena, val as u64);
+        self.fields.push((key, start, self.arena.len()));
     }
 
     fn add_bool_always(&mut self, key: &'static str, val: bool) {
-        let mut buf = Vec::new();
-        rmp::encode::write_bool(&mut buf, val).unwrap();
-        self.fields.push((key, buf));
+        let start = self.arena.len();
+        rmp::encode::write_bool(&mut self.arena, val).unwrap();
+        self.fields.push((key, start, self.arena.len()));
     }
 
     fn add_fixed_bytes_always<const N: usize>(&mut self, key: &'static str, val: &[u8; N]) {
-        let mut buf = Vec::new();
-        rmp::encode::write_bin(&mut buf, val).unwrap();
-        self.fields.push((key, buf));
+        let start = self.arena.len();
+        rmp::encode::write_bin(&mut self.arena, val).unwrap();
+        self.fields.push((key, start, self.arena.len()));
     }
 
     fn add_address_always(&mut self, key: &'static str, val: &Address) {
-        let mut buf = Vec::new();
-        rmp::encode::write_bin(&mut buf, &val.0).unwrap();
-        self.fields.push((key, buf));
+        let start = self.arena.len();
+        rmp::encode::write_bin(&mut self.arena, &val.0).unwrap();
+        self.fields.push((key, start, self.arena.len()));
     }
 
     fn add_option_fixed_bytes_always<const N: usize>(
@@ -314,22 +329,31 @@ impl CanonicalMap {
 
     #[allow(dead_code)] // Part of the _always API; will be used when needed
     fn add_map_always(&mut self, key: &'static str, val: Vec<u8>) {
-        self.fields.push((key, val));
+        self.push_encoded(key, &val);
     }
 
     /// Sort fields by key in lexicographic order (raw UTF-8 bytes).
     ///
     /// Go's go-codec sorts struct field codec tags alphabetically.
     fn encode(mut self) -> Vec<u8> {
-        self.fields
-            .sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        // Callers add the keys in ascending order almost everywhere, so the
+        // sort is skipped unless a pair is out of order.
+        let sorted = self
+            .fields
+            .windows(2)
+            .all(|w| w[0].0.as_bytes() <= w[1].0.as_bytes());
+        if !sorted {
+            self.fields
+                .sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        }
 
-        let mut buf = Vec::new();
+        let keys: usize = self.fields.iter().map(|f| f.0.len() + 2).sum();
+        let mut buf = Vec::with_capacity(5 + keys + self.arena.len());
         rmp::encode::write_map_len(&mut buf, self.fields.len() as u32).unwrap();
 
-        for (key, value) in &self.fields {
+        for &(key, start, end) in &self.fields {
             rmp::encode::write_str(&mut buf, key).unwrap();
-            buf.extend_from_slice(value);
+            buf.extend_from_slice(&self.arena[start..end]);
         }
 
         buf
@@ -492,7 +516,7 @@ fn canonical_encode_transaction_inner(
             for map in &maps {
                 buf.extend_from_slice(map);
             }
-            m.fields.push(("al", buf));
+            m.push_encoded("al", &buf);
         }
     }
     m.add_option_address("aclose", &tx.asset_close_to);
@@ -619,10 +643,10 @@ pub fn canonical_encode_signed_transaction(stx: &SignedTransaction) -> Vec<u8> {
     // Note: hgi and hgh are NOT part of SignedTxn in go-algorand.
     // They belong to SignedTxnInBlock (the block payset wrapper).
     if let Some(ref lsig) = stx.lsig {
-        m.fields.push(("lsig", canonical_encode_logicsig(lsig)));
+        m.push_encoded("lsig", &canonical_encode_logicsig(lsig));
     }
     if let Some(ref msig) = stx.msig {
-        m.fields.push(("msig", canonical_encode_multisig(msig)));
+        m.push_encoded("msig", &canonical_encode_multisig(msig));
     }
     if let Some(ref pqsig) = stx.pqsig {
         m.add_map("pqsig", canonical_encode_pqsig(pqsig));
@@ -688,10 +712,10 @@ fn encode_signed_txn_apply_data(stx: &SignedTransaction, block_wrapper: bool) ->
 
     // SignedTxn fields
     if let Some(ref lsig) = stx.lsig {
-        m.fields.push(("lsig", canonical_encode_logicsig(lsig)));
+        m.push_encoded("lsig", &canonical_encode_logicsig(lsig));
     }
     if let Some(ref msig) = stx.msig {
-        m.fields.push(("msig", canonical_encode_multisig(msig)));
+        m.push_encoded("msig", &canonical_encode_multisig(msig));
     }
     if let Some(ref pqsig) = stx.pqsig {
         m.add_map("pqsig", canonical_encode_pqsig(pqsig));
@@ -807,7 +831,7 @@ pub fn canonical_encode_block(block: &Block) -> Vec<u8> {
         for map in &maps {
             buf.extend_from_slice(map);
         }
-        m.fields.push(("txns", buf));
+        m.push_encoded("txns", &buf);
     }
 
     m.add_u64("upgradedelay", block.upgrade_delay);
@@ -892,7 +916,7 @@ pub fn canonical_encode_unauthenticated_proposal(
         for map in &maps {
             buf.extend_from_slice(map);
         }
-        m.fields.push(("txns", buf));
+        m.push_encoded("txns", &buf);
     }
 
     m.add_u64("upgradedelay", block.upgrade_delay);
@@ -1554,7 +1578,7 @@ pub fn canonical_encode_multisig(msig: &MultisigSig) -> Vec<u8> {
         for map in &maps {
             buf.extend_from_slice(map);
         }
-        m.fields.push(("subsig", buf));
+        m.push_encoded("subsig", &buf);
     }
 
     m.add_u64("thr", msig.threshold as u64);
@@ -1577,7 +1601,7 @@ pub fn canonical_encode_tx_group(hashes: &[Digest]) -> Vec<u8> {
         for h in hashes {
             rmp::encode::write_bin(&mut buf, h.as_bytes()).unwrap();
         }
-        m.fields.push(("txlist", buf));
+        m.push_encoded("txlist", &buf);
     }
 
     m.encode()
@@ -1597,18 +1621,18 @@ pub fn canonical_encode_logicsig(lsig: &LogicSig) -> Vec<u8> {
             for arg in args {
                 rmp::encode::write_bin(&mut buf, arg).unwrap();
             }
-            m.fields.push(("arg", buf));
+            m.push_encoded("arg", &buf);
         }
     }
 
     m.add_bytes("l", &lsig.logic);
 
     if let Some(ref lmsig) = lsig.lmsig {
-        m.fields.push(("lmsig", canonical_encode_multisig(lmsig)));
+        m.push_encoded("lmsig", &canonical_encode_multisig(lmsig));
     }
 
     if let Some(ref msig) = lsig.msig {
-        m.fields.push(("msig", canonical_encode_multisig(msig)));
+        m.push_encoded("msig", &canonical_encode_multisig(msig));
     }
 
     if let Some(ref pqsig) = lsig.pqsig {
@@ -1683,7 +1707,7 @@ pub fn canonical_encode_merkle_proof(proof: &MerkleProof) -> Vec<u8> {
                     None => rmp::encode::write_nil(&mut buf).unwrap(),
                 }
             }
-            m.fields.push(("pth", buf));
+            m.push_encoded("pth", &buf);
         }
     }
     m.add_u64("td", proof.tree_depth as u64);
@@ -1771,7 +1795,7 @@ pub fn canonical_encode_state_proof_body(sp: &StateProofBody) -> Vec<u8> {
             for pos in positions {
                 write_uint(&mut buf, *pos);
             }
-            m.fields.push(("pr", buf));
+            m.push_encoded("pr", &buf);
         }
     }
     if let Some(ref reveals) = sp.reveals {
@@ -1783,7 +1807,7 @@ pub fn canonical_encode_state_proof_body(sp: &StateProofBody) -> Vec<u8> {
                 let encoded = canonical_encode_reveal(reveal);
                 buf.extend_from_slice(&encoded);
             }
-            m.fields.push(("r", buf));
+            m.push_encoded("r", &buf);
         }
     }
     m.add_u64("v", sp.merkle_signature_salt_version as u64);
@@ -1863,7 +1887,7 @@ pub fn canonical_encode_txtail_round(tail: &TxTailRound) -> Vec<u8> {
         for id in &tail.txn_ids {
             rmp::encode::write_bin(&mut buf, id).unwrap();
         }
-        m.fields.push(("i", buf));
+        m.push_encoded("i", &buf);
     }
 
     // "l" — leases (array of encoded TxTailRoundLease maps)
@@ -1878,7 +1902,7 @@ pub fn canonical_encode_txtail_round(tail: &TxTailRound) -> Vec<u8> {
         for map in &maps {
             buf.extend_from_slice(map);
         }
-        m.fields.push(("l", buf));
+        m.push_encoded("l", &buf);
     }
 
     // "v" — last-valid rounds (array of u64)
@@ -1888,7 +1912,7 @@ pub fn canonical_encode_txtail_round(tail: &TxTailRound) -> Vec<u8> {
         for &v in &tail.last_valid {
             write_uint(&mut buf, v);
         }
-        m.fields.push(("v", buf));
+        m.push_encoded("v", &buf);
     }
 
     m.encode()
