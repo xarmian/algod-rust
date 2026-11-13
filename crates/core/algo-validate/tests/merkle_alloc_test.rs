@@ -99,7 +99,8 @@ fn commitments_do_not_clone_the_transactions() {
     // buffers, the transaction encoded a third time inside the
     // SignedTxnInBlock) and 18.0 for the vector commitment. Now: the field
     // index and arena of each of the three maps, nothing for the output
-    // (reused scratch buffers) and nothing for the clone.
+    // (reused scratch buffers), nothing for the clone and nothing per tree
+    // node: about 6.0 per transaction for both.
     assert!(
         merkle_allocs <= 7 * n,
         "compute_payset_merkle_root made {merkle_allocs} allocations for {n} transactions \
@@ -107,9 +108,9 @@ fn commitments_do_not_clone_the_transactions() {
         merkle_allocs as f64 / n as f64
     );
     assert!(
-        vc_allocs <= 11 * n,
+        vc_allocs <= 7 * n,
         "compute_vector_commitment made {vc_allocs} allocations for {n} transactions \
-         ({:.1} per transaction), want at most 11",
+         ({:.1} per transaction), want at most 7",
         vc_allocs as f64 / n as f64
     );
 
