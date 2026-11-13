@@ -791,6 +791,9 @@ mod tests {
                             rule.restore(&mut inplace);
                             let cow = rule.restored_txn(&stx);
                             assert_eq!(*cow, inplace.txn);
+                            let (gid, ghash) = rule.restored_genesis(&stx);
+                            assert_eq!(gid, inplace.txn.genesis_id);
+                            assert_eq!(*ghash, inplace.txn.genesis_hash);
                             assert_eq!(rule.needs_restore(&stx), inplace != stx);
                             assert_eq!(
                                 matches!(cow, Cow::Borrowed(_)),
