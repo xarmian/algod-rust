@@ -87,14 +87,18 @@ fn compute_stib_hash(stx: &SignedTransaction) -> Hash {
     hash_512_256(STIB_PREFIX, &canonical_encode_signed_txn_in_block(stx))
 }
 
-/// Paysets with fewer transactions than this are hashed on the calling
-/// thread; larger ones spread the leaves over the rayon pool, as go-algorand
-/// spreads them over `runtime.NumCPU()` workers
-/// (`crypto/merklearray/merkle.go` `Build`, `worker.go`).
-const PARALLEL_LEAVES_MIN: usize = 128;
+/// Smallest run of transactions worth handing to another thread: about a
+/// quarter of a millisecond of hashing. Paysets below two such runs are
+/// hashed on the calling thread.
+const LEAF_CHUNK_MIN: usize = 256;
 
-/// Transactions per parallel work item (one pair of scratch buffers each).
-const LEAF_CHUNK: usize = 32;
+/// Upper bound on the parallel work items of one payset. go-algorand spreads
+/// the leaves over `runtime.NumCPU()` workers (`crypto/merklearray/merkle.go`
+/// `Build`, `worker.go`); here the whole layer is about a millisecond of
+/// work for a full block, and measured on a 24-thread host splitting it 33
+/// ways was 2x SLOWER than one thread (waking and stealing dominate), while
+/// 4 ways was 2x faster (issue #2318).
+const LEAF_CHUNKS_MAX: usize = 4;
 
 /// The leaf layer of a payset commitment: `leaf(txn_bytes, stib_bytes)` for
 /// every payset entry, in payset order.
@@ -140,14 +144,16 @@ where
             })
             .collect()
     };
-    if block.payset.len() < PARALLEL_LEAVES_MIN {
+    let n = block.payset.len();
+    if n < 2 * LEAF_CHUNK_MIN {
         return chunk_leaves(0, &block.payset);
     }
+    let chunk_len = n.div_ceil(LEAF_CHUNKS_MAX).max(LEAF_CHUNK_MIN);
     let chunks: Vec<Vec<L>> = block
         .payset
-        .par_chunks(LEAF_CHUNK)
+        .par_chunks(chunk_len)
         .enumerate()
-        .map(|(c, chunk)| chunk_leaves(c * LEAF_CHUNK, chunk))
+        .map(|(c, chunk)| chunk_leaves(c * chunk_len, chunk))
         .collect();
     chunks.into_iter().flatten().collect()
 }
