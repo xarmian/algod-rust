@@ -71,7 +71,6 @@
 //   "sig"   -> Sigs ([2]OneTimeSignature, array, omitemptycheckstruct)
 //   "snd"   -> Sender (bin32)
 
-use std::borrow::Cow;
 use std::io::Cursor;
 
 use algo_codec::canonical_encode_unauthenticated_proposal;
@@ -601,7 +600,7 @@ pub fn decode_compound_message(bytes: &[u8]) -> Result<CompoundMessage, CodecErr
 
     for _ in 0..map_len {
         let key = read_str_key(&mut cursor)?;
-        match key.as_ref() {
+        match key {
             "oper" => original_period = Period(read_uint64(&mut cursor)?),
             "oprop" => original_proposer = Address(read_bin_fixed::<32>(&mut cursor)?),
             "sdpf" => seed_proof = read_bin_fixed::<VRF_PROOF_SIZE>(&mut cursor)?,
@@ -632,20 +631,37 @@ pub fn decode_compound_message(bytes: &[u8]) -> Result<CompoundMessage, CodecErr
 /// The key is borrowed from the input: go's msgp decoders compare the key
 /// bytes in place, and an owned `String` per key made certificate decoding
 /// 2.8x slower than go (issue #2317). Anything that is not a complete, valid
-/// UTF-8 `str` goes through [`read_str_key_slow`], which reports exactly the
-/// errors the decoder always reported.
-fn read_str_key<'a>(cursor: &mut Cursor<&'a [u8]>) -> Result<Cow<'a, str>, CodecError> {
+/// UTF-8 `str` is an error; [`read_str_key_error`] reports exactly the error
+/// the decoder always reported for it.
+#[inline]
+fn read_str_key<'a>(cursor: &mut Cursor<&'a [u8]>) -> Result<&'a str, CodecError> {
     let buf: &'a [u8] = cursor.get_ref();
     let pos = (cursor.position() as usize).min(buf.len());
-    if let Some((key, consumed)) = borrow_str(&buf[pos..]) {
-        cursor.set_position((pos + consumed) as u64);
-        return Ok(Cow::Borrowed(key));
+    match borrow_str(&buf[pos..]) {
+        Some((key, consumed)) => {
+            cursor.set_position((pos + consumed) as u64);
+            Ok(key)
+        }
+        None => Err(read_str_key_error(cursor)),
     }
-    read_str_key_slow(cursor).map(Cow::Owned)
+}
+
+/// The error for a key [`borrow_str`] does not take, from the original key
+/// reader.
+#[cold]
+#[inline(never)]
+fn read_str_key_error(cursor: &mut Cursor<&[u8]>) -> CodecError {
+    match read_str_key_slow(cursor) {
+        Err(e) => e,
+        // Unreachable: the original reader only succeeds on a complete,
+        // valid UTF-8 `str`, which `borrow_str` takes.
+        Ok(key) => CodecError::Format(format!("unexpected key {key:?}")),
+    }
 }
 
 /// The msgpack `str` at the start of `buf` and its encoded length, when it is
 /// complete and valid UTF-8.
+#[inline]
 fn borrow_str(buf: &[u8]) -> Option<(&str, usize)> {
     let (header, len): (usize, usize) = match *buf.first()? {
         m @ 0xa0..=0xbf => (1, (m & 0x1f) as usize),
@@ -839,7 +855,29 @@ fn read_uint64(cursor: &mut Cursor<&[u8]>) -> Result<u64, CodecError> {
 /// (`msgp.ReadExactBytes`, issue #2063): accepts `bin`, `str`, `nil` (zeroed)
 /// and an array of uint8, and copies `min(encoded, N)` bytes without a length
 /// check. See `docs/BYTES_DECODE_PARITY.md`.
+#[inline]
 fn read_bin_fixed<const N: usize>(cursor: &mut Cursor<&[u8]>) -> Result<[u8; N], CodecError> {
+    let buf: &[u8] = cursor.get_ref();
+    let pos = (cursor.position() as usize).min(buf.len());
+    // What go's encoder writes for a `[N]byte`: `bin8` of exactly N bytes.
+    // Every other accepted shape takes the general reader below.
+    if N <= u8::MAX as usize {
+        if let Some(body) = buf.get(pos + 2..pos + 2 + N) {
+            if buf[pos] == 0xc4 && buf[pos + 1] as usize == N {
+                let mut arr = [0u8; N];
+                arr.copy_from_slice(body);
+                cursor.set_position((pos + 2 + N) as u64);
+                return Ok(arr);
+            }
+        }
+    }
+    read_bin_fixed_general(cursor)
+}
+
+/// [`read_bin_fixed`] for every shape go accepts (`msgp.ReadExactBytes`).
+fn read_bin_fixed_general<const N: usize>(
+    cursor: &mut Cursor<&[u8]>,
+) -> Result<[u8; N], CodecError> {
     let buf: &[u8] = cursor.get_ref();
     let pos = (cursor.position() as usize).min(buf.len());
     let mut rd = &buf[pos..];
@@ -869,7 +907,7 @@ fn decode_proposal_value(cursor: &mut Cursor<&[u8]>) -> Result<ProposalValue, Co
     let mut pv = BOTTOM;
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_ref() {
+        match key {
             "dig" => pv.block_digest = Digest(read_bin_fixed::<32>(cursor)?),
             "encdig" => pv.encoding_digest = Digest(read_bin_fixed::<32>(cursor)?),
             "oper" => pv.original_period = Period(read_uint64(cursor)?),
@@ -899,7 +937,7 @@ fn decode_raw_vote(cursor: &mut Cursor<&[u8]>) -> Result<RawVote, CodecError> {
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_ref() {
+        match key {
             "per" => rv.period = Period(read_uint64(cursor)?),
             "prop" => rv.proposal = decode_proposal_value(cursor)?,
             "rnd" => rv.round = Round(read_uint64(cursor)?),
@@ -925,7 +963,7 @@ fn decode_unauthenticated_credential(
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_ref() {
+        match key {
             "pf" => proof = read_bin_fixed::<VRF_PROOF_SIZE>(cursor)?,
             _ => {
                 skip_value(cursor)?;
@@ -952,7 +990,7 @@ fn decode_one_time_signature(cursor: &mut Cursor<&[u8]>) -> Result<OneTimeSignat
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_ref() {
+        match key {
             "p" => sig.pk = read_bin_fixed::<32>(cursor)?,
             "p1s" => sig.pk1_sig = read_bin_fixed::<64>(cursor)?,
             "p2" => sig.pk2 = read_bin_fixed::<32>(cursor)?,
@@ -983,7 +1021,7 @@ fn decode_vote_from_cursor(cursor: &mut Cursor<&[u8]>) -> Result<Unauthenticated
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_ref() {
+        match key {
             "cred" => vote.cred = decode_unauthenticated_credential(cursor)?,
             "r" => vote.raw_vote = decode_raw_vote(cursor)?,
             "sig" => vote.sig = decode_one_time_signature(cursor)?,
@@ -1014,7 +1052,7 @@ fn decode_vote_authenticator(cursor: &mut Cursor<&[u8]>) -> Result<VoteAuthentic
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_ref() {
+        match key {
             "cred" => cred = decode_unauthenticated_credential(cursor)?,
             "sig" => sig = decode_one_time_signature(cursor)?,
             "snd" => sender = Address(read_bin_fixed::<32>(cursor)?),
@@ -1058,7 +1096,7 @@ fn decode_equivocation_vote_authenticator(
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_ref() {
+        match key {
             "cred" => cred = decode_unauthenticated_credential(cursor)?,
             "props" => {
                 let arr_len = rmp::decode::read_array_len(cursor)
@@ -1110,7 +1148,7 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<UnauthenticatedBundle, CodecError> 
 
     for _ in 0..map_len {
         let key = read_str_key(&mut cursor)?;
-        match key.as_ref() {
+        match key {
             "eqv" => {
                 let arr_len = rmp::decode::read_array_len(&mut cursor)
                     .map_err(|e| CodecError::Decode(format!("eqv array: {e}")))?;
@@ -1262,7 +1300,7 @@ fn decode_hashable_credential_from_cursor(
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_ref() {
+        match key {
             "i" => hc.iter = read_uint64(cursor)?,
             "m" => hc.member = Address(read_bin_fixed::<32>(cursor)?),
             "v" => hc.raw_out = read_bin_fixed::<VRF_OUTPUT_SIZE>(cursor)?,
@@ -1350,7 +1388,7 @@ fn decode_credential_from_cursor(cursor: &mut Cursor<&[u8]>) -> Result<Credentia
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_ref() {
+        match key {
             "ds" => cred.domain_separation_enabled = read_bool(cursor)?,
             "h" => cred.vrf_out = Digest(read_bin_fixed::<32>(cursor)?),
             "hc" => cred.hashable = decode_hashable_credential_from_cursor(cursor)?,
@@ -1428,7 +1466,7 @@ fn decode_authenticated_vote_from_cursor(cursor: &mut Cursor<&[u8]>) -> Result<V
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_ref() {
+        match key {
             "cred" => vote.cred = decode_credential_from_cursor(cursor)?,
             "r" => vote.raw_vote = decode_raw_vote(cursor)?,
             "sig" => vote.sig = decode_one_time_signature(cursor)?,
@@ -1556,7 +1594,7 @@ fn decode_equivocation_vote_from_cursor(
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_ref() {
+        match key {
             "cred" => ev.cred = decode_credential_from_cursor(cursor)?,
             "per" => ev.period = Period(read_uint64(cursor)?),
             "props" => {
@@ -1682,7 +1720,7 @@ pub fn decode_authenticated_bundle(bytes: &[u8]) -> Result<AuthenticatedBundle, 
 
     for _ in 0..map_len {
         let key = read_str_key(&mut cursor)?;
-        match key.as_ref() {
+        match key {
             "eqv" => {
                 let arr_len = rmp::decode::read_array_len(&mut cursor)
                     .map_err(|e| CodecError::Decode(format!("eqv array: {e}")))?;
@@ -1742,7 +1780,7 @@ fn decode_unauthenticated_bundle_from_cursor(
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_ref() {
+        match key {
             "eqv" => {
                 let arr_len = rmp::decode::read_array_len(cursor)
                     .map_err(|e| CodecError::Decode(format!("eqv array: {e}")))?;
@@ -1840,7 +1878,7 @@ pub fn decode_unauthenticated_proposal(
 
     for _ in 0..map_len {
         let key = read_str_key(&mut cursor)?;
-        match key.as_ref() {
+        match key {
             "oper" => original_period = Period(read_uint64(&mut cursor)?),
             "oprop" => original_proposer = Address(read_bin_fixed::<32>(&mut cursor)?),
             "sdpf" => seed_proof = read_bin_fixed::<VRF_PROOF_SIZE>(&mut cursor)?,
@@ -2787,9 +2825,8 @@ mod skip_tests {
         let got = read_str_key(&mut cursor);
         match (&got, &slow) {
             (Ok(a), Ok(b)) => {
-                assert_eq!(a.as_ref(), b.as_str());
+                assert_eq!(*a, b.as_str());
                 assert_eq!(cursor.position(), slow_cursor.position());
-                assert!(matches!(a, Cow::Borrowed(_)), "a valid key is borrowed");
             }
             (Err(a), Err(b)) => {
                 assert_eq!(format!("{a:?}"), format!("{b:?}"), "error for {buf:02x?}");
@@ -2865,6 +2902,45 @@ mod skip_tests {
         buf.push(0x01);
         assert_eq!(fast_skip_len(&buf), Some(buf.len()));
         check_skip(&buf);
+    }
+
+    #[test]
+    fn fixed_bytes_fast_path_agrees_with_the_general_reader() {
+        fn check(buf: &[u8]) {
+            let mut fast = Cursor::new(buf);
+            let mut general = Cursor::new(buf);
+            let a = read_bin_fixed::<4>(&mut fast);
+            let b = read_bin_fixed_general::<4>(&mut general);
+            assert_eq!(format!("{a:?}"), format!("{b:?}"), "value for {buf:02x?}");
+            if a.is_ok() {
+                assert_eq!(fast.position(), general.position(), "length for {buf:02x?}");
+            }
+        }
+        // bin8 of exactly, fewer and more than N bytes; truncated; str; nil.
+        let cases: &[&[u8]] = &[
+            &[0xc4, 4, 1, 2, 3, 4],
+            &[0xc4, 4, 1, 2, 3, 4, 9],
+            &[0xc4, 4, 1, 2, 3],
+            &[0xc4, 3, 1, 2, 3],
+            &[0xc4, 5, 1, 2, 3, 4, 5],
+            &[0xc4],
+            &[0xa4, 1, 2, 3, 4],
+            &[0xc0],
+            &[0x94, 1, 2, 3, 4],
+            &[],
+        ];
+        for c in cases {
+            check(c);
+        }
+        let mut rng = Rng(0x2317_0000_0000_0004);
+        for _ in 0..100_000 {
+            let mut buf = random_buf(&mut rng);
+            if rng.below(2) == 0 && buf.len() >= 2 {
+                buf[0] = 0xc4;
+                buf[1] = rng.below(7) as u8;
+            }
+            check(&buf);
+        }
     }
 
     #[test]
