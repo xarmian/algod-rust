@@ -127,6 +127,14 @@ pub trait CatchupLedger: Send + Sync {
         false
     }
 
+    /// The pass is (`true`) or is no longer (`false`) applying many blocks in
+    /// a row, far from the network tip. A ledger backed by SQLite uses it to
+    /// run its tracker at `synchronous=NORMAL` for the duration (DIV-011,
+    /// issue #2315). Called with `true` after `CatchupService::BULK_APPLY_AFTER`
+    /// consecutive applied blocks of one pass, and with `false` when the pass
+    /// ends however it ends. The default does nothing.
+    fn set_bulk_apply(&self, _bulk: bool) {}
+
     /// Authenticate a block fetched by the *periodic* catchup path against
     /// the certificate the serving peer supplied.
     ///
@@ -241,6 +249,29 @@ pub trait BlockFetcher: Send + Sync {
 /// 2. The worker loops, selecting on the certificate channel and a shutdown
 ///    signal.
 /// 3. Call [`CatchupService::stop`] to signal shutdown and join the thread.
+/// Leaves bulk-apply mode ([`CatchupLedger::set_bulk_apply`]) when dropped.
+struct BulkApplyGuard<'a> {
+    ledger: &'a dyn CatchupLedger,
+    on: bool,
+}
+
+impl BulkApplyGuard<'_> {
+    fn enable(&mut self) {
+        if !self.on {
+            self.on = true;
+            self.ledger.set_bulk_apply(true);
+        }
+    }
+}
+
+impl Drop for BulkApplyGuard<'_> {
+    fn drop(&mut self) {
+        if self.on {
+            self.ledger.set_bulk_apply(false);
+        }
+    }
+}
+
 pub struct CatchupService {
     /// Shutdown signal sender for the periodic-sync worker thread —
     /// dropping or sending signals it to exit.
@@ -1180,6 +1211,11 @@ impl CatchupService {
         exit_reason
     }
 
+    /// Blocks a pass must have applied in a row before it counts as a bulk
+    /// apply ([`CatchupLedger::set_bulk_apply`]): a pass at the network tip
+    /// applies one or two, a replay or a catchup thousands.
+    const BULK_APPLY_AFTER: u64 = 8;
+
     /// Public, directly-callable range-sync entry point mirroring go's
     /// `Service.sync()` (`catchup/service.go`) as exercised by
     /// `TestServiceFetchBlocksSameRange`: fetch and commit whatever
@@ -1398,6 +1434,12 @@ impl CatchupService {
         let next_to_fetch = Arc::new(AtomicU64::new(start_round.0));
         let stop = Arc::new(AtomicBool::new(false));
         let ctx = Arc::new(PassCtx::new(policy));
+        // Whatever ends the pass (a panic in the apply loop included), the
+        // ledger leaves bulk-apply mode.
+        let mut bulk = BulkApplyGuard {
+            ledger: ledger.as_ref(),
+            on: false,
+        };
         // go's `pipelinedFetch` is a sliding window: it only issues a fetch
         // for rounds `firstRound .. firstRound+limitedParallelRequests`, and
         // the window moves up by one each time the first round is written.
@@ -1772,6 +1814,9 @@ impl CatchupService {
                             );
                         }
                         fetched += 1;
+                        if fetched == Self::BULK_APPLY_AFTER {
+                            bulk.enable();
+                        }
                         timing_blocks += 1;
                         if last_timing_log.elapsed() >= Duration::from_secs(30) {
                             info!(
@@ -4106,6 +4151,69 @@ mod tests {
             "one pass must keep going until the peer has nothing more"
         );
         assert_eq!(exit, SyncExitReason::NoBlock);
+    }
+
+    /// Records the bulk-apply calls of a pass.
+    struct BulkRecordingLedger {
+        inner: PermissiveCatchupLedger,
+        calls: Mutex<Vec<(bool, Round)>>,
+    }
+
+    impl CatchupLedger for BulkRecordingLedger {
+        fn next_round(&self) -> Round {
+            self.inner.next_round()
+        }
+        fn ensure_block(&self, block: &Block, cert: &Certificate) {
+            self.inner.ensure_block(block, cert)
+        }
+        fn authenticate_block(&self, _block: &Block, _cert: &Certificate) -> Result<(), String> {
+            Ok(())
+        }
+        fn set_bulk_apply(&self, bulk: bool) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((bulk, self.inner.next_round()));
+        }
+    }
+
+    fn bulk_calls_of_a_pass(up_to: u64) -> Vec<(bool, Round)> {
+        let ledger = Arc::new(BulkRecordingLedger {
+            inner: PermissiveCatchupLedger {
+                inner: MockCatchupLedger::new(Round(0)),
+            },
+            calls: Mutex::new(Vec::new()),
+        });
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher: Arc<dyn BlockFetcher> = Arc::new(BoundedBlockFetcher {
+            up_to,
+            calls: AtomicU64::new(0),
+        });
+        let shutdown_rx = never_shutdown();
+        CatchupService::sync_range(&ledger_dyn, &fetcher, &shutdown_rx, 4);
+        assert_eq!(ledger.next_round(), Round(up_to + 1));
+        let calls = ledger.calls.lock().unwrap().clone();
+        calls
+    }
+
+    /// DIV-011: a pass that applies many blocks in a row turns bulk apply on
+    /// once, after `BULK_APPLY_AFTER` blocks, and off when it ends.
+    #[test]
+    fn a_long_pass_turns_bulk_apply_on_after_eight_blocks_and_off_at_the_end() {
+        let calls = bulk_calls_of_a_pass(40);
+        assert_eq!(
+            calls,
+            vec![(true, Round(9)), (false, Round(41))],
+            "on after the 8th applied block, off once the pass is over"
+        );
+    }
+
+    /// A pass at the tip (a few blocks) never leaves the configured
+    /// durability.
+    #[test]
+    fn a_short_pass_never_turns_bulk_apply_on() {
+        assert!(bulk_calls_of_a_pass(7).is_empty());
+        assert!(bulk_calls_of_a_pass(1).is_empty());
     }
 
     /// Records, at the start of each fetch, how far ahead of the ledger's

@@ -2485,6 +2485,11 @@ pub struct SqliteLedger {
     /// Current `synchronous` level (shared by the main connection, both
     /// schemas, and the archive writer).
     synchronous_mode: std::sync::atomic::AtomicI64,
+    /// DIVERGENCE DIV-011: a catchup pass is applying many blocks in a row, so
+    /// the tracker connection runs at `NORMAL` instead of the configured
+    /// `FULL` (see [`SqliteLedger::set_bulk_apply`]). The archive writer is not
+    /// affected.
+    bulk_apply: std::sync::atomic::AtomicBool,
     /// DIVERGENCE DIV-009: the rounds of blocks whose archive rows are
     /// committed but whose tracker transaction is not yet. The read pool
     /// treats such rows as not yet visible.
@@ -3392,6 +3397,7 @@ impl SqliteLedger {
             archive_writer_sync: DEFAULT_LEDGER_SYNCHRONOUS_MODE,
             block_wal_limit: DEFAULT_BLOCK_WAL_SIZE_LIMIT,
             synchronous_mode: std::sync::atomic::AtomicI64::new(DEFAULT_LEDGER_SYNCHRONOUS_MODE),
+            bulk_apply: std::sync::atomic::AtomicBool::new(false),
             archive_inflight: std::sync::Arc::new(crate::read_pool::ArchiveInflight::default()),
             block_path: None,
             archive_created: Vec::new(),
@@ -4180,7 +4186,87 @@ impl SqliteLedger {
             ))
             .map_err(|e| AlgoError::Ledger {
                 message: format!("set synchronous mode error: {e}"),
+            })?;
+        self.apply_tracker_synchronous()
+    }
+
+    /// The `synchronous` level the tracker connection should run at: the
+    /// configured one, except `NORMAL` while [`SqliteLedger::set_bulk_apply`]
+    /// is on and the configured level is `FULL` or `EXTRA`.
+    fn effective_tracker_synchronous(&self) -> i64 {
+        let configured = self
+            .synchronous_mode
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if self.bulk_apply.load(std::sync::atomic::Ordering::SeqCst) && configured >= 2 {
+            1
+        } else {
+            configured
+        }
+    }
+
+    /// Apply [`Self::effective_tracker_synchronous`] to the tracker schema. A
+    /// no-op inside a block span (SQLite ignores the pragma in a transaction;
+    /// the next call outside one applies it).
+    fn apply_tracker_synchronous(&self) -> Result<(), AlgoError> {
+        if self.in_block {
+            return Ok(());
+        }
+        self.conn
+            .execute_batch(&format!(
+                "PRAGMA main.synchronous={};",
+                self.effective_tracker_synchronous()
+            ))
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("set tracker synchronous mode error: {e}"),
             })
+    }
+
+    /// DIVERGENCE DIV-011: tell the ledger that a catchup pass is (`true`) or is
+    /// no longer (`false`) applying many blocks in a row.
+    ///
+    /// While on, and when the configured `LedgerSynchronousMode` is `FULL` or
+    /// `EXTRA`, the TRACKER connection runs at `NORMAL`: in WAL mode a commit no
+    /// longer `fsync`s. The block archive keeps the configured level, and
+    /// `commit_block` still makes the archive rows of a block durable BEFORE it
+    /// issues the tracker `COMMIT` (DIV-009), so a power loss can only lose a
+    /// suffix of tracker commits: tracker <= archive, the state a crash between
+    /// the two commits already produced and `reconcile_cross_file` classifies as
+    /// consistent. A process crash loses nothing in either mode. Turning it off
+    /// restores the configured level and runs a `PASSIVE` checkpoint, which
+    /// `fsync`s the WAL, so everything committed in bulk mode is durable from
+    /// then on.
+    ///
+    /// Call it outside a block span; inside one it only records the flag.
+    pub fn set_bulk_apply(&self, bulk: bool) -> Result<(), AlgoError> {
+        let was = self
+            .bulk_apply
+            .swap(bulk, std::sync::atomic::Ordering::SeqCst);
+        if was == bulk {
+            return Ok(());
+        }
+        self.apply_tracker_synchronous()?;
+        if was && !bulk && !self.in_block {
+            // Best effort: a reader may hold the WAL; the next checkpoint
+            // (SQLite's own auto-checkpoint included) makes it durable anyway.
+            let _ = self.conn.query_row("PRAGMA main.wal_checkpoint(PASSIVE)", [], |_| Ok(()));
+        }
+        Ok(())
+    }
+
+    /// The `synchronous` level the tracker connection currently runs at
+    /// (`0` OFF, `1` NORMAL, `2` FULL, `3` EXTRA).
+    pub fn tracker_synchronous_mode(&self) -> Result<i64, AlgoError> {
+        self.conn
+            .query_row("PRAGMA main.synchronous", [], |r| r.get(0))
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("read tracker synchronous mode error: {e}"),
+            })
+    }
+
+    /// The `synchronous` level the block archive is written at.
+    pub fn archive_synchronous_mode(&self) -> i64 {
+        self.synchronous_mode
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Run SQLite `VACUUM` on the tracker (accounts) schema — go's
@@ -18751,6 +18837,7 @@ mod tests {
             archive_writer_sync: _,         // connection setting
             block_wal_limit: _,             // connection setting
             synchronous_mode: _,            // connection setting
+            bulk_apply: _,                  // connection setting
             archive_inflight: _,            // read-pool visibility flag
             block_path: _,                  // attached file
             archive_created: _,             // reconciled by abort_block_state
