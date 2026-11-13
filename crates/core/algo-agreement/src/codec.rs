@@ -2822,11 +2822,20 @@ mod skip_tests {
             (Some(n), None) => panic!("fast skip took {n} bytes of {buf:02x?}, rmpv rejects it"),
             // The fast path only declines a value rmpv accepts when it is
             // nested too deep or holds the reserved marker 0xc1 (which rmpv
-            // reads as nil): both are left to rmpv.
-            (None, Some((v, consumed))) => assert!(
-                container_depth(&v) > FAST_SKIP_MAX_DEPTH || buf[..consumed].contains(&0xc1),
-                "fast skip refused {buf:02x?}, which rmpv accepts"
-            ),
+            // reads as nil): both are left to rmpv. A 0xc1 in marker position
+            // is told from one inside a payload by turning every 0xc1 into
+            // nil: only the former makes the fast path take the value.
+            (None, Some((v, consumed))) => {
+                let as_nil: Vec<u8> = buf
+                    .iter()
+                    .map(|&b| if b == 0xc1 { 0xc0 } else { b })
+                    .collect();
+                assert!(
+                    container_depth(&v) > FAST_SKIP_MAX_DEPTH
+                        || fast_skip_len(&as_nil) == Some(consumed),
+                    "fast skip refused {buf:02x?}, which rmpv accepts"
+                );
+            }
             (None, None) => {}
         }
         // `skip_value` always agrees with rmpv, whichever path it took.
