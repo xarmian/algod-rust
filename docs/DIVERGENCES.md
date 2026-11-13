@@ -225,7 +225,22 @@ fixed-size byte value shorter than the array keeps the earlier tail.
 struct readers accept the map form (and nil, as go does, since #2065) but not
 the array form, and a repeated key replaces the field (nested struct /
 fixed-size array zero-filled) instead of merging. The derived-serde path used
-for catchup `decode_block*` and transaction-sync responses behaves likewise.
+for catchup `decode_block_response` and transaction-sync responses behaves likewise.
+Since #2319 `decode_block` (catchup, archive replay, apply, gossip block source)
+uses the hand-written reader too (behind the same depth pre-scan); its old
+serde path is `decode_block_serde`, the reference of
+`crates/core/algo-codec/tests/decode_block_differential_test.rs`. Over 88k
+mutated blocks the two differ only in six classes, and in each the hand reader
+is the side that matches go: a non-UTF-8 `str` key in `state_proof_tracking` is
+kept as a `str` (serde turned it into `bin`, which changes the header's
+canonical re-encode and so the block hash); an integer where a map key belongs
+is rejected (serde used it as a field index; go's `ReadMapKeyZC` rejects it); a
+nil integer, boolean or struct decodes to zero (serde errors; go decodes zero);
+a `[N]byte` of another length follows `ReadExactBytes` (serde is strict); a
+struct sent as an array and a transaction without `type` are rejected at decode
+(serde accepts; go decodes them, the latter failing later in `WellFormed`: both
+only for non-canonical input no node emits, and never for a block whose digest
+a certificate authenticates).
 
 **What is identical.** All canonical input (go's encoder always writes a
 map with unique keys), nil -> zero for integers/bools/map headers, every
