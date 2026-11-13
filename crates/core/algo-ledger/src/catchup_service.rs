@@ -253,6 +253,16 @@ impl BulkApplyGuard<'_> {
             self.ledger.set_bulk_apply(true);
         }
     }
+
+    /// Leave the mode now (the pass reached the network tip) instead of at
+    /// the end of the pass. `enable` is only ever called once per pass, so it
+    /// is not re-entered afterwards.
+    fn disable(&mut self) {
+        if self.on {
+            self.on = false;
+            self.ledger.set_bulk_apply(false);
+        }
+    }
 }
 
 impl Drop for BulkApplyGuard<'_> {
@@ -1806,6 +1816,12 @@ impl CatchupService {
                             }
                         }
 
+                        // A worker has been told "no such block": the pass is at
+                        // the tip, where each block commits at the configured
+                        // durability again.
+                        if ctx.tip_seen.load(Ordering::SeqCst) {
+                            bulk.disable();
+                        }
                         let step_started = std::time::Instant::now();
                         ledger.ensure_block(&block, &cert);
                         t_ensure += step_started.elapsed();
@@ -4200,15 +4216,16 @@ mod tests {
     }
 
     /// DIV-011: a pass that applies many blocks in a row turns bulk apply on
-    /// once, after `BULK_APPLY_AFTER` blocks, and off when it ends.
+    /// once, after `BULK_APPLY_AFTER` blocks, and off when it ends or reaches
+    /// the tip.
     #[test]
     fn a_long_pass_turns_bulk_apply_on_after_eight_blocks_and_off_at_the_end() {
         let calls = bulk_calls_of_a_pass(40);
-        assert_eq!(
-            calls,
-            vec![(true, Round(9)), (false, Round(41))],
-            "on after the 8th applied block, off once the pass is over"
-        );
+        // On after the 8th applied block; off at the latest when the pass is
+        // over, earlier once a worker has seen the tip. Exactly one of each.
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0], (true, Round(9)));
+        assert!(!calls[1].0 && calls[1].1 > Round(9), "{calls:?}");
     }
 
     /// A pass at the tip (a few blocks) never leaves the configured
