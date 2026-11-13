@@ -237,19 +237,10 @@ pub trait BlockFetcher: Send + Sync {
 // CatchupService
 // ---------------------------------------------------------------------------
 
-/// Service that fetches missing blocks identified by agreement certificates.
+/// DIVERGENCE DIV-011: leaves bulk-apply mode (tracker back at the configured
+/// `synchronous` level) when dropped.
 ///
-/// Mirrors Go's `catchup.Service`, specifically the `periodicSync` select
-/// branch that receives from `unmatchedPendingCertificates` and calls
-/// `syncCert` / `fetchRound`.
-///
-/// # Lifecycle
-///
-/// 1. Call [`CatchupService::start`] to spawn the background worker thread.
-/// 2. The worker loops, selecting on the certificate channel and a shutdown
-///    signal.
-/// 3. Call [`CatchupService::stop`] to signal shutdown and join the thread.
-/// Leaves bulk-apply mode ([`CatchupLedger::set_bulk_apply`]) when dropped.
+/// See [`CatchupLedger::set_bulk_apply`].
 struct BulkApplyGuard<'a> {
     ledger: &'a dyn CatchupLedger,
     on: bool,
@@ -272,6 +263,18 @@ impl Drop for BulkApplyGuard<'_> {
     }
 }
 
+/// Service that fetches missing blocks identified by agreement certificates.
+///
+/// Mirrors Go's `catchup.Service`, specifically the `periodicSync` select
+/// branch that receives from `unmatchedPendingCertificates` and calls
+/// `syncCert` / `fetchRound`.
+///
+/// # Lifecycle
+///
+/// 1. Call [`CatchupService::start`] to spawn the background worker thread.
+/// 2. The worker loops, selecting on the certificate channel and a shutdown
+///    signal.
+/// 3. Call [`CatchupService::stop`] to signal shutdown and join the thread.
 pub struct CatchupService {
     /// Shutdown signal sender for the periodic-sync worker thread —
     /// dropping or sending signals it to exit.
