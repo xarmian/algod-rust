@@ -35,6 +35,10 @@
 //! | D transaction without `type` | accepts | rejects at decode | decodes, fails later |
 //! | E nil where an integer, boolean or struct belongs | rejects ("unit value") | zero value | zero value (DIV-004, #2065) |
 //! | F `[N]byte` field of another length | rejects ("expected N bytes") | `ReadExactBytes`: copies `min(len, N)` bytes | same (`docs/BYTES_DECODE_PARITY.md`) |
+//! | G a repeated key | rejects (`duplicate field`) | last value wins (DIV-004) | decodes into the populated field |
+//!
+//! G cannot arise from the single-byte substitutions below and is pinned by
+//! `a_repeated_key_is_accepted_by_the_hand_reader_only`.
 
 use algo_codec::{decode_block, decode_block_serde};
 use algo_types::Block;
@@ -64,7 +68,10 @@ fn fixtures() -> Vec<(String, Vec<u8>)> {
         current_protocol: "future".into(),
         ..Block::default()
     };
-    out.push(("round-0 block".into(), algo_codec::canonical_encode_block(&genesis)));
+    out.push((
+        "round-0 block".into(),
+        algo_codec::canonical_encode_block(&genesis),
+    ));
     out
 }
 
@@ -93,7 +100,10 @@ fn compare(label: &str, bytes: &[u8], at: usize, t: &mut Tally) {
             let (mut a, mut b) = (a.clone(), b.clone());
             a.state_proof_tracking = None;
             b.state_proof_tracking = None;
-            assert_eq!(a, b, "{label}: both decode, to blocks that differ outside class A");
+            assert_eq!(
+                a, b,
+                "{label}: both decode, to blocks that differ outside class A"
+            );
             t.class_a += 1;
         }
         (Err(_), Err(_)) => t.both_err += 1,
@@ -106,7 +116,9 @@ fn compare(label: &str, bytes: &[u8], at: usize, t: &mut Tally) {
             } else if msg.contains("missing required field 'type'") {
                 t.class_d += 1;
             } else {
-                panic!("{label}: serde accepts, the hand reader rejects, outside the classes: {msg}");
+                panic!(
+                    "{label}: serde accepts, the hand reader rejects, outside the classes: {msg}"
+                );
             }
         }
         (Err(e), Ok(_)) => {
@@ -140,7 +152,10 @@ fn both_decoders_agree_exactly_on_every_canonical_block() {
 fn both_decoders_reject_every_truncation_of_small_blocks() {
     for (name, bytes) in fixtures().into_iter().filter(|(_, b)| b.len() < 4000) {
         for cut in 0..bytes.len() {
-            let (s, h) = (decode_block_serde(&bytes[..cut]), decode_block(&bytes[..cut]));
+            let (s, h) = (
+                decode_block_serde(&bytes[..cut]),
+                decode_block(&bytes[..cut]),
+            );
             assert_eq!(
                 s.is_ok(),
                 h.is_ok(),
@@ -220,7 +235,10 @@ fn sampled_mutations_of_the_large_block_differ_only_in_the_documented_classes() 
     }
     for _ in 0..200 {
         let cut = (next() % bytes.len() as u64) as usize;
-        assert!(decode_block_serde(&bytes[..cut]).is_err(), "{name} cut {cut}");
+        assert!(
+            decode_block_serde(&bytes[..cut]).is_err(),
+            "{name} cut {cut}"
+        );
         assert!(decode_block(&bytes[..cut]).is_err(), "{name} cut {cut}");
     }
     eprintln!("{t:?}");
@@ -241,5 +259,71 @@ fn the_depth_bound_is_unchanged() {
             decode_block(&m).is_ok(),
             "depth {depth}"
         );
+    }
+}
+
+/// Class G.
+#[test]
+fn a_repeated_key_is_accepted_by_the_hand_reader_only() {
+    // {"rnd": 1, "rnd": 2}
+    let dup = [
+        0x82, 0xa3, b'r', b'n', b'd', 0x01, 0xa3, b'r', b'n', b'd', 0x02,
+    ];
+    assert!(decode_block_serde(&dup).is_err());
+    assert_eq!(decode_block(&dup).unwrap().round, algo_types::Round(2));
+}
+
+/// Every block of the committed real-chain corpora and every go-captured block
+/// with a state proof: both decoders give the same block, and it re-encodes to
+/// the same bytes (for the go-captured blocks, to go's own bytes).
+#[test]
+fn real_chain_blocks_decode_identically() {
+    let root = format!("{}/../../..", env!("CARGO_MANIFEST_DIR"));
+    let mut blocks: Vec<(String, Vec<u8>)> = Vec::new();
+    // `blocks.bin`: `ACRPBLK1`, then per round u64 round, u32 length and the
+    // `/v2/blocks/{round}?format=msgpack` body, whose `block` key is the block.
+    for dir in ["small", "testnet-prefix50"] {
+        let path = format!("{root}/benchmarks/corpus/{dir}/blocks.bin");
+        let bytes = read(&path);
+        let mut rest = bytes.strip_prefix(b"ACRPBLK1".as_slice()).expect("magic");
+        while !rest.is_empty() {
+            let len = u32::from_be_bytes(rest[8..12].try_into().unwrap()) as usize;
+            let mut payload = &rest[12..12 + len];
+            rest = &rest[12 + len..];
+            let v = rmpv::decode::read_value(&mut payload).unwrap();
+            let block = &v
+                .as_map()
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k.as_str() == Some("block"))
+                .expect("block key")
+                .1;
+            let mut buf = Vec::new();
+            rmpv::encode::write_value(&mut buf, block).unwrap();
+            blocks.push((format!("{dir} #{}", blocks.len()), buf));
+        }
+    }
+    let stpf = format!("{root}/crates/core/algo-ledger/tests/fixtures/stateproof");
+    for name in [
+        "block_256_voters.bin",
+        "block_660_prev.bin",
+        "block_661_stpf.bin",
+    ] {
+        blocks.push((name.to_string(), read(&format!("{stpf}/{name}"))));
+    }
+    assert!(blocks.len() > 2_000, "{} blocks", blocks.len());
+    for (name, bytes) in &blocks {
+        let serde = decode_block_serde(bytes).unwrap_or_else(|e| panic!("{name}: serde: {e}"));
+        let hand = decode_block(bytes).unwrap_or_else(|e| panic!("{name}: hand: {e}"));
+        assert_eq!(serde, hand, "{name}");
+        let reencoded = algo_codec::canonical_encode_block(&hand);
+        assert_eq!(
+            reencoded,
+            algo_codec::canonical_encode_block(&serde),
+            "{name}"
+        );
+        if name.starts_with("block_") {
+            assert_eq!(&reencoded, bytes, "{name}: not go's bytes");
+        }
     }
 }
