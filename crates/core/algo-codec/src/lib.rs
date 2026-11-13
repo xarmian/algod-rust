@@ -131,7 +131,26 @@ pub fn decode_block_response(bytes: &[u8]) -> Result<BlockResponse> {
 }
 
 /// Decode a raw block from msgpack bytes.
+///
+/// Uses the hand-written reader ([`Block::decode_from_bytes`]) behind the same
+/// depth pre-scan the serde path had, so a hostile nesting is refused with the
+/// same bound (issue #2319). The reader is about 1.5x faster than the derived
+/// serde decoder and, on every non-canonical input the two treat differently,
+/// the one that matches go-algorand's msgp decoder: it keeps a non-UTF-8 `str`
+/// as a `str` (serde turned it into a `bin`, which changes the header's
+/// canonical re-encode and so the block hash), refuses an integer where a map
+/// key belongs (serde used it as a field index), and decodes a nil struct as go
+/// does. `tests/decode_block_differential_test.rs` pins every class of
+/// difference; DIV-004 lists them. [`decode_block_serde`] is the old path.
 pub fn decode_block(bytes: &[u8]) -> Result<Block> {
+    check_msgpack_depth(bytes)?;
+    Block::decode_from_bytes(bytes)
+}
+
+/// The derived-serde block decoder `decode_block` used before issue #2319, kept
+/// as the reference of the differential tests and benchmarks. Do not use it
+/// for new code: see [`decode_block`].
+pub fn decode_block_serde(bytes: &[u8]) -> Result<Block> {
     check_msgpack_depth(bytes)?;
     rmp_serde::from_slice(bytes).map_err(|e| AlgoError::Codec {
         source: Box::new(e),
