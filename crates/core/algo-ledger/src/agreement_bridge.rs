@@ -1217,6 +1217,20 @@ impl crate::catchup_service::CatchupLedger for AgreementLedgerBridge {
         <Self as LedgerWriter>::ensure_block(self, block, cert);
     }
 
+    fn set_bulk_apply(&self, bulk: bool) {
+        // DIVERGENCE DIV-011: tracker at `NORMAL` while a pass applies many
+        // blocks in a row. Taken between two `ensure_block` calls of the
+        // catchup apply loop, so no block span is open on this ledger.
+        match self.ledger.lock() {
+            Ok(ledger) => {
+                if let Err(e) = ledger.set_bulk_apply(bulk) {
+                    warn!(bulk, "set_bulk_apply failed: {e}");
+                }
+            }
+            Err(e) => warn!("ledger lock poisoned in set_bulk_apply: {e}"),
+        }
+    }
+
     fn authenticate_block(
         &self,
         block: &algo_types::Block,

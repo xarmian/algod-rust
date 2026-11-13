@@ -408,6 +408,9 @@ impl CatchupLedger for CorpusCatchupLedger {
     fn is_behind_committing_deltas(&self) -> bool {
         self.inner.is_behind_committing_deltas()
     }
+    fn set_bulk_apply(&self, bulk: bool) {
+        self.inner.set_bulk_apply(bulk)
+    }
     fn authenticate_block(&self, block: &Block, cert: &Certificate) -> Result<(), String> {
         let res = if self.devmode {
             check_devmode_certificate(block, cert)
