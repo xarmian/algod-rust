@@ -32,7 +32,10 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use algo_validate::merkle::{compute_payset_merkle_root, compute_vector_commitment, HashAlgo};
+use algo_validate::merkle::{
+    compute_payset_merkle_root, compute_payset_merkle_root_raw, compute_vector_commitment,
+    compute_vector_commitment_raw, HashAlgo,
+};
 
 struct CountingAlloc;
 
@@ -108,6 +111,36 @@ fn commitments_do_not_clone_the_transactions() {
         "compute_vector_commitment made {vc_allocs} allocations for {n} transactions \
          ({:.1} per transaction), want at most 11",
         vc_allocs as f64 / n as f64
+    );
+
+    // The raw-blob variants take the same (chunked, parallel) leaf path with
+    // the stored SignedTxnInBlock bytes: fed the canonical encodings they
+    // must give the same roots, entry for entry in payset order.
+    let raw: Vec<Vec<u8>> = block
+        .payset
+        .iter()
+        .map(algo_codec::canonical_encode_signed_txn_in_block)
+        .collect();
+    assert_eq!(
+        hex(&compute_payset_merkle_root_raw(&block, &raw)),
+        MERKLE_ROOT
+    );
+    assert_eq!(
+        hex(&compute_vector_commitment_raw(
+            &block,
+            HashAlgo::Sha256,
+            &raw
+        )),
+        VC_SHA256_ROOT
+    );
+    // Swapping two entries of the raw blobs changes the root: the chunk
+    // offset really selects each transaction's own blob.
+    let mut swapped = raw.clone();
+    let last = swapped.len() - 1;
+    swapped.swap(300, last);
+    assert_ne!(
+        hex(&compute_payset_merkle_root_raw(&block, &swapped)),
+        MERKLE_ROOT
     );
 }
 
