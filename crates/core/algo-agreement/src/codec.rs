@@ -600,15 +600,14 @@ pub fn decode_compound_message(bytes: &[u8]) -> Result<CompoundMessage, CodecErr
 
     for _ in 0..map_len {
         let key = read_str_key(&mut cursor)?;
-        match key.as_str() {
+        match key {
             "oper" => original_period = Period(read_uint64(&mut cursor)?),
             "oprop" => original_proposer = Address(read_bin_fixed::<32>(&mut cursor)?),
             "sdpf" => seed_proof = read_bin_fixed::<VRF_PROOF_SIZE>(&mut cursor)?,
             "pv" => prior_vote = decode_vote_from_cursor(&mut cursor)?,
             _ => {
                 // Skip all block fields and any other unknown fields.
-                rmpv::decode::read_value(&mut cursor)
-                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+                skip_value(&mut cursor)?;
             }
         }
     }
@@ -628,7 +627,61 @@ pub fn decode_compound_message(bytes: &[u8]) -> Result<CompoundMessage, CodecErr
 // ── Decoding helpers ─────────────────────────────────────────────────────
 
 /// Read a msgpack string key from cursor.
-fn read_str_key(cursor: &mut Cursor<&[u8]>) -> Result<String, CodecError> {
+///
+/// The key is borrowed from the input: go's msgp decoders compare the key
+/// bytes in place, and an owned `String` per key made certificate decoding
+/// 2.8x slower than go (issue #2317). Anything that is not a complete, valid
+/// UTF-8 `str` is an error; [`read_str_key_error`] reports exactly the error
+/// the decoder always reported for it.
+#[inline]
+fn read_str_key<'a>(cursor: &mut Cursor<&'a [u8]>) -> Result<&'a str, CodecError> {
+    let buf: &'a [u8] = cursor.get_ref();
+    let pos = (cursor.position() as usize).min(buf.len());
+    match borrow_str(&buf[pos..]) {
+        Some((key, consumed)) => {
+            cursor.set_position((pos + consumed) as u64);
+            Ok(key)
+        }
+        None => Err(read_str_key_error(cursor)),
+    }
+}
+
+/// The error for a key [`borrow_str`] does not take, from the original key
+/// reader.
+#[cold]
+#[inline(never)]
+fn read_str_key_error(cursor: &mut Cursor<&[u8]>) -> CodecError {
+    match read_str_key_slow(cursor) {
+        Err(e) => e,
+        // Unreachable: the original reader only succeeds on a complete,
+        // valid UTF-8 `str`, which `borrow_str` takes.
+        Ok(key) => CodecError::Format(format!("unexpected key {key:?}")),
+    }
+}
+
+/// The msgpack `str` at the start of `buf` and its encoded length, when it is
+/// complete and valid UTF-8.
+#[inline]
+fn borrow_str(buf: &[u8]) -> Option<(&str, usize)> {
+    let (header, len): (usize, usize) = match *buf.first()? {
+        m @ 0xa0..=0xbf => (1, (m & 0x1f) as usize),
+        0xd9 => (2, *buf.get(1)? as usize),
+        0xda => (3, u16::from_be_bytes([*buf.get(1)?, *buf.get(2)?]) as usize),
+        0xdb => (
+            5,
+            u32::from_be_bytes([*buf.get(1)?, *buf.get(2)?, *buf.get(3)?, *buf.get(4)?]) as usize,
+        ),
+        _ => return None,
+    };
+    let end = header.checked_add(len)?;
+    let key = std::str::from_utf8(buf.get(header..end)?).ok()?;
+    Some((key, end))
+}
+
+/// The original key reader: materialises the value. Only reached for input
+/// [`borrow_str`] does not take (a key that is not a `str`, is truncated or is
+/// not UTF-8), so that those errors keep their text.
+fn read_str_key_slow(cursor: &mut Cursor<&[u8]>) -> Result<String, CodecError> {
     let val =
         rmpv::decode::read_value(cursor).map_err(|e| CodecError::Decode(format!("key: {e}")))?;
     match val {
@@ -641,8 +694,185 @@ fn read_str_key(cursor: &mut Cursor<&[u8]>) -> Result<String, CodecError> {
     }
 }
 
+/// Containers nested deeper than this are left to `rmpv` (which has its own,
+/// much larger, depth limit and error).
+const FAST_SKIP_MAX_DEPTH: usize = 32;
+
+/// Skip one msgpack value without building it (go: `msgp.Skip`).
+///
+/// A well-formed value nested at most [`FAST_SKIP_MAX_DEPTH`] containers deep
+/// is skipped by [`fast_skip_len`]; everything else (malformed or truncated
+/// input, a reserved marker, deeper nesting) is handed to
+/// `rmpv::decode::read_value` exactly as before, so the accepted inputs, the
+/// bytes consumed and the error texts are unchanged (issue #2317).
+fn skip_value(cursor: &mut Cursor<&[u8]>) -> Result<(), CodecError> {
+    let buf: &[u8] = cursor.get_ref();
+    let pos = (cursor.position() as usize).min(buf.len());
+    if let Some(len) = fast_skip_len(&buf[pos..]) {
+        cursor.set_position((pos + len) as u64);
+        return Ok(());
+    }
+    rmpv::decode::read_value(cursor)
+        .map(drop)
+        .map_err(|e| CodecError::Decode(format!("skip field: {e}")))
+}
+
+/// Encoded length of the msgpack value at the start of `buf`, or `None` when
+/// it is not complete and well formed within [`FAST_SKIP_MAX_DEPTH`].
+fn fast_skip_len(buf: &[u8]) -> Option<usize> {
+    fn be16(buf: &[u8], pos: usize) -> Option<usize> {
+        Some(u16::from_be_bytes([*buf.get(pos)?, *buf.get(pos + 1)?]) as usize)
+    }
+    fn be32(buf: &[u8], pos: usize) -> Option<usize> {
+        let b = buf.get(pos..pos.checked_add(4)?)?;
+        Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    }
+
+    // Values still to read at each enclosing level.
+    let mut stack = [0usize; FAST_SKIP_MAX_DEPTH];
+    let mut depth = 0usize;
+    let mut pending = 1usize;
+    let mut pos = 0usize;
+    loop {
+        while pending == 0 {
+            if depth == 0 {
+                return Some(pos);
+            }
+            depth -= 1;
+            pending = stack[depth];
+        }
+        pending -= 1;
+        let marker = *buf.get(pos)?;
+        pos += 1;
+        // (payload bytes to skip, child values that follow)
+        let (payload, children) = match marker {
+            // positive fixint, negative fixint, nil, false, true
+            0x00..=0x7f | 0xe0..=0xff | 0xc0 | 0xc2 | 0xc3 => (0, 0),
+            0x80..=0x8f => (0, 2 * (marker & 0x0f) as usize),
+            0x90..=0x9f => (0, (marker & 0x0f) as usize),
+            0xa0..=0xbf => ((marker & 0x1f) as usize, 0),
+            // reserved
+            0xc1 => return None,
+            // bin8 / str8
+            0xc4 | 0xd9 => {
+                let n = *buf.get(pos)? as usize;
+                pos += 1;
+                (n, 0)
+            }
+            // bin16 / str16
+            0xc5 | 0xda => {
+                let n = be16(buf, pos)?;
+                pos += 2;
+                (n, 0)
+            }
+            // bin32 / str32
+            0xc6 | 0xdb => {
+                let n = be32(buf, pos)?;
+                pos += 4;
+                (n, 0)
+            }
+            // ext8 / ext16 / ext32: length, then a type byte and the data
+            0xc7 => {
+                let n = *buf.get(pos)? as usize;
+                pos += 1;
+                (n.checked_add(1)?, 0)
+            }
+            0xc8 => {
+                let n = be16(buf, pos)?;
+                pos += 2;
+                (n.checked_add(1)?, 0)
+            }
+            0xc9 => {
+                let n = be32(buf, pos)?;
+                pos += 4;
+                (n.checked_add(1)?, 0)
+            }
+            // float32, uint32, int32
+            0xca | 0xce | 0xd2 => (4, 0),
+            // float64, uint64, int64
+            0xcb | 0xcf | 0xd3 => (8, 0),
+            // uint8, int8
+            0xcc | 0xd0 => (1, 0),
+            // uint16, int16
+            0xcd | 0xd1 => (2, 0),
+            // fixext1/2/4/8/16: a type byte and the data
+            0xd4 => (2, 0),
+            0xd5 => (3, 0),
+            0xd6 => (5, 0),
+            0xd7 => (9, 0),
+            0xd8 => (17, 0),
+            // array16 / array32
+            0xdc => {
+                let n = be16(buf, pos)?;
+                pos += 2;
+                (0, n)
+            }
+            0xdd => {
+                let n = be32(buf, pos)?;
+                pos += 4;
+                (0, n)
+            }
+            // map16 / map32
+            0xde => {
+                let n = be16(buf, pos)?;
+                pos += 2;
+                (0, n.checked_mul(2)?)
+            }
+            0xdf => {
+                let n = be32(buf, pos)?;
+                pos += 4;
+                (0, n.checked_mul(2)?)
+            }
+        };
+        pos = pos.checked_add(payload)?;
+        if pos > buf.len() {
+            return None;
+        }
+        if children > 0 {
+            if depth == FAST_SKIP_MAX_DEPTH {
+                return None;
+            }
+            stack[depth] = pending;
+            depth += 1;
+            pending = children;
+        }
+    }
+}
+
 /// Read a uint64 value from cursor.
+#[inline]
 fn read_uint64(cursor: &mut Cursor<&[u8]>) -> Result<u64, CodecError> {
+    let buf: &[u8] = cursor.get_ref();
+    let pos = (cursor.position() as usize).min(buf.len());
+    // The unsigned encodings go writes; every other shape (signed markers,
+    // truncation, a non-integer) takes the general reader.
+    if let Some((val, consumed)) = borrow_uint(&buf[pos..]) {
+        cursor.set_position((pos + consumed) as u64);
+        return Ok(val);
+    }
+    read_uint64_general(cursor)
+}
+
+/// The unsigned msgpack integer at the start of `buf` (positive fixint,
+/// uint8/16/32/64) and its encoded length.
+#[inline]
+fn borrow_uint(buf: &[u8]) -> Option<(u64, usize)> {
+    let be = |n: usize| -> Option<u64> {
+        let b = buf.get(1..1 + n)?;
+        Some(b.iter().fold(0u64, |acc, &x| (acc << 8) | x as u64))
+    };
+    match *buf.first()? {
+        m @ 0x00..=0x7f => Some((m as u64, 1)),
+        0xcc => Some((be(1)?, 2)),
+        0xcd => Some((be(2)?, 3)),
+        0xce => Some((be(4)?, 5)),
+        0xcf => Some((be(8)?, 9)),
+        _ => None,
+    }
+}
+
+/// [`read_uint64`] for every shape the decoder accepts.
+fn read_uint64_general(cursor: &mut Cursor<&[u8]>) -> Result<u64, CodecError> {
     let val =
         rmpv::decode::read_value(cursor).map_err(|e| CodecError::Decode(format!("uint: {e}")))?;
     match val {
@@ -657,7 +887,29 @@ fn read_uint64(cursor: &mut Cursor<&[u8]>) -> Result<u64, CodecError> {
 /// (`msgp.ReadExactBytes`, issue #2063): accepts `bin`, `str`, `nil` (zeroed)
 /// and an array of uint8, and copies `min(encoded, N)` bytes without a length
 /// check. See `docs/BYTES_DECODE_PARITY.md`.
+#[inline]
 fn read_bin_fixed<const N: usize>(cursor: &mut Cursor<&[u8]>) -> Result<[u8; N], CodecError> {
+    let buf: &[u8] = cursor.get_ref();
+    let pos = (cursor.position() as usize).min(buf.len());
+    // What go's encoder writes for a `[N]byte`: `bin8` of exactly N bytes.
+    // Every other accepted shape takes the general reader below.
+    if N <= u8::MAX as usize {
+        if let Some(body) = buf.get(pos + 2..pos + 2 + N) {
+            if buf[pos] == 0xc4 && buf[pos + 1] as usize == N {
+                let mut arr = [0u8; N];
+                arr.copy_from_slice(body);
+                cursor.set_position((pos + 2 + N) as u64);
+                return Ok(arr);
+            }
+        }
+    }
+    read_bin_fixed_general(cursor)
+}
+
+/// [`read_bin_fixed`] for every shape go accepts (`msgp.ReadExactBytes`).
+fn read_bin_fixed_general<const N: usize>(
+    cursor: &mut Cursor<&[u8]>,
+) -> Result<[u8; N], CodecError> {
     let buf: &[u8] = cursor.get_ref();
     let pos = (cursor.position() as usize).min(buf.len());
     let mut rd = &buf[pos..];
@@ -687,15 +939,14 @@ fn decode_proposal_value(cursor: &mut Cursor<&[u8]>) -> Result<ProposalValue, Co
     let mut pv = BOTTOM;
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_str() {
+        match key {
             "dig" => pv.block_digest = Digest(read_bin_fixed::<32>(cursor)?),
             "encdig" => pv.encoding_digest = Digest(read_bin_fixed::<32>(cursor)?),
             "oper" => pv.original_period = Period(read_uint64(cursor)?),
             "oprop" => pv.original_proposer = Address(read_bin_fixed::<32>(cursor)?),
             _ => {
                 // Skip unknown field
-                rmpv::decode::read_value(cursor)
-                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+                skip_value(cursor)?;
             }
         }
     }
@@ -718,15 +969,14 @@ fn decode_raw_vote(cursor: &mut Cursor<&[u8]>) -> Result<RawVote, CodecError> {
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_str() {
+        match key {
             "per" => rv.period = Period(read_uint64(cursor)?),
             "prop" => rv.proposal = decode_proposal_value(cursor)?,
             "rnd" => rv.round = Round(read_uint64(cursor)?),
             "snd" => rv.sender = Address(read_bin_fixed::<32>(cursor)?),
             "step" => rv.step = Step(read_uint64(cursor)?),
             _ => {
-                rmpv::decode::read_value(cursor)
-                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+                skip_value(cursor)?;
             }
         }
     }
@@ -745,11 +995,10 @@ fn decode_unauthenticated_credential(
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_str() {
+        match key {
             "pf" => proof = read_bin_fixed::<VRF_PROOF_SIZE>(cursor)?,
             _ => {
-                rmpv::decode::read_value(cursor)
-                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+                skip_value(cursor)?;
             }
         }
     }
@@ -773,7 +1022,7 @@ fn decode_one_time_signature(cursor: &mut Cursor<&[u8]>) -> Result<OneTimeSignat
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_str() {
+        match key {
             "p" => sig.pk = read_bin_fixed::<32>(cursor)?,
             "p1s" => sig.pk1_sig = read_bin_fixed::<64>(cursor)?,
             "p2" => sig.pk2 = read_bin_fixed::<32>(cursor)?,
@@ -781,8 +1030,7 @@ fn decode_one_time_signature(cursor: &mut Cursor<&[u8]>) -> Result<OneTimeSignat
             "ps" => sig.pk_sig_old = read_bin_fixed::<64>(cursor)?,
             "s" => sig.sig = read_bin_fixed::<64>(cursor)?,
             _ => {
-                rmpv::decode::read_value(cursor)
-                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+                skip_value(cursor)?;
             }
         }
     }
@@ -805,13 +1053,12 @@ fn decode_vote_from_cursor(cursor: &mut Cursor<&[u8]>) -> Result<Unauthenticated
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_str() {
+        match key {
             "cred" => vote.cred = decode_unauthenticated_credential(cursor)?,
             "r" => vote.raw_vote = decode_raw_vote(cursor)?,
             "sig" => vote.sig = decode_one_time_signature(cursor)?,
             _ => {
-                rmpv::decode::read_value(cursor)
-                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+                skip_value(cursor)?;
             }
         }
     }
@@ -837,13 +1084,12 @@ fn decode_vote_authenticator(cursor: &mut Cursor<&[u8]>) -> Result<VoteAuthentic
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_str() {
+        match key {
             "cred" => cred = decode_unauthenticated_credential(cursor)?,
             "sig" => sig = decode_one_time_signature(cursor)?,
             "snd" => sender = Address(read_bin_fixed::<32>(cursor)?),
             _ => {
-                rmpv::decode::read_value(cursor)
-                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+                skip_value(cursor)?;
             }
         }
     }
@@ -882,7 +1128,7 @@ fn decode_equivocation_vote_authenticator(
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_str() {
+        match key {
             "cred" => cred = decode_unauthenticated_credential(cursor)?,
             "props" => {
                 let arr_len = rmp::decode::read_array_len(cursor)
@@ -908,8 +1154,7 @@ fn decode_equivocation_vote_authenticator(
             }
             "snd" => sender = Address(read_bin_fixed::<32>(cursor)?),
             _ => {
-                rmpv::decode::read_value(cursor)
-                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+                skip_value(cursor)?;
             }
         }
     }
@@ -935,7 +1180,7 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<UnauthenticatedBundle, CodecError> 
 
     for _ in 0..map_len {
         let key = read_str_key(&mut cursor)?;
-        match key.as_str() {
+        match key {
             "eqv" => {
                 let arr_len = rmp::decode::read_array_len(&mut cursor)
                     .map_err(|e| CodecError::Decode(format!("eqv array: {e}")))?;
@@ -971,8 +1216,7 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<UnauthenticatedBundle, CodecError> 
                 bundle.votes = vs;
             }
             _ => {
-                rmpv::decode::read_value(&mut cursor)
-                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+                skip_value(&mut cursor)?;
             }
         }
     }
@@ -1088,13 +1332,12 @@ fn decode_hashable_credential_from_cursor(
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_str() {
+        match key {
             "i" => hc.iter = read_uint64(cursor)?,
             "m" => hc.member = Address(read_bin_fixed::<32>(cursor)?),
             "v" => hc.raw_out = read_bin_fixed::<VRF_OUTPUT_SIZE>(cursor)?,
             _ => {
-                rmpv::decode::read_value(cursor)
-                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+                skip_value(cursor)?;
             }
         }
     }
@@ -1177,15 +1420,14 @@ fn decode_credential_from_cursor(cursor: &mut Cursor<&[u8]>) -> Result<Credentia
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_str() {
+        match key {
             "ds" => cred.domain_separation_enabled = read_bool(cursor)?,
             "h" => cred.vrf_out = Digest(read_bin_fixed::<32>(cursor)?),
             "hc" => cred.hashable = decode_hashable_credential_from_cursor(cursor)?,
             "pf" => cred.proof = read_bin_fixed::<VRF_PROOF_SIZE>(cursor)?,
             "wt" => cred.weight = read_uint64(cursor)?,
             _ => {
-                rmpv::decode::read_value(cursor)
-                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+                skip_value(cursor)?;
             }
         }
     }
@@ -1256,13 +1498,12 @@ fn decode_authenticated_vote_from_cursor(cursor: &mut Cursor<&[u8]>) -> Result<V
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_str() {
+        match key {
             "cred" => vote.cred = decode_credential_from_cursor(cursor)?,
             "r" => vote.raw_vote = decode_raw_vote(cursor)?,
             "sig" => vote.sig = decode_one_time_signature(cursor)?,
             _ => {
-                rmpv::decode::read_value(cursor)
-                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+                skip_value(cursor)?;
             }
         }
     }
@@ -1385,7 +1626,7 @@ fn decode_equivocation_vote_from_cursor(
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_str() {
+        match key {
             "cred" => ev.cred = decode_credential_from_cursor(cursor)?,
             "per" => ev.period = Period(read_uint64(cursor)?),
             "props" => {
@@ -1414,8 +1655,7 @@ fn decode_equivocation_vote_from_cursor(
             "snd" => ev.sender = Address(read_bin_fixed::<32>(cursor)?),
             "step" => ev.step = Step(read_uint64(cursor)?),
             _ => {
-                rmpv::decode::read_value(cursor)
-                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+                skip_value(cursor)?;
             }
         }
     }
@@ -1512,7 +1752,7 @@ pub fn decode_authenticated_bundle(bytes: &[u8]) -> Result<AuthenticatedBundle, 
 
     for _ in 0..map_len {
         let key = read_str_key(&mut cursor)?;
-        match key.as_str() {
+        match key {
             "eqv" => {
                 let arr_len = rmp::decode::read_array_len(&mut cursor)
                     .map_err(|e| CodecError::Decode(format!("eqv array: {e}")))?;
@@ -1549,8 +1789,7 @@ pub fn decode_authenticated_bundle(bytes: &[u8]) -> Result<AuthenticatedBundle, 
                 ab.votes = vs;
             }
             _ => {
-                rmpv::decode::read_value(&mut cursor)
-                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+                skip_value(&mut cursor)?;
             }
         }
     }
@@ -1573,7 +1812,7 @@ fn decode_unauthenticated_bundle_from_cursor(
 
     for _ in 0..map_len {
         let key = read_str_key(cursor)?;
-        match key.as_str() {
+        match key {
             "eqv" => {
                 let arr_len = rmp::decode::read_array_len(cursor)
                     .map_err(|e| CodecError::Decode(format!("eqv array: {e}")))?;
@@ -1609,8 +1848,7 @@ fn decode_unauthenticated_bundle_from_cursor(
                 bundle.votes = vs;
             }
             _ => {
-                rmpv::decode::read_value(cursor)
-                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+                skip_value(cursor)?;
             }
         }
     }
@@ -1672,15 +1910,14 @@ pub fn decode_unauthenticated_proposal(
 
     for _ in 0..map_len {
         let key = read_str_key(&mut cursor)?;
-        match key.as_str() {
+        match key {
             "oper" => original_period = Period(read_uint64(&mut cursor)?),
             "oprop" => original_proposer = Address(read_bin_fixed::<32>(&mut cursor)?),
             "sdpf" => seed_proof = read_bin_fixed::<VRF_PROOF_SIZE>(&mut cursor)?,
             _ => {
                 // Skip all block fields (already consumed via the
                 // block decoder above) and any unknown fields.
-                rmpv::decode::read_value(&mut cursor)
-                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+                skip_value(&mut cursor)?;
             }
         }
     }
@@ -2514,5 +2751,288 @@ mod tests {
         assert_eq!(decoded.proposal.original_proposer, Address([0u8; 32]));
         assert_eq!(decoded.proposal.seed_proof, [0u8; VRF_PROOF_SIZE]);
         assert_eq!(decoded.vote.raw_vote.round, Round(0));
+    }
+}
+
+/// The allocation-free key reader and skipper against the `rmpv` reference
+/// they replaced (issue #2317): same accepted inputs, same bytes consumed.
+#[cfg(test)]
+mod skip_tests {
+    use super::*;
+
+    /// xorshift64*: deterministic, no dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Random bytes biased towards msgpack markers with small lengths, so
+    /// that a good share of the buffers are complete values.
+    fn random_buf(rng: &mut Rng) -> Vec<u8> {
+        const MARKERS: &[u8] = &[
+            0x00, 0x7f, 0x80, 0x81, 0x82, 0x90, 0x91, 0x93, 0xa0, 0xa1, 0xa3, 0xc0, 0xc1, 0xc2,
+            0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf, 0xd0,
+            0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xdb, 0xdc, 0xdd, 0xde,
+            0xdf, 0xe0, 0xff,
+        ];
+        let len = rng.below(48) as usize;
+        (0..len)
+            .map(|_| match rng.below(4) {
+                0 => MARKERS[rng.below(MARKERS.len() as u64) as usize],
+                1 => rng.below(4) as u8,
+                2 => b'a' + rng.below(26) as u8,
+                _ => rng.next() as u8,
+            })
+            .collect()
+    }
+
+    fn container_depth(v: &rmpv::Value) -> usize {
+        match v {
+            rmpv::Value::Array(a) => 1 + a.iter().map(container_depth).max().unwrap_or(0),
+            rmpv::Value::Map(m) => {
+                1 + m
+                    .iter()
+                    .map(|(k, v)| container_depth(k).max(container_depth(v)))
+                    .max()
+                    .unwrap_or(0)
+            }
+            _ => 0,
+        }
+    }
+
+    /// `rmpv`'s verdict on the value at the start of `buf`.
+    fn reference(buf: &[u8]) -> Option<(rmpv::Value, usize)> {
+        let mut c = Cursor::new(buf);
+        let v = rmpv::decode::read_value(&mut c).ok()?;
+        Some((v, c.position() as usize))
+    }
+
+    fn check_skip(buf: &[u8]) {
+        let fast = fast_skip_len(buf);
+        match (fast, reference(buf)) {
+            (Some(n), Some((_, consumed))) => assert_eq!(n, consumed, "length of {buf:02x?}"),
+            (Some(n), None) => panic!("fast skip took {n} bytes of {buf:02x?}, rmpv rejects it"),
+            // The fast path only declines a value rmpv accepts when it is
+            // nested too deep or holds the reserved marker 0xc1 (which rmpv
+            // reads as nil): both are left to rmpv. A 0xc1 in marker position
+            // is told from one inside a payload by turning every 0xc1 into
+            // nil: only the former makes the fast path take the value.
+            (None, Some((v, consumed))) => {
+                let as_nil: Vec<u8> = buf
+                    .iter()
+                    .map(|&b| if b == 0xc1 { 0xc0 } else { b })
+                    .collect();
+                assert!(
+                    container_depth(&v) > FAST_SKIP_MAX_DEPTH
+                        || fast_skip_len(&as_nil) == Some(consumed),
+                    "fast skip refused {buf:02x?}, which rmpv accepts"
+                );
+            }
+            (None, None) => {}
+        }
+        // `skip_value` always agrees with rmpv, whichever path it took.
+        let mut c = Cursor::new(buf);
+        let skipped = skip_value(&mut c);
+        match reference(buf) {
+            Some((_, consumed)) => {
+                skipped.expect("skip_value accepts what rmpv accepts");
+                assert_eq!(c.position() as usize, consumed);
+            }
+            None => {
+                let mut r = Cursor::new(buf);
+                let want = rmpv::decode::read_value(&mut r).unwrap_err();
+                let want = CodecError::Decode(format!("skip field: {want}"));
+                assert_eq!(
+                    format!("{:?}", skipped.unwrap_err()),
+                    format!("{want:?}"),
+                    "error for {buf:02x?}"
+                );
+            }
+        }
+    }
+
+    fn check_key(buf: &[u8]) {
+        let mut slow_cursor = Cursor::new(buf);
+        let slow = read_str_key_slow(&mut slow_cursor);
+        let mut cursor = Cursor::new(buf);
+        let got = read_str_key(&mut cursor);
+        match (&got, &slow) {
+            (Ok(a), Ok(b)) => {
+                assert_eq!(*a, b.as_str());
+                assert_eq!(cursor.position(), slow_cursor.position());
+            }
+            (Err(a), Err(b)) => {
+                assert_eq!(format!("{a:?}"), format!("{b:?}"), "error for {buf:02x?}");
+            }
+            _ => panic!("key reader disagrees on {buf:02x?}: {got:?} vs {slow:?}"),
+        }
+    }
+
+    #[test]
+    fn fast_skip_agrees_with_rmpv_on_random_input() {
+        let mut rng = Rng(0x2317_2317_2317_2317);
+        let mut complete = 0;
+        for _ in 0..200_000 {
+            let buf = random_buf(&mut rng);
+            if fast_skip_len(&buf).is_some() {
+                complete += 1;
+            }
+            check_skip(&buf);
+        }
+        assert!(complete > 10_000, "only {complete} complete values tried");
+    }
+
+    #[test]
+    fn key_reader_agrees_with_the_reference_on_random_input() {
+        let mut rng = Rng(0x0BAD_C0DE_2317_0001);
+        let mut keys = 0;
+        for _ in 0..200_000 {
+            let buf = random_buf(&mut rng);
+            if borrow_str(&buf).is_some() {
+                keys += 1;
+            }
+            check_key(&buf);
+        }
+        assert!(keys > 1_000, "only {keys} valid keys tried");
+    }
+
+    #[test]
+    fn key_reader_edge_cases() {
+        // str8 / str16 / str32 headers, truncation, invalid UTF-8, non-str.
+        let cases: &[&[u8]] = &[
+            &[],
+            &[0xa0],
+            &[0xa3, b'r', b'n', b'd'],
+            &[0xa3, b'r', b'n'],
+            &[0xa2, 0xff, 0xfe],
+            &[0xd9, 3, b'r', b'n', b'd', 0x01],
+            &[0xd9],
+            &[0xda, 0, 3, b'r', b'n', b'd'],
+            &[0xda, 0],
+            &[0xdb, 0, 0, 0, 3, b'r', b'n', b'd'],
+            &[0xdb, 0xff, 0xff, 0xff, 0xff, b'r'],
+            &[0xc4, 1, b'x'],
+            &[0x01],
+            &[0xc1],
+            &[0x91, 0xa1, b'x'],
+        ];
+        for c in cases {
+            check_key(c);
+            check_skip(c);
+        }
+    }
+
+    #[test]
+    fn deep_nesting_is_left_to_rmpv() {
+        // One level past the fast limit: still accepted (rmpv's limit is far
+        // higher), through the fallback.
+        let mut buf = vec![0x91u8; FAST_SKIP_MAX_DEPTH + 1];
+        buf.push(0x01);
+        assert_eq!(fast_skip_len(&buf), None);
+        check_skip(&buf);
+        // Exactly at the limit: fast path.
+        let mut buf = vec![0x91u8; FAST_SKIP_MAX_DEPTH];
+        buf.push(0x01);
+        assert_eq!(fast_skip_len(&buf), Some(buf.len()));
+        check_skip(&buf);
+    }
+
+    #[test]
+    fn fixed_bytes_fast_path_agrees_with_the_general_reader() {
+        fn check(buf: &[u8]) {
+            let mut fast = Cursor::new(buf);
+            let mut general = Cursor::new(buf);
+            let a = read_bin_fixed::<4>(&mut fast);
+            let b = read_bin_fixed_general::<4>(&mut general);
+            assert_eq!(format!("{a:?}"), format!("{b:?}"), "value for {buf:02x?}");
+            if a.is_ok() {
+                assert_eq!(fast.position(), general.position(), "length for {buf:02x?}");
+            }
+        }
+        // bin8 of exactly, fewer and more than N bytes; truncated; str; nil.
+        let cases: &[&[u8]] = &[
+            &[0xc4, 4, 1, 2, 3, 4],
+            &[0xc4, 4, 1, 2, 3, 4, 9],
+            &[0xc4, 4, 1, 2, 3],
+            &[0xc4, 3, 1, 2, 3],
+            &[0xc4, 5, 1, 2, 3, 4, 5],
+            &[0xc4],
+            &[0xa4, 1, 2, 3, 4],
+            &[0xc0],
+            &[0x94, 1, 2, 3, 4],
+            &[],
+        ];
+        for c in cases {
+            check(c);
+        }
+        let mut rng = Rng(0x2317_0000_0000_0004);
+        for _ in 0..100_000 {
+            let mut buf = random_buf(&mut rng);
+            if rng.below(2) == 0 && buf.len() >= 2 {
+                buf[0] = 0xc4;
+                buf[1] = rng.below(7) as u8;
+            }
+            check(&buf);
+        }
+    }
+
+    #[test]
+    fn uint_fast_path_agrees_with_the_general_reader() {
+        fn check(buf: &[u8]) {
+            let mut fast = Cursor::new(buf);
+            let mut general = Cursor::new(buf);
+            let a = read_uint64(&mut fast);
+            let b = read_uint64_general(&mut general);
+            assert_eq!(format!("{a:?}"), format!("{b:?}"), "value for {buf:02x?}");
+            if a.is_ok() {
+                assert_eq!(fast.position(), general.position(), "length for {buf:02x?}");
+            }
+        }
+        let cases: &[&[u8]] = &[
+            &[0x00],
+            &[0x7f],
+            &[0xcc, 0xff],
+            &[0xcc],
+            &[0xcd, 0x01, 0x02],
+            &[0xcd, 0x01],
+            &[0xce, 1, 2, 3, 4],
+            &[0xce, 1, 2, 3],
+            &[0xcf, 1, 2, 3, 4, 5, 6, 7, 8],
+            &[0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            &[0xcf, 1, 2, 3, 4, 5, 6, 7],
+            // signed markers: positive values are accepted, negative rejected
+            &[0xd0, 0x05],
+            &[0xd0, 0xff],
+            &[0xd3, 0, 0, 0, 0, 0, 0, 0, 9],
+            &[0xe0],
+            &[0xc0],
+            &[0xa1, b'x'],
+            &[],
+        ];
+        for c in cases {
+            check(c);
+        }
+        let mut rng = Rng(0x2317_0000_0000_0008);
+        for _ in 0..100_000 {
+            check(&random_buf(&mut rng));
+        }
+    }
+
+    #[test]
+    fn skip_stops_at_the_end_of_the_value() {
+        // {"a": [1, "xy"], "b": bin(2)} followed by a trailing byte.
+        let buf = [
+            0x82, 0xa1, b'a', 0x92, 0x01, 0xa2, b'x', b'y', 0xa1, b'b', 0xc4, 2, 9, 9, 0x7f,
+        ];
+        assert_eq!(fast_skip_len(&buf), Some(buf.len() - 1));
+        check_skip(&buf);
     }
 }
