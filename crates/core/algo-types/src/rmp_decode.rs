@@ -271,14 +271,25 @@ pub fn reject_when_strict(rd: &[u8], key: &[u8]) -> Result<()> {
 /// catchable error instead.
 #[inline]
 pub fn skip_value(rd: &mut &[u8]) -> Result<()> {
-    let mut remaining: Vec<u64> = vec![1];
-    while let Some(count) = remaining.last_mut() {
+    // Values still to read per nesting level. The outermost level (the one
+    // value being skipped) lives in `outer`, so skipping a scalar, the common
+    // case, does not allocate (issue #2317); `remaining` holds the levels
+    // opened by containers.
+    let mut outer: u64 = 1;
+    let mut remaining: Vec<u64> = Vec::new();
+    loop {
+        let count = match remaining.last_mut() {
+            Some(count) => count,
+            None => &mut outer,
+        };
         if *count == 0 {
-            remaining.pop();
+            if remaining.pop().is_none() {
+                break;
+            }
             continue;
         }
         *count -= 1;
-        if remaining.len() > MAX_MSGPACK_DECODE_DEPTH {
+        if remaining.len() + 1 > MAX_MSGPACK_DECODE_DEPTH {
             return Err(codec_err(format!(
                 "skip_value: nesting depth exceeds {MAX_MSGPACK_DECODE_DEPTH}"
             )));

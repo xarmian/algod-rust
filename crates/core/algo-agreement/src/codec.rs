@@ -840,7 +840,39 @@ fn fast_skip_len(buf: &[u8]) -> Option<usize> {
 }
 
 /// Read a uint64 value from cursor.
+#[inline]
 fn read_uint64(cursor: &mut Cursor<&[u8]>) -> Result<u64, CodecError> {
+    let buf: &[u8] = cursor.get_ref();
+    let pos = (cursor.position() as usize).min(buf.len());
+    // The unsigned encodings go writes; every other shape (signed markers,
+    // truncation, a non-integer) takes the general reader.
+    if let Some((val, consumed)) = borrow_uint(&buf[pos..]) {
+        cursor.set_position((pos + consumed) as u64);
+        return Ok(val);
+    }
+    read_uint64_general(cursor)
+}
+
+/// The unsigned msgpack integer at the start of `buf` (positive fixint,
+/// uint8/16/32/64) and its encoded length.
+#[inline]
+fn borrow_uint(buf: &[u8]) -> Option<(u64, usize)> {
+    let be = |n: usize| -> Option<u64> {
+        let b = buf.get(1..1 + n)?;
+        Some(b.iter().fold(0u64, |acc, &x| (acc << 8) | x as u64))
+    };
+    match *buf.first()? {
+        m @ 0x00..=0x7f => Some((m as u64, 1)),
+        0xcc => Some((be(1)?, 2)),
+        0xcd => Some((be(2)?, 3)),
+        0xce => Some((be(4)?, 5)),
+        0xcf => Some((be(8)?, 9)),
+        _ => None,
+    }
+}
+
+/// [`read_uint64`] for every shape the decoder accepts.
+fn read_uint64_general(cursor: &mut Cursor<&[u8]>) -> Result<u64, CodecError> {
     let val =
         rmpv::decode::read_value(cursor).map_err(|e| CodecError::Decode(format!("uint: {e}")))?;
     match val {
@@ -2940,6 +2972,48 @@ mod skip_tests {
                 buf[1] = rng.below(7) as u8;
             }
             check(&buf);
+        }
+    }
+
+    #[test]
+    fn uint_fast_path_agrees_with_the_general_reader() {
+        fn check(buf: &[u8]) {
+            let mut fast = Cursor::new(buf);
+            let mut general = Cursor::new(buf);
+            let a = read_uint64(&mut fast);
+            let b = read_uint64_general(&mut general);
+            assert_eq!(format!("{a:?}"), format!("{b:?}"), "value for {buf:02x?}");
+            if a.is_ok() {
+                assert_eq!(fast.position(), general.position(), "length for {buf:02x?}");
+            }
+        }
+        let cases: &[&[u8]] = &[
+            &[0x00],
+            &[0x7f],
+            &[0xcc, 0xff],
+            &[0xcc],
+            &[0xcd, 0x01, 0x02],
+            &[0xcd, 0x01],
+            &[0xce, 1, 2, 3, 4],
+            &[0xce, 1, 2, 3],
+            &[0xcf, 1, 2, 3, 4, 5, 6, 7, 8],
+            &[0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            &[0xcf, 1, 2, 3, 4, 5, 6, 7],
+            // signed markers: positive values are accepted, negative rejected
+            &[0xd0, 0x05],
+            &[0xd0, 0xff],
+            &[0xd3, 0, 0, 0, 0, 0, 0, 0, 9],
+            &[0xe0],
+            &[0xc0],
+            &[0xa1, b'x'],
+            &[],
+        ];
+        for c in cases {
+            check(c);
+        }
+        let mut rng = Rng(0x2317_0000_0000_0008);
+        for _ in 0..100_000 {
+            check(&random_buf(&mut rng));
         }
     }
 
