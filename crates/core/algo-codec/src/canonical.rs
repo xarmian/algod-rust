@@ -335,7 +335,20 @@ impl CanonicalMap {
     /// Sort fields by key in lexicographic order (raw UTF-8 bytes).
     ///
     /// Go's go-codec sorts struct field codec tags alphabetically.
-    fn encode(mut self) -> Vec<u8> {
+    fn encode(self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.encoded_len_hint());
+        self.encode_into(&mut buf);
+        buf
+    }
+
+    /// Upper bound of the encoded length (map header, keys, values).
+    fn encoded_len_hint(&self) -> usize {
+        let keys: usize = self.fields.iter().map(|f| f.0.len() + 2).sum();
+        5 + keys + self.arena.len()
+    }
+
+    /// Append the encoded map to `buf` (go: `MarshalMsg(b []byte)`).
+    fn encode_into(mut self, buf: &mut Vec<u8>) {
         // Callers add the keys in ascending order almost everywhere, so the
         // sort is skipped unless a pair is out of order.
         let sorted = self
@@ -347,16 +360,25 @@ impl CanonicalMap {
                 .sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
         }
 
-        let keys: usize = self.fields.iter().map(|f| f.0.len() + 2).sum();
-        let mut buf = Vec::with_capacity(5 + keys + self.arena.len());
-        rmp::encode::write_map_len(&mut buf, self.fields.len() as u32).unwrap();
+        buf.reserve(self.encoded_len_hint());
+        rmp::encode::write_map_len(buf, self.fields.len() as u32).unwrap();
 
         for &(key, start, end) in &self.fields {
-            rmp::encode::write_str(&mut buf, key).unwrap();
+            rmp::encode::write_str(buf, key).unwrap();
             buf.extend_from_slice(&self.arena[start..end]);
         }
+    }
 
-        buf
+    /// Add a nested map built by `inner`, written straight into this map's
+    /// arena (no intermediate buffer); an empty map is omitted like
+    /// [`CanonicalMap::add_map`] does.
+    fn add_nested_map(&mut self, key: &'static str, inner: CanonicalMap) {
+        if inner.fields.is_empty() {
+            return;
+        }
+        let start = self.arena.len();
+        inner.encode_into(&mut self.arena);
+        self.fields.push((key, start, self.arena.len()));
     }
 }
 
@@ -499,6 +521,27 @@ fn canonical_encode_transaction_inner(
     genesis_hash: &[u8; 32],
     group: &[u8; 32],
 ) -> Vec<u8> {
+    transaction_map(tx, genesis_id, genesis_hash, group).encode()
+}
+
+/// [`canonical_encode_transaction_with_genesis`] appended to `out`, for
+/// callers that hash many transactions and reuse one buffer (issue #2318).
+pub fn canonical_encode_transaction_with_genesis_into(
+    tx: &Transaction,
+    genesis_id: &str,
+    genesis_hash: &[u8; 32],
+    out: &mut Vec<u8>,
+) {
+    transaction_map(tx, genesis_id, genesis_hash, &tx.group).encode_into(out);
+}
+
+/// The canonical map of a transaction (see [`canonical_encode_transaction`]).
+fn transaction_map(
+    tx: &Transaction,
+    genesis_id: &str,
+    genesis_hash: &[u8; 32],
+    group: &[u8; 32],
+) -> CanonicalMap {
     let mut m = CanonicalMap::new();
 
     // All fields go into the SAME map so they sort correctly in a single
@@ -632,7 +675,7 @@ fn canonical_encode_transaction_inner(
     // Asset transfer (axfer)
     m.add_u64("xaid", tx.xaid);
 
-    m.encode()
+    m
 }
 
 /// Canonically encode a SignedTransaction (the core signed txn, excluding
@@ -665,6 +708,12 @@ pub fn canonical_encode_signed_txn_in_block(stx: &SignedTransaction) -> Vec<u8> 
     encode_signed_txn_apply_data(stx, true)
 }
 
+/// [`canonical_encode_signed_txn_in_block`] appended to `out`, for callers
+/// that hash a whole payset and reuse one buffer (issue #2318).
+pub fn canonical_encode_signed_txn_in_block_into(stx: &SignedTransaction, out: &mut Vec<u8>) {
+    signed_txn_apply_data_map(stx, true).encode_into(out);
+}
+
 /// The encoded length of a `SignedTxnInBlock`, optionally also checking that
 /// the encoding decodes back (go `SignedTxnInBlock.GetEncodedLength(decode)`,
 /// `data/transactions/signedtxn.go`, v5.0.5-stable, issue #2309).
@@ -695,6 +744,10 @@ pub fn canonical_encode_signed_txn_with_ad(stx: &SignedTransaction) -> Vec<u8> {
 }
 
 fn encode_signed_txn_apply_data(stx: &SignedTransaction, block_wrapper: bool) -> Vec<u8> {
+    signed_txn_apply_data_map(stx, block_wrapper).encode()
+}
+
+fn signed_txn_apply_data_map(stx: &SignedTransaction, block_wrapper: bool) -> CanonicalMap {
     let mut m = CanonicalMap::new();
 
     // ApplyData fields (flattened from SignedTxnWithAD -> ApplyData)
@@ -728,9 +781,17 @@ fn encode_signed_txn_apply_data(stx: &SignedTransaction, block_wrapper: bool) ->
 
     m.add_bytes("sig", &stx.sig);
     m.add_option_address("sgnr", &stx.auth_addr);
-    m.add_map("txn", canonical_encode_transaction(&stx.txn));
+    m.add_nested_map(
+        "txn",
+        transaction_map(
+            &stx.txn,
+            &stx.txn.genesis_id,
+            &stx.txn.genesis_hash,
+            &stx.txn.group,
+        ),
+    );
 
-    m.encode()
+    m
 }
 
 /// Canonically encode a BlockHeader (from a Block, excluding payset).

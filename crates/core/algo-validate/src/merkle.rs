@@ -32,8 +32,13 @@
 //   - go-algorand/data/bookkeeping/txn_merkle.go (txnMerkleElem)
 //   - go-algorand/protocol/hash.go (HashID constants)
 
-use algo_codec::{canonical_encode_signed_txn_in_block, canonical_encode_transaction};
+use algo_codec::{
+    canonical_encode_signed_txn_in_block, canonical_encode_signed_txn_in_block_into,
+    canonical_encode_transaction_with_genesis_into,
+};
+use algo_types::genesis_restore::GenesisRestoreRule;
 use algo_types::{Block, SignedTransaction};
+use rayon::prelude::*;
 use sha2::{Digest as _, Sha256, Sha512, Sha512_256};
 
 /// Domain separation prefix for Merkle array internal nodes.
@@ -61,26 +66,193 @@ type Hash = [u8; 32];
 /// The zero hash used for missing children in the Merkle tree.
 const ZERO_HASH: Hash = [0u8; 32];
 
-/// Compute the transaction ID: SHA512/256("TX" || canonical_encode(txn)).
-///
-/// For Merkle commitment, the txid must be computed with genesis fields
-/// RESTORED (genesis_id and genesis_hash), matching go-algorand's
-/// `DecodeSignedTxn` which restores these before calling `txn.ID()`.
-fn compute_txid(txn: &algo_types::Transaction) -> Hash {
-    let canonical = canonical_encode_transaction(txn);
+/// SHA512/256(prefix || data).
+fn hash_512_256(prefix: &[u8], data: &[u8]) -> Hash {
     let mut hasher = Sha512_256::new();
-    hasher.update(TX_PREFIX);
-    hasher.update(&canonical);
+    hasher.update(prefix);
+    hasher.update(data);
     hasher.finalize().into()
 }
 
-/// Compute the SignedTxnInBlock hash: SHA512/256("STIB" || canonical_encode(stib)).
+/// Reference transaction id for the unit tests: over an already restored
+/// transaction, as the commitments computed it before issue #2318.
+#[cfg(test)]
+fn compute_txid(txn: &algo_types::Transaction) -> Hash {
+    hash_512_256(TX_PREFIX, &algo_codec::canonical_encode_transaction(txn))
+}
+
+/// Reference SignedTxnInBlock hash for the unit tests.
+#[cfg(test)]
 fn compute_stib_hash(stx: &SignedTransaction) -> Hash {
-    let canonical = canonical_encode_signed_txn_in_block(stx);
-    let mut hasher = Sha512_256::new();
-    hasher.update(STIB_PREFIX);
-    hasher.update(&canonical);
-    hasher.finalize().into()
+    hash_512_256(STIB_PREFIX, &canonical_encode_signed_txn_in_block(stx))
+}
+
+/// Paysets with fewer transactions than this are hashed on the calling
+/// thread; larger ones spread the leaves over the rayon pool, as go-algorand
+/// spreads them over `runtime.NumCPU()` workers
+/// (`crypto/merklearray/merkle.go` `Build`, `worker.go`).
+const PARALLEL_LEAVES_MIN: usize = 128;
+
+/// Transactions per parallel work item (one pair of scratch buffers each).
+const LEAF_CHUNK: usize = 32;
+
+/// The leaf layer of a payset commitment: `leaf(txn_bytes, stib_bytes)` for
+/// every payset entry, in payset order.
+///
+/// `txn_bytes` is the canonical encoding of the transaction with its genesis
+/// fields restored (go: `DecodeSignedTxn` before `txn.ID()`), what the
+/// transaction id is hashed over. It is produced by encoding with the
+/// restored genesis id/hash rather than by cloning the transaction (issue
+/// #2318). `stib_bytes` is the `SignedTxnInBlock` as stored in the block: the
+/// entry of `raw_stibs` when given (the bytes go wrote, preserving fields the
+/// structs do not model), the canonical re-encoding otherwise.
+///
+/// Both encodings go into scratch buffers reused across a chunk.
+fn leaf_layer<L, F>(block: &Block, raw_stibs: Option<&[Vec<u8>]>, leaf: F) -> Vec<L>
+where
+    L: Send,
+    F: Fn(&[u8], &[u8]) -> L + Sync,
+{
+    let rule = GenesisRestoreRule::for_block(block);
+    let chunk_leaves = |first: usize, chunk: &[SignedTransaction]| -> Vec<L> {
+        let mut txn_buf = Vec::with_capacity(512);
+        let mut stib_buf = Vec::with_capacity(512);
+        chunk
+            .iter()
+            .enumerate()
+            .map(|(i, stx)| {
+                let (genesis_id, genesis_hash) = rule.restored_genesis(stx);
+                txn_buf.clear();
+                canonical_encode_transaction_with_genesis_into(
+                    &stx.txn,
+                    genesis_id,
+                    genesis_hash,
+                    &mut txn_buf,
+                );
+                match raw_stibs {
+                    Some(raw) => leaf(&txn_buf, &raw[first + i]),
+                    None => {
+                        stib_buf.clear();
+                        canonical_encode_signed_txn_in_block_into(stx, &mut stib_buf);
+                        leaf(&txn_buf, &stib_buf)
+                    }
+                }
+            })
+            .collect()
+    };
+    if block.payset.len() < PARALLEL_LEAVES_MIN {
+        return chunk_leaves(0, &block.payset);
+    }
+    let chunks: Vec<Vec<L>> = block
+        .payset
+        .par_chunks(LEAF_CHUNK)
+        .enumerate()
+        .map(|(c, chunk)| chunk_leaves(c * LEAF_CHUNK, chunk))
+        .collect();
+    chunks.into_iter().flatten().collect()
+}
+
+/// The leaf layer of the SHA-512/256 payset Merkle tree.
+fn merkle_leaves(block: &Block, raw_stibs: Option<&[Vec<u8>]>) -> Vec<Hash> {
+    leaf_layer(block, raw_stibs, |txn, stib| {
+        compute_leaf_hash(
+            &hash_512_256(TX_PREFIX, txn),
+            &hash_512_256(STIB_PREFIX, stib),
+        )
+    })
+}
+
+/// The leaves of a vector commitment, in payset order.
+///
+/// go-algorand's `txnMerkleElem.RawLeaf()` (`data/bookkeeping/txn_merkle.go`)
+/// hashes the leaf DATA (txid and stib hash) with SHA-256 for both the
+/// `Sha256` and the `Sha512` tree; only the tree itself (the "TL" leaf and the
+/// "MA" nodes) uses the tree's own algorithm.
+fn vc_leaves(block: &Block, algo: HashAlgo, raw_stibs: Option<&[Vec<u8>]>) -> Vec<VcNode> {
+    leaf_layer(block, raw_stibs, |txn, stib| {
+        let txid: Hash = Sha256::new()
+            .chain_update(TX_PREFIX)
+            .chain_update(txn)
+            .finalize()
+            .into();
+        let stib_hash: Hash = Sha256::new()
+            .chain_update(STIB_PREFIX)
+            .chain_update(stib)
+            .finalize()
+            .into();
+        vc_node(algo, &[TL_PREFIX, &txid, &stib_hash])
+    })
+}
+
+/// A node of a vector commitment tree: the digest in the first
+/// [`HashAlgo::digest_len`] bytes (32 for SHA-256, 64 for SHA-512), zero
+/// padded. Fixed size so that building the tree does not allocate per node.
+type VcNode = [u8; 64];
+
+impl HashAlgo {
+    /// Digest size in bytes.
+    fn digest_len(self) -> usize {
+        match self {
+            HashAlgo::Sha256 => 32,
+            HashAlgo::Sha512 => 64,
+        }
+    }
+}
+
+/// `H(parts...)` with the tree's hash, as a [`VcNode`].
+fn vc_node(algo: HashAlgo, parts: &[&[u8]]) -> VcNode {
+    let mut node = [0u8; 64];
+    match algo {
+        HashAlgo::Sha256 => {
+            let mut h = Sha256::new();
+            for p in parts {
+                h.update(p);
+            }
+            node[..32].copy_from_slice(&h.finalize());
+        }
+        HashAlgo::Sha512 => {
+            let mut h = Sha512::new();
+            for p in parts {
+                h.update(p);
+            }
+            node.copy_from_slice(&h.finalize());
+        }
+    }
+    node
+}
+
+/// The root of the vector commitment over `leaves` (payset order, at least
+/// one): pad to a power of two with the bottom leaf `H("MB")`, place leaf `i`
+/// at the bit-reversed index, hash pairs upwards with `H("MA" || l || r)`
+/// (go: `crypto/merklearray` `generateVectorCommitmentArray`, `Build`).
+fn vc_root(algo: HashAlgo, leaves: Vec<VcNode>) -> Vec<u8> {
+    let len = algo.digest_len();
+    let padded_len = leaves.len().next_power_of_two();
+    let depth = padded_len.trailing_zeros(); // log2(padded_len)
+
+    // Padded positions use H("MB"), the "bottom element" hash of go-algorand's
+    // vectorCommitmentArray: not zero or empty, a real hash that binds the
+    // position of unfilled slots.
+    let mut layer: Vec<VcNode> = vec![vc_node(algo, &[MB_PREFIX]); padded_len];
+    for (i, leaf) in leaves.into_iter().enumerate() {
+        layer[bit_reverse(i, depth)] = leaf;
+    }
+
+    // Build the tree bottom-up, in place: parent i overwrites slot i, which
+    // both of its children (2i, 2i + 1) have already been read from.
+    let mut width = padded_len;
+    while width > 1 {
+        width /= 2;
+        for i in 0..width {
+            let parent = vc_node(
+                algo,
+                &[MA_PREFIX, &layer[i * 2][..len], &layer[i * 2 + 1][..len]],
+            );
+            layer[i] = parent;
+        }
+    }
+
+    layer[0][..len].to_vec()
 }
 
 /// Compute a Merkle leaf hash: SHA512/256("TL" || txid || stib_hash).
@@ -153,23 +325,10 @@ pub fn compute_payset_merkle_root(block: &Block) -> Hash {
         return ZERO_HASH;
     }
 
-    // Build leaf layer.
-    let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(block);
-    let mut layer: Vec<Hash> = block
-        .payset
-        .iter()
-        .map(|stx| {
-            // Restore genesis fields for txid computation (matching go-algorand's
-            // DecodeSignedTxn behavior).
-            let restored_txn = rule.restored_txn(stx);
-
-            let txid = compute_txid(&restored_txn);
-            // STIB hash uses the payset entry as stored in the block
-            // (without genesis restoration, but WITH ApplyData fields).
-            let stib_hash = compute_stib_hash(stx);
-            compute_leaf_hash(&txid, &stib_hash)
-        })
-        .collect();
+    // Build leaf layer: the txid is over the genesis-restored transaction
+    // (go's `DecodeSignedTxn`), the STIB hash over the payset entry as stored
+    // in the block (no genesis restoration, WITH ApplyData fields).
+    let mut layer: Vec<Hash> = merkle_leaves(block, None);
 
     // Build tree bottom-up until we have a single root.
     while layer.len() > 1 {
@@ -293,6 +452,7 @@ fn vc_hash(algo: HashAlgo, parts: &[&[u8]]) -> Vec<u8> {
 /// (txid and stib_hash) when the tree hash type is either `Sha256` or
 /// `Sha512`. Only the `Sha512_256` tree type uses SHA-512/256 for leaf
 /// data. See `data/bookkeeping/txn_merkle.go` lines 101-107.
+#[cfg(test)]
 fn vc_hash_sha256(parts: &[&[u8]]) -> Vec<u8> {
     let mut h = Sha256::new();
     for p in parts {
@@ -309,16 +469,6 @@ fn vc_zero_hash(algo: HashAlgo) -> Vec<u8> {
         HashAlgo::Sha256 => vec![0u8; 32],
         HashAlgo::Sha512 => vec![0u8; 64],
     }
-}
-
-/// Compute a vector commitment leaf: H("TL" || txid || stib_hash).
-fn vc_leaf_hash(algo: HashAlgo, txid: &[u8], stib_hash: &[u8]) -> Vec<u8> {
-    vc_hash(algo, &[TL_PREFIX, txid, stib_hash])
-}
-
-/// Compute a vector commitment internal node: H("MA" || left || right).
-fn vc_internal_hash(algo: HashAlgo, left: &[u8], right: &[u8]) -> Vec<u8> {
-    vc_hash(algo, &[MA_PREFIX, left, right])
 }
 
 /// Compute the vector commitment root for a block's payset.
@@ -340,8 +490,6 @@ pub fn compute_vector_commitment(block: &Block, algo: HashAlgo) -> Vec<u8> {
         return vc_hash(algo, &[MB_PREFIX]);
     }
 
-    let n = block.payset.len();
-
     // Compute leaf hashes.
     //
     // go-algorand's `txnMerkleElem.RawLeaf()` (data/bookkeeping/txn_merkle.go)
@@ -352,54 +500,7 @@ pub fn compute_vector_commitment(block: &Block, algo: HashAlgo) -> Vec<u8> {
     // The TREE construction (TL leaf wrapping, MA internal nodes) always uses
     // the tree's own hash algorithm. So for Sha512 vector commitments, leaf
     // data is SHA-256 but tree hashing is SHA-512.
-    let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(block);
-    let leaf_hashes: Vec<Vec<u8>> = block
-        .payset
-        .iter()
-        .map(|stx| {
-            // Restore genesis fields for txid (same as primary Merkle tree).
-            let restored_txn = rule.restored_txn(stx);
-
-            let txn_canonical = canonical_encode_transaction(&restored_txn);
-            // Leaf data (txid, stib_hash) always uses SHA-256 for both
-            // Sha256 and Sha512 vector commitments.
-            let txid = vc_hash_sha256(&[TX_PREFIX, &txn_canonical]);
-
-            let stib_canonical = canonical_encode_signed_txn_in_block(stx);
-            let stib_hash = vc_hash_sha256(&[STIB_PREFIX, &stib_canonical]);
-
-            vc_leaf_hash(algo, &txid, &stib_hash)
-        })
-        .collect();
-
-    // Pad to next power of 2.
-    let padded_len = n.next_power_of_two();
-    let depth = padded_len.trailing_zeros(); // log2(padded_len)
-
-    // Build padded array with bit-reversal permutation.
-    // Padded positions use H("MB") — the "bottom element" hash from go-algorand's
-    // vectorCommitmentArray. This is NOT zero or empty; it's a real hash that
-    // ensures position-binding for unfilled slots in the tree.
-    let bottom_hash = vc_hash(algo, &[MB_PREFIX]);
-    let mut layer: Vec<Vec<u8>> = vec![bottom_hash; padded_len];
-    for (i, leaf) in leaf_hashes.into_iter().enumerate() {
-        let vc_index = bit_reverse(i, depth);
-        layer[vc_index] = leaf;
-    }
-
-    // Build tree bottom-up.
-    while layer.len() > 1 {
-        let parent_count = layer.len() / 2; // always power of 2
-        let mut parents = Vec::with_capacity(parent_count);
-        for i in 0..parent_count {
-            let left = &layer[i * 2];
-            let right = &layer[i * 2 + 1];
-            parents.push(vc_internal_hash(algo, left, right));
-        }
-        layer = parents;
-    }
-
-    layer.into_iter().next().unwrap()
+    vc_root(algo, vc_leaves(block, algo, None))
 }
 
 // ── Raw-passthrough variants (Epic 12a) ─────────────────────────────
@@ -433,20 +534,7 @@ pub fn compute_payset_merkle_root_raw(block: &Block, raw_blobs: &[Vec<u8>]) -> H
         return ZERO_HASH;
     }
 
-    let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(block);
-    let mut layer: Vec<Hash> = block
-        .payset
-        .iter()
-        .zip(raw_blobs.iter())
-        .map(|(stx, raw_blob)| {
-            // Restore genesis fields for txid computation (same as typed path).
-            let restored_txn = rule.restored_txn(stx);
-
-            let txid = compute_txid(&restored_txn);
-            let stib_hash = compute_stib_hash_raw(raw_blob);
-            compute_leaf_hash(&txid, &stib_hash)
-        })
-        .collect();
+    let mut layer: Vec<Hash> = merkle_leaves(block, Some(raw_blobs));
 
     while layer.len() > 1 {
         layer = build_next_layer(&layer);
@@ -503,62 +591,16 @@ pub fn compute_vector_commitment_raw(
         return vc_hash(algo, &[MB_PREFIX]);
     }
 
-    let n = block.payset.len();
-
     // go-algorand's RawLeaf() uses SHA-256 for leaf data (txid, stib_hash)
     // when the tree hash type is Sha256 or Sha512. Only Sha512_256 uses
     // SHA-512/256 for leaf data. See data/bookkeeping/txn_merkle.go.
-    let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(block);
-    let leaf_hashes: Vec<Vec<u8>> = block
-        .payset
-        .iter()
-        .zip(raw_blobs.iter())
-        .map(|(stx, raw_blob)| {
-            // Restore genesis fields for txid (same as typed path).
-            let restored_txn = rule.restored_txn(stx);
-
-            let txn_canonical = canonical_encode_transaction(&restored_txn);
-            // Leaf data always uses SHA-256 for vector commitments.
-            let txid = vc_hash_sha256(&[TX_PREFIX, &txn_canonical]);
-
-            // Use raw blob for stib_hash (preserves unknown fields).
-            let stib_hash = vc_hash_sha256(&[STIB_PREFIX, raw_blob]);
-
-            vc_leaf_hash(algo, &txid, &stib_hash)
-        })
-        .collect();
-
-    // Pad to next power of 2.
-    let padded_len = n.next_power_of_two();
-    let depth = padded_len.trailing_zeros();
-
-    // Build padded array with bit-reversal permutation.
-    // Padded positions use H("MB") — see compute_vector_commitment.
-    let bottom_hash = vc_hash(algo, &[MB_PREFIX]);
-    let mut layer: Vec<Vec<u8>> = vec![bottom_hash; padded_len];
-    for (i, leaf) in leaf_hashes.into_iter().enumerate() {
-        let vc_index = bit_reverse(i, depth);
-        layer[vc_index] = leaf;
-    }
-
-    // Build tree bottom-up.
-    while layer.len() > 1 {
-        let parent_count = layer.len() / 2;
-        let mut parents = Vec::with_capacity(parent_count);
-        for i in 0..parent_count {
-            let left = &layer[i * 2];
-            let right = &layer[i * 2 + 1];
-            parents.push(vc_internal_hash(algo, left, right));
-        }
-        layer = parents;
-    }
-
-    layer.into_iter().next().unwrap()
+    vc_root(algo, vc_leaves(block, algo, Some(raw_blobs)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use algo_codec::canonical_encode_transaction;
     use algo_types::{Address, Round, Transaction};
 
     fn minimal_signed_txn(amount: u64) -> SignedTransaction {
