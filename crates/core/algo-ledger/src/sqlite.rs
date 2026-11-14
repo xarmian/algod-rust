@@ -440,6 +440,26 @@ pub fn block_path_for_prefix(prefix: &Path) -> std::path::PathBuf {
     std::path::PathBuf::from(s)
 }
 
+/// The newest `onlineaccounts` row of one address (`record_online_account_history`).
+///
+/// `address IN (?1)` and not `address = ?1` on purpose (issue #2333): with the
+/// bundled SQLite (`SQLITE_ENABLE_STAT4`) the planner consumes the variable of
+/// the equality on the first column of this composite primary key when the
+/// second column is ordered or range-scanned, which makes `rusqlite`'s
+/// statement cache (it clears the bindings when it takes a statement back)
+/// re-parse and re-plan the statement on EVERY use: ~4.1 us instead of ~1.2 us
+/// per query, 23,246 times in a 2,000-block replay. A one-element `IN` is the
+/// same lookup (same index, same order, no sort: pinned by
+/// `reprepare_tests`) without consuming the variable.
+pub(crate) const ONLINE_ACCOUNT_LATEST_SQL: &str =
+    "SELECT data FROM onlineaccounts WHERE address IN (?1) ORDER BY updround DESC LIMIT 1";
+
+/// The newest `onlineaccounts` row of one address at or before a round
+/// (`get_online_account_at_round`, the read pool's `lookup_agreement_account`).
+/// See [`ONLINE_ACCOUNT_LATEST_SQL`] for `IN (?1)`.
+pub(crate) const ONLINE_ACCOUNT_AT_ROUND_SQL: &str =
+    "SELECT data FROM onlineaccounts WHERE address IN (?1) AND updround <= ?2 ORDER BY updround DESC LIMIT 1";
+
 /// Statement-cached `execute` / `query_row` (issue #1757): rusqlite's plain
 /// `Connection::execute` / `query_row` compile their SQL on every call, which
 /// the heavy-block profile showed to be a large share of the ~9k writes and
@@ -6244,8 +6264,7 @@ impl SqliteLedger {
             let prev_blob: Option<Vec<u8>> = self
                 .conn
                 .query_row_cached(
-                    "SELECT data FROM onlineaccounts WHERE address = ?1 \
-                     ORDER BY updround DESC LIMIT 1",
+                    ONLINE_ACCOUNT_LATEST_SQL,
                     params![addr.0.as_slice()],
                     |row| row.get(0),
                 )
@@ -6775,8 +6794,7 @@ impl SqliteLedger {
         let data: Option<Vec<u8>> = self
             .conn
             .query_row_cached(
-                "SELECT data FROM onlineaccounts WHERE address = ?1 AND updround <= ?2 \
-                 ORDER BY updround DESC LIMIT 1",
+                ONLINE_ACCOUNT_AT_ROUND_SQL,
                 params![addr.0.as_slice(), round as i64],
                 |row| row.get(0),
             )
@@ -18971,5 +18989,139 @@ mod archive_buffer_tests {
             .unwrap();
         assert_ne!(before, ledger.tracker_rows_fingerprint());
         ledger.rollback_block().unwrap();
+    }
+}
+
+/// Issue #2333: a cached statement must not be re-prepared on every use.
+///
+/// `rusqlite`'s statement cache calls `sqlite3_clear_bindings` when it takes a
+/// statement back, and SQLite marks a statement EXPIRED by that call when its
+/// plan consumed a bound variable (`expmask != 0`). SQLite built with
+/// `SQLITE_ENABLE_STAT4` (the bundled one is) consumes the variable of an
+/// equality on the first column of a composite index when the second column is
+/// range-scanned or ordered, so `WHERE address = ?1 ... ORDER BY updround DESC
+/// LIMIT 1` was parsed and planned again on EVERY execution: 23,246 times, 8.8%
+/// of the replay's apply thread, ~4.1 us per query instead of ~1.2 us.
+#[cfg(test)]
+mod reprepare_tests {
+    use super::*;
+
+    fn seeded() -> SqliteLedger {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        for a in 0..40u8 {
+            for round in [10i64, 20, 30, 40] {
+                ledger
+                    .conn
+                    .execute(
+                        "INSERT INTO onlineaccounts \
+                         (address, updround, normalizedonlinebalance, votelastvalid, data) \
+                         VALUES (?1, ?2, 1, 1, ?3)",
+                        params![vec![a; 32], round, vec![a, round as u8]],
+                    )
+                    .unwrap();
+            }
+        }
+        ledger
+    }
+
+    fn run_once(st: &mut rusqlite::Statement<'_>, addr: Vec<u8>, round: Option<i64>) -> Option<Vec<u8>> {
+        match round {
+            Some(r) => st.query_row(params![addr, r], |row| row.get(0)),
+            None => st.query_row(params![addr], |row| row.get(0)),
+        }
+        .optional()
+        .unwrap()
+    }
+
+    /// Runs `sql` through the connection's statement cache like the node does
+    /// and returns the statement's re-prepare count after `uses` executions.
+    fn reprepares_after(ledger: &SqliteLedger, sql: &str, round: Option<i64>, uses: usize) -> i32 {
+        let mut count = 0;
+        for i in 0..uses {
+            let addr = vec![(i % 60) as u8; 32]; // some present, some absent
+            let mut st = ledger.conn.prepare_cached(sql).unwrap();
+            let _ = run_once(&mut st, addr, round);
+            count = st.get_status(rusqlite::StatementStatus::RePrepare);
+        }
+        count
+    }
+
+    #[test]
+    fn the_latest_row_statement_is_prepared_once() {
+        let ledger = seeded();
+        let n = reprepares_after(&ledger, ONLINE_ACCOUNT_LATEST_SQL, None, 200);
+        assert_eq!(n, 0, "re-prepared {n} times in 200 uses");
+    }
+
+    #[test]
+    fn the_row_at_round_statement_is_prepared_once() {
+        let ledger = seeded();
+        let n = reprepares_after(&ledger, ONLINE_ACCOUNT_AT_ROUND_SQL, Some(35), 200);
+        assert_eq!(n, 0, "re-prepared {n} times in 200 uses");
+    }
+
+    /// The rewrite must keep the index search and the index order: no sort.
+    #[test]
+    fn both_statements_still_search_the_primary_key_without_a_sort() {
+        let ledger = seeded();
+        for (sql, round) in [
+            (ONLINE_ACCOUNT_LATEST_SQL, None),
+            (ONLINE_ACCOUNT_AT_ROUND_SQL, Some(35i64)),
+        ] {
+            let mut st = ledger
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let addr = vec![1u8; 32];
+            let rows: Vec<String> = match round {
+                Some(r) => st
+                    .query_map(params![addr, r], |row| row.get::<_, String>(3))
+                    .unwrap()
+                    .map(|x| x.unwrap())
+                    .collect(),
+                None => st
+                    .query_map(params![addr], |row| row.get::<_, String>(3))
+                    .unwrap()
+                    .map(|x| x.unwrap())
+                    .collect(),
+            };
+            let plan = rows.join(" | ");
+            assert!(
+                plan.contains("SEARCH onlineaccounts USING INDEX sqlite_autoindex_onlineaccounts_1"),
+                "{sql}: {plan}"
+            );
+            assert!(!plan.contains("TEMP B-TREE"), "{sql}: sorts: {plan}");
+        }
+    }
+
+    /// The old text and the new one return the same row for every address and
+    /// round, including addresses without history and rounds before the first
+    /// row.
+    #[test]
+    fn the_statements_return_what_the_original_text_returned() {
+        const OLD_LATEST: &str =
+            "SELECT data FROM onlineaccounts WHERE address = ?1 ORDER BY updround DESC LIMIT 1";
+        const OLD_AT_ROUND: &str = "SELECT data FROM onlineaccounts WHERE address = ?1 \
+             AND updround <= ?2 ORDER BY updround DESC LIMIT 1";
+        let ledger = seeded();
+        for a in 0..60u8 {
+            let addr = vec![a; 32];
+            let mut new_latest = ledger.conn.prepare(ONLINE_ACCOUNT_LATEST_SQL).unwrap();
+            let mut old_latest = ledger.conn.prepare(OLD_LATEST).unwrap();
+            assert_eq!(
+                run_once(&mut new_latest, addr.clone(), None),
+                run_once(&mut old_latest, addr.clone(), None),
+                "latest, address {a}"
+            );
+            for round in [0i64, 9, 10, 11, 25, 30, 39, 40, 41, 1_000_000] {
+                let mut new_at = ledger.conn.prepare(ONLINE_ACCOUNT_AT_ROUND_SQL).unwrap();
+                let mut old_at = ledger.conn.prepare(OLD_AT_ROUND).unwrap();
+                assert_eq!(
+                    run_once(&mut new_at, addr.clone(), Some(round)),
+                    run_once(&mut old_at, addr.clone(), Some(round)),
+                    "address {a}, round {round}"
+                );
+            }
+        }
     }
 }
