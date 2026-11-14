@@ -714,3 +714,55 @@ fn a_staged_header_only_row_is_readable_before_it_is_moved() {
     assert!(file_rounds(&prefix).contains(&2));
     assert_eq!(ledger.get_block_header_data(2).unwrap(), staged_hdr);
 }
+
+// ---- WAL auto-checkpoint during a bulk apply (issue #2316) -----------------
+//
+// SQLite checkpoints the tracker WAL once it holds 1,000 frames (about 4 MB),
+// and every checkpoint costs `fsync`s on the apply thread (the replay's 264
+// `fsync`s were 168 with the threshold raised, ext4 wall 1.5 to 1.4 s). During
+// a bulk apply the threshold is raised to `BULK_AUTOCHECKPOINT_FRAMES`; at the
+// end of the pass it is back to 1,000 and the WAL is checkpointed.
+
+fn tracker_wal_len(prefix: &Path) -> u64 {
+    let mut p = tracker_path_for_prefix(prefix).into_os_string();
+    p.push("-wal");
+    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+}
+
+#[test]
+fn a_bulk_apply_lets_the_tracker_wal_grow_past_the_default_checkpoint_threshold() {
+    const LIMIT: u64 = 5 * 1024 * 1024; // 1,000 frames is about 4.1 MB
+    let lens: Vec<u64> = [false, true]
+        .into_iter()
+        .map(|bulk| {
+            let dir = tempfile::tempdir().unwrap();
+            let prefix = dir.path().join("ledger");
+            let mut ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+            ledger.set_bulk_apply(bulk).unwrap();
+            for round in 1..=600u64 {
+                commit_block_round(&mut ledger, round);
+            }
+            let len = tracker_wal_len(&prefix);
+            assert_eq!(
+                ledger.wal_autocheckpoint_frames(),
+                if bulk { 15_000 } else { 1_000 }
+            );
+            if bulk {
+                // The end of the pass restores the threshold.
+                ledger.set_bulk_apply(false).unwrap();
+                assert_eq!(ledger.wal_autocheckpoint_frames(), 1_000);
+            }
+            len
+        })
+        .collect();
+    assert!(
+        lens[0] < LIMIT,
+        "default: the WAL stays near 1,000 frames, {} bytes",
+        lens[0]
+    );
+    assert!(
+        lens[1] > LIMIT,
+        "bulk: the WAL grows past it, {} bytes",
+        lens[1]
+    );
+}

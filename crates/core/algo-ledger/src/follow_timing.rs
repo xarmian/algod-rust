@@ -556,15 +556,26 @@ impl Drop for StateTimer {
 }
 
 /// SQLite's default `wal_autocheckpoint` threshold, in WAL frames.
-const DEFAULT_AUTOCHECKPOINT_FRAMES: c_int = 1000;
+pub const DEFAULT_AUTOCHECKPOINT_FRAMES: c_int = 1000;
+
+/// The threshold during a bulk catchup apply (DIV-011, issue #2316): about
+/// 62 MB of WAL, below `DEFAULT_TRACKER_WAL_SIZE_LIMIT`. Every checkpoint costs
+/// `fsync`s on the apply thread; raising it took the small-corpus replay from
+/// 264 to 168 `fsync`s and ext4 wall from 1.5 to 1.4 s.
+pub const BULK_AUTOCHECKPOINT_FRAMES: c_int = 15_000;
 
 extern "C" fn wal_hook_cb(
-    _ctx: *mut c_void,
+    ctx: *mut c_void,
     db: *mut rusqlite::ffi::sqlite3,
     name: *const c_char,
     n_frames: c_int,
 ) -> c_int {
-    if n_frames >= DEFAULT_AUTOCHECKPOINT_FRAMES {
+    // SAFETY: `ctx` is the `AtomicI32` inside the `Arc` the ledger passed to
+    // `install_wal_checkpoint_hook` and keeps alive for as long as the
+    // connection (the hook is only called by that connection).
+    let threshold = unsafe { &*(ctx as *const std::sync::atomic::AtomicI32) }
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if n_frames >= threshold {
         let started = Instant::now();
         // SAFETY: SQLite passes the live connection handle and the schema
         // name; this is exactly what `sqlite3WalDefaultHook` does.
@@ -597,13 +608,25 @@ extern "C" fn wal_hook_cb(
 /// this hook (SQLite implements that pragma as `sqlite3_wal_autocheckpoint`,
 /// which installs the default hook), so no code may issue it; the
 /// `no_code_sets_wal_autocheckpoint` test guards that.
-pub fn install_wal_checkpoint_hook(conn: &rusqlite::Connection) {
+///
+/// `threshold` is the checkpoint threshold in WAL frames, read at every
+/// commit; the caller keeps the `Arc` alive for the connection's whole life
+/// (declare it AFTER the connection in the owning struct so it drops later).
+pub fn install_wal_checkpoint_hook(
+    conn: &rusqlite::Connection,
+    threshold: &std::sync::Arc<std::sync::atomic::AtomicI32>,
+) {
     // Fallback: normally `main` has already fixed the process start time.
     init_process_start_time();
     // SAFETY: `handle()` is the live connection; the callback is a plain
-    // `extern "C"` function that ignores its context pointer.
+    // `extern "C"` function that only reads the `AtomicI32` behind `ctx`,
+    // which `threshold` keeps alive (see above).
     unsafe {
-        rusqlite::ffi::sqlite3_wal_hook(conn.handle(), Some(wal_hook_cb), std::ptr::null_mut());
+        rusqlite::ffi::sqlite3_wal_hook(
+            conn.handle(),
+            Some(wal_hook_cb),
+            std::sync::Arc::as_ptr(threshold) as *mut c_void,
+        );
     }
 }
 
@@ -888,7 +911,10 @@ mod tests {
         let conn = rusqlite::Connection::open(dir.join("t.sqlite")).unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(a BLOB);")
             .unwrap();
-        install_wal_checkpoint_hook(&conn);
+        let threshold = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(
+            DEFAULT_AUTOCHECKPOINT_FRAMES,
+        ));
+        install_wal_checkpoint_hook(&conn, &threshold);
         let before = follow_timing().wal_checkpoint.count();
         // synchronous=OFF + batched inserts: fast on CI, same WAL behaviour.
         conn.execute_batch("PRAGMA synchronous=OFF;").unwrap();

@@ -2518,6 +2518,11 @@ pub struct SqliteLedger {
     /// `FULL` (see [`SqliteLedger::set_bulk_apply`]). The archive writer is not
     /// affected.
     bulk_apply: std::sync::atomic::AtomicBool,
+    /// DIVERGENCE DIV-011: the WAL auto-checkpoint threshold of the tracker
+    /// connection (frames), read by the hook installed in `init`: raised
+    /// during a bulk apply (issue #2316). Declared after `conn`, which it must
+    /// outlive (the hook holds a pointer to it).
+    wal_autocheckpoint: std::sync::Arc<std::sync::atomic::AtomicI32>,
     /// DIVERGENCE DIV-011: archive writes of blocks that committed during a
     /// bulk apply and are staged in the tracker (`algod_rust_staged_archive`),
     /// not yet in the block file; served to readers like the open span's
@@ -3203,7 +3208,10 @@ impl SqliteLedger {
         })?;
         // Issue #1678: time the WAL checkpoints SQLite runs on the committing
         // thread (same PASSIVE auto-checkpoint, now observable).
-        crate::follow_timing::install_wal_checkpoint_hook(&conn);
+        let wal_autocheckpoint = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(
+            crate::follow_timing::DEFAULT_AUTOCHECKPOINT_FRAMES,
+        ));
+        crate::follow_timing::install_wal_checkpoint_hook(&conn, &wal_autocheckpoint);
         // Issue #2206: cut the tracker WAL file back after a long pin.
         apply_tracker_wal_size_limit(&conn, DEFAULT_TRACKER_WAL_SIZE_LIMIT)?;
         // Issue #2205: and the block archive file attached as `blockdb`.
@@ -3459,6 +3467,7 @@ impl SqliteLedger {
             block_wal_limit: DEFAULT_BLOCK_WAL_SIZE_LIMIT,
             synchronous_mode: std::sync::atomic::AtomicI64::new(DEFAULT_LEDGER_SYNCHRONOUS_MODE),
             bulk_apply: std::sync::atomic::AtomicBool::new(false),
+            wal_autocheckpoint,
             staged_archive: PendingArchive::default(),
             staged_max_seq: 0,
             span_staged_seq: None,
@@ -4354,6 +4363,17 @@ impl SqliteLedger {
             return Ok(());
         }
         self.apply_tracker_synchronous()?;
+        // DIVERGENCE DIV-011: fewer WAL checkpoints (each one `fsync`s on the
+        // apply thread) while a bulk apply runs; the end of the pass below
+        // checkpoints what grew, and the next commit would anyway.
+        self.wal_autocheckpoint.store(
+            if bulk {
+                crate::follow_timing::BULK_AUTOCHECKPOINT_FRAMES
+            } else {
+                crate::follow_timing::DEFAULT_AUTOCHECKPOINT_FRAMES
+            },
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if was && !bulk && !self.in_block {
             // DIVERGENCE DIV-011: the bulk apply is over: move what it staged to
             // the block file now (a failure keeps the rows staged, durable in
@@ -4376,6 +4396,12 @@ impl SqliteLedger {
             .map_err(|e| AlgoError::Ledger {
                 message: format!("read tracker synchronous mode error: {e}"),
             })
+    }
+
+    /// The tracker connection's WAL auto-checkpoint threshold, in frames.
+    pub fn wal_autocheckpoint_frames(&self) -> i32 {
+        self.wal_autocheckpoint
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The ledger connection's `temp_store` (`0` default, `1` FILE, `2` MEMORY).
@@ -19323,6 +19349,7 @@ mod tests {
             block_wal_limit: _,             // connection setting
             synchronous_mode: _,            // connection setting
             bulk_apply: _,                  // connection setting
+            wal_autocheckpoint: _,          // connection setting
             staged_archive: _,              // committed, drained by drain_staged_archive
             staged_max_seq: _,              // bookkeeping of staged_archive
             span_staged_seq: _,             // reset by abort_block_state
