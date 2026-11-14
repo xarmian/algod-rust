@@ -4113,6 +4113,19 @@ impl SqliteLedger {
         // Self-healing: finish an abort whose ROLLBACK failed earlier before
         // anything new starts (most callers ignore rollback_block's result).
         self.heal_pending_abort()?;
+        // DIVERGENCE DIV-011: blocks still staged outside a bulk apply, or at
+        // the staging cap: retry the move before the span opens, so a block
+        // file that is writable again is used by the very next block (review
+        // of PR #2335: at the cap nothing else retried it until a restart). A
+        // failure keeps them staged; at the cap the commit then refuses.
+        if !self.staged_archive.is_empty()
+            && (!self.bulk_apply.load(std::sync::atomic::Ordering::SeqCst)
+                || self.staged_archive.block_rounds().len() >= 4 * STAGE_MAX_BLOCKS)
+        {
+            if let Err(e) = self.drain_staged_archive() {
+                tracing::warn!(error = %e, "could not move staged blocks to the block file");
+            }
+        }
         self.pending_archive.clear();
         self.reconcile_orphans();
         // DIVERGENCE DIV-009: the span's transaction takes the TRACKER write
@@ -8356,11 +8369,16 @@ impl SqliteLedger {
             return Err(fail("commit", e));
         }
         self.failpoint("after_staged_archive_commit");
-        if let Err(e) = self.conn.execute_cached(
+        match self.conn.execute_cached(
             "DELETE FROM algod_rust_staged_archive WHERE seq <= ?1",
             params![self.staged_max_seq],
         ) {
-            tracing::warn!(error = %e, "staged block archive rows moved but not deleted; they are moved again later");
+            // The table may be empty now and `seq` restart at 1: keep the
+            // bound exact.
+            Ok(_) => self.staged_max_seq = 0,
+            Err(e) => {
+                tracing::warn!(error = %e, "staged block archive rows moved but not deleted; they are moved again later")
+            }
         }
         self.staged_archive.clear();
         self.refresh_inflight_marker();

@@ -655,6 +655,40 @@ fn moves_that_keep_failing_stop_the_apply_instead_of_piling_up() {
     assert_eq!(state_digest(&ledger, 256), reference_digest(256));
 }
 
+/// Re-review finding on PR #2335: the cap is reached after the bulk apply has
+/// already ended (its final move failed too). Once the block file is writable
+/// again the very next block commits, without a restart or another bulk apply.
+#[test]
+fn the_staging_cap_clears_once_the_block_file_is_writable_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = dir.path().join("ledger");
+    let mut ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+    ledger.set_bulk_apply(true).unwrap();
+    commit_block_round(&mut ledger, 1);
+    ledger.inject_staged_drain_failures(usize::MAX);
+    ledger.set_bulk_apply(false).unwrap(); // its move fails: round 1 stays staged
+    for round in 2..=256u64 {
+        commit_block_round(&mut ledger, round);
+    }
+    assert!(file_rounds(&prefix).is_empty());
+    ledger.begin_block().unwrap();
+    ledger
+        .put_block(257, "test", &test_header(257), b"block body 257")
+        .unwrap();
+    ledger.set_current_round(Round(257));
+    let err = ledger.commit_block().unwrap_err();
+    assert!(err.to_string().contains("staged blocks"), "{err}");
+
+    // The disk is fixed; bulk mode stays off.
+    ledger.inject_staged_drain_failures(0);
+    for round in 257..=260u64 {
+        commit_block_round(&mut ledger, round);
+    }
+    assert_eq!(file_rounds(&prefix), (1..=260).collect::<Vec<i64>>());
+    assert_eq!(staged_rows(&prefix), 0);
+    assert_eq!(state_digest(&ledger, 260), reference_digest(260));
+}
+
 /// Review finding on PR #2335: a block committed during a bulk apply without
 /// `put_block` gets only a synthesized header-only row; it must be readable
 /// while staged, as it was when written straight to the file.
@@ -670,7 +704,10 @@ fn a_staged_header_only_row_is_readable_before_it_is_moved() {
     ledger.commit_block().unwrap();
     assert!(!file_rounds(&prefix).contains(&2), "still staged");
     let staged_hdr = ledger.get_block_header_data(2).unwrap();
-    assert!(staged_hdr.is_some(), "a staged header-only row must be readable");
+    assert!(
+        staged_hdr.is_some(),
+        "a staged header-only row must be readable"
+    );
     assert!(ledger.get_block_proto(2).unwrap().is_some());
 
     ledger.set_bulk_apply(false).unwrap();
