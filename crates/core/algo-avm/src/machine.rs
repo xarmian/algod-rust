@@ -1068,6 +1068,48 @@ mod tests {
         assert_eq!(m.cost, 37);
     }
 
+    /// Issue #2320: a branch target is found by binary search over the sorted
+    /// instruction offsets (it used to be a `HashMap` built per evaluation).
+    /// Every instruction boundary resolves to its own index, everything else
+    /// (inside an immediate, before the first instruction) does not.
+    #[test]
+    fn index_of_offset_finds_exactly_the_instruction_boundaries() {
+        // v8: intcblock 3 [1 2 3], intc_0, intc_1, +, intc_2, ==, bnz +0, int 1
+        let program = parse(&[
+            0x08, 0x20, 0x03, 0x01, 0x02, 0x03, 0x22, 0x23, 0x08, 0x24, 0x12, 0x40, 0x00, 0x00,
+            0x81, 0x01,
+        ])
+        .unwrap();
+        let m = AvmMachine::new(program, ExecMode::LogicSig, 1000);
+        let offsets: Vec<usize> = m.program.instructions.iter().map(|i| i.offset).collect();
+        assert!(offsets.len() >= 7, "{offsets:?}");
+        assert!(
+            offsets.windows(2).all(|w| w[0] < w[1]),
+            "ascending: {offsets:?}"
+        );
+        let last_end = m.end_of_program_offset;
+        for offset in 0..=last_end + 3 {
+            let want = offsets.iter().position(|&o| o == offset);
+            assert_eq!(m.index_of_offset(offset), want, "offset {offset}");
+        }
+    }
+
+    /// The program is shared, not copied: `run` and `step` leave it intact and
+    /// a second machine over the same instructions behaves identically.
+    #[test]
+    fn running_does_not_change_the_shared_program() {
+        let program = parse(&bytec_sha256_program(2)).unwrap();
+        let before = program.instructions.len();
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 1000);
+        let _ = m.run(&mut NullContext);
+        assert_eq!(m.program.instructions.len(), before);
+        assert_eq!(
+            std::sync::Arc::strong_count(&m.program),
+            1,
+            "no leaked clone"
+        );
+    }
+
     /// Build a private single-prefix-family opcode table (mirroring the
     /// pattern in `opcode.rs`'s own `resolve()` tests) where sub-opcode `6`
     /// declares a *different* static cost (7) than its prefix entry `0xf0`'s
