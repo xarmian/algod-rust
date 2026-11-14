@@ -24,8 +24,6 @@
 //! instruction by instruction, managing the value stack, call stack,
 //! scratch space, and cost budget.
 
-use std::collections::HashMap;
-
 use algo_error::AlgoError;
 
 use crate::bytecode::{Immediates, Instruction, Program};
@@ -234,16 +232,17 @@ pub struct AvmMachine {
     pub int_constants: Vec<u64>,
     /// Byte constant pool (set by bytecblock).
     pub byte_constants: Vec<Vec<u8>>,
-    /// The parsed program being executed.
-    pub program: Program,
+    /// The parsed program being executed. Shared, so that `run` can hold the
+    /// instruction being executed by reference while the handlers borrow the
+    /// machine mutably: cloning an `Instruction` (its immediates own heap data)
+    /// on every step was 26% of a tight loop (issue #2320).
+    pub program: std::sync::Arc<Program>,
     /// Program version (convenience, copied from program.version).
     pub version: u8,
     /// Whether execution has finished.
     pub finished: bool,
     /// Final result: true = pass (approve), false = reject.
     pub pass: bool,
-    /// Pre-built map from byte offset to instruction index for O(1) branch resolution.
-    pub(crate) offset_to_index: HashMap<usize, usize>,
     /// Byte offset just past the last instruction (valid branch-to-end target).
     pub(crate) end_of_program_offset: usize,
     /// Tracks which opcode bytes have been executed during this run.
@@ -274,10 +273,6 @@ impl AvmMachine {
         for _ in 0..SCRATCH_SPACE_SIZE {
             scratch.push(AvmValue::Uint64(0));
         }
-        let mut offset_to_index = HashMap::with_capacity(program.instructions.len());
-        for (idx, instr) in program.instructions.iter().enumerate() {
-            offset_to_index.insert(instr.offset, idx);
-        }
         // Compute end-of-program byte offset (after last instruction + its immediates).
         let end_of_program_offset = if let Some(last) = program.instructions.last() {
             let imm_len = crate::validator::immediate_byte_len(&last.immediates);
@@ -297,10 +292,9 @@ impl AvmMachine {
             int_constants: Vec::new(),
             byte_constants: Vec::new(),
             version,
-            program,
+            program: std::sync::Arc::new(program),
             finished: false,
             pass: false,
-            offset_to_index,
             end_of_program_offset,
             opcode_hits: [false; 256],
             from_callsub: false,
@@ -429,14 +423,15 @@ impl AvmMachine {
     /// `ctx` provides external state access (transaction fields, app state, etc.).
     /// Pure-opcode tests can pass `&mut NullContext`.
     pub fn step(&mut self, ctx: &mut dyn AvmContext) -> Result<(), AlgoError> {
-        let result = self.step_inner(ctx);
+        let program = std::sync::Arc::clone(&self.program);
+        let result = self.step_inner(&program, ctx);
         // No instruction is current once it ran (or failed): a pop outside an
         // instruction must not print a stale mnemonic.
         self.current_instr = None;
         result
     }
 
-    fn step_inner(&mut self, ctx: &mut dyn AvmContext) -> Result<(), AlgoError> {
+    fn step_inner(&mut self, program: &Program, ctx: &mut dyn AvmContext) -> Result<(), AlgoError> {
         if self.finished {
             return Err(AlgoError::Avm {
                 message: "step called after execution finished".to_string(),
@@ -444,16 +439,16 @@ impl AvmMachine {
         }
 
         // If PC is past end of instructions, program finishes.
-        if self.pc >= self.program.instructions.len() {
+        if self.pc >= program.instructions.len() {
             return self.finish_implicit();
         }
 
-        let instr = self.program.instructions[self.pc].clone();
+        let instr = &program.instructions[self.pc];
         let old_pc = self.pc;
 
         // Record opcode hit for coverage tracking.
         self.opcode_hits[instr.opcode as usize] = true;
-        self.begin_instruction(&instr);
+        self.begin_instruction(instr);
 
         // go checks the opcode's run mode for the program's version first
         // (`<op> not allowed in current mode`), then the arguments, both
@@ -461,8 +456,8 @@ impl AvmMachine {
         if !self.mode_permits(instr.opcode) {
             return Err(self.mode_error());
         }
-        if !self.arg_gate_passes(&instr) {
-            return Err(self.arg_gate_error(&instr));
+        if !self.arg_gate_passes(instr) {
+            return Err(self.arg_gate_error(instr));
         }
 
         // Charge static cost. Must resolve through `resolve_spec` (not the
@@ -478,7 +473,7 @@ impl AvmMachine {
         }
 
         // Dispatch to opcode handler.
-        ops::dispatch(self, &instr, ctx)?;
+        ops::dispatch(self, instr, ctx)?;
 
         // If the handler didn't change the PC (no branch), advance by 1.
         if !self.finished && self.pc == old_pc {
@@ -493,8 +488,12 @@ impl AvmMachine {
     /// `ctx` provides external state access (transaction fields, app state, etc.).
     /// Pure-opcode tests can pass `&mut NullContext`.
     pub fn run(&mut self, ctx: &mut dyn AvmContext) -> Result<bool, AlgoError> {
+        // One reference count for the whole run, not one per instruction.
+        let program = std::sync::Arc::clone(&self.program);
         while !self.finished {
-            self.step(ctx)?;
+            let result = self.step_inner(&program, ctx);
+            self.current_instr = None;
+            result?;
         }
         Ok(self.pass)
     }
@@ -508,13 +507,15 @@ impl AvmMachine {
         ctx: &mut dyn AvmContext,
         tracer: &mut dyn EvalTracer,
     ) -> Result<(), AlgoError> {
-        let result = self.step_with_tracer_inner(ctx, tracer);
+        let program = std::sync::Arc::clone(&self.program);
+        let result = self.step_with_tracer_inner(&program, ctx, tracer);
         self.current_instr = None;
         result
     }
 
     fn step_with_tracer_inner(
         &mut self,
+        program: &Program,
         ctx: &mut dyn AvmContext,
         tracer: &mut dyn EvalTracer,
     ) -> Result<(), AlgoError> {
@@ -525,11 +526,11 @@ impl AvmMachine {
         }
 
         // If PC is past end of instructions, program finishes.
-        if self.pc >= self.program.instructions.len() {
+        if self.pc >= program.instructions.len() {
             return self.finish_implicit();
         }
 
-        let instr = self.program.instructions[self.pc].clone();
+        let instr = &program.instructions[self.pc];
         let old_pc = self.pc;
         // go's tracer reports the program counter as a BYTE offset into the
         // program (the version header counts), not an instruction index.
@@ -537,7 +538,7 @@ impl AvmMachine {
 
         // Record opcode hit for coverage tracking.
         self.opcode_hits[instr.opcode as usize] = true;
-        self.begin_instruction(&instr);
+        self.begin_instruction(instr);
 
         // Tracer: before opcode (called before cost charge so budget-
         // exhaustion opcodes are visible in the trace, matching go-algorand).
@@ -556,8 +557,8 @@ impl AvmMachine {
             );
             return Err(e);
         }
-        if !self.arg_gate_passes(&instr) {
-            let e = self.arg_gate_error(&instr);
+        if !self.arg_gate_passes(instr) {
+            let e = self.arg_gate_error(instr);
             let msg = e.to_string();
             tracer.after_opcode(
                 old_byte_pc,
@@ -579,7 +580,7 @@ impl AvmMachine {
         // index directly beneath it -- see `ops::stack::op_stores`), so it
         // must be read from the pre-dispatch stack here since `ops::dispatch`
         // does not currently thread a tracer through to the opcode handlers.
-        let scratch_write_slot = scratch_write_slot(&instr, &self.stack);
+        let scratch_write_slot = scratch_write_slot(instr, &self.stack);
 
         // Charge static cost. Must resolve through `resolve_spec` (not the
         // bare prefix-byte `lookup`) so a multi-byte "prefix opcode" family
@@ -603,7 +604,7 @@ impl AvmMachine {
         }
 
         // Dispatch to opcode handler.
-        let result = ops::dispatch(self, &instr, ctx);
+        let result = ops::dispatch(self, instr, ctx);
 
         // Tracer: after opcode (with error if any).
         match &result {
@@ -648,8 +649,11 @@ impl AvmMachine {
         ctx: &mut dyn AvmContext,
         tracer: &mut dyn EvalTracer,
     ) -> Result<bool, AlgoError> {
+        let program = std::sync::Arc::clone(&self.program);
         while !self.finished {
-            self.step_with_tracer(ctx, tracer)?;
+            let result = self.step_with_tracer_inner(&program, ctx, tracer);
+            self.current_instr = None;
+            result?;
         }
         Ok(self.pass)
     }
@@ -784,6 +788,18 @@ impl AvmMachine {
     ///
     /// The target byte offset = (byte offset after instruction) + int16_value.
     /// This function finds the instruction index at that byte offset.
+    /// The index of the instruction that starts at byte `offset` of the code
+    /// (after the version byte), or `None` when `offset` is not an instruction
+    /// boundary. The instructions are in ascending offset order, so this is a
+    /// binary search: no map to build per evaluation and no hashing per branch.
+    #[inline]
+    pub(crate) fn index_of_offset(&self, offset: usize) -> Option<usize> {
+        self.program
+            .instructions
+            .binary_search_by_key(&offset, |i| i.offset)
+            .ok()
+    }
+
     pub fn get_branch_target(
         &self,
         from_instruction: usize,
@@ -795,7 +811,7 @@ impl AvmMachine {
         let target_offset = (after_instr as isize + offset as isize) as usize;
 
         // Check if target is an instruction boundary.
-        if let Some(&idx) = self.offset_to_index.get(&target_offset) {
+        if let Some(idx) = self.index_of_offset(target_offset) {
             return Ok(idx);
         }
 
@@ -836,7 +852,7 @@ impl AvmMachine {
         let target_offset = target as usize;
 
         // Check if target is an instruction boundary.
-        if let Some(&idx) = self.offset_to_index.get(&target_offset) {
+        if let Some(idx) = self.index_of_offset(target_offset) {
             return Ok(idx);
         }
 
