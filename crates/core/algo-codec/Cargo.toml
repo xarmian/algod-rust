@@ -18,6 +18,7 @@ serde_bytes.workspace = true
 rmpv.workspace = true
 serde.workspace = true
 sha2.workspace = true
+ring.workspace = true
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

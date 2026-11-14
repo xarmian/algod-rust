@@ -19,7 +19,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use sha2::Digest as Sha2Digest;
-use sha2::{Sha512, Sha512_256};
+use sha2::Sha512;
 
 use algo_types::{Block, BlockHeader, Digest, Transaction};
 
@@ -134,11 +134,7 @@ pub fn compute_block_header_digest_512(header: &BlockHeader) -> [u8; 64] {
 }
 
 fn hash_with_prefix(prefix: &[u8], data: &[u8]) -> Digest {
-    let mut hasher = Sha512_256::new();
-    hasher.update(prefix);
-    hasher.update(data);
-    let result = hasher.finalize();
-    Digest(result.into())
+    Digest(crate::hash::sha512_256(&[prefix, data]))
 }
 
 #[cfg(test)]

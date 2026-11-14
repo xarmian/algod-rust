@@ -20,6 +20,7 @@
 
 mod canonical;
 mod digest;
+pub mod hash;
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub use canonical::payset_txid_hash_runs;

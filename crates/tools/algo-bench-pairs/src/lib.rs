@@ -407,9 +407,9 @@ fn sha512_256_case(dir: &Path, file: &str) -> Result<Pair> {
     let d2 = data.clone();
     Ok((
         Box::new(move || {
-            black_box(Sha512_256::digest(black_box(&data)));
+            black_box(algo_codec::hash::sha512_256(&[black_box(&data)]));
         }),
-        Box::new(move || Ok(format!("hex:{}", hex::encode(Sha512_256::digest(&d2))))),
+        Box::new(move || Ok(format!("hex:{}", hex::encode(algo_codec::hash::sha512_256(&[&d2]))))),
     ))
 }
 

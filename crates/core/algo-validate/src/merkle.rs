@@ -68,10 +68,7 @@ const ZERO_HASH: Hash = [0u8; 32];
 
 /// SHA512/256(prefix || data).
 fn hash_512_256(prefix: &[u8], data: &[u8]) -> Hash {
-    let mut hasher = Sha512_256::new();
-    hasher.update(prefix);
-    hasher.update(data);
-    hasher.finalize().into()
+    algo_codec::hash::sha512_256(&[prefix, data])
 }
 
 /// Reference transaction id for the unit tests: over an already restored
@@ -263,22 +260,14 @@ fn vc_root(algo: HashAlgo, leaves: Vec<VcNode>) -> Vec<u8> {
 
 /// Compute a Merkle leaf hash: SHA512/256("TL" || txid || stib_hash).
 fn compute_leaf_hash(txid: &Hash, stib_hash: &Hash) -> Hash {
-    let mut hasher = Sha512_256::new();
-    hasher.update(TL_PREFIX);
-    hasher.update(txid);
-    hasher.update(stib_hash);
-    hasher.finalize().into()
+    algo_codec::hash::sha512_256(&[TL_PREFIX, txid, stib_hash])
 }
 
 /// Compute an internal Merkle node hash: SHA512/256("MA" || left || right).
 ///
 /// If one child is missing (odd-length layer), the caller passes `ZERO_HASH`.
 fn compute_internal_hash(left: &Hash, right: &Hash) -> Hash {
-    let mut hasher = Sha512_256::new();
-    hasher.update(MA_PREFIX);
-    hasher.update(left);
-    hasher.update(right);
-    hasher.finalize().into()
+    algo_codec::hash::sha512_256(&[MA_PREFIX, left, right])
 }
 
 /// Build a single layer of parent hashes from a child layer.
@@ -518,10 +507,7 @@ pub fn compute_vector_commitment(block: &Block, algo: HashAlgo) -> Vec<u8> {
 
 /// Compute the STIB hash from raw msgpack bytes: SHA512/256("STIB" || raw_blob).
 pub fn compute_stib_hash_raw(raw_blob: &[u8]) -> Hash {
-    let mut hasher = Sha512_256::new();
-    hasher.update(STIB_PREFIX);
-    hasher.update(raw_blob);
-    hasher.finalize().into()
+    hash_512_256(STIB_PREFIX, raw_blob)
 }
 
 /// Compute the payset Merkle root using raw STIB blobs for STIB hashing
