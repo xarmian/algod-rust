@@ -685,25 +685,42 @@ impl AvmMachine {
     }
 
     /// Push a value onto the stack.
+    #[inline]
     pub fn push(&mut self, val: AvmValue) -> Result<(), AlgoError> {
         if self.stack.len() >= MAX_STACK_DEPTH {
-            return Err(AlgoError::Avm {
-                message: format!("stack overflow: depth exceeds {MAX_STACK_DEPTH}"),
-            });
+            return Err(Self::stack_overflow_error());
         }
         self.stack.push(val);
         Ok(())
     }
 
+    #[cold]
+    #[inline(never)]
+    fn stack_overflow_error() -> AlgoError {
+        AlgoError::Avm {
+            message: format!("stack overflow: depth exceeds {MAX_STACK_DEPTH}"),
+        }
+    }
+
     /// Pop any value from the stack.
+    #[inline]
     pub fn pop(&mut self) -> Result<AvmValue, AlgoError> {
-        self.stack.pop().ok_or_else(|| AlgoError::Avm {
-            // go: `stack underflow in <op>` (`step`'s argument gate).
+        match self.stack.pop() {
+            Some(v) => Ok(v),
+            None => Err(self.stack_underflow_error()),
+        }
+    }
+
+    /// go: `stack underflow in <op>` (`step`'s argument gate).
+    #[cold]
+    #[inline(never)]
+    fn stack_underflow_error(&self) -> AlgoError {
+        AlgoError::Avm {
             message: match self.current_op_name() {
                 "" => "stack underflow".to_string(),
                 name => format!("stack underflow in {name}"),
             },
-        })
+        }
     }
 
     /// Pop any value from the stack (alias for `pop`).
@@ -715,6 +732,7 @@ impl AvmMachine {
     ///
     /// Empty bytes are coerced to 0 (matching Go's behavior).
     /// Non-empty bytes produce an error.
+    #[inline]
     pub fn pop_uint(&mut self) -> Result<u64, AlgoError> {
         match self.pop()? {
             AvmValue::Uint64(v) => Ok(v),
@@ -758,30 +776,37 @@ impl AvmMachine {
     /// `TestAppCallOverBudget` row). The opcode's actual handler is never
     /// dispatched in either case (the caller returns this error before
     /// calling `ops::dispatch`), so real execution outcomes are unaffected.
+    #[inline]
     pub fn charge_cost(&mut self, cost: u64) -> Result<(), AlgoError> {
         if cost as i64 > self.budget {
-            // go's `step`: `dynamic cost budget exceeded, executing <op>: local
-            // program cost was <cost so far>`. The budget compared is the
-            // pooled one and the figure printed is this program's own `cost`,
-            // both as go's (`remainingBudget()` vs `cx.cost`). Outside an
-            // instruction (direct calls) there is no opcode to name.
-            let message = match self.current_op_name() {
-                "" => format!(
-                    "dynamic cost budget exceeded: local program cost was {}",
-                    self.cost
-                ),
-                name => format!(
-                    "dynamic cost budget exceeded, executing {name}: local program cost was {}",
-                    self.cost
-                ),
-            };
-            return Err(AlgoError::Avm { message });
+            return Err(self.budget_exceeded_error());
         }
         // Track this program's own cumulative cost independently of the shared
         // (pooled) budget, mirroring go-algorand's `cx.cost`.
         self.cost = self.cost.saturating_add(cost);
         self.budget -= cost as i64;
         Ok(())
+    }
+
+    /// go's `step`: `dynamic cost budget exceeded, executing <op>: local
+    /// program cost was <cost so far>`. The budget compared is the pooled one
+    /// and the figure printed is this program's own `cost`, both as go's
+    /// (`remainingBudget()` vs `cx.cost`). Outside an instruction (direct
+    /// calls) there is no opcode to name.
+    #[cold]
+    #[inline(never)]
+    fn budget_exceeded_error(&self) -> AlgoError {
+        let message = match self.current_op_name() {
+            "" => format!(
+                "dynamic cost budget exceeded: local program cost was {}",
+                self.cost
+            ),
+            name => format!(
+                "dynamic cost budget exceeded, executing {name}: local program cost was {}",
+                self.cost
+            ),
+        };
+        AlgoError::Avm { message }
     }
 
     /// Resolve a branch target from an instruction index + int16 offset.
