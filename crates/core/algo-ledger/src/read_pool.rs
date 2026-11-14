@@ -568,8 +568,7 @@ impl LedgerReadPool {
         }
         let data = self.with_conn(|c| {
             c.prepare_cached(
-                "SELECT data FROM onlineaccounts WHERE address = ?1 AND updround <= ?2 \
-                 ORDER BY updround DESC LIMIT 1",
+                crate::sqlite::ONLINE_ACCOUNT_AT_ROUND_SQL,
             )?
             .query_row(params![addr.0.as_slice(), round as i64], |row| {
                 row.get::<_, Vec<u8>>(0)
