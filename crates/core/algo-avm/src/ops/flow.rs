@@ -356,7 +356,7 @@ fn resolve_label(
     let after_instr = instruction.offset + 1 + imm_len;
     let target_byte_offset = (after_instr as isize + label_offset as isize) as usize;
 
-    if let Some(&idx) = machine.offset_to_index.get(&target_byte_offset) {
+    if let Some(idx) = machine.index_of_offset(target_byte_offset) {
         return Ok(idx);
     }
 
