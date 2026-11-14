@@ -487,6 +487,14 @@ impl CachedConn for Connection {
     }
 }
 
+/// Run one parameterless control statement (`BEGIN ...`, `COMMIT`, the lock
+/// probe) through the connection's statement cache. `Connection::execute_batch`
+/// parses its text on every call; the per-block statements of the apply path
+/// are the same few texts every block (issue #2333).
+fn exec_cached(conn: &Connection, sql: &str) -> rusqlite::Result<()> {
+    conn.prepare_cached(sql)?.execute([]).map(drop)
+}
+
 /// Open a raw `rusqlite::Connection` against the ledger pair derived from
 /// `path` (a prefix or legacy `.sqlite`-suffixed path). The tracker file is
 /// opened as the `main` schema and the block file is attached as `blockdb`.
@@ -4085,15 +4093,10 @@ impl SqliteLedger {
         // does). The no-op UPDATE is the first statement, so it takes the
         // lock now (waiting on the busy handler, as `BEGIN IMMEDIATE` did)
         // instead of at the first real write.
-        self.conn
-            .execute_batch("BEGIN DEFERRED")
-            .map_err(|e| AlgoError::Ledger {
-                message: format!("begin block error: {e}"),
-            })?;
-        if let Err(e) = self
-            .conn
-            .execute_batch("UPDATE acctrounds SET rnd = rnd WHERE 0")
-        {
+        exec_cached(&self.conn, "BEGIN DEFERRED").map_err(|e| AlgoError::Ledger {
+            message: format!("begin block error: {e}"),
+        })?;
+        if let Err(e) = exec_cached(&self.conn, "UPDATE acctrounds SET rnd = rnd WHERE 0") {
             let _ = self.conn.execute_batch("ROLLBACK");
             return Err(AlgoError::Ledger {
                 message: format!("begin block error: {e}"),
@@ -5094,11 +5097,9 @@ impl SqliteLedger {
                 message: "commit block error: injected tracker commit failure".into(),
             });
         }
-        self.conn
-            .execute_batch("COMMIT")
-            .map_err(|e| AlgoError::Ledger {
-                message: format!("commit block error: {e}"),
-            })?;
+        exec_cached(&self.conn, "COMMIT").map_err(|e| AlgoError::Ledger {
+            message: format!("commit block error: {e}"),
+        })?;
         // The block is committed in both files: nothing is in flight any more.
         self.archive_created.clear();
         self.refresh_inflight_marker();
@@ -8055,9 +8056,7 @@ impl SqliteLedger {
         self.failpoint("before_archive_commit");
         self.ensure_archive_writer()?;
         let writer = self.archive_writer.as_ref().expect("opened above");
-        writer
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| fail("begin", e))?;
+        exec_cached(writer, "BEGIN IMMEDIATE").map_err(|e| fail("begin", e))?;
         // Rounds this commit creates (no row yet): removed again if the
         // tracker commit fails.
         let mut created = Vec::new();
@@ -8091,7 +8090,7 @@ impl SqliteLedger {
             self.archive_inflight.set(olo as u64, ohi as u64);
         }
         let writer = self.archive_writer.as_ref().expect("opened above");
-        if let Err(e) = writer.execute_batch("COMMIT") {
+        if let Err(e) = exec_cached(writer, "COMMIT") {
             let _ = writer.execute_batch("ROLLBACK");
             self.archive_created.clear();
             self.refresh_inflight_marker();
