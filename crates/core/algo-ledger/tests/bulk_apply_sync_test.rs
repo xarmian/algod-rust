@@ -555,3 +555,125 @@ fn a_prune_outside_a_span_applies_the_staged_writes_first() {
     assert!(ledger.get_block_data(10).unwrap().is_some());
     assert_eq!(staged_rows(&prefix), 0);
 }
+
+/// Review finding on PR #2335: a round left in the orphan list (its archive
+/// row was written, its tracker commit failed, the orphan delete failed too)
+/// and then committed for real through staging must not be deleted from the
+/// block file by a later orphan reconciliation.
+#[test]
+fn a_committed_round_is_never_deleted_as_an_orphan() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = dir.path().join("ledger");
+    let mut ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+    for round in 1..=5u64 {
+        commit_block_round(&mut ledger, round);
+    }
+    // Round 6: the archive commit succeeds, the tracker commit fails, and the
+    // orphan delete fails at the abort and again at the retry's begin_block.
+    ledger.inject_tracker_commit_failures(1);
+    ledger.inject_orphan_delete_failures(2);
+    ledger.begin_block().unwrap();
+    ledger
+        .put_block(6, "test", &test_header(6), b"block body 6")
+        .unwrap();
+    ledger.put_block_cert(6, b"cert 6").unwrap();
+    ledger.set_current_round(Round(6));
+    assert!(ledger.commit_block().is_err());
+
+    // Re-applied during a bulk apply (staged), then moved to the block file.
+    ledger.set_bulk_apply(true).unwrap();
+    commit_block_round(&mut ledger, 6);
+    ledger.set_bulk_apply(false).unwrap();
+    // The next block reconciles orphans: round 6 is committed, not an orphan.
+    commit_block_round(&mut ledger, 7);
+    assert_eq!(
+        ledger.get_block_data(6).unwrap(),
+        Some(b"block body 6".to_vec()),
+        "committed round 6 lost its block"
+    );
+    assert!(file_rounds(&prefix).contains(&6));
+    drop(ledger);
+    let ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+    assert!(ledger.get_block_data(6).unwrap().is_some());
+}
+
+/// Bulk apply ends while blocks are staged and the move fails or is deferred:
+/// the next blocks keep going through the staging (no block reaches the file
+/// before older staged ones), and the move happens at their commit.
+#[test]
+fn staging_continues_until_the_staged_blocks_are_moved() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = dir.path().join("ledger");
+    let mut ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+    ledger.set_bulk_apply(true).unwrap();
+    for round in 1..=10u64 {
+        commit_block_round(&mut ledger, round);
+    }
+    // End the bulk apply inside a span: the move is deferred to this commit.
+    ledger.begin_block().unwrap();
+    ledger.set_bulk_apply(false).unwrap();
+    ledger.set_current_round(Round(11));
+    ledger
+        .put_block(11, "test", &test_header(11), b"block body 11")
+        .unwrap();
+    ledger.put_block_cert(11, b"cert 11").unwrap();
+    ledger.commit_block().unwrap();
+    assert_eq!(file_rounds(&prefix), (1..=11).collect::<Vec<i64>>());
+    assert_eq!(staged_rows(&prefix), 0);
+}
+
+/// Review finding on PR #2335: when moving staged blocks keeps failing (the
+/// block file is unwritable), the apply stops loudly after 4 x 64 staged
+/// blocks instead of piling them up; once the file is writable again
+/// everything is moved and nothing was lost.
+#[test]
+fn moves_that_keep_failing_stop_the_apply_instead_of_piling_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = dir.path().join("ledger");
+    let mut ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+    ledger.set_bulk_apply(true).unwrap();
+    ledger.inject_staged_drain_failures(usize::MAX);
+    for round in 1..=256u64 {
+        commit_block_round(&mut ledger, round);
+    }
+    assert!(file_rounds(&prefix).is_empty());
+    // The 257th block is refused.
+    ledger.begin_block().unwrap();
+    ledger
+        .put_block(257, "test", &test_header(257), b"block body 257")
+        .unwrap();
+    ledger.set_current_round(Round(257));
+    let err = ledger.commit_block().unwrap_err();
+    assert!(err.to_string().contains("staged blocks"), "{err}");
+    assert_eq!(ledger.last_committed_round().unwrap(), Some(256));
+
+    // The file is writable again: everything staged is moved, in order.
+    ledger.inject_staged_drain_failures(0);
+    ledger.set_bulk_apply(false).unwrap();
+    assert_eq!(file_rounds(&prefix), (1..=256).collect::<Vec<i64>>());
+    assert_eq!(staged_rows(&prefix), 0);
+    assert_eq!(state_digest(&ledger, 256), reference_digest(256));
+}
+
+/// Review finding on PR #2335: a block committed during a bulk apply without
+/// `put_block` gets only a synthesized header-only row; it must be readable
+/// while staged, as it was when written straight to the file.
+#[test]
+fn a_staged_header_only_row_is_readable_before_it_is_moved() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = dir.path().join("ledger");
+    let mut ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+    commit_block_round(&mut ledger, 1);
+    ledger.set_bulk_apply(true).unwrap();
+    ledger.begin_block().unwrap();
+    ledger.set_current_round(Round(2));
+    ledger.commit_block().unwrap();
+    assert!(!file_rounds(&prefix).contains(&2), "still staged");
+    let staged_hdr = ledger.get_block_header_data(2).unwrap();
+    assert!(staged_hdr.is_some(), "a staged header-only row must be readable");
+    assert!(ledger.get_block_proto(2).unwrap().is_some());
+
+    ledger.set_bulk_apply(false).unwrap();
+    assert!(file_rounds(&prefix).contains(&2));
+    assert_eq!(ledger.get_block_header_data(2).unwrap(), staged_hdr);
+}

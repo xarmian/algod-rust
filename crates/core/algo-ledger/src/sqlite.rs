@@ -2523,6 +2523,11 @@ pub struct SqliteLedger {
     /// not yet in the block file; served to readers like the open span's
     /// buffer.
     staged_archive: PendingArchive,
+    /// DIVERGENCE DIV-011: the highest `seq` of `algod_rust_staged_archive` the
+    /// in-memory `staged_archive` covers (a move deletes exactly those rows),
+    /// and the one the open span's staging wrote (moved over on commit).
+    staged_max_seq: i64,
+    span_staged_seq: Option<i64>,
     /// The `synchronous` level last applied to the tracker connection (see
     /// [`SqliteLedger::sync_tracker_level`]).
     tracker_sync_applied: std::sync::atomic::AtomicI64,
@@ -2546,6 +2551,9 @@ pub struct SqliteLedger {
     /// Test hook: fail the next N orphan-row deletes.
     #[cfg(any(test, feature = "test-hooks"))]
     fail_orphan_delete: usize,
+    /// Test hook: fail the next `n` moves of staged block archive rows.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_staged_drain: usize,
     /// Test hook (see [`Self::set_failpoint`]).
     #[cfg(any(test, feature = "test-hooks"))]
     failpoint_cfg: Option<Failpoint>,
@@ -3445,6 +3453,8 @@ impl SqliteLedger {
             synchronous_mode: std::sync::atomic::AtomicI64::new(DEFAULT_LEDGER_SYNCHRONOUS_MODE),
             bulk_apply: std::sync::atomic::AtomicBool::new(false),
             staged_archive: PendingArchive::default(),
+            staged_max_seq: 0,
+            span_staged_seq: None,
             tracker_sync_applied: std::sync::atomic::AtomicI64::new(
                 DEFAULT_LEDGER_SYNCHRONOUS_MODE,
             ),
@@ -3456,6 +3466,8 @@ impl SqliteLedger {
             fail_tracker_commit: 0,
             #[cfg(any(test, feature = "test-hooks"))]
             fail_orphan_delete: 0,
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_staged_drain: 0,
             #[cfg(any(test, feature = "test-hooks"))]
             failpoint_cfg: None,
             #[cfg(test)]
@@ -5125,6 +5137,10 @@ impl SqliteLedger {
         // in the tracker instead, in this same transaction (atomic with the
         // block's tracker rows, no block file `fsync`), and moved to the block
         // file every `STAGE_MAX_BLOCKS` blocks.
+        // The rounds this block writes: once its tracker commit succeeds they
+        // are committed, never orphans (review of PR #2335: a stale orphan
+        // entry for a round later committed deleted its block).
+        let committed_rounds = self.pending_archive.block_rounds();
         let staged = self.stage_pending_archive()?;
         if !staged {
             self.flush_pending_archive()?;
@@ -5147,7 +5163,11 @@ impl SqliteLedger {
             // until it is moved to the block file.
             let ops = std::mem::take(&mut self.pending_archive.ops);
             self.staged_archive.ops.extend(ops);
+            if let Some(seq) = self.span_staged_seq.take() {
+                self.staged_max_seq = self.staged_max_seq.max(seq);
+            }
         }
+        self.orphan_rounds.retain(|r| !committed_rounds.contains(r));
         self.refresh_inflight_marker();
         self.failpoint("after_tracker_commit");
         if let Some(start) = database_commit_start {
@@ -5760,6 +5780,7 @@ impl SqliteLedger {
         // dropped. Rows it already committed to the archive (its tracker
         // COMMIT failed afterwards) are removed again by `reconcile_orphans`.
         self.pending_archive.clear();
+        self.span_staged_seq = None;
         self.reconcile_orphans();
         // Clear pre-mutation records -- they are for the aborted block.
         self.pre_mutations.clear();
@@ -7659,7 +7680,7 @@ pub(crate) const STAGE_MAX_BLOCKS: usize = 64;
 /// transactions in that order, so a crash in between only repeats the move
 /// (the writes are idempotent). Returns how many staged writes were moved.
 fn recover_staged_archive(conn: &Connection) -> rusqlite::Result<usize> {
-    let staged = PendingArchive::load_staged(conn)?;
+    let (staged, max_seq) = PendingArchive::load_staged(conn)?;
     if staged.is_empty() {
         return Ok(0);
     }
@@ -7673,7 +7694,12 @@ fn recover_staged_archive(conn: &Connection) -> rusqlite::Result<usize> {
         let _ = conn.execute_batch("ROLLBACK");
         return Err(e);
     }
-    conn.execute_batch("DELETE FROM algod_rust_staged_archive")?;
+    // Only the rows moved above (another ledger on the same files could have
+    // staged more meanwhile).
+    conn.execute(
+        "DELETE FROM algod_rust_staged_archive WHERE seq <= ?1",
+        params![max_seq],
+    )?;
     tracing::info!(writes = n, "moved staged block archive rows to the block file");
     Ok(n)
 }
@@ -7730,16 +7756,19 @@ impl PendingArchive {
         Ok(())
     }
 
-    /// DIVERGENCE DIV-011: the staging table's writes, in issue order.
-    fn load_staged(conn: &Connection) -> rusqlite::Result<Self> {
+    /// DIVERGENCE DIV-011: the staging table's writes, in issue order, and the
+    /// highest `seq` among them.
+    fn load_staged(conn: &Connection) -> rusqlite::Result<(Self, i64)> {
         let mut st = conn.prepare(
-            "SELECT kind, rnd, proto, hdr, blk, cert, insert_ignore \
+            "SELECT kind, rnd, proto, hdr, blk, cert, insert_ignore, seq \
              FROM algod_rust_staged_archive ORDER BY seq",
         )?;
+        let mut max_seq = 0i64;
         let rows = st.query_map([], |r| {
             let kind: i64 = r.get(0)?;
             let rnd: i64 = r.get(1)?;
-            Ok(match kind {
+            let seq: i64 = r.get(7)?;
+            Ok((seq, match kind {
                 0 => ArchiveOp::Block {
                     round: rnd,
                     proto: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
@@ -7752,13 +7781,37 @@ impl PendingArchive {
                     cert: r.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default(),
                 },
                 _ => ArchiveOp::Prune { below: rnd },
-            })
+            }))
         })?;
         let mut ops = Vec::new();
-        for op in rows {
-            ops.push(op?);
+        for row in rows {
+            let (seq, op) = row?;
+            max_seq = max_seq.max(seq);
+            ops.push(op);
         }
-        Ok(Self { ops })
+        Ok((Self { ops }, max_seq))
+    }
+
+    /// DIVERGENCE DIV-011: the newest header-only row (`insert_ignore`) for
+    /// `round`, when no later write replaced or pruned it. Such a row is only
+    /// written when the file has none, so a reader that finds no row in the
+    /// file uses it.
+    fn latest_header_only(&self, round: i64) -> Option<(&str, &[u8], &[u8])> {
+        for op in self.ops.iter().rev() {
+            match op {
+                ArchiveOp::Block {
+                    round: r,
+                    proto,
+                    hdr,
+                    blk,
+                    insert_ignore: true,
+                } if *r == round => return Some((proto, hdr, blk)),
+                ArchiveOp::Block { round: r, .. } if *r == round => return None,
+                ArchiveOp::Prune { below } if round < *below => return None,
+                _ => {}
+            }
+        }
+        None
     }
 
     fn clear(&mut self) {
@@ -8077,6 +8130,12 @@ impl SqliteLedger {
         self.staged_archive.latest_block(round as i64)
     }
 
+    /// DIVERGENCE DIV-011: a staged header-only row for `round`, for a reader
+    /// that found no row in the block file.
+    fn staged_header_only(&self, round: u64) -> Option<(&str, &[u8], &[u8])> {
+        self.staged_archive.latest_header_only(round as i64)
+    }
+
     /// Whether the buffered writes (the open span's, then the staged ones)
     /// decide that a block row for `round` exists.
     fn buffered_row_state(&self, round: i64) -> Option<bool> {
@@ -8220,8 +8279,23 @@ impl SqliteLedger {
     /// can never be ahead of its blocks, the DIV-009 guarantee, without one
     /// block-file `fsync` per block.
     fn stage_pending_archive(&mut self) -> Result<bool, AlgoError> {
-        if !self.bulk_apply.load(std::sync::atomic::Ordering::SeqCst) || self.block_path.is_none() {
+        // Staging also continues while older blocks are still staged (the bulk
+        // apply ended inside a span, or a move failed): a block must never
+        // reach the file before the staged blocks ahead of it.
+        let bulk = self.bulk_apply.load(std::sync::atomic::Ordering::SeqCst);
+        if (!bulk && self.staged_archive.is_empty()) || self.block_path.is_none() {
             return Ok(false);
+        }
+        // Moves keep failing (the block file is unwritable): stop the apply
+        // loudly, as the per-block archive commit did, instead of piling up
+        // blocks in memory and in the tracker.
+        let staged_blocks = self.staged_archive.block_rounds().len();
+        if staged_blocks >= 4 * STAGE_MAX_BLOCKS {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "commit block error: {staged_blocks} staged blocks could not be moved to the block file"
+                ),
+            });
         }
         // A span whose own connection already wrote the block file (test
         // fixtures) keeps the DIV-009 path, as `flush_pending_archive` does.
@@ -8239,6 +8313,7 @@ impl SqliteLedger {
             .map_err(|e| AlgoError::Ledger {
                 message: format!("stage block archive rows: {e}"),
             })?;
+        self.span_staged_seq = Some(self.conn.last_insert_rowid());
         // Hidden from the read pool from the moment the tracker commit makes
         // the block visible to other connections.
         let mut rounds = self.pending_archive.block_rounds();
@@ -8259,6 +8334,13 @@ impl SqliteLedger {
         if self.staged_archive.is_empty() || self.in_block {
             return Ok(());
         }
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self.fail_staged_drain > 0 {
+            self.fail_staged_drain -= 1;
+            return Err(AlgoError::Ledger {
+                message: "injected staged archive move failure".into(),
+            });
+        }
         let fail = |what: &str, e: rusqlite::Error| AlgoError::Ledger {
             message: format!("move staged block archive rows ({what}): {e}"),
         };
@@ -8274,7 +8356,10 @@ impl SqliteLedger {
             return Err(fail("commit", e));
         }
         self.failpoint("after_staged_archive_commit");
-        if let Err(e) = exec_cached(&self.conn, "DELETE FROM algod_rust_staged_archive") {
+        if let Err(e) = self.conn.execute_cached(
+            "DELETE FROM algod_rust_staged_archive WHERE seq <= ?1",
+            params![self.staged_max_seq],
+        ) {
             tracing::warn!(error = %e, "staged block archive rows moved but not deleted; they are moved again later");
         }
         self.staged_archive.clear();
@@ -8374,6 +8459,13 @@ impl SqliteLedger {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn inject_tracker_commit_failures(&mut self, n: usize) {
         self.fail_tracker_commit = n;
+    }
+
+    /// Test hook: fail the next `n` moves of staged block archive rows to the
+    /// block file (DIV-011).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn inject_staged_drain_failures(&mut self, n: usize) {
+        self.fail_staged_drain = n;
     }
 
     /// Test hook: fail the next `n` deletes of archive rows an uncommitted
@@ -10142,7 +10234,8 @@ impl LedgerStore for SqliteLedger {
             Buffered::Miss => {}
         }
         let _st = crate::follow_timing::StateTimer::read();
-        self.conn
+        let found = self
+            .conn
             .query_row_cached(
                 "SELECT blkdata FROM blockdb.blocks WHERE rnd = ?1",
                 params![round as i64],
@@ -10151,7 +10244,13 @@ impl LedgerStore for SqliteLedger {
             .optional()
             .map_err(|e| AlgoError::Ledger {
                 message: format!("get_block_data error: {e}"),
-            })
+            })?;
+        if found.is_none() {
+            if let Some((_, _, blk)) = self.staged_header_only(round) {
+                return Ok(Some(blk.to_vec()));
+            }
+        }
+        Ok(found)
     }
 
     fn get_block_header_data(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
@@ -10161,7 +10260,8 @@ impl LedgerStore for SqliteLedger {
             Buffered::Miss => {}
         }
         let _st = crate::follow_timing::StateTimer::read();
-        self.conn
+        let found = self
+            .conn
             .query_row_cached(
                 "SELECT hdrdata FROM blockdb.blocks WHERE rnd = ?1",
                 params![round as i64],
@@ -10170,7 +10270,13 @@ impl LedgerStore for SqliteLedger {
             .optional()
             .map_err(|e| AlgoError::Ledger {
                 message: format!("get_block_header_data error: {e}"),
-            })
+            })?;
+        if found.is_none() {
+            if let Some((_, hdr, _)) = self.staged_header_only(round) {
+                return Ok(Some(hdr.to_vec()));
+            }
+        }
+        Ok(found)
     }
 
     fn get_block_cert(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
@@ -10207,7 +10313,8 @@ impl LedgerStore for SqliteLedger {
             Buffered::Miss => {}
         }
         let _st = crate::follow_timing::StateTimer::read();
-        self.conn
+        let found = self
+            .conn
             .query_row_cached(
                 "SELECT proto FROM blockdb.blocks WHERE rnd = ?1",
                 params![round as i64],
@@ -10216,7 +10323,13 @@ impl LedgerStore for SqliteLedger {
             .optional()
             .map_err(|e| AlgoError::Ledger {
                 message: format!("get_block_proto error: {e}"),
-            })
+            })?;
+        if found.is_none() {
+            if let Some((proto, _, _)) = self.staged_header_only(round) {
+                return Ok(Some(proto.to_string()));
+            }
+        }
+        Ok(found)
     }
 
     fn put_block_cert(&mut self, round: u64, certdata: &[u8]) -> Result<(), AlgoError> {
@@ -19177,6 +19290,8 @@ mod tests {
             synchronous_mode: _,            // connection setting
             bulk_apply: _,                  // connection setting
             staged_archive: _,              // committed, drained by drain_staged_archive
+            staged_max_seq: _,              // bookkeeping of staged_archive
+            span_staged_seq: _,             // reset by abort_block_state
             tracker_sync_applied: _,        // connection setting
             archive_inflight: _,            // read-pool visibility flag
             block_path: _,                  // attached file
@@ -19184,6 +19299,7 @@ mod tests {
             orphan_rounds: _,               // reconciled by abort_block_state
             fail_tracker_commit: _,         // test hook
             fail_orphan_delete: _,          // test hook
+            fail_staged_drain: _,           // test hook
             failpoint_cfg: _,               // test hook
             fail_rollback_count: _,         // test-only injection flag
             current_round: _,               // ChainSnapshot
