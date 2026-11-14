@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 
 use algo_error::AlgoError;
-use sha2::{Digest as Sha2Digest, Sha256, Sha512, Sha512_256};
+use sha2::{Digest as Sha2Digest, Sha256, Sha512};
 use sha3::{Keccak256, Sha3_256};
 
 use crate::bytecode::Instruction;
@@ -64,7 +64,7 @@ pub fn op_sha512_256(
     _instruction: &Instruction,
 ) -> Result<(), AlgoError> {
     let data = machine.pop_bytes()?;
-    let hash = Sha512_256::digest(&data);
+    let hash = algo_codec::hash::sha512_256(&[&data]);
     machine.push(AvmValue::Bytes(hash.to_vec()))
 }
 
@@ -1645,6 +1645,9 @@ fn poseidon2_round_keys<F: ark_ff::PrimeField>(seed: &str) -> Vec<Vec<F>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The independent reference the opcode is checked against: `sha2`, not the
+    // `ring`-backed helper the opcode itself uses (issue #2321).
+    use sha2::Sha512_256;
     use crate::bytecode::parse;
     use crate::context::NullContext;
     use crate::machine::ExecMode;

@@ -162,7 +162,10 @@ required) against the workspace `Cargo.lock` as of this PR:
   silently assumed, per this audit's own honesty standard. A newer `ring
   0.17.14` (also in the tree, presumably via a different dependency's
   pinned version) does carry a `license` field (`Apache-2.0 AND ISC`),
-  consistent with this reading.
+  consistent with this reading. Since issue #2321 `ring 0.17` is also a
+  DIRECT dependency of `algo-codec` (`algo_codec::hash`, SHA-512/256 for the hot
+  paths); it was already linked into the node binary through
+  `hickory-resolver`, so the shipped code and the license set are unchanged.
 - **`r-efi 5.3.0` / `r-efi 6.0.0` — `MIT OR Apache-2.0 OR
   LGPL-2.1-or-later`.** Triple-licensed; algod-rust relies on the MIT or
   Apache-2.0 branch, so the LGPL option is available but not the one in

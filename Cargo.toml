@@ -91,6 +91,7 @@ curve25519-dalek = { version = "5", features = ["alloc"] }
 k256 = { version = "0.14", features = ["ecdsa"] }
 p256 = { version = "0.14", features = ["ecdsa"] }
 sha2 = "0.11"
+ring = "0.17"
 sha3 = "0.12"
 shake = "0.1"
 blake2 = "0.11"
