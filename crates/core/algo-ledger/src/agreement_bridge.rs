@@ -1222,7 +1222,7 @@ impl crate::catchup_service::CatchupLedger for AgreementLedgerBridge {
         // blocks in a row. Taken between two `ensure_block` calls of the
         // catchup apply loop, so no block span is open on this ledger.
         match self.ledger.lock() {
-            Ok(ledger) => {
+            Ok(mut ledger) => {
                 if let Err(e) = ledger.set_bulk_apply(bulk) {
                     warn!(bulk, "set_bulk_apply failed: {e}");
                 }

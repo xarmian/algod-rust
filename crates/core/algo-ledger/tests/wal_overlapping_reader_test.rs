@@ -287,6 +287,7 @@ const FAILPOINT_ENV: &str = "WAL_KILL_FAILPOINT";
 const LATE_PUT_ENV: &str = "WAL_KILL_LATE_PUT";
 const PRUNE_ENV: &str = "WAL_KILL_PRUNE";
 const SPLIT_ENV: &str = "WAL_KILL_SPLIT";
+const BULK_ENV: &str = "WAL_KILL_BULK";
 
 /// Where the block file of a ledger lives: next to the tracker, or (the
 /// configured block DB directory) in a `cold` directory beside it.
@@ -396,6 +397,10 @@ fn wal_kill_child() {
         std::fs::create_dir_all(split_dir(&prefix)).unwrap();
     }
     let mut ledger = open_ledger(&prefix).unwrap();
+    if std::env::var(BULK_ENV).is_ok() {
+        // DIV-011: a catchup bulk apply, blocks staged in the tracker.
+        ledger.set_bulk_apply(true).unwrap();
+    }
     if let Ok(spec) = std::env::var(FAILPOINT_ENV) {
         let (name, after) = spec.split_once(':').unwrap();
         ledger.set_failpoint(name, after.parse().unwrap());
@@ -437,6 +442,7 @@ struct ChildOpts<'a> {
     late_put: bool,
     prune: Option<u64>,
     split: bool,
+    bulk: bool,
 }
 
 fn spawn_child(dir: &Path, o: ChildOpts) -> std::process::Child {
@@ -464,6 +470,9 @@ fn spawn_child(dir: &Path, o: ChildOpts) -> std::process::Child {
     }
     if o.split {
         cmd.env(SPLIT_ENV, "1");
+    }
+    if o.bulk {
+        cmd.env(BULK_ENV, "1");
     }
     cmd.spawn().unwrap()
 }
@@ -1074,6 +1083,164 @@ fn kill_mid_commit_recovers_every_reported_round_with_split_dirs() {
         return;
     }
     randomized_kills(true);
+}
+
+// ---- kills during a bulk apply (DIV-011 step 2, issue #2315) ---------------
+//
+// In a bulk apply a block's archive rows are staged in the TRACKER, in the
+// block's own transaction, and moved to the block file every 64 blocks. On the
+// raw files the tracker may then be ahead of the block FILE; the staged rows
+// cover the difference and the next open moves them before anything reads.
+// So these tests check the files after that open.
+
+/// Open (which moves staged blocks to the block file), then every check of
+/// `assert_reopens`, including "the tracker is never ahead of the block file".
+fn assert_reopens_after_staging(prefix: &Path, reported: u64, what: &str) -> SqliteLedger {
+    drop(
+        open_ledger(prefix)
+            .unwrap_or_else(|e| panic!("{what}: reopen refused (moving staged blocks): {e}")),
+    );
+    assert_reopens(prefix, reported, what)
+}
+
+fn randomized_bulk_kills(split: bool) {
+    let kills: u32 = std::env::var("WAL_KILL_COUNT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40);
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = dir.path().join("ledger");
+    if split {
+        std::fs::create_dir_all(split_dir(&prefix)).unwrap();
+    }
+    let mut seed = 0x2315_u64;
+    let (mut staged_at_kill, mut total_progress, mut reported_max) = (0u32, 0u64, 0u64);
+    for kill in 0..kills {
+        let what = format!("bulk kill {kill} (split dirs: {split})");
+        let before = if tracker_path_for_prefix(&prefix).exists() {
+            raw_rounds(&prefix).0 as u64
+        } else {
+            0
+        };
+        let mut child = spawn_child(
+            dir.path(),
+            ChildOpts {
+                late_put: kill % 2 == 1,
+                split,
+                bulk: true,
+                ..Default::default()
+            },
+        );
+        let reader = reported_rounds(&mut child);
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        std::thread::sleep(Duration::from_millis(250 + seed % 750));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let reported = reader.join().unwrap();
+        reported_max = reported_max.max(reported);
+        total_progress += reported.saturating_sub(before);
+        let (acct, bmax) = raw_rounds(&prefix);
+        if acct > bmax {
+            staged_at_kill += 1; // the block file behind, the rest staged
+        }
+        drop(assert_reopens_after_staging(&prefix, reported, &what));
+    }
+    assert!(
+        total_progress > 100,
+        "too little progress to prove anything: {total_progress}"
+    );
+    assert!(
+        staged_at_kill > 0,
+        "no kill landed with blocks staged: the test proves nothing about staging"
+    );
+    let mut ledger = assert_reopens_after_staging(&prefix, 0, "final");
+    let committed = ledger.last_committed_round().unwrap().unwrap();
+    assert!(
+        committed >= reported_max,
+        "reported {reported_max} committed {committed}"
+    );
+    let last = committed + 3;
+    for round in committed + 1..=last {
+        commit_block_round(&mut ledger, round);
+    }
+    assert_eq!(state_digest(&ledger, last), reference_digest(last));
+    println!(
+        "{kills} bulk kills (split dirs: {split}): {staged_at_kill} landed with blocks staged, {total_progress} reported commits, final round {last}"
+    );
+}
+
+/// Hard kills at random points of a bulk apply: inside staged commits, inside
+/// the 64-block moves and between a move and its delete. After each kill the
+/// ledger reopens with every reported round and its block, the tracker never
+/// ahead of the block file, and in the end the state of an uninterrupted run.
+#[test]
+fn kill_during_a_bulk_apply_recovers_every_reported_round() {
+    if std::env::var(CHILD_ENV).is_ok() {
+        return;
+    }
+    randomized_bulk_kills(false);
+}
+
+#[test]
+fn kill_during_a_bulk_apply_recovers_every_reported_round_with_split_dirs() {
+    if std::env::var(CHILD_ENV).is_ok() {
+        return;
+    }
+    randomized_bulk_kills(true);
+}
+
+/// Deterministic: abort right after a 64-block move committed to the block
+/// file and before its staged rows were deleted. The next open moves them
+/// again (idempotent) and the ledger resumes to the uninterrupted state.
+#[test]
+fn crash_between_a_staged_move_and_its_delete_reopens_and_resumes() {
+    if std::env::var(CHILD_ENV).is_ok() {
+        return;
+    }
+    const FINAL: u64 = 150;
+    let reference = reference_digest(FINAL);
+    for (after, split) in [(0u64, false), (1, false), (0, true)] {
+        let what = format!("after_staged_archive_commit after {after} (split dirs: {split})");
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+        if split {
+            std::fs::create_dir_all(split_dir(&prefix)).unwrap();
+        }
+        let o = ChildOpts {
+            target: Some(FINAL),
+            failpoint: Some(("after_staged_archive_commit", after)),
+            split,
+            bulk: true,
+            ..Default::default()
+        };
+        let mut child = spawn_child(dir.path(), o);
+        let reader = reported_rounds(&mut child);
+        assert!(
+            !child.wait().unwrap().success(),
+            "{what}: the failpoint did not fire"
+        );
+        let reported = reader.join().unwrap();
+        // The move of rounds up to 64 * (after + 1) is in the block file.
+        let (acct, bmax) = raw_rounds(&prefix);
+        assert_eq!(bmax as u64, 64 * (after + 1), "{what}");
+        assert_eq!(acct, bmax, "{what}");
+        drop(assert_reopens_after_staging(&prefix, reported, &what));
+
+        let mut resume = spawn_child(
+            dir.path(),
+            ChildOpts {
+                failpoint: None,
+                ..o
+            },
+        );
+        let reader = reported_rounds(&mut resume);
+        assert!(resume.wait().unwrap().success(), "{what}: resume failed");
+        reader.join().unwrap();
+        let ledger = assert_reopens_after_staging(&prefix, FINAL, &format!("{what}, after resume"));
+        assert_eq!(state_digest(&ledger, FINAL), reference, "{what}");
+    }
 }
 
 // ---- cost of the checkpoint ------------------------------------------------
