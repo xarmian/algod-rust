@@ -500,9 +500,10 @@ fn raw_rounds(prefix: &Path) -> (i64, i64) {
             r.get(0)
         })
         .unwrap_or(0);
+    // A kill before the child created the schema leaves no table: no blocks.
     let bmax = b
         .query_row("SELECT coalesce(max(rnd), 0) FROM blocks", [], |r| r.get(0))
-        .unwrap();
+        .unwrap_or(0);
     (acct, bmax)
 }
 

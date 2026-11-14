@@ -3180,6 +3180,13 @@ impl SqliteLedger {
             .map_err(|e| AlgoError::Ledger {
                 message: format!("pragma error: {e}"),
             })?;
+        // DIVERGENCE DIV-012: statement and sub-journals (SAVEPOINTs, the
+        // per-group rollback points) and temporary b-trees stay in memory
+        // instead of spilling to deleted temp files (issue #2316).
+        conn.execute_batch("PRAGMA temp_store=MEMORY;")
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("temp_store pragma error: {e}"),
+            })?;
         // Explicitly set the synchronous mode to go's `LedgerSynchronousMode`
         // default (`FULL` = 2) rather than relying on SQLite's own
         // compile-time default happening to match. `config.Local`'s
@@ -4368,6 +4375,15 @@ impl SqliteLedger {
             .query_row("PRAGMA main.synchronous", [], |r| r.get(0))
             .map_err(|e| AlgoError::Ledger {
                 message: format!("read tracker synchronous mode error: {e}"),
+            })
+    }
+
+    /// The ledger connection's `temp_store` (`0` default, `1` FILE, `2` MEMORY).
+    pub fn temp_store_mode(&self) -> Result<i64, AlgoError> {
+        self.conn
+            .query_row("PRAGMA temp_store", [], |r| r.get(0))
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("read temp_store mode error: {e}"),
             })
     }
 
