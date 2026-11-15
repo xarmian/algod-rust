@@ -97,6 +97,22 @@ const LEAF_CHUNK_MIN: usize = 256;
 /// 4 ways was 2x faster (issue #2318).
 const LEAF_CHUNKS_MAX: usize = 4;
 
+/// Test-only count of the transactions `leaf_layer` encoded on this thread
+/// (issue #2327: one pass must serve every commitment of a block).
+#[cfg(test)]
+pub(crate) mod encode_count {
+    use std::cell::Cell;
+    thread_local! {
+        static ENCODES: Cell<usize> = const { Cell::new(0) };
+    }
+    pub(crate) fn bump() {
+        ENCODES.with(|c| c.set(c.get() + 1));
+    }
+    pub(crate) fn take() -> usize {
+        ENCODES.with(|c| c.replace(0))
+    }
+}
+
 /// The leaf layer of a payset commitment: `leaf(txn_bytes, stib_bytes)` for
 /// every payset entry, in payset order.
 ///
@@ -122,6 +138,8 @@ where
             .iter()
             .enumerate()
             .map(|(i, stx)| {
+                #[cfg(test)]
+                encode_count::bump();
                 let (genesis_id, genesis_hash) = rule.restored_genesis(stx);
                 txn_buf.clear();
                 canonical_encode_transaction_with_genesis_into(
@@ -185,6 +203,108 @@ fn vc_leaves(block: &Block, algo: HashAlgo, raw_stibs: Option<&[Vec<u8>]>) -> Ve
             .into();
         vc_node(algo, &[TL_PREFIX, &txid, &stib_hash])
     })
+}
+
+/// The payset commitments of a block computed together by
+/// [`compute_payset_commitments`]; a field is `Some` only when it was asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaysetCommitments {
+    /// The SHA-512/256 Merkle root (`txn`).
+    pub txn: Option<[u8; 32]>,
+    /// The SHA-256 vector commitment (`txn256`, 32 bytes).
+    pub txn256: Option<Vec<u8>>,
+    /// The SHA-512 vector commitment (`txn512`, 64 bytes).
+    pub txn512: Option<Vec<u8>>,
+}
+
+/// The `txn`, `txn256` and `txn512` commitments of `block` from ONE pass over
+/// the payset: each transaction and `SignedTxnInBlock` is encoded once and
+/// feeds every requested tree (issue #2327; computing each commitment on its
+/// own encodes the whole payset three times). go builds them separately
+/// (`data/bookkeeping/txn_merkle.go`, one `merklearray.Build` per hash
+/// type); the results are identical to
+/// [`compute_payset_merkle_root`] / [`compute_vector_commitment`] (and their
+/// `_raw` variants when `raw_stibs` is given).
+pub fn compute_payset_commitments(
+    block: &Block,
+    want_txn: bool,
+    want_txn256: bool,
+    want_txn512: bool,
+    raw_stibs: Option<&[Vec<u8>]>,
+) -> PaysetCommitments {
+    if let Some(raw) = raw_stibs {
+        assert_eq!(
+            block.payset.len(),
+            raw.len(),
+            "raw_blobs length must match payset length"
+        );
+    }
+    if block.payset.is_empty() {
+        return PaysetCommitments {
+            txn: want_txn.then_some(ZERO_HASH),
+            txn256: want_txn256.then(|| vc_hash(HashAlgo::Sha256, &[MB_PREFIX])),
+            txn512: want_txn512.then(|| vc_hash(HashAlgo::Sha512, &[MB_PREFIX])),
+        };
+    }
+    let want_vc = want_txn256 || want_txn512;
+
+    // One leaf per transaction for every tree that is wanted (zero otherwise).
+    struct Leaves {
+        txn: Hash,
+        vc256: VcNode,
+        vc512: VcNode,
+    }
+    let leaves = leaf_layer(block, raw_stibs, |txn, stib| {
+        let mut l = Leaves {
+            txn: ZERO_HASH,
+            vc256: [0u8; 64],
+            vc512: [0u8; 64],
+        };
+        if want_txn {
+            l.txn = compute_leaf_hash(
+                &hash_512_256(TX_PREFIX, txn),
+                &hash_512_256(STIB_PREFIX, stib),
+            );
+        }
+        if want_vc {
+            // Both vector commitments hash the leaf DATA with SHA-256 (see
+            // `vc_leaves`); only the tree's own hash differs.
+            let txid: Hash = Sha256::new()
+                .chain_update(TX_PREFIX)
+                .chain_update(txn)
+                .finalize()
+                .into();
+            let stib_hash: Hash = Sha256::new()
+                .chain_update(STIB_PREFIX)
+                .chain_update(stib)
+                .finalize()
+                .into();
+            if want_txn256 {
+                l.vc256 = vc_node(HashAlgo::Sha256, &[TL_PREFIX, &txid, &stib_hash]);
+            }
+            if want_txn512 {
+                l.vc512 = vc_node(HashAlgo::Sha512, &[TL_PREFIX, &txid, &stib_hash]);
+            }
+        }
+        l
+    });
+
+    let txn = want_txn.then(|| {
+        let mut layer: Vec<Hash> = leaves.iter().map(|l| l.txn).collect();
+        while layer.len() > 1 {
+            layer = build_next_layer(&layer);
+        }
+        layer[0]
+    });
+    let txn256 =
+        want_txn256.then(|| vc_root(HashAlgo::Sha256, leaves.iter().map(|l| l.vc256).collect()));
+    let txn512 =
+        want_txn512.then(|| vc_root(HashAlgo::Sha512, leaves.iter().map(|l| l.vc512).collect()));
+    PaysetCommitments {
+        txn,
+        txn256,
+        txn512,
+    }
 }
 
 /// A node of a vector commitment tree: the digest in the first
@@ -594,6 +714,58 @@ mod tests {
     use super::*;
     use algo_codec::canonical_encode_transaction;
     use algo_types::{Address, Round, Transaction};
+
+    /// Issue #2327: the single-pass result equals the three single functions,
+    /// with typed and with raw STIB encodings, for empty, tiny, odd-sized and
+    /// parallel-sized (>= 2 * LEAF_CHUNK_MIN) paysets, and for every subset of
+    /// wanted commitments.
+    #[test]
+    fn combined_commitments_equal_the_single_functions() {
+        for n in [0usize, 1, 2, 3, 7, 600] {
+            let payset: Vec<SignedTransaction> =
+                (0..n as u64).map(|i| minimal_signed_txn(10 + i)).collect();
+            let block = minimal_block(payset);
+            let raw: Vec<Vec<u8>> = block
+                .payset
+                .iter()
+                .map(canonical_encode_signed_txn_in_block)
+                .collect();
+            for raw_stibs in [None, Some(raw.as_slice())] {
+                let (txn, v256, v512) = match raw_stibs {
+                    None => (
+                        compute_payset_merkle_root(&block),
+                        compute_vector_commitment(&block, HashAlgo::Sha256),
+                        compute_vector_commitment(&block, HashAlgo::Sha512),
+                    ),
+                    Some(r) => (
+                        compute_payset_merkle_root_raw(&block, r),
+                        compute_vector_commitment_raw(&block, HashAlgo::Sha256, r),
+                        compute_vector_commitment_raw(&block, HashAlgo::Sha512, r),
+                    ),
+                };
+                for mask in 0..8u8 {
+                    let got = compute_payset_commitments(
+                        &block,
+                        mask & 1 != 0,
+                        mask & 2 != 0,
+                        mask & 4 != 0,
+                        raw_stibs,
+                    );
+                    assert_eq!(got.txn, (mask & 1 != 0).then_some(txn), "n={n} mask={mask}");
+                    assert_eq!(
+                        got.txn256,
+                        (mask & 2 != 0).then(|| v256.clone()),
+                        "n={n} mask={mask}"
+                    );
+                    assert_eq!(
+                        got.txn512,
+                        (mask & 4 != 0).then(|| v512.clone()),
+                        "n={n} mask={mask}"
+                    );
+                }
+            }
+        }
+    }
 
     fn minimal_signed_txn(amount: u64) -> SignedTransaction {
         SignedTransaction {
