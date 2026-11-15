@@ -403,58 +403,58 @@ pub fn validate_block_with_cache(
         consensus_version: block.current_protocol.clone(),
     };
 
-    for group in &groups {
-        // LogicSig opcode budget is pooled across the whole atomic group
-        // only when `EnableLogicSigCostPooling` is set for this block's
-        // protocol version (go: v39+, `config/consensus.go`). Before that,
-        // go-algorand gives each LogicSig its own independent
-        // `LogicSigMaxCost` budget (`data/transactions/logic/eval.go`'s
-        // `remainingBudget()`, taken when `PooledLogicSigBudget == nil`) --
-        // see issue #1253. The budget is reset per transaction below when
-        // pooling is disabled so no cost carries over between members.
-        let mut lsig_budget = GroupBudget::for_logicsig(if params.enable_logicsig_cost_pooling {
-            group.len()
-        } else {
-            1
-        });
+    // Build the group slice of SignedTransactions for LogicSig context.
+    // LogicSig programs use `gtxn`, `global GroupSize`, and `txn GroupIndex`
+    // which must see only the atomic group, not the entire block payset.
+    let all_group_txns: Vec<Vec<SignedTransaction>> = groups
+        .iter()
+        .map(|group| group.iter().map(|&(_, stx)| stx.clone()).collect())
+        .collect();
 
-        // Build the group slice of SignedTransactions for LogicSig context.
-        // LogicSig programs use `gtxn`, `global GroupSize`, and `txn GroupIndex`
-        // which must see only the atomic group, not the entire block payset.
-        let group_txns: Vec<SignedTransaction> =
-            group.iter().map(|&(_, stx)| stx.clone()).collect();
+    // Issue #1017: skip real signature verification when this exact group
+    // is already fully covered by `cache` under the identical context.
+    let all_already_verified: Vec<bool> = all_group_txns
+        .iter()
+        .map(|group_txns| {
+            cache.is_some_and(|c| {
+                c.get_unverified_transaction_groups(
+                    std::slice::from_ref(group_txns),
+                    &verification_context,
+                )
+                .is_empty()
+            })
+        })
+        .collect();
+
+    // Issue #2344: verify the signatures of every group the cache does not
+    // cover in parallel (go: `verify.PaysetGroups`, worksets over the whole
+    // payset), then let the sequential per-group loop below read the
+    // verdicts, so the error list and its order are exactly what one-by-one
+    // verification produced.
+    let all_verdicts =
+        verify_group_signatures(&groups, &all_group_txns, &all_already_verified, &params);
+
+    for (gi, group) in groups.iter().enumerate() {
+        let group_txns = &all_group_txns[gi];
+        let already_verified = all_already_verified[gi];
+        let verdicts = &all_verdicts[gi];
 
         // Group-level structural screen (Go: `verify/txn.go`'s
         // `txnGroupBatchPrep` calling `CheckTxnGroup` before any per-txn
         // signature prep). Runs ahead of the per-member loop below, exactly
         // like Go's real ordering.
-        if let Err(e) = crate::checks::check_txn_group(&group_txns) {
+        if let Err(e) = crate::checks::check_txn_group(group_txns) {
             errors.push(BlockValidationError::GroupValidationFailed {
                 error: e.to_string(),
             });
         }
 
-        // Issue #1017: skip real signature verification when this exact
-        // group is already fully covered by `cache` under the identical
-        // context. `group_sig_ok` tracks whether every member's signature
-        // check has succeeded so far, so the group is only added to the
-        // cache (below) when nothing failed.
-        let already_verified = cache.is_some_and(|c| {
-            c.get_unverified_transaction_groups(
-                std::slice::from_ref(&group_txns),
-                &verification_context,
-            )
-            .is_empty()
-        });
+        // `group_sig_ok` tracks whether every member's signature check has
+        // succeeded so far, so the group is only added to the cache (below)
+        // when nothing failed.
         let mut group_sig_ok = true;
 
         for (intra_group_idx, &(idx, stx)) in group.iter().enumerate() {
-            // Non-pooled protocol versions (pre-v39): each transaction gets
-            // a fresh, independent LogicSig budget -- nothing carries over
-            // from a prior group member (see the budget construction above).
-            if !params.enable_logicsig_cost_pooling {
-                lsig_budget = GroupBudget::for_logicsig(1);
-            }
             // State proof transactions (`stpf`) are special protocol-level
             // transactions injected by consensus. They legitimately have fee=0
             // and carry no standard ed25519/multisig/logicsig signature. Skip
@@ -523,20 +523,12 @@ pub fn validate_block_with_cache(
             // real block validation, matching pool admission's disposition
             // above (`verified_txn_cache.rs`) -- both are documented gaps,
             // not silent ones.
-            if !already_verified {
-                if let Err(e) = verify_transaction_signature(
-                    stx,
-                    &group_txns,
-                    intra_group_idx,
-                    &mut lsig_budget,
-                    &params,
-                ) {
-                    group_sig_ok = false;
-                    errors.push(BlockValidationError::SignatureVerificationFailed {
-                        txn_index: idx,
-                        error: e.to_string(),
-                    });
-                }
+            if let Some(Some(Err(error))) = verdicts.get(intra_group_idx) {
+                group_sig_ok = false;
+                errors.push(BlockValidationError::SignatureVerificationFailed {
+                    txn_index: idx,
+                    error: error.clone(),
+                });
             }
 
             // Heartbeat proof verification (Go: `txnBatchPrep` ->
@@ -583,7 +575,7 @@ pub fn validate_block_with_cache(
         // and pre-v40 (no pooling) protocols simply have an available pool of
         // `0` or `len(group) * LogicSigMaxSize` respectively, which the
         // function's own arithmetic already accounts for.
-        if let Err(e) = logic_sig_group_size_check(&group_txns, &params) {
+        if let Err(e) = logic_sig_group_size_check(group_txns, &params) {
             errors.push(BlockValidationError::GroupValidationFailed {
                 error: e.to_string(),
             });
@@ -831,6 +823,84 @@ pub fn contents_match_header(
 
     let errors = verify_payset_commitments(block, raw_payset_blobs);
     Ok(errors.is_empty())
+}
+
+/// The signature verdict of one group member: `None` when this pass does not
+/// verify it (a state proof transaction, or a group the cache already covers),
+/// otherwise the verification result as the error text
+/// `SignatureVerificationFailed` reports.
+type SignatureVerdict = Option<Result<(), String>>;
+
+/// Below this many groups to verify, the fork/join cost of a parallel pass
+/// outweighs the ~30 us a signature costs, so they are verified in place.
+const PARALLEL_SIGNATURE_MIN_GROUPS: usize = 8;
+
+/// Verify the member signatures of every group in `groups` that is not
+/// `already_verified`, in parallel over the groups (go:
+/// `verify.PaysetGroups` fans the payset's groups out over the backlog
+/// execution pool, issue #2344). Returns one verdict vector per group, in
+/// group order and member order, so the caller can report errors in exactly
+/// the order one-by-one verification did; a verdict only depends on its own
+/// group, never on another one's result or on scheduling.
+fn verify_group_signatures(
+    groups: &[Vec<(usize, &SignedTransaction)>],
+    all_group_txns: &[Vec<SignedTransaction>],
+    already_verified: &[bool],
+    params: &algo_types::ConsensusParams,
+) -> Vec<Vec<SignatureVerdict>> {
+    use rayon::prelude::*;
+
+    let one = |gi: usize| -> Vec<SignatureVerdict> {
+        let group = &groups[gi];
+        if already_verified[gi] {
+            return vec![None; group.len()];
+        }
+        let group_txns = &all_group_txns[gi];
+        // LogicSig opcode budget is pooled across the whole atomic group
+        // only when `EnableLogicSigCostPooling` is set for this block's
+        // protocol version (go: v39+, `config/consensus.go`). Before that,
+        // go-algorand gives each LogicSig its own independent
+        // `LogicSigMaxCost` budget (`data/transactions/logic/eval.go`'s
+        // `remainingBudget()`, taken when `PooledLogicSigBudget == nil`) --
+        // see issue #1253. The budget is reset per transaction below when
+        // pooling is disabled so no cost carries over between members.
+        let mut lsig_budget = GroupBudget::for_logicsig(if params.enable_logicsig_cost_pooling {
+            group.len()
+        } else {
+            1
+        });
+        group
+            .iter()
+            .enumerate()
+            .map(|(intra_group_idx, &(_, stx))| {
+                // State proof transactions (`stpf`) are protocol-injected
+                // and carry no signature (see the per-member loop).
+                if stx.txn.txn_type == "stpf" && stx.txn.state_proof.is_some() {
+                    return None;
+                }
+                if !params.enable_logicsig_cost_pooling {
+                    lsig_budget = GroupBudget::for_logicsig(1);
+                }
+                Some(
+                    verify_transaction_signature(
+                        stx,
+                        group_txns,
+                        intra_group_idx,
+                        &mut lsig_budget,
+                        params,
+                    )
+                    .map_err(|e| e.to_string()),
+                )
+            })
+            .collect()
+    };
+
+    let to_verify = already_verified.iter().filter(|v| !**v).count();
+    if to_verify < PARALLEL_SIGNATURE_MIN_GROUPS {
+        (0..groups.len()).map(one).collect()
+    } else {
+        (0..groups.len()).into_par_iter().map(one).collect()
+    }
 }
 
 /// Detect transaction groups within a payset for per-group LogicSig budget pooling.
@@ -1653,6 +1723,38 @@ mod tests {
             .errors
             .iter()
             .any(|e| matches!(e, BlockValidationError::SignatureVerificationFailed { .. })));
+    }
+
+    /// Issue #2344: signatures are verified in parallel over the groups, but
+    /// the verdict, the error list and its ORDER are those of one-by-one
+    /// verification: a block of 200 payments with bad signatures at known
+    /// positions reports exactly those transactions, in payset order, and a
+    /// pass with the whole block cached reports none (cache hits skip the
+    /// verification, a bad signature included).
+    #[test]
+    fn parallel_signature_verification_reports_the_same_errors_in_payset_order() {
+        let key = test_signing_key();
+        let mut block = empty_block();
+        block.payset = (0..200u64)
+            .map(|i| make_signed_txn(&key, 5000 + i))
+            .collect();
+        let bad = [3usize, 64, 65, 199];
+        for &i in &bad {
+            block.payset[i].sig[0] ^= 0xFF;
+        }
+        set_expected_load(&mut block);
+        let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash(), None);
+        let failed: Vec<usize> = result
+            .errors
+            .iter()
+            .filter_map(|e| match e {
+                BlockValidationError::SignatureVerificationFailed { txn_index, .. } => {
+                    Some(*txn_index)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failed, bad.to_vec(), "errors: {:?}", result.errors);
     }
 
     /// Issue #1017: a group that fails signature verification must NOT be
