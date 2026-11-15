@@ -381,9 +381,25 @@ async fn fetch_block_via_unicast_peers(
             ..Default::default()
         },
     );
-    let (response, raw_block_data) = source.get_block_with_raw_data(round).await.map_err(|e| {
-        FetchError::NetworkError(format!("block fetch failed for round {}: {}", round, e))
-    })?;
+    let (response, raw_block_data) =
+        source
+            .get_block_with_raw_data(round)
+            .await
+            .map_err(|e| match e {
+                // The peers answered "requested block is not available" (go's
+                // `blockNotAvailableErrMsg`; `GossipBlockSource` only reports
+                // `NotFound` once enough peers said so): go's
+                // `wsFetcherClient.requestBlock` returns `noBlockForRoundError`
+                // for exactly this answer, which `fetchAndWrite` counts against
+                // `errNoBlockForRoundThreshold` and paces with
+                // `followLatestBackoff`. As a generic network error every fetch
+                // worker retried its future round at once (issue #2343).
+                algo_error::AlgoError::NotFound(_) => FetchError::NoBlockForRound { round },
+                e => FetchError::NetworkError(format!(
+                    "block fetch failed for round {}: {}",
+                    round, e
+                )),
+            })?;
 
     // Extract raw payset blobs from the wire-format block bytes.
     // These are used for payset commitment verification, avoiding
@@ -16244,6 +16260,87 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // -- Issue #2343: "requested block is not available" is a tip answer ----
+
+    /// A block-service peer that answers every request like go's
+    /// `blockService` does for a round it does not have: an `Error` topic
+    /// ("requested block is not available") plus the 8-byte `latest` round.
+    struct NotAvailablePeer {
+        addr: String,
+        requests: std::sync::atomic::AtomicUsize,
+    }
+
+    impl algo_network::gossip_node::Peer for NotAvailablePeer {
+        fn get_address(&self) -> &str {
+            &self.addr
+        }
+        fn get_connection_latency(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn routing_addr(&self) -> &[u8] {
+            &[]
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl algo_network::UnicastPeer for NotAvailablePeer {
+        async fn request(
+            &self,
+            _tag: algo_network::Tag,
+            _topics: algo_network::topics::Topics,
+        ) -> Result<algo_network::topics::Topics, algo_network::errors::PeerError> {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(algo_network::topics::Topics::from_vec(vec![
+                algo_network::topics::Topic::new(
+                    algo_network::topics::ERROR_KEY,
+                    b"requested block is not available".to_vec(),
+                ),
+                algo_network::topics::Topic::new(
+                    algo_network::topics::LATEST_ROUND_KEY,
+                    7u64.to_be_bytes().to_vec(),
+                ),
+            ]))
+        }
+        async fn respond(
+            &self,
+            _request_hash: u64,
+            _topics: algo_network::topics::Topics,
+        ) -> Result<(), algo_network::errors::PeerError> {
+            Ok(())
+        }
+    }
+
+    /// go's `wsFetcherClient.requestBlock` turns that answer into
+    /// `noBlockForRoundError`, which `fetchAndWrite` counts against
+    /// `errNoBlockForRoundThreshold` and answers with `followLatestBackoff`.
+    /// Flattening it into a generic network error made every fetch worker
+    /// retry its future round at once (~550 requests/s per node at the tip).
+    #[test]
+    fn a_not_available_answer_is_a_no_block_for_round_not_a_network_error() {
+        let peer = Arc::new(NotAvailablePeer {
+            addr: "relay:4161".into(),
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let peers: Vec<Arc<dyn algo_network::gossip_node::UnicastPeer>> = vec![peer.clone()];
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(fetch_block_via_unicast_peers(
+                peers,
+                Round(8),
+                Duration::from_secs(2),
+            ))
+            .err()
+            .expect("the peer has no such block");
+        assert!(
+            matches!(err, FetchError::NoBlockForRound { round } if round == Round(8)),
+            "got {err:?}"
+        );
     }
 }
 
