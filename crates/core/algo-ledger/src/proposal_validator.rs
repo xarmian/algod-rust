@@ -108,6 +108,24 @@ pub fn agreement_block_validator(
     )
 }
 
+/// [`agreement_block_validator`] sharing the node's verified-transaction
+/// cache, so the transactions of a proposal that the pool already verified
+/// are not verified again (go: `ledger/eval` `GetUnverifiedTransactionGroups`,
+/// issue #2344).
+pub fn agreement_block_validator_with_cache(
+    genesis_id: String,
+    genesis_hash: [u8; 32],
+    prev_timestamp: Option<i64>,
+    ledger: Arc<Mutex<SqliteLedger>>,
+    verified_txn_cache: Arc<algo_validate::VerifiedTransactionCache>,
+) -> PayoutCheckingValidator<algo_agreement::BlockValidatorBridge> {
+    PayoutCheckingValidator::new(
+        algo_agreement::BlockValidatorBridge::new(genesis_id, genesis_hash, prev_timestamp)
+            .with_verified_txn_cache(verified_txn_cache),
+        ledger,
+    )
+}
+
 /// Wraps a stateless [`BlockValidator`] with go's `validateForPayouts`
 /// evaluated on a rolled-back scratch apply over the ledger.
 pub struct PayoutCheckingValidator<V: BlockValidator> {

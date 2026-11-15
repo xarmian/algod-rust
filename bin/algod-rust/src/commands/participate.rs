@@ -655,6 +655,10 @@ struct ParticipateAgreementControl {
     resolved_genesis_id: String,
     genesis_hash: [u8; 32],
     pool: Arc<TransactionPool>,
+    /// The pool's verified-transaction cache, shared with the proposal
+    /// validator so a proposal's already verified groups are not verified
+    /// again (issue #2344).
+    verified_txn_cache: Arc<algo_validate::VerifiedTransactionCache>,
     round_advanced: Arc<std::sync::Condvar>,
     participation_metrics: Arc<algo_agreement::ParticipationMetrics>,
     /// Per-message-type agreement handled/dropped counters (issue #1134).
@@ -799,11 +803,12 @@ impl ParticipateAgreementControl {
         // repeated txids and live-lease conflicts are judged before this
         // node votes (go `Ledger.Validate`).
         let block_validator: Arc<PayoutCheckingValidator<BlockValidatorBridge>> =
-            Arc::new(algo_ledger::agreement_block_validator(
+            Arc::new(algo_ledger::agreement_block_validator_with_cache(
                 self.resolved_genesis_id.clone(),
                 self.genesis_hash,
                 prev_timestamp,
                 self.ledger.clone(),
+                self.verified_txn_cache.clone(),
             ));
 
         let random_source = RealRandomSource;
@@ -1115,6 +1120,7 @@ impl ParticipateAgreementControl {
             resolved_genesis_id: self.resolved_genesis_id.clone(),
             genesis_hash: self.genesis_hash,
             pool: self.pool.clone(),
+            verified_txn_cache: self.verified_txn_cache.clone(),
             round_advanced: self.round_advanced.clone(),
             participation_metrics: self.participation_metrics.clone(),
             agreement_message_counters: self.agreement_message_counters.clone(),
@@ -7361,6 +7367,7 @@ pub async fn run(
     // `VerifiedTransactionCache`/verifier pool go's `node.go` shares across
     // transports. Shut down alongside the rest of the network stack below
     // (see the `batch_verifier.cancel()` call in the shutdown sequence).
+    let agreement_txn_cache = verified_txn_cache.clone();
     let batch_verifier = Arc::new(algo_validate::BatchVerifier::spawn(
         algo_validate::BatchVerifierConfig::default(),
         verified_txn_cache,
@@ -8055,6 +8062,7 @@ pub async fn run(
         resolved_genesis_id: resolved_genesis_id.clone(),
         genesis_hash,
         pool: pool.clone(),
+        verified_txn_cache: agreement_txn_cache,
         round_advanced: round_advanced.clone(),
         participation_metrics: participation_metrics.clone(),
         agreement_message_counters: agreement_message_counters.clone(),
@@ -16162,6 +16170,7 @@ mod tests {
             resolved_genesis_id: "test-v1".to_string(),
             genesis_hash: [0xAA; 32],
             pool,
+            verified_txn_cache: Arc::new(algo_validate::VerifiedTransactionCache::new(16)),
             round_advanced: Arc::new(std::sync::Condvar::new()),
             participation_metrics: Arc::new(algo_agreement::ParticipationMetrics::new()),
             agreement_message_counters: Arc::new(algo_network::AgreementMessageCounters::new()),

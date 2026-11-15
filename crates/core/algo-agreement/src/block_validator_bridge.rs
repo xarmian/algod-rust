@@ -25,12 +25,13 @@
 // delegates to the ledger's block validation and wraps the result as a
 // ValidatedBlock for the agreement protocol.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tracing::warn;
 
 use algo_types::Block;
-use algo_validate::{validate_block, BlockValidationResult};
+use algo_validate::block::validate_block_with_cache;
+use algo_validate::{BlockValidationResult, VerifiedTransactionCache};
 
 use crate::traits::{AgreementError, BlockValidator, ValidatedBlock};
 
@@ -96,6 +97,10 @@ pub struct BlockValidatorBridge {
     /// Uses `Mutex` for thread-safe interior mutability so
     /// `set_prev_timestamp` can take `&self` rather than `&mut self`.
     prev_timestamp: Mutex<Option<i64>>,
+    /// The node's verified-transaction cache (issue #2344): groups the pool
+    /// already verified are not verified again when a proposal carrying
+    /// them is validated (go: `eval.go` `GetUnverifiedTransactionGroups`).
+    verified_txn_cache: Option<Arc<VerifiedTransactionCache>>,
 }
 
 impl BlockValidatorBridge {
@@ -105,7 +110,16 @@ impl BlockValidatorBridge {
             genesis_id,
             genesis_hash,
             prev_timestamp: Mutex::new(prev_timestamp),
+            verified_txn_cache: None,
         }
+    }
+
+    /// Share the node's verified-transaction cache with this validator, so a
+    /// proposal's transactions the pool already verified are not verified
+    /// again (issue #2344).
+    pub fn with_verified_txn_cache(mut self, cache: Arc<VerifiedTransactionCache>) -> Self {
+        self.verified_txn_cache = Some(cache);
+        self
     }
 
     /// Update the previous block timestamp (call after each committed block).
@@ -130,12 +144,13 @@ impl BlockValidator for BlockValidatorBridge {
                 None
             }
         };
-        let result = validate_block(
+        let result = validate_block_with_cache(
             block,
             prev_ts,
             &self.genesis_id,
             &self.genesis_hash,
             None, // no raw payset blobs in the agreement path
+            self.verified_txn_cache.as_deref(),
         );
 
         if result.is_valid {
@@ -196,6 +211,78 @@ mod tests {
             result.is_ok(),
             "valid block should pass: {:?}",
             result.err()
+        );
+    }
+
+    /// Issue #2344: a proposal's transaction group the node's pool already
+    /// verified (it is in the shared cache under the block's context) is not
+    /// verified again; without the cache the very same block is rejected for
+    /// its signature. (The cached group is a stand-in with a bogus signature,
+    /// which only a skipped verification can accept.)
+    #[test]
+    fn a_cached_group_is_not_reverified_when_a_proposal_is_validated() {
+        use algo_types::{Address, SignedTransaction, Transaction};
+        use algo_validate::rules::SpecialAddresses;
+        use algo_validate::{GroupContext, VerificationContext};
+
+        let mut block = make_valid_empty_block();
+        let txn = Transaction {
+            txn_type: "pay".into(),
+            sender: Address([1u8; 32]),
+            fee: 1000,
+            first_valid: Round(1),
+            last_valid: Round(1000),
+            amount: 5,
+            receiver: Address([2u8; 32]),
+            genesis_id: "test-v1".into(),
+            genesis_hash: [0xAA; 32],
+            ..Default::default()
+        };
+        let mut stripped = txn.clone();
+        stripped.genesis_id = String::new();
+        stripped.genesis_hash = [0u8; 32];
+        let stx = SignedTransaction {
+            txn: stripped,
+            sig: [7u8; 64], // not a signature of this transaction
+            has_genesis_id: true,
+            ..Default::default()
+        };
+        block.payset = vec![stx.clone()];
+        if let Ok(max) = algo_validate::rules::max_txn_bytes_per_block(&block.current_protocol) {
+            let bytes: usize = block
+                .payset
+                .iter()
+                .map(|s| algo_codec::canonical_encode_signed_txn_in_block(s).len())
+                .sum();
+            block.load = algo_validate::rules::compute_expected_load(bytes, max);
+        }
+
+        let uncached = BlockValidatorBridge::new("test-v1".into(), [0xAA; 32], Some(90));
+        assert!(
+            uncached.validate(&block).is_err(),
+            "a bad signature must be rejected without the cache"
+        );
+
+        let cache = Arc::new(VerifiedTransactionCache::new(16));
+        let mut restored = stx;
+        restored.txn = txn;
+        cache.add(Arc::new(GroupContext::new(
+            VerificationContext {
+                spec_addrs: SpecialAddresses {
+                    fee_sink: block.fee_sink,
+                    rewards_pool: block.rewards_pool,
+                },
+                consensus_version: block.current_protocol.clone(),
+            },
+            vec![restored],
+        )));
+        let cached = BlockValidatorBridge::new("test-v1".into(), [0xAA; 32], Some(90))
+            .with_verified_txn_cache(cache);
+        let verdict = cached.validate(&block);
+        assert!(
+            verdict.is_ok(),
+            "the cached group must not be verified again: {:?}",
+            verdict.err()
         );
     }
 
