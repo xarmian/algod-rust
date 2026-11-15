@@ -470,7 +470,7 @@ same go-algorand APIs on the shared fixtures.
 | `codec/block-hash` | `block-large.msgpack` | `BlockHeader.Hash` | `compute_block_digest` |
 | `crypto/sha512_256-32B` / `-1KiB` / `-64KiB` | `bytes-*.bin` | `crypto.Hash` | `sha2::Sha512_256` |
 | `crypto/ed25519-verify` | `stxn-appl.msgpack` | `SignatureVerifier.Verify(txn, sig)` | `algo_validate::verify_single_sig` |
-| `crypto/ed25519-batch-64` / `-1024` | `stxns-64.msgpack`, `stxns-1024.msgpack` | `crypto.BatchVerifier` | `verify_single_sig` per signature (no Rust batch verifier yet) |
+| `crypto/ed25519-batch-64` / `-1024` | `stxns-64.msgpack`, `stxns-1024.msgpack` | `crypto.BatchVerifier` (go's production default is `useSingleVerifierDefault = true`: it verifies one signature at a time, so this row is NOT a batch-vs-single comparison) | `verify_single_sig` per signature (no Rust batch verifier yet, #2345) |
 | `crypto/vrf-verify` | `vrf.frames` (pk, proof, selector bytes) | `VrfPubkey.Verify` | `algo_consensus_crypto::vrf::vrf_verify` |
 | `crypto/falcon-verify` | `falcon.frames` | `FalconVerifier.VerifyBytes` (C) | `algo_falcon::falcon_verify`, default pure-Rust backend ([DIV-001](DIVERGENCES.md)) |
 | `commit/txn-merkle-sha512_256` | `block-large.msgpack` | `Block.TxnMerkleTree().Root()` | `compute_payset_merkle_root` |

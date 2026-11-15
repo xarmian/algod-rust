@@ -143,6 +143,35 @@ const OT2_PREFIX: &[u8] = b"OT2";
 /// Used to sign the block seed under the ephemeral key.
 const SEED_PREFIX: &[u8] = b"SD";
 
+/// Whether the 32-byte compressed Edwards point `b`, which the caller has
+/// already decompressed successfully, is its own canonical encoding, i.e.
+/// `decompress(b).compress() == b`, without the two field inversions of
+/// actually recompressing (issue #2345, ~2.4 us each).
+///
+/// Recompression reproduces `b` unless (a) the y coordinate is not reduced
+/// (`y >= p = 2^255 - 19`, which decompression accepts and reduces), or (b)
+/// the sign bit is set while x is zero (x = 0 has no odd root, so the sign is
+/// lost). x is zero only for `y = 1` and `y = p - 1` (`x^2 = (y^2-1)/(dy^2+1)`).
+/// `byte_level_canonical_point_check_equals_the_recompress_check` pins this
+/// against the recompress check over both sides of the `p` boundary.
+fn is_canonical_point_encoding(b: &[u8; 32]) -> bool {
+    let sign_set = b[31] & 0x80 != 0;
+    let mut y = *b;
+    y[31] &= 0x7F;
+    // y >= p: top byte 0x7F, bytes 1..=30 all 0xFF, low byte >= 0xED.
+    if y[31] == 0x7F && y[1..31].iter().all(|&v| v == 0xFF) && y[0] >= 0xED {
+        return false;
+    }
+    if sign_set {
+        let y_is_one = y[0] == 1 && y[1..].iter().all(|&v| v == 0);
+        let y_is_p_minus_1 = y[0] == 0xEC && y[1..31].iter().all(|&v| v == 0xFF) && y[31] == 0x7F;
+        if y_is_one || y_is_p_minus_1 {
+            return false;
+        }
+    }
+    true
+}
+
 /// Verify a raw ed25519 signature against libsodium's `bv_compatible`
 /// malleability-acceptance ruleset, matching go-algorand's `ed25519Verify`
 /// (`crypto/curve25519.go`, which calls
@@ -185,7 +214,7 @@ fn ed25519_bv_compatible_verify(pk_bytes: &[u8; 32], msg: &[u8], sig_bytes: &[u8
         Some(p) => p,
         None => return false,
     };
-    if R.compress().0 != r_bytes {
+    if !is_canonical_point_encoding(&r_bytes) {
         return false;
     }
 
@@ -196,7 +225,7 @@ fn ed25519_bv_compatible_verify(pk_bytes: &[u8; 32], msg: &[u8], sig_bytes: &[u8
         Some(p) => p,
         None => return false,
     };
-    if A.compress().0 != *pk_bytes || A.is_small_order() {
+    if !is_canonical_point_encoding(pk_bytes) || A.is_small_order() {
         return false;
     }
 
@@ -1436,6 +1465,75 @@ mod bv_compatible_vectors;
 
 #[cfg(test)]
 mod tests {
+    /// Issue #2345: the byte-level canonical-encoding test replaces the
+    /// decompress-then-recompress check (two field inversions, ~2.4 us each)
+    /// of `ed25519_bv_compatible_verify`. It must accept exactly the encodings
+    /// the old check accepted: every y near 0 and near p (both sides of the
+    /// `y >= p` boundary), both sign bits, plus random encodings.
+    #[test]
+    fn byte_level_canonical_point_check_equals_the_recompress_check() {
+        use curve25519_dalek::edwards::CompressedEdwardsY;
+        let old = |b: &[u8; 32]| -> bool {
+            CompressedEdwardsY(*b)
+                .decompress()
+                .is_some_and(|p| p.compress().0 == *b)
+        };
+        let new = |b: &[u8; 32]| -> bool {
+            CompressedEdwardsY(*b).decompress().is_some() && is_canonical_point_encoding(b)
+        };
+        // y = p + k as a 255-bit little-endian integer, k in -40..=40, and y = k.
+        let p_le = {
+            let mut p = [0xFFu8; 32];
+            p[0] = 0xED;
+            p[31] = 0x7F;
+            p
+        };
+        let add = |base: [u8; 32], delta: i32| -> Option<[u8; 32]> {
+            let mut out = base;
+            let mut carry: i32 = delta;
+            for byte in out.iter_mut() {
+                let v = *byte as i32 + carry;
+                *byte = (v & 0xFF) as u8;
+                carry = v >> 8;
+                if carry == 0 {
+                    break;
+                }
+            }
+            (carry == 0 && out[31] < 0x80).then_some(out)
+        };
+        let mut cases = Vec::new();
+        for delta in -40..=40 {
+            if let Some(b) = add(p_le, delta) {
+                cases.push(b);
+            }
+            if delta >= 0 {
+                let mut z = [0u8; 32];
+                z[0] = delta as u8;
+                cases.push(z);
+            }
+        }
+        let mut state = 0x1234_5678_9abc_def0u64;
+        for _ in 0..3000 {
+            let mut b = [0u8; 32];
+            for byte in b.iter_mut() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = state as u8;
+            }
+            cases.push(b);
+        }
+        let mut accepted = 0;
+        for mut b in cases {
+            for sign in [0u8, 0x80] {
+                b[31] = (b[31] & 0x7F) | sign;
+                assert_eq!(new(&b), old(&b), "encoding {}", hex::encode(b));
+                accepted += old(&b) as usize;
+            }
+        }
+        assert!(accepted > 100, "the corpus must contain accepted encodings");
+    }
+
     use super::*;
     use algo_avm::group::GroupBudget;
     use algo_error::AvmDiagnosticValue;
