@@ -1213,6 +1213,7 @@ impl CatchupService {
             triggers,
             waiters,
             FetchPolicy::default(),
+            None,
         );
 
         // Mirrors Go's `s.syncStartNS.Store(0)` at the end of `sync()`
@@ -1313,6 +1314,33 @@ impl CatchupService {
             None,
             &mut Vec::new(),
             FetchPolicy::default(),
+            None,
+        )
+    }
+
+    /// Like [`Self::sync_range`], but bounded at `last_round`: no round past it
+    /// is ever requested and the pass ends `Done` once it is applied. For an
+    /// offline replay of a corpus whose last round is known (`bench
+    /// replay-corpus`, issue #2342), where the unbounded pass would spend
+    /// go's tip probe (`followLatestBackoff`, five 100 ms pauses) after the
+    /// last block. A live node never calls this: its pass has no end but the
+    /// tip, and the probe policy stays go's.
+    pub fn sync_range_to(
+        ledger: &Arc<dyn CatchupLedger>,
+        fetcher: &Arc<dyn BlockFetcher>,
+        shutdown_rx: &Receiver<()>,
+        parallel_blocks: u64,
+        last_round: Round,
+    ) -> SyncExitReason {
+        Self::sync_pass_core(
+            ledger,
+            fetcher,
+            shutdown_rx,
+            parallel_blocks,
+            None,
+            &mut Vec::new(),
+            FetchPolicy::default(),
+            Some(last_round.0),
         )
     }
 
@@ -1427,6 +1455,7 @@ impl CatchupService {
     /// [`Self::sync_pass_inner`] plus the live service's `sync_now`
     /// coalescing: requests arriving on `triggers` during the pass are pushed
     /// to `waiters`, for the caller to answer with the pass's exit reason.
+    #[allow(clippy::too_many_arguments)] // one pass entry point shared by the live service, sync_range and the bounded replay pass
     fn sync_pass_core(
         ledger: &Arc<dyn CatchupLedger>,
         fetcher: &Arc<dyn BlockFetcher>,
@@ -1435,6 +1464,7 @@ impl CatchupService {
         triggers: Option<&Receiver<SyncWaiter>>,
         waiters: &mut Vec<SyncWaiter>,
         policy: FetchPolicy,
+        last_round: Option<u64>,
     ) -> SyncExitReason {
         let mut exit_reason = SyncExitReason::Done;
         let start_round = ledger.next_round();
@@ -1447,6 +1477,10 @@ impl CatchupService {
         let next_to_fetch = Arc::new(AtomicU64::new(start_round.0));
         let stop = Arc::new(AtomicBool::new(false));
         let ctx = Arc::new(PassCtx::new(policy));
+        if let Some(last) = last_round {
+            // No worker fetches (or claims a result for) a round past the bound.
+            ctx.window_limit.store(last, Ordering::SeqCst);
+        }
         // Whatever ends the pass (a panic in the apply loop included), the
         // ledger leaves bulk-apply mode.
         let mut bulk = BulkApplyGuard {
@@ -1903,6 +1937,12 @@ impl CatchupService {
                 // The window slides: the applied round's slot is free again.
                 if let Some(tx) = &permit_tx {
                     let _ = tx.try_send(());
+                }
+                // A bounded pass is over once its last round is applied.
+                if last_round.is_some_and(|l| next_apply > l) {
+                    Self::raise_stop(&stop, &ctx);
+                    stopped = true;
+                    break 'apply;
                 }
             }
             if stopped {
@@ -5291,6 +5331,7 @@ mod tests {
             None,
             &mut Vec::new(),
             policy,
+            None,
         )
     }
 
@@ -5487,6 +5528,43 @@ mod tests {
         assert!(
             started.elapsed() >= Duration::from_millis(400),
             "the probe must pause between attempts like go's followLatestBackoff"
+        );
+    }
+
+    /// Issue #2342: a pass bounded at a known last round (an offline replay)
+    /// never requests a round past it, so it never probes a tip and never
+    /// sleeps `no_block_backoff`; it ends `Done` as soon as the last round is
+    /// applied. The unbounded pass above is unchanged.
+    #[test]
+    fn a_bounded_pass_ends_at_its_last_round_without_a_tip_probe() {
+        let (ledger, ledger_dyn) = permissive_ledger();
+        let fetcher = Arc::new(TipProbeCountingFetcher {
+            up_to: 20,
+            beyond: AtomicU64::new(0),
+            max_round: AtomicU64::new(0),
+        });
+        let fetcher_dyn: Arc<dyn BlockFetcher> = fetcher.clone();
+        let started = std::time::Instant::now();
+        let exit = finishes_within(Duration::from_secs(30), move || {
+            CatchupService::sync_range_to(
+                &ledger_dyn,
+                &fetcher_dyn,
+                &never_shutdown(),
+                8,
+                Round(20),
+            )
+        });
+        assert_eq!(exit, SyncExitReason::Done);
+        assert_eq!(ledger.next_round(), Round(21));
+        assert_eq!(
+            fetcher.beyond.load(Ordering::SeqCst),
+            0,
+            "no request past the bound"
+        );
+        assert!(fetcher.max_round.load(Ordering::SeqCst) <= 20);
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "a bounded pass must not sleep a tip-probe backoff"
         );
     }
 

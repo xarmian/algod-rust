@@ -741,7 +741,11 @@ pub fn replay_corpus(args: &ReplayCorpusArgs) -> anyhow::Result<ReplayResult> {
             if next > last {
                 break;
             }
-            let reason = CatchupService::sync_range(&catchup, &fetcher, &stop_rx, parallel);
+            // Bounded at the corpus's last round: the unbounded pass would
+            // probe the tip after it (five 100 ms pauses, issue #2342), which
+            // go's replay tool (a bare apply loop) has no counterpart of.
+            let reason =
+                CatchupService::sync_range_to(&catchup, &fetcher, &stop_rx, parallel, Round(last));
             if catchup.next_round().0 == next {
                 let fetch = corpus_fetcher
                     .last_error()
