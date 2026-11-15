@@ -40,10 +40,10 @@ use algo_avm::group::GroupBudget;
 use algo_codec::canonical_encode_signed_txn_in_block;
 use algo_types::{Block, SignedTransaction};
 
+#[cfg(test)]
+use crate::merkle::compute_payset_merkle_root;
 use crate::merkle::{
-    compute_payset_flat_commitment, compute_payset_flat_commitment_raw, compute_payset_merkle_root,
-    compute_payset_merkle_root_raw, compute_vector_commitment, compute_vector_commitment_raw,
-    HashAlgo,
+    compute_payset_commitments, compute_payset_flat_commitment, compute_payset_flat_commitment_raw,
 };
 use crate::rules::{
     consensus_params_for_version, has_payset_commit_merkle, has_txn256, has_txn512,
@@ -708,14 +708,20 @@ fn verify_payset_commitments(
     let mut errors = Vec::new();
     let version = &block.current_protocol;
 
+    // Issue #2327: the Merkle `txn` root and the two vector commitments come
+    // from ONE pass over the payset (each transaction encoded once), computed
+    // up front for exactly the commitments this protocol version checks.
+    let check_txn = (block.txn_commitment != [0u8; 32] || !block.payset.is_empty())
+        && has_payset_commit_merkle(version);
+    let check_256 = has_txn256(version);
+    let check_512 = has_txn512(version);
+    let combined =
+        compute_payset_commitments(block, check_txn, check_256, check_512, raw_payset_blobs);
+
     // 6. Primary payset commitment (txn field).
     if block.txn_commitment != [0u8; 32] || !block.payset.is_empty() {
         if has_payset_commit_merkle(version) {
-            let computed_root = if let Some(raw_blobs) = raw_payset_blobs {
-                compute_payset_merkle_root_raw(block, raw_blobs)
-            } else {
-                compute_payset_merkle_root(block)
-            };
+            let computed_root = combined.txn.expect("requested above");
             if block.txn_commitment.as_ref() != computed_root.as_slice() {
                 errors.push(BlockValidationError::PaysetCommitmentMismatch {
                     expected: hex::encode(block.txn_commitment),
@@ -738,12 +744,8 @@ fn verify_payset_commitments(
     }
 
     // 6b. Vector commitment: txn256 (SHA-256, v34+).
-    if has_txn256(version) {
-        let computed = if let Some(raw_blobs) = raw_payset_blobs {
-            compute_vector_commitment_raw(block, HashAlgo::Sha256, raw_blobs)
-        } else {
-            compute_vector_commitment(block, HashAlgo::Sha256)
-        };
+    if check_256 {
+        let computed = combined.txn256.expect("requested above");
         if block.txn256.as_ref() != computed.as_slice() {
             errors.push(BlockValidationError::VectorCommitmentMismatch {
                 field: "txn256".into(),
@@ -754,12 +756,8 @@ fn verify_payset_commitments(
     }
 
     // 6c. Vector commitment: txn512 (SHA-512, v41+).
-    if has_txn512(version) {
-        let computed = if let Some(raw_blobs) = raw_payset_blobs {
-            compute_vector_commitment_raw(block, HashAlgo::Sha512, raw_blobs)
-        } else {
-            compute_vector_commitment(block, HashAlgo::Sha512)
-        };
+    if check_512 {
+        let computed = combined.txn512.expect("requested above");
         if block.txn512.as_ref() != computed.as_slice() {
             errors.push(BlockValidationError::VectorCommitmentMismatch {
                 field: "txn512".into(),
@@ -1723,6 +1721,23 @@ mod tests {
             .errors
             .iter()
             .any(|e| matches!(e, BlockValidationError::SignatureVerificationFailed { .. })));
+    }
+
+    /// Issue #2327: a block that carries all three payset commitments
+    /// (`txn`, `txn256`, `txn512`) is encoded ONCE, not once per commitment.
+    #[test]
+    fn the_three_payset_commitments_share_one_leaf_pass() {
+        let key = test_signing_key();
+        let mut block = empty_block();
+        block.payset = (0..5u64).map(|i| make_signed_txn(&key, 5000 + i)).collect();
+        assert!(has_txn256(&block.current_protocol) && has_txn512(&block.current_protocol));
+        crate::merkle::encode_count::take();
+        let _ = verify_payset_commitments(&block, None);
+        assert_eq!(
+            crate::merkle::encode_count::take(),
+            block.payset.len(),
+            "every transaction must be encoded once for all three commitments"
+        );
     }
 
     /// Issue #2344: signatures are verified in parallel over the groups, but
