@@ -52,30 +52,32 @@ row below is a like-for-like measurement. The per-tier counts (paired, Rust
 faster, Go faster, inconclusive) are generated in each block's "Summary by
 tier" table; in words (figures are medians of the tables below):
 
-- **micro**: Rust is faster on 20 of 27 rows (all the codec encode/decode and
+- **micro**: Rust is faster on 18 of 27 rows (all the codec encode/decode and
   both payset commitments 1.2x to 1.9x, certificate decode 1.6x, AVM
   arithmetic/bytes/hash loops 1.2x to 1.3x, Ed25519/VRF/credential verify
-  1.1x to 1.5x, sortition select 44x). Go is faster on three rows: `txid`
-  1.19x and `sortition-select-f128` 1.18x (#2321) and `avm/app-state-box`
-  1.26x (#2320).
-- **replay, small corpus**: Go 1.29 s, Rust 1.41 s wall (Go 1.09x faster, down
-  from 3.6x). Rust uses 2.9x less CPU time and 6.3x less peak RSS; it writes
-  2.3x more bytes (154 vs 66 MB, #2316) into a 1.12x larger database.
+  1.1x to 1.5x, sortition select 44x). Go is faster on two rows:
+  `sortition-select-f128` 1.22x (#2321) and `avm/app-state-box` 1.26x (#2320);
+  `txid` is no longer one of them.
+- **replay, small corpus** (`RUNS=10`, after #2342): Go 1.34 s, Rust 0.94 s
+  wall (Rust 1.43x faster, was Go 3.6x faster in the first baseline). Rust
+  uses 3.1x less CPU time and 6.2x less peak RSS; it writes 2.3x more bytes
+  (154.5 vs 66 MB, #2316) into a 1.13x larger database.
 - **replay, testnet-prefix50** (re-run after #2342, `RUNS=10`): Go 0.125 s, Rust
-  0.155 s (1.25x slower, was 5.1x); Rust CPU 2.2x lower. Owner: #2339. The
-  `replay small` rows of the `local-main` section below predate #2342; a re-run
-  of the replay tier after it gave Rust 1.09 s vs Go 1.45 s (Rust 1.34x
-  faster, `RUNS=10`, `write_mb` still 2.5x Go's, #2316), and that section is
-  republished with the next full `bench-compare` run.
+  0.155 s (1.25x slower, was 5.1x); Rust CPU 2.2x lower. Owner: #2339.
 - **rest (smoke, c4)**: Rust is ahead on most endpoints' latency/throughput
   rows and level on the rest; `simulate` (4.6x behind in the first baseline) is
-  now level (4,858 vs 4,991 req/s, p99 1.9x lower). Go is 4% faster on
-  `account_hot` and 4% to 8% on `simulate_app` (#2340).
-- **localnet (smoke)**: level on throughput and round time; Rust peak RSS 5.9x
-  lower and block-device writes 37x lower. The only Go-faster rows are the
-  p95/p99 confirmation latencies of the 50 TPS step (6,035 vs 5,783 ms, 1.04x):
-  one 250 ms sampling quantum of a 3 s round, with equal round time and 1.03x
-  higher confirmed TPS in Rust, so a harness quantum, not a node cost.
+  level. The only Go-faster row is `account_hot` p50 (0.288 vs 0.296 ms, 1.03x,
+  #2340).
+- **localnet (smoke)**: level on throughput and round time (3 s); Rust peak RSS
+  5.9x lower and block-device writes 31x lower. The Go-faster rows are the
+  confirmation-latency percentiles (`fixed` p95/p99 1.23x, `ladder-50`
+  p50/p95/p99 1.05x to 1.07x). They are quantised by whole 3 s rounds: a
+  200-transaction step commits in 2 or 3 rounds depending on where it lands
+  relative to a round boundary, `commit_rounds` / `commit_time_s` intervals
+  overlap ([2, 3]) and are inconclusive, confirmed TPS is level, and single-run
+  A/B of the same Rust code flipped the `fixed` p95 direction (Rust faster
+  before #2343, Go faster after, no change on the commit path), so this is
+  round-boundary noise, not a node cost.
 
 ## Environment and how to reproduce
 
@@ -121,23 +123,23 @@ Command: `make bench-compare TIERS=micro,replay,rest,localnet CORPUS=small RUNS=
 
 | Tier | Paired rows | Rust faster | Go faster | Inconclusive |
 |---|---|---|---|---|
-| localnet | 28 | 4 | 2 | 22 |
-| micro | 27 | 20 | 3 | 4 |
-| replay | 7 | 2 | 5 | 0 |
-| rest | 55 | 23 | 5 | 27 |
+| localnet | 28 | 3 | 5 | 20 |
+| micro | 27 | 18 | 2 | 7 |
+| replay | 7 | 5 | 2 | 0 |
+| rest | 55 | 23 | 1 | 31 |
 
 117 paired row(s) in total; 0 paired row(s) excluded from the baseline file (every paired row is kept, including rows whose Go or Rust median is 0). Counts come from the tables below.
 
-Generated 2026-11-15T00:58:20Z. Methodology and fairness rules: [docs/BENCHMARK_COMPARISON.md](https://github.com/xarmian/algod-rust/blob/main/docs/BENCHMARK_COMPARISON.md).
+Generated 2026-11-16T11:29:03Z. Methodology and fairness rules: [docs/BENCHMARK_COMPARISON.md](https://github.com/xarmian/algod-rust/blob/main/docs/BENCHMARK_COMPARISON.md).
 
-**Status: OK.** 117 paired row(s): Rust faster 49, Go faster 15, inconclusive 53; 0 unpaired.
+**Status: OK.** 117 paired row(s): Rust faster 49, Go faster 10, inconclusive 58; 0 unpaired.
 
 #### Builds
 
 | | go-algorand | algod-rust |
 |---|---|---|
-| Commit | `31186e99a69e74483ad95e9ce872903b74758abf` | `d263d96974d9cf1d05e4467aa1bb78f4fdb32f76` |
-| Describe | `v5.0.5-stable` | `d263d969` |
+| Commit | `31186e99a69e74483ad95e9ce872903b74758abf` | `2f2570092a88e9169cc0039545d9d0ff797aaaf1` |
+| Describe | `v5.0.5-stable` | `2f257009` |
 | Pin | expected `v5.0.5-stable`, matches | |
 | Dirty tree | no | no |
 | Binaries | go/algod, go/goal | rust/algod-rust |
@@ -170,32 +172,32 @@ Fairness warnings:
 
 | Benchmark | Unit | Go median | Go spread | Rust median | Rust spread | Rust/Go | Faster |
 |---|---|---|---|---|---|---|---|
-| fixed/commit_rounds | rounds (lower is better) | 2 | [2, 3] 95% CI, n=10 | 3 | [3, 3] 95% CI, n=10 | 1.5 | inconclusive |
-| fixed/commit_time_s | s (lower is better) | 6 | [6, 9] 95% CI, n=10 | 9 | [9, 9] 95% CI, n=10 | 1.5 | inconclusive |
-| fixed/confirmed_tps | txn/s (higher is better) | 33.33 | [22.22, 33.33] 95% CI, n=10 | 22.22 | [22.22, 22.22] 95% CI, n=10 | 0.6667 | inconclusive |
-| fixed/latency_p50_ms | ms (lower is better) | 4027 | [4023, 4029] 95% CI, n=10 | 4023 | [4021, 4027] 95% CI, n=10 | 0.999 | inconclusive |
-| fixed/latency_p95_ms | ms (lower is better) | 5031 | [5030, 6037] 95% CI, n=10 | 6032 | [5027, 6037] 95% CI, n=10 | 1.199 | inconclusive |
-| fixed/latency_p99_ms | ms (lower is better) | 5031 | [5030, 6037] 95% CI, n=10 | 6032 | [5027, 6037] 95% CI, n=10 | 1.199 | inconclusive |
+| fixed/commit_rounds | rounds (lower is better) | 2 | [2, 3] 95% CI, n=10 | 3 | [2, 3] 95% CI, n=10 | 1.5 | inconclusive |
+| fixed/commit_time_s | s (lower is better) | 6 | [6, 9] 95% CI, n=10 | 9 | [6, 9] 95% CI, n=10 | 1.5 | inconclusive |
+| fixed/confirmed_tps | txn/s (higher is better) | 33.33 | [22.22, 33.33] 95% CI, n=10 | 22.22 | [22.22, 33.33] 95% CI, n=10 | 0.6667 | inconclusive |
+| fixed/latency_p50_ms | ms (lower is better) | 4026 | [4022, 4029] 95% CI, n=10 | 4272 | [4023, 4279] 95% CI, n=10 | 1.061 | inconclusive |
+| fixed/latency_p95_ms | ms (lower is better) | 5030 | [5029, 5033] 95% CI, n=10 | 6161 | [5282, 6290] 95% CI, n=10 | 1.225 | **Go** 1.225x |
+| fixed/latency_p99_ms | ms (lower is better) | 5030 | [5029, 5033] 95% CI, n=10 | 6161 | [5282, 6290] 95% CI, n=10 | 1.225 | **Go** 1.225x |
 | fixed/pool_rejected_check | txns (lower is better) | 0 | [0, 0] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
 | fixed/pool_rejected_remember | txns (lower is better) | 0 | [0, 0] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
-| fixed/pool_size_end | txns (lower is better) | 0 | [0, 190] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
+| fixed/pool_size_end | txns (lower is better) | 0 | [0, 10] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
 | fixed/rejected_groups | groups (lower is better) | 0 | [0, 0] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
 | fixed/round_time_s | s (lower is better) | 3 | [3, 3] 95% CI, n=10 | 3 | [3, 3] 95% CI, n=10 | 1 | inconclusive |
-| fixed/set_tps | txn/s (higher is better) | 33.33 | [22.22, 33.33] 95% CI, n=10 | 22.22 | [22.22, 22.22] 95% CI, n=10 | 0.6667 | inconclusive |
+| fixed/set_tps | txn/s (higher is better) | 33.33 | [22.22, 33.33] 95% CI, n=10 | 22.22 | [22.22, 33.33] 95% CI, n=10 | 0.6667 | inconclusive |
 | fixed/start_backlog_txns | txns (lower is better) | 0 | [0, 0] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
-| fixed/submit_tps | txn/s (higher is better) | 99.87 | [99.84, 99.9] 95% CI, n=10 | 99.88 | [99.81, 99.89] 95% CI, n=10 | 1 | inconclusive |
-| ladder-50/blockio_write_mb | MB (lower is better) | 154.7 | [154.6, 155] 95% CI, n=10 | 4.148 | [2.708, 5.474] 95% CI, n=10 | 0.02682 | **Rust** 37.29x |
-| ladder-50/confirmed_tps | txn/s (higher is better) | 25.89 | [25.56, 26.11] 95% CI, n=10 | 26.67 | [26.22, 26.67] 95% CI, n=10 | 1.03 | **Rust** 1.03x |
-| ladder-50/cpu_cores | cores (lower is better) | 0.1434 | [0.1348, 0.305] 95% CI, n=10 | 0.4715 | [0.2008, 0.5126] 95% CI, n=10 | 3.289 | inconclusive |
-| ladder-50/latency_p50_ms | ms (lower is better) | 4774 | [4773, 4777] 95% CI, n=10 | 4777 | [4774, 4780] 95% CI, n=10 | 1.001 | inconclusive |
-| ladder-50/latency_p95_ms | ms (lower is better) | 5783 | [5781, 5785] 95% CI, n=10 | 6035 | [6033, 6037] 95% CI, n=10 | 1.044 | **Go** 1.044x |
-| ladder-50/latency_p99_ms | ms (lower is better) | 5783 | [5781, 5785] 95% CI, n=10 | 6035 | [6033, 6037] 95% CI, n=10 | 1.044 | **Go** 1.044x |
+| fixed/submit_tps | txn/s (higher is better) | 99.88 | [99.84, 99.91] 95% CI, n=10 | 99.89 | [99.87, 99.89] 95% CI, n=10 | 1 | inconclusive |
+| ladder-50/blockio_write_mb | MB (lower is better) | 154.4 | [154.3, 154.4] 95% CI, n=10 | 4.897 | [2.756, 5.226] 95% CI, n=10 | 0.03172 | **Rust** 31.52x |
+| ladder-50/confirmed_tps | txn/s (higher is better) | 26.11 | [25.56, 26.11] 95% CI, n=10 | 27.22 | [25, 27.78] 95% CI, n=10 | 1.043 | inconclusive |
+| ladder-50/cpu_cores | cores (lower is better) | 0.1429 | [0.1397, 0.1708] 95% CI, n=10 | 0.1279 | [0.0736, 0.1472] 95% CI, n=10 | 0.8949 | inconclusive |
+| ladder-50/latency_p50_ms | ms (lower is better) | 4773 | [4527, 4777] 95% CI, n=10 | 5026 | [5024, 5028] 95% CI, n=10 | 1.053 | **Go** 1.053x |
+| ladder-50/latency_p95_ms | ms (lower is better) | 5784 | [5780, 5787] 95% CI, n=10 | 6161 | [6030, 6290] 95% CI, n=10 | 1.065 | **Go** 1.065x |
+| ladder-50/latency_p99_ms | ms (lower is better) | 5784 | [5780, 5787] 95% CI, n=10 | 6161 | [6030, 6290] 95% CI, n=10 | 1.065 | **Go** 1.065x |
 | ladder-50/pool_rejected_check | txns (lower is better) | 0 | [0, 0] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
 | ladder-50/pool_rejected_remember | txns (lower is better) | 0 | [0, 0] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
-| ladder-50/pool_size_end | txns (lower is better) | 195.5 | [195, 295] 95% CI, n=10 | 109.5 | [105, 110] 95% CI, n=10 | 0.5601 | **Rust** 1.785x |
+| ladder-50/pool_size_end | txns (lower is better) | 195 | [195, 200] 95% CI, n=10 | 99.5 | [95, 105] 95% CI, n=10 | 0.5103 | **Rust** 1.96x |
 | ladder-50/rejected_groups | groups (lower is better) | 0 | [0, 0] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
-| ladder-50/round_time_s | s (lower is better) | 3 | [3, 3] 95% CI, n=10 | 3 | [3, 3] 95% CI, n=10 | 1 | inconclusive |
-| ladder-50/rss_mb_peak | MB (lower is better) | 1137 | [1126, 1166] 95% CI, n=10 | 193 | [183.8, 195.8] 95% CI, n=10 | 0.1698 | **Rust** 5.889x |
+| ladder-50/round_time_s | s (lower is better) | 3 | [3, 3] 95% CI, n=10 | 3 | [3, 3.333] 95% CI, n=10 | 1 | inconclusive |
+| ladder-50/rss_mb_peak | MB (lower is better) | 1136 | [1123, 1152] 95% CI, n=10 | 192.8 | [180.5, 196.5] 95% CI, n=10 | 0.1697 | **Rust** 5.893x |
 | ladder-50/start_backlog_txns | txns (lower is better) | 0 | [0, 0] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
 | ladder-50/submit_tps | txn/s (higher is better) | 49.99 | [49.99, 49.99] 95% CI, n=10 | 49.99 | [49.99, 49.99] 95% CI, n=10 | 1 | inconclusive |
 
@@ -203,105 +205,105 @@ Fairness warnings:
 
 | Benchmark | Unit | Go median | Go spread | Rust median | Rust spread | Rust/Go | Faster |
 |---|---|---|---|---|---|---|---|
-| agreement/credential-verify | ns/op (lower is better) | 141,409 | [138,323, 157,788] 95% CI, n=10 | 99,199 | [96,972, 105,362] 95% CI, n=10 | 0.7015 | **Rust** 1.426x |
-| agreement/decode-cert | ns/op (lower is better) | 2978 | [2823, 3125] 95% CI, n=10 | 1846 | [1819, 1983] 95% CI, n=10 | 0.6197 | **Rust** 1.614x |
-| agreement/decode-proposal | ns/op (lower is better) | 419 | [410.9, 428.6] 95% CI, n=10 | 411.5 | [406.8, 418.5] 95% CI, n=10 | 0.9822 | inconclusive |
-| agreement/sortition-select | ns/op (lower is better) | 13,540 | [13,334, 14,387] 95% CI, n=10 | 309.5 | [303.4, 328.3] 95% CI, n=10 | 0.02286 | **Rust** 43.75x |
-| agreement/sortition-select-f128 | ns/op (lower is better) | 759.5 | [731.7, 820.4] 95% CI, n=10 | 898.4 | [892.2, 929.7] 95% CI, n=10 | 1.183 | **Go** 1.183x |
-| avm/app-state-box | ns/op (lower is better) | 8460 | [8398, 9251] 95% CI, n=10 | 10,645 | [10,484, 11,015] 95% CI, n=10 | 1.258 | **Go** 1.258x |
-| avm/lsig-arith-loop | ns/op (lower is better) | 120,098 | [115,850, 133,778] 95% CI, n=10 | 95,065 | [92,307, 99,360] 95% CI, n=10 | 0.7916 | **Rust** 1.263x |
-| avm/lsig-bytes-ops | ns/op (lower is better) | 176,848 | [173,990, 192,177] 95% CI, n=10 | 142,498 | [139,589, 148,738] 95% CI, n=10 | 0.8058 | **Rust** 1.241x |
-| avm/lsig-hash-loop | ns/op (lower is better) | 44,613 | [42,286, 49,166] 95% CI, n=10 | 37,602 | [36,186, 38,240] 95% CI, n=10 | 0.8429 | **Rust** 1.186x |
-| codec/block-hash | ns/op (lower is better) | 1146 | [1106, 1251] 95% CI, n=10 | 874.9 | [846.4, 924.8] 95% CI, n=10 | 0.7634 | **Rust** 1.31x |
-| codec/decode-block-large | ns/op (lower is better) | 314,545 | [305,734, 325,989] 95% CI, n=10 | 316,390 | [309,275, 341,408] 95% CI, n=10 | 1.006 | inconclusive |
-| codec/decode-block-small | ns/op (lower is better) | 998.5 | [985.8, 1140] 95% CI, n=10 | 803.2 | [781, 893.4] 95% CI, n=10 | 0.8044 | **Rust** 1.243x |
-| codec/decode-stxn | ns/op (lower is better) | 658.7 | [646.6, 716.9] 95% CI, n=10 | 476.3 | [431.4, 524.8] 95% CI, n=10 | 0.7231 | **Rust** 1.383x |
-| codec/encode-block-large | ns/op (lower is better) | 461,966 | [456,977, 510,444] 95% CI, n=10 | 270,743 | [263,161, 283,430] 95% CI, n=10 | 0.5861 | **Rust** 1.706x |
-| codec/encode-block-small | ns/op (lower is better) | 1218 | [1185, 1310] 95% CI, n=10 | 835.4 | [815.8, 911] 95% CI, n=10 | 0.6859 | **Rust** 1.458x |
-| codec/encode-stxn | ns/op (lower is better) | 673.7 | [650.8, 735.1] 95% CI, n=10 | 504.1 | [495.3, 541] 95% CI, n=10 | 0.7482 | **Rust** 1.336x |
-| codec/txid | ns/op (lower is better) | 847.6 | [835, 921.4] 95% CI, n=10 | 1012 | [984.4, 1060] 95% CI, n=10 | 1.194 | **Go** 1.194x |
-| commit/txn-merkle-sha512_256 | ns/op (lower is better) | 1,281,766 | [1,250,981, 1,380,625] 95% CI, n=10 | 803,517 | [777,022, 872,820] 95% CI, n=10 | 0.6269 | **Rust** 1.595x |
-| commit/txn-vc-sha256 | ns/op (lower is better) | 1,280,500 | [1,256,308, 1,367,855] 95% CI, n=10 | 665,242 | [642,403, 697,355] 95% CI, n=10 | 0.5195 | **Rust** 1.925x |
-| crypto/ed25519-batch-1024 | ns/op (lower is better) | 39,629,272 | [37,851,718, 41,176,651] 95% CI, n=10 | 33,380,427 | [32,472,202, 35,329,171] 95% CI, n=10 | 0.8423 | **Rust** 1.187x |
-| crypto/ed25519-batch-64 | ns/op (lower is better) | 2,489,980 | [2,337,996, 2,561,907] 95% CI, n=10 | 2,057,834 | [1,999,861, 2,152,663] 95% CI, n=10 | 0.8264 | **Rust** 1.21x |
-| crypto/ed25519-verify | ns/op (lower is better) | 37,078 | [35,857, 38,358] 95% CI, n=10 | 32,256 | [31,501, 33,476] 95% CI, n=10 | 0.87 | **Rust** 1.149x |
-| crypto/falcon-verify | ns/op (lower is better) | 32,767 | [31,945, 35,268] 95% CI, n=10 | 32,190 | [30,717, 32,934] 95% CI, n=10 | 0.9824 | inconclusive |
-| crypto/sha512_256-1KiB | ns/op (lower is better) | 1314 | [1261, 1439] 95% CI, n=10 | 1267 | [1241, 1294] 95% CI, n=10 | 0.9648 | inconclusive |
-| crypto/sha512_256-32B | ns/op (lower is better) | 182.8 | [177.8, 200.9] 95% CI, n=10 | 166.9 | [162.7, 171] 95% CI, n=10 | 0.9131 | **Rust** 1.095x |
-| crypto/sha512_256-64KiB | ns/op (lower is better) | 73,304 | [71,392, 75,499] 95% CI, n=10 | 70,381 | [68,012, 71,028] 95% CI, n=10 | 0.9601 | **Rust** 1.042x |
-| crypto/vrf-verify | ns/op (lower is better) | 141,043 | [137,802, 146,038] 95% CI, n=10 | 96,677 | [95,559, 100,881] 95% CI, n=10 | 0.6854 | **Rust** 1.459x |
+| agreement/credential-verify | ns/op (lower is better) | 143,730 | [136,039, 161,158] 95% CI, n=10 | 105,270 | [99,201, 115,543] 95% CI, n=10 | 0.7324 | **Rust** 1.365x |
+| agreement/decode-cert | ns/op (lower is better) | 3122 | [3007, 3479] 95% CI, n=10 | 2042 | [1937, 2170] 95% CI, n=10 | 0.6542 | **Rust** 1.529x |
+| agreement/decode-proposal | ns/op (lower is better) | 438.9 | [412.9, 476.4] 95% CI, n=10 | 435.6 | [416.8, 454.1] 95% CI, n=10 | 0.9924 | inconclusive |
+| agreement/sortition-select | ns/op (lower is better) | 14,624 | [13,118, 15,495] 95% CI, n=10 | 334.4 | [325.3, 359.3] 95% CI, n=10 | 0.02287 | **Rust** 43.73x |
+| agreement/sortition-select-f128 | ns/op (lower is better) | 785.5 | [728.4, 880] 95% CI, n=10 | 958.3 | [905, 1026] 95% CI, n=10 | 1.22 | **Go** 1.22x |
+| avm/app-state-box | ns/op (lower is better) | 9128 | [8440, 9582] 95% CI, n=10 | 11,461 | [10,720, 12,255] 95% CI, n=10 | 1.256 | **Go** 1.256x |
+| avm/lsig-arith-loop | ns/op (lower is better) | 120,281 | [117,643, 132,143] 95% CI, n=10 | 105,597 | [103,903, 113,823] 95% CI, n=10 | 0.8779 | **Rust** 1.139x |
+| avm/lsig-bytes-ops | ns/op (lower is better) | 188,887 | [171,598, 201,071] 95% CI, n=10 | 155,671 | [150,247, 162,982] 95% CI, n=10 | 0.8242 | **Rust** 1.213x |
+| avm/lsig-hash-loop | ns/op (lower is better) | 47,091 | [43,069, 49,667] 95% CI, n=10 | 38,070 | [36,299, 42,230] 95% CI, n=10 | 0.8084 | **Rust** 1.237x |
+| codec/block-hash | ns/op (lower is better) | 1196 | [1152, 1341] 95% CI, n=10 | 928.8 | [876.3, 981.2] 95% CI, n=10 | 0.7769 | **Rust** 1.287x |
+| codec/decode-block-large | ns/op (lower is better) | 326,298 | [310,654, 370,098] 95% CI, n=10 | 334,152 | [320,130, 360,936] 95% CI, n=10 | 1.024 | inconclusive |
+| codec/decode-block-small | ns/op (lower is better) | 1018 | [1001, 1206] 95% CI, n=10 | 806.9 | [788, 862.9] 95% CI, n=10 | 0.7931 | **Rust** 1.261x |
+| codec/decode-stxn | ns/op (lower is better) | 662.5 | [650, 742.8] 95% CI, n=10 | 482.3 | [446.4, 528.9] 95% CI, n=10 | 0.728 | **Rust** 1.374x |
+| codec/encode-block-large | ns/op (lower is better) | 480,712 | [469,856, 564,225] 95% CI, n=10 | 283,612 | [266,842, 337,420] 95% CI, n=10 | 0.59 | **Rust** 1.695x |
+| codec/encode-block-small | ns/op (lower is better) | 1230 | [1169, 1576] 95% CI, n=10 | 854.1 | [825.5, 976.7] 95% CI, n=10 | 0.6947 | **Rust** 1.44x |
+| codec/encode-stxn | ns/op (lower is better) | 694.6 | [664.6, 797.1] 95% CI, n=10 | 526.1 | [500.1, 560.9] 95% CI, n=10 | 0.7574 | **Rust** 1.32x |
+| codec/txid | ns/op (lower is better) | 868 | [857.5, 1027] 95% CI, n=10 | 1066 | [1013, 1075] 95% CI, n=10 | 1.228 | inconclusive |
+| commit/txn-merkle-sha512_256 | ns/op (lower is better) | 1,303,828 | [1,278,167, 1,415,198] 95% CI, n=10 | 840,549 | [813,205, 874,608] 95% CI, n=10 | 0.6447 | **Rust** 1.551x |
+| commit/txn-vc-sha256 | ns/op (lower is better) | 1,291,572 | [1,271,388, 1,420,590] 95% CI, n=10 | 687,768 | [654,707, 701,027] 95% CI, n=10 | 0.5325 | **Rust** 1.878x |
+| crypto/ed25519-batch-1024 | ns/op (lower is better) | 39,094,010 | [38,162,005, 44,460,770] 95% CI, n=10 | 29,449,045 | [28,467,061, 30,492,420] 95% CI, n=10 | 0.7533 | **Rust** 1.328x |
+| crypto/ed25519-batch-64 | ns/op (lower is better) | 2,457,452 | [2,418,732, 2,828,724] 95% CI, n=10 | 1,833,556 | [1,765,206, 1,862,336] 95% CI, n=10 | 0.7461 | **Rust** 1.34x |
+| crypto/ed25519-verify | ns/op (lower is better) | 37,196 | [36,473, 44,579] 95% CI, n=10 | 28,736 | [27,701, 29,397] 95% CI, n=10 | 0.7725 | **Rust** 1.294x |
+| crypto/falcon-verify | ns/op (lower is better) | 33,773 | [32,809, 37,181] 95% CI, n=10 | 33,459 | [32,265, 35,714] 95% CI, n=10 | 0.9907 | inconclusive |
+| crypto/sha512_256-1KiB | ns/op (lower is better) | 1346 | [1321, 1549] 95% CI, n=10 | 1315 | [1271, 1607] 95% CI, n=10 | 0.977 | inconclusive |
+| crypto/sha512_256-32B | ns/op (lower is better) | 187.4 | [184.1, 212.6] 95% CI, n=10 | 178.2 | [167.4, 190.8] 95% CI, n=10 | 0.9513 | inconclusive |
+| crypto/sha512_256-64KiB | ns/op (lower is better) | 75,434 | [73,193, 81,417] 95% CI, n=10 | 74,487 | [71,527, 107,594] 95% CI, n=10 | 0.9875 | inconclusive |
+| crypto/vrf-verify | ns/op (lower is better) | 140,820 | [138,285, 157,759] 95% CI, n=10 | 102,295 | [99,012, 129,282] 95% CI, n=10 | 0.7264 | **Rust** 1.377x |
 
 ##### replay
 
 | Benchmark | Unit | Go median | Go spread | Rust median | Rust spread | Rust/Go | Faster |
 |---|---|---|---|---|---|---|---|
-| small/blocks_per_s | block/s (higher is better) | 1549 | [1535, 1556] 95% CI, n=10 | 1423 | [1404, 1435] 95% CI, n=10 | 0.9189 | **Go** 1.088x |
-| small/cpu_s | s (lower is better) | 2.777 | [2.77, 2.821] 95% CI, n=10 | 0.9449 | [0.9058, 0.9672] 95% CI, n=10 | 0.3402 | **Rust** 2.939x |
-| small/db_mb | MB (lower is better) | 9.293 | [9.285, 9.301] 95% CI, n=10 | 10.4 | [10.4, 10.4] 95% CI, n=10 | 1.119 | **Go** 1.119x |
-| small/peak_rss_mb | MB (lower is better) | 256.6 | [254.8, 257.9] 95% CI, n=10 | 40.76 | [40.35, 40.99] 95% CI, n=10 | 0.1588 | **Rust** 6.296x |
-| small/txns_per_s | txn/s (higher is better) | 9549 | [9467, 9597] 95% CI, n=10 | 8775 | [8655, 8847] 95% CI, n=10 | 0.9189 | **Go** 1.088x |
-| small/wall_s | s (lower is better) | 1.291 | [1.285, 1.303] 95% CI, n=10 | 1.405 | [1.394, 1.425] 95% CI, n=10 | 1.088 | **Go** 1.088x |
-| small/write_mb | MB (lower is better) | 66.18 | [65.92, 66.47] 95% CI, n=10 | 154.5 | [154.5, 154.5] 95% CI, n=10 | 2.334 | **Go** 2.334x |
+| small/blocks_per_s | block/s (higher is better) | 1488 | [1413, 1516] 95% CI, n=10 | 2120 | [1952, 2148] 95% CI, n=10 | 1.425 | **Rust** 1.425x |
+| small/cpu_s | s (lower is better) | 2.916 | [2.828, 3.094] 95% CI, n=10 | 0.949 | [0.938, 1.049] 95% CI, n=10 | 0.3254 | **Rust** 3.073x |
+| small/db_mb | MB (lower is better) | 9.289 | [9.285, 9.301] 95% CI, n=10 | 10.47 | [10.47, 10.47] 95% CI, n=10 | 1.127 | **Go** 1.127x |
+| small/peak_rss_mb | MB (lower is better) | 256.5 | [255.4, 257.8] 95% CI, n=10 | 41.37 | [40.89, 41.77] 95% CI, n=10 | 0.1613 | **Rust** 6.199x |
+| small/txns_per_s | txn/s (higher is better) | 9173 | [8712, 9350] 95% CI, n=10 | 13,071 | [12,037, 13,244] 95% CI, n=10 | 1.425 | **Rust** 1.425x |
+| small/wall_s | s (lower is better) | 1.344 | [1.319, 1.415] 95% CI, n=10 | 0.9435 | [0.9311, 1.025] 95% CI, n=10 | 0.7018 | **Rust** 1.425x |
+| small/write_mb | MB (lower is better) | 66.04 | [65.51, 66.73] 95% CI, n=10 | 154.5 | [154.5, 154.5] 95% CI, n=10 | 2.339 | **Go** 2.339x |
 
 ##### rest
 
 | Benchmark | Unit | Go median | Go spread | Rust median | Rust spread | Rust/Go | Faster |
 |---|---|---|---|---|---|---|---|
 | account_assets/c4/error_rate | ratio (lower is better) | 0 | [0, 0] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
-| account_assets/c4/p50_ms | ms (lower is better) | 0.2881 | [0.282, 0.2959] 95% CI, n=10 | 0.2606 | [0.2563, 0.2689] 95% CI, n=10 | 0.9043 | **Rust** 1.106x |
-| account_assets/c4/p95_ms | ms (lower is better) | 0.4486 | [0.4419, 0.4631] 95% CI, n=10 | 0.3785 | [0.372, 0.3913] 95% CI, n=10 | 0.8439 | **Rust** 1.185x |
-| account_assets/c4/p99_ms | ms (lower is better) | 0.7208 | [0.6814, 0.8253] 95% CI, n=10 | 0.4691 | [0.4548, 0.4988] 95% CI, n=10 | 0.6507 | **Rust** 1.537x |
-| account_assets/c4/rps | req/s (higher is better) | 13,254 | [12,905, 13,386] 95% CI, n=10 | 14,927 | [14,418, 15,093] 95% CI, n=10 | 1.126 | **Rust** 1.126x |
+| account_assets/c4/p50_ms | ms (lower is better) | 0.2987 | [0.2901, 0.3012] 95% CI, n=10 | 0.268 | [0.2634, 0.2734] 95% CI, n=10 | 0.8974 | **Rust** 1.114x |
+| account_assets/c4/p95_ms | ms (lower is better) | 0.4725 | [0.4591, 0.4927] 95% CI, n=10 | 0.3861 | [0.3789, 0.4053] 95% CI, n=10 | 0.8172 | **Rust** 1.224x |
+| account_assets/c4/p99_ms | ms (lower is better) | 0.7519 | [0.7173, 0.8118] 95% CI, n=10 | 0.4751 | [0.4596, 0.5117] 95% CI, n=10 | 0.6318 | **Rust** 1.583x |
+| account_assets/c4/rps | req/s (higher is better) | 12,701 | [12,530, 13,090] 95% CI, n=10 | 14,563 | [14,074, 14,755] 95% CI, n=10 | 1.147 | **Rust** 1.147x |
 | account_cold/c4/error_rate | ratio (lower is better) | 0 | [0, 0] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
-| account_cold/c4/p50_ms | ms (lower is better) | 0.2525 | [0.2494, 0.256] 95% CI, n=10 | 0.2493 | [0.2488, 0.2519] 95% CI, n=10 | 0.9872 | inconclusive |
-| account_cold/c4/p95_ms | ms (lower is better) | 0.364 | [0.3567, 0.374] 95% CI, n=10 | 0.3553 | [0.3524, 0.3622] 95% CI, n=10 | 0.9762 | inconclusive |
-| account_cold/c4/p99_ms | ms (lower is better) | 0.4705 | [0.4581, 0.4925] 95% CI, n=10 | 0.4384 | [0.4327, 0.4522] 95% CI, n=10 | 0.9319 | **Rust** 1.073x |
-| account_cold/c4/rps | req/s (higher is better) | 15,451 | [15,270, 15,737] 95% CI, n=10 | 15,668 | [15,532, 15,774] 95% CI, n=10 | 1.014 | inconclusive |
+| account_cold/c4/p50_ms | ms (lower is better) | 0.2592 | [0.2567, 0.2667] 95% CI, n=10 | 0.2655 | [0.2567, 0.2767] 95% CI, n=10 | 1.024 | inconclusive |
+| account_cold/c4/p95_ms | ms (lower is better) | 0.3746 | [0.3638, 0.3943] 95% CI, n=10 | 0.3921 | [0.369, 0.4125] 95% CI, n=10 | 1.047 | inconclusive |
+| account_cold/c4/p99_ms | ms (lower is better) | 0.4878 | [0.4661, 0.5086] 95% CI, n=10 | 0.4908 | [0.4562, 0.5146] 95% CI, n=10 | 1.006 | inconclusive |
+| account_cold/c4/rps | req/s (higher is better) | 15,079 | [14,564, 15,258] 95% CI, n=10 | 14,689 | [14,029, 15,247] 95% CI, n=10 | 0.9741 | inconclusive |
 | account_hot/c4/error_rate | ratio (lower is better) | 0 | [0, 0] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
-| account_hot/c4/p50_ms | ms (lower is better) | 0.2782 | [0.2736, 0.2838] 95% CI, n=10 | 0.2907 | [0.2858, 0.2955] 95% CI, n=10 | 1.045 | **Go** 1.045x |
-| account_hot/c4/p95_ms | ms (lower is better) | 0.4109 | [0.3971, 0.4169] 95% CI, n=10 | 0.4213 | [0.4173, 0.4399] 95% CI, n=10 | 1.025 | **Go** 1.025x |
-| account_hot/c4/p99_ms | ms (lower is better) | 0.545 | [0.5085, 0.5749] 95% CI, n=10 | 0.503 | [0.4973, 0.5406] 95% CI, n=10 | 0.9228 | inconclusive |
-| account_hot/c4/rps | req/s (higher is better) | 13,930 | [13,622, 14,228] 95% CI, n=10 | 13,392 | [12,992, 13,580] 95% CI, n=10 | 0.9614 | **Go** 1.04x |
+| account_hot/c4/p50_ms | ms (lower is better) | 0.2879 | [0.2847, 0.2919] 95% CI, n=10 | 0.2956 | [0.2941, 0.3007] 95% CI, n=10 | 1.027 | **Go** 1.027x |
+| account_hot/c4/p95_ms | ms (lower is better) | 0.4316 | [0.4206, 0.4468] 95% CI, n=10 | 0.4349 | [0.4275, 0.4492] 95% CI, n=10 | 1.008 | inconclusive |
+| account_hot/c4/p99_ms | ms (lower is better) | 0.5711 | [0.5526, 0.5841] 95% CI, n=10 | 0.5282 | [0.517, 0.5458] 95% CI, n=10 | 0.9249 | **Rust** 1.081x |
+| account_hot/c4/rps | req/s (higher is better) | 13,389 | [13,065, 13,633] 95% CI, n=10 | 13,091 | [12,850, 13,133] 95% CI, n=10 | 0.9777 | inconclusive |
 | application/c4/error_rate | ratio (lower is better) | 0 | [0, 0] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
-| application/c4/p50_ms | ms (lower is better) | 0.2688 | [0.2675, 0.2734] 95% CI, n=10 | 0.2475 | [0.2441, 0.254] 95% CI, n=10 | 0.9206 | **Rust** 1.086x |
-| application/c4/p95_ms | ms (lower is better) | 0.3891 | [0.3828, 0.4046] 95% CI, n=10 | 0.3562 | [0.3478, 0.3697] 95% CI, n=10 | 0.9152 | **Rust** 1.093x |
-| application/c4/p99_ms | ms (lower is better) | 0.5144 | [0.5096, 0.5331] 95% CI, n=10 | 0.4406 | [0.4301, 0.4625] 95% CI, n=10 | 0.8565 | **Rust** 1.168x |
-| application/c4/rps | req/s (higher is better) | 14,544 | [14,273, 14,625] 95% CI, n=10 | 15,820 | [15,361, 16,042] 95% CI, n=10 | 1.088 | **Rust** 1.088x |
+| application/c4/p50_ms | ms (lower is better) | 0.2793 | [0.2756, 0.2895] 95% CI, n=10 | 0.2563 | [0.2534, 0.2611] 95% CI, n=10 | 0.9175 | **Rust** 1.09x |
+| application/c4/p95_ms | ms (lower is better) | 0.4139 | [0.3982, 0.4541] 95% CI, n=10 | 0.3694 | [0.3641, 0.3835] 95% CI, n=10 | 0.8924 | **Rust** 1.121x |
+| application/c4/p99_ms | ms (lower is better) | 0.5446 | [0.5199, 0.582] 95% CI, n=10 | 0.4673 | [0.4436, 0.4868] 95% CI, n=10 | 0.8581 | **Rust** 1.165x |
+| application/c4/rps | req/s (higher is better) | 13,932 | [13,354, 14,155] 95% CI, n=10 | 15,235 | [14,890, 15,418] 95% CI, n=10 | 1.094 | **Rust** 1.094x |
 | blocks_json/c4/error_rate | ratio (lower is better) | 0 | [0, 0] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
-| blocks_json/c4/p50_ms | ms (lower is better) | 0.4199 | [0.3973, 0.433] 95% CI, n=10 | 0.3024 | [0.2984, 0.3174] 95% CI, n=10 | 0.7203 | **Rust** 1.388x |
-| blocks_json/c4/p95_ms | ms (lower is better) | 0.678 | [0.6503, 0.7061] 95% CI, n=10 | 0.4453 | [0.4373, 0.4956] 95% CI, n=10 | 0.6568 | **Rust** 1.523x |
-| blocks_json/c4/p99_ms | ms (lower is better) | 1.287 | [1.137, 1.411] 95% CI, n=10 | 0.5411 | [0.5253, 0.6132] 95% CI, n=10 | 0.4204 | **Rust** 2.379x |
-| blocks_json/c4/rps | req/s (higher is better) | 8752 | [8637, 9143] 95% CI, n=10 | 12,753 | [11,999, 12,927] 95% CI, n=10 | 1.457 | **Rust** 1.457x |
+| blocks_json/c4/p50_ms | ms (lower is better) | 0.4347 | [0.4164, 0.4459] 95% CI, n=10 | 0.314 | [0.3077, 0.3176] 95% CI, n=10 | 0.7224 | **Rust** 1.384x |
+| blocks_json/c4/p95_ms | ms (lower is better) | 0.7077 | [0.6785, 0.7489] 95% CI, n=10 | 0.4593 | [0.4534, 0.4967] 95% CI, n=10 | 0.649 | **Rust** 1.541x |
+| blocks_json/c4/p99_ms | ms (lower is better) | 1.409 | [1.325, 1.786] 95% CI, n=10 | 0.5535 | [0.547, 0.6759] 95% CI, n=10 | 0.3928 | **Rust** 2.546x |
+| blocks_json/c4/rps | req/s (higher is better) | 8419 | [8162, 8923] 95% CI, n=10 | 12,308 | [11,896, 12,537] 95% CI, n=10 | 1.462 | **Rust** 1.462x |
 | blocks_msgpack/c4/error_rate | ratio (lower is better) | 0 | [0, 0] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
-| blocks_msgpack/c4/p50_ms | ms (lower is better) | 0.2924 | [0.2884, 0.2972] 95% CI, n=10 | 0.2431 | [0.2402, 0.2561] 95% CI, n=10 | 0.8313 | **Rust** 1.203x |
-| blocks_msgpack/c4/p95_ms | ms (lower is better) | 0.435 | [0.4282, 0.4529] 95% CI, n=10 | 0.3522 | [0.3412, 0.3875] 95% CI, n=10 | 0.8097 | **Rust** 1.235x |
-| blocks_msgpack/c4/p99_ms | ms (lower is better) | 0.5684 | [0.5391, 0.5974] 95% CI, n=10 | 0.4443 | [0.4264, 0.4992] 95% CI, n=10 | 0.7817 | **Rust** 1.279x |
-| blocks_msgpack/c4/rps | req/s (higher is better) | 13,364 | [12,978, 13,501] 95% CI, n=10 | 16,029 | [15,111, 16,304] 95% CI, n=10 | 1.199 | **Rust** 1.199x |
+| blocks_msgpack/c4/p50_ms | ms (lower is better) | 0.2975 | [0.2869, 0.3166] 95% CI, n=10 | 0.2463 | [0.2417, 0.2597] 95% CI, n=10 | 0.8277 | **Rust** 1.208x |
+| blocks_msgpack/c4/p95_ms | ms (lower is better) | 0.4463 | [0.431, 0.4967] 95% CI, n=10 | 0.3565 | [0.3514, 0.4036] 95% CI, n=10 | 0.7987 | **Rust** 1.252x |
+| blocks_msgpack/c4/p99_ms | ms (lower is better) | 0.5975 | [0.5425, 0.6604] 95% CI, n=10 | 0.4563 | [0.4403, 0.5224] 95% CI, n=10 | 0.7637 | **Rust** 1.309x |
+| blocks_msgpack/c4/rps | req/s (higher is better) | 13,104 | [12,148, 13,507] 95% CI, n=10 | 15,892 | [14,750, 16,148] 95% CI, n=10 | 1.213 | **Rust** 1.213x |
 | box/c4/error_rate | ratio (lower is better) | 0 | [0, 0] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
-| box/c4/p50_ms | ms (lower is better) | 0.2651 | [0.2637, 0.2889] 95% CI, n=10 | 0.2443 | [0.2361, 0.2478] 95% CI, n=10 | 0.9215 | **Rust** 1.085x |
-| box/c4/p95_ms | ms (lower is better) | 0.3844 | [0.381, 0.4206] 95% CI, n=10 | 0.3454 | [0.334, 0.3577] 95% CI, n=10 | 0.8985 | **Rust** 1.113x |
-| box/c4/p99_ms | ms (lower is better) | 0.5115 | [0.4891, 0.5452] 95% CI, n=10 | 0.4329 | [0.4245, 0.4571] 95% CI, n=10 | 0.8462 | **Rust** 1.182x |
-| box/c4/rps | req/s (higher is better) | 14,751 | [13,366, 14,797] 95% CI, n=10 | 16,088 | [15,871, 16,622] 95% CI, n=10 | 1.091 | **Rust** 1.091x |
+| box/c4/p50_ms | ms (lower is better) | 0.2769 | [0.2733, 0.284] 95% CI, n=10 | 0.2474 | [0.2448, 0.2508] 95% CI, n=10 | 0.8934 | **Rust** 1.119x |
+| box/c4/p95_ms | ms (lower is better) | 0.4014 | [0.3934, 0.4411] 95% CI, n=10 | 0.3575 | [0.3482, 0.3664] 95% CI, n=10 | 0.8907 | **Rust** 1.123x |
+| box/c4/p99_ms | ms (lower is better) | 0.5266 | [0.5098, 0.5606] 95% CI, n=10 | 0.4498 | [0.4369, 0.4652] 95% CI, n=10 | 0.8542 | **Rust** 1.171x |
+| box/c4/rps | req/s (higher is better) | 14,114 | [13,456, 14,302] 95% CI, n=10 | 15,797 | [15,585, 15,976] 95% CI, n=10 | 1.119 | **Rust** 1.119x |
 | simulate/c4/error_rate | ratio (lower is better) | 0 | [0, 0] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
-| simulate/c4/p50_ms | ms (lower is better) | 0.8154 | [0.5235, 0.8381] 95% CI, n=10 | 0.7613 | [0.7443, 0.8393] 95% CI, n=10 | 0.9337 | inconclusive |
-| simulate/c4/p95_ms | ms (lower is better) | 1.13 | [1.106, 1.158] 95% CI, n=10 | 1.142 | [1.119, 1.222] 95% CI, n=10 | 1.011 | inconclusive |
-| simulate/c4/p99_ms | ms (lower is better) | 2.437 | [2.266, 2.931] 95% CI, n=10 | 1.263 | [1.234, 1.368] 95% CI, n=10 | 0.5183 | **Rust** 1.929x |
-| simulate/c4/rps | req/s (higher is better) | 4991 | [4657, 5625] 95% CI, n=10 | 4858 | [4647, 4965] 95% CI, n=10 | 0.9735 | inconclusive |
+| simulate/c4/p50_ms | ms (lower is better) | 0.7561 | [0.5961, 0.8674] 95% CI, n=10 | 0.7823 | [0.7714, 0.7991] 95% CI, n=10 | 1.035 | inconclusive |
+| simulate/c4/p95_ms | ms (lower is better) | 1.159 | [1.113, 1.279] 95% CI, n=10 | 1.142 | [1.124, 1.161] 95% CI, n=10 | 0.986 | inconclusive |
+| simulate/c4/p99_ms | ms (lower is better) | 2.988 | [2.409, 3.256] 95% CI, n=10 | 1.265 | [1.255, 1.311] 95% CI, n=10 | 0.4232 | **Rust** 2.363x |
+| simulate/c4/rps | req/s (higher is better) | 4863 | [4458, 5160] 95% CI, n=10 | 4872 | [4793, 4939] 95% CI, n=10 | 1.002 | inconclusive |
 | simulate_app/c4/error_rate | ratio (lower is better) | 0 | [0, 0] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
-| simulate_app/c4/p50_ms | ms (lower is better) | 1.121 | [0.8166, 1.244] 95% CI, n=10 | 1.096 | [1.083, 1.126] 95% CI, n=10 | 0.9784 | inconclusive |
-| simulate_app/c4/p95_ms | ms (lower is better) | 1.595 | [1.533, 1.669] 95% CI, n=10 | 1.727 | [1.702, 1.764] 95% CI, n=10 | 1.082 | **Go** 1.082x |
-| simulate_app/c4/p99_ms | ms (lower is better) | 4.344 | [3.436, 5.163] 95% CI, n=10 | 1.955 | [1.885, 1.969] 95% CI, n=10 | 0.4501 | **Rust** 2.222x |
-| simulate_app/c4/rps | req/s (higher is better) | 3314 | [3238, 3684] 95% CI, n=10 | 3177 | [3134, 3220] 95% CI, n=10 | 0.9586 | **Go** 1.043x |
+| simulate_app/c4/p50_ms | ms (lower is better) | 0.9389 | [0.8006, 1.218] 95% CI, n=10 | 1.106 | [1.086, 1.161] 95% CI, n=10 | 1.178 | inconclusive |
+| simulate_app/c4/p95_ms | ms (lower is better) | 1.66 | [1.592, 1.765] 95% CI, n=10 | 1.735 | [1.72, 1.81] 95% CI, n=10 | 1.045 | inconclusive |
+| simulate_app/c4/p99_ms | ms (lower is better) | 4.16 | [3.317, 5.56] 95% CI, n=10 | 1.945 | [1.92, 2.002] 95% CI, n=10 | 0.4676 | **Rust** 2.138x |
+| simulate_app/c4/rps | req/s (higher is better) | 3484 | [3104, 3760] 95% CI, n=10 | 3168 | [3075, 3200] 95% CI, n=10 | 0.9092 | inconclusive |
 | status/c4/error_rate | ratio (lower is better) | 0 | [0, 0] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
-| status/c4/p50_ms | ms (lower is better) | 0.243 | [0.2408, 0.248] 95% CI, n=10 | 0.2386 | [0.2356, 0.2457] 95% CI, n=10 | 0.982 | inconclusive |
-| status/c4/p95_ms | ms (lower is better) | 0.3508 | [0.3417, 0.3571] 95% CI, n=10 | 0.3493 | [0.339, 0.3611] 95% CI, n=10 | 0.9958 | inconclusive |
-| status/c4/p99_ms | ms (lower is better) | 0.4583 | [0.4486, 0.4676] 95% CI, n=10 | 0.4378 | [0.4196, 0.4531] 95% CI, n=10 | 0.9553 | inconclusive |
-| status/c4/rps | req/s (higher is better) | 16,123 | [15,785, 16,197] 95% CI, n=10 | 16,280 | [15,817, 16,551] 95% CI, n=10 | 1.01 | inconclusive |
+| status/c4/p50_ms | ms (lower is better) | 0.2503 | [0.2467, 0.26] 95% CI, n=10 | 0.2448 | [0.2412, 0.2521] 95% CI, n=10 | 0.9781 | inconclusive |
+| status/c4/p95_ms | ms (lower is better) | 0.3629 | [0.3552, 0.4011] 95% CI, n=10 | 0.3612 | [0.3521, 0.3779] 95% CI, n=10 | 0.9954 | inconclusive |
+| status/c4/p99_ms | ms (lower is better) | 0.4645 | [0.4593, 0.5179] 95% CI, n=10 | 0.4517 | [0.4316, 0.4809] 95% CI, n=10 | 0.9725 | inconclusive |
+| status/c4/rps | req/s (higher is better) | 15,613 | [14,770, 15,802] 95% CI, n=10 | 15,815 | [15,334, 16,122] 95% CI, n=10 | 1.013 | inconclusive |
 | tx_params/c4/error_rate | ratio (lower is better) | 0 | [0, 0] 95% CI, n=10 | 0 | [0, 0] 95% CI, n=10 | n/a | inconclusive |
-| tx_params/c4/p50_ms | ms (lower is better) | 0.2449 | [0.2384, 0.2478] 95% CI, n=10 | 0.2464 | [0.2356, 0.2556] 95% CI, n=10 | 1.006 | inconclusive |
-| tx_params/c4/p95_ms | ms (lower is better) | 0.352 | [0.3395, 0.3759] 95% CI, n=10 | 0.3598 | [0.3424, 0.3892] 95% CI, n=10 | 1.022 | inconclusive |
-| tx_params/c4/p99_ms | ms (lower is better) | 0.4602 | [0.44, 0.4915] 95% CI, n=10 | 0.4521 | [0.4338, 0.5031] 95% CI, n=10 | 0.9823 | inconclusive |
-| tx_params/c4/rps | req/s (higher is better) | 15,951 | [15,688, 16,362] 95% CI, n=10 | 15,768 | [15,002, 16,555] 95% CI, n=10 | 0.9885 | inconclusive |
+| tx_params/c4/p50_ms | ms (lower is better) | 0.2559 | [0.2479, 0.2787] 95% CI, n=10 | 0.2512 | [0.2427, 0.2621] 95% CI, n=10 | 0.9814 | inconclusive |
+| tx_params/c4/p95_ms | ms (lower is better) | 0.3871 | [0.3572, 0.4271] 95% CI, n=10 | 0.3761 | [0.3515, 0.4103] 95% CI, n=10 | 0.9716 | inconclusive |
+| tx_params/c4/p99_ms | ms (lower is better) | 0.5005 | [0.456, 0.5565] 95% CI, n=10 | 0.477 | [0.4334, 0.5629] 95% CI, n=10 | 0.953 | inconclusive |
+| tx_params/c4/rps | req/s (higher is better) | 15,135 | [13,798, 15,775] 95% CI, n=10 | 15,361 | [14,623, 16,065] 95% CI, n=10 | 1.015 | inconclusive |
 
 Rust/Go is the ratio of the medians. For lower-is-better units a value below 1 means Rust is faster; for higher-is-better units a value above 1 means Rust is faster. A side is only marked faster when the two spreads (95% CI of the median for n >= 6, else min/max) do not overlap. Rows marked (synthetic) come from the selftest tier and measure the harness, not either node.
 
@@ -309,11 +311,11 @@ Rust/Go is the ratio of the medians. For lower-is-better units a value below 1 m
 
 | Tier | Exit | Duration (s) |
 |---|---|---|
-| build | 0 | 197.9 |
-| micro | 0 | 3444 |
-| replay | 0 | 35.05 |
-| rest | 0 | 469.7 |
-| localnet | 0 | 917.3 |
+| build | 0 | 226.1 |
+| micro | 0 | 3511 |
+| replay | 0 | 32.78 |
+| rest | 0 | 448.7 |
+| localnet | 0 | 914.7 |
 <!-- bench-baseline:end local-main -->
 
 ### Baseline `local-testnet-prefix50`: replay of real certificates
@@ -399,18 +401,16 @@ where algod-rust is behind, and they feed the optimization pass #2110.
 ### Performance
 
 Every row where Go is faster with non-overlapping ranges, and who owns it
-(2026-11-15 re-run, `RUNS=10`):
+(2026-11-16 re-run, `RUNS=10`):
 
 | Row (Go faster) | Ratio | Owner / reason |
 |---|---|---|
-| `replay small` wall, blocks/s, txns/s | 1.09x | [#2316](https://github.com/xarmian/algod-rust/issues/2316): remaining cost is tracker WAL bytes and ext4 fsync, flat profile (see [PERF_PHASE23.md](PERF_PHASE23.md) row 12) |
-| `replay small` `write_mb`, `db_mb` | 2.33x, 1.12x | [#2316](https://github.com/xarmian/algod-rust/issues/2316): the tracker WAL (about 140 of 154 MB) is written once and checkpointed; block-device writes in the `localnet` tier are 37x lower than go's |
+| `replay small` `write_mb`, `db_mb` | 2.34x, 1.13x | [#2316](https://github.com/xarmian/algod-rust/issues/2316): the tracker WAL (about 140 of 154 MB) is written once and checkpointed; block-device writes in the `localnet` tier are 37x lower than go's |
 | `replay testnet-prefix50` wall, blocks/s, `write_mb` | 1.25x, 1.25x, 1.99x | [#2339](https://github.com/xarmian/algod-rust/issues/2339): certificate authentication and startup (was 5.07x before #2342 removed the tip-probe sleeps from the timed section) |
 | `micro avm/app-state-box` | 1.26x | [#2320](https://github.com/xarmian/algod-rust/issues/2320): per-call setup costs (bytecode parse, machine construction, allocation) |
-| `micro agreement/sortition-select-f128` | 1.18x | [#2321](https://github.com/xarmian/algod-rust/issues/2321): software f128; measured, division is not the lever (PERF_PHASE23.md row 9) |
-| `micro codec/txid` | 1.19x | [#2321](https://github.com/xarmian/algod-rust/issues/2321): one encode plus one SHA-512/256, 42% in the SHA block function |
-| `rest account_hot`, `simulate_app` p95/rps | 1.03x to 1.08x | [#2340](https://github.com/xarmian/algod-rust/issues/2340) |
-| `localnet ladder-50` p95/p99 latency | 1.04x | harness quantum (see Headline), no node cost |
+| `micro agreement/sortition-select-f128` | 1.22x | [#2321](https://github.com/xarmian/algod-rust/issues/2321): software f128; measured, division is not the lever (PERF_PHASE23.md row 9) |
+| `rest account_hot` p50 | 1.03x | [#2340](https://github.com/xarmian/algod-rust/issues/2340) |
+| `localnet` `fixed` p95/p99, `ladder-50` p50/p95/p99 latency | 1.23x, 1.05x to 1.07x | round-quantised noise (see Headline), no node cost |
 
 The first baseline's findings are closed: #2145 (certificate authentication on
 the large replay), #2162 (simulate), #2165/#2166 (catchup replay and WAL
