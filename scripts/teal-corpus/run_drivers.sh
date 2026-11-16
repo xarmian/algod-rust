@@ -6,7 +6,7 @@
 # Run the Go and Rust TEAL corpus drivers (issue #2366, epic #2364) over a corpus
 # from scripts/teal-corpus/extract.py and diff their outputs.
 #
-#   run_drivers.sh CORPUS_DIR OUT_DIR [disassemble|assemble|reassemble ...]
+#   run_drivers.sh CORPUS_DIR OUT_DIR [disassemble|assemble|reassemble|source ...]
 #
 # Needs GO_DRIVER (built by tools/teal-corpus/build.sh) and RUST_DRIVER (the
 # `teal-corpus` binary from `cargo build -p teal-corpus --release`) in the
@@ -15,7 +15,12 @@
 # disassembly of every program with both drivers, gates on equality, cross-checks
 # rust.assemble(rust.disassemble(P)) and prints the fixed-point statistics
 # (scripts/teal-corpus/reassemble.py; it runs the disassemble stage first when
-# OUT_DIR has no disassemble outputs). Exit 0 when every operation matches, 1 on any
+# OUT_DIR has no disassemble outputs). The `source` stage (issue #2369) is the
+# `assemble` operation over the original ARC-56 source.approval/source.clear TEAL
+# followed by scripts/teal-corpus/source_stats.py: the gate (bytecode, hash, source
+# map, warnings, ordered error list; TMPL_* sources compared on their errors) plus
+# the statistics (assembling sources, equal to the shipped byteCode, by pragma
+# version and compilerInfo generator). Exit 0 when every operation matches, 1 on any
 # mismatch, 2 on a usage or driver failure.
 set -uo pipefail
 CORPUS="${1:?usage: run_drivers.sh CORPUS_DIR OUT_DIR [op...]}"
@@ -46,7 +51,26 @@ reassemble_stage() {
   "$PY" -I "$HERE/reassemble.py" report "$CORPUS" "$OUT"
 }
 
+# source_stage: issue #2369. The assemble outputs are the stage's raw material.
+source_stage() {
+  local rc=0
+  bash "${BASH_SOURCE[0]}" "$CORPUS" "$OUT" assemble || rc=$?
+  [ $rc -eq 2 ] && return 2
+  "$PY" -I "$HERE/source_stats.py" "$CORPUS" "$OUT"
+  local src=$?
+  [ $src -eq 0 ] && [ $rc -eq 0 ] && return 0
+  [ $src -eq 1 ] || [ $rc -eq 1 ] && return 1
+  return 2
+}
+
 for op in "${OPS[@]}"; do
+  if [ "$op" = source ]; then
+    source_stage
+    rc=$?
+    if [ $rc -eq 1 ]; then [ $status -eq 2 ] || status=1
+    elif [ $rc -ne 0 ]; then status=2; fi
+    continue
+  fi
   if [ "$op" = reassemble ]; then
     reassemble_stage
     rc=$?

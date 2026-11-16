@@ -210,12 +210,20 @@ pub(crate) struct OpEntry {
     pub variants: &'static [Variant],
 }
 
-/// go's name of opcode `op`'s immediate `idx` (`i`, `n`, ...), for parse errors;
-/// `i` when the opcode has no such immediate.
-pub(crate) fn imm_name(op: &str, idx: usize) -> &'static str {
-    op_entry(op)
-        .and_then(|e| e.imms.get(idx))
-        .map_or("i", |i| i.name)
+/// go's `fieldNames[version][name]`: `name` belongs to a field group of an
+/// opcode that exists at `version`.
+pub(crate) fn field_name_exists_at(version: u8, name: &str) -> bool {
+    OPS.iter().any(|e| {
+        e.version <= version
+            && e.imms
+                .iter()
+                .any(|i| i.group.is_some_and(|g| g.iter().any(|f| f.name == name)))
+    })
+}
+
+/// The generated entry of opcode `name` (its immediates and their field groups).
+pub(crate) fn op_entry_by_name(name: &str) -> Option<&'static OpEntry> {
+    op_entry(name)
 }
 
 fn op_entry(name: &str) -> Option<&'static OpEntry> {
@@ -777,6 +785,26 @@ fn pseudo_variant(real: &str, version: u8) -> Option<(&'static OpEntry, &'static
     Some((e, v))
 }
 
+/// go's `mergeProtos` version for a pseudo-op given an immediate count that
+/// matches none of its specs: the oldest version among its candidate opcodes,
+/// or `None` when their protos cannot be merged (different stack shapes).
+pub(crate) fn pseudo_merged_min_version(name: &str, version: u8) -> Option<u8> {
+    let targets = pseudo_targets(name)?;
+    let mut shape: Option<(usize, usize)> = None;
+    let mut min_version: Option<u8> = None;
+    for (_, real) in targets {
+        let (entry, v) = pseudo_variant(real, version)?;
+        let this = (v.args.len(), v.returns.len());
+        match shape {
+            None => shape = Some(this),
+            Some(s) if s != this => return None,
+            Some(_) => {}
+        }
+        min_version = Some(min_version.map_or(entry.version, |m| m.min(entry.version)));
+    }
+    min_version
+}
+
 /// go's `getSpec` (the tracker's view of it): `None` when go gives up, so
 /// nothing is tracked.
 fn get_spec(ops: &OpStream, name: &str, argc: usize) -> Option<Spec> {
@@ -884,7 +912,7 @@ fn get_spec(ops: &OpStream, name: &str, argc: usize) -> Option<Spec> {
 
 fn type_error(ops: &mut OpStream, col: usize, msg: String) {
     if ops.type_track_reporting {
-        let line = ops.source_line;
+        let line = ops.stmt_line;
         ops.record_error(line, col, msg);
     }
 }

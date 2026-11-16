@@ -35,6 +35,12 @@ OUT = os.path.join(
 
 ADDR32 = "0x" + "11" * 32
 
+# Front-end error-shaping cases (issue #2369): the shortest source of every
+# class of mismatch the adversarial syntax corpus (gen_synthetic_syntax.py)
+# found between go and the previous assembler. One JSON object per line:
+# {"name", "class", "source"}. The expected output comes from the go driver.
+FRONTEND_CASES = os.path.join(HERE, "asm_frontend_cases.jsonl")
+
 
 def cases():
     c = []
@@ -196,6 +202,13 @@ def cases():
 
     # -- ordering of errors: getSpec complaints before type errors before assembly errors
     add("order_pseudo_count_then_type", "order", v(8, "txn\npop\n+\n"))
+
+    # -- front-end error shaping (issue #2369)
+    with open(FRONTEND_CASES, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                row = json.loads(line)
+                add(row["name"], row["class"], row["source"])
     return c
 
 

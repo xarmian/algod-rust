@@ -1116,8 +1116,8 @@ archival-down: ## Stop archival Go node
 ## ── TEAL corpus parity (Phase 25, epic #2364) ─────────────────
 
 TEAL_CORPUS_WORK ?= teal-corpus-work
-# Stages: disassemble (#2367), reassemble (#2368); assemble (original sources) with #2369. Space-separated.
-TEAL_CORPUS_STAGES ?= disassemble reassemble
+# Stages: disassemble (#2367), reassemble (#2368), source (#2369, original ARC-56 sources; `assemble` alone skips the statistics). Space-separated.
+TEAL_CORPUS_STAGES ?= disassemble reassemble source
 
 ## Fetch the ARC56Registry at a recorded SHA and extract the program/source corpus.
 teal-corpus-fetch:
@@ -1273,7 +1273,7 @@ help:
 	@echo ""
 	@echo "TEAL corpus parity (Phase 25):"
 	@echo "  make teal-corpus-fetch    Fetch the ARC56Registry and extract the corpus (network)"
-	@echo "  make teal-corpus-parity   Go-vs-Rust corpus comparison (TEAL_CORPUS_STAGES=disassemble|assemble|reassemble)"
+	@echo "  make teal-corpus-parity   Go-vs-Rust corpus comparison (TEAL_CORPUS_STAGES=disassemble|assemble|reassemble|source)"
 	@echo ""
 	@echo "Archival Node:"
 	@echo "  make archival-up      Start archival Go node (docker)"
