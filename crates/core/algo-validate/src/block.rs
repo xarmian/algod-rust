@@ -1772,6 +1772,101 @@ mod tests {
         assert_eq!(failed, bad.to_vec(), "errors: {:?}", result.errors);
     }
 
+    /// Issue #2354 (moved from #2344): the parallel pass over many groups
+    /// gives, group by group and member by member, exactly the verdicts of
+    /// verifying each group on its own (the sequential path), on randomized
+    /// payments, multi-member groups, escrow LogicSigs (accepting and
+    /// rejecting programs) and malformed multisigs, with some groups marked
+    /// as already verified.
+    #[test]
+    fn parallel_group_verification_equals_one_group_at_a_time() {
+        let key = test_signing_key();
+        let params = consensus_params_for_version("future").unwrap_or_default();
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..6u64 {
+            let mut payset: Vec<SignedTransaction> = Vec::new();
+            let mut gid = 1u8;
+            for i in 0..(24 + round * 7) {
+                let r = next();
+                let mut member = make_signed_txn(&key, 7000 + i);
+                match r % 6 {
+                    0 => member.sig[(r >> 8) as usize % 64] ^= 0x55,
+                    1 | 2 => {
+                        let prog = if r % 6 == 1 {
+                            vec![0x06, 0x81, 0x01]
+                        } else {
+                            vec![0x06, 0x81, 0x00]
+                        };
+                        member.txn.sender = crate::signature::hash_program(&prog);
+                        member.sig = [0u8; 64];
+                        member.lsig = Some(algo_types::LogicSig {
+                            logic: serde_bytes::ByteBuf::from(prog),
+                            ..Default::default()
+                        });
+                    }
+                    3 => {
+                        member.sig = [0u8; 64];
+                        member.msig = Some(algo_types::MultisigSig {
+                            version: 1,
+                            threshold: 2,
+                            subsigs: vec![algo_types::MultisigSubsig {
+                                public_key: [(r >> 16) as u8; 32],
+                                signature: [(r >> 24) as u8; 64],
+                            }],
+                        });
+                    }
+                    _ => {}
+                }
+                // Every third transaction joins the previous one's group.
+                if r % 3 == 0 && !payset.is_empty() {
+                    let g = payset
+                        .last()
+                        .map(|t: &SignedTransaction| t.txn.group)
+                        .unwrap();
+                    if g == [0u8; 32] {
+                        gid = gid.wrapping_add(1);
+                        let last = payset.len() - 1;
+                        payset[last].txn.group = [gid; 32];
+                    }
+                    member.txn.group = [gid; 32];
+                }
+                payset.push(member);
+            }
+            let groups = detect_validation_groups(&payset).expect("groups");
+            assert!(groups.len() >= PARALLEL_SIGNATURE_MIN_GROUPS);
+            let all_txns: Vec<Vec<SignedTransaction>> = groups
+                .iter()
+                .map(|g| g.iter().map(|&(_, t)| t.clone()).collect())
+                .collect();
+            let cached: Vec<bool> = (0..groups.len())
+                .map(|gi| (gi as u64 + round).is_multiple_of(5))
+                .collect();
+
+            let all = verify_group_signatures(&groups, &all_txns, &cached, &params);
+            for gi in 0..groups.len() {
+                let one = verify_group_signatures(
+                    &groups[gi..gi + 1],
+                    &all_txns[gi..gi + 1],
+                    &cached[gi..gi + 1],
+                    &params,
+                );
+                assert_eq!(all[gi], one[0], "round {round} group {gi}");
+            }
+            let failures = all
+                .iter()
+                .flatten()
+                .filter(|v| matches!(v, Some(Err(_))))
+                .count();
+            assert!(failures > 0, "round {round}: the mix must include failures");
+        }
+    }
+
     /// Issue #1017: a group that fails signature verification must NOT be
     /// added to the cache, so a later (corrected) resubmission is still
     /// verified for real rather than trusted from a bad cache entry.
