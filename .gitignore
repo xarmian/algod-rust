@@ -42,3 +42,6 @@ __pycache__/
 /benchmarks/corpus/testnet-catchpoint/
 /benchmarks/corpus/testnet-catchpoint.partial/
 /benchmarks/corpus/testnet-catchpoint.old/
+
+# ARC56Registry fetch + extracted TEAL corpus working directory (issue #2365, scripts/teal-corpus/). Third-party data, never committed.
+/teal-corpus-work/
