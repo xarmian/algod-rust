@@ -126,8 +126,7 @@ def build():
         out.append(f"deadens: {str(r.get('deadens', False)).lower()}, imms: &[{imms}], variants: &[\n")
         for v in r["variants"]:
             refine = v.get("refine", "")
-            if refine.startswith("init.typeByteMath"):
-                refine = "typeByteMath"
+            if refine == "typeByteMath":
                 mx = byte_math + 1 if r["name"] == "b+" else byte_math * 2
                 assert r["name"] in ("b+", "b*"), r["name"]
                 refine = f"typeByteMath:{mx}"

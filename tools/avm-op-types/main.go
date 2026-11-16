@@ -108,7 +108,13 @@ func refineName(spec logic.OpSpec) string {
 	}
 	name := runtime.FuncForPC(f.Pointer()).Name()
 	name = name[strings.LastIndex(name, "/")+1:]
-	return strings.TrimPrefix(name, "logic.")
+	name = strings.TrimPrefix(name, "logic.")
+	// A closure's compiler-assigned name differs between Go versions
+	// (`init.typeByteMath.func1` vs `glob..func3`); only typeByteMath makes them.
+	if strings.Contains(name, "typeByteMath") {
+		return "typeByteMath"
+	}
+	return name
 }
 
 func sig(v variant) string {
