@@ -45,3 +45,6 @@ __pycache__/
 
 # ARC56Registry fetch + extracted TEAL corpus working directory (issue #2365, scripts/teal-corpus/). Third-party data, never committed.
 /teal-corpus-work/
+
+# Phase 25 go TEAL corpus driver build output (#2366)
+/tools/teal-corpus/teal-corpus-go

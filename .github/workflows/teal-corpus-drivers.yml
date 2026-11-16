@@ -1,0 +1,108 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: TEAL corpus drivers
+
+# Issue #2366 (epic #2364, Phase 25). Builds the Go driver (tools/teal-corpus)
+# against the pinned go-algorand v5.0.5-stable through go-algorand's own
+# libsodium entry point (`make libsodium`, see CLAUDE.md), runs its Go tests,
+# checks that the committed expected/go.*.jsonl fixture rows are not stale, and
+# diffs the Go and Rust drivers on the small fixture corpus. The Rust half's own
+# tests (crates/tools/teal-corpus) also run in unit-tests.yml.
+
+on:
+  pull_request:
+    paths:
+      - "tools/teal-corpus/**"
+      - "crates/tools/teal-corpus/**"
+      - "crates/core/algo-avm/src/assembler.rs"
+      - "crates/core/algo-avm/src/disassembler.rs"
+      - "crates/core/algo-avm/src/sourcemap.rs"
+      - "scripts/teal-corpus/**"
+      - ".github/workflows/teal-corpus-drivers.yml"
+  push:
+    branches: [main]
+    paths:
+      - "tools/teal-corpus/**"
+      - "crates/tools/teal-corpus/**"
+      - "crates/core/algo-avm/src/assembler.rs"
+      - "crates/core/algo-avm/src/disassembler.rs"
+      - "crates/core/algo-avm/src/sourcemap.rs"
+      - "scripts/teal-corpus/**"
+      - ".github/workflows/teal-corpus-drivers.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: teal-corpus-drivers-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_ALGORAND_REV: "v5.0.5-stable"
+
+jobs:
+  go-and-rust-drivers:
+    name: Go driver tests, fixture drift and Go-vs-Rust fixture diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Go toolchain
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build go-algorand's libsodium fork
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool build-essential
+          # Sibling clone: tools/teal-corpus/go.mod replaces go-algorand with
+          # ../../../go-algorand, and build.sh stamps its tag and commit.
+          git clone --branch "$GO_ALGORAND_REV" \
+            https://github.com/algorand/go-algorand.git \
+            "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
+          cd "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
+          make libsodium
+
+      - name: Go driver unit tests
+        working-directory: tools/teal-corpus
+        run: |
+          set -euo pipefail
+          go vet ./...
+          go test ./...
+
+      - name: Build the Go driver
+        run: tools/teal-corpus/build.sh "$RUNNER_TEMP/teal-corpus-go"
+
+      - name: Build the Rust driver
+        run: cargo build -p teal-corpus --release
+
+      - name: Go fixture rows are not stale
+        run: |
+          set -euo pipefail
+          F=crates/tools/teal-corpus/tests/fixtures/small
+          for op in disassemble assemble; do
+            "$RUNNER_TEMP/teal-corpus-go" "$op" --corpus "$F" --out "$RUNNER_TEMP/$op.go.jsonl"
+            # rows only: the first line is the header (go-algorand commit)
+            diff <(tail -n +2 "$F/expected/go.$op.jsonl") <(tail -n +2 "$RUNNER_TEMP/$op.go.jsonl")
+          done
+
+      - name: Diff Go vs Rust on the fixture corpus
+        run: |
+          set -euo pipefail
+          F=crates/tools/teal-corpus/tests/fixtures/small
+          export GO_DRIVER="$RUNNER_TEMP/teal-corpus-go" RUST_DRIVER="$PWD/target/release/teal-corpus"
+          # On the fixture only the invalid inputs differ until #2367/#2368 land
+          # (the cargo tests rust_{assemble,disassemble}_rows_equal_the_go_driver_rows_except_*
+          # pin exactly which rows). Valid programs and sources must agree.
+          scripts/teal-corpus/run_drivers.sh "$F" "$RUNNER_TEMP/out" assemble || [ $? -eq 1 ]
+          scripts/teal-corpus/run_drivers.sh "$F" "$RUNNER_TEMP/out" disassemble || [ $? -eq 1 ]
+          test "$(wc -l < "$RUNNER_TEMP/out/assemble.mismatches.jsonl")" -le 1
+          test "$(wc -l < "$RUNNER_TEMP/out/disassemble.mismatches.jsonl")" -le 2
