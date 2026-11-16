@@ -274,28 +274,28 @@ impl F128 {
 }
 
 /// Go: `bits.Mul64` — `x*y` as a 128-bit product `(hi, lo)`.
-#[inline]
+#[inline(always)]
 fn mul64(x: u64, y: u64) -> (u64, u64) {
     let p = (x as u128) * (y as u128);
     ((p >> 64) as u64, p as u64)
 }
 
 /// Go: `bits.Add64` — `x+y+carry` as `(sum, carryOut)`.
-#[inline]
+#[inline(always)]
 fn add64(x: u64, y: u64, carry: u64) -> (u64, u64) {
-    let s = (x as u128) + (y as u128) + (carry as u128);
-    (s as u64, (s >> 64) as u64)
+    // `carry` is 0 or 1 at every call site (Go's `bits.Add64` contract).
+    let (s, c1) = x.overflowing_add(y);
+    let (s, c2) = s.overflowing_add(carry);
+    (s, (c1 | c2) as u64)
 }
 
 /// Go: `bits.Sub64` — `x-y-borrow` as `(diff, borrowOut)`.
-#[inline]
+#[inline(always)]
 fn sub64(x: u64, y: u64, borrow: u64) -> (u64, u64) {
-    let diff = (x as i128) - (y as i128) - (borrow as i128);
-    if diff < 0 {
-        ((diff + (1i128 << 64)) as u64, 1)
-    } else {
-        (diff as u64, 0)
-    }
+    // `borrow` is 0 or 1 at every call site (Go's `bits.Sub64` contract).
+    let (d, b1) = x.overflowing_sub(y);
+    let (d, b2) = d.overflowing_sub(borrow);
+    (d, (b1 | b2) as u64)
 }
 
 /// Go: `bits.Div64` — `(hi:lo) / y` as `(quotient, remainder)`. The caller
@@ -700,6 +700,37 @@ pub(crate) fn binomial_cdf_walk_f128(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #2321: the carry/borrow primitives equal the plain 128-bit
+    /// arithmetic they replaced, on edge values and a pseudo-random sweep.
+    #[test]
+    fn add64_and_sub64_equal_the_wide_arithmetic() {
+        let mut seed = 0x243F_6A88_85A3_08D3u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let edges = [0u64, 1, 2, u64::MAX, u64::MAX - 1, 1 << 63, (1 << 63) - 1];
+        let mut vals: Vec<u64> = edges.to_vec();
+        vals.extend((0..200).map(|_| next()));
+        for &x in &vals {
+            for &y in &vals {
+                for carry in [0u64, 1] {
+                    let s = (x as u128) + (y as u128) + (carry as u128);
+                    assert_eq!(add64(x, y, carry), (s as u64, (s >> 64) as u64));
+                    let d = (x as i128) - (y as i128) - (carry as i128);
+                    let want = if d < 0 {
+                        ((d + (1i128 << 64)) as u64, 1)
+                    } else {
+                        (d as u64, 0)
+                    };
+                    assert_eq!(sub64(x, y, carry), want);
+                }
+            }
+        }
+    }
     use serde::Deserialize;
     use std::fs;
     use std::path::PathBuf;
