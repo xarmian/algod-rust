@@ -20,26 +20,545 @@
 
 //! TEAL disassembler: converts AVM bytecode back into TEAL source text.
 //!
-//! Uses the existing `bytecode::parse()` to parse the program, then reconstructs
-//! TEAL source text matching go-algorand's `Disassemble()` output.
+//! [`disassemble`] is a port of go-algorand's `logic.Disassemble`
+//! (`data/transactions/logic/assembler.go`: `disassembleInstrumented` and
+//! `disassemble`): one forward pass over the raw bytes that numbers labels in
+//! the order each branch target is first met, re-runs itself once when a
+//! backward jump names a label that was not yet known, and reports exactly
+//! go's error strings (issue #2367, epic #2364). [`pc_details`] renders the
+//! already-parsed program of a running machine instead.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::bytecode::{self, Immediates, Instruction, Program};
 use crate::fields;
-use crate::opcode;
+use crate::opcode::{self, ImmKind, Mode, OpSpec};
 
 /// Disassemble AVM bytecode into TEAL source text.
 ///
-/// Produces output that matches go-algorand's `Disassemble()` function.
-/// `AssembleString(Disassemble(program))` should produce the same bytecode.
+/// Produces exactly the text, or exactly the error string, of go-algorand's
+/// `Disassemble()`. A program whose version is newer than this implementation
+/// supports is not an error but the single comment line go prints for it, and
+/// so is an undecodable version prefix (`// invalid version`, which includes
+/// the empty program).
+/// `AssembleString(Disassemble(program))` produces the same bytecode for the
+/// programs the assembler can express.
 pub fn disassemble(program: &[u8]) -> Result<String, String> {
-    if program.is_empty() {
-        return Err("program is empty".into());
+    let (version, vlen) = uvarint(program);
+    if vlen <= 0 {
+        return Ok("// invalid version\n".to_string());
+    }
+    if version > u64::from(opcode::MAX_AVM_VERSION) {
+        return Ok(format!("// unsupported version {version}\n"));
+    }
+    let version = version as u8;
+    let mut pass = disassemble_pass(program, version, vlen as usize, None)?;
+    if pass.rerun {
+        // A back-jump named a label that did not exist yet: go runs the whole
+        // disassembly again with every label found by the first pass.
+        let labels = std::mem::take(&mut pass.pending);
+        pass = disassemble_pass(program, version, vlen as usize, Some(labels))?;
+        if pass.rerun {
+            return Err("rerun even though we had labels".to_string());
+        }
+    }
+    let mut text = format!("#pragma version {version}\n");
+    // If reassembling this program at its own version would auto-salt it
+    // by default (i.e. it's a v13+ stateless program whose hash happens to
+    // be on-curve — either untouched legacy bytes, or bytes an explicit
+    // `#pragma autosalt false` opted out of salting), emit that pragma so
+    // `AssembleString(Disassemble(program))` round-trips to the same bytes
+    // instead of silently re-salting (and thus changing the hash). Matches
+    // go-algorand's `finalizeDisassemblyWithPragmas` (`assembler.go`).
+    if crate::assembler::default_auto_salt_applies(version, pass.has_stateful_ops, program) {
+        text.push_str("#pragma autosalt false\n");
+    }
+    text.push_str(&pass.body);
+    Ok(text)
+}
+
+/// go's `binary.Uvarint`: the value and the bytes read, `0` when `buf` ends
+/// inside the varint and `-(bytes read)` when it overflows 64 bits.
+fn uvarint(buf: &[u8]) -> (u64, i64) {
+    let (mut x, mut s) = (0u64, 0u32);
+    for (i, &b) in buf.iter().enumerate() {
+        if i == 10 {
+            return (0, -(i as i64 + 1));
+        }
+        if b < 0x80 {
+            if i == 9 && b > 1 {
+                return (0, -(i as i64 + 1));
+            }
+            return (x | (u64::from(b) << s), i as i64 + 1);
+        }
+        x |= u64::from(b & 0x7f) << s;
+        s += 7;
+    }
+    (0, 0)
+}
+
+/// go's `binary.Varint` (zigzag over [`uvarint`]).
+fn varint(buf: &[u8]) -> (i64, i64) {
+    let (ux, n) = uvarint(buf);
+    let mut x = (ux >> 1) as i64;
+    if ux & 1 != 0 {
+        x = !x;
+    }
+    (x, n)
+}
+
+/// One go `immediate` of an opcode: its kind and, for the single-byte kinds,
+/// the name go prints in decode errors.
+enum Imm {
+    Byte(&'static str),
+    Int8(&'static str),
+    Label,
+    Int,
+    Bytes,
+    Ints,
+    Bytess,
+    Labels,
+}
+
+/// The immediates of `spec` as go's `OpDetails.Immediates` lists them.
+fn immediates_of(spec: &OpSpec) -> Vec<Imm> {
+    let names = bytecode::uint8_immediate_names(spec.name).unwrap_or(&[]);
+    let byte = |i: usize| {
+        let n = names.get(i).copied().unwrap_or("?");
+        if matches!(spec.name, "frame_dig" | "frame_bury") {
+            Imm::Int8(n)
+        } else {
+            Imm::Byte(n)
+        }
+    };
+    match spec.imm {
+        ImmKind::None => vec![],
+        ImmKind::Uint8 => vec![byte(0)],
+        ImmKind::Uint8Uint8 => vec![byte(0), byte(1)],
+        ImmKind::Uint8Uint8Uint8 => vec![byte(0), byte(1), byte(2)],
+        ImmKind::Int16 | ImmKind::BranchVarint => vec![Imm::Label],
+        ImmKind::Varuint => vec![Imm::Int],
+        ImmKind::VaruintBytes => vec![Imm::Bytes],
+        ImmKind::IntcBlock | ImmKind::PushInts => vec![Imm::Ints],
+        ImmKind::BytecBlock | ImmKind::PushBytess => vec![Imm::Bytess],
+        ImmKind::Labels => vec![Imm::Labels],
+    }
+}
+
+/// How a single-byte immediate resolves through go's `FieldGroup.Names`.
+enum Group {
+    /// The immediate is a plain number.
+    None,
+    /// The byte names a field.
+    Name(&'static str),
+    /// A group immediate whose byte names nothing (go's "invalid immediate").
+    Invalid,
+}
+
+/// go's `imm.Group.Names[b]` for the `imm_idx`-th immediate of `op`. The
+/// transaction-field groups differ per opcode: the scalar opcodes list only
+/// non-array fields, the `*a`/`*as` opcodes only array fields, and
+/// `itxn_field`/`gitxn` every field.
+fn group_name(op: &str, imm_idx: usize, b: u8) -> Group {
+    let txn_names = |want_array: Option<bool>| match fields::txn_field_name(b) {
+        Some(n) => {
+            let array = fields::TxnField::from_u8(b).is_ok_and(|f| f.is_array());
+            if want_array.is_none_or(|w| w == array) {
+                Group::Name(n)
+            } else {
+                Group::Invalid
+            }
+        }
+        None => Group::Invalid,
+    };
+    match (op, imm_idx) {
+        ("txn", 0) | ("gtxn", 1) | ("gtxns", 0) | ("itxn", 0) => txn_names(Some(false)),
+        ("txna", 0)
+        | ("gtxna", 1)
+        | ("gtxnsa", 0)
+        | ("txnas", 0)
+        | ("gtxnas", 1)
+        | ("gtxnsas", 0)
+        | ("itxna", 0)
+        | ("itxnas", 0)
+        | ("gitxna", 1)
+        | ("gitxnas", 1) => txn_names(Some(true)),
+        ("itxn_field", 0) | ("gitxn", 1) => txn_names(None),
+        // Only the box-access fields are settable with app_params_set.
+        ("app_params_set", 0) if b < 11 => Group::Invalid,
+        _ if fields::opcode_immediate_is_field(op, imm_idx) => {
+            match fields::field_name_for_opcode(op, imm_idx, b) {
+                Some(n) => Group::Name(n),
+                None => Group::Invalid,
+            }
+        }
+        _ => Group::None,
+    }
+}
+
+struct Pass {
+    body: String,
+    has_stateful_ops: bool,
+    rerun: bool,
+    pending: HashMap<i64, String>,
+}
+
+/// One run of go's `disassembleInstrumented` loop over `program`. `labels` is
+/// the label set of an earlier pass (go's "retains all the labels found in the
+/// first pass").
+fn disassemble_pass(
+    program: &[u8],
+    version: u8,
+    vlen: usize,
+    labels: Option<HashMap<i64, String>>,
+) -> Result<Pass, String> {
+    let mut d = Dis {
+        program,
+        pc: vlen,
+        next_pc: 0,
+        version,
+        label_count: 0,
+        pending: labels.unwrap_or_default(),
+        rerun: false,
+        intc: Vec::new(),
+        bytec: Vec::new(),
+    };
+    let mut body = String::new();
+    let mut has_stateful_ops = false;
+    // go resolves version 0 against the v1 opcode set.
+    let ceiling = version.max(1);
+    while d.pc < program.len() {
+        d.output_label_if_needed(&mut body);
+        let byte = program[d.pc];
+        let top = opcode::lookup(byte).filter(|s| s.version <= ceiling);
+        let mut op = top;
+        if let (Some(t), true) = (top, d.pc + 1 < program.len()) {
+            if let Some(subs) = t.sub_ops {
+                let sub = program[d.pc + 1] as usize;
+                if let Some(s) = subs
+                    .get(sub)
+                    .and_then(Option::as_ref)
+                    .filter(|s| s.version <= ceiling)
+                {
+                    op = Some(s);
+                }
+            }
+        }
+        if op.is_some_and(|s| s.mode == Mode::Application) {
+            has_stateful_ops = true;
+        }
+        let Some(spec) = op.filter(|s| s.sub_ops.is_none()) else {
+            // go's getOpSpecError
+            return Err(match top.filter(|t| t.sub_ops.is_some()) {
+                Some(_) if d.pc + 1 >= program.len() => {
+                    format!("prefix opcode 0x{byte:02x} missing sub-opcode")
+                }
+                Some(_) => format!(
+                    "prefix opcode 0x{byte:02x} with improper sub-opcode 0x{:02x}",
+                    program[d.pc + 1]
+                ),
+                None => format!("illegal opcode 0x{byte:02x}"),
+            });
+        };
+        // proto marks a subroutine entry point and must always have a label so
+        // that the disassembly can be validly reassembled (go-algorand PR
+        // #6594): one that is never the target of a callsub gets a fresh label
+        // here, which also forces the rerun that prints it.
+        if spec.name == "proto" && !d.pending.contains_key(&(d.pc as i64)) {
+            d.label_count += 1;
+            let label = format!("label{}", d.label_count);
+            d.put_label(label, d.pc as i64);
+        }
+        let line = d.instruction(spec)?;
+        body.push_str(&line);
+        body.push('\n');
+        d.pc = d.next_pc;
+    }
+    d.output_label_if_needed(&mut body);
+    Ok(Pass {
+        body,
+        has_stateful_ops,
+        rerun: d.rerun,
+        pending: d.pending,
+    })
+}
+
+struct Dis<'a> {
+    program: &'a [u8],
+    pc: usize,
+    next_pc: usize,
+    version: u8,
+    label_count: usize,
+    pending: HashMap<i64, String>,
+    rerun: bool,
+    intc: Vec<u64>,
+    bytec: Vec<&'a [u8]>,
+}
+
+impl<'a> Dis<'a> {
+    fn put_label(&mut self, label: String, target: i64) {
+        self.pending.insert(target, label);
+        if target <= self.pc as i64 {
+            self.rerun = true;
+        }
     }
 
-    let parsed = bytecode::parse(program).map_err(|e| e.to_string())?;
-    disassemble_parsed(&parsed, Some(program)).map(|(text, _)| text)
+    fn output_label_if_needed(&self, out: &mut String) {
+        if let Some(label) = self.pending.get(&(self.pc as i64)) {
+            out.push_str(label);
+            out.push_str(":\n");
+        }
+    }
+
+    /// The label name of `target`, allocating the next one on first sight.
+    fn label_for(&mut self, target: i64) -> String {
+        if let Some(known) = self.pending.get(&target) {
+            return known.clone();
+        }
+        self.label_count += 1;
+        let label = format!("label{}", self.label_count);
+        self.put_label(label.clone(), target);
+        label
+    }
+
+    /// go's `disassemble`: the text of the single instruction at `self.pc`,
+    /// setting `self.next_pc` past it.
+    fn instruction(&mut self, spec: &'static OpSpec) -> Result<String, String> {
+        let program = self.program;
+        let mut out = spec.name.to_string();
+        let mut pc = self.pc + 1;
+        if spec.sub_opcode != 0 {
+            pc += 1; // skip the sub-opcode byte; immediates follow
+        }
+        let varint_branch = self.version >= opcode::VARINT_BRANCH_VERSION
+            && opcode::is_varint_branch_opcode(spec.opcode);
+        let imms = if varint_branch {
+            vec![Imm::Label]
+        } else {
+            immediates_of(spec)
+        };
+        for (idx, imm) in imms.iter().enumerate() {
+            out.push(' ');
+            match imm {
+                Imm::Byte(name) | Imm::Int8(name) => {
+                    if pc + 1 > program.len() {
+                        return Err(format!(
+                            "program end while reading immediate {name} for {}",
+                            spec.name
+                        ));
+                    }
+                    let b = program[pc];
+                    match group_name(spec.name, idx, b) {
+                        Group::Name(n) => out.push_str(n),
+                        Group::Invalid => {
+                            return Err(format!("invalid immediate {name} for {}: {b}", spec.name));
+                        }
+                        Group::None if matches!(imm, Imm::Int8(_)) => {
+                            out.push_str(&(b as i8).to_string());
+                        }
+                        Group::None => out.push_str(&b.to_string()),
+                    }
+                    if spec.name == "intc" && (b as usize) < self.intc.len() {
+                        out.push_str(&format!(" // {}", self.intc[b as usize]));
+                    }
+                    if spec.name == "bytec" && (b as usize) < self.bytec.len() {
+                        out.push_str(&format!(
+                            " // {}",
+                            guess_byte_format(self.bytec[b as usize])
+                        ));
+                    }
+                    pc += 1;
+                }
+                Imm::Label => {
+                    let (offset, offset_len) = if varint_branch {
+                        let (v, n) = varint(&program[pc..]);
+                        if n <= 0 {
+                            return Err(format!("could not decode label for {}", spec.name));
+                        }
+                        (v, n as usize)
+                    } else {
+                        if pc + 2 > program.len() {
+                            return Err(format!(
+                                "program end while reading label for {}",
+                                spec.name
+                            ));
+                        }
+                        (decode_branch_offset(program, pc), 2)
+                    };
+                    let mut target = offset
+                        .wrapping_add(pc as i64)
+                        .wrapping_add(offset_len as i64);
+                    if varint_branch && offset < 0 {
+                        // back-jump from the instruction start
+                        target = (pc as i64 - 1).wrapping_add(offset);
+                    }
+                    out.push_str(&self.label_for(target));
+                    pc += offset_len;
+                }
+                Imm::Int => {
+                    let (val, n) = uvarint(&program[pc..]);
+                    if n <= 0 {
+                        return Err(format!("could not decode immediate uint for {}", spec.name));
+                    }
+                    out.push_str(&val.to_string());
+                    pc += n as usize;
+                }
+                Imm::Bytes => {
+                    let (length, n) = uvarint(&program[pc..]);
+                    if n <= 0 {
+                        return Err(format!(
+                            "could not decode immediate bytes for {}",
+                            spec.name
+                        ));
+                    }
+                    pc += n as usize;
+                    let end = (pc as u64).wrapping_add(length);
+                    if end > program.len() as u64 || end < pc as u64 {
+                        return Err(format!(
+                            "could not decode immediate bytes for {}",
+                            spec.name
+                        ));
+                    }
+                    let constant = &program[pc..end as usize];
+                    out.push_str(&format!(
+                        "0x{} // {}",
+                        bytes_to_hex(constant),
+                        guess_byte_format(constant)
+                    ));
+                    pc = end as usize;
+                }
+                Imm::Ints => {
+                    let (ints, next) = parse_int_imm_args(program, pc)?;
+                    out.push_str(
+                        &ints
+                            .iter()
+                            .map(u64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                    if spec.name == "intcblock" {
+                        self.intc = ints;
+                    }
+                    pc = next;
+                }
+                Imm::Bytess => {
+                    let (items, next) = parse_byte_imm_args(program, pc)?;
+                    out.push_str(
+                        &items
+                            .iter()
+                            .map(|b| format!("0x{}", bytes_to_hex(b)))
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                    if spec.name == "bytecblock" {
+                        self.bytec = items;
+                    }
+                    pc = next;
+                }
+                Imm::Labels => {
+                    let (targets, next) =
+                        parse_labels(program, pc).map_err(|e| format!("{e} for {}", spec.name))?;
+                    let labels: Vec<String> =
+                        targets.into_iter().map(|t| self.label_for(t)).collect();
+                    out.push_str(&labels.join(" "));
+                    pc = next;
+                }
+            }
+        }
+        if let Some(n) = spec.name.strip_prefix("intc_") {
+            let idx = n.bytes().next().map(|b| usize::from(b.wrapping_sub(b'0')));
+            if let Some(v) = idx.and_then(|i| self.intc.get(i)) {
+                out.push_str(&format!(" // {v}"));
+            }
+        }
+        if let Some(n) = spec.name.strip_prefix("bytec_") {
+            let idx = n.bytes().next().map(|b| usize::from(b.wrapping_sub(b'0')));
+            if let Some(v) = idx.and_then(|i| self.bytec.get(i)) {
+                out.push_str(&format!(" // {}", guess_byte_format(v)));
+            }
+        }
+        self.next_pc = pc;
+        Ok(out)
+    }
+}
+
+/// go's `decodeBranchOffset`: a big-endian int16.
+fn decode_branch_offset(program: &[u8], pos: usize) -> i64 {
+    i64::from(i16::from_be_bytes([program[pos], program[pos + 1]]))
+}
+
+/// go's `parseIntImmArgs`.
+fn parse_int_imm_args(program: &[u8], pos: usize) -> Result<(Vec<u64>, usize), String> {
+    let (count, n) = uvarint(&program[pos..]);
+    if n <= 0 {
+        return Err(format!("could not decode length of int list at pc={pos}"));
+    }
+    let mut pos = pos + n as usize;
+    if count > program.len() as u64 {
+        return Err("const int list with too many items".to_string());
+    }
+    let mut ints = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        if pos >= program.len() {
+            return Err("const int list ran past end of program".to_string());
+        }
+        let (v, n) = uvarint(&program[pos..]);
+        if n <= 0 {
+            return Err(format!("could not decode int const[{i}] at pc={pos}"));
+        }
+        ints.push(v);
+        pos += n as usize;
+    }
+    Ok((ints, pos))
+}
+
+/// go's `parseByteImmArgs`.
+fn parse_byte_imm_args(program: &[u8], pos: usize) -> Result<(Vec<&[u8]>, usize), String> {
+    let (count, n) = uvarint(&program[pos..]);
+    if n <= 0 {
+        return Err(format!("could not decode length of bytes list at pc={pos}"));
+    }
+    let mut pos = pos + n as usize;
+    if count > program.len() as u64 {
+        return Err("const bytes list with too many items".to_string());
+    }
+    let mut items = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        if pos >= program.len() {
+            return Err("const bytes list ran past end of program".to_string());
+        }
+        let (len, n) = uvarint(&program[pos..]);
+        if n <= 0 {
+            return Err(format!("could not decode []byte const[{i}] at pc={pos}"));
+        }
+        pos += n as usize;
+        let end = (pos as u64).wrapping_add(len);
+        if end > program.len() as u64 || end < pos as u64 {
+            return Err("const bytes list ran past end of program".to_string());
+        }
+        items.push(&program[pos..end as usize]);
+        pos = end as usize;
+    }
+    Ok((items, pos))
+}
+
+/// go's `parseLabels` (switch/match): the absolute branch targets.
+fn parse_labels(program: &[u8], pos: usize) -> Result<(Vec<i64>, usize), String> {
+    if pos >= program.len() {
+        return Err("could not decode label count".to_string());
+    }
+    let count = program[pos] as usize;
+    let mut pos = pos + 1;
+    let end = pos + 2 * count; // end of op: offset is applied to this position
+    if end > program.len() {
+        return Err("could not decode labels".to_string());
+    }
+    let mut targets = Vec::with_capacity(count);
+    for _ in 0..count {
+        targets.push(end as i64 + decode_branch_offset(program, pos));
+        pos += 2;
+    }
+    Ok((targets, pos))
 }
 
 /// go's `pcDetails` (`data/transactions/logic/eval.go`): the disassembly of
@@ -48,7 +567,7 @@ pub fn disassemble(program: &[u8]) -> Result<String, String> {
 /// `opcodes=` of the `Details` go prints for a failed application call in
 /// simulate. Empty when `pc` is not the start of an instruction.
 pub fn pc_details(parsed: &Program, pc: usize) -> String {
-    let Ok((text, offsets)) = disassemble_parsed(parsed, None) else {
+    let Ok((text, offsets)) = disassemble_parsed(parsed) else {
         return String::new();
     };
     const MAX_ADDITIONAL_OPCODES: usize = 2;
@@ -68,12 +587,10 @@ pub fn pc_details(parsed: &Program, pc: usize) -> String {
 
 /// The disassembly of `parsed`, and for every instruction the pair `(byte
 /// offset with the version byte, offset of its text)` (go's `pcOffset`: after
-/// the label line that precedes it). `program` is only needed for the
-/// `autosalt` pragma line, which a `pc_details` caller does not use.
-fn disassemble_parsed(
-    parsed: &Program,
-    program: Option<&[u8]>,
-) -> Result<(String, Vec<(usize, usize)>), String> {
+/// the label line that precedes it). Used by [`pc_details`] only; it renders a
+/// program that already parsed, so unlike [`disassemble`] it never meets a
+/// malformed one.
+fn disassemble_parsed(parsed: &Program) -> Result<(String, Vec<(usize, usize)>), String> {
     let header = if parsed.version < 128 { 1 } else { 2 };
     let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(parsed.instructions.len());
 
@@ -87,23 +604,6 @@ fn disassemble_parsed(
 
     let mut out = String::new();
     out.push_str(&format!("#pragma version {}\n", parsed.version));
-
-    // If reassembling this program at its own version would auto-salt it
-    // by default (i.e. it's a v13+ stateless program whose hash happens to
-    // be on-curve — either untouched legacy bytes, or bytes an explicit
-    // `#pragma autosalt false` opted out of salting), emit that pragma so
-    // `AssembleString(Disassemble(program))` round-trips to the same bytes
-    // instead of silently re-salting (and thus changing the hash). Matches
-    // go-algorand's `finalizeDisassemblyWithPragmas` (`assembler.go`).
-    let has_stateful_ops = parsed.instructions.iter().any(|instr| {
-        opcode::lookup(instr.opcode).is_some_and(|spec| spec.mode == opcode::Mode::Application)
-    });
-    if let Some(program) = program {
-        if crate::assembler::default_auto_salt_applies(parsed.version, has_stateful_ops, program) {
-            out.push_str("#pragma autosalt false\n");
-        }
-    }
-
     for instr in &parsed.instructions {
         // Emit label if this offset is a branch target
         if let Some(label) = labels.get(&instr.offset) {
@@ -450,7 +950,18 @@ fn guess_byte_format(bytes: &[u8]) -> String {
         return format!("addr {}", addr);
     }
     if all_printable_ascii(bytes) {
-        return format!("{:?}", String::from_utf8_lossy(bytes));
+        // go's `%#v` of a string: only the quote and the backslash need
+        // escaping inside printable ASCII.
+        let mut quoted = String::with_capacity(bytes.len() + 2);
+        quoted.push('"');
+        for &b in bytes {
+            if b == b'"' || b == b'\\' {
+                quoted.push('\\');
+            }
+            quoted.push(char::from(b));
+        }
+        quoted.push('"');
+        return quoted;
     }
     format!("0x{}", bytes_to_hex(bytes))
 }
@@ -688,7 +1199,9 @@ bytec 4 // \"last\"\n";
 
     #[test]
     fn test_empty_program() {
-        assert!(disassemble(&[]).is_err());
+        // go: `binary.Uvarint` of nothing reads zero bytes, so the program has
+        // no decodable version and `Disassemble` returns that comment.
+        assert_eq!(disassemble(&[]).unwrap(), "// invalid version\n");
     }
 
     /// Port of go-algorand's `TestDisassembleDeadSubroutine`

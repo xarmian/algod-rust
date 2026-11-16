@@ -1417,6 +1417,10 @@ pub fn block_field_by_name(name: &str) -> Option<u8> {
         "BlkProtocol" => Some(7),
         "BlkTxnCounter" => Some(8),
         "BlkProposerPayout" => Some(9),
+        "BlkBranch512" => Some(10),
+        "BlkSha512_256TxnCommitment" => Some(11),
+        "BlkSha256TxnCommitment" => Some(12),
+        "BlkSha512TxnCommitment" => Some(13),
         _ => None,
     }
 }
@@ -1433,6 +1437,10 @@ pub fn block_field_name(index: u8) -> Option<&'static str> {
         7 => Some("BlkProtocol"),
         8 => Some("BlkTxnCounter"),
         9 => Some("BlkProposerPayout"),
+        10 => Some("BlkBranch512"),
+        11 => Some("BlkSha512_256TxnCommitment"),
+        12 => Some("BlkSha256TxnCommitment"),
+        13 => Some("BlkSha512TxnCommitment"),
         _ => None,
     }
 }

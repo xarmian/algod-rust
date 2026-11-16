@@ -5323,15 +5323,13 @@ dup
             "unexpected error: {err}"
         );
 
-        // Version 0x11 (17) is unsupported.
+        // Version 0x11 (17) is unsupported: go's `Disassemble` reports it as a
+        // comment line, not an error (TestDisassembleSingleOp, assembler_test.go).
         let ops = assemble_string("#pragma version 8\nint 1\n").unwrap();
         let mut program = ops.program.clone();
         program[0] = 0x11;
-        let err = crate::disassembler::disassemble(&program).unwrap_err();
-        assert!(
-            err.contains("unsupported") || err.to_lowercase().contains("version"),
-            "unexpected error: {err}"
-        );
+        let text = crate::disassembler::disassemble(&program).unwrap();
+        assert_eq!(text, "// unsupported version 17\n");
     }
 
     #[test]

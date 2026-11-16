@@ -342,6 +342,13 @@ pub fn render_output(op: Operation, rows: &[Row]) -> String {
 pub struct DiffReport {
     pub operation: String,
     pub compared: usize,
+    /// Rows equal on both sides that succeeded.
+    pub identical: usize,
+    /// Rows equal on both sides that failed with the same error (list).
+    pub both_error_identical: usize,
+    /// Rows, on either side, that record a panic or a timeout. These count as
+    /// failures even when both sides agree.
+    pub robustness_failures: usize,
     pub left_header: Value,
     pub right_header: Value,
     /// One `{sha256, operation, field, first_diff, left, right}` per differing row.
@@ -419,10 +426,25 @@ pub fn diff_files(left: &Path, right: &Path) -> Result<DiffReport, String> {
     };
     let shas: BTreeSet<&String> = lrows.keys().chain(rrows.keys()).collect();
     let mut mismatches = Vec::new();
+    let (mut identical, mut both_error_identical) = (0, 0);
+    let is_robustness_failure =
+        |v: &Value| v.get("panic").is_some() || v.get("timeout") == Some(&Value::Bool(true));
+    let robustness_failures = lrows
+        .values()
+        .chain(rrows.values())
+        .filter(|v| is_robustness_failure(v))
+        .count();
     for sha in &shas {
         let (l, r) = (lrows.get(*sha), rrows.get(*sha));
         let (field, fd, lv, rv) = match (l, r) {
-            (Some(a), Some(b)) if a == b => continue,
+            (Some(a), Some(b)) if a == b => {
+                if a.get("ok") == Some(&Value::Bool(true)) {
+                    identical += 1;
+                } else if !is_robustness_failure(a) {
+                    both_error_identical += 1;
+                }
+                continue;
+            }
             (Some(a), Some(b)) => {
                 let keys: BTreeSet<&String> = a
                     .as_object()
@@ -458,6 +480,9 @@ pub fn diff_files(left: &Path, right: &Path) -> Result<DiffReport, String> {
     Ok(DiffReport {
         operation,
         compared: shas.len(),
+        identical,
+        both_error_identical,
+        robustness_failures,
         left_header: lh,
         right_header: rh,
         mismatches,

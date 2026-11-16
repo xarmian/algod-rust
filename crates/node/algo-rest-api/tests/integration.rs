@@ -9453,16 +9453,42 @@ async fn teal_disassemble_happy_path() {
 async fn teal_disassemble_error_returns_400() {
     let server = TestServer::start(mock_with_developer_api()).await;
 
-    // Send invalid bytecode
+    // Version 8 followed by an opcode byte nothing is assigned to: go's
+    // Disassemble fails with "illegal opcode 0xff" and the handler answers 400.
     let resp = server
         .client
         .post(server.url("/v2/teal/disassemble"))
         .header("X-Algo-API-Token", &server.api_token)
-        .body(vec![0xFF, 0xFF])
+        .body(vec![0x08, 0xFF])
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
+}
+
+/// go's Disassemble does not fail on an undecodable or unsupported version: it
+/// returns a one-line comment, which the handler serves with status 200
+/// (assembler.go `disassembleInstrumented`; issue #2367).
+#[tokio::test]
+async fn teal_disassemble_bad_version_is_a_200_comment() {
+    let server = TestServer::start(mock_with_developer_api()).await;
+
+    for (body, want) in [
+        (vec![0xFF, 0xFF], "// invalid version\n"),
+        (vec![0x7F, 0x43], "// unsupported version 127\n"),
+    ] {
+        let resp = server
+            .client
+            .post(server.url("/v2/teal/disassemble"))
+            .header("X-Algo-API-Token", &server.api_token)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(json["result"], want);
+    }
 }
 
 #[tokio::test]
