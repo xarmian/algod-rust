@@ -29,7 +29,7 @@
 //! specifically the `syncCert` / `fetchRound` path that handles certificate-
 //! driven single-block fetches.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -325,6 +325,14 @@ pub struct CatchupService {
     trigger_tx: Option<crossbeam_channel::Sender<SyncWaiter>>,
 }
 
+/// A certificate authentication running ahead of the apply cursor on a helper
+/// thread (issue #2339): its verdict channel (`None` when it panicked) and the
+/// thread.
+type AuthLookahead = (
+    crossbeam_channel::Receiver<Option<Result<(), String>>>,
+    thread::JoinHandle<()>,
+);
+
 /// Outcome of a single worker's fetch attempt in [`CatchupService::sync_pass`],
 /// sent back to the main thread for in-order validation/apply.
 ///
@@ -341,7 +349,7 @@ enum FetchOutcome {
     /// (checked before fetching).
     Unsupported,
     /// The fetch itself failed or returned the wrong round's block.
-    Fetch(Box<Result<FetchedBlockCert, FetchError>>),
+    Fetch(Box<Result<Arc<FetchedBlockCert>, FetchError>>),
 }
 
 /// Typed exit reason for a sync pass ([`CatchupService::sync_pass_inner`])
@@ -1452,6 +1460,48 @@ impl CatchupService {
         ctx.notify_progress();
     }
 
+    /// Start authenticating the certificate of the fetched block for `round`
+    /// (if it is buffered, has a certificate and is not already running) on a
+    /// helper thread; see the call site (issue #2339).
+    fn start_auth_lookahead(
+        ledger: &Arc<dyn CatchupLedger>,
+        buffer: &BTreeMap<u64, FetchOutcome>,
+        round: u64,
+        running: &mut HashMap<u64, AuthLookahead>,
+    ) {
+        if running.contains_key(&round) {
+            return;
+        }
+        let Some(FetchOutcome::Fetch(fetched)) = buffer.get(&round) else {
+            return;
+        };
+        let Ok(fetched) = fetched.as_ref() else {
+            return;
+        };
+        if fetched.cert.is_none() || fetched.block.round.0 != round {
+            return;
+        }
+        let fetched = Arc::clone(fetched);
+        let ledger = Arc::clone(ledger);
+        let (tx, rx) = crossbeam_channel::bounded::<Option<Result<(), String>>>(1);
+        let spawned = thread::Builder::new()
+            .name("catchup-auth".to_string())
+            .spawn(move || {
+                let verdict = fetched.cert.as_ref().and_then(|cert| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        ledger.authenticate_block(&fetched.block, cert)
+                    }))
+                    .ok()
+                });
+                drop(fetched);
+                drop(ledger);
+                let _ = tx.send(verdict);
+            });
+        if let Ok(handle) = spawned {
+            running.insert(round, (rx, handle));
+        }
+    }
+
     /// [`Self::sync_pass_inner`] plus the live service's `sync_now`
     /// coalescing: requests arriving on `triggers` during the pass are pushed
     /// to `waiters`, for the caller to answer with the pass's exit reason.
@@ -1573,12 +1623,10 @@ impl CatchupService {
                         if ledger.round_is_not_supported(r) {
                             return FetchOutcome::Unsupported;
                         }
-                        FetchOutcome::Fetch(Box::new(Self::fetch_round_with_retries(
-                            fetcher.as_ref(),
-                            r,
-                            &stop,
-                            &ctx,
-                        )))
+                        FetchOutcome::Fetch(Box::new(
+                            Self::fetch_round_with_retries(fetcher.as_ref(), r, &stop, &ctx)
+                                .map(Arc::new),
+                        ))
                     }))
                     .unwrap_or_else(|_| {
                         FetchOutcome::Fetch(Box::new(Err(FetchError::NetworkError(format!(
@@ -1652,6 +1700,9 @@ impl CatchupService {
         drop(permit_rx);
 
         let mut buffer: BTreeMap<u64, FetchOutcome> = BTreeMap::new();
+        // Certificate authentications running ahead of the apply cursor
+        // (issue #2339), by round.
+        let mut auth_lookahead: HashMap<u64, AuthLookahead> = HashMap::new();
         let mut next_apply = start_round.0;
         let mut fetched = 0u64;
         // Once `true`, the main loop below applies nothing more and only
@@ -1758,7 +1809,7 @@ impl CatchupService {
                     FetchOutcome::Fetch(boxed) => {
                         let fetched_block = boxed.expect("checked Ok above via is_err guard");
                         let expected_round = Round(next_apply);
-                        let block = fetched_block.block;
+                        let block = &fetched_block.block;
                         if block.round != expected_round {
                             warn!(
                                 expected_round = %expected_round,
@@ -1771,7 +1822,7 @@ impl CatchupService {
                             break 'apply;
                         }
 
-                        let Some(cert) = fetched_block.cert else {
+                        let Some(cert) = fetched_block.cert.as_ref() else {
                             warn!(
                                 round = %expected_round,
                                 "catchup service: periodic sync got a block with no \
@@ -1787,8 +1838,35 @@ impl CatchupService {
                         // unresponsive for minutes on its first sync pass;
                         // log any step of the apply path that is slow so the
                         // next live run names the culprit.
+                        // Issue #2339 (go: `fetchAndWrite` authenticates a fetched
+                        // block in its own goroutine once round `r - seedLookback`
+                        // is in the ledger): round `r + 1` needs round `r - 1`
+                        // (the seed lookback is 2 on every protocol), which is
+                        // committed by now, so its certificate is authenticated
+                        // on a helper thread while this one authenticates and
+                        // applies round `r`. The helper's verdict is used when
+                        // the apply cursor reaches `r + 1`; without one (spawn
+                        // failure, panic) the apply thread authenticates itself.
+                        // (Results that arrived meanwhile are moved into the
+                        // buffer first, so round `r + 1` is seen as soon as it
+                        // has been fetched.)
+                        while let Ok((r, o)) = result_rx.try_recv() {
+                            buffer.insert(r, o);
+                        }
+                        Self::start_auth_lookahead(
+                            ledger,
+                            &buffer,
+                            next_apply + 1,
+                            &mut auth_lookahead,
+                        );
                         let step_started = std::time::Instant::now();
-                        let auth_result = ledger.authenticate_block(&block, &cert);
+                        let auth_result = match auth_lookahead
+                            .remove(&next_apply)
+                            .and_then(|(rx, _handle)| rx.recv().ok().flatten())
+                        {
+                            Some(verdict) => verdict,
+                            None => ledger.authenticate_block(block, cert),
+                        };
                         t_auth += step_started.elapsed();
                         if step_started.elapsed() > Duration::from_secs(1) {
                             warn!(
@@ -1812,7 +1890,7 @@ impl CatchupService {
 
                         let step_started = std::time::Instant::now();
                         let contents_result = algo_validate::contents_match_header(
-                            &block,
+                            block,
                             fetched_block.raw_payset_blobs.as_deref(),
                         );
                         t_contents += step_started.elapsed();
@@ -1857,7 +1935,7 @@ impl CatchupService {
                             bulk.disable();
                         }
                         let step_started = std::time::Instant::now();
-                        ledger.ensure_block(&block, &cert);
+                        ledger.ensure_block(block, cert);
                         t_ensure += step_started.elapsed();
                         if step_started.elapsed() > Duration::from_secs(1) {
                             warn!(
@@ -1960,6 +2038,11 @@ impl CatchupService {
         drop(permit_tx);
         for w in workers {
             let _ = w.join();
+        }
+        // An authentication still running for a round the pass never reached
+        // must not outlive it (it holds the ledger).
+        for (_, (_rx, handle)) in auth_lookahead.drain() {
+            let _ = handle.join();
         }
 
         if fetched > 0 {
@@ -5565,6 +5648,111 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_millis(300),
             "a bounded pass must not sleep a tip-probe backoff"
+        );
+    }
+
+    /// Issue #2339 (go: `fetchAndWrite` authenticates a fetched block once its
+    /// `lookbackComplete` channel fires, i.e. once round `r - seedLookback`
+    /// is in the ledger, `catchup/service.go`): certificates of upcoming
+    /// rounds are authenticated while earlier rounds are still being applied,
+    /// but never before round `r - 2` is committed. With a slow
+    /// authentication the pass finishes in well under the serial time, no
+    /// authentication sees fewer than `r - 2` rounds committed, and the
+    /// ledger ends at the same round.
+    #[test]
+    fn certificates_are_authenticated_ahead_of_the_apply_cursor_but_after_the_lookback() {
+        struct SlowAuth {
+            inner: MockCatchupLedger,
+            in_flight: std::sync::atomic::AtomicUsize,
+            max_in_flight: std::sync::atomic::AtomicUsize,
+            too_early: AtomicU64,
+            calls: AtomicU64,
+        }
+        impl CatchupLedger for SlowAuth {
+            fn next_round(&self) -> Round {
+                self.inner.next_round()
+            }
+            fn ensure_block(&self, block: &Block, cert: &Certificate) {
+                self.inner.ensure_block(block, cert)
+            }
+            fn authenticate_block(&self, block: &Block, _cert: &Certificate) -> Result<(), String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                // Round r - 2 must be committed: next_round() >= r - 1.
+                if self.inner.next_round().0 + 1 < block.round.0 {
+                    self.too_early.fetch_add(1, Ordering::SeqCst);
+                }
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(15));
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let ledger = Arc::new(SlowAuth {
+            inner: MockCatchupLedger::new(Round(0)),
+            in_flight: Default::default(),
+            max_in_flight: Default::default(),
+            too_early: AtomicU64::new(0),
+            calls: AtomicU64::new(0),
+        });
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher: Arc<dyn BlockFetcher> = Arc::new(BoundedBlockFetcher {
+            up_to: 20,
+            calls: AtomicU64::new(0),
+        });
+        let started = std::time::Instant::now();
+        let exit = finishes_within(Duration::from_secs(30), move || {
+            CatchupService::sync_range_to(&ledger_dyn, &fetcher, &never_shutdown(), 8, Round(20))
+        });
+        let elapsed = started.elapsed();
+        assert_eq!(exit, SyncExitReason::Done);
+        assert_eq!(ledger.inner.next_round(), Round(21));
+        assert_eq!(ledger.too_early.load(Ordering::SeqCst), 0);
+        assert!(ledger.calls.load(Ordering::SeqCst) >= 20);
+        assert!(
+            ledger.max_in_flight.load(Ordering::SeqCst) >= 2,
+            "upcoming certificates must authenticate concurrently"
+        );
+        assert!(
+            elapsed < Duration::from_millis(20 * 15 * 7 / 10),
+            "20 authentications of 15 ms took {elapsed:?}, not pipelined"
+        );
+    }
+
+    /// A certificate that fails to authenticate stops the pass at exactly
+    /// that round, however far ahead its authentication ran.
+    #[test]
+    fn a_failed_prefetched_authentication_stops_the_pass_at_its_round() {
+        struct RejectsRound9(MockCatchupLedger);
+        impl CatchupLedger for RejectsRound9 {
+            fn next_round(&self) -> Round {
+                self.0.next_round()
+            }
+            fn ensure_block(&self, block: &Block, cert: &Certificate) {
+                self.0.ensure_block(block, cert)
+            }
+            fn authenticate_block(&self, block: &Block, _cert: &Certificate) -> Result<(), String> {
+                if block.round.0 == 9 {
+                    Err("bad certificate".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let ledger = Arc::new(RejectsRound9(MockCatchupLedger::new(Round(0))));
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher: Arc<dyn BlockFetcher> = Arc::new(BoundedBlockFetcher {
+            up_to: 20,
+            calls: AtomicU64::new(0),
+        });
+        let exit = finishes_within(Duration::from_secs(30), move || {
+            CatchupService::sync_range_to(&ledger_dyn, &fetcher, &never_shutdown(), 8, Round(20))
+        });
+        assert_eq!(exit, SyncExitReason::NoBlock);
+        assert_eq!(
+            ledger.0.next_round(),
+            Round(9),
+            "rounds 1..=8 committed, 9 refused"
         );
     }
 
