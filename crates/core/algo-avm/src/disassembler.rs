@@ -1056,7 +1056,7 @@ mod tests {
         // disassemble back to the `txna` spelling, at every version from
         // gtxna's introduction (v2) through the current max version.
         for v in 2..=13u8 {
-            let txna_source = format!("#pragma version {v}\ntxna Accounts 0\nreturn\n");
+            let txna_source = format!("#pragma version {v}\ntxna Accounts 0\npop\n");
             let txna_ops = assemble_string(&txna_source).unwrap();
             let txna_disassembled = disassemble(&txna_ops.program).unwrap();
             assert!(
@@ -1067,7 +1067,7 @@ mod tests {
             // `txn Accounts 0` (an array field with an index) is a pseudo-op
             // that assembles to the txna opcode -- verify the resulting
             // bytecode is byte-identical and disassembles identically.
-            let txn_alias_source = format!("#pragma version {v}\ntxn Accounts 0\nreturn\n");
+            let txn_alias_source = format!("#pragma version {v}\ntxn Accounts 0\npop\n");
             let txn_alias_ops = assemble_string(&txn_alias_source).unwrap();
             assert_eq!(
                 txna_ops.program, txn_alias_ops.program,
@@ -1085,7 +1085,7 @@ mod tests {
     fn test_disassemble_gtxna_aliasing() {
         // Mirrors go-algorand's TestDisassembleGtxna.
         for v in 2..=13u8 {
-            let gtxna_source = format!("#pragma version {v}\ngtxna 0 Accounts 0\nreturn\n");
+            let gtxna_source = format!("#pragma version {v}\ngtxna 0 Accounts 0\npop\n");
             let gtxna_ops = assemble_string(&gtxna_source).unwrap();
             let gtxna_disassembled = disassemble(&gtxna_ops.program).unwrap();
             assert!(
@@ -1093,7 +1093,7 @@ mod tests {
                 "v{v}: expected 'gtxna 0 Accounts 0' in {gtxna_disassembled}"
             );
 
-            let gtxn_alias_source = format!("#pragma version {v}\ngtxn 0 Accounts 0\nreturn\n");
+            let gtxn_alias_source = format!("#pragma version {v}\ngtxn 0 Accounts 0\npop\n");
             let gtxn_alias_ops = assemble_string(&gtxn_alias_source).unwrap();
             assert_eq!(
                 gtxna_ops.program, gtxn_alias_ops.program,

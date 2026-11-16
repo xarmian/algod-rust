@@ -64,7 +64,11 @@ divergences:
 arg-gate-table:
 	python3 scripts/gen_arg_gate_table.py --check
 
-lint: fmt-check clippy divergences arg-gate-table
+## The assembler's type-tracking table is generated from go's type dump (issue #2368).
+type-track-table:
+	python3 scripts/gen_type_track_table.py --check
+
+lint: fmt-check clippy divergences arg-gate-table type-track-table
 
 deny:
 	cargo deny check
@@ -1112,8 +1116,8 @@ archival-down: ## Stop archival Go node
 ## ── TEAL corpus parity (Phase 25, epic #2364) ─────────────────
 
 TEAL_CORPUS_WORK ?= teal-corpus-work
-# Stages: disassemble (#2367); assemble once #2368/#2369 land. Space-separated.
-TEAL_CORPUS_STAGES ?= disassemble
+# Stages: disassemble (#2367), reassemble (#2368); assemble (original sources) with #2369. Space-separated.
+TEAL_CORPUS_STAGES ?= disassemble reassemble
 
 ## Fetch the ARC56Registry at a recorded SHA and extract the program/source corpus.
 teal-corpus-fetch:
@@ -1269,7 +1273,7 @@ help:
 	@echo ""
 	@echo "TEAL corpus parity (Phase 25):"
 	@echo "  make teal-corpus-fetch    Fetch the ARC56Registry and extract the corpus (network)"
-	@echo "  make teal-corpus-parity   Go-vs-Rust corpus comparison (TEAL_CORPUS_STAGES=disassemble)"
+	@echo "  make teal-corpus-parity   Go-vs-Rust corpus comparison (TEAL_CORPUS_STAGES=disassemble|assemble|reassemble)"
 	@echo ""
 	@echo "Archival Node:"
 	@echo "  make archival-up      Start archival Go node (docker)"

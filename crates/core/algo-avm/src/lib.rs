@@ -42,6 +42,8 @@ pub mod sourcemap;
 pub mod tracer;
 pub mod txn_fields;
 mod type_track;
+#[rustfmt::skip]
+mod type_track_table;
 pub mod validator;
 
 // Re-export key types for convenience.

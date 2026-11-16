@@ -18,1274 +18,1048 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Static stack-type-tracking pass for the TEAL assembler (issue #829).
+//! The assembler's static stack-type tracker: a port of go-algorand's
+//! `ProgramKnowledge`, `trackStack`, `getSpec`'s pseudo-op protos, the
+//! `typed(...)` refine functions and `OpStream.returns`
+//! (`data/transactions/logic/assembler.go`, `eval.go`).
 //!
-//! Mirrors a deliberately incremental slice of go-algorand's compile-time
-//! stack-type inference: `data/transactions/logic/assembler.go`'s
-//! `ProgramKnowledge` (the tracked `stack` of [`StackType`]s, its
-//! `deadcode`/`bottom` fields, and its `scratchSpace` -- see below),
-//! `trackStack` (arg/return checking against the tracked stack), and the
-//! handful of `type*` "refine" functions (`typeSwap`, `typeDup`,
-//! `typeDupTwo`, `typeSelect`, `typeSetBit`, `typeDig`, `typeEquals`,
-//! `typeStore`, `typeLoad`, `typeStores`, `typeLoads`) whose return type (or,
-//! for the scratch-space four, a side effect on `scratchSpace`) depends on
-//! what's actually tracked on the stack rather than a fixed per-opcode
-//! proto.
-//!
-//! # What this slice covers
-//!
-//! - Straight-line (branch-free) instruction sequences: arithmetic/logic/
-//!   comparison opcodes with a fixed uint64/bytes proto, literal pushes
-//!   (`int`, `byte`, `pushint`, `pushbytes`, `intc*`, `bytec*`, `addr`,
-//!   `arg*`, `method`), and the stack-shuffling opcodes above whose return
-//!   type is data-dependent.
-//! - **Branch-merge unification** (`TestBranchAssemblyTypeCheck`,
-//!   `TestTypeTracking`, `TestTypeTrackingRegression`): mirrors go's actual
-//!   algorithm exactly, which turns out to be simpler than a full
-//!   per-predecessor CFG merge. go tracks two extra bits of state
-//!   alongside the stack (`ProgramKnowledge.deadcode`/`bottom`,
-//!   `assembler.go:307-380`):
-//!   - `b`/`callsub`/`retsub`/`err`/`return` (`OpSpec.deadens`,
-//!     `opcodes.go:520-527`) mark everything until the next label as dead
-//!     code: no type checks or stack-effect tracking happen there (the
-//!     tracked stack is left empty), so a real type mistake inside dead
-//!     code is never reported. `callsub` additionally reopens analysis
-//!     immediately (its own target is a label-like entry point, since
-//!     `retsub` returns right after it), rather than waiting for a
-//!     textual label.
-//!   - Reaching a label after dead code reopens analysis with a
-//!     *permissive* stack: further underflow (asking for more stack
-//!     arguments than are currently tracked) is silently satisfied by an
-//!     implicit, unlimited supply of [`StackType::Any`] rather than
-//!     reported as a height error, mirroring `bottom` becoming `StackAny`.
-//!   - Critically, a label reached *without* preceding dead code (e.g.
-//!     immediately after a conditional `bnz`/`bz`, which does not deaden)
-//!     does **not** reset anything -- go simply trusts that whatever's
-//!     tracked along the fallthrough path also describes the state at any
-//!     jump into that label, and keeps analyzing with it unchanged. This is
-//!     asymmetric and not a true meet-over-all-predecessors dataflow
-//!     join, but it is exactly go's real behavior, confirmed against
-//!     `TestBranchAssemblyTypeCheck`/`TestTypeTracking`.
-//!
-//! `switch` was moved out of the old "permanently disable" set into the
-//! normal-tracking path in this slice: like `bnz`/`bz`, go's `switch`
-//! does not deaden (index-out-of-range falls through), and it already
-//! had a fixed, exact proto (`Uint64` pop, no push) in [`TYPE_TABLE`].
-//!
-//! - **Scratch-slot per-index type tracking** (`TestScratchTypeCheck`, and
-//!   the message-observable case of `TestScratchBounds`): mirrors go's
-//!   `ProgramKnowledge.scratchSpace` (see [`OpStream::scratch_space`]) --
-//!   `store i`/`load i` (a fixed immediate slot) read/write that slot's
-//!   exact type; `stores`/`loads` (a *dynamic* slot index popped from the
-//!   stack at runtime) resolve the slot exactly only when the index is a
-//!   compile-time-constant `int` literal sitting right underneath (tracked
-//!   via [`OpStream::type_stack_const`], mirroring go's narrow
-//!   `StackType.constInt()` use in `typeStores`/`typeLoads`); otherwise
-//!   `stores` conservatively unions *every* slot with the stored value's
-//!   type (go can't know which slot was actually written), and `loads`
-//!   falls back to a shared type only if literally every slot currently
-//!   agrees, else `Any`. All four slots start as `Uint64` (an untouched
-//!   scratch slot reads as zero at runtime) and reset to `Any` -- never back
-//!   to `Uint64` -- wherever [`OpStream::type_track_bottom_permissive`] is
-//!   set (a label reached through dead code, or a `callsub`), mirroring
-//!   go's `ProgramKnowledge.reset`.
-//!
-//! On a type mismatch this reports the same diagnostic shape as
-//! go-algorand's `typeErrorf` calls in `trackStack`: `"<instr> arg <i>
-//! wanted type <want> got <got>"` or `"<instr> expects <n> stack arguments
-//! but stack height is <h>"`.
-//!
-//! - **`#pragma typetrack false`/`true`** (part of `TestTypeTracking`):
-//!   mirrors go's manual off/on toggle mid-program (`assembler.go:2501-2519`,
-//!   `OpStream.typeTracking`/`typeErrorf`, `assembler.go:256,294,2039-2043`).
-//!   This gates only whether a mismatch is *reported* -- the tracked stack
-//!   (and scratch-space) keeps evolving underneath regardless, exactly like
-//!   go's `trackStack` unconditionally popping/pushing `ops.known.stack`
-//!   and only `typeErrorf` checking the flag. Toggling from off back to on
-//!   resets tracked knowledge to a permissive state (mirrors
-//!   `ops.known.reset()`, called from the pragma handler,
-//!   `assembler.go:2513-2517`), exactly like reaching a label after dead
-//!   code; toggling off, or re-declaring the current state, does not reset.
-//!   See [`OpStream::type_track_reporting`](crate::assembler::OpStream) and
-//!   the `#pragma typetrack` handling in
-//!   [`assemble_string`](crate::assembler::assemble_string).
-//!
-//! - **Fixed-immediate-arity opcodes** (`TestDupPopNTyping`): `popn n`,
-//!   `dupn n`, `cover n`, and `uncover n` all read a single immediate byte
-//!   directly from the bytecode at assembly time, so their pop/push counts
-//!   are fully known statically. Ports go's
-//!   `typePopN`/`typeDupN`/`typeCover`/`typeUncover`
-//!   (`assembler.go:1486-1524,1621-1646`) directly -- see the `"popn"` /
-//!   `"dupn"` / `"cover"` / `"uncover"` arms of [`refined_types`]. `popn n`
-//!   pops `n` opaque (`Any`) values with no return; `dupn n` leaves `n+1`
-//!   copies of the popped value's actual tracked type on top; `cover n` /
-//!   `uncover n` rotate the top `n+1` stack slots (`Any` going in, the
-//!   actual tracked types coming back out in the rotated order, whenever
-//!   that many slots are currently tracked).
-//!
-//! - **`txn`/`gtxn`/`gtxns` and their `txna`/`gtxna`/`gtxnsa` array-index
-//!   siblings** (part of `TestMatchTyping`; see [`TYPE_TABLE`]'s dedicated
-//!   section): go's assembler does *not* look up the accessed field's
-//!   actual runtime type here at all -- every one of these six opcodes has
-//!   a fixed proto that always pushes a single opaque `StackAny`
-//!   (`opcodes.go:608-617`; none of them carry a `.typed(...)` refine
-//!   function), so there is no per-field lookup table to reuse. The only
-//!   real modeling work is arity: `txn`/`gtxn`/`gtxns` are pseudo-ops whose
-//!   *immediate count* (not the mnemonic) picks the real dispatched-to
-//!   opcode (`txn` vs. `txna`, etc. -- see `asm_pseudo_arity`); this happens
-//!   to be moot for type tracking specifically, because within each pseudo
-//!   mnemonic's dispatch table every arity shares the exact same proto
-//!   (`txn`/`txna` both pop 0 push 1; `gtxn`/`gtxna` both pop 0 push 1;
-//!   `gtxns`/`gtxnsa` both pop 1 push 1) -- so looking up the pseudo
-//!   mnemonic itself in [`TYPE_TABLE`] (before dispatch is even resolved)
-//!   already gives the right answer regardless of how many immediates were
-//!   actually written. `gtxns`/`gtxnsa` pop a dynamic uint64 transaction
-//!   index off the stack (proto `"i:a"`); the other four take every
-//!   selector as an assembler immediate instead, so they pop nothing
-//!   (proto `":a"`).
-//!
-//! - **`pushbytess`/`pushints`** (part of `TestMatchTyping`): a `varuint`
-//!   count immediate followed by that many typed literal values. Ports go's
-//!   `typePushBytess`/`typePushInts` (`assembler.go:1648-1664`) directly --
-//!   see the `"pushbytess"`/`"pushints"` arms of [`refined_types`]: one
-//!   `Bytes`/`Uint64` push per raw immediate token (`args.len()`), no pops
-//!   (the fixed zero-pop base proto already applies). Like go's own refine
-//!   functions (which are handed the same unparsed `[]token` this slice's
-//!   `args` mirrors), this counts *raw tokens*, not decoded values -- a
-//!   multi-token byte-literal form (`base64 <arg>`, two tokens for one
-//!   value) over-counts the push by one in both implementations. This is
-//!   harmless for the "never fabricate an error" guarantee: the extra push
-//!   is still correctly typed, and can only make a later height check more
-//!   permissive, never less.
-//!
-//! - **`match`** (`TestMatchTyping`): pops `N+1` opaque values, where `N` is
-//!   the number of branch-target labels written (`args.len()`) -- the `N`
-//!   case values pushed earlier (one per label) plus the switched-on value
-//!   on top -- and pushes nothing. Ports go's `typeMatch`
-//!   (`assembler.go:1693-1697`) directly; the label *targets* themselves
-//!   (and the varuint-length jump table they assemble into) are irrelevant
-//!   to type tracking, only the immediate token *count* matters, so this
-//!   needed no bytecode-length parsing despite initially looking like the
-//!   hardest of the four remaining opcodes.
-//!
-//! - **`itxn_field`'s field-type-aware refinement** (`TestTxTypes`; slice
-//!   7): ports go's `typeTxField` (`assembler.go:1532-1541`) directly --
-//!   see [`itxn_field_type`] and the `"itxn_field"` arm of
-//!   [`refined_types`]. `itxn_field`'s base proto (`opcodes.go:753`, `"a:"`)
-//!   pops one opaque value; when the single immediate token is a
-//!   recognized `txn`-family field name, the popped value's expected type
-//!   is refined to that field's own type (e.g. `Sender` expects `Bytes`,
-//!   `Amount` expects `Uint64`) instead of accepting anything. Unlike this
-//!   module's other refine functions, go's `typeTxField` doesn't filter by
-//!   `itxVersion` (whether a field is *settable* via `itxn_field` at all is
-//!   a separate, unrelated assembly-time check outside this module), so
-//!   [`itxn_field_type`] covers every recognized field name. Fixes
-//!   `TestTxTypes`.
-//!
-//! # What's deferred (tracked as follow-up work under issue #829)
-//!
-//! - **Bounds-refined types** (sized-type diagnostics like `[32]byte`, and
-//!   `TestScratchBounds`'s direct `os.known.scratchSpace[i].Bound`
-//!   assertions): go's `StackType` also carries a `[min, max]` length/value
-//!   bound (`NewStackType`, `eval.go`); this slice's [`StackType`] is
-//!   bound-free (`Uint64` / `Bytes` / `Any`), matching go's `overlaps`
-//!   exactly for every opcode this slice models (bounds only ever narrow
-//!   the plain-`StackUint64`/`StackBytes` case, which is what every opcode
-//!   here uses) but not reproducing go's `[N]byte`/`(<= N)`-style
-//!   diagnostic text, nor `TestScratchBounds`'s exact numeric `Bound`
-//!   values (only its one message-observable assertion -- the final
-//!   `testProg` call, an AVMType-level mismatch -- is covered; see
-//!   [`OpStream::type_stack_const`] for the narrow, purpose-built
-//!   constant-tracking this slice does instead of general bound
-//!   propagation). A full port of go's `overlaps`/bound-arithmetic would be
-//!   a substantial redesign of [`StackType`] from a 3-way enum to a
-//!   tagged bound pair for comparatively little additional
-//!   diagnostic-message precision (no currently-modeled opcode's
-//!   *accept/reject* verdict depends on it, only the wording of some
-//!   messages) -- left as a follow-up rather than folded into this slice.
-//!   **Re-verified in slice 7** with `itxn_field` now modeled too (the
-//!   issue's other remaining item): go's `overlaps` (`eval.go:1030-1051`)
-//!   is a *range* intersection, not an exact-bound match, so a generic
-//!   `StackBytes` argument (e.g. a `byte` literal of any length) always
-//!   overlaps a field's narrower bound (e.g. `StackAddress`'s `[32,32]`)
-//!   regardless of the literal's actual length -- the real length
-//!   enforcement happens elsewhere, not in type tracking. `itxn_field`
-//!   confirms rather than overturns slice 6's conclusion: still no
-//!   currently-modeled opcode's accept/reject verdict depends on bounds.
-//! - Two of the issue's originally cited "still needs bounds" tests turned
-//!   out, on inspection of `eval_test.go`, not to describe a `type_track`
-//!   gap at all: `TestArgType` is a runtime `stackValue.avmType()` unit
-//!   test with no assembler/type-tracking involvement whatsoever, and
-//!   `TestTypeComplaints` (`"err; store 0"`, `"int 1; return; store 0"`) is
-//!   already covered by this module's existing dead-code handling (slice
-//!   2) -- both cases are `store` reached only after `err`/`return`
-//!   deadens, so [`track_instruction`]'s `type_track_deadcode` early return
-//!   already skips them with no type error, matching go exactly.
-//!
-//! See `docs/phase17/parity_txn_logic.md` for the full go-test mapping.
+//! Every opcode's per-version `proto` (argument and return [`StackType`]s with
+//! their bounds and names), its refine function's name, its field-group
+//! immediates and every field's own type come from
+//! [`crate::type_track_table`], GENERATED from go-algorand's own tables by
+//! `scripts/gen_type_track_table.py` (`tools/avm-op-types`). Only the refine
+//! functions themselves (`typeDup`, `typeFrameDig`, ...) are ported by hand;
+//! a test keeps their list in sync with the go dump. History: issue #829
+//! (an incremental slice), issue #2368 (the full port, driven by the
+//! ARC56Registry reassembly corpus).
 
 use crate::assembler::OpStream;
-use crate::opcode;
+use crate::type_track_table::OPS;
 
-/// A statically tracked stack-slot type. Mirrors go-algorand's `avmType`
-/// (`eval.go`) without its bounds refinement (see module docs).
+/// go's `avmType` (`eval.go`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StackType {
+pub(crate) enum Avm {
+    None,
+    Any,
     Uint64,
     Bytes,
-    /// Could be either type -- unifies with anything. Mirrors go's
-    /// `StackAny`.
-    Any,
 }
 
-use StackType::{Any, Bytes, Uint64};
+const MAX_UINT64: u64 = u64::MAX;
+const MAX_STRING_SIZE: u64 = 4096;
+
+/// go's `StackType`: an AVM type, a `[min, max]` bound (value for uint64,
+/// length for `[]byte`) and the name it prints. The name is derived from the
+/// type and bound exactly like `NewStackType` does, unless a table type carries
+/// an `alias` (`address`, `bool`, `bigint`, `boxName`, ...), so derived
+/// equality is go's struct equality (`Name`, `AVMType`, `Bound`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StackType {
+    avm: Avm,
+    min: u64,
+    max: u64,
+    alias: Option<&'static str>,
+}
+
+/// go's `StackAny`.
+pub(crate) const ANY: StackType = StackType::new(Avm::Any, 0, 0, None);
+/// go's `StackUint64`.
+pub(crate) const UINT64: StackType = StackType::new(Avm::Uint64, 0, MAX_UINT64, None);
+/// go's `StackBytes`.
+pub(crate) const BYTES: StackType = StackType::new(Avm::Bytes, 0, MAX_STRING_SIZE, None);
+/// go's `StackNone`.
+const NONE: StackType = StackType::new(Avm::None, 0, 0, None);
 
 impl StackType {
-    /// Mirrors go's `StackType.overlaps` (`eval.go:1030-1051`) restricted to
-    /// the bound-free case: `Any` overlaps everything, otherwise the two
-    /// types must match exactly.
-    fn overlaps(self, expected: StackType) -> bool {
-        self == Any || expected == Any || self == expected
+    pub(crate) const fn new(avm: Avm, min: u64, max: u64, alias: Option<&'static str>) -> Self {
+        Self {
+            avm,
+            min,
+            max,
+            alias,
+        }
+    }
+
+    /// go's `NewStackType` with no explicit name.
+    fn bounded(avm: Avm, min: u64, max: u64) -> Self {
+        Self::new(avm, min, max, None)
+    }
+
+    /// go's `StackType.Typed`.
+    pub(crate) fn typed(self) -> bool {
+        matches!(self.avm, Avm::Uint64 | Avm::Bytes)
+    }
+
+    /// go's `StackType.union`.
+    fn union(self, b: StackType) -> StackType {
+        if self.avm != b.avm {
+            return ANY;
+        }
+        Self::bounded(self.avm, self.min.min(b.min), self.max.max(b.max))
+    }
+
+    /// go's `StackType.narrowed`.
+    fn narrowed(self, min: u64, max: u64) -> StackType {
+        Self::bounded(self.avm, min, max)
+    }
+
+    /// go's `StackType.widened`.
+    fn widened(self) -> StackType {
+        match self.avm {
+            Avm::Bytes => BYTES,
+            Avm::Uint64 => UINT64,
+            // go panics for `none`; it is never on a stack being widened
+            // (`typeEquals` only sees values pushed by earlier opcodes).
+            Avm::Any | Avm::None => ANY,
+        }
+    }
+
+    /// go's `StackType.constInt`.
+    fn const_int(self) -> Option<u64> {
+        (self.avm == Avm::Uint64 && self.min == self.max).then_some(self.min)
+    }
+
+    /// go's `StackType.overlaps`.
+    pub(crate) fn overlaps(self, expected: StackType) -> bool {
+        if self.avm == Avm::None || expected.avm == Avm::None {
+            return false;
+        }
+        if self.avm == Avm::Any || expected.avm == Avm::Any {
+            return true;
+        }
+        if self.avm != expected.avm {
+            return false;
+        }
+        self.min <= expected.max && self.max >= expected.min
     }
 }
 
 impl std::fmt::Display for StackType {
+    /// go's `StackType.String`: the alias, or `NewStackType`'s derived name.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Uint64 => "uint64",
-            Bytes => "[]byte",
-            Any => "any",
-        })
-    }
-}
-
-/// Mirrors go's `StackType.union` (`eval.go:991-1000`) restricted to the
-/// bound-free case: same type through, otherwise `Any`.
-fn union(a: StackType, b: StackType) -> StackType {
-    if a == b {
-        a
-    } else {
-        Any
-    }
-}
-
-/// Static arg/return type table for opcodes with a fixed, data-independent
-/// proto. Mirrors the relevant subset of go-algorand's per-opcode `proto(..)`
-/// strings (`opcodes.go`). Opcodes not listed here fall back to
-/// [`StackType::Any`] for every argument/return slot (using the pop/push
-/// counts already in [`opcode::OpSpec`]) -- always safe, since `Any`
-/// overlaps everything and never manufactures a spurious mismatch.
-const TYPE_TABLE: &[(&str, &[StackType], &[StackType])] = &[
-    // ---- Arithmetic / comparison / logic (proto "ii:i") ----
-    ("+", &[Uint64, Uint64], &[Uint64]),
-    ("-", &[Uint64, Uint64], &[Uint64]),
-    ("*", &[Uint64, Uint64], &[Uint64]),
-    ("/", &[Uint64, Uint64], &[Uint64]),
-    ("%", &[Uint64, Uint64], &[Uint64]),
-    ("<", &[Uint64, Uint64], &[Uint64]),
-    (">", &[Uint64, Uint64], &[Uint64]),
-    ("<=", &[Uint64, Uint64], &[Uint64]),
-    (">=", &[Uint64, Uint64], &[Uint64]),
-    ("&&", &[Uint64, Uint64], &[Uint64]),
-    ("||", &[Uint64, Uint64], &[Uint64]),
-    ("|", &[Uint64, Uint64], &[Uint64]),
-    ("&", &[Uint64, Uint64], &[Uint64]),
-    ("^", &[Uint64, Uint64], &[Uint64]),
-    // ---- Unary uint64 (proto "i:i") ----
-    ("!", &[Uint64], &[Uint64]),
-    ("~", &[Uint64], &[Uint64]),
-    // ---- Type conversion ----
-    ("itob", &[Uint64], &[Bytes]),
-    ("btoi", &[Bytes], &[Uint64]),
-    ("len", &[Bytes], &[Uint64]),
-    ("concat", &[Bytes, Bytes], &[Bytes]),
-    // ---- Wide arithmetic (proto "ii:ii" / "iiii:iiii") ----
-    ("mulw", &[Uint64, Uint64], &[Uint64, Uint64]),
-    ("addw", &[Uint64, Uint64], &[Uint64, Uint64]),
-    (
-        "divmodw",
-        &[Uint64, Uint64, Uint64, Uint64],
-        &[Uint64, Uint64, Uint64, Uint64],
-    ),
-    // ---- ==/!= base proto ("aa:T"); `refined_types` overrides the args
-    // once both operand types are known, but the fixed uint64 (boolean)
-    // return always applies. ----
-    ("==", &[Any, Any], &[Uint64]),
-    ("!=", &[Any, Any], &[Uint64]),
-    // ---- select/setbit: proto fixes everything but the return type,
-    // which `refined_types` overrides. ----
-    ("select", &[Any, Any, Uint64], &[Any]),
-    ("setbit", &[Any, Uint64, Uint64], &[Any]),
-    // ---- dig: static fallback proto ("a:aa") used only when the
-    // immediate can't be parsed; `refined_types` normally overrides both
-    // sides using the actual depth. ----
-    ("dig", &[Any], &[Any, Any]),
-    // ---- Literal / constant-pool pushes ----
-    ("pushint", &[], &[Uint64]),
-    ("pushbytes", &[], &[Bytes]),
-    ("intc", &[], &[Uint64]),
-    ("intc_0", &[], &[Uint64]),
-    ("intc_1", &[], &[Uint64]),
-    ("intc_2", &[], &[Uint64]),
-    ("intc_3", &[], &[Uint64]),
-    ("bytec", &[], &[Bytes]),
-    ("bytec_0", &[], &[Bytes]),
-    ("bytec_1", &[], &[Bytes]),
-    ("bytec_2", &[], &[Bytes]),
-    ("bytec_3", &[], &[Bytes]),
-    ("arg", &[], &[Bytes]),
-    ("arg_0", &[], &[Bytes]),
-    ("arg_1", &[], &[Bytes]),
-    ("arg_2", &[], &[Bytes]),
-    ("arg_3", &[], &[Bytes]),
-    // ---- Branch/exit condition types. `bnz`/`bz`/`switch` don't deaden
-    // (go's `OpSpec.deadens`, `opcodes.go:520-527` -- execution may fall
-    // through past any of them), so tracking continues normally after
-    // them; `return` does deaden (see `deadens_tracking`). ----
-    ("bnz", &[Uint64], &[]),
-    ("bz", &[Uint64], &[]),
-    ("switch", &[Uint64], &[]),
-    ("return", &[Uint64], &[]),
-    ("assert", &[Uint64], &[]),
-    // ---- Scratch-space load/store base protos (opcodes.go:611-627):
-    // `load`/`store` take a fixed immediate slot index (not a stack arg);
-    // `loads`/`stores` take a dynamic uint64 index off the stack. All four
-    // push/pop an `Any` value, refined to the tracked slot's exact type (or
-    // used to update it) by `refined_types` below. ----
-    ("load", &[], &[Any]),
-    ("store", &[Any], &[]),
-    ("loads", &[Uint64], &[Any]),
-    ("stores", &[Uint64, Any], &[]),
-    // ---- `txn`/`gtxn`/`txna`/`gtxna`/`gtxns`/`gtxnsa` field access
-    // (opcodes.go:608-617): every one of these pushes a single `StackAny`
-    // regardless of the field's own runtime type ("StackType" is `a` in
-    // every one of these opcodes' proto strings) -- go's assembler does
-    // *not* look up the accessed field's actual type to refine this, unlike
-    // this table's other entries (see the `hard_disables_tracking` removal
-    // note in the module docs). `gtxns`/`gtxnsa` additionally pop the
-    // dynamic transaction-group index off the stack (proto "i:a"); the
-    // other four take every selector as an assembler immediate instead, so
-    // they pop nothing (proto ":a"). This applies identically regardless of
-    // which of a pseudo-op's dispatch arities was used to reach here (see
-    // `asm_pseudo_arity`'s doc comment): `txn`'s 1- and 2-immediate forms
-    // (`txn` vs `txna`) share this exact proto, and likewise for
-    // `gtxn`/`gtxna` and `gtxns`/`gtxnsa`. ----
-    ("txn", &[], &[Any]),
-    ("gtxn", &[], &[Any]),
-    ("txna", &[], &[Any]),
-    ("gtxna", &[], &[Any]),
-    ("gtxns", &[Uint64], &[Any]),
-    ("gtxnsa", &[Uint64], &[Any]),
-    // ---- `itxn_field` (opcodes.go:753, proto "a:"): pops one opaque value
-    // by default, refined below by `refined_types` to the assigned field's
-    // actual expected type (`typeTxField`) whenever the field name is
-    // recognized. ----
-    ("itxn_field", &[Any], &[]),
-    // ---- `asset_holding_get`/`asset_params_get`/`app_params_get`/
-    // `acct_params_get` (opcodes.go:684-688, TestAssembleAsset): each pops a
-    // fixed-shape reference (asset_holding_get's `ai:aT`/`ii:aT` version
-    // split is handled in `refined_types` below, since it needs `ops.version`
-    // -- these table entries are the fallback used only when a mismatched
-    // arity leaves the refine function unable to run, e.g. dead code) and
-    // pushes `[value, didExist]`; the `value` slot (`StackAny` here) is
-    // refined by `refined_types` to the selected field's actual type
-    // whenever the field name is recognized, mirroring go's `ops.returns`
-    // call inside `asmDefault`'s group-immediate handling
-    // (`assembler.go:1240-1243`). ----
-    ("asset_holding_get", &[Any, Uint64], &[Any, Uint64]),
-    ("asset_params_get", &[Uint64], &[Any, Uint64]),
-    ("app_params_get", &[Uint64], &[Any, Uint64]),
-    ("acct_params_get", &[Any], &[Any, Uint64]),
-];
-
-fn table_lookup(mnemonic: &str) -> Option<(&'static [StackType], &'static [StackType])> {
-    TYPE_TABLE
-        .iter()
-        .find(|(name, _, _)| *name == mnemonic)
-        .map(|(_, a, r)| (*a, *r))
-}
-
-/// Mnemonics that are looked up directly (not via [`opcode::lookup_by_name`])
-/// because they never reach `asm_regular`: pseudo-ops that assemble to an
-/// `intc`/`bytec` reference rather than being real opcodes themselves.
-/// Always push exactly one value of a fixed type, regardless of the literal
-/// written (mirrors go's `typePushInt`/`typeByte`, `assembler.go:1666-1690`,
-/// which is likewise unconditional).
-fn literal_push_type(mnemonic: &str) -> Option<StackType> {
-    match mnemonic {
-        "int" => Some(Uint64),
-        "byte" | "addr" | "method" => Some(Bytes),
-        _ => None,
-    }
-}
-
-/// Mnemonics that unconditionally end or divert control flow, marking
-/// everything until the next label as dead code. Mirrors go's
-/// `OpSpec.deadens` (`opcodes.go:520-527`) exactly: `bnz`/`bz`/`switch` are
-/// deliberately *not* included here (a conditional branch, or an
-/// out-of-range `switch` index, can fall through to the next instruction),
-/// unlike this module's previous "permanently disable on any branch" logic.
-/// See [`OpStream::type_track_deadcode`](crate::assembler::OpStream) and
-/// the module docs' branch-merge section.
-fn deadens_tracking(mnemonic: &str) -> bool {
-    matches!(mnemonic, "b" | "callsub" | "retsub" | "err" | "return")
-}
-
-/// A side effect a refine function has on [`OpStream::scratch_space`]
-/// (go's `pgm.scratchSpace[i] = ...` assignments inside `typeStore`/
-/// `typeStores`, `assembler.go:1543-1576` -- unlike every other refine
-/// function, these two mutate `ProgramKnowledge` rather than just
-/// overriding the args/returns passed to `trackStack`).
-#[derive(Debug, Clone, Copy)]
-enum ScratchEffect {
-    /// `store i` / `stores` with a known-constant index: set exactly one
-    /// slot to the stored value's type (`typeStore`; `typeStores`'s
-    /// `isConst` branch).
-    Set(usize, StackType),
-    /// `stores` with a non-constant index: mirrors `typeStores`'s fallback
-    /// (`assembler.go:1570-1574`) -- since the actual written slot isn't
-    /// known, every slot is conservatively widened to the union of its
-    /// current type and the stored value's type, rather than picked
-    /// arbitrarily or left untouched.
-    UnionAll(StackType),
-}
-
-/// Refine functions for opcodes whose args and/or returns depend on the
-/// types currently tracked on the stack rather than a fixed proto. Mirrors
-/// go's `refineFunc`s (`assembler.go:1323-1484,1543-1619`). Returns `None`
-/// when this mnemonic has no refine function; returns `Some((args_override,
-/// returns_override, scratch_effect))` otherwise, where either of the first
-/// two being `None` means "use the [`TYPE_TABLE`]/default proto for that
-/// side" (matching go's `nargs`/`nreturns` being `nil`).
-///
-/// `consts` is [`OpStream::type_stack_const`] (parallel to `stack`): the
-/// compile-time-constant value of each tracked entry, when known -- used by
-/// `loads`/`stores` to resolve a dynamic scratch-slot index exactly when
-/// it's a literal, mirroring go's `StackType.constInt()` (see
-/// [`OpStream::type_stack_const`]'s doc comment for what this narrow slice
-/// of go's real bound-tracking does and doesn't reproduce). `scratch` is
-/// [`OpStream::scratch_space`], read (not mutated) here; the caller applies
-/// any returned [`ScratchEffect`] afterward. `version` is [`OpStream::version`],
-/// needed only by `asset_holding_get` to pick between its two versioned
-/// protos (see that match arm) -- go instead selects between two whole
-/// `OpSpec` entries by version (`getSpec`), which this module doesn't model
-/// for any other opcode. `bottom_permissive` is
-/// [`OpStream::type_track_bottom_permissive`], needed only by `bury`'s
-/// insufficient-height case (see that match arm) to decide between forcing
-/// a height error and silently falling back to the default fixed proto,
-/// mirroring go's `pgm.bottom.AVMType == avmNone` check in `typeBury`.
-#[allow(clippy::type_complexity)]
-fn refined_types(
-    stack: &[StackType],
-    consts: &[Option<u64>],
-    scratch: &[StackType; 256],
-    version: u8,
-    bottom_permissive: bool,
-    mnemonic: &str,
-    args: &[&str],
-) -> Option<(
-    Option<Vec<StackType>>,
-    Option<Vec<StackType>>,
-    Option<ScratchEffect>,
-)> {
-    let len = stack.len();
-    match mnemonic {
-        // typeSwap (assembler.go:1323-1333): returns become whatever was on
-        // top (order swapped); args stay the default `Any`/`Any`.
-        "swap" => {
-            let mut swapped = [Any, Any];
-            if len >= 1 {
-                swapped[0] = stack[len - 1];
-                if len >= 2 {
-                    swapped[1] = stack[len - 2];
-                }
-            }
-            Some((None, Some(swapped.to_vec()), None))
+        if let Some(a) = self.alias {
+            return f.write_str(a);
         }
-        // typeDup (assembler.go:1450-1456).
-        "dup" => {
-            let top = if len >= 1 { stack[len - 1] } else { Any };
-            Some((None, Some(vec![top, top]), None))
-        }
-        // typeDupTwo (assembler.go:1458-1468): duplicates the top two.
-        "dup2" => {
-            let mut two = [Any, Any];
-            if len >= 1 {
-                two[1] = stack[len - 1];
-                if len >= 2 {
-                    two[0] = stack[len - 2];
-                }
-            }
-            Some((None, Some(vec![two[0], two[1], two[0], two[1]]), None))
-        }
-        // typeSelect (assembler.go:1470-1476): result is the union of the
-        // two non-selector operands.
-        "select" => {
-            let result = if len >= 3 {
-                union(stack[len - 2], stack[len - 3])
-            } else {
-                Any
-            };
-            Some((None, Some(vec![result]), None))
-        }
-        // typeSetBit (assembler.go:1478-1484): result keeps the target's
-        // (bottom arg's) type.
-        "setbit" => {
-            let result = if len >= 3 { stack[len - 3] } else { Any };
-            Some((None, Some(vec![result]), None))
-        }
-        // typeEquals (assembler.go:1439-1448): both operands must be the
-        // same avm type as whatever's on top; return type is the fixed
-        // boolean from TYPE_TABLE.
-        "==" | "!=" => {
-            let top = if !stack.is_empty() {
-                stack[len - 1]
-            } else {
-                Any
-            };
-            Some((Some(vec![top, top]), None, None))
-        }
-        // typeDig (assembler.go:1335-1350): pops/returns `n+1` items,
-        // duplicating the one at depth `n`.
-        "dig" => {
-            let n: usize = args.first()?.parse().ok()?;
-            let depth = n + 1;
-            let mut returns = vec![Any; depth + 1];
-            if len >= depth {
-                let idx = len - depth;
-                returns[..depth].copy_from_slice(&stack[idx..]);
-                returns[depth] = stack[idx];
-            }
-            Some((Some(vec![Any; depth]), Some(returns), None))
-        }
-        // typeBury (assembler.go:1352-1378): `bury n` pops the top `n+1`
-        // tracked values and pushes back `n`, with the bottom-most of those
-        // `n` (the slot actually being buried into) replaced by the
-        // original top's type -- the value being buried down overwrites it.
-        // `bury 0` is rejected before this arm is ever reached (see
-        // `track_instruction`'s dedicated special case, mirroring go's
-        // `errors.New("bury 0 always fails")`).
-        "bury" => {
-            let n: usize = args.first()?.parse().ok()?;
-            let depth = n + 1;
-            if len < depth {
-                // Mirrors go's `idx := top - n; if idx < 0`: with a
-                // permissive bottom (analysis reopened after dead code,
-                // `pgm.bottom.AVMType != avmNone`) there's nothing to
-                // refine -- fall back entirely to the default fixed proto
-                // (pop 1 `Any`, push nothing), exactly like go's `nil, nil,
-                // nil`. Without a permissive bottom, force the pop count to
-                // `depth` so `apply_stack_effect` reports the standard
-                // "expects N stack arguments" height error, mirroring go's
-                // `anyTypes(n + 1)`.
-                return if bottom_permissive {
-                    Some((None, None, None))
+        let (min, max) = (self.min, self.max);
+        match self.avm {
+            Avm::None => f.write_str("none"),
+            Avm::Any => f.write_str("any"),
+            Avm::Uint64 => {
+                if min == max {
+                    write!(f, "{min}")
+                } else if min == 0 && max != 0 {
+                    if max != MAX_UINT64 {
+                        write!(f, "uint64 (<= {max})")
+                    } else {
+                        f.write_str("uint64")
+                    }
+                } else if min != 0 && max != 0 {
+                    write!(f, "uint64 ({min}-{max})")
                 } else {
-                    Some((Some(vec![Any; depth]), None, None))
-                };
-            }
-            let idx = len - depth;
-            let mut returns = vec![Any; n];
-            returns.copy_from_slice(&stack[idx..idx + n]);
-            returns[0] = stack[len - 1];
-            Some((Some(stack[idx..].to_vec()), Some(returns), None))
-        }
-        // typeStore (assembler.go:1543-1553): a known slot index (`store`
-        // always has a literal immediate, never a stack arg) gets set to
-        // whatever type is currently on top of the tracked stack -- the
-        // value `store` is about to pop. No args/returns override (the
-        // fixed `Any` pop from [`TYPE_TABLE`] applies).
-        "store" => {
-            let idx = scratch_slot_immediate(args);
-            let effect = match (idx, stack.last()) {
-                (Some(i), Some(&top)) => Some(ScratchEffect::Set(i, top)),
-                _ => None,
-            };
-            Some((None, None, effect))
-        }
-        // typeLoad (assembler.go:1578-1584): pushes the tracked type of the
-        // known slot index instead of the default `Any`.
-        "load" => {
-            let ret = scratch_slot_immediate(args).map(|i| vec![scratch[i]]);
-            Some((None, ret, None))
-        }
-        // typeStores (assembler.go:1555-1576): the index is a *dynamic*
-        // stack value (second from top; the value being stored is on top --
-        // proto `"ia:"`). When it's a compile-time constant (pushed by a
-        // literal `int`, tracked via `consts`), exactly that slot is set;
-        // otherwise every slot is conservatively unioned with the stored
-        // value's type, since the real target slot isn't known statically.
-        "stores" => {
-            if len == 0 {
-                return Some((None, None, None));
-            }
-            let value_ty = stack[len - 1];
-            if len >= 2 {
-                if let Some(i) = const_scratch_index(consts, len - 2) {
-                    return Some((None, None, Some(ScratchEffect::Set(i, value_ty))));
+                    f.write_str("uint64")
                 }
             }
-            Some((None, None, Some(ScratchEffect::UnionAll(value_ty))))
-        }
-        // typeLoads (assembler.go:1601-1619): the index (top of stack) is
-        // dynamic. When it's a compile-time constant, pushes exactly that
-        // slot's type; otherwise, mirrors go's fallback of pushing a known
-        // type only if *every* scratch slot currently shares one (still
-        // useful after a plain `store` to every slot, or the all-`Uint64`/
-        // all-`Any` initial/post-reset states), else falls back to the
-        // default `Any`.
-        "loads" => {
-            if len == 0 {
-                return Some((None, None, None));
+            Avm::Bytes => {
+                if min == max {
+                    write!(f, "[{min}]byte")
+                } else if min == 0 && max != 0 {
+                    if max != MAX_STRING_SIZE {
+                        write!(f, "[<={max}]byte")
+                    } else {
+                        f.write_str("[]byte")
+                    }
+                } else if min != 0 && max != 0 {
+                    write!(f, "[{min}-{max}]byte")
+                } else {
+                    f.write_str("[]byte")
+                }
             }
-            if let Some(i) = const_scratch_index(consts, len - 1) {
-                return Some((None, Some(vec![scratch[i]]), None));
-            }
-            let first = scratch[0];
-            let uniform = scratch.iter().all(|&t| t == first);
-            Some((None, uniform.then(|| vec![first]), None))
         }
-        // typePopN (assembler.go:1621-1627): `popn n` pops exactly `n`
-        // values, each accepting any type -- there's no return.
-        "popn" => {
-            let n: usize = args.first()?.parse().ok()?;
-            Some((Some(vec![Any; n]), Some(vec![]), None))
-        }
-        // typeDupN (assembler.go:1629-1646): `dupn n` (base proto `"a:"`
-        // already supplies the single fixed `Any` pop, so args isn't
-        // overridden here) leaves `n+1` copies of the popped value on top --
-        // typed as whatever's actually on top of the tracked stack (read
-        // before the pop happens), or `Any` when that's unknown.
-        "dupn" => {
-            let n: usize = args.first()?.parse().ok()?;
-            let top = if len >= 1 { stack[len - 1] } else { Any };
-            Some((None, Some(vec![top; n + 1]), None))
-        }
-        // typeCover (assembler.go:1486-1506): `cover n` moves the top value
-        // down `n` positions, i.e. rotates the top `depth = n+1` stack slots
-        // (the top value plus the `n` items below it). Every value in that
-        // range is accepted as `Any` on the way in (args is always the
-        // opaque `anyTypes(depth)`); the pushed types mirror the actual
-        // rotation, refined to the real tracked types whenever the full
-        // `depth` is currently known (falling back to `Any` for any slot
-        // that isn't).
-        "cover" => {
-            let n: usize = args.first()?.parse().ok()?;
-            let depth = n + 1;
-            let mut returns = vec![Any; depth];
-            if len >= depth {
-                let idx = len - depth;
-                returns[0] = stack[len - 1];
-                returns[1..depth].copy_from_slice(&stack[idx..len - 1]);
-            }
-            Some((Some(vec![Any; depth]), Some(returns), None))
-        }
-        // typeUncover (assembler.go:1508-1524): `uncover n` moves the value
-        // `n` positions down the stack up to the top -- the same `depth =
-        // n+1` window as `cover`, rotated the opposite way.
-        "uncover" => {
-            let n: usize = args.first()?.parse().ok()?;
-            let depth = n + 1;
-            let mut returns = vec![Any; depth];
-            if len >= depth {
-                let idx = len - depth;
-                returns[depth - 1] = stack[idx];
-                returns[..depth - 1].copy_from_slice(&stack[idx + 1..len]);
-            }
-            Some((Some(vec![Any; depth]), Some(returns), None))
-        }
-        // typePushBytess (assembler.go:1648-1655): `pushbytess` pushes one
-        // `StackBytes` per raw immediate token following the mnemonic --
-        // `args` here is exactly that raw token list (mirroring go's
-        // `refineFunc`, which is likewise handed the unparsed `[]token`
-        // rather than the count of successfully-decoded byte-literal
-        // values; a multi-token literal form like `base64 <arg>` therefore
-        // over-counts by one push relative to the real encoded value count
-        // in both implementations -- harmless here since every extra push
-        // is still correctly typed `Bytes` and can only make a later height
-        // check more permissive, never fabricate a spurious error). No args
-        // override: the base proto's fixed zero pops already applies.
-        "pushbytess" => Some((None, Some(vec![Bytes; args.len()]), None)),
-        // typePushInts (assembler.go:1657-1664): same shape as
-        // `pushbytess`, one `StackUint64` per raw immediate token.
-        "pushints" => Some((None, Some(vec![Uint64; args.len()]), None)),
-        // typeMatch (assembler.go:1693-1697): `match label1 .. labelN` pops
-        // `N+1` opaque values -- the `N` case values pushed earlier (one per
-        // label, matched positionally) plus the switched-on value on top --
-        // and pushes nothing. `args` is the label-token list, so `N =
-        // args.len()`; go deliberately doesn't try to unify the popped
-        // types the way `typeEquals` does ("it is legal to mix types"), so
-        // every popped slot is `Any`.
-        "match" => Some((Some(vec![Any; args.len() + 1]), None, None)),
-        // typeTxField (assembler.go:1532-1541): refines the popped value's
-        // expected type to the assigned field's own type (`itxn_field`'s
-        // single immediate token is the field name) instead of the default
-        // opaque `Any` from `TYPE_TABLE`. `None` when the field name isn't
-        // recognized (mirrors go's `!ok` early return) -- args then falls
-        // back to `TYPE_TABLE`'s default `[Any]`, same as go's `nargs ==
-        // nil` leaving `spec.Arg.Types` untouched.
-        "itxn_field" => Some((
-            args.first()
-                .and_then(|f| itxn_field_type(f))
-                .map(|ty| vec![ty]),
-            None,
-            None,
-        )),
-        // `asset_holding_get` (opcodes.go:684-685, TestAssembleAsset): two
-        // versioned protos share the mnemonic -- `ii:aT` below
-        // `directRefEnabledVersion` (account is a foreign-accounts-array
-        // index, popped as `Uint64`), `ai:aT` from it on (account can also be
-        // a direct address `Bytes`/`Any` reference). `getSpec` picks the
-        // OpSpec by version in go; this module has no per-mnemonic versioned
-        // table, so the split is applied here instead. The pushed `value`
-        // slot (first return) is refined to the selected field's actual type
-        // (`AssetHoldingFields`, `fields.go:1355-1358`) when recognized,
-        // mirroring go's `ops.returns` call inside `asmDefault`'s
-        // group-immediate handling (`assembler.go:1240-1243`); the `didExist`
-        // flag (second return) is always `Uint64`.
-        "asset_holding_get" => {
-            const DIRECT_REF_ENABLED_VERSION: u8 = 4;
-            let args_override = if version < DIRECT_REF_ENABLED_VERSION {
-                vec![Uint64, Uint64]
-            } else {
-                vec![Any, Uint64]
-            };
-            let ret = args
-                .first()
-                .and_then(|f| asset_holding_field_type(f))
-                .map(|ty| vec![ty, Uint64]);
-            Some((Some(args_override), ret, None))
-        }
-        // `balance`/`min_balance` (opcodes.go:668-669,693-694,
-        // TestAssembleBalance/TestAssembleMinBalance): same
-        // `directRefEnabledVersion` split as `asset_holding_get` above --
-        // below v4 the account argument is a foreign-accounts-array index
-        // (`Uint64` only, proto `i:i`); from v4 on a direct address
-        // reference is also accepted (proto widens to `a:i` / `Any`).
-        // Neither opcode's pushed `Uint64` return depends on the version,
-        // so only the popped arg is overridden here.
-        "balance" | "min_balance" => {
-            const DIRECT_REF_ENABLED_VERSION: u8 = 4;
-            let args_override = if version < DIRECT_REF_ENABLED_VERSION {
-                vec![Uint64]
-            } else {
-                vec![Any]
-            };
-            Some((Some(args_override), None, None))
-        }
-        // `asset_params_get`/`app_params_get`/`acct_params_get`
-        // (opcodes.go:686-688, TestAssembleAsset): fixed (non-versioned) pop
-        // shape already covered by `TYPE_TABLE`; only the pushed `value`
-        // slot needs refining to the selected field's actual type
-        // (`AssetParamsFields`/`AppParamsFields`/`AcctParamsFields`,
-        // `fields.go:1444-1457,1550-1564,1714-1732`), same as
-        // `asset_holding_get` above.
-        "asset_params_get" => Some((
-            None,
-            args.first()
-                .and_then(|f| asset_params_field_type(f))
-                .map(|ty| vec![ty, Uint64]),
-            None,
-        )),
-        "app_params_get" => Some((
-            None,
-            args.first()
-                .and_then(|f| app_params_field_type(f))
-                .map(|ty| vec![ty, Uint64]),
-            None,
-        )),
-        "acct_params_get" => Some((
-            None,
-            args.first()
-                .and_then(|f| acct_params_field_type(f))
-                .map(|ty| vec![ty, Uint64]),
-            None,
-        )),
-        _ => None,
     }
 }
 
-/// Mirrors go's `assetHoldingFieldSpecs[].ftype` (`fields.go:1355-1358`),
-/// used to refine `asset_holding_get`'s pushed value type to the selected
-/// field's actual type. Every recognized field collapses to `Uint64` at the
-/// `AVMType` level (`AssetFrozen`'s `StackBoolean` included -- see the
-/// `itxn_field_type` doc comment for why bound-refined types collapse this
-/// way); `None` for an unrecognized name, mirroring `!ok`.
-fn asset_holding_field_type(field_name: &str) -> Option<StackType> {
-    match field_name {
-        "AssetBalance" | "AssetFrozen" => Some(Uint64),
-        _ => None,
+/// One field of a field group (generated).
+pub(crate) struct FieldEntry {
+    pub name: &'static str,
+    #[allow(dead_code)]
+    pub version: u8,
+    pub ty: StackType,
+}
+
+/// One immediate of an opcode (generated): a field-group selector or not.
+pub(crate) struct ImmEntry {
+    /// go's `immediate.Name` (`i`, `n`, `f`, ...): named in immediate parse errors.
+    pub name: &'static str,
+    pub group: Option<&'static [FieldEntry]>,
+}
+
+/// An opcode's proto from the version it starts at (generated).
+pub(crate) struct Variant {
+    pub from: u8,
+    pub args: &'static [StackType],
+    pub returns: &'static [StackType],
+    pub refine: &'static str,
+}
+
+/// An opcode (generated).
+pub(crate) struct OpEntry {
+    pub name: &'static str,
+    pub version: u8,
+    pub deadens: bool,
+    pub imms: &'static [ImmEntry],
+    pub variants: &'static [Variant],
+}
+
+/// go's name of opcode `op`'s immediate `idx` (`i`, `n`, ...), for parse errors;
+/// `i` when the opcode has no such immediate.
+pub(crate) fn imm_name(op: &str, idx: usize) -> &'static str {
+    op_entry(op)
+        .and_then(|e| e.imms.get(idx))
+        .map_or("i", |i| i.name)
+}
+
+fn op_entry(name: &str) -> Option<&'static OpEntry> {
+    OPS.binary_search_by(|e| e.name.cmp(name))
+        .ok()
+        .map(|i| &OPS[i])
+}
+
+impl OpEntry {
+    /// `OpsByName[version][name]`'s proto, if the opcode exists at `version`.
+    fn variant_at(&self, version: u8) -> Option<&'static Variant> {
+        if self.version > version {
+            return None;
+        }
+        self.variants.iter().rev().find(|v| v.from <= version)
     }
 }
 
-/// Mirrors go's `assetParamsFieldSpecs[].ftype` (`fields.go:1444-1457`).
-fn asset_params_field_type(field_name: &str) -> Option<StackType> {
-    Some(match field_name {
-        "AssetTotal" | "AssetDecimals" | "AssetDefaultFrozen" => Uint64,
-        "AssetUnitName" | "AssetName" | "AssetURL" | "AssetMetadataHash" | "AssetManager"
-        | "AssetReserve" | "AssetFreeze" | "AssetClawback" | "AssetCreator" => Bytes,
-        _ => return None,
-    })
+/// go's `ProgramKnowledge`: what is statically known about the stack and the
+/// scratch space at the current point of the program.
+#[derive(Debug, Clone)]
+pub(crate) struct Knowledge {
+    /// The types known to be on the value stack. Empty in dead code.
+    pub(crate) stack: Vec<StackType>,
+    /// go's `bottom`: `StackNone` at program start, `StackAny` after a reset
+    /// (`true`): the stack "virtually" holds an infinite list of `any` below
+    /// `stack`.
+    bottom_any: bool,
+    /// Dead code: no type checking errors are reported.
+    pub(crate) deadcode: bool,
+    /// The frame pointer, or -1 when not known.
+    fp: i64,
+    scratch: [StackType; 256],
 }
 
-/// Mirrors go's `appParamsFieldSpecs[].ftype` (`fields.go:1550-1564`).
-fn app_params_field_type(field_name: &str) -> Option<StackType> {
-    Some(match field_name {
-        "AppApprovalProgram"
-        | "AppClearStateProgram"
-        | "AppCreator"
-        | "AppAddress"
-        | "AppSizeSponsor" => Bytes,
-        "AppGlobalNumUint"
-        | "AppGlobalNumByteSlice"
-        | "AppLocalNumUint"
-        | "AppLocalNumByteSlice"
-        | "AppExtraProgramPages"
-        | "AppVersion"
-        | "AppForeignBoxReads"
-        | "AppFamilyBoxAccess" => Uint64,
-        _ => return None,
-    })
+/// go's `StackZeroUint64`: an untouched scratch slot reads as zero.
+// Go gives it the name "0", which is also what `NewStackType` derives for a
+// constant 0, so it equals a tracked `int 0` (go compares the whole struct).
+const ZERO_UINT64: StackType = StackType::new(Avm::Uint64, 0, 0, None);
+
+impl Knowledge {
+    pub(crate) fn new() -> Self {
+        Self {
+            stack: Vec::new(),
+            bottom_any: false,
+            deadcode: false,
+            fp: -1,
+            scratch: [ZERO_UINT64; 256],
+        }
+    }
+
+    fn bottom(&self) -> StackType {
+        if self.bottom_any {
+            ANY
+        } else {
+            NONE
+        }
+    }
+
+    fn top(&self) -> StackType {
+        self.stack.last().copied().unwrap_or_else(|| self.bottom())
+    }
+
+    fn pop(&mut self) -> StackType {
+        match self.stack.pop() {
+            Some(t) => t,
+            None => self.bottom(),
+        }
+    }
+
+    pub(crate) fn deaden(&mut self) {
+        self.stack.clear();
+        self.deadcode = true;
+    }
+
+    /// go's `label`: control may enter from elsewhere.
+    pub(crate) fn label(&mut self) {
+        if self.deadcode {
+            self.reset();
+        }
+    }
+
+    /// go's `reset`: clear what is known and permit any stack value.
+    pub(crate) fn reset(&mut self) {
+        self.stack.clear();
+        self.bottom_any = true;
+        self.fp = -1;
+        self.deadcode = false;
+        self.scratch = [ANY; 256];
+    }
 }
 
-/// Mirrors go's `acctParamsFieldSpecs[].ftype` (`fields.go:1714-1732`).
-fn acct_params_field_type(field_name: &str) -> Option<StackType> {
-    Some(match field_name {
-        "AcctAuthAddr" => Bytes,
-        "AcctBalance"
-        | "AcctMinBalance"
-        | "AcctTotalNumUint"
-        | "AcctTotalNumByteSlice"
-        | "AcctTotalExtraAppPages"
-        | "AcctTotalAppsCreated"
-        | "AcctTotalAppsOptedIn"
-        | "AcctTotalAssetsCreated"
-        | "AcctTotalAssets"
-        | "AcctTotalBoxes"
-        | "AcctTotalBoxBytes"
-        | "AcctIncentiveEligible"
-        | "AcctLastProposed"
-        | "AcctLastHeartbeat" => Uint64,
-        _ => return None,
-    })
+/// go's `reJoin`.
+fn rejoin(instruction: &str, args: &[&str]) -> String {
+    let mut s = instruction.to_string();
+    for a in args {
+        s.push(' ');
+        s.push_str(a);
+    }
+    s
 }
 
-/// Mirrors go's `txnFieldSpecs[].ftype`'s `AVMType` (`fields.go:290-378`),
-/// used by `typeTxField` (`assembler.go:1532-1541`) to refine `itxn_field`'s
-/// popped-argument type to the field actually being assigned. Covers every
-/// recognized `txn`-family field name -- `typeTxField` doesn't filter by
-/// `itxVersion` (whether the field is *settable* via `itxn_field` at all is
-/// a separate, unrelated assembly-time check, out of this module's scope),
-/// so an unsettable-but-real field name (e.g. `FirstValid`) still refines
-/// here; `None` only for a name `txnFieldSpecByName` wouldn't recognize
-/// either.
-///
-/// Every go `ftype` collapses to `Uint64` or `Bytes` at the `AVMType`
-/// level: `StackAddress`/`StackBytes32`/`StackBytes64` (`eval.go:883-889`)
-/// are all bound-refined `Bytes`, and `StackBoolean` is a bound-refined
-/// `Uint64`. Confirms the module docs' "bounds don't change any verdict"
-/// conclusion extends to `itxn_field` too: go's `overlaps` (`eval.go:1030-
-/// 1051`) is a *range* intersection, not an exact-bound match, so e.g. a
-/// generic `StackBytes` (`bound(0, maxStringSize)`) argument always
-/// overlaps the narrower `StackAddress` (`bound(32, 32)`) regardless of the
-/// actual byte-literal length -- the real 32-byte-length enforcement for an
-/// address field happens elsewhere (at `itxn_field` assembly/eval, not in
-/// type tracking), so this slice's bound-free `Bytes`/`Bytes` match is
-/// exactly as precise as go's own type-tracking pass here.
-fn itxn_field_type(field_name: &str) -> Option<StackType> {
-    Some(match field_name {
-        "Sender"
-        | "Note"
-        | "Lease"
-        | "Receiver"
-        | "CloseRemainderTo"
-        | "VotePK"
-        | "SelectionPK"
-        | "Type"
-        | "AssetSender"
-        | "AssetReceiver"
-        | "AssetCloseTo"
-        | "TxID"
-        | "ApplicationArgs"
-        | "Accounts"
-        | "ApprovalProgram"
-        | "ClearStateProgram"
-        | "RekeyTo"
-        | "ConfigAssetUnitName"
-        | "ConfigAssetName"
-        | "ConfigAssetURL"
-        | "ConfigAssetMetadataHash"
-        | "ConfigAssetManager"
-        | "ConfigAssetReserve"
-        | "ConfigAssetFreeze"
-        | "ConfigAssetClawback"
-        | "FreezeAssetAccount"
-        | "Logs"
-        | "LastLog"
-        | "StateProofPK"
-        | "ApprovalProgramPages"
-        | "ClearStateProgramPages" => Bytes,
-        "Fee"
-        | "FirstValid"
-        | "FirstValidTime"
-        | "LastValid"
-        | "Amount"
-        | "VoteFirst"
-        | "VoteLast"
-        | "VoteKeyDilution"
-        | "TypeEnum"
-        | "XferAsset"
-        | "AssetAmount"
-        | "GroupIndex"
-        | "ApplicationID"
-        | "OnCompletion"
-        | "NumAppArgs"
-        | "NumAccounts"
-        | "ConfigAsset"
-        | "ConfigAssetTotal"
-        | "ConfigAssetDecimals"
-        | "ConfigAssetDefaultFrozen"
-        | "FreezeAsset"
-        | "FreezeAssetFrozen"
-        | "Assets"
-        | "NumAssets"
-        | "Applications"
-        | "NumApplications"
-        | "GlobalNumUint"
-        | "GlobalNumByteSlice"
-        | "LocalNumUint"
-        | "LocalNumByteSlice"
-        | "ExtraProgramPages"
-        | "Nonparticipation"
-        | "NumLogs"
-        | "CreatedAssetID"
-        | "CreatedApplicationID"
-        | "NumApprovalProgramPages"
-        | "NumClearStateProgramPages"
-        | "RejectVersion" => Uint64,
-        _ => return None,
-    })
-}
-
-/// Parses `load`/`store`'s single immediate-slot-index argument, mirroring
-/// go's `getImm(args, 0, false)` (`assembler.go:1289-...`) used by
-/// `typeStore`/`typeLoad`: `None` for a missing or unparsable argument (the
-/// rest of assembly reports its own diagnostic for that; nothing to refine
-/// here), or an out-of-range index (there are only 256 scratch slots).
-fn scratch_slot_immediate(args: &[&str]) -> Option<usize> {
-    args.first()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&i| i < 256)
-}
-
-/// Reads `consts[pos]` (the compile-time-constant value of the tracked
-/// stack entry at `pos`, if any -- see [`OpStream::type_stack_const`]) as a
-/// scratch-slot index, mirroring go's `StackType.constInt()` calls in
-/// `typeStores`/`typeLoads`. `None` when the entry isn't a known constant,
-/// or the constant is out of the 256-slot range.
-fn const_scratch_index(consts: &[Option<u64>], pos: usize) -> Option<usize> {
-    consts
-        .get(pos)
-        .copied()
-        .flatten()
-        .map(|v| v as usize)
-        .filter(|&i| i < 256)
-}
-
-/// Join an instruction's mnemonic with its immediate-argument tokens for
-/// error messages, mirroring go's `reJoin` (`assembler.go:2045-2053`) --
-/// e.g. `dig 2` rather than just `dig`.
-fn rejoin(mnemonic: &str, args: &[&str]) -> String {
-    if args.is_empty() {
-        mnemonic.to_string()
+/// Parse like go's `strconv.ParseInt(s, 0, bits)`, returning only the value.
+fn go_parse_int(s: &str, bits: u32) -> Option<i64> {
+    let (neg, body) = match s.as_bytes().first()? {
+        b'-' => (true, &s[1..]),
+        b'+' => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let u = go_parse_uint_base0(body, 64)?;
+    let limit = 1u128 << (bits - 1);
+    if neg {
+        if (u as u128) > limit {
+            return None;
+        }
+        Some((u as i128).wrapping_neg() as i64)
     } else {
-        format!("{mnemonic} {}", args.join(" "))
+        if (u as u128) >= limit {
+            return None;
+        }
+        Some(u as i64)
     }
 }
 
-/// Checks that the tracked type stack has `arg_types` on it (reporting a
-/// type error if not), pops them, then pushes `return_types`. Mirrors go's
-/// `OpStream.trackStack` (`assembler.go:2056-2096`), including its choice
-/// to still push `return_types` even after an arg-count/type mismatch --
-/// this avoids one reported mistake cascading into a wall of unrelated
-/// height errors for the rest of the program.
-///
-/// When [`OpStream::type_track_bottom_permissive`] is set (analysis has
-/// resumed after a label following dead code -- see the module docs), an
-/// arg count exceeding the tracked stack's real height is *not* reported as
-/// an error: go's `ProgramKnowledge.pop` returns `bottom` (`StackAny`) for
-/// any position past the top of the real stack (`assembler.go:345-353`),
-/// so missing entries are treated as an implicit, always-overlapping `Any`
-/// rather than a height mismatch. This is what [`StackType::Any`]'s
-/// `.unwrap_or(Any)` fallback below reproduces for each individual pop.
-fn apply_stack_effect(
-    ops: &mut OpStream,
-    mnemonic: &str,
-    args: &[&str],
-    arg_types: &[StackType],
-    return_types: &[StackType],
-) {
-    let argcount = arg_types.len();
-    if argcount > ops.type_stack.len() && !ops.type_track_bottom_permissive {
-        // Mirrors go's `typeErrorf` (`assembler.go:2039-2043`): a mismatch
-        // is only *recorded* while `#pragma typetrack` reporting is on --
-        // see `OpStream::type_track_reporting`'s doc comment. The
-        // bookkeeping above/below (the height check itself, and the
-        // pop/push loop) runs unconditionally either way.
-        if ops.type_track_reporting {
-            ops.record_error(
-                ops.source_line,
-                0,
-                format!(
-                    "{} expects {} stack arguments but stack height is {}",
-                    rejoin(mnemonic, args),
-                    argcount,
-                    ops.type_stack.len(),
-                ),
-            );
+/// `strconv.ParseUint(s, 0, 64)` (base prefixes, `_` separators).
+pub(crate) fn go_parse_uint_base0(s: &str, _bits: u32) -> Option<u64> {
+    go_parse_uint_base0_err(s).ok()
+}
+
+/// `strconv.ParseUint(s, 0, 64)` with go's `NumError` reason: `invalid syntax`
+/// or `value out of range`.
+pub(crate) fn go_parse_uint_base0_err(s: &str) -> Result<u64, &'static str> {
+    const SYNTAX: &str = "invalid syntax";
+    const RANGE: &str = "value out of range";
+    let b = s.as_bytes();
+    if b.is_empty() {
+        return Err(SYNTAX);
+    }
+    let (base, digits): (u32, &str) = if b[0] == b'0' && s.len() >= 3 {
+        match b[1] {
+            b'b' | b'B' => (2, &s[2..]),
+            b'o' | b'O' => (8, &s[2..]),
+            b'x' | b'X' => (16, &s[2..]),
+            _ => (8, &s[1..]),
         }
+    } else if b[0] == b'0' {
+        (8, &s[1..])
+    } else {
+        (10, s)
+    };
+    if !underscore_ok(s) {
+        return Err(SYNTAX);
+    }
+    let mut n: u64 = 0;
+    let mut overflow = false;
+    for c in digits.chars() {
+        if c == '_' {
+            continue;
+        }
+        let Some(d) = c.to_digit(base) else {
+            return Err(SYNTAX);
+        };
+        match n
+            .checked_mul(u64::from(base))
+            .and_then(|v| v.checked_add(u64::from(d)))
+        {
+            Some(v) => n = v,
+            None => overflow = true,
+        }
+    }
+    if overflow {
+        Err(RANGE)
+    } else {
+        Ok(n)
+    }
+}
+
+/// go's `underscoreOK` (strconv/atoi.go).
+fn underscore_ok(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut saw = b'^';
+    if !b.is_empty() && (b[0] == b'-' || b[0] == b'+') {
+        i = 1;
+    }
+    let mut hex = false;
+    if b.len() >= i + 2
+        && b[i] == b'0'
+        && matches!(b[i + 1].to_ascii_lowercase(), b'b' | b'o' | b'x')
+    {
+        hex = b[i + 1].eq_ignore_ascii_case(&b'x');
+        i += 2;
+        saw = b'0';
+    }
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_digit() || (hex && (b'a'..=b'f').contains(&c.to_ascii_lowercase())) {
+            saw = b'0';
+        } else if c == b'_' {
+            if saw != b'0' {
+                return false;
+            }
+            saw = b'_';
+        } else {
+            if saw == b'_' {
+                return false;
+            }
+            saw = b'!';
+        }
+        i += 1;
+    }
+    saw != b'_'
+}
+
+/// go's `getImm`: the immediate at `idx`, within `-128..=127` (`signed`) or
+/// `0..=255`.
+fn get_imm(args: &[&str], idx: usize, signed: bool) -> Option<i64> {
+    let s = args.get(idx)?;
+    let n = go_parse_int(s, 9)?;
+    if signed {
+        (-128..=127).contains(&n).then_some(n)
+    } else {
+        (0..=255).contains(&n).then_some(n)
+    }
+}
+
+/// What a refine function returns: go's `(nargs, nreturns, err)`.
+#[derive(Default)]
+struct Refined {
+    args: Option<Vec<StackType>>,
+    returns: Option<Vec<StackType>>,
+    err: Option<String>,
+}
+
+fn any_types(n: usize) -> Vec<StackType> {
+    vec![ANY; n]
+}
+
+fn refined(args: Option<Vec<StackType>>, returns: Option<Vec<StackType>>) -> Refined {
+    Refined {
+        args,
+        returns,
+        err: None,
+    }
+}
+
+fn refine_err(msg: String) -> Refined {
+    Refined {
+        err: Some(msg),
+        ..Refined::default()
+    }
+}
+
+/// The `typed(...)` refine functions of go's `assembler.go`, keyed by the
+/// function name `tools/avm-op-types` dumps. `fields` is the `TxnFields`
+/// group (for `typeTxField`).
+fn run_refine(
+    name: &str,
+    pgm: &mut Knowledge,
+    args: &[&str],
+    txn_fields: Option<&'static [FieldEntry]>,
+) -> Refined {
+    let top = pgm.stack.len() as isize - 1;
+    let st = |i: isize| pgm.stack[i as usize];
+    match name {
+        "typeSwap" => {
+            let mut swapped = [ANY, ANY];
+            if top >= 0 {
+                swapped[0] = st(top);
+                if top >= 1 {
+                    swapped[1] = st(top - 1);
+                }
+            }
+            refined(None, Some(swapped.to_vec()))
+        }
+        "typeDig" => {
+            let Some(n) = get_imm(args, 0, false) else {
+                return Refined::default();
+            };
+            let depth = n as usize + 1;
+            let mut returns = any_types(depth + 1);
+            let idx = pgm.stack.len() as isize - depth as isize;
+            if idx >= 0 {
+                let idx = idx as usize;
+                returns[..depth].copy_from_slice(&pgm.stack[idx..]);
+                returns[depth] = pgm.stack[idx];
+            }
+            refined(Some(any_types(depth)), Some(returns))
+        }
+        "typeBury" => {
+            let Some(n) = get_imm(args, 0, false) else {
+                return Refined::default();
+            };
+            if n == 0 {
+                return refine_err("bury 0 always fails".to_string());
+            }
+            let n = n as usize;
+            let idx = top - n as isize;
+            if idx < 0 {
+                if !pgm.bottom_any {
+                    // By demanding n+1 elements, we trigger an error.
+                    return refined(Some(any_types(n + 1)), None);
+                }
+                return Refined::default();
+            }
+            let idx = idx as usize;
+            let typ = pgm.top();
+            let mut returns = pgm.stack[idx..idx + n].to_vec();
+            returns[0] = typ;
+            refined(Some(pgm.stack[idx..].to_vec()), Some(returns))
+        }
+        "typeFrameDig" => {
+            let Some(n) = get_imm(args, 0, true) else {
+                return Refined::default();
+            };
+            if pgm.fp == -1 {
+                return Refined::default();
+            }
+            let idx = pgm.fp + n;
+            if idx < 0 {
+                return refine_err(format!("frame_dig {} in sub with {} args", n, pgm.fp));
+            }
+            if idx as usize >= pgm.stack.len() {
+                return refine_err("frame_dig above stack".to_string());
+            }
+            refined(None, Some(vec![pgm.stack[idx as usize]]))
+        }
+        "typeFrameBury" => {
+            let Some(n) = get_imm(args, 0, true) else {
+                return Refined::default();
+            };
+            let typ = pgm.top();
+            if pgm.fp == -1 {
+                for s in pgm.stack.iter_mut() {
+                    if *s != typ {
+                        *s = ANY;
+                    }
+                }
+                return Refined::default();
+            }
+            let idx = pgm.fp + n;
+            if idx < 0 {
+                return refine_err(format!("frame_bury {} in sub with {} args", n, pgm.fp));
+            }
+            let top_i = pgm.stack.len() as i64 - 1;
+            if idx >= top_i {
+                return refine_err("frame_bury above stack".to_string());
+            }
+            let idx = idx as usize;
+            let depth = (top_i as usize) - idx;
+            let mut returns = pgm.stack[idx..idx + depth].to_vec();
+            returns[0] = typ;
+            refined(Some(pgm.stack[idx..].to_vec()), Some(returns))
+        }
+        "typeEquals" => {
+            if top >= 0 {
+                let w = st(top).widened();
+                return refined(Some(vec![w, w]), None);
+            }
+            Refined::default()
+        }
+        "typeDup" => {
+            if top >= 0 {
+                return refined(None, Some(vec![st(top), st(top)]));
+            }
+            Refined::default()
+        }
+        "typeDupTwo" => {
+            let mut two = [ANY, ANY];
+            if top >= 0 {
+                two[1] = st(top);
+                if top >= 1 {
+                    two[0] = st(top - 1);
+                }
+            }
+            refined(None, Some(vec![two[0], two[1], two[0], two[1]]))
+        }
+        "typeSelect" => {
+            if top >= 2 {
+                return refined(None, Some(vec![st(top - 1).union(st(top - 2))]));
+            }
+            Refined::default()
+        }
+        "typeSetBit" => {
+            if top >= 2 {
+                return refined(None, Some(vec![st(top - 2)]));
+            }
+            Refined::default()
+        }
+        "typeCover" => {
+            let Some(n) = get_imm(args, 0, false) else {
+                return Refined::default();
+            };
+            let depth = n as usize + 1;
+            let mut returns = any_types(depth);
+            let idx = pgm.stack.len() as isize - depth as isize;
+            if idx >= 0 {
+                let idx = idx as usize;
+                returns[0] = pgm.stack[pgm.stack.len() - 1];
+                for i in idx..pgm.stack.len() - 1 {
+                    returns[i - idx + 1] = pgm.stack[i];
+                }
+            }
+            refined(Some(any_types(depth)), Some(returns))
+        }
+        "typeUncover" => {
+            let Some(n) = get_imm(args, 0, false) else {
+                return Refined::default();
+            };
+            let depth = n as usize + 1;
+            let mut returns = any_types(depth);
+            let idx = pgm.stack.len() as isize - depth as isize;
+            if idx >= 0 {
+                let idx = idx as usize;
+                returns[depth - 1] = pgm.stack[idx];
+                for i in idx + 1..pgm.stack.len() {
+                    returns[i - idx - 1] = pgm.stack[i];
+                }
+            }
+            refined(Some(any_types(depth)), Some(returns))
+        }
+        "typeTxField" => {
+            if args.len() != 1 {
+                return Refined::default();
+            }
+            match txn_fields.and_then(|g| g.iter().find(|f| f.name == args[0])) {
+                Some(f) => refined(Some(vec![f.ty]), None),
+                None => Refined::default(),
+            }
+        }
+        "typeStore" => {
+            let Some(i) = get_imm(args, 0, false) else {
+                return Refined::default();
+            };
+            if top >= 0 {
+                pgm.scratch[i as usize] = st(top);
+            }
+            Refined::default()
+        }
+        "typeStores" => {
+            if top < 0 {
+                return Refined::default();
+            }
+            if top >= 1 {
+                if let Some(idx) = st(top - 1).const_int() {
+                    let v = st(top);
+                    // go indexes `scratchSpace[idx]` unchecked (a panic for
+                    // idx >= 256); an out-of-range constant is ignored here.
+                    if let Some(slot) = pgm.scratch.get_mut(idx as usize) {
+                        *slot = v;
+                    }
+                    return Refined::default();
+                }
+            }
+            let v = st(top);
+            for s in pgm.scratch.iter_mut() {
+                *s = s.union(v);
+            }
+            Refined::default()
+        }
+        "typeLoad" => {
+            let Some(i) = get_imm(args, 0, false) else {
+                return Refined::default();
+            };
+            refined(None, Some(vec![pgm.scratch[i as usize]]))
+        }
+        "typeProto" => {
+            let (Some(a), Some(_)) = (get_imm(args, 0, false), get_imm(args, 1, false)) else {
+                return Refined::default();
+            };
+            if !pgm.stack.is_empty() || !pgm.bottom_any {
+                return refine_err("proto must be unreachable from previous PC".to_string());
+            }
+            pgm.stack = any_types(a as usize);
+            pgm.fp = a;
+            Refined::default()
+        }
+        "typeLoads" => {
+            if top < 0 {
+                return Refined::default();
+            }
+            if let Some(v) = st(top).const_int() {
+                if let Some(slot) = pgm.scratch.get(v as usize) {
+                    return refined(None, Some(vec![*slot]));
+                }
+                return Refined::default();
+            }
+            let first = pgm.scratch[0];
+            if pgm.scratch.iter().any(|s| *s != first) {
+                return Refined::default();
+            }
+            refined(None, Some(vec![first]))
+        }
+        "typePopN" => {
+            let Some(n) = get_imm(args, 0, false) else {
+                return Refined::default();
+            };
+            refined(Some(any_types(n as usize)), None)
+        }
+        "typeDupN" => {
+            let Some(n) = get_imm(args, 0, false) else {
+                return Refined::default();
+            };
+            if top < 0 {
+                return Refined::default();
+            }
+            refined(None, Some(vec![st(top); n as usize + 1]))
+        }
+        "typePushBytess" => refined(None, Some(vec![BYTES; args.len()])),
+        "typePushInts" => refined(None, Some(vec![UINT64; args.len()])),
+        "typeBzero" => refined(
+            Some(vec![UINT64.narrowed(0, MAX_STRING_SIZE)]),
+            Some(vec![BYTES]),
+        ),
+        "typeMatch" => refined(Some(any_types(args.len() + 1)), None),
+        other => {
+            if let Some(max) = other.strip_prefix("typeByteMath:") {
+                let max: u64 = max.parse().unwrap_or(0);
+                return refined(None, Some(vec![StackType::bounded(Avm::Bytes, 0, max)]));
+            }
+            debug_assert!(other.is_empty(), "unported refine function {other}");
+            Refined::default()
+        }
+    }
+}
+
+/// The spec `getSpec` resolves for one instruction, as the tracker needs it.
+struct Spec {
+    /// The name error messages use (`txn without immediates`, ...).
+    instruction: String,
+    args: Vec<StackType>,
+    returns: Vec<StackType>,
+    refine: String,
+    /// The opcode whose group immediates assemble the field immediates.
+    asm_entry: Option<&'static OpEntry>,
+    /// The tracked opcode's own entry (for `deadens`, `typeTxField`'s group).
+    entry: Option<&'static OpEntry>,
+    name: String,
+}
+
+/// go's `pseudoOps` table: `(immediate count -> real opcode)`; the arity-free
+/// full pseudo-ops (`int`, `byte`, `addr`, `method`) are handled separately.
+fn pseudo_targets(name: &str) -> Option<&'static [(usize, &'static str)]> {
+    match name {
+        "txn" => Some(&[(1, "txn"), (2, "txna")]),
+        "gtxn" => Some(&[(2, "gtxn"), (3, "gtxna")]),
+        "gtxns" => Some(&[(1, "gtxns"), (2, "gtxnsa")]),
+        "extract" => Some(&[(0, "extract3"), (2, "extract")]),
+        "replace" => Some(&[(0, "replace3"), (1, "replace2")]),
+        _ => None,
+    }
+}
+
+/// `OpsByName[version][name]`, falling back to the newest version like
+/// `prepareVersionedPseudoTable`.
+fn pseudo_variant(real: &str, version: u8) -> Option<(&'static OpEntry, &'static Variant)> {
+    let e = op_entry(real)?;
+    let v = e.variant_at(version).or_else(|| e.variants.last())?;
+    Some((e, v))
+}
+
+/// go's `getSpec` (the tracker's view of it): `None` when go gives up, so
+/// nothing is tracked.
+fn get_spec(ops: &OpStream, name: &str, argc: usize) -> Option<Spec> {
+    let version = ops.effective_version();
+    match name {
+        "int" | "byte" | "addr" | "method" => {
+            let refine = match name {
+                "int" => "typePushInt",
+                "byte" => "typeByte",
+                _ => "",
+            };
+            let ret = if name == "int" { UINT64 } else { BYTES };
+            let instruction = if argc == 0 {
+                format!("{name} without immediates")
+            } else {
+                name.to_string()
+            };
+            return Some(Spec {
+                instruction,
+                args: vec![],
+                returns: vec![ret],
+                refine: refine.to_string(),
+                asm_entry: None,
+                entry: None,
+                name: name.to_string(),
+            });
+        }
+        _ => {}
+    }
+    if let Some(targets) = pseudo_targets(name) {
+        let instruction = if argc == 0 {
+            format!("{name} without immediates")
+        } else {
+            name.to_string()
+        };
+        if let Some((_, real)) = targets.iter().find(|(n, _)| *n == argc) {
+            let (entry, v) = pseudo_variant(real, version)?;
+            return Some(Spec {
+                instruction,
+                args: v.args.to_vec(),
+                returns: v.returns.to_vec(),
+                refine: v.refine.to_string(),
+                asm_entry: Some(entry),
+                entry: Some(entry),
+                name: name.to_string(),
+            });
+        }
+        // go's `mergeProtos`: the immediate count matched no spec, so type
+        // tracking uses a proto combining all of them.
+        let mut args: Option<Vec<StackType>> = None;
+        let mut returns: Option<Vec<StackType>> = None;
+        for (_, real) in targets {
+            let (_, v) = pseudo_variant(real, version)?;
+            match (&mut args, &mut returns) {
+                (None, None) => {
+                    args = Some(v.args.to_vec());
+                    returns = Some(v.returns.to_vec());
+                }
+                (Some(a), Some(r)) => {
+                    if a.len() != v.args.len() || r.len() != v.returns.len() {
+                        return None;
+                    }
+                    for (x, y) in a.iter_mut().zip(v.args) {
+                        if x != y {
+                            *x = ANY;
+                        }
+                    }
+                    for (x, y) in r.iter_mut().zip(v.returns) {
+                        if x != y {
+                            *x = ANY;
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        return Some(Spec {
+            instruction,
+            args: args.unwrap_or_default(),
+            returns: returns.unwrap_or_default(),
+            refine: String::new(),
+            asm_entry: None,
+            entry: None,
+            name: name.to_string(),
+        });
+    }
+    let entry = op_entry(name)?;
+    let v = entry.variant_at(version)?;
+    // `itxn`/`gitxn` hand a different immediate count to `itxna`/`gitxna`.
+    let asm_entry = match (name, argc) {
+        ("itxn", 2) => op_entry("itxna"),
+        ("gitxn", 3) => op_entry("gitxna"),
+        _ => Some(entry),
+    };
+    Some(Spec {
+        instruction: name.to_string(),
+        args: v.args.to_vec(),
+        returns: v.returns.to_vec(),
+        refine: v.refine.to_string(),
+        asm_entry,
+        entry: Some(entry),
+        name: name.to_string(),
+    })
+}
+
+fn type_error(ops: &mut OpStream, col: usize, msg: String) {
+    if ops.type_track_reporting {
+        let line = ops.source_line;
+        ops.record_error(line, col, msg);
+    }
+}
+
+/// go's `trackStack`.
+fn track_stack(
+    ops: &mut OpStream,
+    col: usize,
+    args: &[StackType],
+    returns: &[StackType],
+    instruction: &str,
+    tokens: &[&str],
+) {
+    if ops.known.deadcode {
+        return;
+    }
+    let argcount = args.len();
+    if argcount > ops.known.stack.len() && !ops.known.bottom_any {
+        let msg = format!(
+            "{} expects {} stack arguments but stack height is {}",
+            rejoin(instruction, tokens),
+            argcount,
+            ops.known.stack.len()
+        );
+        type_error(ops, col, msg);
     } else {
         for i in (0..argcount).rev() {
-            let want = arg_types[i];
-            // Any position past the top of the real tracked stack is
-            // treated as an implicit `Any` (see doc comment above) rather
-            // than popped -- this only actually happens when
-            // `type_track_bottom_permissive` let the height check above
-            // through with too few real entries.
-            let got = ops.type_stack.pop().unwrap_or(Any);
-            // Keep `type_stack_const` in lockstep with `type_stack` (see its
-            // doc comment) -- popping past the tracked stack's real height
-            // (the `bottom_permissive` case above) is safe: `Vec::pop` on an
-            // empty vec is a no-op `None`, same as `type_stack`'s.
-            ops.type_stack_const.pop();
-            if !got.overlaps(want) && ops.type_track_reporting {
-                ops.record_error(
-                    ops.source_line,
-                    0,
-                    format!(
-                        "{} arg {} wanted type {} got {}",
-                        rejoin(mnemonic, args),
-                        i,
-                        want,
-                        got,
-                    ),
+            let want = args[i];
+            let got = ops.known.pop();
+            if !got.overlaps(want) {
+                let msg = format!(
+                    "{} arg {} wanted type {} got {}",
+                    rejoin(instruction, tokens),
+                    i,
+                    want,
+                    got
                 );
+                type_error(ops, col, msg);
             }
         }
     }
+    ops.known.stack.extend_from_slice(returns);
+}
 
-    if !return_types.is_empty() {
-        ops.type_stack.extend_from_slice(return_types);
-        // None of the pushed values are themselves known constants -- a
-        // fresh literal is only ever tracked via the `literal_push_type`
-        // path in `track_instruction`, not through a `trackStack` return.
-        ops.type_stack_const
-            .extend(std::iter::repeat_n(None, return_types.len()));
+/// go's `OpStream.returns`: specialise the first `any` of the top
+/// `n_returns` stack entries to `replacement`.
+fn specialise_returns(ops: &mut OpStream, n_returns: usize, replacement: StackType) {
+    if ops.known.deadcode {
+        return;
+    }
+    let end = ops.known.stack.len();
+    if n_returns > end {
+        return;
+    }
+    for t in ops.known.stack[end - n_returns..].iter_mut() {
+        if t.avm == Avm::Any {
+            *t = replacement;
+            return;
+        }
     }
 }
 
-/// Tracks one assembled instruction's effect on the static type stack,
-/// reporting a type error on the same [`OpStream::errors`](crate::assembler::AssemblyError)
-/// list as any other assembly error. No-op once
-/// [`OpStream::type_track_disabled`] is set. See the module docs for scope.
-pub(crate) fn track_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
-    if ops.type_track_disabled {
+/// The first half of go's `asmDefault` for the opcode that assembles the
+/// instruction: the immediates are checked in order and, once the field-group
+/// immediate names a typed field, `ops.returns` refines the tracked return
+/// type before any later error (e.g. a too-new field) stops assembly.
+fn refine_field_return(ops: &mut OpStream, spec: &Spec, args: &[&str]) {
+    let Some(entry) = spec.asm_entry else { return };
+    // Opcodes with their own assembler function never reach `ops.returns`.
+    if matches!(entry.name, "itxn_field" | "app_params_set") {
         return;
     }
-
-    // Mirrors go's `trackStack`'s `if ops.known.deadcode { return }`
-    // (assembler.go:2058-2060): no type checks or stack-effect tracking
-    // happen for an instruction reached only through dead code -- the
-    // tracked stack stays exactly as [`deadens_tracking`] left it (empty)
-    // until the next label reopens analysis. This deliberately skips the
-    // dynamic-arity permanent-disable fallback at the bottom of this
-    // function too: an opcode this slice can't model precisely (e.g.
-    // `match`) appearing in unreachable code has no stack effect to get
-    // wrong, so it must not spend the *permanent* disable on dead code.
-    if ops.type_track_deadcode {
+    if args.len() != entry.imms.len() {
         return;
     }
-
-    if let Some(pushed) = literal_push_type(mnemonic) {
-        // Mirrors go's `typePushInt` (`assembler.go:1666-1677`): an `int`
-        // literal's compile-time value is tracked (base-10-parseable
-        // only -- a named constant or non-decimal literal falls back to
-        // `None`, same as go's `strconv.ParseUint` failure) so a later
-        // `loads`/`stores` sitting right on top of it can resolve its
-        // scratch-slot index exactly. `byte`/`addr`/`method` never carry a
-        // usable scratch index, so they're never const-tracked.
-        let konst = (mnemonic == "int")
-            .then(|| args.first().and_then(|s| s.parse::<u64>().ok()))
-            .flatten();
-        ops.type_stack.push(pushed);
-        ops.type_stack_const.push(konst);
-        return;
-    }
-
-    // `replace`'s pseudo-op arity dispatch (issue #945, `assembler.go:1815`
-    // `"replace": {0: replace3, 1: replace2}`): unlike `txn`/`gtxn`/`gtxns`
-    // (whose dispatched-to opcodes all share one proto regardless of which
-    // arity was used -- see the `TYPE_TABLE` entries below), `replace`'s
-    // two target opcodes pop a genuinely different number/type of stack
-    // arguments -- `replace2 s` (immediate offset) pops `[Bytes, Bytes]`;
-    // `replace3` (stack offset) pops `[Bytes, Uint64, Bytes]` -- so this
-    // has to branch on `args.len()` directly rather than going through the
-    // fixed-shape `TYPE_TABLE`/`refined_types` lookups below. An
-    // unrecognized arity is left untracked; `asm_pseudo_arity` reports its
-    // own "replace expects ..." assembly error for it.
-    if mnemonic == "replace" {
-        match args.len() {
-            0 => apply_stack_effect(ops, mnemonic, args, &[Bytes, Uint64, Bytes], &[Bytes]),
-            1 => apply_stack_effect(ops, mnemonic, args, &[Bytes, Bytes], &[Bytes]),
-            _ => {}
-        }
-        return;
-    }
-
-    // typeBury's `bury 0` special case (assembler.go:1357-1359): there is no
-    // valid stack shape where burying the top value into itself makes
-    // sense, so go raises a dedicated hard error here -- unlike every other
-    // height mismatch, which is reported via the standard "arg N wanted
-    // type"/"expects N stack arguments" phrasing derived from a pop/push
-    // override. This is handled before `refined_types` is ever consulted
-    // (mirroring go's `trackStack` still running with the *unrefined*
-    // `spec.Arg.Types`/`spec.Return.Types` -- pop 1 `Any`, push nothing --
-    // since `typeBury`'s `nargs`/`nreturns` stay `nil` on its error branch).
-    if mnemonic == "bury" && args.first().and_then(|s| s.parse::<usize>().ok()) == Some(0) {
-        if ops.type_track_reporting {
-            ops.record_error(ops.source_line, 0, "bury 0 always fails".to_string());
-        }
-        apply_stack_effect(ops, mnemonic, args, &[Any], &[]);
-        return;
-    }
-
-    // typeProto (assembler.go:1586-1599): a `proto a r` is only reachable
-    // legitimately when nothing is live on the tracked stack -- an empty
-    // tracked stack *and* a permissive bottom (mirrors go's `len(pgm.stack)
-    // != 0 || pgm.bottom.AVMType != avmAny`; [`OpStream::type_track_bottom_permissive`]
-    // is this slice's stand-in for `pgm.bottom == StackAny`, see its doc
-    // comment). A permissive bottom only exists after a label/`callsub`
-    // reopens analysis following dead code (or an unconditional branch), so
-    // a bare `proto` as literally the first instruction is rejected too --
-    // `type_track_bottom_permissive` starts `false`, mirroring go's
-    // zero-value `StackNone` bottom at program start. On success the
-    // tracked stack is force-set to `a` `Any` values (go's `pgm.stack =
-    // anyTypes(a)`) rather than appended to, but since the check just
-    // proved the tracked stack is already empty, pushing `a` `Any` values
-    // via the ordinary pop/push path achieves the identical result.
-    if mnemonic == "proto" {
-        if let (Some(a), Some(_r)) = (
-            args.first().and_then(|s| s.parse::<i64>().ok()),
-            args.get(1).and_then(|s| s.parse::<i64>().ok()),
-        ) {
-            if !ops.type_stack.is_empty() || !ops.type_track_bottom_permissive {
-                if ops.type_track_reporting {
-                    ops.record_error(
-                        ops.source_line,
-                        0,
-                        "proto must be unreachable from previous PC".to_string(),
-                    );
+    let n_returns = entry
+        .variant_at(ops.effective_version())
+        .or_else(|| entry.variants.last())
+        .map_or(0, |v| v.returns.len());
+    for (imm, arg) in entry.imms.iter().zip(args) {
+        match imm.group {
+            Some(group) => {
+                let Some(f) = group.iter().find(|f| f.name == *arg) else {
+                    return;
+                };
+                if f.ty.typed() {
+                    specialise_returns(ops, n_returns, f.ty);
                 }
-                // Mirrors go: on error, `nargs`/`nreturns` stay `nil`, so
-                // `trackStack` still runs with `proto`'s fixed base proto
-                // (no pops/pushes) -- the tracked stack is left untouched.
-                apply_stack_effect(ops, mnemonic, args, &[], &[]);
-            } else {
-                let count = a.max(0) as usize;
-                apply_stack_effect(ops, mnemonic, args, &[], &vec![Any; count]);
             }
-        }
-        // A non-parseable `a`/`r` immediate mirrors go's `getImm` failure:
-        // `typeProto` returns `(nil, nil, nil)`, a pure no-op -- nothing
-        // further to track (a separate assembly-time error, if any, is
-        // reported elsewhere for the bad immediate itself).
-        return;
-    }
-
-    let spec = match opcode::lookup_by_name(mnemonic) {
-        // Not a real opcode (or a pseudo-op this slice doesn't model, e.g.
-        // `extract`'s own arity dispatch) -- the rest of assembly will
-        // report its own error if this mnemonic is genuinely invalid;
-        // nothing to track here either way.
-        None => return,
-        Some(s) => s,
-    };
-
-    let refine = refined_types(
-        &ops.type_stack,
-        &ops.type_stack_const,
-        &ops.scratch_space,
-        ops.version,
-        ops.type_track_bottom_permissive,
-        mnemonic,
-        args,
-    );
-    let table = table_lookup(mnemonic);
-
-    let arg_types = refine
-        .as_ref()
-        .and_then(|(a, _, _)| a.clone())
-        .or_else(|| table.map(|(a, _)| a.to_vec()))
-        .or_else(|| (spec.stack_pops >= 0).then(|| vec![Any; spec.stack_pops as usize]));
-    let return_types = refine
-        .as_ref()
-        .and_then(|(_, r, _)| r.clone())
-        .or_else(|| table.map(|(_, r)| r.to_vec()))
-        .or_else(|| (spec.stack_pushes >= 0).then(|| vec![Any; spec.stack_pushes as usize]));
-
-    let (arg_types, return_types) = match (arg_types, return_types) {
-        (Some(a), Some(r)) => (a, r),
-        // Dynamic pop/push count with no refine function and no explicit
-        // table entry (e.g. `pushbytess`, `pushints`, `match`, or `popn`/
-        // `dupn`/`cover`/`uncover` with an immediate that failed to parse --
-        // which normally can't happen, since a bad immediate there is
-        // already a separate assembly error on its own) -- this slice can't
-        // keep the tracked stack height in sync, so stop rather than guess.
-        _ => {
-            ops.type_track_disabled = true;
-            return;
-        }
-    };
-
-    // Apply `store`/`stores`' scratch-space side effect (mirrors go setting
-    // `pgm.scratchSpace[...]` directly inside `typeStore`/`typeStores`,
-    // unconditionally and *before* `trackStack` pops/checks the args --
-    // see `refined_types`' doc comment). Unlike the args/returns override,
-    // this always takes effect regardless of any type mismatch reported by
-    // `apply_stack_effect` below, matching go exactly.
-    if let Some(effect) = refine.and_then(|(_, _, e)| e) {
-        match effect {
-            ScratchEffect::Set(i, ty) => ops.scratch_space[i] = ty,
-            ScratchEffect::UnionAll(ty) => {
-                for slot in ops.scratch_space.iter_mut() {
-                    *slot = union(*slot, ty);
+            None => {
+                // go's `byteImm`: an unsigned immediate of at most 255.
+                match go_parse_uint_base0(arg, 64) {
+                    Some(v) if v <= 255 => {}
+                    _ => return,
                 }
             }
         }
     }
+}
 
-    apply_stack_effect(ops, mnemonic, args, &arg_types, &return_types);
-
-    if deadens_tracking(mnemonic) {
-        ops.type_stack.clear();
-        ops.type_stack_const.clear();
-        ops.type_track_deadcode = true;
-        if mnemonic == "callsub" {
-            // Mirrors go's assemble loop: `callsub` deadens (its own
-            // `retsub` returns from an arbitrary caller, so nothing about
-            // the stack past this point is known from *this* call site),
-            // but is immediately followed by `ops.known.label()`
-            // (assembler.go:2234-2237) rather than waiting for a textual
-            // label -- `retsub` returns right after the `callsub`, making
-            // it an entry point like any other label. `label()` resets
-            // `scratchSpace` to all-`Any` too when called on deadcode
-            // (`assembler.go:364-380`), which is always true here (`b`/
-            // `callsub`/etc. above just set it) -- see
-            // `OpStream::scratch_space`'s doc comment.
-            ops.type_track_deadcode = false;
-            ops.type_track_bottom_permissive = true;
-            ops.scratch_space = [Any; 256];
+/// go's refine functions for the pseudo-ops `int` and `byte`.
+fn pseudo_refine(
+    name: &str,
+    args: &[&str],
+    parse_binary: &dyn Fn(&[&str]) -> Option<usize>,
+) -> Option<Vec<StackType>> {
+    match name {
+        // typePushInt: one entry per token, decimal-parseable ones constant.
+        "typePushInt" => Some(
+            args.iter()
+                .map(|a| match a.parse::<u64>() {
+                    Ok(v) if a.bytes().all(|b| b.is_ascii_digit()) => {
+                        StackType::bounded(Avm::Uint64, v, v)
+                    }
+                    _ => UINT64,
+                })
+                .collect(),
+        ),
+        // typeByte
+        "typeByte" => {
+            if args.is_empty() {
+                return Some(vec![BYTES]);
+            }
+            let l = parse_binary(args).unwrap_or(0) as u64;
+            Some(vec![StackType::bounded(Avm::Bytes, l, l)])
         }
+        _ => None,
+    }
+}
+
+/// Tracks one instruction's effect on the static type stack (go's per
+/// instruction block in `parseText`, before the opcode is assembled),
+/// reporting type errors like any other assembly error. `col` is the column of
+/// the mnemonic token; `byte_len` returns the decoded length of a `byte`
+/// literal's tokens.
+pub(crate) fn track_instruction(
+    ops: &mut OpStream,
+    col: usize,
+    mnemonic: &str,
+    args: &[&str],
+    byte_len: &dyn Fn(&[&str]) -> Option<usize>,
+) {
+    let Some(spec) = get_spec(ops, mnemonic, args.len()) else {
+        return;
+    };
+    let mut arg_types = spec.args.clone();
+    let mut return_types = spec.returns.clone();
+    if spec.refine == "typePushInt" || spec.refine == "typeByte" {
+        if let Some(r) = pseudo_refine(&spec.refine, args, byte_len) {
+            return_types = r;
+        }
+    } else if !spec.refine.is_empty() {
+        let txn_fields = op_entry("itxn_field")
+            .and_then(|e| e.imms.first())
+            .and_then(|i| i.group);
+        let r = run_refine(&spec.refine, &mut ops.known, args, txn_fields);
+        if let Some(e) = r.err {
+            type_error(ops, col, e);
+        }
+        if let Some(a) = r.args {
+            arg_types = a;
+        }
+        if let Some(rt) = r.returns {
+            return_types = rt;
+        }
+    }
+    track_stack(ops, col, &arg_types, &return_types, &spec.instruction, args);
+    refine_field_return(ops, &spec, args);
+    let deadens = spec.entry.is_some_and(|e| e.deadens);
+    if deadens {
+        ops.known.deaden();
+    }
+    if spec.name == "callsub" {
+        // `retsub` returns right after the `callsub`: an entry point like a label.
+        ops.known.label();
     }
 }
 
@@ -1295,27 +1069,78 @@ mod tests {
 
     #[test]
     fn overlaps_matches_go_semantics() {
-        assert!(Any.overlaps(Uint64));
-        assert!(Uint64.overlaps(Any));
-        assert!(Any.overlaps(Any));
-        assert!(Uint64.overlaps(Uint64));
-        assert!(Bytes.overlaps(Bytes));
-        assert!(!Uint64.overlaps(Bytes));
-        assert!(!Bytes.overlaps(Uint64));
+        assert!(ANY.overlaps(UINT64));
+        assert!(UINT64.overlaps(ANY));
+        assert!(ANY.overlaps(ANY));
+        assert!(UINT64.overlaps(UINT64));
+        assert!(BYTES.overlaps(BYTES));
+        assert!(!UINT64.overlaps(BYTES));
+        assert!(!BYTES.overlaps(UINT64));
+        assert!(!NONE.overlaps(ANY));
+        let b32 = StackType::new(Avm::Bytes, 32, 32, None);
+        assert!(b32.overlaps(BYTES));
+        assert!(!b32.overlaps(StackType::new(Avm::Bytes, 33, 33, None)));
     }
 
     #[test]
     fn union_matches_go_semantics() {
-        assert_eq!(union(Uint64, Uint64), Uint64);
-        assert_eq!(union(Bytes, Bytes), Bytes);
-        assert_eq!(union(Uint64, Bytes), Any);
-        assert_eq!(union(Any, Uint64), Any);
+        assert_eq!(UINT64.union(UINT64), UINT64);
+        assert_eq!(BYTES.union(BYTES), BYTES);
+        assert_eq!(UINT64.union(BYTES), ANY);
+        assert_eq!(ANY.union(UINT64), ANY);
+        let a = StackType::new(Avm::Bytes, 3, 3, None);
+        let b = StackType::new(Avm::Bytes, 5, 5, None);
+        assert_eq!(a.union(b).to_string(), "[3-5]byte");
     }
 
     #[test]
-    fn display_matches_go_avm_type_string() {
-        assert_eq!(Uint64.to_string(), "uint64");
-        assert_eq!(Bytes.to_string(), "[]byte");
-        assert_eq!(Any.to_string(), "any");
+    fn display_matches_go_names() {
+        assert_eq!(UINT64.to_string(), "uint64");
+        assert_eq!(BYTES.to_string(), "[]byte");
+        assert_eq!(ANY.to_string(), "any");
+        assert_eq!(StackType::new(Avm::Uint64, 7, 7, None).to_string(), "7");
+        assert_eq!(
+            StackType::new(Avm::Uint64, 0, 5, None).to_string(),
+            "uint64 (<= 5)"
+        );
+        assert_eq!(
+            StackType::new(Avm::Uint64, 2, 5, None).to_string(),
+            "uint64 (2-5)"
+        );
+        assert_eq!(
+            StackType::new(Avm::Bytes, 0, 5, None).to_string(),
+            "[<=5]byte"
+        );
+        assert_eq!(
+            StackType::new(Avm::Bytes, 32, 32, Some("address")).to_string(),
+            "address"
+        );
+    }
+
+    #[test]
+    fn parse_int_matches_go_base_zero() {
+        assert_eq!(go_parse_int("0x10", 9), Some(16));
+        assert_eq!(go_parse_int("0b11", 9), Some(3));
+        assert_eq!(go_parse_int("017", 9), Some(15));
+        assert_eq!(go_parse_int("1_0", 9), Some(10));
+        assert_eq!(go_parse_int("-256", 9), Some(-256));
+        assert_eq!(go_parse_int("256", 9), None);
+        assert_eq!(go_parse_int("_1", 9), None);
+        assert_eq!(go_parse_int("0", 9), Some(0));
+        assert_eq!(go_parse_int("", 9), None);
+    }
+
+    #[test]
+    fn every_refine_function_of_the_go_table_is_ported() {
+        let mut p = Knowledge::new();
+        for e in OPS {
+            for v in e.variants {
+                if v.refine.is_empty() {
+                    continue;
+                }
+                // `run_refine` debug-asserts on an unported name.
+                let _ = run_refine(v.refine, &mut p, &[], None);
+            }
+        }
     }
 }
