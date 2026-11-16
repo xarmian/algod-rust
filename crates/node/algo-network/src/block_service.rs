@@ -463,6 +463,20 @@ impl BlockService {
             );
         }
 
+        // A round above the ledger's latest is not in the ledger: answer from
+        // the in-memory latest round, no database read (go: `ledgercore.
+        // ErrNoEntry` -> `BlockNotAvailable` with the `latest` topic).
+        let latest = self.ledger.latest_round();
+        if round > latest {
+            return (
+                Topics::from_vec(vec![
+                    Topic::new(ERROR_KEY, BLOCK_NOT_AVAILABLE_ERR_MSG.as_bytes().to_vec()),
+                    Topic::new(LATEST_ROUND_KEY, latest.to_be_bytes().to_vec()),
+                ]),
+                None,
+            );
+        }
+
         // Fetch the block
         match self.ledger.encoded_block_cert(round) {
             Ok((block_data, cert_data)) => {
@@ -1098,6 +1112,53 @@ mod tests {
     // -----------------------------------------------------------------------
     // WS block request tests
     // -----------------------------------------------------------------------
+
+    /// Issue #2352: a request for a round above the ledger's latest is
+    /// answered from the in-memory latest round, without opening the ledger
+    /// (go: `ledgercore.ErrNoEntry` -> "requested block is not available"
+    /// plus the `latest` topic), so a catching-up peer polling the tip does
+    /// not cost the relay a database read per request.
+    #[test]
+    fn ws_future_round_is_answered_without_a_ledger_read() {
+        struct CountingLedger(std::sync::atomic::AtomicUsize);
+        impl LedgerForBlockService for CountingLedger {
+            fn encoded_block_cert(
+                &self,
+                round: u64,
+            ) -> Result<(Vec<u8>, Vec<u8>), BlockServiceError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(BlockServiceError::BlockNotAvailable {
+                    round,
+                    latest_round: Some(10),
+                })
+            }
+            fn latest_round(&self) -> u64 {
+                10
+            }
+        }
+        let ledger = Arc::new(CountingLedger(std::sync::atomic::AtomicUsize::new(0)));
+        let service = BlockService::new(
+            ledger.clone(),
+            "test".to_string(),
+            DEFAULT_BLOCK_SERVICE_MEM_CAP,
+        );
+        let (resp, guard) =
+            service.handle_ws_block_request(&make_block_request_topics(11).marshal());
+        assert!(guard.is_none());
+        assert_eq!(
+            resp.get_value(ERROR_KEY),
+            Some(BLOCK_NOT_AVAILABLE_ERR_MSG.as_bytes())
+        );
+        assert_eq!(
+            resp.get_value(LATEST_ROUND_KEY),
+            Some(10u64.to_be_bytes().as_slice())
+        );
+        assert_eq!(ledger.0.load(Ordering::SeqCst), 0, "no ledger read");
+
+        // The latest round itself is still looked up.
+        let _ = service.handle_ws_block_request(&make_block_request_topics(10).marshal());
+        assert_eq!(ledger.0.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn ws_block_request_success() {

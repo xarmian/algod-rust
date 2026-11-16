@@ -84,8 +84,15 @@ struct PeerFetchFailure {
 fn classify_parse_error(round: Round, peer: &str, e: BlockFetchError) -> PeerFetchFailure {
     let message = format!("failed to parse block response for round {round} from peer {peer}: {e}");
     match e {
-        BlockFetchError::ServiceError { message: m, .. } => PeerFetchFailure {
-            error: if m.contains(BLOCK_NOT_AVAILABLE_MSG) {
+        BlockFetchError::ServiceError {
+            message: m,
+            latest_round,
+        } => PeerFetchFailure {
+            // go's `wsFetcherClient.requestBlock` (`catchup/universalFetcher.go`,
+            // go commit 7ebb9f475, v3.20.1-stable) reports `noBlockForRoundError`
+            // only when the error response ALSO carries an 8-byte `latest`
+            // topic; an error without it is an ordinary request failure.
+            error: if latest_round.is_some() && m.contains(BLOCK_NOT_AVAILABLE_MSG) {
                 AlgoError::NotFound(message)
             } else {
                 AlgoError::Network { message }
@@ -662,7 +669,9 @@ impl BlockSource for GossipBlockSource {
 mod tests {
     use super::*;
     use algo_network::errors::PeerError;
-    use algo_network::topics::{Topic, Topics, BLOCK_DATA_KEY, CERT_DATA_KEY, ERROR_KEY};
+    use algo_network::topics::{
+        Topic, Topics, BLOCK_DATA_KEY, CERT_DATA_KEY, ERROR_KEY, LATEST_ROUND_KEY,
+    };
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -794,16 +803,20 @@ mod tests {
                     Ok(resp)
                 }
                 Some(MockResponse::ServiceError(msg)) => {
-                    let resp = Topics::from_vec(vec![Topic::new(ERROR_KEY, msg.into_bytes())]);
-                    Ok(resp)
+                    // A real service's not-available answer carries `latest`.
+                    let mut topics = vec![Topic::new(ERROR_KEY, msg.clone().into_bytes())];
+                    if msg.contains("requested block is not available") {
+                        topics.push(Topic::new(LATEST_ROUND_KEY, 0u64.to_be_bytes().to_vec()));
+                    }
+                    Ok(Topics::from_vec(topics))
                 }
                 Some(MockResponse::RequestError(e)) => Err(e),
                 None => {
                     // Default: return a service error for unknown rounds.
-                    let resp = Topics::from_vec(vec![Topic::new(
-                        ERROR_KEY,
-                        b"requested block is not available".to_vec(),
-                    )]);
+                    let resp = Topics::from_vec(vec![
+                        Topic::new(ERROR_KEY, b"requested block is not available".to_vec()),
+                        Topic::new(LATEST_ROUND_KEY, 0u64.to_be_bytes().to_vec()),
+                    ]);
                     Ok(resp)
                 }
             }
@@ -1421,8 +1434,20 @@ mod tests {
             message: m.to_string(),
             latest_round: None,
         };
-        let f = classify_parse_error(Round(7), "p", svc("requested block is not available"));
+        let svc_latest = |m: &str| BlockFetchError::ServiceError {
+            message: m.to_string(),
+            latest_round: Some(5),
+        };
+        let f = classify_parse_error(
+            Round(7),
+            "p",
+            svc_latest("requested block is not available"),
+        );
         assert!(f.answered && matches!(f.error, AlgoError::NotFound(_)));
+        // go: the error topic WITHOUT an 8-byte `latest` is a plain request
+        // failure, not `noBlockForRoundError` (#2352).
+        let f = classify_parse_error(Round(7), "p", svc("requested block is not available"));
+        assert!(f.answered && matches!(f.error, AlgoError::Network { .. }));
         let f = classify_parse_error(Round(7), "p", svc("internal error"));
         assert!(f.answered && matches!(f.error, AlgoError::Network { .. }));
         for garbled in [
