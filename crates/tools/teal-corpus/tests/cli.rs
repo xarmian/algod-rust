@@ -145,8 +145,6 @@ fn assemble_fixture_rows_are_pinned() {
         .contains("autosalt"));
 }
 
-const INVALID_VERSION: &str = "8d0d8ce9b5f33f6105918d9d0adc9ec40886e14e59379bba65d935b45389a34d";
-
 fn diff_against_go(op: &str) -> (Option<i32>, Vec<Value>) {
     let d = scratch(&format!("vsgo-{op}"));
     let out = d.join("rust.jsonl");
@@ -182,18 +180,16 @@ fn rust_assemble_rows_equal_the_go_driver_rows_except_the_known_invalid_source()
     assert_eq!(ms[0]["field"], "errors");
 }
 
-/// Known disassembly differences the drivers surface on the two invalid
-/// fixture programs (error text; go also accepts an unsupported version as a
-/// `// unsupported version` comment). Fixing them is #2367's job; when it
-/// lands this test must tighten to an empty mismatch list. Valid programs
-/// must already agree.
+/// Disassembly parity on the fixture corpus: the valid programs, the
+/// unsupported-version program (go prints a `// unsupported version` comment)
+/// and the truncated program (same error text) all match go row for row. The
+/// full-registry run and the byte-program regression cases live in #2367's
+/// `algo-avm/tests/disassemble_go_parity.rs`.
 #[test]
-fn rust_disassemble_rows_equal_the_go_driver_rows_except_the_known_invalid_programs() {
+fn rust_disassemble_rows_equal_the_go_driver_rows() {
     let (code, ms) = diff_against_go("disassemble");
-    let shas: Vec<&str> = ms.iter().map(|m| m["sha256"].as_str().unwrap()).collect();
-    assert_eq!(code, Some(1));
-    assert_eq!(shas, [INVALID_VERSION, TRUNCATED], "{ms:?}");
-    assert!(ms.iter().all(|m| m["field"] == "error"));
+    assert_eq!(code, Some(0), "{ms:?}");
+    assert!(ms.is_empty(), "{ms:?}");
 }
 
 #[test]
@@ -305,6 +301,64 @@ fn diff_reports_a_row_missing_on_one_side() {
     assert_eq!(ms[0]["sha256"], TRUNCATED);
     assert_eq!(ms[0]["field"], "row");
     assert_eq!(ms[0]["right"], Value::Null);
+}
+
+/// The summary #2367 asks for: programs compared, identical, both-error-
+/// identical, mismatched, panics/timeouts. The fixture has 3 successful rows
+/// and 1 truncated program that errors the same way on both sides.
+#[test]
+fn diff_summary_counts_identical_both_error_mismatched_and_robustness() {
+    let d = scratch("summary");
+    let a = d.join("a.jsonl");
+    run_driver("disassemble", &a, "2");
+    let m = d.join("m.jsonl");
+    let res = bin()
+        .arg("diff")
+        .arg(&a)
+        .arg(&a)
+        .arg("--out")
+        .arg(&m)
+        .output()
+        .unwrap();
+    assert_eq!(res.status.code(), Some(0));
+    let err = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        err.contains(
+            "4 rows compared, 3 identical, 1 both-error-identical, 0 mismatches, 0 panics/timeouts"
+        ),
+        "{err}"
+    );
+}
+
+/// A panic or timeout row is a failure even when both sides recorded the
+/// same one: the comparison must not pass over it as "identical".
+#[test]
+fn diff_fails_on_a_recorded_panic_even_when_both_sides_agree() {
+    let d = scratch("panicrow");
+    let a = d.join("a.jsonl");
+    run_driver("disassemble", &a, "2");
+    let text = std::fs::read_to_string(&a).unwrap();
+    let b = d.join("b.jsonl");
+    let seeded = text.replacen(
+        &format!("{{\"ok\":true,\"sha256\":\"{VALID_PUSHINT}\",\"text\":\"#pragma version 8\\npushint 1\\n\"}}"),
+        &format!("{{\"ok\":false,\"panic\":\"boom\",\"sha256\":\"{VALID_PUSHINT}\"}}"),
+        1,
+    );
+    assert_ne!(seeded, text, "the seeded panic row replaced nothing");
+    std::fs::write(&b, &seeded).unwrap();
+    let m = d.join("m.jsonl");
+    let res = bin()
+        .arg("diff")
+        .arg(&b)
+        .arg(&b)
+        .arg("--out")
+        .arg(&m)
+        .output()
+        .unwrap();
+    assert_eq!(res.status.code(), Some(1));
+    assert_eq!(std::fs::read(&m).unwrap().len(), 0, "no mismatch rows");
+    let err = String::from_utf8_lossy(&res.stderr);
+    assert!(err.contains("2 panics/timeouts"), "{err}");
 }
 
 #[test]

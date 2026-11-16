@@ -1,0 +1,126 @@
+{"class": "label-order", "name": "label_single_forward", "ok": true, "program_hex": "0841000300000043", "text": "#pragma version 8\nbz label1\nerr\nerr\nerr\nlabel1:\nreturn\n"}
+{"class": "label-order", "name": "label_switch_descending", "ok": true, "program_hex": "088d03000200010000000000", "text": "#pragma version 8\nswitch label1 label2 label3\nlabel3:\nerr\nlabel2:\nerr\nlabel1:\nerr\n"}
+{"class": "label-order", "name": "label_two_branches_reversed", "ok": true, "program_hex": "0842000342000000000000", "text": "#pragma version 8\nb label1\nb label1\nlabel1:\nerr\nerr\nerr\nerr\n"}
+{"class": "label-order", "name": "label_match_duplicate_targets", "ok": true, "program_hex": "088e0200020002000043", "text": "#pragma version 8\nmatch label1 label1\nerr\nerr\nlabel1:\nreturn\n"}
+{"class": "label-order", "name": "label_backward_loop", "ok": true, "program_hex": "082241fffc43", "text": "#pragma version 8\nlabel1:\nintc_0\nbz label1\nreturn\n"}
+{"class": "label-order", "name": "label_into_instruction", "ok": true, "program_hex": "088101420001810243", "text": "#pragma version 8\npushint 1\nb label1\npushint 2\nreturn\n"}
+{"class": "label-order", "name": "label_trailing", "ok": true, "program_hex": "08420000", "text": "#pragma version 8\nb label1\nlabel1:\n"}
+{"class": "label-order", "name": "label_negative_target", "ok": true, "program_hex": "0842ff0043", "text": "#pragma version 8\nb label1\nreturn\n"}
+{"class": "label-order", "name": "label_mixed_repeat", "ok": true, "program_hex": "08224000034200034342fff843", "text": "#pragma version 8\nintc_0\nbnz label1\nb label2\nlabel1:\nreturn\nb label3\nreturn\n"}
+{"class": "label-order", "name": "label_proto_unreferenced", "ok": true, "program_hex": "084200038a01018943", "text": "#pragma version 8\nb label1\nlabel2:\nproto 1 1\nlabel1:\nretsub\nreturn\n"}
+{"class": "label-order", "name": "label_proto_interleaved", "ok": true, "program_hex": "084200068a0000894200038a01018943", "text": "#pragma version 8\nb label1\nlabel2:\nproto 0 0\nretsub\nb label3\nlabel4:\nproto 1 1\nlabel3:\nretsub\nreturn\n"}
+{"class": "label-order", "name": "label_varint_forward", "ok": true, "program_hex": "0d42020043", "text": "#pragma version 13\nb label1\nerr\nlabel1:\nreturn\n"}
+{"class": "label-order", "name": "label_varint_backward", "ok": true, "program_hex": "0d22420143", "text": "#pragma version 13\nlabel1:\nintc_0\nb label1\nreturn\n"}
+{"class": "label-order", "name": "label_varint_two_labels_reversed", "ok": true, "program_hex": "0d420442000043", "text": "#pragma version 13\nb label1\nb label1\nlabel1:\nerr\nreturn\n"}
+{"class": "label-order", "name": "label_varint_padded_offset", "ok": true, "program_hex": "0d428200000043", "text": "#pragma version 13\n#pragma autosalt false\nb label1\nerr\nlabel1:\nerr\nreturn\n"}
+{"class": "label-order", "name": "label_callsub_varint", "ok": true, "program_hex": "0d8802438a000089", "text": "#pragma version 13\n#pragma autosalt false\ncallsub label1\nreturn\nlabel1:\nproto 0 0\nretsub\n"}
+{"class": "label-order", "name": "label_switch_v13", "ok": true, "program_hex": "0d8d02000100000043", "text": "#pragma version 13\n#pragma autosalt false\nswitch label1 label2\nlabel2:\nerr\nlabel1:\nreturn\n"}
+{"class": "label-order", "name": "label_v14_forward", "ok": true, "program_hex": "0e40020043", "text": "#pragma version 14\n#pragma autosalt false\nbnz label1\nerr\nlabel1:\nreturn\n"}
+{"class": "version", "name": "version_unsupported_15", "ok": true, "program_hex": "0f43", "text": "// unsupported version 15\n"}
+{"class": "version", "name": "version_unsupported_255", "ok": true, "program_hex": "ff0143", "text": "// unsupported version 255\n"}
+{"class": "version", "name": "version_unsupported_varuint", "ok": true, "program_hex": "810143", "text": "// unsupported version 129\n"}
+{"class": "version", "name": "version_invalid_varint", "ok": true, "program_hex": "ffffffffffffffffffffffff", "text": "// invalid version\n"}
+{"class": "version", "name": "version_empty", "ok": true, "program_hex": "", "text": "// invalid version\n"}
+{"class": "version", "name": "version_only", "ok": true, "program_hex": "08", "text": "#pragma version 8\n"}
+{"class": "version", "error": "illegal opcode 0x43", "name": "version_zero_alias", "ok": false, "program_hex": "002243"}
+{"class": "version", "name": "version_padded_varuint", "ok": true, "program_hex": "88002243", "text": "#pragma version 8\nintc_0\nreturn\n"}
+{"class": "opcode-error", "error": "illegal opcode 0xff", "name": "opcode_illegal_byte", "ok": false, "program_hex": "08ff"}
+{"class": "opcode-error", "error": "illegal opcode 0x4b", "name": "opcode_not_yet_in_version", "ok": false, "program_hex": "02224b"}
+{"class": "opcode-error", "error": "illegal opcode 0x81", "name": "opcode_pushint_in_v2", "ok": false, "program_hex": "028101"}
+{"class": "opcode-error", "error": "prefix opcode 0xd4 missing sub-opcode", "name": "opcode_prefix_missing_sub", "ok": false, "program_hex": "0dd4"}
+{"class": "opcode-error", "error": "prefix opcode 0xd4 with improper sub-opcode 0xff", "name": "opcode_prefix_bad_sub", "ok": false, "program_hex": "0dd4ff"}
+{"class": "opcode-error", "error": "illegal opcode 0xd4", "name": "opcode_prefix_before_v13", "ok": false, "program_hex": "0cd401"}
+{"class": "opcode-error", "name": "opcode_prefix_ok", "ok": true, "program_hex": "0dd40143", "text": "#pragma version 13\napp_box_create\nreturn\n"}
+{"class": "opcode-error", "error": "illegal opcode 0xfe", "name": "opcode_after_valid_text", "ok": false, "program_hex": "082243fe"}
+{"class": "immediate", "name": "imm_txn_field", "ok": true, "program_hex": "08310043", "text": "#pragma version 8\ntxn Sender\nreturn\n"}
+{"class": "immediate", "error": "invalid immediate f for txn: 255", "name": "imm_txn_bad_field", "ok": false, "program_hex": "0831ff"}
+{"class": "immediate", "error": "program end while reading immediate f for txn", "name": "imm_txn_truncated", "ok": false, "program_hex": "0831"}
+{"class": "immediate", "error": "invalid immediate f for global: 255", "name": "imm_global_bad_field", "ok": false, "program_hex": "0832ff"}
+{"class": "immediate", "name": "imm_gtxn_second_group", "ok": true, "program_hex": "0833000143", "text": "#pragma version 8\ngtxn 0 Fee\nreturn\n"}
+{"class": "immediate", "error": "program end while reading immediate f for gtxn", "name": "imm_gtxn_truncated_second", "ok": false, "program_hex": "083300"}
+{"class": "immediate", "error": "invalid immediate f for gtxn: 255", "name": "imm_gtxn_bad_field", "ok": false, "program_hex": "083300ff"}
+{"class": "field-group", "error": "invalid immediate f for txna: 0", "name": "imm_txna_scalar_field_rejected", "ok": false, "program_hex": "083600"}
+{"class": "field-group", "name": "imm_txna_array_field", "ok": true, "program_hex": "08361c0043", "text": "#pragma version 8\ntxna Accounts 0\nreturn\n"}
+{"class": "field-group", "error": "program end while reading immediate i for txna", "name": "imm_txna_truncated_index", "ok": false, "program_hex": "08361c"}
+{"class": "field-group", "error": "invalid immediate f for txn: 28", "name": "imm_txn_array_field_rejected", "ok": false, "program_hex": "08311c"}
+{"class": "field-group", "name": "imm_txn_last_field", "ok": true, "program_hex": "08314443", "text": "#pragma version 8\ntxn RejectVersion\nreturn\n"}
+{"class": "field-group", "error": "invalid immediate f for txn: 69", "name": "imm_txn_past_last_field", "ok": false, "program_hex": "083145"}
+{"class": "field-group", "name": "imm_txnas_array_field", "ok": true, "program_hex": "08c01c43", "text": "#pragma version 8\ntxnas Accounts\nreturn\n"}
+{"class": "field-group", "error": "invalid immediate f for txnas: 0", "name": "imm_txnas_scalar_field_rejected", "ok": false, "program_hex": "08c000"}
+{"class": "field-group", "name": "imm_gtxns_scalar_field", "ok": true, "program_hex": "08380043", "text": "#pragma version 8\ngtxns Sender\nreturn\n"}
+{"class": "field-group", "error": "invalid immediate f for gtxnsa: 0", "name": "imm_gtxnsa_scalar_field_rejected", "ok": false, "program_hex": "08390000"}
+{"class": "field-group", "error": "invalid immediate f for itxn: 28", "name": "imm_itxn_array_field_rejected", "ok": false, "program_hex": "08b41c"}
+{"class": "field-group", "name": "imm_itxn_field_accepts_array_field", "ok": true, "program_hex": "08b21c43", "text": "#pragma version 8\nitxn_field Accounts\nreturn\n"}
+{"class": "field-group", "name": "imm_gitxn_accepts_array_field", "ok": true, "program_hex": "08b7001c43", "text": "#pragma version 8\ngitxn 0 Accounts\nreturn\n"}
+{"class": "field-group", "name": "imm_app_params_set_box_field", "ok": true, "program_hex": "0d760b43", "text": "#pragma version 13\napp_params_set AppForeignBoxReads\nreturn\n"}
+{"class": "field-group", "error": "invalid immediate f for app_params_set: 0", "name": "imm_app_params_set_low_field_rejected", "ok": false, "program_hex": "0d7600"}
+{"class": "immediate", "name": "imm_gtxna_three", "ok": true, "program_hex": "0837001c0243", "text": "#pragma version 8\ngtxna 0 Accounts 2\nreturn\n"}
+{"class": "immediate", "error": "program end while reading immediate i for gtxna", "name": "imm_gtxna_truncated_third", "ok": false, "program_hex": "0837001c"}
+{"class": "immediate", "error": "program end while reading immediate r for proto", "name": "imm_proto_truncated", "ok": false, "program_hex": "088a01"}
+{"class": "immediate", "name": "imm_frame_dig_negative", "ok": true, "program_hex": "088bff43", "text": "#pragma version 8\nframe_dig -1\nreturn\n"}
+{"class": "immediate", "name": "imm_frame_bury_int8", "ok": true, "program_hex": "088c8043", "text": "#pragma version 8\nframe_bury -128\nreturn\n"}
+{"class": "immediate", "error": "program end while reading immediate i for frame_dig", "name": "imm_frame_dig_truncated", "ok": false, "program_hex": "088b"}
+{"class": "immediate", "name": "imm_extract_pair", "ok": true, "program_hex": "08800057000243", "text": "#pragma version 8\npushbytes 0x // \"\"\nextract 0 2\nreturn\n"}
+{"class": "immediate", "error": "invalid immediate v for ecdsa_verify: 255", "name": "imm_ecdsa_curve_bad", "ok": false, "program_hex": "0805ff"}
+{"class": "immediate", "name": "imm_block_field_ok", "ok": true, "program_hex": "088101d10043", "text": "#pragma version 8\npushint 1\nblock BlkSeed\nreturn\n"}
+{"class": "immediate", "error": "invalid immediate f for block: 255", "name": "imm_block_field_bad", "ok": false, "program_hex": "088101d1ff"}
+{"class": "field-group", "name": "imm_block_field_v13_branch512", "ok": true, "program_hex": "0d8101d10a43", "text": "#pragma version 13\n#pragma autosalt false\npushint 1\nblock BlkBranch512\nreturn\n"}
+{"class": "field-group", "name": "imm_block_field_v13_sha512_256_commitment", "ok": true, "program_hex": "0d8101d10b43", "text": "#pragma version 13\n#pragma autosalt false\npushint 1\nblock BlkSha512_256TxnCommitment\nreturn\n"}
+{"class": "field-group", "name": "imm_block_field_v13_sha256_commitment", "ok": true, "program_hex": "0d8101d10c43", "text": "#pragma version 13\n#pragma autosalt false\npushint 1\nblock BlkSha256TxnCommitment\nreturn\n"}
+{"class": "field-group", "name": "imm_block_field_v13_sha512_commitment", "ok": true, "program_hex": "0d8101d10d43", "text": "#pragma version 13\n#pragma autosalt false\npushint 1\nblock BlkSha512TxnCommitment\nreturn\n"}
+{"class": "field-group", "error": "invalid immediate f for block: 14", "name": "imm_block_field_past_last", "ok": false, "program_hex": "0d8101d10e"}
+{"class": "immediate", "error": "invalid immediate c for mimc: 255", "name": "imm_mimc_bad", "ok": false, "program_hex": "0be6ff"}
+{"class": "immediate", "error": "invalid immediate s for vrf_verify: 255", "name": "imm_vrf_verify_bad", "ok": false, "program_hex": "08d0ff"}
+{"class": "immediate", "error": "invalid immediate e for base64_decode: 255", "name": "imm_base64_decode_bad", "ok": false, "program_hex": "085eff"}
+{"class": "immediate", "error": "invalid immediate f for asset_params_get: 255", "name": "imm_asset_params_bad", "ok": false, "program_hex": "0871ff"}
+{"class": "immediate", "name": "imm_intc_with_block", "ok": true, "program_hex": "0820020708210143", "text": "#pragma version 8\nintcblock 7 8\nintc 1 // 8\nreturn\n"}
+{"class": "immediate", "name": "imm_intc_out_of_block", "ok": true, "program_hex": "082001072105222343", "text": "#pragma version 8\nintcblock 7\nintc 5\nintc_0 // 7\nintc_1\nreturn\n"}
+{"class": "immediate", "name": "imm_bytec_with_block", "ok": true, "program_hex": "08260202686901ff2700282943", "text": "#pragma version 8\nbytecblock 0x6869 0xff\nbytec 0 // \"hi\"\nbytec_0 // \"hi\"\nbytec_1 // 0xff\nreturn\n"}
+{"class": "immediate", "name": "imm_second_intcblock_wins", "ok": true, "program_hex": "08200107222001092243", "text": "#pragma version 8\nintcblock 7\nintc_0 // 7\nintcblock 9\nintc_0 // 9\nreturn\n"}
+{"class": "immediate", "name": "imm_second_bytecblock_wins", "ok": true, "program_hex": "082601016128260101622843", "text": "#pragma version 8\nbytecblock 0x61\nbytec_0 // \"a\"\nbytecblock 0x62\nbytec_0 // \"b\"\nreturn\n"}
+{"class": "constant", "name": "const_intcblock_empty", "ok": true, "program_hex": "08200043", "text": "#pragma version 8\nintcblock \nreturn\n"}
+{"class": "constant", "name": "const_bytecblock_empty", "ok": true, "program_hex": "08260043", "text": "#pragma version 8\nbytecblock \nreturn\n"}
+{"class": "constant", "name": "const_intcblock_large", "ok": true, "program_hex": "082002ffffffffffffffffff010043", "text": "#pragma version 8\nintcblock 18446744073709551615 0\nreturn\n"}
+{"class": "constant", "name": "const_pushint_padded_varuint", "ok": true, "program_hex": "0881800043", "text": "#pragma version 8\npushint 0\nreturn\n"}
+{"class": "constant", "name": "const_pushints", "ok": true, "program_hex": "08830201ff0143", "text": "#pragma version 8\npushints 1 255\nreturn\n"}
+{"class": "constant", "name": "const_pushints_empty", "ok": true, "program_hex": "08830043", "text": "#pragma version 8\npushints \nreturn\n"}
+{"class": "constant", "name": "const_pushbytess", "ok": true, "program_hex": "0882020268690043", "text": "#pragma version 8\npushbytess 0x6869 0x\nreturn\n"}
+{"class": "constant", "name": "const_pushbytess_empty", "ok": true, "program_hex": "08820043", "text": "#pragma version 8\npushbytess \nreturn\n"}
+{"class": "constant", "name": "const_pushbytes_ascii", "ok": true, "program_hex": "088002686943", "text": "#pragma version 8\npushbytes 0x6869 // \"hi\"\nreturn\n"}
+{"class": "constant", "name": "const_pushbytes_empty", "ok": true, "program_hex": "08800043", "text": "#pragma version 8\npushbytes 0x // \"\"\nreturn\n"}
+{"class": "constant", "name": "const_pushbytes_quote_backslash", "ok": true, "program_hex": "088003225c2743", "text": "#pragma version 8\npushbytes 0x225c27 // \"\\\"\\\\'\"\nreturn\n"}
+{"class": "constant", "name": "const_pushbytes_nonprintable", "ok": true, "program_hex": "0880030a0d0943", "text": "#pragma version 8\npushbytes 0x0a0d09 // 0x0a0d09\nreturn\n"}
+{"class": "constant", "name": "const_pushbytes_high_bit", "ok": true, "program_hex": "088002c3a943", "text": "#pragma version 8\npushbytes 0xc3a9 // 0xc3a9\nreturn\n"}
+{"class": "constant", "name": "const_pushbytes_del", "ok": true, "program_hex": "0880027e7f43", "text": "#pragma version 8\npushbytes 0x7e7f // 0x7e7f\nreturn\n"}
+{"class": "constant", "name": "const_pushbytes_32_address", "ok": true, "program_hex": "088020000000000000000000000000000000000000000000000000000000000000000043", "text": "#pragma version 8\npushbytes 0x0000000000000000000000000000000000000000000000000000000000000000 // addr AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ\nreturn\n"}
+{"class": "constant", "name": "const_pushbytes_32_printable", "ok": true, "program_hex": "088020616161616161616161616161616161616161616161616161616161616161616143", "text": "#pragma version 8\npushbytes 0x6161616161616161616161616161616161616161616161616161616161616161 // addr MFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQS3KHEHM\nreturn\n"}
+{"class": "truncated", "error": "could not decode length of int list at pc=2", "name": "trunc_intcblock_no_count", "ok": false, "program_hex": "0820"}
+{"class": "truncated", "error": "const int list ran past end of program", "name": "trunc_intcblock_short", "ok": false, "program_hex": "08200301"}
+{"class": "truncated", "error": "could not decode int const[0] at pc=3", "name": "trunc_intcblock_item", "ok": false, "program_hex": "08200180"}
+{"class": "truncated", "error": "const int list with too many items", "name": "trunc_intcblock_too_many", "ok": false, "program_hex": "0820ff0101"}
+{"class": "truncated", "error": "could not decode length of int list at pc=2", "name": "trunc_intcblock_count_overflow", "ok": false, "program_hex": "0820ffffffffffffffffffff"}
+{"class": "truncated", "error": "could not decode length of bytes list at pc=2", "name": "trunc_bytecblock_no_count", "ok": false, "program_hex": "0826"}
+{"class": "truncated", "error": "const bytes list ran past end of program", "name": "trunc_bytecblock_short", "ok": false, "program_hex": "0826020161"}
+{"class": "truncated", "error": "const bytes list ran past end of program", "name": "trunc_bytecblock_item_len", "ok": false, "program_hex": "082601"}
+{"class": "truncated", "error": "const bytes list ran past end of program", "name": "trunc_bytecblock_item_data", "ok": false, "program_hex": "0826010561"}
+{"class": "truncated", "error": "const bytes list with too many items", "name": "trunc_bytecblock_too_many", "ok": false, "program_hex": "0826ff0100"}
+{"class": "truncated", "name": "trunc_bytecblock_trailing_empty", "ok": true, "program_hex": "08260100", "text": "#pragma version 8\nbytecblock 0x\n"}
+{"class": "truncated", "name": "trunc_bytecblock_trailing_empty_v13", "ok": true, "program_hex": "0d260100", "text": "#pragma version 13\n#pragma autosalt false\nbytecblock 0x\n"}
+{"class": "truncated", "error": "could not decode immediate uint for pushint", "name": "trunc_pushint_no_value", "ok": false, "program_hex": "0881"}
+{"class": "truncated", "error": "could not decode immediate uint for pushint", "name": "trunc_pushint_unterminated", "ok": false, "program_hex": "088180"}
+{"class": "truncated", "error": "could not decode immediate uint for pushint", "name": "trunc_pushint_overflow", "ok": false, "program_hex": "0881ffffffffffffffffffff01"}
+{"class": "truncated", "error": "could not decode immediate bytes for pushbytes", "name": "trunc_pushbytes_no_len", "ok": false, "program_hex": "0880"}
+{"class": "truncated", "error": "could not decode immediate bytes for pushbytes", "name": "trunc_pushbytes_short", "ok": false, "program_hex": "0880056162"}
+{"class": "truncated", "error": "const int list ran past end of program", "name": "trunc_pushints_short", "ok": false, "program_hex": "08830201"}
+{"class": "truncated", "error": "const bytes list ran past end of program", "name": "trunc_pushbytess_short", "ok": false, "program_hex": "0882020161"}
+{"class": "truncated", "error": "program end while reading label for b", "name": "trunc_branch_no_offset", "ok": false, "program_hex": "0842"}
+{"class": "truncated", "error": "program end while reading label for b", "name": "trunc_branch_one_byte", "ok": false, "program_hex": "084200"}
+{"class": "truncated", "error": "could not decode label for b", "name": "trunc_branch_varint_none", "ok": false, "program_hex": "0d42"}
+{"class": "truncated", "error": "could not decode label for b", "name": "trunc_branch_varint_unterminated", "ok": false, "program_hex": "0d4280"}
+{"class": "truncated", "error": "could not decode label for b", "name": "trunc_branch_varint_overflow", "ok": false, "program_hex": "0d42ffffffffffffffffffff01"}
+{"class": "truncated", "error": "could not decode label count for switch", "name": "trunc_switch_no_count", "ok": false, "program_hex": "088d"}
+{"class": "truncated", "error": "could not decode labels for switch", "name": "trunc_switch_short", "ok": false, "program_hex": "088d020000"}
+{"class": "truncated", "error": "could not decode label count for match", "name": "trunc_match_no_count", "ok": false, "program_hex": "088e"}
+{"class": "truncated", "error": "could not decode labels for match", "name": "trunc_match_short", "ok": false, "program_hex": "088e0300000000"}
+{"class": "truncated", "error": "could not decode immediate uint for pushint", "name": "trunc_error_after_labels", "ok": false, "program_hex": "0842000081"}
+{"class": "shape", "name": "shape_subroutine_loop", "ok": true, "program_hex": "082002010222880006438a01018bff23084940fff989", "text": "#pragma version 8\nintcblock 1 2\nintc_0 // 1\ncallsub label1\nreturn\nlabel2:\nproto 1 1\nframe_dig -1\nlabel1:\nintc_1 // 2\n+\ndup\nbnz label3\nretsub\n"}

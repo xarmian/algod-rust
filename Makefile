@@ -37,6 +37,7 @@ P2P_INTEROP_1V1_CLUSTER := ops/mixed-cluster-p2p-1v1
 .PHONY: p2p-interop-1v1-up p2p-interop-1v1-down p2p-interop-1v1-status p2p-interop-1v1-soak-test
 .PHONY: phase6-cluster-up phase6-cluster-down phase6-cluster-status
 .PHONY: consensus-analyzer-test consensus-negative-test
+.PHONY: teal-corpus-fetch teal-corpus-parity
 
 ## ── Build & Test ──────────────────────────────────────────────
 
@@ -1108,6 +1109,28 @@ archival-up: ## Start archival Go node
 archival-down: ## Stop archival Go node
 	docker compose -f docker/docker-compose.yml --profile archival down
 
+## ── TEAL corpus parity (Phase 25, epic #2364) ─────────────────
+
+TEAL_CORPUS_WORK ?= teal-corpus-work
+# Stages: disassemble (#2367); assemble once #2368/#2369 land. Space-separated.
+TEAL_CORPUS_STAGES ?= disassemble
+
+## Fetch the ARC56Registry at a recorded SHA and extract the program/source corpus.
+teal-corpus-fetch:
+	python3 -I scripts/teal-corpus/fetch.py --work-dir $(TEAL_CORPUS_WORK)
+	python3 -I scripts/teal-corpus/extract.py --work-dir $(TEAL_CORPUS_WORK)
+
+## Build the Go (pinned go-algorand) and Rust drivers and compare them over the
+## corpus. Exits non-zero on any mismatch, panic or timeout; prints programs
+## compared / identical / both-error-identical / mismatched / panics+timeouts.
+## Needs `make libsodium` in ../go-algorand first (see CLAUDE.md).
+teal-corpus-parity:
+	@test -d $(TEAL_CORPUS_WORK)/corpus/programs || { echo "no corpus: run 'make teal-corpus-fetch' first" >&2; exit 2; }
+	bash tools/teal-corpus/build.sh $(TEAL_CORPUS_WORK)/teal-corpus-go
+	cargo build -p teal-corpus --release
+	GO_DRIVER=$(CURDIR)/$(TEAL_CORPUS_WORK)/teal-corpus-go RUST_DRIVER=$(CURDIR)/target/release/teal-corpus \
+		bash scripts/teal-corpus/run_drivers.sh $(TEAL_CORPUS_WORK)/corpus $(TEAL_CORPUS_WORK)/out $(TEAL_CORPUS_STAGES)
+
 ## ── Help ─────────────────────────────────────────────────────
 
 help:
@@ -1243,6 +1266,10 @@ help:
 	@echo "  make bench-decode     Rust decode-only (includes HTTP fetch)"
 	@echo "  make bench-go         Go REST fetch (HTTP only, curl-based)"
 	@echo "                        (BENCH_START=$(BENCH_START), BENCH_COUNT=$(BENCH_COUNT))"
+	@echo ""
+	@echo "TEAL corpus parity (Phase 25):"
+	@echo "  make teal-corpus-fetch    Fetch the ARC56Registry and extract the corpus (network)"
+	@echo "  make teal-corpus-parity   Go-vs-Rust corpus comparison (TEAL_CORPUS_STAGES=disassemble)"
 	@echo ""
 	@echo "Archival Node:"
 	@echo "  make archival-up      Start archival Go node (docker)"

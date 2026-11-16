@@ -18,6 +18,11 @@ on:
       - "crates/tools/teal-corpus/**"
       - "crates/core/algo-avm/src/assembler.rs"
       - "crates/core/algo-avm/src/disassembler.rs"
+      - "crates/core/algo-avm/src/fields.rs"
+      - "crates/core/algo-avm/src/bytecode.rs"
+      - "crates/core/algo-avm/src/opcode.rs"
+      - "crates/core/algo-avm/tests/disassemble_go_parity.rs"
+      - "crates/core/algo-avm/tests/fixtures/disasm_go_parity.jsonl"
       - "crates/core/algo-avm/src/sourcemap.rs"
       - "scripts/teal-corpus/**"
       - ".github/workflows/teal-corpus-drivers.yml"
@@ -28,6 +33,11 @@ on:
       - "crates/tools/teal-corpus/**"
       - "crates/core/algo-avm/src/assembler.rs"
       - "crates/core/algo-avm/src/disassembler.rs"
+      - "crates/core/algo-avm/src/fields.rs"
+      - "crates/core/algo-avm/src/bytecode.rs"
+      - "crates/core/algo-avm/src/opcode.rs"
+      - "crates/core/algo-avm/tests/disassemble_go_parity.rs"
+      - "crates/core/algo-avm/tests/fixtures/disasm_go_parity.jsonl"
       - "crates/core/algo-avm/src/sourcemap.rs"
       - "scripts/teal-corpus/**"
       - ".github/workflows/teal-corpus-drivers.yml"
@@ -99,10 +109,24 @@ jobs:
           set -euo pipefail
           F=crates/tools/teal-corpus/tests/fixtures/small
           export GO_DRIVER="$RUNNER_TEMP/teal-corpus-go" RUST_DRIVER="$PWD/target/release/teal-corpus"
-          # On the fixture only the invalid inputs differ until #2367/#2368 land
-          # (the cargo tests rust_{assemble,disassemble}_rows_equal_the_go_driver_rows_except_*
-          # pin exactly which rows). Valid programs and sources must agree.
+          # Disassembly is exact (#2367): zero mismatches. On the assembler
+          # fixture only the invalid source differs until #2368/#2369 land (the
+          # cargo test rust_assemble_rows_equal_the_go_driver_rows_except_* pins
+          # exactly which row). Valid sources must agree.
           bash scripts/teal-corpus/run_drivers.sh "$F" "$RUNNER_TEMP/out" assemble || [ $? -eq 1 ]
-          bash scripts/teal-corpus/run_drivers.sh "$F" "$RUNNER_TEMP/out" disassemble || [ $? -eq 1 ]
           test "$(wc -l < "$RUNNER_TEMP/out/assemble.mismatches.jsonl")" -le 1
-          test "$(wc -l < "$RUNNER_TEMP/out/disassemble.mismatches.jsonl")" -le 2
+          bash scripts/teal-corpus/run_drivers.sh "$F" "$RUNNER_TEMP/out" disassemble
+
+      - name: Disassembly regression cases are not stale
+        run: |
+          set -euo pipefail
+          python3 scripts/teal-corpus/disasm_fixtures.py --check --go-driver "$RUNNER_TEMP/teal-corpus-go"
+
+      - name: Disassembly parity on a synthetic adversarial corpus
+        run: |
+          set -euo pipefail
+          export GO_DRIVER="$RUNNER_TEMP/teal-corpus-go" RUST_DRIVER="$PWD/target/release/teal-corpus"
+          # Every opcode byte at every version, every immediate byte value (at
+          # v8), random and truncated programs: zero mismatches, panics, timeouts.
+          python3 scripts/teal-corpus/gen_synthetic.py "$RUNNER_TEMP/syn" --sweep-versions 8 --random 5000
+          bash scripts/teal-corpus/run_drivers.sh "$RUNNER_TEMP/syn" "$RUNNER_TEMP/synout" disassemble

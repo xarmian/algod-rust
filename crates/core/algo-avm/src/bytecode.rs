@@ -653,14 +653,14 @@ fn read_byte(data: &[u8], pos: usize) -> Result<u8, AlgoError> {
 /// `TestAssembleDisassembleErrors`. Opcodes not listed here (or a position
 /// beyond the listed slice) fall back to the older generic "unexpected end
 /// of program at offset N" wording rather than guessing a wrong letter.
-fn uint8_immediate_names(op_name: &str) -> Option<&'static [&'static str]> {
+pub(crate) fn uint8_immediate_names(op_name: &str) -> Option<&'static [&'static str]> {
     Some(match op_name {
         "ecdsa_verify" | "ecdsa_pk_decompress" | "ecdsa_pk_recover" => &["v"],
         "intc" | "bytec" => &["i"],
         "arg" => &["n"],
         "txn" | "global" | "gtxns" | "itxn" | "itxn_field" | "txnas" | "gtxnsas" | "itxnas"
         | "block" | "asset_holding_get" | "asset_params_get" | "app_params_get"
-        | "acct_params_get" | "voter_params_get" => &["f"],
+        | "app_params_set" | "acct_params_get" | "voter_params_get" => &["f"],
         "load" | "store" | "gloads" => &["i"],
         "gaid" => &["t"],
         "bury" | "popn" | "dupn" | "dig" | "cover" | "uncover" => &["n"],

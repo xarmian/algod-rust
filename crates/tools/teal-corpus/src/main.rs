@@ -146,12 +146,15 @@ fn main() {
                     std::process::exit(2);
                 }
                 eprintln!(
-                    "diff {}: {} rows compared, {} mismatches",
+                    "diff {}: {} rows compared, {} identical, {} both-error-identical, {} mismatches, {} panics/timeouts",
                     rep.operation,
                     rep.compared,
-                    rep.mismatches.len()
+                    rep.identical,
+                    rep.both_error_identical,
+                    rep.mismatches.len(),
+                    rep.robustness_failures
                 );
-                i32::from(!rep.mismatches.is_empty())
+                i32::from(!rep.mismatches.is_empty() || rep.robustness_failures > 0)
             }
         },
     };
