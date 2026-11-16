@@ -1,0 +1,22 @@
+[package]
+name = "teal-corpus"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Offline Rust batch driver for the Phase 25 TEAL corpus parity check (#2366, epic #2364): disassemble/assemble a corpus into a JSONL schema shared with tools/teal-corpus, plus the diff command"
+publish = false
+
+[[bin]]
+name = "teal-corpus"
+path = "src/main.rs"
+
+[dependencies]
+algo-avm.workspace = true
+algo-types.workspace = true
+sha2.workspace = true
+hex.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true

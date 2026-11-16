@@ -6008,6 +6008,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "teal-corpus"
+version = "0.1.0"
+dependencies = [
+ "algo-avm",
+ "algo-types",
+ "base64 0.23.1",
+ "clap",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
