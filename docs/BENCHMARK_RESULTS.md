@@ -35,8 +35,10 @@ with `report.py --publish` (see [Regression detection](#regression-detection-and
   it proves that real certificates authenticate identically on both sides and
   says little about steady-state apply speed. The Rust replay is bounded at the
   corpus's last round since #2342 (it used to spend about 0.5 s probing the tip
-  after the last block, which go's bare apply loop has no counterpart of); Go is
-  now 1.25x ahead on wall clock (0.125 s vs 0.155 s, `RUNS=10`).
+  after the last block, which go's bare apply loop has no counterpart of) and
+  authenticates the next round's certificate on a helper thread while the
+  current round is applied, as go does in its fetching goroutines (#2339);
+  Rust is now 1.16x ahead on wall clock (0.0997 s vs 0.115 s, `RUNS=10`).
 - **Not in this baseline.** The `catchup` tier (public network, hours, not
   reproducible), the full `rest`/`localnet` ladders, and replay of the large
   (~1M transaction) corpus (the decision on how to publish it is pending). The
@@ -62,8 +64,10 @@ tier" table; in words (figures are medians of the tables below):
   wall (Rust 1.43x faster, was Go 3.6x faster in the first baseline). Rust
   uses 3.1x less CPU time and 6.2x less peak RSS; it writes 2.3x more bytes
   (154.5 vs 66 MB, #2316) into a 1.13x larger database.
-- **replay, testnet-prefix50** (re-run after #2342, `RUNS=10`): Go 0.125 s, Rust
-  0.155 s (1.25x slower, was 5.1x); Rust CPU 2.2x lower. Owner: #2339.
+- **replay, testnet-prefix50** (re-run after #2339, `RUNS=10`): Go 0.115 s, Rust
+  0.0997 s (Rust 1.16x faster, was 5.1x slower); Rust CPU 2.5x lower, peak RSS
+  4.2x lower. Go is ahead only on the fixed database/write overhead (`db_mb`
+  3.8 vs 0.8 MB, `write_mb` 4.3 vs 2.2 MB, tiny absolute numbers).
 - **rest (smoke, c4)**: Rust is ahead on most endpoints' latency/throughput
   rows and level on the rest; `simulate` (4.6x behind in the first baseline) is
   level. The only Go-faster row is `account_hot` p50 (0.288 vs 0.296 ms, 1.03x,
@@ -327,22 +331,22 @@ Command: `make bench-compare TIERS=replay CORPUS=testnet-prefix50 RUNS=10`
 
 | Tier | Paired rows | Rust faster | Go faster | Inconclusive |
 |---|---|---|---|---|
-| replay | 7 | 2 | 5 | 0 |
+| replay | 7 | 5 | 2 | 0 |
 
 7 paired row(s) in total; 0 paired row(s) excluded from the baseline file (every paired row is kept, including rows whose Go or Rust median is 0). Counts come from the tables below.
 
-Generated 2026-11-15T21:27:22Z. Methodology and fairness rules: [docs/BENCHMARK_COMPARISON.md](https://github.com/xarmian/algod-rust/blob/main/docs/BENCHMARK_COMPARISON.md).
+Generated 2026-11-16T12:19:10Z. Methodology and fairness rules: [docs/BENCHMARK_COMPARISON.md](https://github.com/xarmian/algod-rust/blob/main/docs/BENCHMARK_COMPARISON.md).
 
-**Status: OK.** 7 paired row(s): Rust faster 2, Go faster 5, inconclusive 0; 0 unpaired.
+**Status: OK.** 7 paired row(s): Rust faster 5, Go faster 2, inconclusive 0; 0 unpaired.
 
 #### Builds
 
 | | go-algorand | algod-rust |
 |---|---|---|
-| Commit | `31186e99a69e74483ad95e9ce872903b74758abf` | `d263d96974d9cf1d05e4467aa1bb78f4fdb32f76` |
-| Describe | `v5.0.5-stable` | `d263d969` |
+| Commit | `31186e99a69e74483ad95e9ce872903b74758abf` | `e5325a98f62629aef4864f548c489fe2d49d2956` |
+| Describe | `v5.0.5-stable` | `e5325a98` |
 | Pin | expected `v5.0.5-stable`, matches | |
-| Dirty tree | no | yes |
+| Dirty tree | no | no |
 | Binaries | go/algod, go/goal | rust/algod-rust |
 
 #### Environment
@@ -366,7 +370,6 @@ Generated 2026-11-15T21:27:22Z. Methodology and fairness rules: [docs/BENCHMARK_
 Fairness warnings:
 
 - virtualised CPU (Microsoft): noisy neighbours can skew results
-- algod-rust working tree has uncommitted changes
 
 #### Results
 
@@ -374,13 +377,13 @@ Fairness warnings:
 
 | Benchmark | Unit | Go median | Go spread | Rust median | Rust spread | Rust/Go | Faster |
 |---|---|---|---|---|---|---|---|
-| testnet-prefix50/blocks_per_s | block/s (higher is better) | 401.5 | [392.8, 413.2] 95% CI, n=10 | 322.2 | [317.5, 325.6] 95% CI, n=10 | 0.8024 | **Go** 1.246x |
-| testnet-prefix50/cpu_s | s (lower is better) | 1.128 | [1.091, 1.161] 95% CI, n=10 | 0.5211 | [0.5059, 0.534] 95% CI, n=10 | 0.4618 | **Rust** 2.165x |
+| testnet-prefix50/blocks_per_s | block/s (higher is better) | 434.1 | [426.5, 444.1] 95% CI, n=10 | 501.6 | [481.8, 507.4] 95% CI, n=10 | 1.156 | **Rust** 1.156x |
+| testnet-prefix50/cpu_s | s (lower is better) | 0.9634 | [0.9129, 0.999] 95% CI, n=10 | 0.393 | [0.3809, 0.4084] 95% CI, n=10 | 0.408 | **Rust** 2.451x |
 | testnet-prefix50/db_mb | MB (lower is better) | 0.8244 | [0.8244, 0.8244] 95% CI, n=10 | 3.842 | [3.842, 3.842] 95% CI, n=10 | 4.66 | **Go** 4.66x |
-| testnet-prefix50/peak_rss_mb | MB (lower is better) | 139.7 | [139.2, 142.4] 95% CI, n=10 | 32.74 | [32.63, 32.93] 95% CI, n=10 | 0.2343 | **Rust** 4.267x |
-| testnet-prefix50/txns_per_s | txn/s (higher is better) | 8.03 | [7.856, 8.264] 95% CI, n=10 | 6.444 | [6.351, 6.512] 95% CI, n=10 | 0.8024 | **Go** 1.246x |
-| testnet-prefix50/wall_s | s (lower is better) | 0.1245 | [0.121, 0.1273] 95% CI, n=10 | 0.1552 | [0.1536, 0.1575] 95% CI, n=10 | 1.246 | **Go** 1.246x |
-| testnet-prefix50/write_mb | MB (lower is better) | 2.16 | [2.145, 2.199] 95% CI, n=10 | 4.297 | [4.297, 4.297] 95% CI, n=10 | 1.989 | **Go** 1.989x |
+| testnet-prefix50/peak_rss_mb | MB (lower is better) | 140.3 | [139.3, 145.6] 95% CI, n=10 | 33.58 | [33.32, 33.95] 95% CI, n=10 | 0.2394 | **Rust** 4.178x |
+| testnet-prefix50/txns_per_s | txn/s (higher is better) | 8.682 | [8.53, 8.882] 95% CI, n=10 | 10.03 | [9.637, 10.15] 95% CI, n=10 | 1.156 | **Rust** 1.156x |
+| testnet-prefix50/wall_s | s (lower is better) | 0.1152 | [0.1126, 0.1172] 95% CI, n=10 | 0.09968 | [0.09854, 0.1038] 95% CI, n=10 | 0.8654 | **Rust** 1.156x |
+| testnet-prefix50/write_mb | MB (lower is better) | 2.16 | [2.137, 2.18] 95% CI, n=10 | 4.297 | [4.297, 4.297] 95% CI, n=10 | 1.989 | **Go** 1.989x |
 
 Rust/Go is the ratio of the medians. For lower-is-better units a value below 1 means Rust is faster; for higher-is-better units a value above 1 means Rust is faster. A side is only marked faster when the two spreads (95% CI of the median for n >= 6, else min/max) do not overlap. Rows marked (synthetic) come from the selftest tier and measure the harness, not either node.
 
@@ -388,8 +391,8 @@ Rust/Go is the ratio of the medians. For lower-is-better units a value below 1 m
 
 | Tier | Exit | Duration (s) |
 |---|---|---|
-| build | 0 | 188 |
-| replay | 0 | 8.799 |
+| build | 0 | 158.7 |
+| replay | 0 | 7.427 |
 <!-- bench-baseline:end local-testnet-prefix50 -->
 
 ## Open findings from the epic
@@ -406,7 +409,7 @@ Every row where Go is faster with non-overlapping ranges, and who owns it
 | Row (Go faster) | Ratio | Owner / reason |
 |---|---|---|
 | `replay small` `write_mb`, `db_mb` | 2.34x, 1.13x | [#2316](https://github.com/xarmian/algod-rust/issues/2316): the tracker WAL (about 140 of 154 MB) is written once and checkpointed; block-device writes in the `localnet` tier are 37x lower than go's |
-| `replay testnet-prefix50` wall, blocks/s, `write_mb` | 1.25x, 1.25x, 1.99x | [#2339](https://github.com/xarmian/algod-rust/issues/2339): certificate authentication and startup (was 5.07x before #2342 removed the tip-probe sleeps from the timed section) |
+| `replay testnet-prefix50` `db_mb`, `write_mb` | 4.66x, 1.99x | [#2316](https://github.com/xarmian/algod-rust/issues/2316): fixed schema/index overhead of a 50-block database (3.8 vs 0.8 MB, 4.3 vs 2.2 MB); wall clock is no longer a Go-faster row (#2339) |
 | `micro avm/app-state-box` | 1.26x | [#2320](https://github.com/xarmian/algod-rust/issues/2320): per-call setup costs (bytecode parse, machine construction, allocation) |
 | `micro agreement/sortition-select-f128` | 1.22x | [#2321](https://github.com/xarmian/algod-rust/issues/2321): software f128; measured, division is not the lever (PERF_PHASE23.md row 9) |
 | `rest account_hot` p50 | 1.03x | [#2340](https://github.com/xarmian/algod-rust/issues/2340) |
