@@ -95,7 +95,9 @@ impl RuntimeMetricsSnapshot {
     /// Sample the current process's counters via `sysinfo`.
     pub fn capture() -> Self {
         let pid = Pid::from_u32(std::process::id());
-        let mut sys = System::new();
+        let Ok(mut sys) = System::new() else {
+            return Self::default();
+        };
         sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
         match sys.process(pid) {
             Some(proc) => Self {
@@ -183,11 +185,13 @@ pub struct NetDevMetricsSnapshot {
 impl NetDevMetricsSnapshot {
     /// Sample every network interface's cumulative counters via `sysinfo`.
     pub fn capture() -> Self {
-        let networks = Networks::new_with_refreshed_list();
+        let Ok(networks) = Networks::new_with_refreshed_list() else {
+            return Self::default();
+        };
         let mut interfaces: Vec<NetDevInterface> = networks
             .iter()
             .map(|(name, data)| NetDevInterface {
-                name: name.clone(),
+                name: name.to_string_lossy().into_owned(),
                 bytes_received: data.total_received(),
                 bytes_sent: data.total_transmitted(),
             })
