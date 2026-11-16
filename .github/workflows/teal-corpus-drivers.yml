@@ -79,7 +79,7 @@ jobs:
           go test ./...
 
       - name: Build the Go driver
-        run: tools/teal-corpus/build.sh "$RUNNER_TEMP/teal-corpus-go"
+        run: bash tools/teal-corpus/build.sh "$RUNNER_TEMP/teal-corpus-go"
 
       - name: Build the Rust driver
         run: cargo build -p teal-corpus --release
@@ -102,7 +102,7 @@ jobs:
           # On the fixture only the invalid inputs differ until #2367/#2368 land
           # (the cargo tests rust_{assemble,disassemble}_rows_equal_the_go_driver_rows_except_*
           # pin exactly which rows). Valid programs and sources must agree.
-          scripts/teal-corpus/run_drivers.sh "$F" "$RUNNER_TEMP/out" assemble || [ $? -eq 1 ]
-          scripts/teal-corpus/run_drivers.sh "$F" "$RUNNER_TEMP/out" disassemble || [ $? -eq 1 ]
+          bash scripts/teal-corpus/run_drivers.sh "$F" "$RUNNER_TEMP/out" assemble || [ $? -eq 1 ]
+          bash scripts/teal-corpus/run_drivers.sh "$F" "$RUNNER_TEMP/out" disassemble || [ $? -eq 1 ]
           test "$(wc -l < "$RUNNER_TEMP/out/assemble.mismatches.jsonl")" -le 1
           test "$(wc -l < "$RUNNER_TEMP/out/disassemble.mismatches.jsonl")" -le 2
