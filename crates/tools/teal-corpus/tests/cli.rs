@@ -164,20 +164,16 @@ fn diff_against_go(op: &str) -> (Option<i32>, Vec<Value>) {
     (r.status.code(), rows(&m))
 }
 
-/// Known assembler difference the drivers surface on the invalid fixture
-/// source: go quotes the unknown opcode (`unknown opcode: frobnicate`, the
-/// Rust assembler `unknown opcode: "frobnicate"`) and reports column 4 for the
-/// `byte` argument error where Rust reports 0. Fixing it is #2368/#2369's job;
-/// when it lands this test must tighten to an empty mismatch list. The valid
-/// and warning sources must already agree on bytecode, hash, source map and
-/// warnings.
+/// Assembly parity on the fixture corpus: the valid sources, the warning source
+/// and the invalid source (go quotes nothing in `unknown opcode: frobnicate` and
+/// blames column 4 of `byte` for its missing argument) all match go row for
+/// row. The regression cases live in `algo-avm/tests/assemble_go_parity.rs`
+/// (#2368) and the full-registry run in `scripts/teal-corpus/run_drivers.sh`.
 #[test]
-fn rust_assemble_rows_equal_the_go_driver_rows_except_the_known_invalid_source() {
+fn rust_assemble_rows_equal_the_go_driver_rows() {
     let (code, ms) = diff_against_go("assemble");
-    let shas: Vec<&str> = ms.iter().map(|m| m["sha256"].as_str().unwrap()).collect();
-    assert_eq!(code, Some(1));
-    assert_eq!(shas, [SRC_INVALID], "{ms:?}");
-    assert_eq!(ms[0]["field"], "errors");
+    assert_eq!(code, Some(0), "{ms:?}");
+    assert!(ms.is_empty(), "{ms:?}");
 }
 
 /// Disassembly parity on the fixture corpus: the valid programs, the

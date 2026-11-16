@@ -182,6 +182,8 @@ struct LabelReference {
     label: String,
     /// Line number for error reporting.
     line: usize,
+    /// Column of the label token, which go blames for every label error.
+    col: usize,
     /// End of the full instruction containing this label ref (for offset computation).
     offset_position: usize,
     /// `true` for a varint-encoded branch (`bnz`/`bz`/`b`/`callsub` at
@@ -277,75 +279,19 @@ pub struct OpStream {
     auto_salt_line: usize,
 
     /// Static stack-type-tracking state (issue #829). Mirrors a slice of
-    /// go-algorand's `ProgramKnowledge.stack` -- the types statically known
-    /// to be on the value stack at the current point in a straight-line
-    /// instruction sequence. See the `type_track` module docs for exactly
-    /// what this incremental pass covers.
-    pub(crate) type_stack: Vec<type_track::StackType>,
-    /// Parallel to [`Self::type_stack`] (always the same length): the
-    /// compile-time-constant `u64` value of the corresponding tracked stack
-    /// entry, when known. Mirrors the narrow slice of go-algorand's
-    /// `StackType.Bound`/`constInt()` (`eval.go:944-1024`) this pass needs --
-    /// just enough to recognize a literal `int N` value sitting under
-    /// `loads`/`stores` so their scratch-slot index can be resolved exactly
-    /// (`typeLoads`/`typeStores`, `assembler.go:1555-1619`), not go's full
-    /// `[min,max]` bound propagation through arithmetic (that remains
-    /// deferred -- see the `type_track` module docs' "Bounds-refined types"
-    /// section). `Some(v)` only for a value just pushed by a literal `int v`
-    /// (base-10-parseable, mirroring `typePushInt`'s
-    /// `strconv.ParseUint(..., 10, 64)`); `None` for everything else,
-    /// including every opcode's *result* (this pass never re-derives a
-    /// constant from an operation, only from the literal push itself).
-    pub(crate) type_stack_const: Vec<Option<u64>>,
-    /// The statically known type of each of the 256 scratch slots. Mirrors
-    /// go-algorand's `ProgramKnowledge.scratchSpace` (`assembler.go:334`).
-    /// Starts as [`type_track::StackType::Uint64`] for every slot (mirrors
-    /// `newOpStream`'s `o.known.scratchSpace[i] = StackZeroUint64`,
-    /// `assembler.go:300-302` -- an untouched scratch slot reads as the
-    /// zero-valued uint64 at runtime) and is reset to
-    /// [`type_track::StackType::Any`] for every slot -- never back to
-    /// `Uint64` -- at the same points [`Self::type_track_bottom_permissive`]
-    /// is set (mirrors `ProgramKnowledge.reset`, `assembler.go:371-380`,
-    /// called from `label()`/the `callsub` reopening -- see
-    /// [`type_track::track_instruction`] and the label-handling code in
-    /// [`assemble_string`]).
-    pub(crate) scratch_space: [type_track::StackType; 256],
-    /// Once set, `type_track::track_instruction` stops tracking (and
-    /// stops reporting type errors) for the rest of the program. Set on
-    /// any opcode this slice doesn't model precisely enough to keep the
-    /// tracked stack height in sync with the real one (e.g. `txn`'s
-    /// arity-dependent dispatch, `match`'s dynamic label count). Unlike
-    /// [`Self::type_track_deadcode`], this never turns back off.
-    pub(crate) type_track_disabled: bool,
-    /// Mirrors go-algorand's `ProgramKnowledge.deadcode`
-    /// (`assembler.go:323-325`): set after an opcode that unconditionally
-    /// ends or diverts control flow (`b`, `retsub`, `err`, `return`, or
-    /// `callsub` before it immediately reopens analysis -- see
-    /// [`type_track::track_instruction`]). While set, `track_instruction`
-    /// skips all type checking and stack-effect tracking (the tracked
-    /// stack is left empty), matching go's `trackStack`'s
-    /// `if ops.known.deadcode { return }`. Cleared -- along with setting
-    /// [`Self::type_track_bottom_permissive`] -- the next time a label is
-    /// reached, mirroring `ProgramKnowledge.label`/`reset`.
-    pub(crate) type_track_deadcode: bool,
-    /// Mirrors go-algorand's `ProgramKnowledge.bottom` becoming `StackAny`
-    /// after a `reset()` (`assembler.go:314-321,371-380`): once set, a
-    /// stack-height/arg-count check that would otherwise fail because the
-    /// tracked stack doesn't (yet) have enough real entries is treated as
-    /// satisfied by an implicit, unlimited supply of
-    /// [`type_track::StackType::Any`] underneath it, instead of being
-    /// reported as a "wrong number of stack arguments" error. This is what
-    /// lets analysis safely resume after a label or `callsub` without
-    /// knowing what the incoming stack actually looked like. Never cleared
-    /// once set (matches go: `bottom` only ever moves from `StackNone` to
-    /// `StackAny`, never back).
-    pub(crate) type_track_bottom_permissive: bool,
+    /// go-algorand's `ProgramKnowledge` (the tracked stack, `bottom`,
+    /// `deadcode`, frame pointer and scratch-space types), see
+    /// [`type_track`].
+    pub(crate) known: type_track::Knowledge,
+    /// Column of the current statement's mnemonic token, and of each of its
+    /// argument tokens, so assembly errors can name the token go blames.
+    pub(crate) stmt_col: usize,
+    pub(crate) arg_cols: Vec<usize>,
     /// Whether a type mismatch found by [`type_track::track_instruction`]
     /// is actually *reported* as an assembly error. Mirrors go-algorand's
     /// `OpStream.typeTracking` (`assembler.go:256,294`, default `true`),
-    /// toggled by `#pragma typetrack true|false`. Unlike
-    /// [`Self::type_track_disabled`], this does **not** stop the pass from
-    /// running -- the tracked stack (and scratch-space state) keeps
+    /// toggled by `#pragma typetrack true|false`. It does **not** stop the
+    /// pass from running -- the tracked stack (and scratch-space state) keeps
     /// evolving underneath even while reporting is off, exactly like go's
     /// `trackStack` unconditionally popping/pushing `ops.known.stack`
     /// (`assembler.go:2056-2096`) and only `typeErrorf`
@@ -379,12 +325,9 @@ impl OpStream {
             has_stateful_ops: false,
             auto_salt: AutoSaltMode::Unset,
             auto_salt_line: 0,
-            type_stack: Vec::new(),
-            type_stack_const: Vec::new(),
-            scratch_space: [type_track::StackType::Uint64; 256],
-            type_track_disabled: false,
-            type_track_deadcode: false,
-            type_track_bottom_permissive: false,
+            known: type_track::Knowledge::new(),
+            stmt_col: 0,
+            arg_cols: Vec::new(),
             type_track_reporting: true,
         }
     }
@@ -410,6 +353,11 @@ impl OpStream {
         } else {
             self.version
         }
+    }
+
+    /// Column of argument token `i` of the current statement (0 when absent).
+    pub(crate) fn arg_col(&self, i: usize) -> usize {
+        self.arg_cols.get(i).copied().unwrap_or(0)
     }
 
     pub(crate) fn record_error(&mut self, line: usize, col: usize, msg: String) {
@@ -454,7 +402,7 @@ impl OpStream {
             _ => {
                 self.record_error(
                     self.source_line,
-                    0,
+                    self.arg_col(0),
                     "cannot have more than 256 int constants".into(),
                 );
             }
@@ -470,7 +418,7 @@ impl OpStream {
             if self.cnt_intc_block > 0 {
                 self.record_error(
                     self.source_line,
-                    0,
+                    self.arg_col(0),
                     format!("value {val} does not appear in existing intcblock"),
                 );
                 return;
@@ -502,7 +450,7 @@ impl OpStream {
             _ => {
                 self.record_error(
                     self.source_line,
-                    0,
+                    self.arg_col(0),
                     "cannot have more than 256 byte constants".into(),
                 );
             }
@@ -522,7 +470,7 @@ impl OpStream {
             if self.cnt_bytec_block > 0 {
                 self.record_error(
                     self.source_line,
-                    0,
+                    self.arg_col(0),
                     format!(
                         "value 0x{} does not appear in existing bytecblock",
                         hex::encode(&val)
@@ -661,7 +609,7 @@ impl OpStream {
                     if !reported.contains(&lr.label) {
                         self.errors.push(AssemblyError {
                             line: lr.line,
-                            col: 0,
+                            col: lr.col,
                             message: format!("reference to undefined label {:?}", lr.label),
                         });
                         reported.insert(lr.label.clone());
@@ -673,7 +621,7 @@ impl OpStream {
             if self.version < BACK_BRANCH_ENABLED_VERSION && dest < lr.offset_position {
                 self.errors.push(AssemblyError {
                     line: lr.line,
-                    col: 0,
+                    col: lr.col,
                     message: format!(
                         "label {:?} is a back reference, back jump support was introduced in v4",
                         lr.label,
@@ -690,7 +638,7 @@ impl OpStream {
             if self.version <= 1 && dest == raw.len() {
                 self.errors.push(AssemblyError {
                     line: lr.line,
-                    col: 0,
+                    col: lr.col,
                     message: format!("label {:?} is too far away", lr.label),
                 });
                 continue;
@@ -705,7 +653,7 @@ impl OpStream {
                     // at assembly time -- matches go-algorand's resolveLabels.
                     self.errors.push(AssemblyError {
                         line: lr.line,
-                        col: 0,
+                        col: lr.col,
                         message: format!("branch to start of same instruction: {:?} ", lr.label),
                     });
                     continue;
@@ -724,7 +672,7 @@ impl OpStream {
                 if jump < -limit || jump >= limit {
                     self.errors.push(AssemblyError {
                         line: lr.line,
-                        col: 0,
+                        col: lr.col,
                         message: format!("label {:?} is too far away", lr.label),
                     });
                     continue;
@@ -740,7 +688,7 @@ impl OpStream {
                     // program text either way.
                     self.errors.push(AssemblyError {
                         line: lr.line,
-                        col: 0,
+                        col: lr.col,
                         message: format!(
                             "internal error: branch varint size mismatch for label {:?}",
                             lr.label
@@ -756,7 +704,7 @@ impl OpStream {
             if !(-0x8000..=0x7fff).contains(&jump) {
                 self.errors.push(AssemblyError {
                     line: lr.line,
-                    col: 0,
+                    col: lr.col,
                     message: format!("label {:?} is too far away", lr.label),
                 });
                 continue;
@@ -996,8 +944,14 @@ impl OpStream {
     /// `prependCBlocks` (`assembler.go`).
     fn prepend_cblocks(&self) -> (Vec<u8>, usize) {
         let mut pre = Vec::new();
-        // Version byte
-        pre.push(self.version);
+        // Version header: go writes `ops.Version` as a uvarint; a program
+        // that never settled its version keeps `assemblerNoVersion`
+        // (`^uint64(0)`).
+        if self.version == ASSEMBLER_NO_VERSION {
+            write_varuint_to_vec(&mut pre, u64::MAX);
+        } else {
+            pre.push(self.version);
+        }
 
         if !self.intc.is_empty() && self.cnt_intc_block == 0 {
             pre.push(0x20); // intcblock opcode
@@ -1531,11 +1485,7 @@ fn handle_pragma(ops: &mut OpStream, tokens: &[&str], version_set: &mut bool) {
             // `TestTypeTracking`'s "consecutively does _not_
             // reset" case.
             if !was_reporting && on {
-                ops.type_stack.clear();
-                ops.type_stack_const.clear();
-                ops.scratch_space = [type_track::StackType::Any; 256];
-                ops.type_track_deadcode = false;
-                ops.type_track_bottom_permissive = true;
+                ops.known.reset();
             }
         } else {
             ops.record_error(
@@ -1568,43 +1518,28 @@ fn process_statement(ops: &mut OpStream, current: &[ColToken]) {
         // `createLabel` call site (`assembler.go:2192-2199`): checked
         // *before* the ordinary duplicate-label check, and skips creating
         // the label entirely on a conflict.
+        let label_col = current[0].0;
         if ops.macros.contains_key(label) {
             ops.record_error(
                 ops.source_line,
-                0,
+                label_col,
                 format!("Cannot create label with same name as macro: {label}"),
             );
-        } else if ops.labels.contains_key(label) {
-            ops.record_error(ops.source_line, 0, format!("duplicate label {:?}", label));
         } else {
+            if ops.labels.contains_key(label) {
+                ops.record_error(
+                    ops.source_line,
+                    label_col,
+                    format!("duplicate label {:?}", label),
+                );
+            }
+            // go's `createLabel` records the duplicate and still overwrites the
+            // label's position.
             ops.labels.insert(label.to_string(), ops.pending.len());
-        }
-        // A label is a possible entry point from elsewhere in the
-        // program (a branch target). Mirrors go-algorand's
-        // `ProgramKnowledge.label`/`reset` (assembler.go:364-380),
-        // called from `createLabel` (assembler.go:390): if the
-        // instructions since the last label unconditionally
-        // diverted control flow (`type_track_deadcode`), the
-        // knowledge accumulated up to here doesn't describe what's
-        // actually on the stack at this label, so analysis reopens
-        // with permissive "any" knowledge instead. Otherwise (a
-        // label reached by ordinary fallthrough, e.g. right after a
-        // conditional `bnz`/`bz`) go does *not* reset -- it simply
-        // trusts that whatever's tracked from the fallthrough path
-        // also describes any jump into this label, and keeps
-        // analyzing with the tracked stack as-is. See the
-        // `type_track` module docs for what's still deferred, and
-        // the `#pragma typetrack` handling above for the other spot
-        // this same reset shape (minus `type_track_disabled`, which
-        // the pragma never touches -- see its handling above) is
-        // triggered. Mirrors go's `ProgramKnowledge.reset`
-        // (`assembler.go:371-380`) resetting `scratchSpace` to
-        // `StackAny` for every slot alongside `bottom`/`deadcode` --
-        // see `Self::scratch_space`'s doc comment.
-        if !ops.type_track_disabled && ops.type_track_deadcode {
-            ops.type_track_deadcode = false;
-            ops.type_track_bottom_permissive = true;
-            ops.scratch_space = [type_track::StackType::Any; 256];
+            // go's `createLabel` ends with `ops.known.label()`: a label is a
+            // possible entry point from elsewhere, so knowledge gathered in
+            // dead code no longer describes the stack here.
+            ops.known.label();
         }
         tok_idx = 1;
         if tok_idx >= current.len() {
@@ -1623,8 +1558,13 @@ fn process_statement(ops: &mut OpStream, current: &[ColToken]) {
     // token (after any leading label has been consumed), not a hardcoded
     // 0 -- see issue #1394.
     let col = current[tok_idx].0;
+    ops.stmt_col = col;
+    ops.arg_cols = current[tok_idx + 1..].iter().map(|s| s.0).collect();
     ops.record_source_location(ops.source_line, col);
-    type_track::track_instruction(ops, mnemonic, &args);
+    pseudo_get_spec_errors(ops, mnemonic, &args);
+    type_track::track_instruction(ops, col, mnemonic, &args, &|a| {
+        parse_binary_args(a).ok().map(|(v, _)| v.len())
+    });
     assemble_instruction(ops, mnemonic, &args);
 }
 
@@ -1699,18 +1639,11 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
         }
     }
 
-    if !version_set && ops.version == ASSEMBLER_NO_VERSION {
-        ops.version = ASSEMBLER_DEFAULT_VERSION;
-    }
-
-    // Empty program check (comment-only or pragma-only programs)
-    if ops.pending.is_empty() && ops.errors.is_empty() {
-        ops.record_error(
-            0,
-            0,
-            "empty program; at least one instruction is required".into(),
-        );
-    }
+    // go has no "empty program" error beyond the empty *text* check above: a
+    // program of only pragmas and comments assembles to just its version
+    // header. When no instruction settled the version either, go keeps
+    // `assemblerNoVersion` (`^uint64(0)`) and writes that as the header's
+    // uvarint (`prependCBlocks`).
 
     // Constant optimization for v4+
     if ops.version >= OPTIMIZE_CONSTANTS_ENABLED_VERSION {
@@ -1760,6 +1693,7 @@ fn assemble_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
         "intcblock" => asm_intc_block(ops, args),
         "bytecblock" => asm_bytec_block(ops, args),
         "txn" | "gtxn" | "gtxns" | "replace" | "extract" => asm_pseudo_arity(ops, mnemonic, args),
+        "substring" => asm_substring(ops, args),
         _ => asm_regular(ops, mnemonic, args),
     }
 }
@@ -1839,53 +1773,67 @@ fn join_immediate_counts(counts: &[usize]) -> String {
     msg
 }
 
-/// Assemble a `txn`/`gtxn`/`gtxns`/`replace`/`extract` pseudo-op, dispatching
-/// by immediate count to the real opcode -- the scalar opcode or its
-/// array-indexed (`txna`/`gtxna`/`gtxnsa`) sibling, `replace3`/`replace2`, or
-/// `extract3`/`extract` -- per go-algorand's `pseudoOps` table
-/// (assembler.go:1804-1816).
-fn asm_pseudo_arity(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
+/// go's `getSpec` complaints about a pseudo-op (assembler.go:1735-1773): an
+/// immediate count matching no spec (`pseudoImmediatesError`), or a dispatched-to
+/// opcode newer than the program version. They are recorded before the
+/// instruction's type tracking, like go (`getSpec` runs first).
+fn pseudo_get_spec_errors(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
     let table = pseudo_arity_table(mnemonic);
+    if table.is_empty() {
+        return;
+    }
     match table.iter().find(|(n, _)| *n == args.len()) {
         Some(&(_, target)) => {
-            let spec = match opcode::lookup_by_name(target) {
-                Some(s) => s,
-                None => {
-                    ops.record_error(ops.source_line, 0, format!("unknown opcode: {:?}", target));
-                    return;
+            if let Some(spec) = opcode::lookup_by_name(target) {
+                if spec.version > ops.effective_version() {
+                    let phrase = match args.len() {
+                        0 => "no immediates".to_string(),
+                        1 => "1 immediate".to_string(),
+                        n => format!("{n} immediates"),
+                    };
+                    ops.record_error(
+                        ops.source_line,
+                        ops.stmt_col,
+                        format!(
+                            "{mnemonic} opcode with {phrase} was introduced in v{}",
+                            spec.version
+                        ),
+                    );
                 }
-            };
-            // go's getSpec (assembler.go:1756-1759): version-gate under the
-            // pseudo mnemonic, citing the immediate count that was used --
-            // e.g. "txn opcode with 2 immediates was introduced in v2".
-            if spec.version > ops.effective_version() {
-                let phrase = if args.len() == 1 {
-                    "1 immediate".to_string()
-                } else {
-                    format!("{} immediates", args.len())
-                };
-                ops.record_error(
-                    ops.source_line,
-                    0,
-                    format!(
-                        "{mnemonic} opcode with {phrase} was introduced in v{}",
-                        spec.version
-                    ),
-                );
-                return;
             }
-            asm_regular_named(ops, target, mnemonic, args);
         }
         None => {
             // go's pseudoImmediatesError (assembler.go:1722-1730).
             let counts: Vec<usize> = table.iter().map(|(n, _)| *n).collect();
             ops.record_error(
                 ops.source_line,
-                0,
+                ops.stmt_col,
                 format!("{mnemonic} expects {}", join_immediate_counts(&counts)),
             );
         }
     }
+}
+
+/// Assemble a `txn`/`gtxn`/`gtxns`/`replace`/`extract` pseudo-op, dispatching
+/// on the immediate count. Its `getSpec` errors were already recorded by
+/// [`pseudo_get_spec_errors`].
+fn asm_pseudo_arity(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
+    let table = pseudo_arity_table(mnemonic);
+    let Some(&(_, target)) = table.iter().find(|(n, _)| *n == args.len()) else {
+        return;
+    };
+    let Some(spec) = opcode::lookup_by_name(target) else {
+        ops.record_error(
+            ops.source_line,
+            ops.stmt_col,
+            format!("unknown opcode: {target}"),
+        );
+        return;
+    };
+    if spec.version > ops.effective_version() {
+        return;
+    }
+    asm_regular_named(ops, target, mnemonic, args);
 }
 
 /// Parses a `#pragma autosalt`/`#pragma typetrack`-style boolean value.
@@ -1901,16 +1849,18 @@ fn parse_pragma_bool(s: &str) -> Option<bool> {
 
 fn asm_int(ops: &mut OpStream, args: &[&str]) {
     if args.len() != 1 {
-        ops.record_error(
-            ops.source_line,
-            0,
-            "int expects 1 immediate argument".into(),
-        );
+        record_arg_count_error(ops, "int", args, 1);
         return;
     }
 
-    // After backBranchEnabledVersion, if there's a manual cblock, use pushint
+    // After backBranchEnabledVersion, control flow is confusing, so if there's
+    // a manual cblock, use push instead of trying to use what's given.
     if ops.cnt_intc_block > 0 && ops.version >= BACK_BRANCH_ENABLED_VERSION {
+        ops.record_warning(
+            ops.source_line,
+            ops.arg_col(0),
+            format!("int {} used with explicit intcblock. must pushint", args[0]),
+        );
         asm_push_int(ops, args);
         return;
     }
@@ -1921,75 +1871,59 @@ fn asm_int(ops: &mut OpStream, args: &[&str]) {
         }
         ops.record_error(
             ops.source_line,
-            0,
+            ops.stmt_col,
             format!("int {} used with manual intcblocks. Use intc.", args[0]),
         );
         return;
     }
 
-    // Check named constants
-    if let Some(val) = parse_named_int(args[0]) {
-        ops.int_literal(val);
-        return;
-    }
-
-    match args[0].parse::<u64>() {
-        Ok(val) => ops.int_literal(val),
-        Err(_) => {
-            // Try parsing with 0x prefix
-            if args[0].starts_with("0x") || args[0].starts_with("0X") {
-                match u64::from_str_radix(&args[0][2..], 16) {
-                    Ok(val) => ops.int_literal(val),
-                    Err(_) => ops.record_error(
-                        ops.source_line,
-                        0,
-                        format!("unable to parse {:?} as integer", args[0]),
-                    ),
-                }
-            } else {
-                ops.record_error(
-                    ops.source_line,
-                    0,
-                    format!("unable to parse {:?} as integer", args[0]),
-                );
-            }
-        }
+    // txn type and OnCompletion constants, else go's `ParseUint(s, 0, 64)`.
+    let val = parse_named_int(args[0]).or_else(|| type_track::go_parse_uint_base0(args[0], 64));
+    match val {
+        Some(v) => ops.int_literal(v),
+        None => ops.record_error(
+            ops.source_line,
+            ops.arg_col(0),
+            format!("unable to parse {:?} as integer", args[0]),
+        ),
     }
 }
 
 fn asm_push_int(ops: &mut OpStream, args: &[&str]) {
     if args.len() != 1 {
-        ops.record_error(
-            ops.source_line,
-            0,
-            "pushint expects 1 immediate argument".into(),
-        );
+        record_arg_count_error(ops, "pushint", args, 1);
         return;
     }
-    let val = if let Some(v) = parse_named_int(args[0]) {
-        v
-    } else {
-        match parse_u64(args[0]) {
-            Ok(v) => v,
-            Err(_) => {
-                ops.record_error(
-                    ops.source_line,
-                    0,
-                    format!("unable to parse {:?} as integer", args[0]),
-                );
-                return;
-            }
-        }
+    // go's `asmPushInt` takes only `ParseUint(s, 0, 64)`: no named constants.
+    let Some(val) = type_track::go_parse_uint_base0(args[0], 64) else {
+        ops.record_error(
+            ops.source_line,
+            ops.arg_col(0),
+            format!("unable to parse {:?} as integer", args[0]),
+        );
+        return;
     };
     ops.pending.push(0x81); // pushint
     write_varuint_to_vec(&mut ops.pending, val);
+}
+
+/// The column go blames when `parseBinaryArgs` fails on `args`: the token it
+/// reports as `consumed` (1 for a bad payload after `base64`/`b64`/`base32`/
+/// `b32`, else 0).
+fn binary_error_col(ops: &OpStream, args: &[&str], err: &str) -> usize {
+    let two_token = matches!(args[0], "base64" | "b64" | "base32" | "b32");
+    if two_token && args.len() >= 2 && !err.contains("needs byte literal argument") {
+        ops.arg_col(1)
+    } else {
+        ops.arg_col(0)
+    }
 }
 
 fn asm_byte(ops: &mut OpStream, args: &[&str]) {
     if args.is_empty() {
         ops.record_error(
             ops.source_line,
-            0,
+            ops.stmt_col + "byte".len(),
             "byte needs byte literal argument".into(),
         );
         return;
@@ -1997,17 +1931,25 @@ fn asm_byte(ops: &mut OpStream, args: &[&str]) {
 
     // After backBranchEnabledVersion, if there's a manual cblock, use pushbytes
     if ops.cnt_bytec_block > 0 && ops.version >= BACK_BRANCH_ENABLED_VERSION {
-        asm_push_bytes(ops, args);
+        ops.record_warning(
+            ops.source_line,
+            ops.arg_col(0),
+            format!(
+                "byte {} used with explicit bytecblock. must pushbytes",
+                args[0]
+            ),
+        );
+        asm_push_bytes(ops, "byte", args);
         return;
     }
     if ops.cnt_bytec_block > 1 {
         if ops.version >= 3 {
-            asm_push_bytes(ops, args);
+            asm_push_bytes(ops, "byte", args);
             return;
         }
         ops.record_error(
             ops.source_line,
-            0,
+            ops.arg_col(0),
             format!("byte {} used with manual bytecblocks. Use bytec.", args[0]),
         );
         return;
@@ -2018,7 +1960,7 @@ fn asm_byte(ops: &mut OpStream, args: &[&str]) {
             if args.len() != consumed {
                 ops.record_error(
                     ops.source_line,
-                    0,
+                    ops.arg_col(consumed),
                     "byte with extraneous argument".to_string(),
                 );
                 return;
@@ -2026,7 +1968,7 @@ fn asm_byte(ops: &mut OpStream, args: &[&str]) {
             if val.len() > opcode::MAX_STRING_SIZE {
                 ops.record_error(
                     ops.source_line,
-                    0,
+                    ops.arg_col(0),
                     format!(
                         "byte value is too big ({} bytes, limit {})",
                         val.len(),
@@ -2037,16 +1979,20 @@ fn asm_byte(ops: &mut OpStream, args: &[&str]) {
             }
             ops.byte_literal(val)
         }
-        Err(e) => ops.record_error(ops.source_line, 0, format!("byte {e}")),
+        Err(e) => {
+            let col = binary_error_col(ops, args, &e);
+            ops.record_error(ops.source_line, col, format!("byte {e}"))
+        }
     }
 }
 
-fn asm_push_bytes(ops: &mut OpStream, args: &[&str]) {
+/// `pushbytes`, and `byte` when it falls back to it: errors name `mnemonic`.
+fn asm_push_bytes(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
     if args.is_empty() {
         ops.record_error(
             ops.source_line,
-            0,
-            "pushbytes needs byte literal argument".into(),
+            ops.stmt_col + mnemonic.len(),
+            format!("{mnemonic} needs byte literal argument"),
         );
         return;
     }
@@ -2055,17 +2001,17 @@ fn asm_push_bytes(ops: &mut OpStream, args: &[&str]) {
             if args.len() != consumed {
                 ops.record_error(
                     ops.source_line,
-                    0,
-                    "pushbytes with extraneous argument".to_string(),
+                    ops.arg_col(consumed),
+                    format!("{mnemonic} with extraneous argument"),
                 );
                 return;
             }
             if val.len() > opcode::MAX_STRING_SIZE {
                 ops.record_error(
                     ops.source_line,
-                    0,
+                    ops.arg_col(0),
                     format!(
-                        "pushbytes value is too big ({} bytes, limit {})",
+                        "{mnemonic} value is too big ({} bytes, limit {})",
                         val.len(),
                         opcode::MAX_STRING_SIZE
                     ),
@@ -2076,32 +2022,27 @@ fn asm_push_bytes(ops: &mut OpStream, args: &[&str]) {
             write_varuint_to_vec(&mut ops.pending, val.len() as u64);
             ops.pending.extend_from_slice(&val);
         }
-        Err(e) => ops.record_error(ops.source_line, 0, format!("pushbytes {e}")),
+        Err(e) => {
+            let col = binary_error_col(ops, args, &e);
+            ops.record_error(ops.source_line, col, format!("{mnemonic} {e}"))
+        }
     }
 }
 
 fn asm_addr(ops: &mut OpStream, args: &[&str]) {
     if args.len() != 1 {
-        ops.record_error(
-            ops.source_line,
-            0,
-            "addr expects 1 immediate argument".into(),
-        );
+        record_arg_count_error(ops, "addr", args, 1);
         return;
     }
     match decode_algorand_address(args[0]) {
         Ok(bytes) => ops.byte_literal(bytes),
-        Err(e) => ops.record_error(ops.source_line, 0, format!("addr: {e}")),
+        Err(e) => ops.record_error(ops.source_line, ops.arg_col(0), format!("addr: {e}")),
     }
 }
 
 fn asm_method(ops: &mut OpStream, args: &[&str]) {
     if args.len() != 1 {
-        ops.record_error(
-            ops.source_line,
-            0,
-            "method expects 1 immediate argument".into(),
-        );
+        record_arg_count_error(ops, "method", args, 1);
         return;
     }
     let arg = args[0];
@@ -2136,39 +2077,92 @@ fn asm_method(ops: &mut OpStream, args: &[&str]) {
     }
 }
 
-fn asm_intc_block(ops: &mut OpStream, args: &[&str]) {
-    let mut vals = Vec::new();
-    for arg in args {
-        match parse_u64(arg) {
-            Ok(v) => {
-                vals.push(v);
+/// go's `asmIntImmArgs`: the count, then each value as a uvarint. A value that
+/// does not parse is recorded (go's `strconv.ParseUint` error text, blaming the
+/// token) and counts as 0.
+fn asm_int_imm_args(ops: &mut OpStream, args: &[&str]) -> Vec<u64> {
+    write_varuint_to_vec(&mut ops.pending, args.len() as u64);
+    let mut vals = Vec::with_capacity(args.len());
+    for (i, arg) in args.iter().enumerate() {
+        let v = match type_track::go_parse_uint_base0_err(arg) {
+            Ok(v) => v,
+            Err(kind) => {
+                ops.record_error(
+                    ops.source_line,
+                    ops.arg_col(i),
+                    format!("strconv.ParseUint: parsing {arg:?}: {kind}"),
+                );
+                0
             }
-            Err(_) => ops.record_error(
-                ops.source_line,
-                0,
-                format!("unable to parse {:?} as integer", arg),
-            ),
+        };
+        write_varuint_to_vec(&mut ops.pending, v);
+        vals.push(v);
+    }
+    vals
+}
+
+/// go's `asmByteImmArgs`: the count, then each value length-prefixed. Stops at
+/// the first bad argument and blames its first token.
+fn asm_byte_imm_args(ops: &mut OpStream, name: &str, args: &[&str]) -> Option<Vec<Vec<u8>>> {
+    let mut vals: Vec<Vec<u8>> = Vec::new();
+    let mut remaining = args;
+    let mut consumed_tokens = 0;
+    while !remaining.is_empty() {
+        let col = ops.arg_col(consumed_tokens);
+        match parse_binary_args(remaining) {
+            Ok((val, consumed)) => {
+                if val.len() > opcode::MAX_STRING_SIZE {
+                    ops.record_error(
+                        ops.source_line,
+                        col,
+                        format!(
+                            "{name} arg {} is too big ({} bytes, limit {})",
+                            vals.len(),
+                            val.len(),
+                            opcode::MAX_STRING_SIZE
+                        ),
+                    );
+                    return None;
+                }
+                vals.push(val);
+                remaining = &remaining[consumed..];
+                consumed_tokens += consumed;
+            }
+            Err(e) => {
+                ops.record_error(ops.source_line, col, format!("{name} {e}"));
+                return None;
+            }
         }
     }
-    ops.pending.push(0x20); // intcblock opcode
     write_varuint_to_vec(&mut ops.pending, vals.len() as u64);
-    for v in &vals {
-        write_varuint_to_vec(&mut ops.pending, *v);
+    for bv in &vals {
+        write_varuint_to_vec(&mut ops.pending, bv.len() as u64);
+        ops.pending.extend_from_slice(bv);
     }
+    Some(vals)
+}
+
+fn asm_intc_block(ops: &mut OpStream, args: &[&str]) {
+    ops.pending.push(0x20); // intcblock opcode
+    let vals = asm_int_imm_args(ops, args);
     // Mirrors go's `asmIntCBlock` (assembler.go:912-926): a manual intcblock
     // reached only through unconditionally-diverted control flow (dead code,
     // e.g. after an unconditional `b`/`callsub`/`retsub`/`err`/`return` and
     // before the next label) does not become the "currently live" intcblock
     // that `int`/`intc N` resolve against -- go's own `int` literal lookup
     // (`TestManualCBlocksPreBackBranch`) keeps "seeing" the last *reachable*
-    // manual cblock instead. `type_track_deadcode` (set by branch/flow
+    // manual cblock instead. `ops.known.deadcode` (set by branch/flow
     // opcodes, cleared at the next label) is computed in the same pass
     // just before this runs (`process_statement` calls
     // `type_track::track_instruction` first), so it accurately reflects
     // reachability here.
-    if !ops.type_track_deadcode {
+    if !ops.known.deadcode {
         if ops.has_pseudo_int {
-            ops.record_error(ops.source_line, 0, "intcblock following int".into());
+            ops.record_error(
+                ops.source_line,
+                ops.stmt_col,
+                "intcblock following int".into(),
+            );
         }
         ops.intc_refs.clear();
         ops.intc = vals;
@@ -2178,48 +2172,17 @@ fn asm_intc_block(ops: &mut OpStream, args: &[&str]) {
 
 fn asm_bytec_block(ops: &mut OpStream, args: &[&str]) {
     ops.pending.push(0x26); // bytecblock opcode
-    let mut vals: Vec<Vec<u8>> = Vec::new();
-    let mut remaining = args;
-    while !remaining.is_empty() {
-        match parse_binary_args(remaining) {
-            Ok((val, consumed)) => {
-                if val.len() > opcode::MAX_STRING_SIZE {
-                    ops.record_error(
-                        ops.source_line,
-                        0,
-                        format!(
-                            "bytecblock arg {} is too big ({} bytes, limit {})",
-                            vals.len(),
-                            val.len(),
-                            opcode::MAX_STRING_SIZE
-                        ),
-                    );
-                    remaining = &remaining[consumed..];
-                    continue;
-                }
-                vals.push(val);
-                remaining = &remaining[consumed..];
-            }
-            Err(e) => {
-                ops.record_error(ops.source_line, 0, format!("bytecblock {e}"));
-                // Skip this arg and continue to accumulate further errors
-                remaining = &remaining[1..];
-            }
-        }
-    }
-    write_varuint_to_vec(&mut ops.pending, vals.len() as u64);
-    for bv in &vals {
-        write_varuint_to_vec(&mut ops.pending, bv.len() as u64);
-        ops.pending.extend_from_slice(bv);
-    }
+    let Some(vals) = asm_byte_imm_args(ops, "bytecblock", args) else {
+        return;
+    };
 
     // Mirrors go's `asmByteCBlock` (assembler.go:960-976): same
     // dead-code-skip rule as `asm_intc_block` above, for byte constants.
-    if !ops.type_track_deadcode {
+    if !ops.known.deadcode {
         if ops.has_pseudo_byte {
             ops.record_error(
                 ops.source_line,
-                0,
+                ops.stmt_col,
                 "bytecblock following byte/addr/method".into(),
             );
         }
@@ -2227,6 +2190,41 @@ fn asm_bytec_block(ops: &mut OpStream, args: &[&str]) {
         ops.bytec = vals;
         ops.cnt_bytec_block += 1;
     }
+}
+
+/// go's `asmSubstring`: after the default assembly, `end < start` is an error
+/// blamed on the first immediate.
+fn asm_substring(ops: &mut OpStream, args: &[&str]) {
+    let before = ops.errors.len();
+    asm_regular(ops, "substring", args);
+    if ops.errors.len() != before || args.len() < 2 {
+        return;
+    }
+    let start = type_track::go_parse_uint_base0(args[0], 64).unwrap_or(0);
+    let end = type_track::go_parse_uint_base0(args[1], 64).unwrap_or(0);
+    if end < start {
+        let col = ops.arg_cols.first().copied().unwrap_or(0);
+        ops.record_error(ops.source_line, col, "substring end is before start".into());
+    }
+}
+
+/// go's `checkArgCount` error: blames the end of the last offered token when
+/// arguments are missing, or the first extra argument.
+fn record_arg_count_error(ops: &mut OpStream, mnemonic: &str, args: &[&str], expected: usize) {
+    let offered = args.len();
+    let col = if offered > expected {
+        ops.arg_cols.get(expected).copied().unwrap_or(0)
+    } else if offered == 0 {
+        ops.stmt_col + mnemonic.len()
+    } else {
+        ops.arg_cols.get(offered - 1).copied().unwrap_or(0) + args[offered - 1].len()
+    };
+    let msg = if expected == 1 {
+        format!("{mnemonic} expects 1 immediate argument")
+    } else {
+        format!("{mnemonic} expects {expected} immediate arguments")
+    };
+    ops.record_error(ops.source_line, col, msg);
 }
 
 fn asm_regular(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
@@ -2250,8 +2248,8 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
         None => {
             ops.record_error(
                 ops.source_line,
-                0,
-                format!("unknown opcode: {:?}", lookup_name),
+                ops.stmt_col,
+                format!("unknown opcode: {lookup_name}"),
             );
             return;
         }
@@ -2260,11 +2258,8 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
     if spec.version > ops.effective_version() {
         ops.record_error(
             ops.source_line,
-            0,
-            format!(
-                "{} opcode was introduced in v{}. Missed #pragma version?",
-                mnemonic, spec.version,
-            ),
+            ops.stmt_col,
+            format!("{} opcode was introduced in v{}", mnemonic, spec.version),
         );
         return;
     }
@@ -2276,11 +2271,7 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
     match spec.imm {
         ImmKind::None => {
             if !args.is_empty() {
-                ops.record_error(
-                    ops.source_line,
-                    0,
-                    format!("{} expects 0 immediate arguments", mnemonic),
-                );
+                record_arg_count_error(ops, mnemonic, args, 0);
                 return;
             }
             ops.pending.push(spec.opcode);
@@ -2294,11 +2285,7 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
         }
         ImmKind::Uint8 => {
             if args.len() != 1 {
-                ops.record_error(
-                    ops.source_line,
-                    0,
-                    format!("{} expects 1 immediate argument", mnemonic),
-                );
+                record_arg_count_error(ops, mnemonic, args, 1);
                 return;
             }
             // Explicit `intc`/`bytec` mnemonics: mirror go-algorand's
@@ -2311,8 +2298,60 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
             // the end of the constant pool built so far, or -- once the
             // pool is large enough -- more than 256 constants), so route
             // here before ever pushing the generic `spec.opcode` byte.
+            // go's `asmItxnField` (assembler.go:1128-1145): its own field
+            // checks and messages, gated on the field's *settable* version.
+            if mnemonic == "itxn_field" {
+                let col = ops.arg_cols.first().copied().unwrap_or(0);
+                let Some(byte) = fields::txn_field_by_name(args[0]) else {
+                    ops.record_error(
+                        ops.source_line,
+                        col,
+                        format!("itxn_field unknown field: {:?}", args[0]),
+                    );
+                    return;
+                };
+                let itx = fields::TxnField::from_u8(byte)
+                    .map(|f| f.itx_version())
+                    .unwrap_or(0);
+                if itx == 0 {
+                    ops.record_error(
+                        ops.source_line,
+                        col,
+                        format!("itxn_field {:?} is not allowed.", args[0]),
+                    );
+                    return;
+                }
+                if itx > ops.effective_version() {
+                    ops.record_error(
+                        ops.source_line,
+                        col,
+                        format!(
+                            "itxn_field {} field was introduced in v{}. Missed #pragma version?",
+                            args[0], itx
+                        ),
+                    );
+                    return;
+                }
+                ops.pending.push(spec.opcode);
+                ops.pending.push(byte);
+                return;
+            }
+            // go's `asmArg`: `arg 0..3` assemble to the one-byte `arg_N`.
+            if mnemonic == "arg" {
+                match parse_uint8_or_int8(args[0], mnemonic, "argument") {
+                    Ok(val) if val < 4 => {
+                        ops.pending.push(0x2d + val);
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        ops.record_error(ops.source_line, ops.arg_col(0), e);
+                        return;
+                    }
+                }
+            }
             if mnemonic == "intc" || mnemonic == "bytec" {
-                match parse_uint8_or_int8(args[0], mnemonic) {
+                match parse_uint8_or_int8(args[0], mnemonic, "constant") {
                     Ok(val) => {
                         let pool_len = if mnemonic == "intc" {
                             ops.intc.len()
@@ -2322,7 +2361,7 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
                         if val as usize >= pool_len {
                             ops.record_error(
                                 ops.source_line,
-                                0,
+                                ops.arg_cols.first().copied().unwrap_or(0),
                                 format!("{} {} is not defined", mnemonic, val),
                             );
                             return;
@@ -2334,7 +2373,7 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
                         }
                     }
                     Err(e) => {
-                        ops.record_error(ops.source_line, 0, format!("{mnemonic} {e}"));
+                        ops.record_error(ops.source_line, ops.arg_col(0), e);
                     }
                 }
                 return;
@@ -2346,7 +2385,7 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
                     if field_version > ops.effective_version() {
                         ops.record_error(
                             ops.source_line,
-                            0,
+                            ops.arg_cols.first().copied().unwrap_or(0),
                             format!(
                                 "{} {} field was introduced in v{}. Missed #pragma version?",
                                 mnemonic, args[0], field_version,
@@ -2359,12 +2398,14 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
                     }
                 }
                 ops.pending.push(val);
-            } else if let Ok(val) = parse_uint8_or_int8(args[0], mnemonic) {
+            } else if let Ok(val) =
+                parse_uint8_or_int8(args[0], mnemonic, type_track::imm_name(lookup_name, 0))
+            {
                 ops.pending.push(val);
             } else if is_field_group_immediate(mnemonic, 0) {
                 ops.record_error(
                     ops.source_line,
-                    0,
+                    ops.arg_cols.first().copied().unwrap_or(0),
                     format!("{} unknown field: {:?}", mnemonic, args[0]),
                 );
                 // Remove the opcode we just pushed since the arg is invalid
@@ -2375,18 +2416,19 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
                 // generic "unknown field" -- there's no field name to speak
                 // of here, matching go's byteImm/int8Imm error text.
                 let e =
-                    parse_uint8_or_int8(args[0], mnemonic).expect_err("Ok already handled above");
-                ops.record_error(ops.source_line, 0, format!("{mnemonic} {e}"));
+                    parse_uint8_or_int8(args[0], mnemonic, type_track::imm_name(lookup_name, 0))
+                        .expect_err("Ok already handled above");
+                ops.record_error(
+                    ops.source_line,
+                    ops.arg_cols.first().copied().unwrap_or(0),
+                    format!("{mnemonic} {e}"),
+                );
                 ops.pending.pop();
             }
         }
         ImmKind::Uint8Uint8 => {
             if args.len() != 2 {
-                ops.record_error(
-                    ops.source_line,
-                    0,
-                    format!("{} expects 2 immediate arguments", mnemonic),
-                );
+                record_arg_count_error(ops, mnemonic, args, 2);
                 return;
             }
             ops.pending.push(spec.opcode);
@@ -2396,7 +2438,7 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
                         if field_version > ops.effective_version() {
                             ops.record_error(
                                 ops.source_line,
-                                0,
+                                ops.arg_cols.get(i).copied().unwrap_or(0),
                                 format!(
                                     "{} {} field was introduced in v{}. Missed #pragma version?",
                                     mnemonic, arg, field_version,
@@ -2406,12 +2448,14 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
                         }
                     }
                     ops.pending.push(val);
-                } else if let Ok(val) = parse_uint8_or_int8(arg, mnemonic) {
+                } else if let Ok(val) =
+                    parse_uint8_or_int8(arg, mnemonic, type_track::imm_name(lookup_name, i))
+                {
                     ops.pending.push(val);
                 } else {
                     ops.record_error(
                         ops.source_line,
-                        0,
+                        ops.arg_cols.get(i).copied().unwrap_or(0),
                         format!("{} unknown field: {:?}", mnemonic, arg),
                     );
                 }
@@ -2419,11 +2463,7 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
         }
         ImmKind::Uint8Uint8Uint8 => {
             if args.len() != 3 {
-                ops.record_error(
-                    ops.source_line,
-                    0,
-                    format!("{} expects 3 immediate arguments", mnemonic),
-                );
+                record_arg_count_error(ops, mnemonic, args, 3);
                 return;
             }
             ops.pending.push(spec.opcode);
@@ -2433,7 +2473,7 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
                         if field_version > ops.effective_version() {
                             ops.record_error(
                                 ops.source_line,
-                                0,
+                                ops.arg_cols.get(i).copied().unwrap_or(0),
                                 format!(
                                     "{} {} field was introduced in v{}. Missed #pragma version?",
                                     mnemonic, arg, field_version,
@@ -2443,12 +2483,14 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
                         }
                     }
                     ops.pending.push(val);
-                } else if let Ok(val) = parse_uint8_or_int8(arg, mnemonic) {
+                } else if let Ok(val) =
+                    parse_uint8_or_int8(arg, mnemonic, type_track::imm_name(lookup_name, i))
+                {
                     ops.pending.push(val);
                 } else {
                     ops.record_error(
                         ops.source_line,
-                        0,
+                        ops.arg_cols.get(i).copied().unwrap_or(0),
                         format!("{} unknown field: {:?}", mnemonic, arg),
                     );
                 }
@@ -2467,11 +2509,7 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
             }
 
             if args.len() != 1 {
-                ops.record_error(
-                    ops.source_line,
-                    0,
-                    format!("{} expects 1 immediate argument", mnemonic),
-                );
+                record_arg_count_error(ops, mnemonic, args, 1);
                 return;
             }
             let label = args[0].to_string();
@@ -2484,58 +2522,18 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
                 position: offset_pos,
                 label,
                 line: ops.source_line,
+                col: ops.arg_cols.first().copied().unwrap_or(0),
                 offset_position: end_of_instruction,
                 varint: false,
             });
         }
         ImmKind::Varuint => {
             // pushint
-            if args.len() != 1 {
-                ops.record_error(
-                    ops.source_line,
-                    0,
-                    format!("{} expects 1 immediate argument", mnemonic),
-                );
-                return;
-            }
-            match parse_u64(args[0]) {
-                Ok(val) => {
-                    ops.pending.push(spec.opcode);
-                    write_varuint_to_vec(&mut ops.pending, val);
-                }
-                Err(e) => ops.record_error(ops.source_line, 0, format!("{mnemonic}: {e}")),
-            }
+            asm_push_int(ops, args);
         }
         ImmKind::VaruintBytes => {
             // pushbytes
-            if args.is_empty() {
-                ops.record_error(
-                    ops.source_line,
-                    0,
-                    format!("{} needs byte literal argument", mnemonic),
-                );
-                return;
-            }
-            match parse_binary_args(args) {
-                Ok((val, _consumed)) => {
-                    if val.len() > opcode::MAX_STRING_SIZE {
-                        ops.record_error(
-                            ops.source_line,
-                            0,
-                            format!(
-                                "{mnemonic} value is too big ({} bytes, limit {})",
-                                val.len(),
-                                opcode::MAX_STRING_SIZE
-                            ),
-                        );
-                        return;
-                    }
-                    ops.pending.push(spec.opcode);
-                    write_varuint_to_vec(&mut ops.pending, val.len() as u64);
-                    ops.pending.extend_from_slice(&val);
-                }
-                Err(e) => ops.record_error(ops.source_line, 0, format!("{mnemonic} {e}")),
-            }
+            asm_push_bytes(ops, mnemonic, args);
         }
         ImmKind::IntcBlock => {
             // Manual intcblock (shouldn't reach here since we handle it above, but just in case)
@@ -2558,7 +2556,7 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
             }
             ops.pending.push(num_labels as u8);
             let op_end_pos = ops.pending.len() + 2 * num_labels;
-            for arg in args {
+            for (arg_idx, arg) in args.iter().enumerate() {
                 let label = arg.to_string();
                 let pos = ops.pending.len();
                 ops.pending.push(0);
@@ -2567,6 +2565,7 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
                     position: pos,
                     label,
                     line: ops.source_line,
+                    col: ops.arg_cols.get(arg_idx).copied().unwrap_or(0),
                     offset_position: op_end_pos,
                     varint: false,
                 });
@@ -2575,13 +2574,7 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
         ImmKind::PushInts => {
             // pushints
             ops.pending.push(spec.opcode);
-            write_varuint_to_vec(&mut ops.pending, args.len() as u64);
-            for arg in args {
-                match parse_u64(arg) {
-                    Ok(v) => write_varuint_to_vec(&mut ops.pending, v),
-                    Err(e) => ops.record_error(ops.source_line, 0, format!("{mnemonic}: {e}")),
-                }
-            }
+            asm_int_imm_args(ops, args);
         }
         ImmKind::BranchVarint => {
             // Never a static table entry (see opcode::ImmKind::BranchVarint's
@@ -2600,39 +2593,7 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
         ImmKind::PushBytess => {
             // pushbytess
             ops.pending.push(spec.opcode);
-            let mut vals: Vec<Vec<u8>> = Vec::new();
-            let mut remaining = args;
-            while !remaining.is_empty() {
-                match parse_binary_args(remaining) {
-                    Ok((val, consumed)) => {
-                        if val.len() > opcode::MAX_STRING_SIZE {
-                            ops.record_error(
-                                ops.source_line,
-                                0,
-                                format!(
-                                    "{mnemonic} arg {} is too big ({} bytes, limit {})",
-                                    vals.len(),
-                                    val.len(),
-                                    opcode::MAX_STRING_SIZE
-                                ),
-                            );
-                            remaining = &remaining[consumed..];
-                            continue;
-                        }
-                        vals.push(val);
-                        remaining = &remaining[consumed..];
-                    }
-                    Err(e) => {
-                        ops.record_error(ops.source_line, 0, format!("{mnemonic} {e}"));
-                        break;
-                    }
-                }
-            }
-            write_varuint_to_vec(&mut ops.pending, vals.len() as u64);
-            for bv in &vals {
-                write_varuint_to_vec(&mut ops.pending, bv.len() as u64);
-                ops.pending.extend_from_slice(bv);
-            }
+            let _ = asm_byte_imm_args(ops, mnemonic, args);
         }
     }
 }
@@ -2651,11 +2612,7 @@ const VARINT_BRANCH_INITIAL_SIZE: usize = 3;
 /// `resolve_labels`, once every label's final position is known.
 fn asm_branch_varint(ops: &mut OpStream, opcode_byte: u8, mnemonic: &str, args: &[&str]) {
     if args.len() != 1 {
-        ops.record_error(
-            ops.source_line,
-            0,
-            format!("{} expects 1 immediate argument", mnemonic),
-        );
+        record_arg_count_error(ops, mnemonic, args, 1);
         return;
     }
     let label = args[0].to_string();
@@ -2669,6 +2626,7 @@ fn asm_branch_varint(ops: &mut OpStream, opcode_byte: u8, mnemonic: &str, args: 
         position: offset_pos,
         label,
         line: ops.source_line,
+        col: ops.arg_cols.first().copied().unwrap_or(0),
         offset_position: end_of_instruction,
         varint: true,
     });
@@ -2925,41 +2883,25 @@ fn parse_named_int(name: &str) -> Option<u64> {
 // Parsing helpers
 // ---------------------------------------------------------------------------
 
-fn parse_uint8_or_int8(s: &str, mnemonic: &str) -> Result<u8, String> {
+fn parse_uint8_or_int8(s: &str, mnemonic: &str, label: &str) -> Result<u8, String> {
     // frame_dig/frame_bury are the *only* opcodes in go-algorand whose
     // immediate is `immInt8` (opcodes.go:713-714) -- a signed byte in
     // -128..=127, encoded on the wire as its two's-complement `u8` bit
-    // pattern. go's `int8Imm` (assembler.go:1098) parses with
-    // `strconv.ParseInt(value, 10, 8)`, which itself rejects anything
-    // outside that range (rather than falling back to an unsigned parse),
-    // so e.g. `frame_dig 128` must fail to assemble, not silently succeed
-    // by being read as an unsigned byte.
+    // pattern. go's `int8Imm` parses with `strconv.ParseInt(value, 10, 8)`,
+    // which itself rejects anything outside that range.
     if mnemonic == "frame_dig" || mnemonic == "frame_bury" {
         return s
             .parse::<i8>()
             .map(|v| v as u8)
-            .map_err(|_| format!("unable to parse {s:?} as int8"));
+            .map_err(|_| format!("unable to parse {label} {s:?} as int8"));
     }
-    // Every other opcode with a plain byte immediate (load, store, ...) uses
-    // go's `byteImm` (assembler.go:1087), which parses with
-    // `strconv.ParseUint(value, 0, 64)` -- unsigned only. A negative literal
-    // therefore fails to parse rather than wrapping into the `u8` range
-    // (e.g. `load -100` must be rejected, not silently reinterpreted as
-    // `load 156`), and a value over 255 is a distinct "beyond 255" error.
-    match s.parse::<u64>() {
-        Ok(v) if v > 255 => Err(format!("i beyond 255: {v}")),
-        Ok(v) => Ok(v as u8),
-        Err(_) => Err(format!("unable to parse {s:?} as integer")),
-    }
-}
-
-fn parse_u64(s: &str) -> Result<u64, String> {
-    if s.starts_with("0x") || s.starts_with("0X") {
-        u64::from_str_radix(&s[2..], 16).map_err(|e| e.to_string())
-    } else if s.starts_with("0o") || s.starts_with("0O") {
-        u64::from_str_radix(&s[2..], 8).map_err(|e| e.to_string())
-    } else {
-        s.parse::<u64>().map_err(|e| e.to_string())
+    // Every other opcode with a plain byte immediate uses go's `byteImm`
+    // (assembler.go:1087): `strconv.ParseUint(value, 0, 64)` (base prefixes
+    // and `_` separators, unsigned only), then a distinct "beyond 255" error.
+    match type_track::go_parse_uint_base0(s, 64) {
+        Some(v) if v > 255 => Err(format!("{label} beyond 255: {v}")),
+        Some(v) => Ok(v as u8),
+        None => Err(format!("unable to parse {label} {s:?} as integer")),
     }
 }
 
@@ -4193,7 +4135,7 @@ mod tests {
         let errs = expect_errors("#pragma version 8\narg x\n");
         assert!(
             errs.iter()
-                .any(|e| e.message.starts_with("arg") && e.message.contains("unable to parse")),
+                .any(|e| e.message == "unable to parse argument \"x\" as integer"),
             "arg x: expected an 'unable to parse' error, got: {errs:?}"
         );
     }
@@ -4424,8 +4366,8 @@ mod tests {
         // form when no immediate was given at all but the stack is short.
         let errs = expect_errors("#pragma version 8\nbyte 0x0000\nbyte 0x1234\nreplace\n");
         assert!(
-            errs.iter()
-                .any(|e| e.message == "replace expects 3 stack arguments but stack height is 2"),
+            errs.iter().any(|e| e.message
+                == "replace without immediates expects 3 stack arguments but stack height is 2"),
             "unexpected errors: {errs:?}"
         );
     }
@@ -4439,7 +4381,7 @@ mod tests {
         let errs = expect_errors("#pragma version 8\nbyte 0x0000\nint 0\nbyte 0x1234\nreplace 0\n");
         assert!(
             errs.iter()
-                .any(|e| e.message == "replace 0 arg 0 wanted type []byte got uint64"),
+                .any(|e| e.message == "replace 0 arg 0 wanted type []byte got 0"),
             "unexpected errors: {errs:?}"
         );
     }
@@ -5798,7 +5740,7 @@ dup
     // fallback instead of go's "value ... does not appear in existing
     // intcblock" rejection. Fixed to mirror go's `asmIntCBlock`/
     // `asmByteCBlock` (`assembler.go:912-976`) exactly: skip the
-    // live-block update whenever `OpStream::type_track_deadcode` is set,
+    // live-block update whenever `OpStream::known.deadcode` is set,
     // which is already tracked in the same single assembly pass (via
     // `type_track::track_instruction`, run just before instruction
     // assembly in `process_statement`) for the branch-merge type-tracking
@@ -6187,7 +6129,7 @@ dup
         // (salting is meaningless there — stateful programs are never
         // used as LogicSig contract-account addresses).
         let source =
-            "#pragma version 13\n#pragma autosalt true\nint 0\napp_global_get\npop\nint 1\nreturn\n";
+            "#pragma version 13\n#pragma autosalt true\nbyte \"k\"\napp_global_get\npop\nint 1\nreturn\n";
         let ops = assemble_string(source).unwrap();
         assert_eq!(
             ops.warnings.len(),
@@ -6598,7 +6540,7 @@ dup
         // TestTypeTrackingRegression: exercises that a permissive stack
         // established by `callsub`'s reset doesn't get "stuck" at a
         // particular type on repeated `load`/`store`. `callsub` resets
-        // every scratch slot to `Any` (see `OpStream::scratch_space`), so
+        // every scratch slot to `Any` (see `type_track::Knowledge`), so
         // `load 1`'s index (used by `stores`) and both `load 0`s type as
         // `Any` throughout -- `Any` overlaps `stores`' `Uint64` index arg
         // and `+`'s `Uint64` operands alike, so this must still assemble
@@ -7227,15 +7169,44 @@ dup
     }
 
     #[test]
-    fn test_txn_family_pushes_any_type() {
-        // go's assembler does not look up the accessed field's actual
-        // type for `txn`/`gtxn`/`gtxns`/`txna`/`gtxna`/`gtxnsa` -- every
-        // one of them always pushes an opaque `StackAny` (see the
-        // `type_track` module docs' "`txn`/`gtxn`/`gtxns`..." section), so
-        // the pushed value is happily consumed by either a uint64- or a
-        // bytes-wanting opcode.
-        assemble_string("#pragma version 8\ntxn Sender\nint 1\n+\npop\n").unwrap();
-        assemble_string("#pragma version 8\ntxn Fee\nbyte 0x1234\nconcat\npop\n").unwrap();
+    fn test_txn_family_pushes_the_fields_own_type() {
+        // go's `asmDefault` specialises the `any` a `txn`-family opcode pushes
+        // to the selected field's own type (`ops.returns`,
+        // `assembler.go:1241-1243`): `Sender` is an address, `Fee` a uint64
+        // (expected texts produced by the pinned go-algorand, see
+        // `tests/assemble_go_parity.rs`).
+        let errs = expect_errors(
+            "#pragma version 8
+txn Sender
+int 1
++
+pop
+",
+        );
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(errs[0].message, "+ arg 0 wanted type uint64 got address");
+        let errs = expect_errors(
+            "#pragma version 8
+txn Fee
+byte 0x1234
+concat
+pop
+",
+        );
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(
+            errs[0].message,
+            "concat arg 0 wanted type []byte got uint64"
+        );
+        assemble_string(
+            "#pragma version 8
+txn Fee
+int 1
++
+pop
+",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -7283,7 +7254,7 @@ dup
         assert!(
             errs.iter()
                 .any(|e| e.message.starts_with("itxn_field Sender arg 0")
-                    && e.message.contains("wanted type []byte got uint64")),
+                    && e.message.contains("wanted type address got 1")),
             "{errs:?}"
         );
 
@@ -7299,7 +7270,7 @@ dup
         assert!(
             errs.iter()
                 .any(|e| e.message.starts_with("itxn_field Amount arg 0")
-                    && e.message.contains("wanted type uint64 got []byte")),
+                    && e.message.contains("wanted type uint64 got [2]byte")),
             "{errs:?}"
         );
 
