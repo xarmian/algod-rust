@@ -56,15 +56,18 @@ impl MetricsCollector {
         // Take one synchronous sample before spawning the background thread
         // so that peak_rss is never zero.
         {
-            let mut sys = System::new();
-            sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-            if let Some(proc) = sys.process(pid) {
-                peak_rss.fetch_max(proc.memory(), Ordering::Relaxed);
+            if let Ok(mut sys) = System::new() {
+                sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+                if let Some(proc) = sys.process(pid) {
+                    peak_rss.fetch_max(proc.memory(), Ordering::Relaxed);
+                }
             }
         }
 
         let sample_handle = thread::spawn(move || {
-            let mut sys = System::new();
+            let Ok(mut sys) = System::new() else {
+                return;
+            };
             while !stop.load(Ordering::Relaxed) {
                 sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sample_pid]), true);
                 if let Some(proc) = sys.process(sample_pid) {
@@ -102,9 +105,11 @@ impl MetricsCollector {
 
         // Get CPU usage from process times.
         let avg_cpu_pct = {
-            let mut sys = System::new();
-            sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[self.pid]), true);
-            if let Some(proc) = sys.process(self.pid) {
+            let mut sys = System::new().ok();
+            if let Some(s) = sys.as_mut() {
+                s.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[self.pid]), true);
+            }
+            if let Some(proc) = sys.as_ref().and_then(|s| s.process(self.pid)) {
                 // sysinfo reports cpu_usage as percentage (can exceed 100 on multicore).
                 // We take a single snapshot; for a long-running benchmark this is
                 // a reasonable approximation.
@@ -134,7 +139,9 @@ impl Default for MetricsCollector {
 /// One-shot helper: return the current RSS of this process in bytes.
 pub fn current_rss_bytes() -> u64 {
     let pid = Pid::from_u32(std::process::id());
-    let mut sys = System::new();
+    let Ok(mut sys) = System::new() else {
+        return 0;
+    };
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
     sys.process(pid).map_or(0, |p| p.memory())
 }
