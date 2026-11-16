@@ -355,7 +355,7 @@ pub struct CorpusCatchupLedger {
 }
 
 /// The last certificate-authentication failure of a replay: the round and the
-/// reason. A later successful authentication clears it, and it is reported
+/// reason. A later successful authentication of the same round clears it, and it is reported
 /// only for the round the replay stalled at, so a stall with another cause
 /// (a fetch failure, an apply failure) never points at certificates.
 #[derive(Default)]
@@ -365,7 +365,17 @@ impl LastAuthError {
     /// Record the outcome of authenticating `round`'s certificate.
     pub fn note(&self, round: u64, res: &Result<(), String>) {
         if let Ok(mut last) = self.0.lock() {
-            *last = res.as_ref().err().map(|e| (round, e.clone()));
+            match res {
+                Err(e) => *last = Some((round, e.clone())),
+                // Certificates of upcoming rounds are authenticated ahead of
+                // the apply cursor (#2339): only a success for the failing
+                // round itself (a retry) clears its failure.
+                Ok(()) => {
+                    if last.as_ref().is_some_and(|(r, _)| *r == round) {
+                        *last = None;
+                    }
+                }
+            }
         }
     }
 
@@ -1287,8 +1297,8 @@ mod tests {
     }
 
     /// The authentication failure is reported only for the round the replay
-    /// stalled at, and only while no later authentication has succeeded:
-    /// a later unrelated stall must not point at certificates.
+    /// stalled at, and only until the same round authenticates: a later
+    /// unrelated stall must not point at certificates.
     #[test]
     fn last_auth_error_is_reported_only_for_the_stalled_round() {
         let e = LastAuthError::default();
@@ -1306,10 +1316,12 @@ mod tests {
         // the same round authenticates on a later attempt: cleared
         e.note(5, &Ok(()));
         assert_eq!(e.report(5), "");
-        // a failure, then later rounds succeed, then an unrelated stall
+        // a failure, then the NEXT round's certificate (authenticated ahead
+        // of the apply cursor, #2339) succeeds: the failure of 7 stays, and an
+        // unrelated stall elsewhere does not point at certificates
         e.note(7, &Err("bad".to_string()));
         e.note(8, &Ok(()));
-        assert_eq!(e.report(7), "");
+        assert_eq!(e.report(7), "; last authentication error: round 7: bad");
         assert_eq!(e.report(9), "");
         // a genuine failure after successes is still reported
         e.note(9, &Err("bad again".to_string()));
