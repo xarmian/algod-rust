@@ -456,6 +456,9 @@ struct Refined {
     args: Option<Vec<StackType>>,
     returns: Option<Vec<StackType>>,
     err: Option<String>,
+    /// go panics here (an unchecked slice index): the text of that Go runtime
+    /// panic. Recorded whether or not type-error reporting is on.
+    panic: Option<String>,
 }
 
 fn any_types(n: usize) -> Vec<StackType> {
@@ -467,12 +470,26 @@ fn refined(args: Option<Vec<StackType>>, returns: Option<Vec<StackType>>) -> Ref
         args,
         returns,
         err: None,
+        panic: None,
     }
 }
 
 fn refine_err(msg: String) -> Refined {
     Refined {
         err: Some(msg),
+        ..Refined::default()
+    }
+}
+
+/// go's `typeStores`/`typeLoads` index `scratchSpace[idx]` unchecked, so a
+/// constant stack-top index >= 256 panics inside `logic.AssembleString`. The
+/// port reports the identical Go runtime panic text as a typed condition
+/// (`OpStream::panic`) instead of panicking (issue #2381).
+fn scratch_index_panic(idx: u64) -> Refined {
+    Refined {
+        panic: Some(format!(
+            "runtime error: index out of range [{idx}] with length 256"
+        )),
         ..Refined::default()
     }
 }
@@ -670,11 +687,11 @@ fn run_refine(
             if top >= 1 {
                 if let Some(idx) = st(top - 1).const_int() {
                     let v = st(top);
-                    // go indexes `scratchSpace[idx]` unchecked (a panic for
-                    // idx >= 256); an out-of-range constant is ignored here.
-                    if let Some(slot) = pgm.scratch.get_mut(idx as usize) {
-                        *slot = v;
-                    }
+                    // go panics here for idx >= 256.
+                    let Some(slot) = pgm.scratch.get_mut(idx as usize) else {
+                        return scratch_index_panic(idx);
+                    };
+                    *slot = v;
                     return Refined::default();
                 }
             }
@@ -706,10 +723,11 @@ fn run_refine(
                 return Refined::default();
             }
             if let Some(v) = st(top).const_int() {
-                if let Some(slot) = pgm.scratch.get(v as usize) {
-                    return refined(None, Some(vec![*slot]));
-                }
-                return Refined::default();
+                // go panics here for v >= 256.
+                return match pgm.scratch.get(v as usize) {
+                    Some(slot) => refined(None, Some(vec![*slot])),
+                    None => scratch_index_panic(v),
+                };
             }
             let first = pgm.scratch[0];
             if pgm.scratch.iter().any(|s| *s != first) {
@@ -1072,6 +1090,9 @@ pub(crate) fn track_instruction(
         if let Some(e) = r.err {
             type_error(ops, col, e);
         }
+        if let Some(p) = r.panic {
+            ops.panic.get_or_insert(p);
+        }
         if let Some(a) = r.args {
             arg_types = a;
         }
@@ -1169,6 +1190,61 @@ mod tests {
                 // `run_refine` debug-asserts on an unported name.
                 let _ = run_refine(v.refine, &mut p, &[], None);
             }
+        }
+    }
+
+    // go's `typeStores`/`typeLoads` index `scratchSpace[idx]` unchecked and
+    // panic for a constant index >= 256 (issue #2381). The port reports the
+    // same condition as a typed `AssembleFailure::Panic` carrying go's panic
+    // text, without panicking, also under `#pragma typetrack false`.
+    fn go_panic(src: &str) -> Option<String> {
+        match crate::assembler::assemble_string_checked(src) {
+            Err(crate::assembler::AssembleFailure::Panic(m)) => Some(m),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_constant_scratch_index_of_256_or_more_is_go_s_index_out_of_range_panic() {
+        for (src, n) in [
+            ("#pragma version 14@nint 300@nbyte 0x@nstores", 300),
+            ("#pragma version 14@nint 256@nbyte 0x@nstores@nint 1", 256),
+            ("#pragma version 14@nint 300@nloads@npop@nint 1", 300),
+            (
+                "#pragma version 14@n#pragma typetrack false@nint 300@nbyte 0x@nstores",
+                300,
+            ),
+        ] {
+            let src = src.replace("@n", "\n");
+            assert_eq!(
+                go_panic(&src).as_deref(),
+                Some(format!("runtime error: index out of range [{n}] with length 256").as_str()),
+                "{src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_compat_entry_point_reports_the_panic_as_an_error_not_a_panic() {
+        let src = "#pragma version 14\nint 300\nloads\npop\nint 1";
+        let Err(errs) = crate::assembler::assemble_string(src) else {
+            panic!("must fail")
+        };
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].message.contains("index out of range [300]"));
+    }
+
+    #[test]
+    fn a_constant_scratch_index_below_256_still_assembles() {
+        for src in [
+            "#pragma version 14\nint 255\nbyte 0x\nstores\nint 1",
+            "#pragma version 14\nint 255\nloads\npop\nint 1",
+        ] {
+            let src = src.replace("@n", "\n");
+            assert!(
+                crate::assembler::assemble_string_checked(&src).is_ok(),
+                "{src:?}"
+            );
         }
     }
 }

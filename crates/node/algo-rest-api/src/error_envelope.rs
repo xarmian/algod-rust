@@ -78,6 +78,30 @@ pub fn plain_text_response(status: StatusCode, body: &'static str) -> Response {
     response
 }
 
+/// A response that makes hyper abandon the connection before any HTTP bytes
+/// are written, as go's net/http does when a handler panics (it recovers per
+/// connection, logs, and closes the socket without answering). The body fails
+/// on its first poll, ahead of the head being flushed.
+pub fn aborted_connection_response() -> Response {
+    struct Aborted;
+    impl hyper::body::Body for Aborted {
+        type Data = axum::body::Bytes;
+        type Error = std::io::Error;
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            std::task::Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "handler aborted the connection",
+            ))))
+        }
+    }
+    let mut response = Response::new(axum::body::Body::new(Aborted));
+    response.extensions_mut().insert(SkipEnvelopeRewrite);
+    response
+}
+
 /// Maximum rejection-body size to buffer for rewriting. Extractor rejection
 /// messages are always short, human-readable strings; this is a generous
 /// defensive ceiling, not a realistic expected size.
