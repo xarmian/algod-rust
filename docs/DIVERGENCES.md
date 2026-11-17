@@ -225,8 +225,12 @@ fixed-size byte value shorter than the array keeps the earlier tail.
 **What algod-rust does instead.** The hand-written `decode_from_reader`
 struct readers accept the map form (and nil, as go does, since #2065) but not
 the array form, and a repeated key replaces the field (nested struct /
-fixed-size array zero-filled) instead of merging. The derived-serde path (transaction-sync responses and the like) behaves likewise;
-since #2394 the catchup `decode_block_response` uses the hand-written reader too
+fixed-size array zero-filled) instead of merging; the transaction-sync
+response reads its transactions with the same `SignedTransaction` reader
+(since #2396). Making these readers merge is #2424. The non-consensus
+catchpoint, identity-handshake and peer-meta readers are not part of this
+entry: they decode a repeated key exactly as go does (#2421).
+Since #2394 the catchup `decode_block_response` uses the hand-written reader too
 (`decode_block_response_serde` is the old path).
 Since #2319 `decode_block` (catchup, archive replay, apply, gossip block source)
 uses the hand-written reader too (behind the same depth pre-scan); its old
@@ -242,7 +246,9 @@ a `[N]byte` of another length follows `ReadExactBytes` (serde is strict); a
 struct sent as an array and a transaction without `type` are rejected at decode
 (serde accepts; go decodes them, the latter failing later in `WellFormed`: both
 only for non-canonical input no node emits, and never for a block whose digest
-a certificate authenticates).
+a certificate authenticates). Since #2421 a `bin` or uint8 array where a go
+`string` belongs is read as its bytes, as go's `ReadStringZC` does (serde
+rejects it).
 
 **`LogicSig` (#2390).** The `LogicSig` / `MultisigSig` / `PQSig` readers
 carry go's allocation bounds (`l` at most 16000 bytes, `arg` at most 255
@@ -273,7 +279,8 @@ go's real decoders (`scripts/strict-decode/strict_decode_fixtures.py`).
 
 **What is identical.** All canonical input (go's encoder always writes a
 map with unique keys), nil -> zero for integers/bools/map headers, every
-byte-field form (`docs/BYTES_DECODE_PARITY.md`), unknown-key handling (since
+byte-field form (`docs/BYTES_DECODE_PARITY.md`), a `bin` or uint8-array value
+for a go `string` field (#2421), unknown-key handling (since
 #2394), and every hash, ID and signature input (all are over the canonical re-encode of
 the decoded struct in both implementations).
 

@@ -195,9 +195,10 @@ const MAX_HEADER_VALUES: usize = 16;
 /// or value list, at most [`MAX_HEADER_KEYS`] keys and [`MAX_HEADER_VALUES`]
 /// values per key (`msgp.ErrOverflow`), a value list may be written as a map
 /// (read as its interleaved key/value array, go-codec compat), keys and values are go strings
-/// (`msgp.ReadStringBytes`: any bytes, `nil` is ""; invalid UTF-8 is
-/// replaced, which go's own header lookups never match either), a repeated
-/// key replaces the earlier one, and trailing bytes are ignored.
+/// (`msgp.ReadStringBytes`: any bytes, `nil` is "", kept losslessly in the
+/// [`algo_types::raw_text`] form), a repeated key replaces the earlier value
+/// list (go decodes each value list into a fresh slice), and trailing bytes
+/// are ignored.
 pub fn decode_headers(bytes: &[u8]) -> Result<PeerMetaHeaders, WsProtoError> {
     let err = |m: String| WsProtoError::HeaderDecode(m);
     let mut rd = bytes;
@@ -251,18 +252,12 @@ fn take_nil(rd: &mut &[u8]) -> bool {
     }
 }
 
-/// go `msgp.ReadStringBytes`: a `str` (or `nil`, read as "") of any bytes.
+/// A go `string` (`msgp.ReadStringBytes`: `str`, `nil` is "", go-codec compat
+/// `bin` / uint8 array). Arbitrary bytes are kept in the lossless
+/// [`algo_types::raw_text`] form (issue #2421), so two distinct go keys stay
+/// distinct; valid UTF-8 (every real header) is unchanged.
 fn read_go_string(rd: &mut &[u8]) -> Result<String, String> {
-    if take_nil(rd) {
-        return Ok(String::new());
-    }
-    let len = rmp::decode::read_str_len(rd).map_err(|e| format!("string: {e}"))? as usize;
-    if rd.len() < len {
-        return Err(format!("string: need {len} bytes, have {}", rd.len()));
-    }
-    let s = String::from_utf8_lossy(&rd[..len]).into_owned();
-    *rd = &rd[len..];
-    Ok(s)
+    algo_types::go_msgp::read_string(rd).map_err(|e| format!("string: {e}"))
 }
 
 /// Write the 2-byte-length-prefixed msgpack peer-meta-headers message.

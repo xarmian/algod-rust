@@ -1,18 +1,24 @@
-{"go_ok": true, "id": 0, "key": "a27a7a", "kind": "peermeta", "map": 0, "pos": 0, "seed": "peermeta_rand2", "sha": "761d23d29d346b4f", "val": "c0"}
+{"go_ok": true, "go_val": "5eaff5bda1ab0792", "id": 0, "key": "a27a7a", "kind": "peermeta", "map": 0, "pos": 0, "seed": "peermeta_rand2", "sha": "761d23d29d346b4f", "val": "c0"}
 {"go_ok": false, "id": 1, "key": "a27a7a", "kind": "peermeta", "map": 0, "pos": 1, "seed": "peermeta_rand3", "sha": "86215089c99e2e5d", "val": "c40100"}
 {"go_ok": false, "id": 2, "key": "a27a7a", "kind": "peermeta", "map": 0, "pos": 1, "seed": "peermeta_rand3", "sha": "0df3818370d47b59", "val": "a178"}
-{"go_ok": true, "id": 3, "key": "a27a7a", "kind": "peermeta", "map": 0, "pos": 0, "seed": "peermeta_rand1", "sha": "e6bda9424a61dfbd", "val": "c0"}
+{"go_ok": true, "go_val": "69687c38e5deadc4", "id": 3, "key": "a27a7a", "kind": "peermeta", "map": 0, "pos": 0, "seed": "peermeta_rand1", "sha": "e6bda9424a61dfbd", "val": "c0"}
 {"go_ok": false, "id": 4, "key": "a27a7a", "kind": "peermeta", "map": 0, "pos": 0, "seed": "peermeta_rand1", "sha": "2f058ae807d576ea", "val": "a178"}
 {"go_ok": false, "id": 5, "key": "a27a7a", "kind": "peermeta", "map": 0, "pos": 0, "seed": "peermeta_real1", "sha": "a7ec75deb2149261", "val": "81a16101"}
-{"go_ok": true, "id": 6, "key": "", "kind": "peermeta", "map": -1, "pos": 0, "seed": "peermeta_rand2", "sha": "7297171c01992701", "val": ""}
+{"go_ok": true, "go_val": "7297171c01992701", "id": 6, "key": "", "kind": "peermeta", "map": -1, "pos": 0, "seed": "peermeta_rand2", "sha": "7297171c01992701", "val": ""}
 {"go_ok": false, "id": 7, "key": "a27a7a", "kind": "peermeta", "map": 0, "pos": 7, "seed": "peermeta_real0", "sha": "24d4b400b51d9805", "val": "c40100"}
-{"go_ok": true, "id": 8, "key": "", "kind": "peermeta", "map": -1, "pos": 0, "seed": "peermeta_real0", "sha": "35ec9396dc585c10", "val": ""}
-{"go_ok": true, "id": 9, "key": "", "kind": "peermeta", "map": -1, "pos": 0, "seed": "peermeta_rand0", "sha": "18423a5f1e4bce1a", "val": ""}
+{"go_ok": true, "go_val": "35ec9396dc585c10", "id": 8, "key": "", "kind": "peermeta", "map": -1, "pos": 0, "seed": "peermeta_real0", "sha": "35ec9396dc585c10", "val": ""}
+{"go_ok": true, "go_val": "18423a5f1e4bce1a", "id": 9, "key": "", "kind": "peermeta", "map": -1, "pos": 0, "seed": "peermeta_rand0", "sha": "18423a5f1e4bce1a", "val": ""}
 {"go_ok": false, "id": 10, "key": "a27a7a", "kind": "peermeta", "map": 0, "pos": 1, "seed": "peermeta_real1", "sha": "72361e17b528a476", "val": "81a16101"}
-{"go_ok": true, "id": 11, "key": "", "kind": "peermeta", "map": -1, "pos": 0, "seed": "peermeta_real1", "sha": "6651530a3be88c9c", "val": ""}
+{"go_ok": true, "go_val": "6651530a3be88c9c", "id": 11, "key": "", "kind": "peermeta", "map": -1, "pos": 0, "seed": "peermeta_real1", "sha": "6651530a3be88c9c", "val": ""}
 {"go_ok": false, "id": 12, "key": "a27a7a", "kind": "peermeta", "map": 0, "pos": 1, "seed": "peermeta_rand0", "sha": "b4b70d35f9ebfad6", "val": "01"}
 {"go_ok": false, "id": 13, "key": "a27a7a", "kind": "peermeta", "map": 0, "pos": 1, "seed": "peermeta_rand0", "sha": "06ebc6778ea41e57", "val": "c3"}
 {"go_ok": false, "id": 14, "key": "a27a7a", "kind": "peermeta", "map": 0, "pos": 1, "seed": "peermeta_real0", "sha": "23a3a699ad64c445", "val": "c3"}
-{"go_ok": true, "id": 15, "key": "a27a7a", "kind": "peermeta", "map": 0, "pos": 0, "seed": "peermeta_rand2", "sha": "761d23d29d346b4f", "val": "c0"}
-{"go_ok": true, "id": 16, "key": "", "kind": "peermeta", "map": -1, "pos": 0, "seed": "peermeta_rand1", "sha": "0473045a202edb75", "val": ""}
-{"go_ok": true, "id": 17, "key": "", "kind": "peermeta", "map": -1, "pos": 0, "seed": "peermeta_rand3", "sha": "8acb03fa91e4caed", "val": ""}
+{"go_ok": true, "go_val": "5eaff5bda1ab0792", "id": 15, "key": "a27a7a", "kind": "peermeta", "map": 0, "pos": 0, "seed": "peermeta_rand2", "sha": "761d23d29d346b4f", "val": "c0"}
+{"go_ok": true, "go_val": "0473045a202edb75", "id": 16, "key": "", "kind": "peermeta", "map": -1, "pos": 0, "seed": "peermeta_rand1", "sha": "0473045a202edb75", "val": ""}
+{"go_ok": true, "go_val": "8acb03fa91e4caed", "id": 17, "key": "", "kind": "peermeta", "map": -1, "pos": 0, "seed": "peermeta_rand3", "sha": "8acb03fa91e4caed", "val": ""}
+{"go_ok": true, "go_val": "0473045a202edb75", "id": 18, "key": "d9379cd3ddae55beac52a4f7cfcc90705ae1680c867311ec0ee696a64ac36be2b26dd90175dce4b50b0d098d3d33da4cc1cdf2bd1203005cb6", "kind": "peermeta", "map": 0, "pos": 1, "seed": "peermeta_rand1", "sha": "604ea0291fe4a951", "val": "91d934ff6151d74f9bf3269a5eaa0dec2d98db801ff35bb158e7540466ac0c001749e37e27e8a2143af427b4ef036e750f543c56add071"}
+{"go_ok": true, "go_val": "6651530a3be88c9c", "id": 19, "key": "b2582d416c676f72616e642d56657273696f6e", "kind": "peermeta", "map": 0, "pos": 1, "seed": "peermeta_real1", "sha": "572540d37093bdce", "val": "91a3322e32"}
+{"go_ok": true, "go_val": "8acb03fa91e4caed", "id": 20, "key": "aee4d0ea213e7c029b9c224a2d3d07", "kind": "peermeta", "map": 0, "pos": 0, "seed": "peermeta_rand3", "sha": "49e650497751e24f", "val": "91d925f99a8611870d3af7098d93b6870fbee5d6bd92ee662a9e564b36ec7eba2cfe741ef4cd98dd"}
+{"go_ok": true, "go_val": "50fc763304af7794", "id": 21, "key": "d9334d036cad6e4ad23118d63fb90ebd441d1b788e4f9fca7c5108a4a73595ac03948f71d2de64a9866def82d8a26aa8ebd35870b8", "kind": "peermeta", "map": 0, "pos": 1, "seed": "peermeta_rand2", "sha": "62a2fbb4c287364e", "val": "92d93e5ebbc49074c101e92955284710491263f514429e86651c2d794cf230c842c3d0c17c948668a1673977d17a8209bec968c89f617c5ed26c7f64e072472703d93e5ebbc49074c101e92955284710491263f514429e86651c2d794cf230c842c3d0c17c948668a1673977d17a8209bec968c89f617c5ed26c7f64e072472703"}
+{"go_ok": true, "go_val": "35ec9396dc585c10", "id": 22, "key": "b2582d416c676f72616e642d56657273696f6e", "kind": "peermeta", "map": 0, "pos": 1, "seed": "peermeta_real0", "sha": "faed988ad4658a60", "val": "92a3322e32a3322e32"}
+{"go_ok": true, "go_val": "0bdfe0b9277cd838", "id": 23, "key": "ad070fa75487639846c0aa93a14f", "kind": "peermeta", "map": 0, "pos": 1, "seed": "peermeta_rand0", "sha": "a773ed25efecad9e", "val": "90"}

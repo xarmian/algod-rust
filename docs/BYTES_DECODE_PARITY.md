@@ -317,4 +317,48 @@ set and go accepts; the Rust reader replaced the participant and rejected
 check runs on the merged result, nil still zeroes it). Pinned as two
 always-present cases (`PINNED` in `strict_decode_fixtures.py`). This narrows,
 and does not widen, DIV-004's "replace instead of merge on a duplicated key"
-(other struct fields still replace; no observable accept/reject difference).
+(other struct fields still replace; #2421's decoded-value oracle shows that is
+observable, tracked by #2424).
+
+## Issue #2421: a repeated key decodes into the populated field
+
+go's generated decoders have no duplicate-key detection: a repeated map key is
+decoded again into the field it already filled. A scalar or `[]byte` /
+`msgp.Raw` is overwritten; a nested struct keeps the fields the repeat does not
+mention (a `nil` map header resets it, `(*z) = T{}`); a map keeps its entries
+and gets the new ones (each value fresh); a slice of `n` elements is re-sliced
+when `cap >= n` (each element decoded into the existing one, elements hidden
+by a shorter repeat come back with a longer one) and is a fresh `make` of zero
+elements otherwise; a `[N]byte` (`ReadExactBytes(b, z.X[:])`) overwrites only
+the first `min(len, N)` bytes and keeps the rest (`nil` zeroes it). A go
+`string` field also reads a `bin` or a uint8 array (`ReadStringZC`'s go-codec
+fallback), which `rmp_decode::read_string` / `read_str_bytes` now do for every
+reader.
+
+**Non-consensus readers (fixed).** The catchpoint readers
+(`crates/core/algo-ledger/src/catchpoint/msgp_compat.rs`: header, chunk
+`bl`/`kv`/`oa`/`orp` with go's slice capacity, `BalanceRecordV6.c`, the
+account / resource / online blobs including `TealKeyValue`, the state-proof
+verification `spd`), the identity handshake messages
+(`crates/node/algo-network/src/identity.rs`) and the libp2p peer meta headers
+(`crates/node/algo-p2p/src/wsproto.rs`, now lossless for non-UTF-8 bytes) decode
+exactly what go decodes. The importer also gained go's
+`prepareNormalizedBalancesV6` checks it lacked
+(`importer::decode_balance_record_blobs`): an empty account / resource blob
+and a resource that is neither an asset nor an app fail the restore.
+
+**Proof.** The fixture generator's oracles now return go's re-encode of the
+decoded value; every accepted case carries its sha256 prefix (`go_val`), and
+the ledger / network / p2p sets carry repeated-key cases (a key the map already
+has, with a value derived from its first one or another map's value under the
+same key). The replaying tests re-encode algod-rust's decoded value the way go
+encodes it and compare. Red before the fix: 16 of 801 ledger cases, 1 identity
+case, 11 of 24 peer-meta cases; green after, plus 36k fuzz cases
+(`--fuzz 20000`, 26432 ledger / 9196 network / 630 p2p). Unit tests pin go's
+slice-capacity result (checked against go v5.0.5-stable) and each merge rule.
+
+**Consensus readers and tx-sync (not yet).** With the same oracle, 389 of 4748
+consensus cases decode differently from go (and some verdicts differ); the
+tx-sync response goes through the same `SignedTransaction` reader. Their
+repeated-key cases stay off (`repeat_kinds`) until #2424 makes those readers
+merge; DIV-004 keeps that half until then.

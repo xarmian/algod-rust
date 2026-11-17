@@ -47,9 +47,9 @@ use super::checkpoint::ImportCheckpoint;
 use super::msgp_compat::{decode_base_account_data, decode_resources_data};
 use super::parser::{self, CatchpointEntry};
 use super::types::{
-    BalanceRecordV6, CatchpointError, CatchpointFileHeader, CatchpointSnapshotChunkV6, KVRecordV6,
-    OnlineAccountRecordV6, OnlineRoundParamsRecordV6, RESOURCE_FLAGS_EMPTY_APP,
-    RESOURCE_FLAGS_EMPTY_ASSET, RESOURCE_FLAGS_OWNERSHIP,
+    BalanceRecordV6, CatchpointBaseAccountData, CatchpointError, CatchpointFileHeader,
+    CatchpointSnapshotChunkV6, KVRecordV6, OnlineAccountRecordV6, OnlineRoundParamsRecordV6,
+    RESOURCE_FLAGS_EMPTY_APP, RESOURCE_FLAGS_EMPTY_ASSET, RESOURCE_FLAGS_OWNERSHIP,
 };
 use super::types::{CATCHPOINT_FILE_VERSION_V5, CATCHPOINT_FILE_VERSION_V7};
 use crate::rewards::normalized_online_balance;
@@ -873,9 +873,9 @@ impl<'a> CatchpointImporter<'a> {
     /// Insert a balance record into `catchpointbalances` + resources +
     /// asset creators.
     fn import_balance_record(&mut self, record: &BalanceRecordV6) -> Result<(), CatchpointError> {
-        // Decode account data to compute normalizedonlinebalance.
-        let acct_data = decode_base_account_data(&record.account_data)
-            .map_err(|e| CatchpointError::ImportError(format!("decode account data: {e}")))?;
+        // Decode account data (for normalizedonlinebalance) and every
+        // resource, as go does before writing anything.
+        let (acct_data, resources) = decode_balance_record_blobs(record)?;
 
         let status = AccountStatus::from(acct_data.status);
         let nob = normalized_online_balance(
@@ -918,18 +918,18 @@ impl<'a> CatchpointImporter<'a> {
         };
 
         // Insert resources.
-        for (&aidx, resource_data) in &record.resources {
-            // Decode resource to determine ctype and check ownership for asset creators table.
-            let rd = decode_resources_data(resource_data)
-                .map_err(|e| CatchpointError::ImportError(format!("decode resource data: {e}")))?;
+        for (aidx, rd) in &resources {
+            let aidx = *aidx;
+            let resource_data = &record.resources[&aidx];
 
             // Determine ctype: asset=0, app=1 (matches Go's basics.CreatableType).
-            // Unknown/non-owning resources use -1 — the same "unknown"
+            // `decode_balance_record_blobs` already rejected a resource that
+            // is neither (as go does); -1 stays the defensive "unknown", the same
             // sentinel Go uses (see G5 / DOC-24, and
             // `../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:970`
             // where the post-migration column is `NOT NULL DEFAULT -1`).
-            let resource_is_asset = is_asset(rd.resource_flags, &rd);
-            let resource_is_app = is_app(rd.resource_flags, &rd);
+            let resource_is_asset = is_asset(rd.resource_flags, rd);
+            let resource_is_app = is_app(rd.resource_flags, rd);
             let ctype: i64 = if resource_is_app {
                 CTYPE_APP
             } else if resource_is_asset {
@@ -1683,6 +1683,53 @@ fn is_holding(flags: u8) -> bool {
     (flags & super::types::RESOURCE_FLAGS_NOT_HOLDING) == super::types::RESOURCE_FLAGS_HOLDING
 }
 
+/// A balance record's decoded account blob and resource blobs (ascending
+/// creatable index).
+pub type DecodedBalanceRecordBlobs = (
+    CatchpointBaseAccountData,
+    Vec<(u64, super::types::CatchpointResourcesData)>,
+);
+
+/// What go's catchpoint restore does with one balance record before writing
+/// it (`prepareNormalizedBalancesV6`, `ledger/acctdeltas.go`): decode the
+/// account blob and every resource blob with `protocol.Decode`, where an empty
+/// blob (a `nil` or absent `b`, a `nil` resource) is a decode error
+/// (`msgp.ErrShortBytes`), and classify every resource as an asset or an app
+/// (`ResourcesHashBuilderV6` -> `rdGetCreatableHashKind`: a resource that is
+/// neither fails the restore).
+pub fn decode_balance_record_blobs(
+    record: &BalanceRecordV6,
+) -> Result<DecodedBalanceRecordBlobs, CatchpointError> {
+    const SHORT: &str = "msgp: too few bytes left to read object";
+    if record.account_data.is_empty() {
+        return Err(CatchpointError::ImportError(format!(
+            "decode account data: {SHORT}"
+        )));
+    }
+    let acct_data = decode_base_account_data(&record.account_data)
+        .map_err(|e| CatchpointError::ImportError(format!("decode account data: {e}")))?;
+    let mut idx: Vec<u64> = record.resources.keys().copied().collect();
+    idx.sort_unstable();
+    let mut resources = Vec::with_capacity(idx.len());
+    for aidx in idx {
+        let blob = &record.resources[&aidx];
+        if blob.is_empty() {
+            return Err(CatchpointError::ImportError(format!(
+                "decode resource data: {SHORT}"
+            )));
+        }
+        let rd = decode_resources_data(blob)
+            .map_err(|e| CatchpointError::ImportError(format!("decode resource data: {e}")))?;
+        if !is_asset(rd.resource_flags, &rd) && !is_app(rd.resource_flags, &rd) {
+            return Err(CatchpointError::ImportError(format!(
+                "unknown creatable for aidx {aidx}: neither an asset nor an app"
+            )));
+        }
+        resources.push((aidx, rd));
+    }
+    Ok((acct_data, resources))
+}
+
 /// Returns `true` if the resource is an asset resource.
 ///
 /// Matches Go logic: either the `EmptyAsset` flag is set, or the asset fields
@@ -1824,9 +1871,10 @@ mod tests {
         ]
     }
 
-    /// Non-owning resource blob (resource_flags = 0).
+    /// A held, not owned asset (`l` amount 5, flags 0). An empty `{}` is
+    /// neither an asset nor an app, which go's restore rejects (#2421).
     fn non_owning_resource_blob() -> Vec<u8> {
-        vec![0x80] // empty map
+        vec![0x81, 0xa1, b'l', 0x05]
     }
 
     fn make_balance_record(
@@ -1855,6 +1903,34 @@ mod tests {
         assert_eq!(stats.accounts, 0);
         assert_eq!(stats.kvs, 0);
         assert_eq!(stats.chunks_processed, 1);
+    }
+
+    /// go's `prepareNormalizedBalancesV6` rejects an empty account or
+    /// resource blob (a `nil` `b`: `protocol.Decode` of no bytes) and a
+    /// resource that is neither an asset nor an app ("unknown creatable");
+    /// the importer used to store them (issue #2421).
+    #[test]
+    fn decode_balance_record_blobs_rejects_what_go_rejects() {
+        let rec = make_balance_record([1u8; 32], Vec::new(), HashMap::new());
+        assert!(decode_balance_record_blobs(&rec).is_err());
+
+        let mut res = HashMap::new();
+        res.insert(5u64, ByteBuf::from(vec![0x80]));
+        let rec = make_balance_record([1u8; 32], empty_account_data_blob(), res);
+        let err = decode_balance_record_blobs(&rec).unwrap_err();
+        assert!(err.to_string().contains("unknown creatable"), "{err}");
+
+        let mut res = HashMap::new();
+        res.insert(5u64, ByteBuf::new());
+        let rec = make_balance_record([1u8; 32], empty_account_data_blob(), res);
+        assert!(decode_balance_record_blobs(&rec).is_err());
+
+        let mut res = HashMap::new();
+        res.insert(7u64, ByteBuf::from(owned_asset_resource_blob()));
+        res.insert(5u64, ByteBuf::from(owned_asset_resource_blob()));
+        let rec = make_balance_record([1u8; 32], empty_account_data_blob(), res);
+        let (_, rds) = decode_balance_record_blobs(&rec).unwrap();
+        assert_eq!(rds.iter().map(|r| r.0).collect::<Vec<_>>(), [5, 7]);
     }
 
     #[test]
@@ -2127,7 +2203,8 @@ mod tests {
         let mut resources = HashMap::new();
         resources.insert(10u64, ByteBuf::from(non_owning_resource_blob()));
 
-        let record = make_balance_record(addr, empty_account_data_blob(), resources);
+        // account data `{j: 1}`: one asset holding, matching the resource
+        let record = make_balance_record(addr, vec![0x81, 0xa1, b'j', 0x01], resources);
 
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         importer.import_balance_record(&record).unwrap();

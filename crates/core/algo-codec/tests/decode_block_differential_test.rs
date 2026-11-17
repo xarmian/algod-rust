@@ -41,6 +41,7 @@
 //! | H a key the struct lacks (a substitution renames a key) | ignores it | rejects (issue #2394) | rejects (`msgp.ErrNoField`) |
 //! | I a wrong-typed key or value (an integer for a map, an empty map for an integer) in `state_proof_tracking`, the one field serde keeps opaque and the hand reader types (#2394) | accepts | rejects | rejects (`ReadUint64Bytes` `TypeError`) |
 //! | J a non-UTF-8 byte in a go `string` field value (`gen`, `proto`, `nextproto`, `upgradeprop`, txn `type`; a substitution of a string's marker or content) | rejects (`Utf8Error`) | keeps the bytes losslessly (#2397) | keeps the bytes (`ReadStringBytes`) |
+//! | K a `bin` or uint8 array where a go `string` field value belongs (a substitution of the string's marker) | rejects ("invalid type ... expected a string") | reads its bytes (#2421) | reads its bytes (`ReadStringZC` falls back to go-codec's `readBytesBytes`) |
 //!
 //! G cannot arise from the single-byte substitutions below and is pinned by
 //! `a_repeated_key_is_accepted_by_the_hand_reader_only`.
@@ -105,6 +106,7 @@ struct Tally {
     class_h: usize,
     class_i: usize,
     class_j: usize,
+    class_k: usize,
 }
 
 /// Compare the two decoders on `bytes` (mutated at `at`, or `usize::MAX`).
@@ -158,8 +160,13 @@ fn compare(label: &str, bytes: &[u8], at: usize, t: &mut Tally) {
                 t.class_f += 1;
             } else if msg.contains("Utf8Error") {
                 t.class_j += 1;
+            } else if at != usize::MAX
+                && matches!(bytes[at], 0x90..=0x9f | 0xdc | 0xdd | 0xc4..=0xc6)
+                && msg.contains("expected a string")
+            {
+                t.class_k += 1;
             } else {
-                panic!("{label}: the hand reader accepts, serde rejects, outside classes E, F and J: {msg}");
+                panic!("{label}: the hand reader accepts, serde rejects, outside classes E, F, J and K: {msg}");
             }
         }
     }
