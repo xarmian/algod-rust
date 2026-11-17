@@ -56,7 +56,7 @@ use algo_types::go_msgp::{
     EVAL_MAX_ARGS, MAX_LOGIC_SIG_ARG_SIZE, MAX_LOGIC_SIG_MAX_SIZE, MAX_MULTISIG,
     MAX_PQ_PUBLIC_KEY_SIZE, MAX_PQ_SIGNATURE_SIZE,
 };
-use algo_types::{MultisigSig, MultisigSubsig, PQAddressSalt, PQSig};
+use algo_types::{LogicSig, MultisigSig, MultisigSubsig, PQAddressSalt, PQSig};
 use serde_bytes::ByteBuf;
 
 /// A `transactions.LogicSig` as go's generated decoder leaves it.
@@ -64,6 +64,10 @@ use serde_bytes::ByteBuf;
 pub struct GoLogicSig {
     /// `Logic` (`l`).
     pub logic: Vec<u8>,
+    /// `Logic == nil` in go: no `l` (or a `nil` one) was decoded. go's
+    /// `goal clerk sign`/`send` treat that as "no LogicSig"; an empty but
+    /// non-nil `l` is a LogicSig with an empty program.
+    pub logic_nil: bool,
     /// `Sig` (`sig`).
     pub sig: [u8; 64],
     /// `Msig` (`msig`); a zero value when the record has none.
@@ -85,6 +89,44 @@ pub fn decode_logicsig_go(bytes: &[u8]) -> Result<GoLogicSig> {
         context: "failed to decode LogicSig like go's protocol.Decode".into(),
     })?;
     Ok(z.finish())
+}
+
+/// Decode `bytes` as go's `protocol.Decode(bytes, &msig)` does for a
+/// `crypto.MultisigSig` (what `libgoal` runs on kmd's `multisig/sign` and
+/// `multisig/signprogram` responses): the same generated decoder
+/// [`decode_logicsig_go`] runs for `msig` / `lmsig`.
+pub fn decode_multisig_go(bytes: &[u8]) -> Result<MultisigSig> {
+    let mut b = bytes;
+    let mut z = MsigState::default();
+    z.decode(&mut b).map_err(|e| AlgoError::Codec {
+        source: e.into(),
+        context: "failed to decode MultisigSig like go's protocol.Decode".into(),
+    })?;
+    Ok(z.finish())
+}
+
+impl GoLogicSig {
+    /// The value goal's signing and sending code works with: members go holds
+    /// blank (`Blank()`: no sig, no msig, no pqsig, no args) are absent, so
+    /// re-encoding omits them like go's `omitempty`. A `nil` argument is an
+    /// empty one (go encodes a nil `[]byte` as an empty `bin`).
+    pub fn into_logicsig(self) -> LogicSig {
+        let msig = |m: MultisigSig| Some(m).filter(|m| !m.blank());
+        let args = (!self.args.is_empty()).then(|| {
+            self.args
+                .into_iter()
+                .map(|a| ByteBuf::from(a.unwrap_or_default()))
+                .collect()
+        });
+        LogicSig {
+            logic: ByteBuf::from(self.logic),
+            sig: self.sig,
+            msig: msig(self.msig),
+            args,
+            lmsig: msig(self.lmsig),
+            pqsig: Some(self.pqsig).filter(|p| !p.blank()),
+        }
+    }
 }
 
 type R<T> = std::result::Result<T, &'static str>;
@@ -517,6 +559,7 @@ impl PqState {
 
 struct LsigState {
     logic: Vec<u8>,
+    logic_nil: bool,
     sig: [u8; 64],
     msig: MsigState,
     lmsig: MsigState,
@@ -528,6 +571,7 @@ impl Default for LsigState {
     fn default() -> Self {
         Self {
             logic: Vec::new(),
+            logic_nil: true,
             sig: [0; 64],
             msig: MsigState::default(),
             lmsig: MsigState::default(),
@@ -538,6 +582,13 @@ impl Default for LsigState {
 }
 
 impl LsigState {
+    fn decode_logic(&mut self, b: &mut &[u8]) -> R<()> {
+        let (v, nil) = read_bounded_bytes(b, MAX_LOGIC_SIG_MAX_SIZE)?;
+        self.logic = v;
+        self.logic_nil = nil;
+        Ok(())
+    }
+
     fn decode_args(&mut self, b: &mut &[u8]) -> R<()> {
         let (n, _nil) = read_array_header(b, true)?;
         if n > EVAL_MAX_ARGS {
@@ -560,7 +611,7 @@ impl LsigState {
                 }
                 for _ in 0..n {
                     match read_map_key(b)?.as_slice() {
-                        b"l" => self.logic = read_bounded_bytes(b, MAX_LOGIC_SIG_MAX_SIZE)?.0,
+                        b"l" => self.decode_logic(b)?,
                         b"sig" => read_exact(b, &mut self.sig)?,
                         b"msig" => self.msig.decode(b)?,
                         b"lmsig" => self.lmsig.decode(b)?,
@@ -573,7 +624,7 @@ impl LsigState {
             Form::Array(mut n) => {
                 if n > 0 {
                     n -= 1;
-                    self.logic = read_bounded_bytes(b, MAX_LOGIC_SIG_MAX_SIZE)?.0;
+                    self.decode_logic(b)?;
                 }
                 if n > 0 {
                     n -= 1;
@@ -606,6 +657,7 @@ impl LsigState {
     fn finish(self) -> GoLogicSig {
         GoLogicSig {
             logic: self.logic,
+            logic_nil: self.logic_nil,
             sig: self.sig,
             msig: self.msig.finish(),
             lmsig: self.lmsig.finish(),
