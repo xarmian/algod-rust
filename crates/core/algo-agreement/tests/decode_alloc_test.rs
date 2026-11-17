@@ -91,8 +91,13 @@ fn decoding_a_certificate_does_not_allocate_per_key() {
 fn decoding_a_proposal_does_not_allocate_for_the_second_pass() {
     let data = fixture("proposal.msgpack");
     let _ = decode_compound_message(&data).expect("decode proposal");
-    let (block_only, _) =
-        allocations(|| algo_types::Block::decode_from_bytes(&data).expect("decode block"));
+    let (block_only, _) = allocations(|| {
+        algo_types::Block::decode_with_extra_keys(
+            &mut &data[..],
+            &[b"oper", b"oprop", b"sdpf", b"pv"],
+        )
+        .expect("decode block")
+    });
     let (n, _) = allocations(|| decode_compound_message(&data).expect("decode proposal"));
     // Everything beyond the block decode is the scan for `oper` / `oprop` /
     // `sdpf` / `pv`: it reads fixed-size fields and skips the block's own.

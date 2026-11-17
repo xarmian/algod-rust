@@ -27,7 +27,7 @@
 //! 3. Edge cases: empty blocks, unknown fields, transactions with extra fields
 
 use algo_codec::{
-    decode_block, decode_block_fast, decode_block_response, decode_block_response_fast,
+    decode_block, decode_block_fast, decode_block_response_fast, decode_block_response_serde,
     encode_block,
 };
 use algo_types::{Address, Block, BlockResponse, SignedTransaction, Transaction, TxnType};
@@ -55,7 +55,7 @@ static FIXTURES: &[(&str, &[u8], u64)] = &[
 #[test]
 fn fast_decode_matches_serde_all_fixtures_block_response() {
     for (name, bytes, _round) in FIXTURES {
-        let serde_result = decode_block_response(bytes)
+        let serde_result = decode_block_response_serde(bytes)
             .unwrap_or_else(|e| panic!("serde decode failed for {name}: {e}"));
         let fast_result = decode_block_response_fast(bytes)
             .unwrap_or_else(|e| panic!("fast decode failed for {name}: {e}"));
@@ -73,7 +73,7 @@ macro_rules! block_response_equiv_test {
         #[test]
         fn $name() {
             let bytes = include_bytes!(concat!("fixtures/", $file));
-            let serde_result = decode_block_response(bytes).expect("serde decode failed");
+            let serde_result = decode_block_response_serde(bytes).expect("serde decode failed");
             let fast_result = decode_block_response_fast(bytes).expect("fast decode failed");
             assert_eq!(serde_result, fast_result);
         }
@@ -97,7 +97,7 @@ block_response_equiv_test!(block_response_equiv_9, "block_9.msgpack");
 fn fast_decode_matches_serde_all_fixtures_inner_block() {
     for (name, bytes, _round) in FIXTURES {
         // Decode the response first, then re-encode just the block
-        let br: BlockResponse = decode_block_response(bytes)
+        let br: BlockResponse = decode_block_response_serde(bytes)
             .unwrap_or_else(|e| panic!("decode_block_response failed for {name}: {e}"));
         let block_bytes = encode_block(&br.block)
             .unwrap_or_else(|e| panic!("encode_block failed for {name}: {e}"));
@@ -121,7 +121,7 @@ fn fast_decode_matches_serde_all_fixtures_inner_block() {
 fn roundtrip_serde_encode_fast_decode_block_response() {
     for (name, bytes, _round) in FIXTURES {
         // Step 1: decode with serde
-        let serde_result = decode_block_response(bytes)
+        let serde_result = decode_block_response_serde(bytes)
             .unwrap_or_else(|e| panic!("initial serde decode failed for {name}: {e}"));
 
         // Step 2: re-encode the block with serde
@@ -145,7 +145,7 @@ fn roundtrip_serde_encode_fast_decode_block_response() {
 #[test]
 fn roundtrip_double_serde_fast_decode() {
     for (name, bytes, _round) in FIXTURES {
-        let original = decode_block_response(bytes)
+        let original = decode_block_response_serde(bytes)
             .unwrap_or_else(|e| panic!("decode failed for {name}: {e}"));
 
         let re_encoded = encode_block(&original.block)
@@ -253,9 +253,9 @@ fn fast_decode_minimal_block_with_rnd() {
     );
 }
 
-/// A block with unknown fields should have those fields skipped by the
-/// fast decoder, producing the same result as serde (which uses
-/// `deny_unknown_fields` is NOT set, so it also skips them).
+/// A block with an unknown field: serde (no `deny_unknown_fields`) skips it,
+/// the hand reader rejects it as go's msgp decoder does (`msgp.ErrNoField`,
+/// issue #2394). `decode_block` is the hand reader.
 #[test]
 fn fast_decode_block_with_unknown_fields() {
     // Build a msgpack map with one known field ("rnd" = 42) and one
@@ -270,32 +270,21 @@ fn fast_decode_block_with_unknown_fields() {
     rmp::encode::write_str(&mut buf, "zzz_unknown").unwrap();
     rmp::encode::write_uint(&mut buf, 99).unwrap();
 
-    let serde_result = decode_block(&buf);
-    let fast_result = decode_block_fast(&buf);
+    assert_unknown_field(decode_block(&buf));
+    assert_unknown_field(decode_block_fast(&buf));
+}
 
+/// The hand reader failed with go's `ErrNoField`.
+fn assert_unknown_field<T: std::fmt::Debug>(r: Result<T, algo_error::AlgoError>) {
+    let err = r.expect_err("go's msgp decoder rejects an unknown key");
     assert!(
-        serde_result.is_ok(),
-        "serde should handle unknown fields: {:?}",
-        serde_result.err()
-    );
-    assert!(
-        fast_result.is_ok(),
-        "fast should handle unknown fields: {:?}",
-        fast_result.err()
-    );
-
-    let serde_block = serde_result.unwrap();
-    let fast_block = fast_result.unwrap();
-
-    assert_eq!(serde_block.round.0, 42);
-    assert_eq!(fast_block.round.0, 42);
-    assert_eq!(
-        serde_block, fast_block,
-        "block with unknown fields: serde vs fast mismatch"
+        format!("{err:?}").contains("no matching struct field found"),
+        "{err:?}"
     );
 }
 
-/// A BlockResponse with unknown top-level fields should be handled.
+/// A BlockResponse with an unknown top-level field: go's `EncodedBlockCert`
+/// has only `block` and `cert`, so `protocol.Decode` fails (issue #2394).
 #[test]
 fn fast_decode_block_response_with_unknown_fields() {
     // Build: {"block": {rnd: 7}, "extra_field": true}
@@ -314,29 +303,10 @@ fn fast_decode_block_response_with_unknown_fields() {
     rmp::encode::write_str(&mut buf, "extra_field").unwrap();
     rmp::encode::write_bool(&mut buf, true).unwrap();
 
-    let serde_result = decode_block_response(&buf);
-    let fast_result = decode_block_response_fast(&buf);
-
-    assert!(
-        serde_result.is_ok(),
-        "serde should handle unknown response fields: {:?}",
-        serde_result.err()
-    );
-    assert!(
-        fast_result.is_ok(),
-        "fast should handle unknown response fields: {:?}",
-        fast_result.err()
-    );
-
-    let serde_br = serde_result.unwrap();
-    let fast_br = fast_result.unwrap();
-
-    assert_eq!(serde_br.block.round.0, 7);
-    assert_eq!(fast_br.block.round.0, 7);
-    assert_eq!(
-        serde_br, fast_br,
-        "block response with unknown fields: serde vs fast mismatch"
-    );
+    // the lenient serde reference skips it, the production decoders do not
+    assert!(decode_block_response_serde(&buf).is_ok());
+    assert_unknown_field(decode_block_response_fast(&buf));
+    assert_unknown_field(algo_codec::decode_block_response(&buf));
 }
 
 /// Verify that field-level data is identical between serde and fast
@@ -344,7 +314,7 @@ fn fast_decode_block_response_with_unknown_fields() {
 #[test]
 fn fast_decode_field_level_equivalence() {
     for (name, bytes, round) in FIXTURES {
-        let serde_br = decode_block_response(bytes)
+        let serde_br = decode_block_response_serde(bytes)
             .unwrap_or_else(|e| panic!("serde decode failed for {name}: {e}"));
         let fast_br = decode_block_response_fast(bytes)
             .unwrap_or_else(|e| panic!("fast decode failed for {name}: {e}"));
@@ -450,7 +420,7 @@ fn both_decoders_reject_truncated_input() {
         // Truncate to half the original size
         let truncated = &bytes[..bytes.len() / 2];
 
-        let serde_result = decode_block_response(truncated);
+        let serde_result = decode_block_response_serde(truncated);
         let fast_result = decode_block_response_fast(truncated);
 
         assert!(
@@ -469,7 +439,7 @@ fn both_decoders_reject_truncated_input() {
 fn both_decoders_reject_garbage_input() {
     let garbage = b"this is not msgpack at all!";
 
-    let serde_result = decode_block_response(garbage);
+    let serde_result = decode_block_response_serde(garbage);
     let fast_result = decode_block_response_fast(garbage);
 
     assert!(serde_result.is_err(), "serde should reject garbage");
@@ -523,21 +493,11 @@ fn fast_decode_block_with_nested_unknown_field() {
     rmp::encode::write_uint(&mut buf, 2).unwrap();
     rmp::encode::write_uint(&mut buf, 3).unwrap();
 
-    let serde_result = decode_block(&buf);
-    let fast_result = decode_block_fast(&buf);
-
-    assert!(serde_result.is_ok(), "serde: {:?}", serde_result.err());
-    assert!(fast_result.is_ok(), "fast: {:?}", fast_result.err());
-
-    assert_eq!(
-        serde_result.unwrap(),
-        fast_result.unwrap(),
-        "nested unknown field: serde vs fast mismatch"
-    );
+    assert_unknown_field(decode_block(&buf));
+    assert_unknown_field(decode_block_fast(&buf));
 }
 
-/// Verify that multiple unknown fields of various types are all
-/// properly skipped by the fast decoder.
+/// Unknown fields of every value type are rejected (issue #2394).
 #[test]
 fn fast_decode_block_skips_many_unknown_types() {
     // Build a block map with known "rnd" plus unknowns of different types:
@@ -581,18 +541,9 @@ fn fast_decode_block_skips_many_unknown_types() {
     rmp::encode::write_str(&mut buf, "k").unwrap();
     rmp::encode::write_str(&mut buf, "v").unwrap();
 
-    let serde_result = decode_block(&buf);
-    let fast_result = decode_block_fast(&buf);
-
-    assert!(serde_result.is_ok(), "serde: {:?}", serde_result.err());
-    assert!(fast_result.is_ok(), "fast: {:?}", fast_result.err());
-
-    let serde_block = serde_result.unwrap();
-    let fast_block = fast_result.unwrap();
-
-    assert_eq!(serde_block.round.0, 100);
-    assert_eq!(fast_block.round.0, 100);
-    assert_eq!(serde_block, fast_block, "many unknown types: mismatch");
+    // the first unknown key (whatever the type of its value) fails the decode
+    assert_unknown_field(decode_block(&buf));
+    assert_unknown_field(decode_block_fast(&buf));
 }
 
 /// Verify both decoders handle an empty byte slice by returning an error.
@@ -606,7 +557,7 @@ fn both_decoders_reject_empty_input() {
     assert!(serde_result.is_err(), "serde should reject empty input");
     assert!(fast_result.is_err(), "fast should reject empty input");
 
-    let serde_result = decode_block_response(empty);
+    let serde_result = decode_block_response_serde(empty);
     let fast_result = decode_block_response_fast(empty);
 
     assert!(

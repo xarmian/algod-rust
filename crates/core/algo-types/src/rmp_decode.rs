@@ -255,13 +255,32 @@ fn unknown_field_error(rd: &[u8], key: &[u8], (base, len): (usize, usize)) -> Al
     }
 }
 
-/// The fallback arm of every reader's key match: skip the value, or fail in
-/// strict mode. `rd` must point just after the already-read `key`.
+/// The fallback arm of every reader's key match: a key the struct lacks.
+///
+/// go's generated msgp decoders (and the reflection codec, `ErrorIfNoField =
+/// true`) fail with `msgp.ErrNoField` on such a key wherever the message
+/// comes from (gossip, catchup, REST, a block DB read), so this is an error
+/// whether or not a [`strict_unknown_fields`] guard is alive (issue #2394);
+/// the guard only adds the request-body offset go's REST text carries. `rd`
+/// must point just after the already-read `key`.
 #[inline]
 pub fn unknown_key(rd: &mut &[u8], key: &[u8]) -> Result<()> {
-    match STRICT_BASE.with(Cell::get) {
-        Some(base) => Err(unknown_field_error(rd, key, base)),
-        None => skip_value(rd),
+    Err(match STRICT_BASE.with(Cell::get) {
+        Some(base) => unknown_field_error(rd, key, base),
+        None => no_matching_field_error(key),
+    })
+}
+
+/// [`unknown_key`] for a message with no request body to count offsets from.
+#[cold]
+pub fn no_matching_field_error(key: &[u8]) -> AlgoError {
+    let text = format!(
+        "msgpack decode error: no matching struct field found when decoding stream map with key {}",
+        String::from_utf8_lossy(key)
+    );
+    AlgoError::Codec {
+        source: text.clone().into(),
+        context: text,
     }
 }
 
@@ -1051,6 +1070,20 @@ pub fn read_optional_rmpv(rd: &mut &[u8]) -> Result<Option<rmpv::Value>> {
     }
 }
 
+/// [`read_optional_rmpv`] for a value go decodes with a generated msgp
+/// decoder: first check, against `sch`, that it holds no key go's struct lacks
+/// (issue #2394), since the value itself is carried opaque.
+pub(crate) fn read_checked_optional_rmpv(
+    rd: &mut &[u8],
+    sch: &crate::msgp_schema::Sch,
+) -> Result<Option<rmpv::Value>> {
+    if !is_nil(rd) {
+        let mut probe = *rd;
+        crate::msgp_schema::validate(&mut probe, sch)?;
+    }
+    read_optional_rmpv(rd)
+}
+
 /// Read a BTreeMap<u64, T> from a msgpack map where keys are integers.
 #[inline]
 pub fn read_u64_map<T>(
@@ -1625,11 +1658,9 @@ mod tests {
     }
 
     #[test]
-    fn skip_value_via_unknown_field_rejects_deep_nesting() {
-        // Integration check: an unrecognized Transaction field (the fast
-        // decoder's `_ => skip_value(rd)?` arm) whose value is a
-        // maliciously deep structure must be rejected, not just a
-        // top-level payload passed straight to skip_value/check_msgpack_depth.
+    fn unknown_field_with_deeply_nested_value_is_rejected_not_skipped() {
+        // Integration check: an unrecognized Transaction field whose value is
+        // a maliciously deep structure is rejected, not skipped.
         use crate::Transaction;
 
         let mut buf = Vec::new();
@@ -1643,12 +1674,12 @@ mod tests {
 
         let mut rd = &buf[..];
         let err = Transaction::decode_from_reader(&mut rd).unwrap_err();
+        // the unknown key is refused (go's msgp.ErrNoField) before its value is
+        // skipped, so the 255 cap is not reached here; it still holds for the
+        // pre-scan (`check_msgpack_depth_matches_skip_value_at_the_boundary`)
         assert!(
-            format!("{err}").to_lowercase().contains("depth")
-                || std::error::Error::source(&err)
-                    .map(|s| s.to_string().to_lowercase().contains("depth"))
-                    .unwrap_or(false),
-            "got: {err}"
+            format!("{err:?}").contains("no matching struct field"),
+            "got: {err:?}"
         );
     }
 }

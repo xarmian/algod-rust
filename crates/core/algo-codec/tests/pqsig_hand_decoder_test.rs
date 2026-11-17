@@ -104,11 +104,10 @@ fn hand_decoder_keeps_every_pqsig_field_including_a_non_zero_salt() {
     assert_eq!(hand, oracle);
 }
 
-/// A pqsig map with an extra key: the known fields are still decoded (the
-/// sibling hand decoders skip unknown keys too; see the follow-up issue
-/// about go rejecting unknown fields on submit).
+/// A pqsig map with an extra key is rejected, as go's generated `PQSig`
+/// decoder does (`msgp.ErrNoField`; issue #2394).
 #[test]
-fn hand_decoder_pqsig_decodes_known_fields_next_to_an_unknown_key() {
+fn hand_decoder_pqsig_rejects_an_unknown_key() {
     let mut raw: Vec<u8> = vec![0x85];
     raw.extend_from_slice(b"\xa3sch\xc4\x02f1");
     raw.extend_from_slice(b"\xa3slt\x03");
@@ -116,10 +115,9 @@ fn hand_decoder_pqsig_decodes_known_fields_next_to_an_unknown_key() {
     raw.extend_from_slice(b"\xa3sig\xc4\x01\x09");
     raw.extend_from_slice(b"\xa3zzz\x01");
     let mut rd: &[u8] = &raw;
-    let pq = algo_types::PQSig::decode_from_reader(&mut rd).expect("decode");
-    assert!(rd.is_empty());
-    assert_eq!(pq.scheme, *b"f1");
-    assert_eq!(pq.salt, algo_types::PQAddressSalt(3));
-    assert_eq!(pq.public_key.as_slice(), &[1u8, 2]);
-    assert_eq!(pq.signature.as_slice(), &[9u8]);
+    let err = algo_types::PQSig::decode_from_reader(&mut rd).expect_err("unknown key");
+    assert!(
+        format!("{err:?}").contains("no matching struct field found"),
+        "{err:?}"
+    );
 }

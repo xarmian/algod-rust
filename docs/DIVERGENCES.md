@@ -225,8 +225,9 @@ fixed-size byte value shorter than the array keeps the earlier tail.
 **What algod-rust does instead.** The hand-written `decode_from_reader`
 struct readers accept the map form (and nil, as go does, since #2065) but not
 the array form, and a repeated key replaces the field (nested struct /
-fixed-size array zero-filled) instead of merging. The derived-serde path used
-for catchup `decode_block_response` and transaction-sync responses behaves likewise.
+fixed-size array zero-filled) instead of merging. The derived-serde path (transaction-sync responses and the like) behaves likewise;
+since #2394 the catchup `decode_block_response` uses the hand-written reader too
+(`decode_block_response_serde` is the old path).
 Since #2319 `decode_block` (catchup, archive replay, apply, gossip block source)
 uses the hand-written reader too (behind the same depth pre-scan); its old
 serde path is `decode_block_serde`, the reference of
@@ -257,10 +258,23 @@ of `tests/common/lsig_cases.rs` (also run through a real go `goal` in
 `crates/tools/goal-rust/tests/clerk_compile_e2e.rs`), that the consensus
 reader never accepts a record the port rejects.
 
+**Unknown keys (#2394) are not part of this divergence.** go's msgp
+decoders (and the reflection codec, `ErrorIfNoField = true`) fail with
+`msgp.ErrNoField` on a key the struct lacks, on every path that decodes a
+message: gossip proposal payloads / votes / bundles, catchup and REST blocks,
+block DB reads. Until #2394 the hand-written block, header, vote and bundle
+readers skipped such keys (only REST submit, gossip TX and simulate were
+strict), so a Rust node could vote for a proposal go nodes drop at decode. Every
+reader now rejects them at any nesting level, including the three subtrees
+kept as raw `rmpv::Value`s (`spt`, `dt`, the block response's `cert`; checked by
+`crates/core/algo-types/src/msgp_schema.rs`), proven by
+`crates/core/algo-agreement/tests/strict_unknown_fields_go_parity.rs` against
+go's real decoders (`scripts/strict-decode/strict_decode_fixtures.py`).
+
 **What is identical.** All canonical input (go's encoder always writes a
 map with unique keys), nil -> zero for integers/bools/map headers, every
-byte-field form (`docs/BYTES_DECODE_PARITY.md`), unknown-key handling, and
-every hash, ID and signature input (all are over the canonical re-encode of
+byte-field form (`docs/BYTES_DECODE_PARITY.md`), unknown-key handling (since
+#2394), and every hash, ID and signature input (all are over the canonical re-encode of
 the decoded struct in both implementations).
 
 **Why.** Positional decoding needs a per-struct field-order table for ~100

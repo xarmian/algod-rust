@@ -180,6 +180,56 @@ def str_key(s):
     return bytes([0xA0 | len(raw)]) + raw
 
 
+def ascii_strs(b):
+    """`b` with every non-ASCII byte of a msgpack `str` value replaced by `x`.
+
+    go's randomiser fills Go strings (transaction type, genesis id, log lines,
+    ...) with arbitrary bytes, and go accepts non-UTF-8 `str` values anywhere;
+    algod-rust's string readers refuse them (a separate, documented difference
+    in docs/BYTES_DECODE_PARITY.md that this fixture is not about), so the
+    random seeds keep their strings ASCII and the verdicts isolate unknown keys.
+    """
+    out = bytearray(b)
+
+    def go(i):
+        c = out[i]
+        if 0x80 <= c <= 0x8F or 0x90 <= c <= 0x9F or c in (0xDC, 0xDD, 0xDE, 0xDF):
+            if c in (0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F):
+                n, hl, mul = c & 0x0F, 1, 2
+            elif c <= 0x9F:
+                n, hl, mul = c & 0x0F, 1, 1
+            elif c == 0xDC:
+                n, hl, mul = int.from_bytes(out[i + 1 : i + 3], "big"), 3, 1
+            elif c == 0xDD:
+                n, hl, mul = int.from_bytes(out[i + 1 : i + 5], "big"), 5, 1
+            elif c == 0xDE:
+                n, hl, mul = int.from_bytes(out[i + 1 : i + 3], "big"), 3, 2
+            else:
+                n, hl, mul = int.from_bytes(out[i + 1 : i + 5], "big"), 5, 2
+            j = i + hl
+            for _ in range(n * mul):
+                j = go(j)
+            return j
+        e = skip(bytes(out), i)
+        if 0xA0 <= c <= 0xBF:
+            hl = 1
+        elif c == 0xD9:
+            hl = 2
+        elif c == 0xDA:
+            hl = 3
+        elif c == 0xDB:
+            hl = 5
+        else:
+            return e
+        for k in range(i + hl, e):
+            if out[k] > 0x7F:
+                out[k] = 0x78
+        return e
+
+    go(0)
+    return bytes(out)
+
+
 def top_value(b, key):
     """Raw bytes of top-level map `key`'s value."""
     n, hl = map_header(b, 0)
@@ -352,11 +402,13 @@ def run_go(go_algorand, rows, seeds_out=None):
 
 # ── cases ─────────────────────────────────────────────────────────────────
 
+# No empty array: go decodes a struct from an array (positionally), so `[]` is
+# accepted wherever a struct value is expected; algod-rust reads the map form
+# only (DIV-004), a documented difference this fixture is not about.
 VALUES = [
     bytes([0xC0]),  # nil
     bytes([0x01]),  # uint 1
     bytes([0xA1, 0x78]),  # "x"
-    bytes([0x90]),  # []
     bytes([0x80]),  # {}
     bytes([0xC4, 0x01, 0x00]),  # bin
     bytes([0x81, 0xA1, 0x61, 0x01]),  # {"a":1}
@@ -364,28 +416,37 @@ VALUES = [
 ]
 
 
-def key_pool(seeds):
-    pool = set()
-    for s in seeds:
-        b = bytes.fromhex(s["hex"])
-        for start, hl, entries, end in walk_maps(b):
-            for ks, vs, ve in entries:
-                if 0xA0 <= b[ks] <= 0xBF:
-                    pool.add(b[ks:vs])
-    return sorted(pool)
+def donor_entries(b):
+    """Every (key, value) entry of every map of `b`, as raw bytes."""
+    out = []
+    for start, hl, entries, end in walk_maps(b):
+        for ks, vs, ve in entries:
+            # An array-valued entry is left out: go decodes a struct from an
+            # array (DIV-004), so a dict of structs accepts it under any key.
+            if 0xA0 <= b[ks] <= 0xBF and not (0x90 <= b[vs] <= 0x9F or b[vs] in (0xDC, 0xDD)):
+                out.append((b[ks:vs], b[vs:ve]))
+    return out
 
 
 def make_cases(seeds, rng, per_map, cap=None):
-    pool = key_pool(seeds)
+    """Per map of every seed, `per_map` mutants: an unknown key `zz` (any value
+    kind), then *transplants*, a real (key, value) entry of another map of the
+    same seed. A transplant is well typed, so where the key is valid in the
+    destination go accepts it (a repeated key), and where it is not go rejects
+    it as an unknown field: no verdict depends on a value's type."""
     cases = []
     for s in seeds:
         b = bytes.fromhex(s["hex"])
+        donors = donor_entries(b)
         cases.append((s, -1, 0, b"", b""))
         for m, (start, hl, entries, end) in enumerate(walk_maps(b)):
             for j in range(per_map):
-                # first case: an unknown key; later ones: a key from another struct
-                key = str_key("zz") if j == 0 else rng.choice(pool)
-                cases.append((s, m, rng.randint(0, len(entries)), key, rng.choice(VALUES)))
+                pos = rng.randint(0, len(entries))
+                if j == 0 or not donors:
+                    cases.append((s, m, pos, str_key("zz"), rng.choice(VALUES)))
+                else:
+                    k, v = rng.choice(donors)
+                    cases.append((s, m, pos, k, v))
     rng.shuffle(cases)
     if cap is not None:
         cases = cases[:cap]
@@ -443,6 +504,8 @@ def main():
     if a.regen_seeds or not os.path.exists(SEEDS):
         rand = []
         run_go(go, [], seeds_out=rand)
+        for r in rand:
+            r["hex"] = ascii_strs(bytes.fromhex(r["hex"])).hex()
         seeds = real_seeds() + rand
         # a seed go itself rejects would only test the baseline: keep go-accepted ones
         v = run_go(go, [{"name": s["name"], "kind": s["kind"], "hex": s["hex"]} for s in seeds])

@@ -36,6 +36,10 @@
 //! | E nil where an integer, boolean or struct belongs | rejects ("unit value") | zero value | zero value (DIV-004, #2065) |
 //! | F `[N]byte` field of another length | rejects ("expected N bytes") | `ReadExactBytes`: copies `min(len, N)` bytes | same (`docs/BYTES_DECODE_PARITY.md`) |
 //! | G a repeated key | rejects (`duplicate field`) | last value wins (DIV-004) | decodes into the populated field |
+//! | H a key the struct lacks (a substitution renames a key) | ignores it | rejects (issue #2394) | rejects (`msgp.ErrNoField`) |
+//! | I a wrong-typed key or value (an integer for a map, an empty map for an integer) in `state_proof_tracking`, the one field serde keeps opaque and the hand reader types (#2394) | accepts | rejects | rejects (`ReadUint64Bytes` `TypeError`) |
+//! | H a key the struct lacks (a substitution renames a key) | ignores it | rejects (issue #2394) | rejects (`msgp.ErrNoField`) |
+//! | I a wrong-typed key or value (an integer for a map, an empty map for an integer) in `state_proof_tracking`, the one field serde keeps opaque and the hand reader types (#2394) | accepts | rejects | rejects (`ReadUint64Bytes` `TypeError`) |
 //!
 //! G cannot arise from the single-byte substitutions below and is pinned by
 //! `a_repeated_key_is_accepted_by_the_hand_reader_only`.
@@ -50,8 +54,20 @@ fn read(p: &str) -> Vec<u8> {
 fn fixtures() -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
     for n in 1..=9 {
+        // a `/v2/blocks/{round}?format=msgpack` body: the block is its `block` key
         let p = format!("tests/fixtures/block_{n}.msgpack");
-        out.push((p.clone(), read(&p)));
+        let mut body = &read(&p)[..];
+        let v = rmpv::decode::read_value(&mut body).unwrap();
+        let block = &v
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("block"))
+            .expect("block key")
+            .1;
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, block).unwrap();
+        out.push((p, buf));
     }
     for name in ["block-small.msgpack", "block-large.msgpack"] {
         let p = format!(
@@ -85,6 +101,8 @@ struct Tally {
     class_d: usize,
     class_e: usize,
     class_f: usize,
+    class_h: usize,
+    class_i: usize,
 }
 
 /// Compare the two decoders on `bytes` (mutated at `at`, or `usize::MAX`).
@@ -109,7 +127,16 @@ fn compare(label: &str, bytes: &[u8], at: usize, t: &mut Tally) {
         (Err(_), Err(_)) => t.both_err += 1,
         (Ok(_), Err(e)) => {
             let msg = format!("{e:?}");
-            if msg.contains("expected string marker") {
+            if msg.contains("no matching struct field") {
+                t.class_h += 1;
+            } else if serde
+                .as_ref()
+                .is_ok_and(|b| b.state_proof_tracking.is_some())
+            {
+                // only valid for a block that carries `spt`: serde kept the
+                // mutated value opaque, the hand reader's typed check failed
+                t.class_i += 1;
+            } else if msg.contains("expected string marker") {
                 t.class_b += 1;
             } else if at == 0 && msg.contains("read_map_len") {
                 t.class_c += 1;
@@ -188,9 +215,12 @@ fn single_byte_substitutions_differ_only_in_the_documented_classes() {
     }
     eprintln!("{t:?}");
     assert!(t.both_ok > 20_000 && t.both_err > 1_000, "{t:?}");
-    // Each class really occurs, so the assertions above are not vacuous.
+    // Each class really occurs, so the assertions above are not vacuous. (A and
+    // F are not asserted: since #2394 the hand reader types `state_proof_tracking`
+    // as go does, so a non-UTF-8 key there is rejected by both it and go, and the
+    // small fixtures no longer hit a `[N]byte` field of another length.)
     assert!(
-        t.class_a > 0 && t.class_b > 0 && t.class_c > 0 && t.class_e > 0 && t.class_f > 0,
+        t.class_b > 0 && t.class_c > 0 && t.class_e > 0 && t.class_h > 0 && t.class_i > 0,
         "{t:?}"
     );
 }
@@ -245,8 +275,10 @@ fn sampled_mutations_of_the_large_block_differ_only_in_the_documented_classes() 
     assert!(t.both_ok + t.both_err > 2_000, "{t:?}");
 }
 
-/// The depth bound of the pre-scan holds for the new `decode_block`: a deeply
-/// nested unknown field is refused at exactly the depth it was before.
+/// The depth bound of the pre-scan holds for `decode_block`: a deeply nested
+/// value is refused by the pre-scan at exactly the depth it was before. Since
+/// #2394 the hand reader refuses the unknown key itself even within the bound
+/// (go's `msgp.ErrNoField`), where serde skips it.
 #[test]
 fn the_depth_bound_is_unchanged() {
     for depth in [10usize, 200, 253, 254, 255, 256, 300, 5_000] {
@@ -254,11 +286,21 @@ fn the_depth_bound_is_unchanged() {
         let mut m = vec![0x81, 0xa3, b'z', b'z', b'z'];
         m.extend(std::iter::repeat_n(0x91u8, depth));
         m.push(0x00);
+        let within_bound = algo_types::check_msgpack_depth(&m).is_ok();
         assert_eq!(
             decode_block_serde(&m).is_ok(),
-            decode_block(&m).is_ok(),
+            within_bound,
             "depth {depth}"
         );
+        let msg = format!("{:?}", decode_block(&m).unwrap_err());
+        if within_bound {
+            assert!(
+                msg.contains("no matching struct field"),
+                "depth {depth}: {msg}"
+            );
+        } else {
+            assert!(msg.contains("depth"), "depth {depth}: {msg}");
+        }
     }
 }
 

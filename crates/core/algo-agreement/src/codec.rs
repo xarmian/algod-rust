@@ -578,15 +578,15 @@ pub fn encode_compound_message(cm: &CompoundMessage) -> Vec<u8> {
 /// prior vote (`unauthenticatedVote`).
 ///
 /// Decoding strategy:
-/// 1. Decode the bytes as a `Block` via `Block::decode_from_bytes` (which
-///    skips unknown keys like `oper`, `oprop`, `sdpf`, `pv`).
+/// 1. Decode the bytes as a `Block` via `Block::decode_from_bytes` (which skips only
+///    the proposal's own top-level keys `oper`, `oprop`, `sdpf`, `pv`).
 /// 2. Scan the map a second time to extract the proposal-specific fields
 ///    (`oper`, `oprop`, `sdpf`) and the optional prior vote (`pv`).
 pub fn decode_compound_message(bytes: &[u8]) -> Result<CompoundMessage, CodecError> {
     // Step 1: Decode block fields (skips unknown keys). Use the
     // rnd-tolerant wrapper so transmittedPayload fixtures with
     // round=0 (which omit the `rnd` key via omitempty) still parse.
-    let block = decode_block_allowing_missing_rnd(bytes)?;
+    let block = decode_block_allowing_missing_rnd(bytes, &[b"oper", b"oprop", b"sdpf", b"pv"])?;
 
     // Step 2: Scan the map to extract proposal-specific fields and prior vote.
     let mut cursor = Cursor::new(bytes);
@@ -606,7 +606,8 @@ pub fn decode_compound_message(bytes: &[u8]) -> Result<CompoundMessage, CodecErr
             "sdpf" => seed_proof = read_bin_fixed::<VRF_PROOF_SIZE>(&mut cursor)?,
             "pv" => prior_vote = decode_vote_from_cursor(&mut cursor)?,
             _ => {
-                // Skip all block fields and any other unknown fields.
+                // A block field: the strict block decode above already
+                // rejected every key go's `transmittedPayload` lacks.
                 skip_value(&mut cursor)?;
             }
         }
@@ -705,6 +706,15 @@ const FAST_SKIP_MAX_DEPTH: usize = 32;
 /// input, a reserved marker, deeper nesting) is handed to
 /// `rmpv::decode::read_value` exactly as before, so the accepted inputs, the
 /// bytes consumed and the error texts are unchanged (issue #2317).
+/// go's `msgp.ErrNoField`: a key the struct lacks fails the whole decode
+/// (issue #2394).
+#[cold]
+fn unknown_field(key: &str) -> CodecError {
+    CodecError::Decode(format!(
+        "no matching struct field found when decoding stream map with key {key}"
+    ))
+}
+
 fn skip_value(cursor: &mut Cursor<&[u8]>) -> Result<(), CodecError> {
     let buf: &[u8] = cursor.get_ref();
     let pos = (cursor.position() as usize).min(buf.len());
@@ -944,10 +954,7 @@ fn decode_proposal_value(cursor: &mut Cursor<&[u8]>) -> Result<ProposalValue, Co
             "encdig" => pv.encoding_digest = Digest(read_bin_fixed::<32>(cursor)?),
             "oper" => pv.original_period = Period(read_uint64(cursor)?),
             "oprop" => pv.original_proposer = Address(read_bin_fixed::<32>(cursor)?),
-            _ => {
-                // Skip unknown field
-                skip_value(cursor)?;
-            }
+            _ => return Err(unknown_field(key)),
         }
     }
 
@@ -975,9 +982,7 @@ fn decode_raw_vote(cursor: &mut Cursor<&[u8]>) -> Result<RawVote, CodecError> {
             "rnd" => rv.round = Round(read_uint64(cursor)?),
             "snd" => rv.sender = Address(read_bin_fixed::<32>(cursor)?),
             "step" => rv.step = Step(read_uint64(cursor)?),
-            _ => {
-                skip_value(cursor)?;
-            }
+            _ => return Err(unknown_field(key)),
         }
     }
 
@@ -997,9 +1002,7 @@ fn decode_unauthenticated_credential(
         let key = read_str_key(cursor)?;
         match key {
             "pf" => proof = read_bin_fixed::<VRF_PROOF_SIZE>(cursor)?,
-            _ => {
-                skip_value(cursor)?;
-            }
+            _ => return Err(unknown_field(key)),
         }
     }
 
@@ -1029,9 +1032,7 @@ fn decode_one_time_signature(cursor: &mut Cursor<&[u8]>) -> Result<OneTimeSignat
             "p2s" => sig.pk2_sig = read_bin_fixed::<64>(cursor)?,
             "ps" => sig.pk_sig_old = read_bin_fixed::<64>(cursor)?,
             "s" => sig.sig = read_bin_fixed::<64>(cursor)?,
-            _ => {
-                skip_value(cursor)?;
-            }
+            _ => return Err(unknown_field(key)),
         }
     }
 
@@ -1057,9 +1058,7 @@ fn decode_vote_from_cursor(cursor: &mut Cursor<&[u8]>) -> Result<Unauthenticated
             "cred" => vote.cred = decode_unauthenticated_credential(cursor)?,
             "r" => vote.raw_vote = decode_raw_vote(cursor)?,
             "sig" => vote.sig = decode_one_time_signature(cursor)?,
-            _ => {
-                skip_value(cursor)?;
-            }
+            _ => return Err(unknown_field(key)),
         }
     }
 
@@ -1088,9 +1087,7 @@ fn decode_vote_authenticator(cursor: &mut Cursor<&[u8]>) -> Result<VoteAuthentic
             "cred" => cred = decode_unauthenticated_credential(cursor)?,
             "sig" => sig = decode_one_time_signature(cursor)?,
             "snd" => sender = Address(read_bin_fixed::<32>(cursor)?),
-            _ => {
-                skip_value(cursor)?;
-            }
+            _ => return Err(unknown_field(key)),
         }
     }
 
@@ -1153,9 +1150,7 @@ fn decode_equivocation_vote_authenticator(
                 sigs[1] = decode_one_time_signature(cursor)?;
             }
             "snd" => sender = Address(read_bin_fixed::<32>(cursor)?),
-            _ => {
-                skip_value(cursor)?;
-            }
+            _ => return Err(unknown_field(key)),
         }
     }
 
@@ -1215,9 +1210,7 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<UnauthenticatedBundle, CodecError> 
                 }
                 bundle.votes = vs;
             }
-            _ => {
-                skip_value(&mut cursor)?;
-            }
+            _ => return Err(unknown_field(key)),
         }
     }
 
@@ -1336,9 +1329,7 @@ fn decode_hashable_credential_from_cursor(
             "i" => hc.iter = read_uint64(cursor)?,
             "m" => hc.member = Address(read_bin_fixed::<32>(cursor)?),
             "v" => hc.raw_out = read_bin_fixed::<VRF_OUTPUT_SIZE>(cursor)?,
-            _ => {
-                skip_value(cursor)?;
-            }
+            _ => return Err(unknown_field(key)),
         }
     }
 
@@ -1426,9 +1417,7 @@ fn decode_credential_from_cursor(cursor: &mut Cursor<&[u8]>) -> Result<Credentia
             "hc" => cred.hashable = decode_hashable_credential_from_cursor(cursor)?,
             "pf" => cred.proof = read_bin_fixed::<VRF_PROOF_SIZE>(cursor)?,
             "wt" => cred.weight = read_uint64(cursor)?,
-            _ => {
-                skip_value(cursor)?;
-            }
+            _ => return Err(unknown_field(key)),
         }
     }
 
@@ -1502,9 +1491,7 @@ fn decode_authenticated_vote_from_cursor(cursor: &mut Cursor<&[u8]>) -> Result<V
             "cred" => vote.cred = decode_credential_from_cursor(cursor)?,
             "r" => vote.raw_vote = decode_raw_vote(cursor)?,
             "sig" => vote.sig = decode_one_time_signature(cursor)?,
-            _ => {
-                skip_value(cursor)?;
-            }
+            _ => return Err(unknown_field(key)),
         }
     }
 
@@ -1654,9 +1641,7 @@ fn decode_equivocation_vote_from_cursor(
             }
             "snd" => ev.sender = Address(read_bin_fixed::<32>(cursor)?),
             "step" => ev.step = Step(read_uint64(cursor)?),
-            _ => {
-                skip_value(cursor)?;
-            }
+            _ => return Err(unknown_field(key)),
         }
     }
 
@@ -1788,9 +1773,7 @@ pub fn decode_authenticated_bundle(bytes: &[u8]) -> Result<AuthenticatedBundle, 
                 }
                 ab.votes = vs;
             }
-            _ => {
-                skip_value(&mut cursor)?;
-            }
+            _ => return Err(unknown_field(key)),
         }
     }
 
@@ -1847,9 +1830,7 @@ fn decode_unauthenticated_bundle_from_cursor(
                 }
                 bundle.votes = vs;
             }
-            _ => {
-                skip_value(cursor)?;
-            }
+            _ => return Err(unknown_field(key)),
         }
     }
 
@@ -1897,7 +1878,7 @@ pub fn decode_unauthenticated_proposal(
     // uproposal fixtures where round=0 omit that key via Go's
     // `omitempty`. Synthesize `rnd: 0` when the key is absent so the
     // block decoder can complete — round stays Round(0) either way.
-    let block = decode_block_allowing_missing_rnd(bytes)?;
+    let block = decode_block_allowing_missing_rnd(bytes, &[b"oper", b"oprop", b"sdpf"])?;
 
     // Step 2: scan the map to extract proposal-specific fields.
     let mut cursor = Cursor::new(bytes);
@@ -1915,8 +1896,8 @@ pub fn decode_unauthenticated_proposal(
             "oprop" => original_proposer = Address(read_bin_fixed::<32>(&mut cursor)?),
             "sdpf" => seed_proof = read_bin_fixed::<VRF_PROOF_SIZE>(&mut cursor)?,
             _ => {
-                // Skip all block fields (already consumed via the
-                // block decoder above) and any unknown fields.
+                // A block field: the strict block decode above already
+                // rejected every key go's `unauthenticatedProposal` lacks.
                 skip_value(&mut cursor)?;
             }
         }
@@ -1943,8 +1924,12 @@ pub fn decode_unauthenticated_proposal(
 /// matters because `decode_compound_message` is on the network ingest
 /// path (`demux::handle_raw_proposal`) and pre-scanning every proposal
 /// map would add per-packet CPU and amplify proposal-spam.
-fn decode_block_allowing_missing_rnd(bytes: &[u8]) -> Result<Block, CodecError> {
-    match Block::decode_from_bytes(bytes) {
+fn decode_block_allowing_missing_rnd(
+    bytes: &[u8],
+    extra_keys: &[&[u8]],
+) -> Result<Block, CodecError> {
+    let decode = |b: &[u8]| Block::decode_with_extra_keys(&mut &b[..], extra_keys);
+    match decode(bytes) {
         Ok(block) => Ok(block),
         Err(first_err) => {
             // Only attempt the synthesized-`rnd` fallback if the
@@ -1960,7 +1945,7 @@ fn decode_block_allowing_missing_rnd(bytes: &[u8]) -> Result<Block, CodecError> 
             let patched = inject_rnd_zero(bytes).map_err(|_| {
                 CodecError::Decode(format!("block decode: {}", format_error_chain(&first_err)))
             })?;
-            Block::decode_from_bytes(&patched).map_err(|retry_err| {
+            decode(&patched).map_err(|retry_err| {
                 CodecError::Decode(format!(
                     "block decode (rnd synthesized): {}",
                     format_error_chain(&retry_err)
@@ -2608,7 +2593,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_vote_unknown_fields_skipped() {
+    fn decode_vote_unknown_fields_rejected() {
         // Build a valid vote encoding with an extra unknown field
         let vote = UnauthenticatedVote {
             raw_vote: RawVote {
@@ -2632,8 +2617,9 @@ mod tests {
         write_str_key(&mut buf, "zzz");
         rmp::encode::write_uint(&mut buf, 999).unwrap();
 
-        let decoded = decode_vote(&buf).expect("should skip unknown fields");
-        assert_eq!(decoded.raw_vote.round, Round(42));
+        // go's msgp decoder: msgp.ErrNoField (issue #2394)
+        let err = decode_vote(&buf).expect_err("unknown fields are rejected");
+        assert!(err.to_string().contains("zzz"), "{err}");
     }
 
     // ── Compound message round-trip tests ────────────────────────────────

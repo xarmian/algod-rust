@@ -31,7 +31,9 @@ use sha2::{Digest, Sha256};
 // ── raw msgpack walking ───────────────────────────────────────────────────
 
 fn be(b: &[u8], i: usize, n: usize) -> usize {
-    b[i..i + n].iter().fold(0usize, |a, &x| (a << 8) | x as usize)
+    b[i..i + n]
+        .iter()
+        .fold(0usize, |a, &x| (a << 8) | x as usize)
 }
 
 fn skip(b: &[u8], i: usize) -> usize {
@@ -196,47 +198,92 @@ fn wrap_in_stxn(kind: &str, b: &[u8], txn: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// (entry point name, accepted?) for every Rust decoder that reads `kind`.
-fn rust_verdicts(kind: &str, b: &[u8], txn: &[u8]) -> Vec<(&'static str, bool)> {
+fn verdict<T, E: std::fmt::Display + std::fmt::Debug>(r: Result<T, E>) -> Result<(), String> {
+    r.map(|_| ()).map_err(|e| format!("{e:?} / {e}"))
+}
+
+fn rust_verdicts(kind: &str, b: &[u8], txn: &[u8]) -> Vec<(&'static str, Result<(), String>)> {
     match kind {
-        "payload" => vec![("decode_compound_message", decode_compound_message(b).is_ok())],
-        "vote" => vec![("decode_vote", decode_vote(b).is_ok())],
-        "bundle" | "cert" => vec![("decode_bundle", decode_bundle(b).is_ok())],
+        "payload" => vec![(
+            "decode_compound_message",
+            verdict(decode_compound_message(b)),
+        )],
+        "vote" => vec![("decode_vote", verdict(decode_vote(b)))],
+        "bundle" | "cert" => vec![("decode_bundle", verdict(decode_bundle(b)))],
         "blockcert" => vec![
-            ("decode_block_response", algo_codec::decode_block_response(b).is_ok()),
-            ("decode_block_response_fast", algo_codec::decode_block_response_fast(b).is_ok()),
+            (
+                "decode_block_response",
+                verdict(algo_codec::decode_block_response(b)),
+            ),
+            (
+                "decode_block_response_fast",
+                verdict(algo_codec::decode_block_response_fast(b)),
+            ),
         ],
         "block" => vec![
-            ("decode_block", algo_codec::decode_block(b).is_ok()),
-            ("decode_block_fast", algo_codec::decode_block_fast(b).is_ok()),
+            ("decode_block", verdict(algo_codec::decode_block(b))),
+            (
+                "decode_block_fast",
+                verdict(algo_codec::decode_block_fast(b)),
+            ),
         ],
-        "header" => vec![("BlockHeader::decode_from_bytes", BlockHeader::decode_from_bytes(b).is_ok())],
+        "header" => vec![(
+            "BlockHeader::decode_from_bytes",
+            verdict(BlockHeader::decode_from_bytes(b)),
+        )],
         "stxn" => {
             let _g = algo_types::strict_unknown_fields(b);
-            vec![("SignedTransaction (strict guard)", SignedTransaction::decode_from_bytes(b).is_ok())]
+            vec![(
+                "SignedTransaction (strict guard)",
+                verdict(SignedTransaction::decode_from_bytes(b)),
+            )]
         }
-        "stxninblock" => vec![("SignedTransaction (block)", SignedTransaction::decode_from_bytes(b).is_ok())],
-        "txn" => vec![("Transaction::decode_from_bytes", Transaction::decode_from_bytes(b).is_ok())],
+        "stxninblock" => vec![(
+            "SignedTransaction (block)",
+            verdict(SignedTransaction::decode_from_bytes(b)),
+        )],
+        "txn" => vec![(
+            "Transaction::decode_from_bytes",
+            verdict(Transaction::decode_from_bytes(b)),
+        )],
         "applydata" | "evaldelta" => match wrap_in_stxn(kind, b, txn) {
-            Some(w) => vec![("SignedTransaction (block, wrapped)", SignedTransaction::decode_from_bytes(&w).is_ok())],
-            None => vec![("(top-level key outside ApplyData)", false)],
+            Some(w) => vec![(
+                "SignedTransaction (block, wrapped)",
+                verdict(SignedTransaction::decode_from_bytes(&w)),
+            )],
+            None => vec![(
+                "(top-level key outside ApplyData)",
+                Err("top-level key outside ApplyData".into()),
+            )],
         },
         other => panic!("unknown kind {other}"),
     }
 }
 
 fn fixture(name: &str) -> String {
-    let p = format!("{}/tests/fixtures/strict_decode/{name}", env!("CARGO_MANIFEST_DIR"));
+    let p = format!(
+        "{}/tests/fixtures/strict_decode/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    );
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{p}: {e}"))
 }
 
 fn rows(text: &str) -> Vec<Value> {
-    text.lines().filter(|l| !l.trim().is_empty()).map(|l| serde_json::from_str(l).unwrap()).collect()
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
 }
 
 fn seeds() -> BTreeMap<String, Vec<u8>> {
     rows(&fixture("seeds.jsonl"))
         .into_iter()
-        .map(|r| (r["name"].as_str().unwrap().to_string(), hex::decode(r["hex"].as_str().unwrap()).unwrap()))
+        .map(|r| {
+            (
+                r["name"].as_str().unwrap().to_string(),
+                hex::decode(r["hex"].as_str().unwrap()).unwrap(),
+            )
+        })
         .collect()
 }
 
@@ -255,18 +302,30 @@ fn replay(cases: Vec<Value>, what: &str) {
         let seed = &seeds[c["seed"].as_str().unwrap()];
         let key = hex::decode(c["key"].as_str().unwrap()).unwrap();
         let val = hex::decode(c["val"].as_str().unwrap()).unwrap();
-        let mutant = mutate(seed, c["map"].as_i64().unwrap(), c["pos"].as_u64().unwrap() as usize, &key, &val);
+        let mutant = mutate(
+            seed,
+            c["map"].as_i64().unwrap(),
+            c["pos"].as_u64().unwrap() as usize,
+            &key,
+            &val,
+        );
         let sha = hex::encode(&Sha256::digest(&mutant)[..8]);
-        assert_eq!(sha, c["sha"].as_str().unwrap(), "{what} case {}: the Rust mutator diverges from the script's", c["id"]);
+        assert_eq!(
+            sha,
+            c["sha"].as_str().unwrap(),
+            "{what} case {}: the Rust mutator diverges from the script's",
+            c["id"]
+        );
         let kind = c["kind"].as_str().unwrap();
         let go_ok = c["go_ok"].as_bool().unwrap();
         accepted += go_ok as usize;
         by_kind.entry(kind.to_string()).or_default().0 += 1;
-        for (path, rust_ok) in rust_verdicts(kind, &mutant, &txn) {
+        for (path, rust) in rust_verdicts(kind, &mutant, &txn) {
+            let rust_ok = rust.is_ok();
             if rust_ok != go_ok {
                 by_kind.entry(kind.to_string()).or_default().1 += 1;
                 mismatches.push(format!(
-                    "{what} case {} ({kind}, seed {}, map {}, pos {}, key {}, val {}): go {} but {path} {}",
+                    "{what} case {} ({kind}, seed {}, map {}, pos {}, key {}, val {}): go {} but {path} {}{}",
                     c["id"],
                     c["seed"].as_str().unwrap(),
                     c["map"],
@@ -275,12 +334,15 @@ fn replay(cases: Vec<Value>, what: &str) {
                     c["val"].as_str().unwrap(),
                     if go_ok { "accepts" } else { "rejects" },
                     if rust_ok { "accepts" } else { "rejects" },
+                    rust.as_ref().err().map(|e| format!(" ({e})")).unwrap_or_default(),
                 ));
             }
         }
     }
     assert!(accepted > 0 && accepted < cases.len(), "degenerate fixture");
     if !mismatches.is_empty() {
+        // unmutated seeds first: a seed go accepts and Rust rejects is a reader gap
+        mismatches.sort_by_key(|m| !m.contains("map -1"));
         let shown: Vec<_> = mismatches.iter().take(40).cloned().collect();
         panic!(
             "{} of {} {what} cases differ from go:\n{}",

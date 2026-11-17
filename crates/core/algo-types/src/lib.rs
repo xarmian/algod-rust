@@ -31,6 +31,7 @@ pub mod genesis_restore;
 mod header;
 pub mod networks;
 pub mod pq;
+pub(crate) mod msgp_schema;
 pub(crate) mod rmp_decode;
 mod round;
 pub mod serde_bytes_array;

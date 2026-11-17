@@ -2104,25 +2104,21 @@ mod tests {
         }
     }
 
-    /// ... and exercise the real 255 cap through the same reader on the
-    /// non-strict skip path (`unknown_key` -> `skip_value`).
+    /// Outside the strict guard (a block read) the same unknown key is still
+    /// `ErrNoField`, as in go (issue #2394): the reader errors on the key
+    /// before it looks at the value, so no skip (and no depth cap) is involved.
     #[test]
-    fn signed_txn_reader_caps_skipped_value_depth_at_255() {
+    fn signed_txn_reader_rejects_unknown_key_without_the_guard() {
         let base = encode_group(&[make_signed_txn(1)]);
         let mut deep = vec![0x91u8; 300];
         deep.push(0xC0);
-        let bytes = with_extra_key(&base, "zz", &deep);
-        let mut rd = &bytes[..];
-        let err = SignedTransaction::decode_from_reader(&mut rd).unwrap_err();
-        let msg = error_chain(&err);
-        assert!(msg.contains("nesting depth exceeds 255"), "got: {msg}");
-
-        // 200 levels (under the cap) is skipped fine.
-        let mut ok_deep = vec![0x91u8; 200];
-        ok_deep.push(0xC0);
-        let bytes = with_extra_key(&base, "zz", &ok_deep);
-        let mut rd = &bytes[..];
-        SignedTransaction::decode_from_reader(&mut rd).expect("under the cap");
+        for value in [&deep[..], &[0x01u8][..]] {
+            let bytes = with_extra_key(&base, "zz", value);
+            let mut rd = &bytes[..];
+            let err = SignedTransaction::decode_from_reader(&mut rd).unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(msg.contains("no matching struct field found"), "got: {msg}");
+        }
     }
 
     /// (C) the logged error names the offending key and element offset.

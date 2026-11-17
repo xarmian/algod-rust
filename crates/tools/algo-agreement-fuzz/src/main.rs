@@ -130,9 +130,12 @@ struct Cli {
     #[arg(long, default_value_t = 60)]
     capture_secs: u64,
 
-    /// Which single field to corrupt for `malformed-proposal`.
+    /// Which single field to corrupt for `malformed-proposal`. `unknown-field`
+    /// (issue #2394) leaves the block intact and adds one key no go struct has
+    /// (to the first transaction, else the top level): go's msgp decoder drops
+    /// the payload with `ErrNoField`.
     #[arg(long, default_value = "bad-payset-commitment",
-          value_parser = ["bad-payset-commitment", "bad-prev-block-hash", "bad-genesis-hash", "bad-seed-proof", "proposer-mismatch"])]
+          value_parser = ["bad-payset-commitment", "bad-prev-block-hash", "bad-genesis-hash", "bad-seed-proof", "proposer-mismatch", "unknown-field"])]
     proposal_fault: String,
 
     /// Write a JSON report here.
@@ -698,6 +701,9 @@ async fn run_vote_case(
 async fn run_malformed_proposal(cli: &Cli, algod: &Algod, transport: &Transport) -> Result<Report> {
     use algo_agreement::codec;
 
+    if cli.proposal_fault == "unknown-field" {
+        return run_unknown_field_proposal(cli, algod, transport).await;
+    }
     let fault = parse_proposal_fault(&cli.proposal_fault)?;
     let capture_transport = transport.with_observe(cli.capture_secs);
 
@@ -783,6 +789,86 @@ async fn run_malformed_proposal(cli: &Cli, algod: &Algod, transport: &Transport)
         committed = %committed_digest,
         adopted_corrupted = committed_digest == injected_digest,
         "round {} settled", round.0
+    );
+    Ok(report)
+}
+
+/// Case 4b (issue #2394): a genuine proposal payload with one unknown key.
+///
+/// The block is untouched, so the honest copy of the proposal is what the
+/// network commits; the assertions are in the node's log (go: "dropping
+/// proposal that failed to decode ... no matching struct field found ... key
+/// zzunk"), and that the quorum keeps making rounds.
+async fn run_unknown_field_proposal(
+    cli: &Cli,
+    algod: &Algod,
+    transport: &Transport,
+) -> Result<Report> {
+    use algo_agreement::codec;
+
+    let captured = transport
+        .with_observe(cli.capture_secs)
+        .capture_proposal()
+        .await?;
+    let cm = codec::decode_compound_message(&captured)
+        .map_err(|e| anyhow!("captured PP did not decode: {e}"))?;
+    let round = cm.proposal.round();
+    let baseline_bytes = encode_compound_message(&cm);
+    let (injected_bytes, site) = algo_agreement_fuzz::with_unknown_field(&baseline_bytes)?;
+    // algod-rust itself must refuse what it is about to inject (go does).
+    if codec::decode_compound_message(&injected_bytes).is_ok() {
+        bail!("algod-rust's own decoder accepted the payload with an unknown key");
+    }
+    tracing::info!(
+        round = round.0,
+        ?site,
+        "injecting a proposal with an unknown key"
+    );
+
+    let mut report = Report {
+        case: format!("malformed-proposal/unknown-field/{site:?}"),
+        tag: "PP".to_string(),
+        sender: cm.vote.raw_vote.sender.to_algorand_string(),
+        round: round.0,
+        period: cm.vote.raw_vote.period.0,
+        step: cm.vote.raw_vote.step.0,
+        committee_weight: 0,
+        baseline_hex: Some(hex::encode(&baseline_bytes)),
+        injected_hex: hex::encode(&injected_bytes),
+        differing_byte_count: Some(count_differing_bytes(&baseline_bytes, &injected_bytes)),
+        expected_go_error: "no matching struct field found".to_string(),
+        disconnected: None,
+        elapsed_ms: None,
+        frames_received: None,
+        honest_block_digest: Some(cm.proposal.block_digest().to_string()),
+        injected_block_digest: Some(cm.proposal.block_digest().to_string()),
+        committed_block_digest: None,
+        corrupted_block_adopted: None,
+        dry_run: cli.dry_run,
+    };
+    if cli.dry_run {
+        return Ok(report);
+    }
+    let outcome = transport
+        .with_observe(cli.observe_secs)
+        .inject_one(Tag::ProposalPayload, injected_bytes)
+        .await?;
+    report.disconnected = Some(outcome.disconnected);
+    report.elapsed_ms = Some(outcome.elapsed_ms);
+    report.frames_received = Some(outcome.frames_received);
+    // the honest block of that round is committed (the injected copy is the
+    // same block): the cluster must not stall because of the dropped copy
+    let committed = wait_for_block(algod, round, Duration::from_secs(120)).await?;
+    report.committed_block_digest = Some(
+        algo_agreement::UnauthenticatedProposal {
+            block: committed,
+            seed_proof: [0u8; 80],
+            original_period: Period(0),
+            original_proposer: Address([0u8; 32]),
+            received_at: Duration::ZERO,
+        }
+        .block_digest()
+        .to_string(),
     );
     Ok(report)
 }

@@ -317,7 +317,7 @@ impl BlockHeader {
                 (2, b't') => match key {
                     b"tc" => h.txn_counter = rmp_decode::read_u64(rd)?,
                     b"ts" => h.timestamp = rmp_decode::read_i64(rd)?,
-                    _ => rmp_decode::skip_value(rd)?,
+                    _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 // ── 3-byte keys ──────────────────────────────────
                 (3, b'g') if key == b"gen" => h.genesis_id = rmp_decode::read_string(rd)?,
@@ -327,10 +327,13 @@ impl BlockHeader {
                         h.round = Round(rmp_decode::read_u64(rd)?);
                     }
                     b"rwd" => h.rewards_pool = rmp_decode::read_address_go_compat(rd)?,
-                    _ => rmp_decode::skip_value(rd)?,
+                    _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 (3, b's') if key == b"spt" => {
-                    h.state_proof_tracking = rmp_decode::read_optional_rmpv(rd)?
+                    h.state_proof_tracking = rmp_decode::read_checked_optional_rmpv(
+                        rd,
+                        &crate::msgp_schema::STATE_PROOF_TRACKING,
+                    )?
                 }
                 (3, b't') if key == b"txn" => {
                     h.txn_commitment = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
@@ -340,7 +343,7 @@ impl BlockHeader {
                 (4, b'f') => match key {
                     b"fees" => h.fee_sink = rmp_decode::read_address_go_compat(rd)?,
                     b"frac" => h.rewards_residue = rmp_decode::read_u64(rd)?,
-                    _ => rmp_decode::skip_value(rd)?,
+                    _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 (4, b'p') if key == b"prev" => {
                     h.branch = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
@@ -358,7 +361,7 @@ impl BlockHeader {
                 (6, b't') => match key {
                     b"txn256" => h.txn256 = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?,
                     b"txn512" => h.txn512 = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?,
-                    _ => rmp_decode::skip_value(rd)?,
+                    _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 // ── 7-byte keys ──────────────────────────────────
                 (7, b'n') if key == b"nextyes" => {
@@ -373,7 +376,7 @@ impl BlockHeader {
                 (10, b'n') => match key {
                     b"nextswitch" => h.next_protocol_switch_on = Round(rmp_decode::read_u64(rd)?),
                     b"nextbefore" => h.next_protocol_vote_before = Round(rmp_decode::read_u64(rd)?),
-                    _ => rmp_decode::skip_value(rd)?,
+                    _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 (10, b'p') => match key {
                     b"partupdrmv" => {
@@ -384,17 +387,17 @@ impl BlockHeader {
                         h.absent_participation_accounts =
                             rmp_decode::read_optional_vec(rd, rmp_decode::read_address_go_compat)?
                     }
-                    _ => rmp_decode::skip_value(rd)?,
+                    _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 // ── upgrade* keys ────────────────────────────────
                 (_, b'u') => match key {
                     b"upgradeprop" => h.upgrade_propose = rmp_decode::read_string(rd)?,
                     b"upgradedelay" => h.upgrade_delay = rmp_decode::read_u64(rd)?,
                     b"upgradeyes" => h.upgrade_approve = rmp_decode::read_bool(rd)?,
-                    _ => rmp_decode::skip_value(rd)?,
+                    _ => rmp_decode::unknown_key(rd, key)?,
                 },
-                // Unknown fields are skipped
-                _ => rmp_decode::skip_value(rd)?,
+                // go's msgp decoder: msgp.ErrNoField (issue #2394)
+                _ => rmp_decode::unknown_key(rd, key)?,
             }
         }
         // A missing `rnd` means round 0: go-algorand's msgpack omits zero-valued

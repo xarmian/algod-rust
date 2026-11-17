@@ -27,6 +27,15 @@
 #   4 malformed-proposal     a genuine proposal payload captured off the wire
 #                            with exactly one block field corrupted.
 #                            Go: rejects the payload, does not adopt it.
+#   5 unknown-field-proposal a genuine proposal payload with ONE unknown key
+#                            added (to its first transaction, else the top
+#                            level); the block itself is untouched (issue
+#                            #2394). go's generated msgp decoder fails with
+#                            ErrNoField and drops the payload: "dropping
+#                            proposal that failed to decode: ... key zzunk".
+#                            Opt-in (CASES=unknown-field-proposal): the
+#                            honest copy is what the network commits, so the
+#                            evidence is that log line plus liveness.
 #
 # All three vote cases must make Go disconnect the injector with `BadData`
 # (agreement/player.go `voteMalformed` -> disconnectAction -> wsNetwork
@@ -218,6 +227,7 @@ expected_go_error() {
         wrong-committee-weight) echo "credential has weight 0" ;;
         wrong-ots-domain)       echo "could not verify FS signature on vote" ;;
         malformed-proposal)     echo "" ;;
+        unknown-field-proposal) echo "" ;;
         *) echo "" ;;
     esac
 }
@@ -257,8 +267,16 @@ run_case() {  # run_case <case>
     fi
 
     local rc=0
+    # unknown-field-proposal is the injector's malformed-proposal case with the
+    # `unknown-field` fault (issue #2394)
+    local inject_case="$case" inject_extra=()
+    if [ "$case" = "unknown-field-proposal" ]; then
+        inject_case="malformed-proposal"
+        inject_extra=(--proposal-fault unknown-field)
+    fi
     "$FUZZ" \
-        --case "$case" \
+        --case "$inject_case" \
+        ${inject_extra[@]+"${inject_extra[@]}"} \
         --node "$TARGET_REST" \
         --token "$ALGOD_TOKEN" \
         --gossip "$TARGET_GOSSIP" \
@@ -329,6 +347,24 @@ run_case() {  # run_case <case>
             record "$case" "bad-data" pass "node logged 'disconnected: BadData'"
         else
             record "$case" "bad-data" info "no 'disconnected: BadData' line (log level may hide it)"
+        fi
+    elif [ "$case" = "unknown-field-proposal" ]; then
+        # go drops the payload at decode ("dropping proposal that failed to
+        # decode", agreement/demux.go) without a disconnect, at WARN level.
+        if grep -F "dropping proposal that failed to decode" "$log" | grep -qF "no matching struct field found" \
+            && grep -F "dropping proposal that failed to decode" "$log" | grep -qF "zzunk"; then
+            record "$case" "go-dropped-at-decode" pass \
+                "node logged 'dropping proposal that failed to decode ... no matching struct field found ... key zzunk'"
+        else
+            record "$case" "go-dropped-at-decode" fail \
+                "node never dropped the payload at decode for key zzunk (see $log)"
+            FAILED=1
+        fi
+        if grep -qF "algod-rust's own decoder accepted" "$OUT_DIR/$case.injector.log"; then
+            record "$case" "rust-decoder-rejects" fail "algod-rust's decoder accepted the payload with an unknown key"
+            FAILED=1
+        else
+            record "$case" "rust-decoder-rejects" pass "algod-rust's decoder rejected the same bytes before injection"
         fi
     else
         # A malformed payload is answered with ignoreAction, not a disconnect

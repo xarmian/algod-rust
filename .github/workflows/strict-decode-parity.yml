@@ -1,0 +1,82 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Strict decode parity
+
+# Issue #2394. go-algorand decodes every msgpack message with generated msgp
+# decoders that fail (msgp.ErrNoField) on a key the struct lacks. The committed
+# fixtures under crates/core/algo-agreement/tests/fixtures/strict_decode/ hold
+# mutated blocks / proposal payloads / votes / bundles / certificates with go's
+# accept/reject verdict. This job (1) regenerates the verdicts with go's real
+# decoders in the pinned go-algorand checkout and fails when the committed file
+# is stale, (2) replays them through algod-rust's decoders, and (3) runs a
+# larger one-off differential fuzz (every map of every seed, ~60k mutants) with
+# zero tolerated mismatches. go-algorand needs its libsodium fork built through
+# its own entry point (`make libsodium`, see CLAUDE.md).
+
+on:
+  pull_request:
+    paths:
+      - "tools/strict-decode-oracle/**"
+      - "scripts/strict-decode/**"
+      - "crates/core/algo-agreement/tests/strict_unknown_fields_go_parity.rs"
+      - "crates/core/algo-agreement/tests/fixtures/strict_decode/**"
+      - "crates/core/algo-agreement/src/codec.rs"
+      - "crates/core/algo-types/src/**"
+      - "crates/core/algo-codec/src/lib.rs"
+      - ".github/workflows/strict-decode-parity.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: strict-decode-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_ALGORAND_REV: "v5.0.5-stable"
+
+jobs:
+  go-oracle:
+    name: go-vs-Rust strict unknown-field parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Go toolchain
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build go-algorand's libsodium fork
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool build-essential
+          git clone --branch "$GO_ALGORAND_REV" \
+            https://github.com/algorand/go-algorand.git \
+            "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
+          cd "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
+          make libsodium
+
+      - name: Committed go verdicts are not stale
+        run: |
+          set -euo pipefail
+          python3 scripts/strict-decode/strict_decode_fixtures.py --check \
+            --go-algorand "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
+
+      - name: algod-rust matches go on every committed mutant
+        run: cargo test -p algo-agreement --test strict_unknown_fields_go_parity rust_decoders_match_go
+
+      - name: Differential fuzz against go (about 60k mutants)
+        run: |
+          set -euo pipefail
+          python3 scripts/strict-decode/strict_decode_fixtures.py --fuzz 100000 "$RUNNER_TEMP/fuzz.jsonl" \
+            --go-algorand "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
+          STRICT_FUZZ_FILE="$RUNNER_TEMP/fuzz.jsonl" \
+            cargo test -p algo-agreement --test strict_unknown_fields_go_parity fuzz_file -- --nocapture

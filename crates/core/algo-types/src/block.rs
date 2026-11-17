@@ -312,6 +312,15 @@ impl Block {
     /// Block is a flat struct containing all BlockHeader fields plus a `txns` payset.
     /// Uses two-level key dispatch: (key_len, first_byte) for fast routing.
     pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        Self::decode_with_extra_keys(rd, &[])
+    }
+
+    /// [`Self::decode_from_reader`] for a map that carries `extra_keys` next
+    /// to the block's own: go's `unauthenticatedProposal` embeds a `Block`
+    /// beside `sdpf`/`oper`/`oprop`, `transmittedPayload` also `pv`. Those
+    /// top-level keys are skipped (the caller reads them); any other unknown
+    /// key, at any level, is `msgp.ErrNoField` as in go (issue #2394).
+    pub fn decode_with_extra_keys(rd: &mut &[u8], extra_keys: &[&[u8]]) -> DecodeResult<Self> {
         let len = rmp_decode::read_map_len(rd)?;
         let mut b = Self::default();
         for _ in 0..len {
@@ -329,7 +338,7 @@ impl Block {
                 (2, b't') => match key {
                     b"tc" => b.txn_counter = rmp_decode::read_u64(rd)?,
                     b"ts" => b.timestamp = rmp_decode::read_i64(rd)?,
-                    _ => rmp_decode::skip_value(rd)?,
+                    _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 // ── 3-byte keys ──────────────────────────────────
                 (3, b'g') if key == b"gen" => b.genesis_id = rmp_decode::read_string(rd)?,
@@ -342,10 +351,13 @@ impl Block {
                     // to reject here.
                     b"rnd" => b.round = Round(rmp_decode::read_u64(rd)?),
                     b"rwd" => b.rewards_pool = rmp_decode::read_address_go_compat(rd)?,
-                    _ => rmp_decode::skip_value(rd)?,
+                    _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 (3, b's') if key == b"spt" => {
-                    b.state_proof_tracking = rmp_decode::read_optional_rmpv(rd)?
+                    b.state_proof_tracking = rmp_decode::read_checked_optional_rmpv(
+                        rd,
+                        &crate::msgp_schema::STATE_PROOF_TRACKING,
+                    )?
                 }
                 (3, b't') if key == b"txn" => {
                     b.txn_commitment = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
@@ -355,7 +367,7 @@ impl Block {
                 (4, b'f') => match key {
                     b"fees" => b.fee_sink = rmp_decode::read_address_go_compat(rd)?,
                     b"frac" => b.rewards_residue = rmp_decode::read_u64(rd)?,
-                    _ => rmp_decode::skip_value(rd)?,
+                    _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 (4, b'p') if key == b"prev" => {
                     b.branch = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
@@ -376,12 +388,12 @@ impl Block {
                 (6, b't') => match key {
                     b"txn256" => b.txn256 = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?,
                     b"txn512" => b.txn512 = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?,
-                    _ => rmp_decode::skip_value(rd)?,
+                    _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 // ── 7-byte keys ──────────────────────────────────
                 (7, b'n') => match key {
                     b"nextyes" => b.next_protocol_approvals = rmp_decode::read_u64(rd)?,
-                    _ => rmp_decode::skip_value(rd)?,
+                    _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 (7, b'p') if key == b"prev512" => {
                     b.prev512 = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?
@@ -389,13 +401,13 @@ impl Block {
                 // ── 9-byte keys ──────────────────────────────────
                 (9, b'n') => match key {
                     b"nextproto" => b.next_protocol = rmp_decode::read_string(rd)?,
-                    _ => rmp_decode::skip_value(rd)?,
+                    _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 // ── 10-byte keys ─────────────────────────────────
                 (10, b'n') => match key {
                     b"nextswitch" => b.next_protocol_switch_on = Round(rmp_decode::read_u64(rd)?),
                     b"nextbefore" => b.next_protocol_vote_before = Round(rmp_decode::read_u64(rd)?),
-                    _ => rmp_decode::skip_value(rd)?,
+                    _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 (10, b'p') => match key {
                     b"partupdrmv" => {
@@ -406,17 +418,18 @@ impl Block {
                         b.absent_participation_accounts =
                             rmp_decode::read_optional_vec(rd, rmp_decode::read_address_go_compat)?
                     }
-                    _ => rmp_decode::skip_value(rd)?,
+                    _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 // ── upgrade* keys (10-12 bytes) ──────────────────
                 (_, b'u') => match key {
                     b"upgradeprop" => b.upgrade_propose = rmp_decode::read_string(rd)?,
                     b"upgradedelay" => b.upgrade_delay = rmp_decode::read_u64(rd)?,
                     b"upgradeyes" => b.upgrade_approve = rmp_decode::read_bool(rd)?,
-                    _ => rmp_decode::skip_value(rd)?,
+                    _ => rmp_decode::unknown_key(rd, key)?,
                 },
-                // Unknown fields are skipped
-                _ => rmp_decode::skip_value(rd)?,
+                // go's msgp decoder: msgp.ErrNoField (issue #2394)
+                _ if extra_keys.contains(&key) => rmp_decode::skip_value(rd)?,
+                _ => rmp_decode::unknown_key(rd, key)?,
             }
         }
         Ok(b)
@@ -443,8 +456,13 @@ impl BlockResponse {
             let key = rmp_decode::read_key_bytes(rd)?;
             match (key.len(), key.first().copied().unwrap_or(0)) {
                 (5, b'b') if key == b"block" => block = Some(Block::decode_from_reader(rd)?),
-                (4, b'c') if key == b"cert" => cert = rmp_decode::read_optional_rmpv(rd)?,
-                _ => rmp_decode::skip_value(rd)?,
+                (4, b'c') if key == b"cert" => {
+                    cert = rmp_decode::read_checked_optional_rmpv(
+                        rd,
+                        &crate::msgp_schema::CERTIFICATE,
+                    )?
+                }
+                _ => rmp_decode::unknown_key(rd, key)?,
             }
         }
         Ok(BlockResponse {
