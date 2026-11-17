@@ -431,6 +431,8 @@ The `v5.0.3-stable → v5.0.5-stable` sweep ships consensus version v43 (`CloseR
 
 The `v5.0.5-stable → v5.0.5-stable` sweep (Phase 24) is a one-change hardening release with no protocol upgrade: a generate-only check that each transaction a node assembles into a block decodes back (`SignedTxnInBlock.GetEncodedLength(decode)`). See `docs/PHASE24_PROPOSAL.md` and epic issue [#2308](https://github.com/xarmian/algod-rust/issues/2308).
 
+The TEAL corpus parity check (Phase 25) proves algod-rust's TEAL disassembler and assembler byte-identical to go-algorand's (`Disassemble`, `AssembleString`, source maps, errors, warnings and the `/v2/teal/*` handlers) on every distinct program and original source of the public [ARC56Registry](https://github.com/scholtz/ARC56Registry), and keeps proving it nightly: `.github/workflows/teal-corpus-parity.yml` is green only on zero mismatches, panics and timeouts in the `disassemble`, `reassemble` and `source` stages (and the REST sample). It introduces no protocol change and no divergence. See `docs/PHASE25_VALIDATION.md`, `docs/TEAL_CORPUS_PARITY.md` and epic issue [#2364](https://github.com/xarmian/algod-rust/issues/2364).
+
 ---
 
 ## Phase 15 — Licensing and Legal-Framework Compliance

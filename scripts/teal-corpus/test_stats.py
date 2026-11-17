@@ -145,6 +145,18 @@ class Stats(Fixture):
         self.assertEqual(s["reassemble"]["identical_error"], 1)
         self.assertNotIn("rest_sample", s)
 
+    def test_rest_sample_stage_from_the_live_test_rows(self):
+        # the rows live_teal_corpus_parity writes with TEAL_CORPUS_REST_OUT (#2372)
+        def row(label, body, ok=True):
+            return {"sha256": sha(label.encode()), "ok": ok, "status": 200 if ok else 400,
+                    "content_type": "application/json", "body_sha256": sha(body)}
+        go = [row("a", b"1"), row("b", b"2", ok=False), row("c", b"3")]
+        rs = [row("a", b"1"), row("b", b"2", ok=False), row("c", b"DIFFERENT")]
+        write_rows(os.path.join(self.out, "rest_sample.go.jsonl"), "rest_sample", go, impl="go")
+        write_rows(os.path.join(self.out, "rest_sample.rust.jsonl"), "rest_sample", rs, impl="rust")
+        s = self.build()["stages"]["rest_sample"]
+        self.assertEqual((s["compared"], s["identical"], s["identical_error"], s["mismatched"]), (3, 1, 1, 1))
+
     def test_robustness_counts_unmirrored_panics(self):
         rows = [{"sha256": "a" * 64, "ok": False, "panic": "boom"}]
         write_rows(os.path.join(self.out, "assemble.go.jsonl"), "assemble", rows)

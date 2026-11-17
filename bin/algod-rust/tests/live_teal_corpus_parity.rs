@@ -61,6 +61,9 @@
 //! * `ALGOD_GO_URL` / `ALGOD_RUST_URL` - the two nodes (defaults
 //!   `http://127.0.0.1:4001` / `:4002`, the `make validate-api-up` harness);
 //! * `TEAL_CORPUS_GO_DRIVER` - optional go offline driver;
+//! * `TEAL_CORPUS_REST_OUT` - directory to write `rest_sample.{go,rust}.jsonl`
+//!   into (one row per node-vs-node comparison; `scripts/teal-corpus/stats.py`
+//!   turns them into the `rest_sample` stage of `stats.json`, #2372);
 //! * `TEAL_CORPUS_REQUIRED=1` - fail instead of skipping when the corpus or a
 //!   node is missing (CI sets it).
 //!
@@ -314,9 +317,66 @@ impl Mismatches {
     }
 }
 
+/// The `rest_sample` stage rows (#2372): one go row and one rust row per
+/// node-vs-node comparison, in the driver JSONL row shape that
+/// `scripts/teal-corpus/stats.py` aggregates. Equal answers (status, content
+/// type, body bytes, or a transport error on both sides) give equal rows.
+#[derive(Default)]
+struct RestRows(Vec<(String, Value, Value)>);
+
+fn rest_row(label: &str, r: &HttpResult) -> Value {
+    let sha256 = teal_corpus::sha256_hex(label.as_bytes());
+    match r {
+        Ok(r) => serde_json::json!({
+            "sha256": sha256,
+            "ok": r.status == 200,
+            "status": r.status,
+            "content_type": r.content_type,
+            "body_sha256": teal_corpus::sha256_hex(&r.body),
+        }),
+        Err(_) => serde_json::json!({"sha256": sha256, "ok": false, "error": "transport error"}),
+    }
+}
+
+impl RestRows {
+    fn add(&mut self, label: &str, go: &HttpResult, rust: &HttpResult) {
+        self.0.push((
+            label.to_string(),
+            rest_row(label, go),
+            rest_row(label, rust),
+        ));
+    }
+
+    /// Write `rest_sample.{go,rust}.jsonl` into `dir` (`TEAL_CORPUS_REST_OUT`).
+    fn write(&self, dir: &Path) {
+        std::fs::create_dir_all(dir).expect("rest out dir");
+        for (impl_name, pick) in [("go", 1usize), ("rust", 2usize)] {
+            let mut text = serde_json::json!({"header": {
+                "operation": "rest_sample", "impl": impl_name,
+            }})
+            .to_string();
+            text.push('\n');
+            for row in &self.0 {
+                let v = if pick == 1 { &row.1 } else { &row.2 };
+                text.push_str(&v.to_string());
+                text.push('\n');
+            }
+            std::fs::write(dir.join(format!("rest_sample.{impl_name}.jsonl")), text)
+                .expect("write rest_sample rows");
+        }
+    }
+}
+
 /// Compare the two nodes' answers to the same request: status, content type and
 /// the full body bytes (a transport error on one side only is a mismatch).
-fn compare_nodes(label: &str, go: &HttpResult, rust: &HttpResult, out: &mut Mismatches) {
+fn compare_nodes(
+    label: &str,
+    go: &HttpResult,
+    rust: &HttpResult,
+    out: &mut Mismatches,
+    rows: &mut RestRows,
+) {
+    rows.add(label, go, rust);
     let same = match (go, rust) {
         (Err(_), Err(_)) => true,
         (Ok(g), Ok(r)) => {
@@ -658,6 +718,7 @@ async fn teal_corpus_rest_matches_go_and_offline() {
     let scratch = std::env::temp_dir().join(format!("teal-corpus-rest-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).expect("scratch dir");
     let mut mism = Mismatches(Vec::new());
+    let mut rest_rows = RestRows::default();
     let mut stats = Stats::default();
 
     // ---- phase A: disassemble ---------------------------------------------
@@ -685,7 +746,7 @@ async fn teal_corpus_rest_matches_go_and_offline() {
     let mut texts: Vec<(Entry, Vec<u8>)> = Vec::new();
     for (e, go, rust) in &disasm_results {
         let label = format!("disassemble {} (v{}, {} bytes)", e.sha, e.version, e.size);
-        compare_nodes(&label, go, rust, &mut mism);
+        compare_nodes(&label, go, rust, &mut mism, &mut rest_rows);
         let sha = &e.sha;
         let rust_row = &disasm_all[sha];
         let go_row = go_disasm.as_ref().map_or(rust_row, |m| &m[sha]);
@@ -763,7 +824,7 @@ async fn teal_corpus_rest_matches_go_and_offline() {
     };
     for (label, sha, sourcemap, len, go, rust) in &compile_results {
         let label = format!("{label} sourcemap={sourcemap}");
-        compare_nodes(&label, go, rust, &mut mism);
+        compare_nodes(&label, go, rust, &mut mism, &mut rest_rows);
         if *len > MAX_TEAL_SOURCE_BYTES {
             // Over `MaxTealSourceBytes` (the largest programs' disassembly): both
             // nodes must answer with go's `http.MaxBytesReader` error.
@@ -858,6 +919,7 @@ async fn teal_corpus_rest_matches_go_and_offline() {
             &go,
             &rust,
             &mut mism,
+            &mut rest_rows,
         );
     }
 
@@ -1009,7 +1071,13 @@ async fn teal_corpus_rest_matches_go_and_offline() {
         let go = request(&c, Node::Go, method.clone(), path, body.clone(), token).await;
         let rust = request(&c, Node::Rust, method, path, body, token).await;
         stats.bump("edge-case");
-        compare_nodes(&format!("edge case: {name}"), &go, &rust, &mut mism);
+        compare_nodes(
+            &format!("edge case: {name}"),
+            &go,
+            &rust,
+            &mut mism,
+            &mut rest_rows,
+        );
     }
 
     // ---- go's assembler panic: both nodes drop the connection ---------------
@@ -1049,6 +1117,13 @@ async fn teal_corpus_rest_matches_go_and_offline() {
     }
 
     let _ = std::fs::remove_dir_all(&scratch);
+    // The stage rows are written before any mismatch panic, so a red run still
+    // has them (the node comparisons above are what they record).
+    if let Ok(dir) = std::env::var("TEAL_CORPUS_REST_OUT") {
+        if !dir.is_empty() {
+            rest_rows.write(Path::new(&dir));
+        }
+    }
     println!("teal-corpus REST tier stats: {:?}", stats.0);
     if !mism.0.is_empty() {
         // Group by the first line with sha256 tokens and byte counts removed,

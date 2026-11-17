@@ -37,7 +37,7 @@ P2P_INTEROP_1V1_CLUSTER := ops/mixed-cluster-p2p-1v1
 .PHONY: p2p-interop-1v1-up p2p-interop-1v1-down p2p-interop-1v1-status p2p-interop-1v1-soak-test
 .PHONY: phase6-cluster-up phase6-cluster-down phase6-cluster-status
 .PHONY: consensus-analyzer-test consensus-negative-test
-.PHONY: teal-corpus-fetch teal-corpus-parity teal-corpus-stats teal-corpus-history
+.PHONY: teal-corpus-fetch teal-corpus-parity teal-corpus-stats teal-corpus-history teal-corpus-gate
 
 ## ── Build & Test ──────────────────────────────────────────────
 
@@ -1155,6 +1155,15 @@ teal-corpus-stats:
 teal-corpus-history: teal-corpus-stats
 	python3 -I scripts/teal-corpus/stats.py history $(TEAL_CORPUS_WORK)/out/stats.json docs/teal-corpus/history.csv
 
+## Issue #2372: the nightly workflow's pass condition, locally. Run after
+## `make teal-corpus-fetch teal-corpus-parity` (and, to include the REST sample,
+## after the live test wrote rest_sample.*.jsonl with TEAL_CORPUS_REST_OUT).
+## Exits non-zero on an empty/failed extraction, a missing or empty stage, or any
+## mismatch, panic or timeout. TEAL_CORPUS_REQUIRE_REST=1 also requires rest_sample.
+teal-corpus-gate: teal-corpus-stats
+	python3 -I scripts/teal-corpus/gate.py extraction $(TEAL_CORPUS_WORK)/corpus
+	python3 -I scripts/teal-corpus/gate.py verdict $(TEAL_CORPUS_WORK)/out/stats.json $(if $(TEAL_CORPUS_REQUIRE_REST),--require-rest)
+
 ## ── Help ─────────────────────────────────────────────────────
 
 help:
@@ -1294,6 +1303,7 @@ help:
 	@echo "TEAL corpus parity (Phase 25):"
 	@echo "  make teal-corpus-fetch    Fetch the ARC56Registry and extract the corpus (network)"
 	@echo "  make teal-corpus-parity   Go-vs-Rust corpus comparison (TEAL_CORPUS_STAGES=disassemble|assemble|reassemble|source)"
+	@echo "  make teal-corpus-gate     Nightly pass condition on the last run (extraction sane, no mismatch/panic/timeout)"
 	@echo "  make teal-corpus-stats    stats.json of the last parity run; teal-corpus-history appends docs/teal-corpus/history.csv"
 	@echo "  make bench-compare TIERS=teal-corpus   Go-vs-Rust assembler/disassembler timings on the corpus (equality-gated)"
 	@echo ""
