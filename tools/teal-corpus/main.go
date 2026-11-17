@@ -269,6 +269,72 @@ func renderOutput(op string, rows []row, h header) []byte {
 	return buf.Bytes()
 }
 
+// opcodeTable is every opcode name of go-algorand's opcode table
+// (logic.OpSpecs) with the first AVM version that has it. The same name at
+// several versions keeps the lowest. Issue #2371: the corpus statistics list
+// the table opcodes no corpus program uses.
+func opcodeTable() map[string]uint64 {
+	t := map[string]uint64{}
+	for _, s := range logic.OpSpecs {
+		if v, ok := t[s.Name]; !ok || s.Version < v {
+			t[s.Name] = s.Version
+		}
+	}
+	return t
+}
+
+// renderOpcodes is the `opcodes` command's JSON document (json.Marshal sorts
+// the map keys).
+func renderOpcodes(tag, commit string) []byte {
+	doc := map[string]any{
+		"schema":             "teal-corpus-opcodes/v1",
+		"go_algorand_tag":    tag,
+		"go_algorand_commit": commit,
+		"opcodes":            opcodeTable(),
+	}
+	var buf bytes.Buffer
+	encodeLine(&buf, doc)
+	return buf.Bytes()
+}
+
+// timings records the per-input processing time of a batch (issue #2371).
+type timings struct {
+	mu  sync.Mutex
+	per map[string]int64
+}
+
+// wrap measures f around the work itself, inside the worker, so the goroutine
+// hand-off and the timeout timer are not part of it.
+func (t *timings) wrap(f func(input) row) func(input) row {
+	return func(in input) row {
+		start := time.Now()
+		r := f(in)
+		ns := time.Since(start).Nanoseconds()
+		t.mu.Lock()
+		t.per[in.Sha256] = ns
+		t.mu.Unlock()
+		return r
+	}
+}
+
+func (t *timings) render(op string, jobs, inputs, inputBytes int, wall time.Duration) []byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	doc := map[string]any{
+		"schema":         "teal-corpus-timings/v1",
+		"impl":           "go-algorand",
+		"operation":      op,
+		"jobs":           jobs,
+		"inputs":         inputs,
+		"input_bytes":    inputBytes,
+		"wall_ns":        wall.Nanoseconds(),
+		"per_program_ns": t.per,
+	}
+	var buf bytes.Buffer
+	encodeLine(&buf, doc)
+	return buf.Bytes()
+}
+
 func run(op string, args []string) int {
 	fs := flag.NewFlagSet(op, flag.ContinueOnError)
 	corpus := fs.String("corpus", "", "corpus directory produced by scripts/teal-corpus/extract.py")
@@ -276,6 +342,7 @@ func run(op string, args []string) int {
 	out := fs.String("out", "", "output JSONL file (default stdout)")
 	jobs := fs.Int("jobs", runtime.NumCPU(), "parallel workers")
 	timeoutMs := fs.Int("timeout-ms", 10000, "per-input time budget in milliseconds")
+	timingsOut := fs.String("timings", "", "also write per-input processing times, batch wall clock and input size as JSON (use with --jobs 1)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -292,7 +359,24 @@ func run(op string, args []string) int {
 		fmt.Fprintf(os.Stderr, "error: reading %s: %v\n", dir, err)
 		return 2
 	}
-	rows := runBatch(inputs, *jobs, time.Duration(*timeoutMs)*time.Millisecond, func(in input) row { return process(op, in) })
+	work := func(in input) row { return process(op, in) }
+	tm := &timings{per: map[string]int64{}}
+	if *timingsOut != "" {
+		work = tm.wrap(work)
+	}
+	inputBytes := 0
+	for _, in := range inputs {
+		inputBytes += len(in.Bytes)
+	}
+	started := time.Now()
+	rows := runBatch(inputs, *jobs, time.Duration(*timeoutMs)*time.Millisecond, work)
+	wall := time.Since(started)
+	if *timingsOut != "" {
+		if err := os.WriteFile(*timingsOut, tm.render(op, *jobs, len(inputs), inputBytes, wall), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "error: writing timings: %v\n", err)
+			return 2
+		}
+	}
 	data := renderOutput(op, rows, header{Impl: "go-algorand", GoAlgorandTag: goAlgorandTag, GoAlgorandCommit: goAlgorandCommit})
 	if *out == "" {
 		_, err = os.Stdout.Write(data)
@@ -323,8 +407,15 @@ func run(op string, args []string) int {
 }
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "opcodes" {
+		// teal-corpus opcodes: go-algorand's opcode table as JSON on stdout (#2371).
+		if _, err := os.Stdout.Write(renderOpcodes(goAlgorandTag, goAlgorandCommit)); err != nil {
+			os.Exit(2)
+		}
+		os.Exit(0)
+	}
 	if len(os.Args) < 2 || (os.Args[1] != "disassemble" && os.Args[1] != "assemble") {
-		fmt.Fprintf(os.Stderr, "usage: %s disassemble|assemble --corpus DIR [--out FILE] [--jobs N] [--timeout-ms N]\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(os.Stderr, "usage: %s disassemble|assemble --corpus DIR [--out FILE] [--jobs N] [--timeout-ms N] [--timings FILE]\n       %s opcodes\n", filepath.Base(os.Args[0]), filepath.Base(os.Args[0]))
 		os.Exit(2)
 	}
 	// Hung goroutines cannot be joined; exit without waiting for them.

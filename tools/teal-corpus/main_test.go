@@ -177,3 +177,52 @@ func TestHangingInputTimesOutAndBatchContinues(t *testing.T) {
 		t.Fatalf("rows: %+v", rows)
 	}
 }
+
+// Issue #2371: the opcode table and the timings document.
+func TestOpcodeTableHasTheCoreOpcodesAtTheirFirstVersion(t *testing.T) {
+	tab := opcodeTable()
+	for name, v := range map[string]uint64{"err": 1, "pushint": 3, "ed25519verify_bare": 7, "box_put": 8} {
+		if got, ok := tab[name]; !ok || got != v {
+			t.Fatalf("opcodeTable()[%q] = %d, %v; want %d", name, got, ok, v)
+		}
+	}
+	var doc struct {
+		Schema  string            `json:"schema"`
+		Tag     string            `json:"go_algorand_tag"`
+		Opcodes map[string]uint64 `json:"opcodes"`
+	}
+	if err := json.Unmarshal(renderOpcodes("v-test", "c0ffee"), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Schema != "teal-corpus-opcodes/v1" || doc.Tag != "v-test" || len(doc.Opcodes) != len(tab) {
+		t.Fatalf("bad opcodes doc: %+v", doc)
+	}
+}
+
+func TestTimingsCoverEveryInputAndLeaveRowsUnchanged(t *testing.T) {
+	dir := filepath.Join(fixtureDir, inputSubdir("disassemble"))
+	inputs, err := loadInputs(dir, inputExt("disassemble"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tm := &timings{per: map[string]int64{}}
+	timed := runBatch(inputs, 1, 10*time.Second, tm.wrap(func(in input) row { return process("disassemble", in) }))
+	plain := runFixture(t, "disassemble", 1)
+	h := header{Impl: "go-algorand"}
+	if !bytes.Equal(renderOutput("disassemble", timed, h), renderOutput("disassemble", plain, h)) {
+		t.Fatal("timing wrapper changed the rows")
+	}
+	var doc struct {
+		Schema string           `json:"schema"`
+		Impl   string           `json:"impl"`
+		Inputs int              `json:"inputs"`
+		Wall   int64            `json:"wall_ns"`
+		Per    map[string]int64 `json:"per_program_ns"`
+	}
+	if err := json.Unmarshal(tm.render("disassemble", 1, len(inputs), 10, time.Millisecond), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Schema != "teal-corpus-timings/v1" || doc.Impl != "go-algorand" || doc.Inputs != 4 || doc.Wall != 1000000 || len(doc.Per) != 4 {
+		t.Fatalf("bad timings doc: %+v", doc)
+	}
+}

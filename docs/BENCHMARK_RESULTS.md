@@ -413,6 +413,8 @@ Every row where Go is faster with non-overlapping ranges, and who owns it
 | `micro avm/app-state-box` | 1.26x | [#2320](https://github.com/xarmian/algod-rust/issues/2320): per-call setup costs (bytecode parse, machine construction, allocation) |
 | `micro agreement/sortition-select-f128` | 1.22x | [#2321](https://github.com/xarmian/algod-rust/issues/2321): software f128; measured, division is not the lever (PERF_PHASE23.md row 9) |
 | `rest account_hot` p50 | 1.03x | [#2340](https://github.com/xarmian/algod-rust/issues/2340) |
+| `teal-corpus assemble-sources/all`, `assemble-disassembled/all` (wall, MB/s, p50, p99) | 1.24x, 1.26x (p50 1.30x, 1.33x) | [#2410](https://github.com/xarmian/algod-rust/issues/2410): per-call fixed cost on the typical small program (the 20 largest sources are level); profile first |
+| `teal-corpus disassemble/all` wall, MB/s | 1.08x | [#2411](https://github.com/xarmian/algod-rust/issues/2411): 0.04 s in total; p50 is inconclusive and Rust is ahead on p99 (1.20x) and on the 20 largest programs (1.12x) |
 | `localnet` `fixed` p95/p99, `ladder-50` p50/p95/p99 latency | 1.23x, 1.05x to 1.07x | round-quantised noise (see Headline), no node cost |
 
 The first baseline's findings are closed: #2145 (certificate authentication on
@@ -437,6 +439,24 @@ identically, apart from wall-clock-dependent fields. The gate's simulate
 request is a payment: an app-call simulate (state deltas, logs, inner
 transactions in `txn-result`) is not covered and still differs
 ([#2178](https://github.com/xarmian/algod-rust/issues/2178)).
+
+## TEAL corpus tier (Phase 25, #2371)
+
+The `teal-corpus` tier (`make bench-compare TIERS=teal-corpus`) times go-algorand's
+and algod-rust's TEAL disassembler and assembler, single-threaded, over the
+3,692 programs / 3,687 sources of the ARC56Registry (`e75e509c`), gated on
+byte-identical outputs. Run on 2026-11-17 on the same machine as above (go
+`v5.0.5-stable`, algod-rust `8af88af3`, `RUNS=10`, gate green, zero mismatches).
+Full report, stats, history and reproduction: [TEAL_CORPUS_PARITY.md](TEAL_CORPUS_PARITY.md).
+
+| Workload | Metric | Go | Rust | Faster |
+|---|---|---|---|---|
+| `disassemble/all` | wall | 0.486 s | 0.525 s | Go 1.08x ([#2411](https://github.com/xarmian/algod-rust/issues/2411)) |
+| `disassemble/all` | p50 / p99 per program | 44.6 / 1,105 us | 46.2 / 919 us | inconclusive / Rust 1.20x |
+| `assemble-disassembled/all` | wall | 1.080 s | 1.355 s | Go 1.26x ([#2410](https://github.com/xarmian/algod-rust/issues/2410)) |
+| `assemble-sources/all` | wall | 1.127 s | 1.394 s | Go 1.24x ([#2410](https://github.com/xarmian/algod-rust/issues/2410)) |
+| `disassemble/top20` | wall | 42.2 ms | 37.5 ms | Rust 1.12x |
+| `assemble-sources/top20` | wall | 83.6 ms | 83.9 ms | inconclusive |
 
 ## Regression detection and CI
 
