@@ -306,3 +306,15 @@ sanitisation) replays every case against go's real decoders (red before the
 fix: 126 mismatches, all `read_string: invalid utf-8`);
 `non_utf8_string_fields_round_trip_byte_exact` re-encodes those seeds to the
 identical bytes; the real-chain corpus tests are unchanged.
+
+**Follow-up found by the 100k differential fuzz on PR #2401 (unsanitised seeds
+exposed it).** A state-proof `Reveal` with a repeated `p` key carrying `{}`:
+go decodes the empty map INTO the already populated `Participant` (fields the
+map does not mention are kept), so the `codec:",required"` verifier is still
+set and go accepts; the Rust reader replaced the participant and rejected
+"missing required field 'p'". `Reveal.part`, `Participant.pk` and
+`MerkleSignatureVerifier` now decode into the existing value (the `required`
+check runs on the merged result, nil still zeroes it). Pinned as two
+always-present cases (`PINNED` in `strict_decode_fixtures.py`). This narrows,
+and does not widen, DIV-004's "replace instead of merge on a duplicated key"
+(other struct fields still replace; no observable accept/reject difference).

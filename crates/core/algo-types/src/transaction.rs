@@ -1948,8 +1948,20 @@ impl SigSlotCommit {
 
 impl MerkleSignatureVerifier {
     pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
         let mut s = Self::default();
+        Self::decode_into(rd, &mut s)?;
+        Ok(s)
+    }
+
+    /// Decode into an already populated verifier: go's generated decoder
+    /// keeps the fields a repeated key's map does not mention (issue #2397,
+    /// a duplicated `p` carrying `{}`), a map-header nil zeroes it.
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        if rmp_decode::try_read_nil(rd) {
+            *s = Self::default();
+            return Ok(());
+        }
+        let len = rmp_decode::read_map_len(rd)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
                 b"cmt" => s.commitment = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?,
@@ -1957,7 +1969,7 @@ impl MerkleSignatureVerifier {
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
-        Ok(s)
+        Ok(())
     }
 
     pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
@@ -1968,18 +1980,44 @@ impl MerkleSignatureVerifier {
 
 impl Participant {
     pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
         let mut s = Self::default();
+        Self::decode_into(rd, &mut s)?;
+        Ok(s)
+    }
+
+    /// Decode into an already populated participant (see
+    /// [`MerkleSignatureVerifier::decode_into`]); the `required` check runs on
+    /// the merged result, like go's.
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        if rmp_decode::try_read_nil(rd) {
+            *s = Self::default();
+        } else {
+            Self::merge_map(rd, s)?;
+        }
+        Self::check_required(s)
+    }
+
+    fn merge_map(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_map_len(rd)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
                 b"p" => {
-                    s.pk =
-                        rmp_decode::read_optional(rd, MerkleSignatureVerifier::decode_from_reader)?
+                    if rmp_decode::try_read_nil(rd) {
+                        s.pk = None;
+                    } else {
+                        let mut v = s.pk.take().unwrap_or_default();
+                        MerkleSignatureVerifier::decode_into(rd, &mut v)?;
+                        s.pk = Some(v);
+                    }
                 }
                 b"w" => s.weight = rmp_decode::read_u64(rd)?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
+        Ok(())
+    }
+
+    fn check_required(s: &Self) -> DecodeResult<()> {
         // go-algorand v4.7.2-stable marks `basics.Participant.PK` `codec:",required"`: the
         // generated decoder rejects `PK.MsgIsZero()` regardless of key presence on the wire,
         // so also reject an explicit-but-all-zero verifier, not just an absent "p" key.
@@ -1993,7 +2031,7 @@ impl Participant {
                 context: "rmp_decode".into(),
             });
         }
-        Ok(s)
+        Ok(())
     }
 
     pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
@@ -2011,7 +2049,17 @@ impl Reveal {
                 b"s" => {
                     s.sig_slot = rmp_decode::read_optional(rd, SigSlotCommit::decode_from_reader)?
                 }
-                b"p" => s.part = rmp_decode::read_optional(rd, Participant::decode_from_reader)?,
+                b"p" => {
+                    if rmp_decode::try_read_nil(rd) {
+                        s.part = None;
+                    } else {
+                        // a repeated `p` merges into the populated participant
+                        // like go's decoder (issue #2397)
+                        let mut v = s.part.take().unwrap_or_default();
+                        Participant::decode_into(rd, &mut v)?;
+                        s.part = Some(v);
+                    }
+                }
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }

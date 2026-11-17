@@ -3244,3 +3244,5 @@
 {"go_ok": false, "id": 3243, "key": "a27a7a", "kind": "stxn", "map": 11, "pos": 1, "seed": "stxn_rand3", "sha": "bef87c81aa0694ec", "val": "c3"}
 {"go_ok": false, "id": 3244, "key": "a2756e", "kind": "payload", "map": 28, "pos": 2, "seed": "payload_rand0", "sha": "e29a6e9a7e4089ca", "val": "a17d"}
 {"go_ok": false, "id": 3245, "key": "a27a7a", "kind": "evaldelta", "map": 23, "pos": 0, "seed": "evaldelta_rand2", "sha": "620bbcc1d9e08a4c", "val": "81a16101"}
+{"go_ok": true, "id": 3246, "key": "a170", "kind": "applydata", "map": 22, "pos": 2, "seed": "applydata_rand3", "sha": "50bee1e4abe819d4", "val": "80"}
+{"go_ok": true, "id": 3247, "key": "a170", "kind": "applydata", "map": 23, "pos": 2, "seed": "applydata_rand3", "sha": "81615cee11b2bd40", "val": "80"}

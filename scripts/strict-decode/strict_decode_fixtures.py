@@ -366,6 +366,17 @@ VALUES = [
 ]
 
 
+# Always-present regression cases (seed, map index, position, key, value): a
+# repeated key whose value is an empty map. go's generated decoder decodes the
+# empty map INTO the already populated struct (fields it does not mention are
+# kept), so a state-proof `Reveal`/`Participant` with a duplicated `p` still has
+# its `required` verifier (issue #2397, found by the 100k differential fuzz).
+PINNED = [
+    ("applydata_rand3", 22, 2, str_key("p"), bytes([0x80])),  # Reveal: second `p` = {}
+    ("applydata_rand3", 23, 2, str_key("p"), bytes([0x80])),  # Participant: second `p` = {}
+]
+
+
 def donor_entries(b):
     """Every (key, value) entry of every map of `b`, as raw bytes."""
     out = []
@@ -400,6 +411,10 @@ def make_cases(seeds, rng, per_map, cap=None):
     rng.shuffle(cases)
     if cap is not None:
         cases = cases[:cap]
+    by_name = {s["name"]: s for s in seeds}
+    for seed, m, pos, key, val in PINNED:
+        if seed in by_name:
+            cases.append((by_name[seed], m, pos, key, val))
     out = []
     for n, (s, m, pos, key, val) in enumerate(cases):
         mut = mutate(bytes.fromhex(s["hex"]), m, pos, key, val)
