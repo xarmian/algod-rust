@@ -18,12 +18,13 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+mod timefmt;
+
 use std::path::{Path, PathBuf};
 
 use algo_error::Result;
 use algo_rest_client::{AlgodClient, BlockSource};
 use algo_types::Round;
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -71,7 +72,7 @@ pub async fn capture_block(
     // Write metadata
     let meta = FixtureMetadata {
         round: round.0,
-        captured_at: Utc::now().to_rfc3339(),
+        captured_at: timefmt::now_rfc3339(),
         source_url: source_url.to_string(),
     };
     let meta_path = base.with_extension("meta.json");
@@ -153,7 +154,7 @@ pub async fn capture_state_delta(
 
     let meta = FixtureMetadata {
         round: round.0,
-        captured_at: Utc::now().to_rfc3339(),
+        captured_at: timefmt::now_rfc3339(),
         source_url: source_url.to_string(),
     };
     let meta_path = base.with_extension("meta.json");

@@ -20,6 +20,11 @@
 
 //! A lossless `String` view of an arbitrary byte string (issue #2388).
 //!
+//! Also used (issue #2397) to hold go `string` consensus fields that are arbitrary
+//! bytes on the wire (`gen`, `proto`, `nextproto`, `upgradeprop`, a transaction's
+//! `type`) in a Rust `String`: `rmp_decode::read_string` produces this form and
+//! the canonical encoder writes [`decode`]d bytes back.
+//!
 //! go's `logic.AssembleString(string(body))` takes any byte string: a Go
 //! `string` is not required to be UTF-8, so a string literal keeps raw bytes
 //! and an invalid byte in a comment is ignored. The assembler front end here

@@ -702,7 +702,17 @@ pub fn read_bool(rd: &mut &[u8]) -> Result<bool> {
 
 // ── String / bytes readers ─────────────────────────────────────
 
-/// Read a msgpack string as an owned String.
+/// Read a msgpack string as an owned String, losslessly.
+///
+/// go's `string` fields (`gen`, `proto`, `nextproto`, `upgradeprop`, a
+/// transaction's `type`, ...) are arbitrary byte sequences: `msgp.ReadStringZC`
+/// only bounds the length and never validates UTF-8 (issue #2397). Valid UTF-8
+/// is returned as is; a value with invalid bytes is returned in the bijective
+/// [`crate::raw_text`] form (an invalid byte becomes a private-use character)
+/// so that re-encoding with `raw_text::decode` reproduces go's exact bytes.
+/// This matters for consensus: a proposer may put any byte string of at most
+/// `MaxVersionStringLen` bytes in `upgradeprop`, go accepts the block, and the
+/// string then lives on in every following header as `nextproto`.
 #[inline]
 pub fn read_string(rd: &mut &[u8]) -> Result<String> {
     // go `msgp.ReadStringZC` (used by every generated `string` field) maps
@@ -719,9 +729,7 @@ pub fn read_string(rd: &mut &[u8]) -> Result<String> {
             rd.len()
         )));
     }
-    let s = std::str::from_utf8(&rd[..len])
-        .map_err(|e| codec_err(format!("read_string: invalid utf-8: {e}")))?
-        .to_owned();
+    let s = crate::raw_text::encode(&rd[..len]).into_owned();
     *rd = &rd[len..];
     Ok(s)
 }
@@ -1184,6 +1192,19 @@ mod tests {
         let data = [0xa3, b'p', b'a', b'y'];
         let mut rd = &data[..];
         assert_eq!(read_string(&mut rd).unwrap(), "pay");
+    }
+
+    /// Issue #2397: a go `string` may hold any bytes; reading keeps them
+    /// losslessly (valid UTF-8 unchanged).
+    #[test]
+    fn read_string_keeps_non_utf8_bytes_losslessly() {
+        let data = [0xa3, 0xff, b'a', 0xc3];
+        let mut rd = &data[..];
+        let s = read_string(&mut rd).unwrap();
+        assert!(rd.is_empty());
+        assert_eq!(crate::raw_text::decode(&s).as_ref(), &data[1..]);
+        let mut rd = &[0xa2, 0xc3, 0xa9][..];
+        assert_eq!(read_string(&mut rd).unwrap(), "\u{e9}");
     }
 
     #[test]

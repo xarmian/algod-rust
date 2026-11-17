@@ -28,7 +28,6 @@ use algo_network::{
     DEFAULT_GOSSIP_FANOUT,
 };
 use async_trait::async_trait;
-use chrono::Utc;
 use serde_json::json;
 use tracing::info;
 
@@ -49,7 +48,7 @@ impl MessageHandler for ObserveHandler {
         let tag_str = msg.tag.as_str();
         let size = msg.data.len();
         let sender = &msg.sender;
-        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let now = crate::timefmt::rfc3339_millis_z(time::OffsetDateTime::now_utc());
 
         let line = json!({
             "timestamp": now,

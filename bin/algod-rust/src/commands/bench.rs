@@ -146,7 +146,7 @@ pub async fn run_replay(
         scenario: "replay".to_string(),
         implementation: Implementation::Rust,
         metrics,
-        timestamp: chrono::Utc::now().to_rfc3339(),
+        timestamp: crate::timefmt::now_rfc3339(),
         git_sha: algo_bench::metrics::git_sha(),
         config: BenchConfig {
             block_range: Some(format!("{}-{}", start_round, end_round)),
@@ -251,7 +251,7 @@ pub async fn run_decode(
         scenario: "decode".to_string(),
         implementation: Implementation::Rust,
         metrics,
-        timestamp: chrono::Utc::now().to_rfc3339(),
+        timestamp: crate::timefmt::now_rfc3339(),
         git_sha: algo_bench::metrics::git_sha(),
         config: BenchConfig {
             block_range: Some(format!("{}-{}", start_round, end_round)),

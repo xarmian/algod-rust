@@ -180,56 +180,6 @@ def str_key(s):
     return bytes([0xA0 | len(raw)]) + raw
 
 
-def ascii_strs(b):
-    """`b` with every non-ASCII byte of a msgpack `str` value replaced by `x`.
-
-    go's randomiser fills Go strings (transaction type, genesis id, log lines,
-    ...) with arbitrary bytes, and go accepts non-UTF-8 `str` values anywhere;
-    algod-rust's string readers (`read_string`) refuse them: a separate
-    difference, tracked in its own issue, that this fixture is not about, so the
-    random seeds keep their strings ASCII and the verdicts isolate unknown keys.
-    """
-    out = bytearray(b)
-
-    def go(i):
-        c = out[i]
-        if 0x80 <= c <= 0x8F or 0x90 <= c <= 0x9F or c in (0xDC, 0xDD, 0xDE, 0xDF):
-            if c in (0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F):
-                n, hl, mul = c & 0x0F, 1, 2
-            elif c <= 0x9F:
-                n, hl, mul = c & 0x0F, 1, 1
-            elif c == 0xDC:
-                n, hl, mul = int.from_bytes(out[i + 1 : i + 3], "big"), 3, 1
-            elif c == 0xDD:
-                n, hl, mul = int.from_bytes(out[i + 1 : i + 5], "big"), 5, 1
-            elif c == 0xDE:
-                n, hl, mul = int.from_bytes(out[i + 1 : i + 3], "big"), 3, 2
-            else:
-                n, hl, mul = int.from_bytes(out[i + 1 : i + 5], "big"), 5, 2
-            j = i + hl
-            for _ in range(n * mul):
-                j = go(j)
-            return j
-        e = skip(bytes(out), i)
-        if 0xA0 <= c <= 0xBF:
-            hl = 1
-        elif c == 0xD9:
-            hl = 2
-        elif c == 0xDA:
-            hl = 3
-        elif c == 0xDB:
-            hl = 5
-        else:
-            return e
-        for k in range(i + hl, e):
-            if out[k] > 0x7F:
-                out[k] = 0x78
-        return e
-
-    go(0)
-    return bytes(out)
-
-
 def top_value(b, key):
     """Raw bytes of top-level map `key`'s value."""
     n, hl = map_header(b, 0)
@@ -416,6 +366,17 @@ VALUES = [
 ]
 
 
+# Always-present regression cases (seed, map index, position, key, value): a
+# repeated key whose value is an empty map. go's generated decoder decodes the
+# empty map INTO the already populated struct (fields it does not mention are
+# kept), so a state-proof `Reveal`/`Participant` with a duplicated `p` still has
+# its `required` verifier (issue #2397, found by the 100k differential fuzz).
+PINNED = [
+    ("applydata_rand3", 22, 2, str_key("p"), bytes([0x80])),  # Reveal: second `p` = {}
+    ("applydata_rand3", 23, 2, str_key("p"), bytes([0x80])),  # Participant: second `p` = {}
+]
+
+
 def donor_entries(b):
     """Every (key, value) entry of every map of `b`, as raw bytes."""
     out = []
@@ -450,6 +411,10 @@ def make_cases(seeds, rng, per_map, cap=None):
     rng.shuffle(cases)
     if cap is not None:
         cases = cases[:cap]
+    by_name = {s["name"]: s for s in seeds}
+    for seed, m, pos, key, val in PINNED:
+        if seed in by_name:
+            cases.append((by_name[seed], m, pos, key, val))
     out = []
     for n, (s, m, pos, key, val) in enumerate(cases):
         mut = mutate(bytes.fromhex(s["hex"]), m, pos, key, val)
@@ -504,8 +469,6 @@ def main():
     if a.regen_seeds or not os.path.exists(SEEDS):
         rand = []
         run_go(go, [], seeds_out=rand)
-        for r in rand:
-            r["hex"] = ascii_strs(bytes.fromhex(r["hex"])).hex()
         seeds = real_seeds() + rand
         # a seed go itself rejects would only test the baseline: keep go-accepted ones
         v = run_go(go, [{"name": s["name"], "kind": s["kind"], "hex": s["hex"]} for s in seeds])

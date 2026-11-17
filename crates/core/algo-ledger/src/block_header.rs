@@ -98,7 +98,11 @@ fn apply_upgrade_vote(
             });
         }
 
-        if vote.upgrade_propose.len() as u64 > params.max_version_string_len {
+        // go's `len(string)` counts bytes: `upgrade_propose` is in the lossless
+        // raw form (issue #2397), where one invalid byte is a 4-byte character.
+        if algo_types::raw_text::raw_len(&vote.upgrade_propose) as u64
+            > params.max_version_string_len
+        {
             return Err(AlgoError::Ledger {
                 message: format!(
                     "apply_upgrade_vote: proposed protocol version {} too long",
@@ -1202,6 +1206,36 @@ mod tests {
             apply_upgrade_vote(&prev_state, 10, &vote_with_propose("12345678"), &params).is_ok(),
             "a proposal exactly at max_version_string_len must be accepted"
         );
+    }
+
+    /// Issue #2397: go's `len(UpgradePropose)` counts bytes, and go accepts a
+    /// non-UTF-8 proposal: 8 invalid bytes fit `max_version_string_len = 8`
+    /// (they are 32 bytes in the lossless raw `String` form), 9 do not.
+    #[test]
+    fn apply_upgrade_vote_counts_raw_bytes_of_non_utf8_propose() {
+        let params = ConsensusParams {
+            max_version_string_len: 8,
+            ..v41_params()
+        };
+        let prev_state = NextUpgradeState {
+            current_protocol: CONSENSUS_V41.to_string(),
+            next_protocol: String::new(),
+            next_protocol_approvals: 0,
+            next_protocol_vote_before: Round(0),
+            next_protocol_switch_on: Round(0),
+        };
+        let vote = |bytes: &[u8]| NextUpgradeVote {
+            upgrade_propose: algo_types::raw_text::encode(bytes).into_owned(),
+            upgrade_delay: 10_000,
+            upgrade_approve: false,
+        };
+        let ok = apply_upgrade_vote(&prev_state, 10, &vote(&[0xff; 8]), &params)
+            .expect("8 raw bytes are within the limit");
+        assert_eq!(
+            algo_types::raw_text::decode(&ok.next_protocol).as_ref(),
+            &[0xff; 8]
+        );
+        assert!(apply_upgrade_vote(&prev_state, 10, &vote(&[0xff; 9]), &params).is_err());
     }
 
     #[test]

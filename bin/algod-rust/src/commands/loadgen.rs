@@ -927,7 +927,7 @@ fn build_report(
 
     LoadgenReport {
         scenario: "loadgen".to_string(),
-        timestamp: chrono::Utc::now().to_rfc3339(),
+        timestamp: crate::timefmt::now_rfc3339(),
         config: serde_json::json!({
             "endpoints": cfg.endpoints,
             "target_tps": cfg.target_tps,
