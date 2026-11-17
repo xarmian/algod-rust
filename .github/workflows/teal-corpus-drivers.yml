@@ -19,6 +19,7 @@ on:
       - "crates/core/algo-avm/tests/fixtures/go_op_types.jsonl"
       - "crates/tools/teal-corpus/**"
       - "crates/core/algo-avm/src/assembler.rs"
+      - "crates/core/algo-avm/src/abi_verify.rs"
       - "crates/core/algo-avm/src/disassembler.rs"
       - "crates/core/algo-avm/src/type_track.rs"
       - "crates/core/algo-avm/src/type_track_table.rs"
@@ -40,6 +41,7 @@ on:
       - "crates/core/algo-avm/tests/fixtures/go_op_types.jsonl"
       - "crates/tools/teal-corpus/**"
       - "crates/core/algo-avm/src/assembler.rs"
+      - "crates/core/algo-avm/src/abi_verify.rs"
       - "crates/core/algo-avm/src/disassembler.rs"
       - "crates/core/algo-avm/src/type_track.rs"
       - "crates/core/algo-avm/src/type_track_table.rs"
@@ -156,6 +158,18 @@ jobs:
           # programs: the assembler's static type tracking against go's.
           python3 scripts/teal-corpus/gen_synthetic_asm.py "$RUNNER_TEMP/synasm" --random 20000 --versions 8,13
           bash scripts/teal-corpus/run_drivers.sh "$RUNNER_TEMP/synasm" "$RUNNER_TEMP/synasmout" assemble
+
+      - name: Assembly error-shaping parity on a synthetic adversarial corpus
+        run: |
+          set -euo pipefail
+          export GO_DRIVER="$RUNNER_TEMP/teal-corpus-go" RUST_DRIVER="$PWD/target/release/teal-corpus"
+          F=crates/tools/teal-corpus/tests/fixtures/small
+          # Wrong immediates, bad literals and encodings, directives, macros and
+          # odd whitespace, plus token-level mutations of the fixture sources
+          # (#2369): zero mismatches in bytecode, source map, warnings and the
+          # ordered error list (line, column, text).
+          python3 scripts/teal-corpus/gen_synthetic_syntax.py "$RUNNER_TEMP/synsyntax" --count 20000 --mutate 20000 --mutate-from "$F"
+          bash scripts/teal-corpus/run_drivers.sh "$RUNNER_TEMP/synsyntax" "$RUNNER_TEMP/synsyntaxout" assemble
 
       - name: Disassembly parity on a synthetic adversarial corpus
         run: |

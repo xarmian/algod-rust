@@ -23,6 +23,7 @@
 //! Provides the opcode table, bytecode parser, program validator,
 //! stack machine, and opcode implementations for TEAL program execution.
 
+mod abi_verify;
 pub(crate) mod arg_gate;
 pub(crate) mod arg_gate_table;
 pub mod assembler;
