@@ -610,8 +610,7 @@ pub fn attach_challenge_header(challenge_signed: &IdentityChallengeSigned) -> St
 // `msgp.ErrNoField`, `nil` is a zero struct, a struct may also be a positional
 // array, a `[32]byte` / `[64]byte` is read with `msgp.ReadExactBytes` (zero
 // padded) and `PublicAddress` is bounded by `maxAddressLen`. A repeated key is
-// decoded again into the same field (a
-// nested struct is merged, as go does).
+// decoded again into the same field (a nested struct is merged, as go does).
 
 /// go `maxAddressLen` (`network/netidentity.go`): the `allocbound` of
 /// `identityChallenge.PublicAddress`.
