@@ -5176,10 +5176,11 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         apply_data.close_rewards += pass.close_rewards;
 
         // Handle rekey_to BEFORE type-specific apply (matching Go's ordering:
-        // rewards -> rekey -> type-specific dispatch).
-        if let Some(rekey_addr) = txn.rekey_to {
+        // rewards -> rekey -> type-specific dispatch). go's `apply.Rekey`
+        // ignores a zero RekeyTo rather than clearing AuthAddr (#2409).
+        if let Some(rekey_addr) = txn.rekey_to.filter(|a| !a.is_zero()) {
             let mut account = store.get_or_default_account(&txn.sender);
-            if rekey_addr == txn.sender || rekey_addr.is_zero() {
+            if rekey_addr == txn.sender {
                 account.auth_addr = None;
             } else {
                 account.auth_addr = Some(rekey_addr);
@@ -8056,6 +8057,29 @@ mod tests {
 
         apply_transaction(&mut state, &stx2, &ctx, 0).unwrap();
         assert_eq!(state.get_account(&sender).unwrap().auth_addr, None);
+    }
+
+    /// Issue #2409: go's `apply.Rekey` (ledger/apply/apply.go) only touches
+    /// `AuthAddr` when `RekeyTo` is non-zero, so an explicit zero `RekeyTo`
+    /// leaves an existing rekey in place instead of clearing it.
+    #[test]
+    fn test_zero_rekey_to_keeps_existing_auth_addr() {
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let auth = Address([5u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (receiver, 100_000), (fee_sink, 0)],
+            fee_sink,
+        );
+        state.get_or_default_account_mut(&sender).auth_addr = Some(auth);
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        let mut stx = pay_txn(sender, receiver, 1_000, 1_000);
+        stx.txn.rekey_to = Some(Address([0u8; 32]));
+
+        apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+        assert_eq!(state.get_account(&sender).unwrap().auth_addr, Some(auth));
     }
 
     // ── Authorizer-vs-AuthAddr enforcement (issue #824, ported from

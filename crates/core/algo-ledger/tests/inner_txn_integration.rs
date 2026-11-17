@@ -1950,6 +1950,64 @@ fn rekeyed_account_close_erases_rekey_for_later_inner_txn() {
     );
 }
 
+/// Issue #2409 (mainnet round 67040897): an inner txn whose `RekeyTo` is
+/// set to the zero address (`global ZeroAddress`, as app 3643581007 does
+/// when it does not want to rekey) must leave the sender's existing rekey
+/// alone. go's `apply.Rekey` (ledger/apply/apply.go) is a no-op for a zero
+/// `RekeyTo`; algod-rust used to clear `auth_addr` instead, so the next
+/// inner txn from the same account failed "unauthorized" and the node
+/// halted on a block mainnet had accepted.
+#[test]
+fn zero_rekey_to_keeps_existing_rekey_for_later_inner_txn() {
+    let app_id = 42u64;
+    let rekeyed = [0xAA; 32]; // rekeyed to the app
+    let receiver = [0xBB; 32];
+
+    let mut store = LedgerState::new();
+    seed_app_approve(&mut store, app_id, Address([1u8; 32]));
+    let app_addr = Address(app_address(app_id));
+    fund_account(&mut store, app_addr, 1_000_000);
+    fund_account(&mut store, Address(receiver), 1_000_000);
+
+    let rekeyed_acct = store.get_or_default_account_mut(&Address(rekeyed));
+    rekeyed_acct.micro_algos = 2_000_000;
+    rekeyed_acct.auth_addr = Some(app_addr);
+
+    let txn = make_appl_txn([0xCC; 32], app_id);
+    let mut ctx = make_context(&mut store, vec![txn], app_id);
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    ctx.fee_credit = 10_000;
+
+    let mut code = Vec::new();
+    for _ in 0..2 {
+        // pay 1 from the rekeyed account, RekeyTo = zero address.
+        code.push(0xb1); // itxn_begin
+        code.extend(pushint(1));
+        code.extend([0xb2, 16]); // TypeEnum = pay
+        code.extend(pushint(1));
+        code.extend([0xb2, 8]); // Amount
+        code.extend(pushbytes(&rekeyed));
+        code.extend([0xb2, 0]); // Sender
+        code.extend(pushbytes(&receiver));
+        code.extend([0xb2, 7]); // Receiver
+        code.extend(pushbytes(&[0u8; 32]));
+        code.extend([0xb2, 32]); // RekeyTo = zero address
+        code.push(0xb3); // itxn_submit
+    }
+    code.extend(pushint(1));
+    code.push(0x43); // return
+
+    let result = run_with_context(6, &code, &mut ctx);
+    assert!(
+        !is_failure(&result),
+        "a zero RekeyTo must not clear the rekey, got: {result:?}"
+    );
+    let acct = ctx.store.get_account(&Address(rekeyed)).unwrap();
+    assert_eq!(acct.auth_addr, Some(app_addr));
+    assert_eq!(acct.micro_algos, 2_000_000 - 2);
+}
+
 /// Phase 17 (issue #1363): TestRekeyBack
 /// (data/transactions/logic/evalAppTxn_test.go:356) -- an inner pay that
 /// sets `RekeyTo` back to the sender's OWN address (the original owner,

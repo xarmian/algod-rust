@@ -976,7 +976,8 @@ impl InnerTxnBuilder {
                         if b.len() == 32 {
                             let mut addr = [0u8; 32];
                             addr.copy_from_slice(b);
-                            txn.rekey_to = Some(Address(addr));
+                            // A zero address is go's unset RekeyTo.
+                            txn.rekey_to = (addr != [0u8; 32]).then_some(Address(addr));
                         }
                     }
                 }
@@ -7114,10 +7115,14 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             // inner appl-call's RekeyTo taking effect immediately so a
             // subsequent nested inner txn's sender-authorization check
             // (`auth_addr`) sees it within the same top-level transaction.
-            if let Some(rekey_addr) = txns[i].txn.rekey_to {
+            //
+            // go's `apply.Rekey` (ledger/apply/apply.go) is a no-op for a zero
+            // RekeyTo: `itxn_field RekeyTo` with `global ZeroAddress` must
+            // leave an existing rekey in place, not clear it (issue #2409).
+            if let Some(rekey_addr) = txns[i].txn.rekey_to.filter(|a| !a.is_zero()) {
                 let rekey_sender = txns[i].txn.sender;
                 let mut rekey_account = self.store.get_or_default_account(&rekey_sender);
-                if rekey_addr == rekey_sender || rekey_addr.is_zero() {
+                if rekey_addr == rekey_sender {
                     rekey_account.auth_addr = None;
                 } else {
                     rekey_account.auth_addr = Some(rekey_addr);
