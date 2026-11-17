@@ -1,12 +1,12 @@
 {"go_ok": false, "id": 0, "key": "a27a7a", "kind": "cpchunk", "map": 20, "pos": 0, "seed": "cpchunk_rand2", "sha": "a8e4794b07049d78", "val": "81a16101"}
 {"go_ok": false, "id": 1, "key": "a27a7a", "kind": "cpchunk", "map": 4, "pos": 1, "seed": "cp1_balances_1", "sha": "eecba76898b320ef", "val": "01"}
 {"go_ok": false, "id": 2, "key": "a27a7a", "kind": "cpspver", "map": 3, "pos": 0, "seed": "cp0_stateProofVerificationContext", "sha": "71e5d7268b3dc542", "val": "c3"}
-{"go_ok": true, "id": 3, "key": "a143", "kind": "cpchunk", "map": 4, "pos": 20, "seed": "cpchunk_rand1", "sha": "96b9878d9edfb8fb", "val": "c3"}
+{"go_ok": true, "go_val": "070df7991357cfd7", "id": 3, "key": "a143", "kind": "cpchunk", "map": 4, "pos": 20, "seed": "cpchunk_rand1", "sha": "96b9878d9edfb8fb", "val": "c3"}
 {"go_ok": false, "id": 4, "key": "a27a7a", "kind": "cpspver", "map": 1, "pos": 2, "seed": "cp0_stateProofVerificationContext", "sha": "6b655bbff712878e", "val": "c40100"}
 {"go_ok": false, "id": 5, "key": "a142", "kind": "cpchunk", "map": 23, "pos": 0, "seed": "cpchunk_rand3", "sha": "b5f315e2ed495a5b", "val": "c420cffbcbfc317cc4075b4d5f2d5c0b01b7ce6d53a355369820d18edf65ec1aa97a"}
 {"go_ok": false, "id": 6, "key": "a142", "kind": "cpchunk", "map": 10, "pos": 1, "seed": "cpchunk_rand2", "sha": "2b38485678eb9749", "val": "c4207c071f28dece3eba7f0f563a97d5dde3c4188737cf93bb8362ff7b4c255e417a"}
 {"go_ok": false, "id": 7, "key": "a27a7a", "kind": "cpchunk", "map": 0, "pos": 0, "seed": "cp0_balances_4", "sha": "1a9df9132862588b", "val": "a178"}
-{"go_ok": true, "id": 8, "key": "a27a7a", "kind": "cpchunk", "map": 25, "pos": 0, "seed": "cpchunk_rand0", "sha": "61d07938ee9f3191", "val": "80"}
+{"go_ok": true, "go_val": "e91e81d0f60b9a60", "id": 8, "key": "a27a7a", "kind": "cpchunk", "map": 25, "pos": 0, "seed": "cpchunk_rand0", "sha": "61d07938ee9f3191", "val": "80"}
 {"go_ok": false, "id": 9, "key": "a67277646c766c", "kind": "cpchunk", "map": 0, "pos": 0, "seed": "cp0_balances_4", "sha": "4e7829a83135fdaf", "val": "cd0173"}
 {"go_ok": false, "id": 10, "key": "a27a7a", "kind": "cpchunk", "map": 1, "pos": 3, "seed": "cpchunk_rand0", "sha": "a6952c808d697877", "val": "c3"}
 {"go_ok": false, "id": 11, "key": "a27a7a", "kind": "cpchunk", "map": 26, "pos": 0, "seed": "cpchunk_rand1", "sha": "f60e8251bdfcf848", "val": "81a16101"}
@@ -21,19 +21,19 @@
 {"go_ok": false, "id": 20, "key": "a27a7a", "kind": "cpchunk", "map": 3, "pos": 1, "seed": "cp0_balances_4", "sha": "519ec838e618dd61", "val": "a178"}
 {"go_ok": false, "id": 21, "key": "a27a7a", "kind": "cpchunk", "map": 22, "pos": 12, "seed": "cpchunk_rand2", "sha": "08b7ed26c1e25e61", "val": "80"}
 {"go_ok": false, "id": 22, "key": "a16f", "kind": "cpchunk", "map": 20, "pos": 1, "seed": "cpchunk_rand1", "sha": "524722331919c2dc", "val": "c3"}
-{"go_ok": true, "id": 23, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cp0_balances_4", "sha": "417544e572a4b662", "val": ""}
-{"go_ok": true, "id": 24, "key": "a27a7a", "kind": "cpchunk", "map": 30, "pos": 10, "seed": "cpchunk_rand3", "sha": "668799d31e955151", "val": "c0"}
+{"go_ok": true, "go_val": "417544e572a4b662", "id": 23, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cp0_balances_4", "sha": "417544e572a4b662", "val": ""}
+{"go_ok": true, "go_val": "15262eab556f533c", "id": 24, "key": "a27a7a", "kind": "cpchunk", "map": 30, "pos": 10, "seed": "cpchunk_rand3", "sha": "668799d31e955151", "val": "c0"}
 {"go_ok": false, "id": 25, "key": "a163", "kind": "cpchunk", "map": 14, "pos": 0, "seed": "cp1_balances_1", "sha": "46d4c234a9741beb", "val": "82cd03e982a16cce000f418fa17acd025dcd03ea83a16e01a17081a16c82a2747402a275690aa17acd024e"}
 {"go_ok": false, "id": 26, "key": "a27474", "kind": "cpchunk", "map": 22, "pos": 28, "seed": "cpchunk_rand3", "sha": "43ffcb4f7dcb9c6c", "val": "cf75a3fe7a788ca3f6"}
 {"go_ok": false, "id": 27, "key": "a27a7a", "kind": "cpheader", "map": 1, "pos": 1, "seed": "cpheader_rand2", "sha": "9bc7c33121db08fa", "val": "c40100"}
 {"go_ok": false, "id": 28, "key": "a146", "kind": "cpchunk", "map": 7, "pos": 0, "seed": "cpchunk_rand3", "sha": "a1aba20451102e3c", "val": "c440f174ec978dfa8d001090b017bac3aa58e289a406d9bb89a1a7f20ff980efed7b8bc263429ed08a125ab8205087fa69f3b2be7c4993087b13b3511faecf41f21c"}
 {"go_ok": false, "id": 29, "key": "a179", "kind": "cpchunk", "map": 16, "pos": 0, "seed": "cpchunk_rand0", "sha": "76ae7b52bed2e892", "val": "cc94"}
-{"go_ok": true, "id": 30, "key": "a27a7a", "kind": "cpchunk", "map": 4, "pos": 2, "seed": "cp1_balances_4", "sha": "09ab62883bc055ca", "val": "c0"}
+{"go_ok": true, "go_val": "09ab62883bc055ca", "id": 30, "key": "a27a7a", "kind": "cpchunk", "map": 4, "pos": 2, "seed": "cp1_balances_4", "sha": "09ab62883bc055ca", "val": "c0"}
 {"go_ok": false, "id": 31, "key": "a16c", "kind": "cpchunk", "map": 5, "pos": 2, "seed": "cp0_balances_1", "sha": "3f716616ebe1557c", "val": "82a2747402a2756906"}
 {"go_ok": false, "id": 32, "key": "a27a7a", "kind": "cpspver", "map": 2, "pos": 0, "seed": "cp1_stateProofVerificationContext", "sha": "4c80cd77a109a1a7", "val": "c0"}
-{"go_ok": true, "id": 33, "key": "a27a7a", "kind": "cpchunk", "map": 6, "pos": 9, "seed": "cp1_balances_3", "sha": "7a004661b4d13648", "val": "81a16101"}
+{"go_ok": true, "go_val": "7a004661b4d13648", "id": 33, "key": "a27a7a", "kind": "cpchunk", "map": 6, "pos": 9, "seed": "cp1_balances_3", "sha": "7a004661b4d13648", "val": "81a16101"}
 {"go_ok": false, "id": 34, "key": "a27a7a", "kind": "cpspver", "map": 1, "pos": 4, "seed": "cpspver_rand1", "sha": "1c46c48f39905ba4", "val": "c3"}
-{"go_ok": true, "id": 35, "key": "a3726e64", "kind": "cpchunk", "map": 2, "pos": 3, "seed": "cp1_balances_4", "sha": "446e6dd705a618cf", "val": "cd016b"}
+{"go_ok": true, "go_val": "446e6dd705a618cf", "id": 35, "key": "a3726e64", "kind": "cpchunk", "map": 2, "pos": 3, "seed": "cp1_balances_4", "sha": "446e6dd705a618cf", "val": "cd016b"}
 {"go_ok": false, "id": 36, "key": "a161", "kind": "cpchunk", "map": 11, "pos": 0, "seed": "cpchunk_rand1", "sha": "cc944297bda8fc44", "val": "c420d926aa7efced7e118dbc13fb116ba2dfc8b8e2a78427a5a9a53687444e7dbcd8"}
 {"go_ok": false, "id": 37, "key": "a16a", "kind": "cpchunk", "map": 21, "pos": 0, "seed": "cpchunk_rand3", "sha": "28d6eed90b990a7a", "val": "c420d9435ca008c95447d961c8e15e865791974da9d3b0f9283a3696e1b2f540d8d3"}
 {"go_ok": false, "id": 38, "key": "a27a7a", "kind": "cpchunk", "map": 3, "pos": 2, "seed": "cpchunk_rand0", "sha": "5e191f41f020f1e0", "val": "c40100"}
@@ -49,33 +49,33 @@
 {"go_ok": false, "id": 48, "key": "a27a7a", "kind": "cpheader", "map": 1, "pos": 4, "seed": "cp0_content", "sha": "6fbeab1681009445", "val": "81a16101"}
 {"go_ok": false, "id": 49, "key": "a27a7a", "kind": "cpchunk", "map": 3, "pos": 2, "seed": "cp1_balances_4", "sha": "c2b96f6412afc082", "val": "c0"}
 {"go_ok": false, "id": 50, "key": "a27462", "kind": "cpchunk", "map": 9, "pos": 25, "seed": "cpchunk_rand2", "sha": "9dd527f706e94f87", "val": "ba5ff9292c3c34322c9d8a55be732fa4a49e1524692713a6829cd6"}
-{"go_ok": true, "id": 51, "key": "a3726e64", "kind": "cpchunk", "map": 4, "pos": 3, "seed": "cp0_balances_4", "sha": "f4760919c05a8da5", "val": "cd035f"}
+{"go_ok": true, "go_val": "f4760919c05a8da5", "id": 51, "key": "a3726e64", "kind": "cpchunk", "map": 4, "pos": 3, "seed": "cp0_balances_4", "sha": "f4760919c05a8da5", "val": "cd035f"}
 {"go_ok": false, "id": 52, "key": "ab626c6f636b73526f756e64", "kind": "cpheader", "map": 1, "pos": 2, "seed": "cpheader_rand2", "sha": "afffe230adfa4428", "val": "cf003bcfb1fc6be8ae"}
 {"go_ok": false, "id": 53, "key": "a27a7a", "kind": "cpchunk", "map": 8, "pos": 0, "seed": "cpchunk_rand1", "sha": "df41769a292a5780", "val": "c3"}
 {"go_ok": false, "id": 54, "key": "a27a7a", "kind": "cpspver", "map": 1, "pos": 0, "seed": "cpspver_rand0", "sha": "3ab13787d19d7e16", "val": "01"}
 {"go_ok": false, "id": 55, "key": "a27a7a", "kind": "cpchunk", "map": 1, "pos": 1, "seed": "cp0_balances_1", "sha": "ca304b6676bf0de0", "val": "c3"}
 {"go_ok": false, "id": 56, "key": "a27a7a", "kind": "cpchunk", "map": 3, "pos": 2, "seed": "cp0_balances_2", "sha": "6c2781263ce21999", "val": "81a16101"}
-{"go_ok": true, "id": 57, "key": "", "kind": "cpheader", "map": -1, "pos": 0, "seed": "cpheader_rand0", "sha": "03fce54788ee2f1f", "val": ""}
+{"go_ok": true, "go_val": "03fce54788ee2f1f", "id": 57, "key": "", "kind": "cpheader", "map": -1, "pos": 0, "seed": "cpheader_rand0", "sha": "03fce54788ee2f1f", "val": ""}
 {"go_ok": false, "id": 58, "key": "a177", "kind": "cpchunk", "map": 27, "pos": 0, "seed": "cpchunk_rand1", "sha": "3c45c9fabcd85d15", "val": "cf3ea132e2674e5797"}
-{"go_ok": true, "id": 59, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cpchunk_rand1", "sha": "2a2f3a35f549a8e9", "val": ""}
+{"go_ok": true, "go_val": "590927d54f1bd8f3", "id": 59, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cpchunk_rand1", "sha": "2a2f3a35f549a8e9", "val": ""}
 {"go_ok": false, "id": 60, "key": "a27a7a", "kind": "cpchunk", "map": 6, "pos": 0, "seed": "cp1_balances_1", "sha": "87028468d7158889", "val": "c40100"}
 {"go_ok": false, "id": 61, "key": "a16f", "kind": "cpchunk", "map": 5, "pos": 1, "seed": "cpchunk_rand1", "sha": "f93583666f11a506", "val": "cfa0705ce947f2566d"}
 {"go_ok": false, "id": 62, "key": "a17a", "kind": "cpchunk", "map": 10, "pos": 0, "seed": "cp0_balances_1", "sha": "47f0877ada4b0fe4", "val": "cd0486"}
 {"go_ok": false, "id": 63, "key": "a461646472", "kind": "cpchunk", "map": 0, "pos": 0, "seed": "cp1_balances_3", "sha": "ed4257f33aec6a9d", "val": "c4201fd652630ea07f61fad97e6dd3db1e9d45b91095ce72023db93efaafbc54375c"}
 {"go_ok": false, "id": 64, "key": "a27a7a", "kind": "cpchunk", "map": 8, "pos": 3, "seed": "cpchunk_rand0", "sha": "02733690b5d32d23", "val": "c0"}
-{"go_ok": true, "id": 65, "key": "a27a7a", "kind": "cpchunk", "map": 6, "pos": 1, "seed": "cp0_balances_1", "sha": "911bc68cf7a10df7", "val": "c0"}
+{"go_ok": true, "go_val": "95cf0ca1e968c094", "id": 65, "key": "a27a7a", "kind": "cpchunk", "map": 6, "pos": 1, "seed": "cp0_balances_1", "sha": "911bc68cf7a10df7", "val": "c0"}
 {"go_ok": false, "id": 66, "key": "a17a", "kind": "cpchunk", "map": 14, "pos": 0, "seed": "cp0_balances_1", "sha": "2427bbf618b92e3f", "val": "cd046f"}
 {"go_ok": false, "id": 67, "key": "a464617461", "kind": "cpchunk", "map": 0, "pos": 0, "seed": "cp1_balances_4", "sha": "46bfaf25d21c7aa2", "val": "83a66f6e6c696e65cf00016bdac93d7000a570726f746fd95968747470733a2f2f6769746875622e636f6d2f616c676f72616e64666f756e646174696f6e2f73706563732f747265652f37336334336234613936393933393038383463353165326139353938643439653238333733643130a67277646c766ccc9c"}
 {"go_ok": false, "id": 68, "key": "a27a7a", "kind": "cpchunk", "map": 20, "pos": 1, "seed": "cpchunk_rand1", "sha": "b345ebf8ab522094", "val": "81a16101"}
-{"go_ok": true, "id": 69, "key": "a27a7a", "kind": "cpchunk", "map": 23, "pos": 1, "seed": "cpchunk_rand0", "sha": "67d464cba9d43b03", "val": "c0"}
+{"go_ok": true, "go_val": "d280ef66530548b3", "id": 69, "key": "a27a7a", "kind": "cpchunk", "map": 23, "pos": 1, "seed": "cpchunk_rand0", "sha": "67d464cba9d43b03", "val": "c0"}
 {"go_ok": false, "id": 70, "key": "a27a7a", "kind": "cpchunk", "map": 31, "pos": 2, "seed": "cpchunk_rand0", "sha": "4f0a59beba44ce2c", "val": "c0"}
 {"go_ok": false, "id": 71, "key": "a176", "kind": "cpspver", "map": 0, "pos": 0, "seed": "cpspver_rand0", "sha": "fc395fd279ec00ce", "val": "a194"}
 {"go_ok": false, "id": 72, "key": "a27a7a", "kind": "cpchunk", "map": 6, "pos": 0, "seed": "cpchunk_rand1", "sha": "7b05b91f3e07d568", "val": "c0"}
 {"go_ok": false, "id": 73, "key": "a67277646c766c", "kind": "cpheader", "map": 0, "pos": 7, "seed": "cpheader_rand0", "sha": "5810aa153b292f50", "val": "cf05daea968259610f"}
 {"go_ok": false, "id": 74, "key": "a16c", "kind": "cpchunk", "map": 0, "pos": 3, "seed": "cpchunk_rand1", "sha": "4f90ae1f451e4f88", "val": "cf7860496bc90a1ae2"}
 {"go_ok": false, "id": 75, "key": "a67277646c766c", "kind": "cpheader", "map": 0, "pos": 8, "seed": "cpheader_rand3", "sha": "064402c3522495da", "val": "cfd6e95fb86b84038b"}
-{"go_ok": true, "id": 76, "key": "a16a", "kind": "cpchunk", "map": 36, "pos": 1, "seed": "cpchunk_rand3", "sha": "2870344d6f7cc4ee", "val": "c4208da0eb5cf4dc49edf74caefc08514c1ea40a79b03fb90e14d0af0626db4c3d2b"}
-{"go_ok": true, "id": 77, "key": "a27a7a", "kind": "cpchunk", "map": 4, "pos": 0, "seed": "cp0_balances_3", "sha": "fedc3171ea9acefa", "val": "81a16101"}
+{"go_ok": true, "go_val": "73f671d58dbde592", "id": 76, "key": "a16a", "kind": "cpchunk", "map": 36, "pos": 1, "seed": "cpchunk_rand3", "sha": "2870344d6f7cc4ee", "val": "c4208da0eb5cf4dc49edf74caefc08514c1ea40a79b03fb90e14d0af0626db4c3d2b"}
+{"go_ok": true, "go_val": "fedc3171ea9acefa", "id": 77, "key": "a27a7a", "kind": "cpchunk", "map": 4, "pos": 0, "seed": "cp0_balances_3", "sha": "fedc3171ea9acefa", "val": "81a16101"}
 {"go_ok": false, "id": 78, "key": "a27474", "kind": "cpchunk", "map": 11, "pos": 2, "seed": "cp0_balances_1", "sha": "59f2cf16d32344a4", "val": "02"}
 {"go_ok": false, "id": 79, "key": "a3766c76", "kind": "cpchunk", "map": 9, "pos": 10, "seed": "cpchunk_rand0", "sha": "d5ad357141c84d96", "val": "cfec5ec7e59c09e0d1"}
 {"go_ok": false, "id": 80, "key": "a27a7a", "kind": "cpchunk", "map": 3, "pos": 2, "seed": "cp0_balances_2", "sha": "6144e213ca76335e", "val": "80"}
@@ -83,13 +83,13 @@
 {"go_ok": false, "id": 82, "key": "a16f", "kind": "cpchunk", "map": 27, "pos": 0, "seed": "cpchunk_rand0", "sha": "5ea1f8d1c00a84f9", "val": "cfe3d79531a906d83f"}
 {"go_ok": false, "id": 83, "key": "a27a7a", "kind": "cpheader", "map": 2, "pos": 0, "seed": "cpheader_rand1", "sha": "8bf918377a863972", "val": "c40100"}
 {"go_ok": false, "id": 84, "key": "a170", "kind": "cpchunk", "map": 6, "pos": 1, "seed": "cp1_balances_1", "sha": "7e89916def0573b9", "val": "81a16c82a2747402a2756907"}
-{"go_ok": true, "id": 85, "key": "a16b", "kind": "cpchunk", "map": 32, "pos": 6, "seed": "cpchunk_rand2", "sha": "ce34f49ae3ee5324", "val": "c420efcebacb0509973312c51d4e7dab38c6e2d635930651dc8b21bd7775e986777f"}
+{"go_ok": true, "go_val": "209dbe428e8c3ed7", "id": 85, "key": "a16b", "kind": "cpchunk", "map": 32, "pos": 6, "seed": "cpchunk_rand2", "sha": "ce34f49ae3ee5324", "val": "c420efcebacb0509973312c51d4e7dab38c6e2d635930651dc8b21bd7775e986777f"}
 {"go_ok": false, "id": 86, "key": "a27a7a", "kind": "cpchunk", "map": 14, "pos": 3, "seed": "cpchunk_rand1", "sha": "abfd130b9a97313f", "val": "c3"}
 {"go_ok": false, "id": 87, "key": "a27a7a", "kind": "cpchunk", "map": 0, "pos": 1, "seed": "cpchunk_rand0", "sha": "ac99e96343da8e2c", "val": "c3"}
 {"go_ok": false, "id": 88, "key": "a27a7a", "kind": "cpchunk", "map": 1, "pos": 2, "seed": "cp0_balances_2", "sha": "9f2a03e5ff54e40f", "val": "a178"}
 {"go_ok": false, "id": 89, "key": "a27a7a", "kind": "cpchunk", "map": 10, "pos": 0, "seed": "cpchunk_rand1", "sha": "df5e9d58712c7920", "val": "01"}
 {"go_ok": false, "id": 90, "key": "a27a7a", "kind": "cpchunk", "map": 0, "pos": 0, "seed": "cp1_balances_2", "sha": "2bc4ec2570c2857e", "val": "01"}
-{"go_ok": true, "id": 91, "key": "a27a7a", "kind": "cpchunk", "map": 7, "pos": 1, "seed": "cpchunk_rand1", "sha": "9e5eeffef81c2790", "val": "80"}
+{"go_ok": true, "go_val": "82377ab9e600d560", "id": 91, "key": "a27a7a", "kind": "cpchunk", "map": 7, "pos": 1, "seed": "cpchunk_rand1", "sha": "9e5eeffef81c2790", "val": "80"}
 {"go_ok": false, "id": 92, "key": "a27474", "kind": "cpchunk", "map": 15, "pos": 11, "seed": "cpchunk_rand3", "sha": "80e8934e5578fe56", "val": "cf9e7159854be71124"}
 {"go_ok": false, "id": 93, "key": "a173", "kind": "cpchunk", "map": 3, "pos": 1, "seed": "cpchunk_rand0", "sha": "ed1348a1b7d001a3", "val": "81b2c247a104b2408e571c7dcb0f3590a04fd7f283a27462d9267c442a6705ac3063e2e23c2a13a56a7a2d5bf8641bdfc72a2b3fc3bb2e1ef4610a0ad720b1e2a27474cf2b0a2529c974e6c1a27569cfef250b2176f9912b"}
 {"go_ok": false, "id": 94, "key": "a27a7a", "kind": "cpchunk", "map": 5, "pos": 1, "seed": "cpchunk_rand3", "sha": "ae962d5ad8c619bc", "val": "81a16101"}
@@ -97,26 +97,26 @@
 {"go_ok": false, "id": 96, "key": "a163", "kind": "cpchunk", "map": 24, "pos": 0, "seed": "cpchunk_rand0", "sha": "e3f7d3109e168994", "val": "cfa97643957d3f9967"}
 {"go_ok": false, "id": 97, "key": "a27a7a", "kind": "cpheader", "map": 2, "pos": 1, "seed": "cpheader_rand2", "sha": "42ffeab38fbcd0ac", "val": "01"}
 {"go_ok": false, "id": 98, "key": "a16a", "kind": "cpchunk", "map": 12, "pos": 1, "seed": "cpchunk_rand0", "sha": "25b533af6bac573b", "val": "c420b3aa654c57b9d311aa7723ec056b1b8c75f3f3da71272e5fba69d8788ccc94ae"}
-{"go_ok": true, "id": 99, "key": "a3726e64", "kind": "cpchunk", "map": 32, "pos": 11, "seed": "cpchunk_rand1", "sha": "521b97db09278870", "val": "cfb81b876f97cdf3bc"}
+{"go_ok": true, "go_val": "dc364a2f42efe7ef", "id": 99, "key": "a3726e64", "kind": "cpchunk", "map": 32, "pos": 11, "seed": "cpchunk_rand1", "sha": "521b97db09278870", "val": "cfb81b876f97cdf3bc"}
 {"go_ok": false, "id": 100, "key": "a27a7a", "kind": "cpspver", "map": 0, "pos": 0, "seed": "cpspver_rand1", "sha": "563720731ec68178", "val": "c3"}
-{"go_ok": true, "id": 101, "key": "a16e", "kind": "cpchunk", "map": 9, "pos": 2, "seed": "cp0_balances_1", "sha": "5676d8db51839eee", "val": "01"}
+{"go_ok": true, "go_val": "55d1b066f273399d", "id": 101, "key": "a16e", "kind": "cpchunk", "map": 9, "pos": 2, "seed": "cp0_balances_1", "sha": "5676d8db51839eee", "val": "01"}
 {"go_ok": false, "id": 102, "key": "a27a7a", "kind": "cpchunk", "map": 10, "pos": 1, "seed": "cpchunk_rand3", "sha": "5d4f6102164693a7", "val": "c40100"}
 {"go_ok": false, "id": 103, "key": "a17a", "kind": "cpchunk", "map": 17, "pos": 1, "seed": "cp0_balances_1", "sha": "af11795592a7aa9d", "val": "cd049c"}
 {"go_ok": false, "id": 104, "key": "a27a7a", "kind": "cpchunk", "map": 17, "pos": 4, "seed": "cpchunk_rand3", "sha": "dcd7023e28a5027c", "val": "01"}
-{"go_ok": true, "id": 105, "key": "a143", "kind": "cpchunk", "map": 4, "pos": 0, "seed": "cp0_balances_3", "sha": "5c670b79fb2333a9", "val": "cd0370"}
+{"go_ok": true, "go_val": "5c670b79fb2333a9", "id": 105, "key": "a143", "kind": "cpchunk", "map": 4, "pos": 0, "seed": "cp0_balances_3", "sha": "5c670b79fb2333a9", "val": "cd0370"}
 {"go_ok": false, "id": 106, "key": "a27a7a", "kind": "cpchunk", "map": 11, "pos": 3, "seed": "cpchunk_rand3", "sha": "29d2adc896df88ee", "val": "a178"}
 {"go_ok": false, "id": 107, "key": "a157", "kind": "cpchunk", "map": 3, "pos": 2, "seed": "cp0_balances_3", "sha": "30e7cbdc36c6375e", "val": "cd0530"}
 {"go_ok": false, "id": 108, "key": "a27a7a", "kind": "cpspver", "map": 1, "pos": 4, "seed": "cpspver_rand3", "sha": "cbd35d3b39417e77", "val": "80"}
 {"go_ok": false, "id": 109, "key": "a164", "kind": "cpchunk", "map": 11, "pos": 0, "seed": "cp1_balances_1", "sha": "780506042f2a9629", "val": "ce116831f6"}
 {"go_ok": false, "id": 110, "key": "ad62616c616e636573526f756e64", "kind": "cpheader", "map": 3, "pos": 0, "seed": "cp1_content", "sha": "abdd84b04bd2b567", "val": "cd02a8"}
-{"go_ok": true, "id": 111, "key": "a27a7a", "kind": "cpchunk", "map": 4, "pos": 0, "seed": "cp1_balances_3", "sha": "0c6c1bc2ae245cf0", "val": "c40100"}
+{"go_ok": true, "go_val": "0c6c1bc2ae245cf0", "id": 111, "key": "a27a7a", "kind": "cpchunk", "map": 4, "pos": 0, "seed": "cp1_balances_3", "sha": "0c6c1bc2ae245cf0", "val": "c40100"}
 {"go_ok": false, "id": 112, "key": "a27a7a", "kind": "cpchunk", "map": 14, "pos": 0, "seed": "cpchunk_rand3", "sha": "7c4b5b1a118101b5", "val": "c3"}
-{"go_ok": true, "id": 113, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cp0_balances_3", "sha": "6a269fa006da0845", "val": ""}
+{"go_ok": true, "go_val": "6a269fa006da0845", "id": 113, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cp0_balances_3", "sha": "6a269fa006da0845", "val": ""}
 {"go_ok": false, "id": 114, "key": "a27a7a", "kind": "cpchunk", "map": 25, "pos": 0, "seed": "cpchunk_rand1", "sha": "c1ad16cbbfa19314", "val": "c40100"}
 {"go_ok": false, "id": 115, "key": "a27a7a", "kind": "cpchunk", "map": 3, "pos": 1, "seed": "cp1_balances_2", "sha": "c438404c733704d7", "val": "c0"}
 {"go_ok": false, "id": 116, "key": "a141", "kind": "cpchunk", "map": 29, "pos": 5, "seed": "cpchunk_rand1", "sha": "5ee23db8dae9407f", "val": "c420726933f0b2b78b03b69cd607a2456c4c773066763b76f4503635910198ce5229"}
 {"go_ok": false, "id": 117, "key": "a27a7a", "kind": "cpheader", "map": 3, "pos": 0, "seed": "cp0_content", "sha": "59c9ca5ab5a5e267", "val": "a178"}
-{"go_ok": true, "id": 118, "key": "a27a7a", "kind": "cpchunk", "map": 12, "pos": 0, "seed": "cpchunk_rand1", "sha": "dacd6e1666de1950", "val": "80"}
+{"go_ok": true, "go_val": "16f3c53c1cf22dd7", "id": 118, "key": "a27a7a", "kind": "cpchunk", "map": 12, "pos": 0, "seed": "cpchunk_rand1", "sha": "dacd6e1666de1950", "val": "80"}
 {"go_ok": false, "id": 119, "key": "ad6163636f756e7473436f756e74", "kind": "cpheader", "map": 2, "pos": 1, "seed": "cpheader_rand0", "sha": "ac282a563a25079d", "val": "cf670af74b9494d6d4"}
 {"go_ok": false, "id": 120, "key": "a17a", "kind": "cpchunk", "map": 35, "pos": 0, "seed": "cpchunk_rand2", "sha": "96e4599873c13a36", "val": "cf24f0970409177d83"}
 {"go_ok": false, "id": 121, "key": "a166", "kind": "cpchunk", "map": 7, "pos": 1, "seed": "cpchunk_rand0", "sha": "2cad282a5c20ada8", "val": "bfd413e7f84e61ca687a872a96c41192180ee1ad124dd1f696ead84214c4a6a3"}
@@ -129,14 +129,14 @@
 {"go_ok": false, "id": 128, "key": "a17a", "kind": "cpchunk", "map": 21, "pos": 2, "seed": "cp0_balances_1", "sha": "4e8b58600781dd56", "val": "cd049c"}
 {"go_ok": false, "id": 129, "key": "a27a7a", "kind": "cpchunk", "map": 5, "pos": 1, "seed": "cp1_balances_4", "sha": "96b6d0dc43ed0d02", "val": "80"}
 {"go_ok": false, "id": 130, "key": "a162", "kind": "cpchunk", "map": 21, "pos": 2, "seed": "cp1_balances_1", "sha": "c188d224022ad3d4", "val": "cf000000e8e55dbe17"}
-{"go_ok": true, "id": 131, "key": "a27a7a", "kind": "cpchunk", "map": 32, "pos": 3, "seed": "cpchunk_rand2", "sha": "784ab9abeb4e0836", "val": "a178"}
+{"go_ok": true, "go_val": "a27fcba5a2312a2b", "id": 131, "key": "a27a7a", "kind": "cpchunk", "map": 32, "pos": 3, "seed": "cpchunk_rand2", "sha": "784ab9abeb4e0836", "val": "a178"}
 {"go_ok": false, "id": 132, "key": "a27a7a", "kind": "cpheader", "map": 2, "pos": 0, "seed": "cpheader_rand0", "sha": "84227e3cbd53b797", "val": "a178"}
-{"go_ok": true, "id": 133, "key": "a27a7a", "kind": "cpchunk", "map": 32, "pos": 0, "seed": "cpchunk_rand3", "sha": "0dc5d5115e6d7904", "val": "c3"}
+{"go_ok": true, "go_val": "512ef25e807b044b", "id": 133, "key": "a27a7a", "kind": "cpchunk", "map": 32, "pos": 0, "seed": "cpchunk_rand3", "sha": "0dc5d5115e6d7904", "val": "c3"}
 {"go_ok": false, "id": 134, "key": "a27a7a", "kind": "cpchunk", "map": 5, "pos": 3, "seed": "cp0_balances_3", "sha": "f18591f5f81c2db6", "val": "81a16101"}
 {"go_ok": false, "id": 135, "key": "a27a7a", "kind": "cpchunk", "map": 24, "pos": 1, "seed": "cpchunk_rand3", "sha": "7f911687ea5413b2", "val": "80"}
 {"go_ok": false, "id": 136, "key": "a164", "kind": "cpchunk", "map": 8, "pos": 0, "seed": "cpchunk_rand2", "sha": "aaaf9800bc56a96e", "val": "d93790ab4b145b97c61aebc92cfae0ce19c12102173be660def71e276a178ff48049dae8cc43d787f472a113e3712e9a2f82b854574be6a6c5"}
 {"go_ok": false, "id": 137, "key": "a170", "kind": "cpchunk", "map": 0, "pos": 2, "seed": "cpchunk_rand0", "sha": "5c6aec495505397b", "val": "cfabd1af2214711f80"}
-{"go_ok": true, "id": 138, "key": "a3757064", "kind": "cpchunk", "map": 2, "pos": 0, "seed": "cp1_balances_3", "sha": "888ab43d63fafe8a", "val": "cd0265"}
+{"go_ok": true, "go_val": "888ab43d63fafe8a", "id": 138, "key": "a3757064", "kind": "cpchunk", "map": 2, "pos": 0, "seed": "cp1_balances_3", "sha": "888ab43d63fafe8a", "val": "cd0265"}
 {"go_ok": false, "id": 139, "key": "a27474", "kind": "cpchunk", "map": 16, "pos": 3, "seed": "cp0_balances_1", "sha": "c3ba65cf41eb5661", "val": "02"}
 {"go_ok": false, "id": 140, "key": "a27a7a", "kind": "cpheader", "map": 1, "pos": 1, "seed": "cpheader_rand0", "sha": "4b5b52e11c79f6f7", "val": "c0"}
 {"go_ok": false, "id": 141, "key": "a167", "kind": "cpchunk", "map": 16, "pos": 0, "seed": "cpchunk_rand1", "sha": "98f8d3af0fdcc5f9", "val": "c42026b5a6f37eda48b094c94df5e76983661f63778ba896262b17788e9291c115a9"}
@@ -146,9 +146,9 @@
 {"go_ok": false, "id": 145, "key": "a145", "kind": "cpchunk", "map": 4, "pos": 18, "seed": "cpchunk_rand0", "sha": "c51c9cf672353b2a", "val": "cf7460b7dc8740d517"}
 {"go_ok": false, "id": 146, "key": "b36df18dc1aaa58680bfcfc55b15da334ef2a428", "kind": "cpchunk", "map": 24, "pos": 2, "seed": "cpchunk_rand1", "sha": "03a377b659eb0755", "val": "80"}
 {"go_ok": false, "id": 147, "key": "a156", "kind": "cpchunk", "map": 17, "pos": 8, "seed": "cpchunk_rand3", "sha": "3c20f6d0a62516a2", "val": "cfb37a15015d9b52ba"}
-{"go_ok": true, "id": 148, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cpchunk_rand2", "sha": "13d9c515c3f6d973", "val": ""}
+{"go_ok": true, "go_val": "77c0683a5bb981ae", "id": 148, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cpchunk_rand2", "sha": "13d9c515c3f6d973", "val": ""}
 {"go_ok": false, "id": 149, "key": "a17a", "kind": "cpchunk", "map": 0, "pos": 2, "seed": "cpchunk_rand2", "sha": "6bec6dc806b6e7b6", "val": "cfb8b809bddbb1c0de"}
-{"go_ok": true, "id": 150, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cp1_balances_4", "sha": "0bd73d0a6bc80b4e", "val": ""}
+{"go_ok": true, "go_val": "0bd73d0a6bc80b4e", "id": 150, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cp1_balances_4", "sha": "0bd73d0a6bc80b4e", "val": ""}
 {"go_ok": false, "id": 151, "key": "a173", "kind": "cpchunk", "map": 7, "pos": 1, "seed": "cpchunk_rand1", "sha": "7bfd8d7e9b1fe11a", "val": "81b36df18dc1aaa58680bfcfc55b15da334ef2a42880"}
 {"go_ok": false, "id": 152, "key": "a27a7a", "kind": "cpchunk", "map": 10, "pos": 2, "seed": "cp0_balances_1", "sha": "0630ad11e6558371", "val": "c0"}
 {"go_ok": false, "id": 153, "key": "a144", "kind": "cpchunk", "map": 27, "pos": 0, "seed": "cpchunk_rand3", "sha": "ffe453205480c91b", "val": "c3"}
@@ -161,30 +161,30 @@
 {"go_ok": false, "id": 160, "key": "a16c", "kind": "cpchunk", "map": 21, "pos": 2, "seed": "cpchunk_rand1", "sha": "e4d392e0b24c22f8", "val": "cf5cd006ba0e56e14e"}
 {"go_ok": false, "id": 161, "key": "a17a", "kind": "cpchunk", "map": 15, "pos": 2, "seed": "cp0_balances_1", "sha": "51b66ea0d7020297", "val": "cd046f"}
 {"go_ok": false, "id": 162, "key": "a27a7a", "kind": "cpchunk", "map": 15, "pos": 2, "seed": "cpchunk_rand0", "sha": "cabdb68f1cee13bf", "val": "c40100"}
-{"go_ok": true, "id": 163, "key": "a16e", "kind": "cpchunk", "map": 34, "pos": 2, "seed": "cpchunk_rand3", "sha": "70dccb3e08e2fb99", "val": "cfc4620a897ac49ff2"}
+{"go_ok": true, "go_val": "9bd18290861a174c", "id": 163, "key": "a16e", "kind": "cpchunk", "map": 34, "pos": 2, "seed": "cpchunk_rand3", "sha": "70dccb3e08e2fb99", "val": "cfc4620a897ac49ff2"}
 {"go_ok": false, "id": 164, "key": "a16d", "kind": "cpchunk", "map": 18, "pos": 1, "seed": "cpchunk_rand2", "sha": "f8c3f6819b9bc561", "val": "cfd12f4e9b8ecd55cc"}
 {"go_ok": false, "id": 165, "key": "a27a7a", "kind": "cpheader", "map": 0, "pos": 10, "seed": "cpheader_rand1", "sha": "c2e23b1c99c80c83", "val": "c40100"}
 {"go_ok": false, "id": 166, "key": "a27a7a", "kind": "cpchunk", "map": 31, "pos": 5, "seed": "cpchunk_rand1", "sha": "58fc9e48ac0ce7f7", "val": "a178"}
-{"go_ok": true, "id": 167, "key": "a141", "kind": "cpchunk", "map": 4, "pos": 0, "seed": "cp1_balances_3", "sha": "6e67463c8676a9a7", "val": "c4201d85564fa8b9e962d3bdaaa4194e5a668084dcb799b92aafd84b597ad4e9030f"}
+{"go_ok": true, "go_val": "6e67463c8676a9a7", "id": 167, "key": "a141", "kind": "cpchunk", "map": 4, "pos": 0, "seed": "cp1_balances_3", "sha": "6e67463c8676a9a7", "val": "c4201d85564fa8b9e962d3bdaaa4194e5a668084dcb799b92aafd84b597ad4e9030f"}
 {"go_ok": false, "id": 168, "key": "a3766c76", "kind": "cpchunk", "map": 12, "pos": 1, "seed": "cpchunk_rand2", "sha": "c563d00ad528bfce", "val": "cfc321619fc799261b"}
 {"go_ok": false, "id": 169, "key": "a16c", "kind": "cpchunk", "map": 10, "pos": 0, "seed": "cp1_balances_1", "sha": "372423c2ad8beb91", "val": "ce000f3e83"}
 {"go_ok": false, "id": 170, "key": "a27a7a", "kind": "cpheader", "map": 0, "pos": 5, "seed": "cpheader_rand2", "sha": "bd8f668d494d4b1b", "val": "c40100"}
 {"go_ok": false, "id": 171, "key": "a27a7a", "kind": "cpspver", "map": 2, "pos": 0, "seed": "cp0_stateProofVerificationContext", "sha": "1f5d28a5fb6276cd", "val": "80"}
-{"go_ok": true, "id": 172, "key": "a27a7a", "kind": "cpchunk", "map": 4, "pos": 2, "seed": "cp0_balances_4", "sha": "ba9152011aec6be6", "val": "c3"}
+{"go_ok": true, "go_val": "ba9152011aec6be6", "id": 172, "key": "a27a7a", "kind": "cpchunk", "map": 4, "pos": 2, "seed": "cp0_balances_4", "sha": "ba9152011aec6be6", "val": "c3"}
 {"go_ok": false, "id": 173, "key": "a27a7a", "kind": "cpchunk", "map": 2, "pos": 1, "seed": "cpchunk_rand3", "sha": "62136dbd2d59c39b", "val": "a178"}
 {"go_ok": false, "id": 174, "key": "a144", "kind": "cpchunk", "map": 22, "pos": 19, "seed": "cpchunk_rand1", "sha": "679b60dc2adf2ea9", "val": "cfe8239c8f5ae327de"}
 {"go_ok": false, "id": 175, "key": "a27a7a", "kind": "cpchunk", "map": 5, "pos": 2, "seed": "cp0_balances_1", "sha": "009ca7bc04c53862", "val": "a178"}
 {"go_ok": false, "id": 176, "key": "a27a7a", "kind": "cpchunk", "map": 20, "pos": 1, "seed": "cpchunk_rand0", "sha": "fa331e4f06f8af55", "val": "c3"}
 {"go_ok": false, "id": 177, "key": "a171", "kind": "cpchunk", "map": 35, "pos": 0, "seed": "cpchunk_rand0", "sha": "078573d585c734ea", "val": "cf3e561eaa8ddeaa77"}
-{"go_ok": true, "id": 178, "key": "a27a7a", "kind": "cpchunk", "map": 7, "pos": 1, "seed": "cpchunk_rand2", "sha": "7f1c1e040eee5b2a", "val": "c0"}
-{"go_ok": true, "id": 179, "key": "a27a7a", "kind": "cpchunk", "map": 34, "pos": 2, "seed": "cpchunk_rand3", "sha": "d088b1c5831c50a6", "val": "81a16101"}
-{"go_ok": true, "id": 180, "key": "a16c", "kind": "cpchunk", "map": 30, "pos": 1, "seed": "cpchunk_rand3", "sha": "25d3476bdac9d2f3", "val": "cfe8f7ec036fcb16e4"}
+{"go_ok": true, "go_val": "629ecdbb918f5e1f", "id": 178, "key": "a27a7a", "kind": "cpchunk", "map": 7, "pos": 1, "seed": "cpchunk_rand2", "sha": "7f1c1e040eee5b2a", "val": "c0"}
+{"go_ok": true, "go_val": "afa54c64c744dd17", "id": 179, "key": "a27a7a", "kind": "cpchunk", "map": 34, "pos": 2, "seed": "cpchunk_rand3", "sha": "d088b1c5831c50a6", "val": "81a16101"}
+{"go_ok": true, "go_val": "31553c0443efa261", "id": 180, "key": "a16c", "kind": "cpchunk", "map": 30, "pos": 1, "seed": "cpchunk_rand3", "sha": "25d3476bdac9d2f3", "val": "cfe8f7ec036fcb16e4"}
 {"go_ok": false, "id": 181, "key": "a176", "kind": "cpchunk", "map": 2, "pos": 10, "seed": "cpchunk_rand1", "sha": "ba913c90c9d06bc0", "val": "cf3fea3c6e034522fe"}
 {"go_ok": false, "id": 182, "key": "a27a7a", "kind": "cpchunk", "map": 20, "pos": 0, "seed": "cpchunk_rand3", "sha": "2dedc645e0387fd7", "val": "01"}
 {"go_ok": false, "id": 183, "key": "a27a7a", "kind": "cpchunk", "map": 11, "pos": 2, "seed": "cp1_balances_1", "sha": "b6d82d2e3c9c9f85", "val": "01"}
 {"go_ok": false, "id": 184, "key": "a17a", "kind": "cpchunk", "map": 0, "pos": 0, "seed": "cp0_balances_1", "sha": "655a625a9675be05", "val": "cd0481"}
 {"go_ok": false, "id": 185, "key": "a27a7a", "kind": "cpchunk", "map": 28, "pos": 2, "seed": "cpchunk_rand1", "sha": "674e94cbbb3fd3a2", "val": "c0"}
-{"go_ok": true, "id": 186, "key": "a27a7a", "kind": "cpchunk", "map": 2, "pos": 0, "seed": "cp0_balances_4", "sha": "f96c0cf9cb4a8bff", "val": "a178"}
+{"go_ok": true, "go_val": "f96c0cf9cb4a8bff", "id": 186, "key": "a27a7a", "kind": "cpchunk", "map": 2, "pos": 0, "seed": "cp0_balances_4", "sha": "f96c0cf9cb4a8bff", "val": "a178"}
 {"go_ok": false, "id": 187, "key": "a27a7a", "kind": "cpchunk", "map": 9, "pos": 22, "seed": "cpchunk_rand2", "sha": "f665eb80a18aeb50", "val": "01"}
 {"go_ok": false, "id": 188, "key": "a27474", "kind": "cpchunk", "map": 7, "pos": 1, "seed": "cpchunk_rand2", "sha": "82cb297aab4ef268", "val": "cf85ed0f29a3298a75"}
 {"go_ok": false, "id": 189, "key": "a174", "kind": "cpchunk", "map": 33, "pos": 1, "seed": "cpchunk_rand0", "sha": "58971b67e887b4dd", "val": "cf9d4e43babaf526f5"}
@@ -198,18 +198,18 @@
 {"go_ok": false, "id": 197, "key": "a158", "kind": "cpchunk", "map": 9, "pos": 11, "seed": "cpchunk_rand1", "sha": "2b29902869eafcf6", "val": "c3"}
 {"go_ok": false, "id": 198, "key": "a27a7a", "kind": "cpchunk", "map": 15, "pos": 2, "seed": "cp0_balances_1", "sha": "94a425faf6d96577", "val": "c40100"}
 {"go_ok": false, "id": 199, "key": "a27a7a", "kind": "cpchunk", "map": 27, "pos": 0, "seed": "cpchunk_rand0", "sha": "c00910ba0f278437", "val": "80"}
-{"go_ok": true, "id": 200, "key": "a3726e64", "kind": "cpchunk", "map": 4, "pos": 0, "seed": "cp1_balances_4", "sha": "6a22da5d3fe9726d", "val": "cd016a"}
+{"go_ok": true, "go_val": "6a22da5d3fe9726d", "id": 200, "key": "a3726e64", "kind": "cpchunk", "map": 4, "pos": 0, "seed": "cp1_balances_4", "sha": "6a22da5d3fe9726d", "val": "cd016a"}
 {"go_ok": false, "id": 201, "key": "a776657273696f6e", "kind": "cpheader", "map": 2, "pos": 1, "seed": "cp0_content", "sha": "f9999718abc04ae8", "val": "cc83"}
 {"go_ok": false, "id": 202, "key": "a27a7a", "kind": "cpchunk", "map": 19, "pos": 0, "seed": "cp1_balances_1", "sha": "f56199f294e0b6d4", "val": "c3"}
 {"go_ok": false, "id": 203, "key": "a169", "kind": "cpchunk", "map": 31, "pos": 2, "seed": "cpchunk_rand3", "sha": "a650821e49e2d64e", "val": "c420071b058b6320572057dd58bdaaf53a4a1b9af55e13613a4c545bda689a9f0e30"}
 {"go_ok": false, "id": 204, "key": "a27a7a", "kind": "cpchunk", "map": 3, "pos": 0, "seed": "cp1_balances_2", "sha": "32cf3b0ef8db442e", "val": "80"}
-{"go_ok": true, "id": 205, "key": "a3726e64", "kind": "cpchunk", "map": 2, "pos": 3, "seed": "cp0_balances_4", "sha": "c0ec69508e153d76", "val": "cd035e"}
+{"go_ok": true, "go_val": "c0ec69508e153d76", "id": 205, "key": "a3726e64", "kind": "cpchunk", "map": 2, "pos": 3, "seed": "cp0_balances_4", "sha": "c0ec69508e153d76", "val": "cd035e"}
 {"go_ok": false, "id": 206, "key": "a27a7a", "kind": "cpchunk", "map": 29, "pos": 2, "seed": "cpchunk_rand0", "sha": "caf74fe0a8f186fb", "val": "01"}
 {"go_ok": false, "id": 207, "key": "a16a", "kind": "cpchunk", "map": 12, "pos": 0, "seed": "cp1_balances_1", "sha": "2ec2c94ced73f75b", "val": "01"}
 {"go_ok": false, "id": 208, "key": "a142", "kind": "cpchunk", "map": 26, "pos": 1, "seed": "cpchunk_rand0", "sha": "2fcc4491da9e653c", "val": "c4203625c96f9286e510f1af6e442ed2a50735e1677fb93ac9b7f792174476b5ee25"}
 {"go_ok": false, "id": 209, "key": "a164", "kind": "cpchunk", "map": 11, "pos": 0, "seed": "cpchunk_rand0", "sha": "686e56347c770930", "val": "cf514de2274148b1f2"}
 {"go_ok": false, "id": 210, "key": "a27a7a", "kind": "cpchunk", "map": 4, "pos": 10, "seed": "cpchunk_rand3", "sha": "7632b27af3453c7a", "val": "01"}
-{"go_ok": true, "id": 211, "key": "a27a7a", "kind": "cpchunk", "map": 20, "pos": 0, "seed": "cp0_balances_1", "sha": "d81c2830766b3e21", "val": "80"}
+{"go_ok": true, "go_val": "e045a5b66ea81f21", "id": 211, "key": "a27a7a", "kind": "cpchunk", "map": 20, "pos": 0, "seed": "cp0_balances_1", "sha": "d81c2830766b3e21", "val": "80"}
 {"go_ok": false, "id": 212, "key": "a159", "kind": "cpchunk", "map": 18, "pos": 0, "seed": "cpchunk_rand3", "sha": "d5d6cb30fa217990", "val": "cf832e222747396c68"}
 {"go_ok": false, "id": 213, "key": "a27a7a", "kind": "cpchunk", "map": 14, "pos": 2, "seed": "cpchunk_rand0", "sha": "93f6ac0bda9ae441", "val": "a178"}
 {"go_ok": false, "id": 214, "key": "a27a7a", "kind": "cpchunk", "map": 7, "pos": 1, "seed": "cpchunk_rand3", "sha": "aa7cd7a5cdc66b5e", "val": "c40100"}
@@ -221,9 +221,9 @@
 {"go_ok": false, "id": 220, "key": "a146", "kind": "cpchunk", "map": 1, "pos": 1, "seed": "cp0_balances_3", "sha": "2253c7a025a3c734", "val": "c440b09b94026ccdca6d290142f36afd8f964c3914ff66c96a5a1e4b72dfa74f7d46c173e67e42f9f38b9761f74ab7e835f8c7d9266b1f83085f9102b1441c0c08a9"}
 {"go_ok": false, "id": 221, "key": "a174", "kind": "cpchunk", "map": 12, "pos": 0, "seed": "cpchunk_rand1", "sha": "554f1351eabafb80", "val": "cf1acda3749f9085f2"}
 {"go_ok": false, "id": 222, "key": "a27a7a", "kind": "cpchunk", "map": 2, "pos": 0, "seed": "cp0_balances_1", "sha": "453865045b6d0716", "val": "81a16101"}
-{"go_ok": true, "id": 223, "key": "a36e6f62", "kind": "cpchunk", "map": 6, "pos": 8, "seed": "cp0_balances_3", "sha": "37695e2510558744", "val": "cf000000e8d4b46d7f"}
+{"go_ok": true, "go_val": "37695e2510558744", "id": 223, "key": "a36e6f62", "kind": "cpchunk", "map": 6, "pos": 8, "seed": "cp0_balances_3", "sha": "37695e2510558744", "val": "cf000000e8d4b46d7f"}
 {"go_ok": false, "id": 224, "key": "a163", "kind": "cpchunk", "map": 3, "pos": 0, "seed": "cp0_balances_1", "sha": "b4ab0f14d6d3bb77", "val": "cd01fc"}
-{"go_ok": true, "id": 225, "key": "a27a7a", "kind": "cpchunk", "map": 36, "pos": 0, "seed": "cpchunk_rand0", "sha": "8b50e35a351963a8", "val": "c40100"}
+{"go_ok": true, "go_val": "70d48ccdb5195c94", "id": 225, "key": "a27a7a", "kind": "cpchunk", "map": 36, "pos": 0, "seed": "cpchunk_rand0", "sha": "8b50e35a351963a8", "val": "c40100"}
 {"go_ok": false, "id": 226, "key": "a27a7a", "kind": "cpchunk", "map": 1, "pos": 2, "seed": "cpchunk_rand2", "sha": "390ee429d034d69b", "val": "01"}
 {"go_ok": false, "id": 227, "key": "a16b", "kind": "cpchunk", "map": 0, "pos": 0, "seed": "cp0_balances_2", "sha": "a26f50ccd1f7bccc", "val": "c41462783a00000000000003ea620000000000000030"}
 {"go_ok": false, "id": 228, "key": "a27a7a", "kind": "cpspver", "map": 1, "pos": 0, "seed": "cpspver_rand2", "sha": "b79197981fb097d6", "val": "c3"}
@@ -232,20 +232,20 @@
 {"go_ok": false, "id": 231, "key": "a27a7a", "kind": "cpchunk", "map": 0, "pos": 1, "seed": "cp1_balances_1", "sha": "82d087cff662ae1b", "val": "c3"}
 {"go_ok": false, "id": 232, "key": "a27a7a", "kind": "cpheader", "map": 2, "pos": 1, "seed": "cpheader_rand3", "sha": "4cbe14cc901afbec", "val": "c3"}
 {"go_ok": false, "id": 233, "key": "ab6368756e6b73436f756e74", "kind": "cpheader", "map": 1, "pos": 0, "seed": "cp1_content", "sha": "6c2bbe4a14a3ef0c", "val": "04"}
-{"go_ok": true, "id": 234, "key": "a27a7a", "kind": "cpchunk", "map": 36, "pos": 1, "seed": "cpchunk_rand2", "sha": "b5345406eea09695", "val": "80"}
+{"go_ok": true, "go_val": "fb4f620f725ada15", "id": 234, "key": "a27a7a", "kind": "cpchunk", "map": 36, "pos": 1, "seed": "cpchunk_rand2", "sha": "b5345406eea09695", "val": "80"}
 {"go_ok": false, "id": 235, "key": "a27a7a", "kind": "cpchunk", "map": 7, "pos": 2, "seed": "cp0_balances_1", "sha": "9bad938924a2eba1", "val": "c0"}
 {"go_ok": false, "id": 236, "key": "a161", "kind": "cpchunk", "map": 9, "pos": 0, "seed": "cp1_balances_1", "sha": "4698ab01337fbd5f", "val": "c42009a9e346104d70852dbef7a103925d2bade0acb4511de17941b98fdd5f57efcb"}
 {"go_ok": false, "id": 237, "key": "a27a7a", "kind": "cpchunk", "map": 18, "pos": 1, "seed": "cpchunk_rand1", "sha": "53155cad80e15a37", "val": "01"}
-{"go_ok": true, "id": 238, "key": "a27a7a", "kind": "cpchunk", "map": 25, "pos": 0, "seed": "cpchunk_rand2", "sha": "f91b2b01829e507f", "val": "80"}
+{"go_ok": true, "go_val": "c3e838983d6636c9", "id": 238, "key": "a27a7a", "kind": "cpchunk", "map": 25, "pos": 0, "seed": "cpchunk_rand2", "sha": "f91b2b01829e507f", "val": "80"}
 {"go_ok": false, "id": 239, "key": "a27a7a", "kind": "cpheader", "map": 2, "pos": 1, "seed": "cp1_content", "sha": "45f88c374c6ec493", "val": "80"}
 {"go_ok": false, "id": 240, "key": "a27a7a", "kind": "cpchunk", "map": 24, "pos": 1, "seed": "cpchunk_rand2", "sha": "ad49279113f10e27", "val": "c0"}
 {"go_ok": false, "id": 241, "key": "a27a7a", "kind": "cpchunk", "map": 0, "pos": 0, "seed": "cp0_balances_3", "sha": "94b2ef37645196e1", "val": "c40100"}
-{"go_ok": true, "id": 242, "key": "", "kind": "cpheader", "map": -1, "pos": 0, "seed": "cpheader_rand2", "sha": "08a9135cfa240708", "val": ""}
+{"go_ok": true, "go_val": "08a9135cfa240708", "id": 242, "key": "", "kind": "cpheader", "map": -1, "pos": 0, "seed": "cpheader_rand2", "sha": "08a9135cfa240708", "val": ""}
 {"go_ok": false, "id": 243, "key": "a27a7a", "kind": "cpchunk", "map": 17, "pos": 24, "seed": "cpchunk_rand1", "sha": "894db32e386159e1", "val": "c0"}
 {"go_ok": false, "id": 244, "key": "a163", "kind": "cpchunk", "map": 33, "pos": 2, "seed": "cpchunk_rand1", "sha": "ef3c591a9fa1cc01", "val": "cfbcfce41958e7b955"}
-{"go_ok": true, "id": 245, "key": "", "kind": "cpspver", "map": -1, "pos": 0, "seed": "cpspver_rand2", "sha": "3021cf61217ace11", "val": ""}
+{"go_ok": true, "go_val": "3021cf61217ace11", "id": 245, "key": "", "kind": "cpspver", "map": -1, "pos": 0, "seed": "cpspver_rand2", "sha": "3021cf61217ace11", "val": ""}
 {"go_ok": false, "id": 246, "key": "a170", "kind": "cpchunk", "map": 7, "pos": 2, "seed": "cp1_balances_1", "sha": "4ef70a4614f2b322", "val": "81a16c81a2747402"}
-{"go_ok": true, "id": 247, "key": "a27a7a", "kind": "cpchunk", "map": 12, "pos": 0, "seed": "cpchunk_rand3", "sha": "77f58be69f749831", "val": "c0"}
+{"go_ok": true, "go_val": "6378a2dba7163c18", "id": 247, "key": "a27a7a", "kind": "cpchunk", "map": 12, "pos": 0, "seed": "cpchunk_rand3", "sha": "77f58be69f749831", "val": "c0"}
 {"go_ok": false, "id": 248, "key": "a162", "kind": "cpchunk", "map": 18, "pos": 0, "seed": "cp0_balances_1", "sha": "2ce029863b373930", "val": "cf000000e8f2e3864f"}
 {"go_ok": false, "id": 249, "key": "a27a7a", "kind": "cpchunk", "map": 22, "pos": 5, "seed": "cpchunk_rand3", "sha": "29bd5539ac112226", "val": "c3"}
 {"go_ok": false, "id": 250, "key": "a27a7a", "kind": "cpchunk", "map": 16, "pos": 1, "seed": "cp0_balances_1", "sha": "0ff14ad881184807", "val": "80"}
@@ -254,37 +254,37 @@
 {"go_ok": false, "id": 253, "key": "a27a7a", "kind": "cpchunk", "map": 29, "pos": 1, "seed": "cpchunk_rand1", "sha": "83437e8977c7614a", "val": "01"}
 {"go_ok": false, "id": 254, "key": "a27a7a", "kind": "cpchunk", "map": 35, "pos": 2, "seed": "cpchunk_rand3", "sha": "68733ed325dc2132", "val": "80"}
 {"go_ok": false, "id": 255, "key": "a171", "kind": "cpchunk", "map": 19, "pos": 0, "seed": "cpchunk_rand3", "sha": "0b54122b201811c3", "val": "c401d5"}
-{"go_ok": true, "id": 256, "key": "", "kind": "cpspver", "map": -1, "pos": 0, "seed": "cp0_stateProofVerificationContext", "sha": "3fe5fc4f209fb0c2", "val": ""}
+{"go_ok": true, "go_val": "3fe5fc4f209fb0c2", "id": 256, "key": "", "kind": "cpspver", "map": -1, "pos": 0, "seed": "cp0_stateProofVerificationContext", "sha": "3fe5fc4f209fb0c2", "val": ""}
 {"go_ok": false, "id": 257, "key": "a27a7a", "kind": "cpchunk", "map": 8, "pos": 0, "seed": "cpchunk_rand2", "sha": "939a7858455001c3", "val": "a178"}
-{"go_ok": true, "id": 258, "key": "a27a7a", "kind": "cpchunk", "map": 18, "pos": 0, "seed": "cpchunk_rand0", "sha": "34b06dd60f00a4ba", "val": "c0"}
+{"go_ok": true, "go_val": "7c5f19ee00dcb4c8", "id": 258, "key": "a27a7a", "kind": "cpchunk", "map": 18, "pos": 0, "seed": "cpchunk_rand0", "sha": "34b06dd60f00a4ba", "val": "c0"}
 {"go_ok": false, "id": 259, "key": "a27a7a", "kind": "cpchunk", "map": 5, "pos": 5, "seed": "cp1_balances_3", "sha": "818da8b8ff5f1a76", "val": "a178"}
 {"go_ok": false, "id": 260, "key": "a27a7a", "kind": "cpchunk", "map": 13, "pos": 0, "seed": "cp1_balances_1", "sha": "04f735c822b803d4", "val": "c3"}
 {"go_ok": false, "id": 261, "key": "a27a7a", "kind": "cpchunk", "map": 11, "pos": 0, "seed": "cpchunk_rand0", "sha": "6f967e6ed52f35c4", "val": "a178"}
 {"go_ok": false, "id": 262, "key": "a113", "kind": "cpchunk", "map": 33, "pos": 0, "seed": "cpchunk_rand2", "sha": "9eb8e6769edfdd6d", "val": "83a27462affa4203bb887d1743b50b645623899ca27474cf13a99a0581c8ac4fa27569cfbd0e117c72ca8254"}
 {"go_ok": false, "id": 263, "key": "a27a7a", "kind": "cpchunk", "map": 4, "pos": 21, "seed": "cpchunk_rand0", "sha": "2e42d49b08140a14", "val": "a178"}
 {"go_ok": false, "id": 264, "key": "a27a7a", "kind": "cpchunk", "map": 19, "pos": 2, "seed": "cpchunk_rand3", "sha": "f3a5fe63010f79be", "val": "a178"}
-{"go_ok": true, "id": 265, "key": "a464617461", "kind": "cpchunk", "map": 6, "pos": 0, "seed": "cp0_balances_4", "sha": "5a796801a5feb274", "val": "83a66f6e6c696e65cf00016beecf3d4c00a570726f746fd95968747470733a2f2f6769746875622e636f6d2f616c676f72616e64666f756e646174696f6e2f73706563732f747265652f37336334336234613936393933393038383463353165326139353938643439653238333733643130a67277646c766ccd0173"}
+{"go_ok": true, "go_val": "5a796801a5feb274", "id": 265, "key": "a464617461", "kind": "cpchunk", "map": 6, "pos": 0, "seed": "cp0_balances_4", "sha": "5a796801a5feb274", "val": "83a66f6e6c696e65cf00016beecf3d4c00a570726f746fd95968747470733a2f2f6769746875622e636f6d2f616c676f72616e64666f756e646174696f6e2f73706563732f747265652f37336334336234613936393933393038383463353165326139353938643439653238333733643130a67277646c766ccd0173"}
 {"go_ok": false, "id": 266, "key": "a3726e64", "kind": "cpchunk", "map": 23, "pos": 1, "seed": "cpchunk_rand2", "sha": "8ca5ef0485884740", "val": "cf9143f40f5eca7aba"}
 {"go_ok": false, "id": 267, "key": "a166", "kind": "cpchunk", "map": 0, "pos": 0, "seed": "cpchunk_rand3", "sha": "895936f7705fdd21", "val": "d92fa25ead01e6a616cd9b3b5fc95aa806256ddafa0b9a79aca0909d0a21ad23396ac4a8a98e7dc33d99f36017b4f7e03a"}
-{"go_ok": true, "id": 268, "key": "a27a7a", "kind": "cpchunk", "map": 30, "pos": 2, "seed": "cpchunk_rand2", "sha": "7ee86a58dff4bbab", "val": "c3"}
+{"go_ok": true, "go_val": "a856ba3be8e6d554", "id": 268, "key": "a27a7a", "kind": "cpchunk", "map": 30, "pos": 2, "seed": "cpchunk_rand2", "sha": "7ee86a58dff4bbab", "val": "c3"}
 {"go_ok": false, "id": 269, "key": "a27a7a", "kind": "cpspver", "map": 1, "pos": 0, "seed": "cp0_stateProofVerificationContext", "sha": "06693569b0409f57", "val": "01"}
-{"go_ok": true, "id": 270, "key": "a165", "kind": "cpchunk", "map": 36, "pos": 2, "seed": "cpchunk_rand1", "sha": "2ae568535b3f11df", "val": "c4209628fa134a9fe21ee97e0f89d6cbb01ffb9061c8ed0022db537d355ab5a0788f"}
+{"go_ok": true, "go_val": "d189cbff64b7c6f4", "id": 270, "key": "a165", "kind": "cpchunk", "map": 36, "pos": 2, "seed": "cpchunk_rand1", "sha": "2ae568535b3f11df", "val": "c4209628fa134a9fe21ee97e0f89d6cbb01ffb9061c8ed0022db537d355ab5a0788f"}
 {"go_ok": false, "id": 271, "key": "a145", "kind": "cpchunk", "map": 3, "pos": 1, "seed": "cpchunk_rand3", "sha": "f90a7ca7ca45e6a4", "val": "cf79a0506d9b07f574"}
-{"go_ok": true, "id": 272, "key": "a27474", "kind": "cpchunk", "map": 21, "pos": 0, "seed": "cpchunk_rand2", "sha": "1d2fcc72e0c39a74", "val": "cf85ed0f29a3298a75"}
+{"go_ok": true, "go_val": "fb7df5ff6a68bd61", "id": 272, "key": "a27474", "kind": "cpchunk", "map": 21, "pos": 0, "seed": "cpchunk_rand2", "sha": "1d2fcc72e0c39a74", "val": "cf85ed0f29a3298a75"}
 {"go_ok": false, "id": 273, "key": "a27a7a", "kind": "cpchunk", "map": 31, "pos": 2, "seed": "cpchunk_rand2", "sha": "b2be95169583cea7", "val": "80"}
 {"go_ok": false, "id": 274, "key": "a141", "kind": "cpchunk", "map": 6, "pos": 0, "seed": "cpchunk_rand3", "sha": "8d399051de5092bb", "val": "c4207948989e3638089746ab48e6a4d47c465ab3163c38a145e5e7397a4988f1be53"}
 {"go_ok": false, "id": 275, "key": "a27a7a", "kind": "cpchunk", "map": 3, "pos": 0, "seed": "cpchunk_rand1", "sha": "c97d0597a5bfcdde", "val": "81a16101"}
 {"go_ok": false, "id": 276, "key": "a27a7a", "kind": "cpspver", "map": 0, "pos": 1, "seed": "cpspver_rand0", "sha": "f669c933549c4225", "val": "c3"}
-{"go_ok": true, "id": 277, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cpchunk_rand0", "sha": "58e29687aa12dd71", "val": ""}
-{"go_ok": true, "id": 278, "key": "a27a7a", "kind": "cpchunk", "map": 2, "pos": 2, "seed": "cp1_balances_4", "sha": "e71c2986bd0e378d", "val": "c0"}
-{"go_ok": true, "id": 279, "key": "a143", "kind": "cpchunk", "map": 36, "pos": 3, "seed": "cpchunk_rand0", "sha": "e193afe4a4c26242", "val": "c3"}
+{"go_ok": true, "go_val": "05c367d252cae97b", "id": 277, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cpchunk_rand0", "sha": "58e29687aa12dd71", "val": ""}
+{"go_ok": true, "go_val": "e71c2986bd0e378d", "id": 278, "key": "a27a7a", "kind": "cpchunk", "map": 2, "pos": 2, "seed": "cp1_balances_4", "sha": "e71c2986bd0e378d", "val": "c0"}
+{"go_ok": true, "go_val": "a5d6a91139fbb38a", "id": 279, "key": "a143", "kind": "cpchunk", "map": 36, "pos": 3, "seed": "cpchunk_rand0", "sha": "e193afe4a4c26242", "val": "c3"}
 {"go_ok": false, "id": 280, "key": "a27a7a", "kind": "cpchunk", "map": 18, "pos": 1, "seed": "cpchunk_rand2", "sha": "2e55075ff524e1b8", "val": "01"}
 {"go_ok": false, "id": 281, "key": "a16f", "kind": "cpchunk", "map": 29, "pos": 3, "seed": "cpchunk_rand0", "sha": "02dac8b3efe825c9", "val": "cfe3d79531a906d83f"}
 {"go_ok": false, "id": 282, "key": "a27a7a", "kind": "cpchunk", "map": 2, "pos": 1, "seed": "cp1_balances_2", "sha": "fd11a8bffb35c004", "val": "c3"}
 {"go_ok": false, "id": 283, "key": "a156", "kind": "cpchunk", "map": 17, "pos": 25, "seed": "cpchunk_rand0", "sha": "36a3f4194626107f", "val": "cf4d11f107a65381ea"}
 {"go_ok": false, "id": 284, "key": "a27a7a", "kind": "cpchunk", "map": 12, "pos": 0, "seed": "cpchunk_rand0", "sha": "2843995acef84a4d", "val": "a178"}
 {"go_ok": false, "id": 285, "key": "a27a7a", "kind": "cpchunk", "map": 17, "pos": 0, "seed": "cp1_balances_1", "sha": "af7f401f23b173eb", "val": "01"}
-{"go_ok": true, "id": 286, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cp1_balances_3", "sha": "d44d622dc190a45f", "val": ""}
+{"go_ok": true, "go_val": "d44d622dc190a45f", "id": 286, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cp1_balances_3", "sha": "d44d622dc190a45f", "val": ""}
 {"go_ok": false, "id": 287, "key": "a15a", "kind": "cpchunk", "map": 9, "pos": 28, "seed": "cpchunk_rand3", "sha": "adf74ad8d35c8565", "val": "cfb48bc6a66d2359bf"}
 {"go_ok": false, "id": 288, "key": "a17a", "kind": "cpchunk", "map": 20, "pos": 0, "seed": "cp1_balances_1", "sha": "6c7b0d0a88ab5934", "val": "cd0262"}
 {"go_ok": false, "id": 289, "key": "a27a7a", "kind": "cpchunk", "map": 1, "pos": 2, "seed": "cpchunk_rand3", "sha": "d0dc213fd427c04c", "val": "01"}
@@ -297,8 +297,8 @@
 {"go_ok": false, "id": 296, "key": "a16a", "kind": "cpchunk", "map": 5, "pos": 0, "seed": "cp1_balances_1", "sha": "39d23ed163af6f22", "val": "01"}
 {"go_ok": false, "id": 297, "key": "a27a7a", "kind": "cpchunk", "map": 6, "pos": 0, "seed": "cpchunk_rand3", "sha": "a61f17798e4d478e", "val": "c3"}
 {"go_ok": false, "id": 298, "key": "a171", "kind": "cpchunk", "map": 27, "pos": 2, "seed": "cpchunk_rand2", "sha": "4b6a86c6709152b0", "val": "c40177"}
-{"go_ok": true, "id": 299, "key": "a162", "kind": "cpchunk", "map": 32, "pos": 2, "seed": "cpchunk_rand0", "sha": "cb256a2b4ef50ce9", "val": "de0016a141c4200dccd1e45ff8be7a56fa7301905c77b3edb2c89ee6471b3f30bfec2c5f1d92d0a142c420d64e652c7971b1eb1cc8bb6d01cedea1dd7d238e6e14f5aeced8743fa1d69d8da143cf5157f1bd46ddd76aa144cf0ddb046be38e9644a145cf4c6d91168b881965a146c4400a7a2feda6d95bd2c14144ba8403b86483c83aa5235587d5ff81b372db3e5988e43ec7c77e82b5faedbf793bbd692bb0095f6a721590b6410781e6f066b3a78ba161ccaba163cfa97643957d3f9967a164cf514de2274148b1f2a165c420ea3353ed3765ccd77aeb30c89c9c30d99ac7da7bfcc6dfb9984d4ad18c47089ca166cffb57841e5127e527a167cffec99b006e3246c7a168ce6385c120a169cfa47022d7b51cd777a16acf170b1636940c5390a16bcfc435f2e245f61784a16ccfba17dede32c9a6b7a16dcf2a929b102c71a5d3a16ecff650fc84bef2d4d4a170cfabd1af2214711f80a171cf3c992082c577d8fba17acfc6f80a6127986c93"}
-{"go_ok": true, "id": 300, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cp0_balances_2", "sha": "ed4b0ffb9a7120ad", "val": ""}
+{"go_ok": true, "go_val": "5e7eb6226d13be35", "id": 299, "key": "a162", "kind": "cpchunk", "map": 32, "pos": 2, "seed": "cpchunk_rand0", "sha": "cb256a2b4ef50ce9", "val": "de0016a141c4200dccd1e45ff8be7a56fa7301905c77b3edb2c89ee6471b3f30bfec2c5f1d92d0a142c420d64e652c7971b1eb1cc8bb6d01cedea1dd7d238e6e14f5aeced8743fa1d69d8da143cf5157f1bd46ddd76aa144cf0ddb046be38e9644a145cf4c6d91168b881965a146c4400a7a2feda6d95bd2c14144ba8403b86483c83aa5235587d5ff81b372db3e5988e43ec7c77e82b5faedbf793bbd692bb0095f6a721590b6410781e6f066b3a78ba161ccaba163cfa97643957d3f9967a164cf514de2274148b1f2a165c420ea3353ed3765ccd77aeb30c89c9c30d99ac7da7bfcc6dfb9984d4ad18c47089ca166cffb57841e5127e527a167cffec99b006e3246c7a168ce6385c120a169cfa47022d7b51cd777a16acf170b1636940c5390a16bcfc435f2e245f61784a16ccfba17dede32c9a6b7a16dcf2a929b102c71a5d3a16ecff650fc84bef2d4d4a170cfabd1af2214711f80a171cf3c992082c577d8fba17acfc6f80a6127986c93"}
+{"go_ok": true, "go_val": "ed4b0ffb9a7120ad", "id": 300, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cp0_balances_2", "sha": "ed4b0ffb9a7120ad", "val": ""}
 {"go_ok": false, "id": 301, "key": "a27a7a", "kind": "cpheader", "map": 4, "pos": 2, "seed": "cp1_content", "sha": "0307352c64299b00", "val": "c3"}
 {"go_ok": false, "id": 302, "key": "a166", "kind": "cpchunk", "map": 29, "pos": 2, "seed": "cpchunk_rand3", "sha": "fbfcb9e4368d162e", "val": "cfb36d1bbd255803fd"}
 {"go_ok": false, "id": 303, "key": "a27a7a", "kind": "cpchunk", "map": 3, "pos": 2, "seed": "cp1_balances_1", "sha": "f362b72c7e888e38", "val": "c3"}
@@ -309,15 +309,15 @@
 {"go_ok": false, "id": 308, "key": "a27a7a", "kind": "cpchunk", "map": 1, "pos": 4, "seed": "cpchunk_rand1", "sha": "82339cd2a2422099", "val": "a178"}
 {"go_ok": false, "id": 309, "key": "a165", "kind": "cpchunk", "map": 23, "pos": 1, "seed": "cpchunk_rand1", "sha": "96531b0c857ff476", "val": "d930665b5f49e6a1e75d7de8e64001722804d892d311485b7fddca6b031eb301729cee4ba764db03321c4e9c66345fcabb00"}
 {"go_ok": false, "id": 310, "key": "a16c", "kind": "cpchunk", "map": 12, "pos": 3, "seed": "cp0_balances_1", "sha": "55fd9174a0330bb4", "val": "82a2747402a2756906"}
-{"go_ok": true, "id": 311, "key": "a16b", "kind": "cpchunk", "map": 36, "pos": 1, "seed": "cpchunk_rand2", "sha": "fead7c41f1815984", "val": "c40198"}
-{"go_ok": true, "id": 312, "key": "", "kind": "cpheader", "map": -1, "pos": 0, "seed": "cp1_content", "sha": "7496f1c28597c770", "val": ""}
+{"go_ok": true, "go_val": "3ced88bc6a383803", "id": 311, "key": "a16b", "kind": "cpchunk", "map": 36, "pos": 1, "seed": "cpchunk_rand2", "sha": "fead7c41f1815984", "val": "c40198"}
+{"go_ok": true, "go_val": "7496f1c28597c770", "id": 312, "key": "", "kind": "cpheader", "map": -1, "pos": 0, "seed": "cp1_content", "sha": "7496f1c28597c770", "val": ""}
 {"go_ok": false, "id": 313, "key": "a27a7a", "kind": "cpchunk", "map": 13, "pos": 0, "seed": "cpchunk_rand1", "sha": "ec48d3a0daf18b02", "val": "a178"}
 {"go_ok": false, "id": 314, "key": "a27a7a", "kind": "cpchunk", "map": 19, "pos": 0, "seed": "cpchunk_rand0", "sha": "0c2cb5e11c9979ca", "val": "c3"}
-{"go_ok": true, "id": 315, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cp1_balances_1", "sha": "dbe079a85befc084", "val": ""}
+{"go_ok": true, "go_val": "95c7e1ec96f063a4", "id": 315, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cp1_balances_1", "sha": "dbe079a85befc084", "val": ""}
 {"go_ok": false, "id": 316, "key": "a27a7a", "kind": "cpchunk", "map": 27, "pos": 0, "seed": "cpchunk_rand1", "sha": "cb55fe0c35fadced", "val": "c0"}
 {"go_ok": false, "id": 317, "key": "a27a7a", "kind": "cpchunk", "map": 2, "pos": 2, "seed": "cp1_balances_2", "sha": "09a92b4da42cdb53", "val": "01"}
 {"go_ok": false, "id": 318, "key": "a27a7a", "kind": "cpchunk", "map": 11, "pos": 0, "seed": "cpchunk_rand1", "sha": "d85a47e061360cd5", "val": "81a16101"}
-{"go_ok": true, "id": 319, "key": "a170", "kind": "cpchunk", "map": 18, "pos": 1, "seed": "cp1_balances_1", "sha": "b1a3e5519a8f160b", "val": "81a16c81a2747402"}
+{"go_ok": true, "go_val": "f81e91d759b620f8", "id": 319, "key": "a170", "kind": "cpchunk", "map": 18, "pos": 1, "seed": "cp1_balances_1", "sha": "b1a3e5519a8f160b", "val": "81a16c81a2747402"}
 {"go_ok": false, "id": 320, "key": "a27a7a", "kind": "cpchunk", "map": 4, "pos": 8, "seed": "cpchunk_rand1", "sha": "ff234e8140b95379", "val": "a178"}
 {"go_ok": false, "id": 321, "key": "a145", "kind": "cpchunk", "map": 1, "pos": 4, "seed": "cp1_balances_3", "sha": "14dbc332b5edf0a3", "val": "cd2710"}
 {"go_ok": false, "id": 322, "key": "ab626c6f636b73526f756e64", "kind": "cpheader", "map": 3, "pos": 1, "seed": "cp0_content", "sha": "9560ca37c2aa4ec8", "val": "cd05dc"}
@@ -331,11 +331,11 @@
 {"go_ok": false, "id": 330, "key": "a163", "kind": "cpchunk", "map": 31, "pos": 1, "seed": "cpchunk_rand1", "sha": "77a644efe446adec", "val": "82cf2ef05da0f8b7faa3de001ca141cf4481ec90905fcd40a142c42081a08b9af295d90dfd61b1cce87fa9cdb0e75f20b8c1696426112548a314d41fa144c3a161cf3375190dee2764efa162ce5937d340a163c3a164d92458229990361eb66f5893f344137e336b3193550564cc7da724d8a5b931195e5267d031f8a165d930cf2bddc2652d0b7e5852253cd5631e5e20b370a6758cfa184ae12539198ee7a443f1727fda2912ef18661c64b59e7f0ba166d92071b61f28b2d7f8d248ce8a29062523984c7d015253cef05dd15fe08050f46cdaa167c42026b5a6f37eda48b094c94df5e76983661f63778ba896262b17788e9291c115a9a168c4203e579a27beb2bfe8a0237c4e77dc7f22d2c2eaadf4005adcdcc46bab0dd660b3a169c4204585b642aa1ab4c1730a602df7e7c9f20006ac73c04cac171912dece03f0b00da16ac420e545899f79c3121228c7039bf063850e4c3b4c4a774a3d9def4a31aadcbd23bda16bc42073ea4f35b1e8e8a8291f03a5c2e6ff76be2ef1fe2c3eb5394672771bb64b30cea16ccff50f8245e2563259a16ecfa8cb580e16c120daa16fcf649cb158dbaf1f75a17081b332c25989083d7b0e88e6aa455e2244008abad880a171c40173a172c40166a17381d9244e7e6c2b70aa48ea42e5b6af2a86df1f302876b4253fc3b79350ae8360a86f597cb1991e83a27462af1a11bae2ea9d0992b72edbdce60bb4a27474cfc53305c81ceb2034a27569cf73130f0bed4bc431a174cfd47984322f1236bba175cfb636ee60ed02cfc8a176cff89ada5db71f8f0da177cfb987b5bdafe95bbca178ce41265982a179ccc1a17acf96977a27b680b035cf441d93114ddc38e4de001da141cfe88f8d90522b60d8a142c42056a942f55b57c3258ecac0ead80cdefcb276f2c2741a2ae2bfc4be9c0f8228d1a143c3a144c3a161cf99cf6839b4aaaeefa162ceb011e39ca163c3a164b2932917cb7f8ba0944c09345ebc27e27e6663a165d929f56f7892f0bc6c89c46d40ad9be2b0737f13c53ebccbce2dac4b20aea36846e0ed95287209dbcac9aea166b1805684cf2d1ac3ff0cb5cf786d68b046d3a167c420a88918cac4e43ae123dd1ab7198381723d9040bb7fbff49eba3f95ce822b38b3a168c420587079810e00a3987369ef2aa1ab5594fab2c345983d76d569ba432c4981cf99a169c420f38f97084aa80371c052571e5a5e150e0cda9012ae85e332d7ee4a9687ccd5dca16ac420e8617a8b33d1e337086a88474e4a1fd7b1a97b67a17093f0069058c1029b12afa16bc4207752ca80d8b80f2caecfed1319d60954302236bd2360e8918d44af17cd3b8863a16ccf7860496bc90a1ae2a16ecfb5bf02991401c256a16fcfb7959b67141faf94a17081b3f498924d43146f46b7e66666a3bab1e3dd6f5983a27462a616b3db7d0737a27474cfcbbd757a8fd4876aa27569cf5184c11388b91c67a171c401b7a172c40179a17381b4e3186480e55c36942836f43191bc7260753d1d0080a174cf1acda3749f9085f2a175cff5348258f860c569a176cf5b314293f4022fa7a177cfc448ca9ad96ca408a178cef672c6c6a17961a17acf55e08f64194c63f2"}
 {"go_ok": false, "id": 331, "key": "a179", "kind": "cpchunk", "map": 8, "pos": 3, "seed": "cpchunk_rand3", "sha": "d214afd772662d84", "val": "cce5"}
 {"go_ok": false, "id": 332, "key": "a163", "kind": "cpchunk", "map": 6, "pos": 1, "seed": "cp0_balances_1", "sha": "57a224f7d46344ee", "val": "82cd03e982a16cce000f3755a17acd0486cd03ea83a16e01a17081a16c82a2747402a2756905a17acd046f"}
-{"go_ok": true, "id": 333, "key": "a27462", "kind": "cpchunk", "map": 19, "pos": 0, "seed": "cpchunk_rand1", "sha": "a1ac1b7f7be5805f", "val": "a87e2833a15f70531c"}
-{"go_ok": true, "id": 334, "key": "a162", "kind": "cpchunk", "map": 34, "pos": 1, "seed": "cpchunk_rand1", "sha": "d2b393f7e15b80f4", "val": "ce5937d340"}
+{"go_ok": true, "go_val": "d97c9b7f419efbd1", "id": 333, "key": "a27462", "kind": "cpchunk", "map": 19, "pos": 0, "seed": "cpchunk_rand1", "sha": "a1ac1b7f7be5805f", "val": "a87e2833a15f70531c"}
+{"go_ok": true, "go_val": "da249222e83faf9a", "id": 334, "key": "a162", "kind": "cpchunk", "map": 34, "pos": 1, "seed": "cpchunk_rand1", "sha": "d2b393f7e15b80f4", "val": "ce5937d340"}
 {"go_ok": false, "id": 335, "key": "a16f", "kind": "cpchunk", "map": 15, "pos": 8, "seed": "cpchunk_rand1", "sha": "6c484adfb4cd146b", "val": "cf649cb158dbaf1f75"}
 {"go_ok": false, "id": 336, "key": "a17a", "kind": "cpchunk", "map": 19, "pos": 1, "seed": "cpchunk_rand2", "sha": "171b14076b814356", "val": "cfe54ea9d8e85d278e"}
-{"go_ok": true, "id": 337, "key": "", "kind": "cpspver", "map": -1, "pos": 0, "seed": "cpspver_rand0", "sha": "1b4e2bd38bbb35cc", "val": ""}
+{"go_ok": true, "go_val": "1b4e2bd38bbb35cc", "id": 337, "key": "", "kind": "cpspver", "map": -1, "pos": 0, "seed": "cpspver_rand0", "sha": "1b4e2bd38bbb35cc", "val": ""}
 {"go_ok": false, "id": 338, "key": "a27a7a", "kind": "cpchunk", "map": 15, "pos": 2, "seed": "cp1_balances_1", "sha": "60d1879d05337a21", "val": "c0"}
 {"go_ok": false, "id": 339, "key": "a172", "kind": "cpchunk", "map": 8, "pos": 3, "seed": "cpchunk_rand0", "sha": "0c1a7d30075c7aeb", "val": "c40120"}
 {"go_ok": false, "id": 340, "key": "a16d", "kind": "cpchunk", "map": 8, "pos": 1, "seed": "cpchunk_rand1", "sha": "5b933114730bd6a5", "val": "cf2848a7de58016cac"}
@@ -348,8 +348,8 @@
 {"go_ok": false, "id": 347, "key": "b36f6e6c696e654163636f756e7473436f756e74", "kind": "cpheader", "map": 1, "pos": 2, "seed": "cpheader_rand1", "sha": "fb5d9317d101847a", "val": "cf08ac551a9e1a4d31"}
 {"go_ok": false, "id": 348, "key": "a179", "kind": "cpchunk", "map": 11, "pos": 2, "seed": "cpchunk_rand3", "sha": "9d2f2bfccaea0437", "val": "cc95"}
 {"go_ok": false, "id": 349, "key": "a145", "kind": "cpchunk", "map": 17, "pos": 13, "seed": "cpchunk_rand2", "sha": "9812189b60d94d10", "val": "cf1e8ca9545d88114e"}
-{"go_ok": true, "id": 350, "key": "a27a7a", "kind": "cpchunk", "map": 34, "pos": 1, "seed": "cpchunk_rand0", "sha": "d09a3531c9f694b8", "val": "a178"}
-{"go_ok": true, "id": 351, "key": "a166", "kind": "cpchunk", "map": 34, "pos": 2, "seed": "cpchunk_rand2", "sha": "f0cf1833f5375352", "val": "b9f4fcf23e9add7bc186fac1869b5503a7b7d62f8eb217e94d1a"}
+{"go_ok": true, "go_val": "fd9225741db15161", "id": 350, "key": "a27a7a", "kind": "cpchunk", "map": 34, "pos": 1, "seed": "cpchunk_rand0", "sha": "d09a3531c9f694b8", "val": "a178"}
+{"go_ok": true, "go_val": "d702234e27cb600d", "id": 351, "key": "a166", "kind": "cpchunk", "map": 34, "pos": 2, "seed": "cpchunk_rand2", "sha": "f0cf1833f5375352", "val": "b9f4fcf23e9add7bc186fac1869b5503a7b7d62f8eb217e94d1a"}
 {"go_ok": false, "id": 352, "key": "a27a7a", "kind": "cpchunk", "map": 9, "pos": 1, "seed": "cp1_balances_1", "sha": "0d258a9d8bf67238", "val": "c0"}
 {"go_ok": false, "id": 353, "key": "a27a7a", "kind": "cpchunk", "map": 14, "pos": 1, "seed": "cp0_balances_1", "sha": "032ab21e46989ae8", "val": "81a16101"}
 {"go_ok": false, "id": 354, "key": "a16c", "kind": "cpchunk", "map": 28, "pos": 0, "seed": "cpchunk_rand3", "sha": "eb05f072dc0cc5ce", "val": "cf219aac62b806f709"}
@@ -361,8 +361,8 @@
 {"go_ok": false, "id": 360, "key": "a27a7a", "kind": "cpspver", "map": 2, "pos": 4, "seed": "cp1_stateProofVerificationContext", "sha": "73361eea2e94952e", "val": "80"}
 {"go_ok": false, "id": 361, "key": "a67277646c766c", "kind": "cpchunk", "map": 1, "pos": 1, "seed": "cp1_balances_4", "sha": "6a80fdaa335e208b", "val": "cc9b"}
 {"go_ok": false, "id": 362, "key": "a168", "kind": "cpchunk", "map": 18, "pos": 1, "seed": "cpchunk_rand0", "sha": "10408698d31d0811", "val": "ce6385c120"}
-{"go_ok": true, "id": 363, "key": "a16b", "kind": "cpchunk", "map": 34, "pos": 0, "seed": "cpchunk_rand0", "sha": "a2a7e772e08ad529", "val": "c4205488a2a0c2a334f59f8cd33d88a1e7631ab3ecd33b8bd3118204bc49c1741469"}
-{"go_ok": true, "id": 364, "key": "a16e", "kind": "cpchunk", "map": 4, "pos": 2, "seed": "cp0_balances_1", "sha": "000539008dd5b20c", "val": "01"}
+{"go_ok": true, "go_val": "723debc16e6a474b", "id": 363, "key": "a16b", "kind": "cpchunk", "map": 34, "pos": 0, "seed": "cpchunk_rand0", "sha": "a2a7e772e08ad529", "val": "c4205488a2a0c2a334f59f8cd33d88a1e7631ab3ecd33b8bd3118204bc49c1741469"}
+{"go_ok": true, "go_val": "e1de4d0e985e3e3e", "id": 364, "key": "a16e", "kind": "cpchunk", "map": 4, "pos": 2, "seed": "cp0_balances_1", "sha": "000539008dd5b20c", "val": "01"}
 {"go_ok": false, "id": 365, "key": "a27a7a", "kind": "cpchunk", "map": 4, "pos": 0, "seed": "cp0_balances_1", "sha": "0c29f860a52bcf2a", "val": "01"}
 {"go_ok": false, "id": 366, "key": "a67277646c766c", "kind": "cpchunk", "map": 5, "pos": 0, "seed": "cp0_balances_4", "sha": "60779dc59502e594", "val": "cd0173"}
 {"go_ok": false, "id": 367, "key": "a27a7a", "kind": "cpchunk", "map": 29, "pos": 2, "seed": "cpchunk_rand3", "sha": "412188e941166764", "val": "01"}
@@ -375,7 +375,7 @@
 {"go_ok": false, "id": 374, "key": "b36f6e6c696e654163636f756e7473436f756e74", "kind": "cpheader", "map": 4, "pos": 2, "seed": "cp0_content", "sha": "0216726dbfb7a6c5", "val": "40"}
 {"go_ok": false, "id": 375, "key": "a27a7a", "kind": "cpchunk", "map": 18, "pos": 0, "seed": "cp1_balances_1", "sha": "475c3ef6a0671b08", "val": "81a16101"}
 {"go_ok": false, "id": 376, "key": "a176", "kind": "cpchunk", "map": 3, "pos": 2, "seed": "cpchunk_rand1", "sha": "f9e9cbf839546710", "val": "cf5b314293f4022fa7"}
-{"go_ok": true, "id": 377, "key": "a3757064", "kind": "cpchunk", "map": 2, "pos": 8, "seed": "cp0_balances_3", "sha": "c83615c2715827f3", "val": "cd03f0"}
+{"go_ok": true, "go_val": "c83615c2715827f3", "id": 377, "key": "a3757064", "kind": "cpchunk", "map": 2, "pos": 8, "seed": "cp0_balances_3", "sha": "c83615c2715827f3", "val": "cd03f0"}
 {"go_ok": false, "id": 378, "key": "a27a7a", "kind": "cpchunk", "map": 5, "pos": 0, "seed": "cpchunk_rand2", "sha": "d78a57fe9071410e", "val": "a178"}
 {"go_ok": false, "id": 379, "key": "a27a7a", "kind": "cpspver", "map": 1, "pos": 1, "seed": "cpspver_rand0", "sha": "8d38df50f3766657", "val": "01"}
 {"go_ok": false, "id": 380, "key": "a176", "kind": "cpspver", "map": 0, "pos": 0, "seed": "cpspver_rand2", "sha": "370ae347ca51f810", "val": "a1a1"}
@@ -390,7 +390,7 @@
 {"go_ok": false, "id": 389, "key": "b36f6e6c696e654163636f756e7473436f756e74", "kind": "cpheader", "map": 1, "pos": 3, "seed": "cp0_content", "sha": "8772123b3d1d1017", "val": "40"}
 {"go_ok": false, "id": 390, "key": "a179", "kind": "cpchunk", "map": 16, "pos": 1, "seed": "cpchunk_rand2", "sha": "6992ff6989b9a70f", "val": "ccad"}
 {"go_ok": false, "id": 391, "key": "a27a7a", "kind": "cpchunk", "map": 5, "pos": 0, "seed": "cp0_balances_4", "sha": "f6656ddb8cd46115", "val": "81a16101"}
-{"go_ok": true, "id": 392, "key": "a16a", "kind": "cpchunk", "map": 30, "pos": 2, "seed": "cpchunk_rand0", "sha": "f2384fe054b83629", "val": "c420aada46198a557654392d7ab5be3abfbd5daf200b413d38ea850c82c29f8203a1"}
+{"go_ok": true, "go_val": "1423ea896d5674be", "id": 392, "key": "a16a", "kind": "cpchunk", "map": 30, "pos": 2, "seed": "cpchunk_rand0", "sha": "f2384fe054b83629", "val": "c420aada46198a557654392d7ab5be3abfbd5daf200b413d38ea850c82c29f8203a1"}
 {"go_ok": false, "id": 393, "key": "a16f", "kind": "cpchunk", "map": 26, "pos": 0, "seed": "cpchunk_rand1", "sha": "b15a8d53f00cc703", "val": "cf649cb158dbaf1f75"}
 {"go_ok": false, "id": 394, "key": "a27a7a", "kind": "cpchunk", "map": 1, "pos": 5, "seed": "cp1_balances_3", "sha": "1992f49e3000f352", "val": "81a16101"}
 {"go_ok": false, "id": 395, "key": "a27a7a", "kind": "cpspver", "map": 0, "pos": 0, "seed": "cpspver_rand2", "sha": "496b5afc2eafd47c", "val": "c0"}
@@ -400,18 +400,18 @@
 {"go_ok": false, "id": 399, "key": "a27a7a", "kind": "cpchunk", "map": 10, "pos": 0, "seed": "cp1_balances_1", "sha": "84f60bd3177a81cc", "val": "81a16101"}
 {"go_ok": false, "id": 400, "key": "a27a7a", "kind": "cpchunk", "map": 23, "pos": 1, "seed": "cpchunk_rand3", "sha": "a48f5b090ed99b75", "val": "c3"}
 {"go_ok": false, "id": 401, "key": "a27a7a", "kind": "cpchunk", "map": 2, "pos": 0, "seed": "cp0_balances_2", "sha": "5cc1ac0149795353", "val": "c0"}
-{"go_ok": true, "id": 402, "key": "", "kind": "cpheader", "map": -1, "pos": 0, "seed": "cpheader_rand3", "sha": "5c0d0bf20e9c7011", "val": ""}
-{"go_ok": true, "id": 403, "key": "", "kind": "cpheader", "map": -1, "pos": 0, "seed": "cp0_content", "sha": "e3b2aaf51a34be47", "val": ""}
+{"go_ok": true, "go_val": "5c0d0bf20e9c7011", "id": 402, "key": "", "kind": "cpheader", "map": -1, "pos": 0, "seed": "cpheader_rand3", "sha": "5c0d0bf20e9c7011", "val": ""}
+{"go_ok": true, "go_val": "e3b2aaf51a34be47", "id": 403, "key": "", "kind": "cpheader", "map": -1, "pos": 0, "seed": "cp0_content", "sha": "e3b2aaf51a34be47", "val": ""}
 {"go_ok": false, "id": 404, "key": "a27a7a", "kind": "cpspver", "map": 1, "pos": 0, "seed": "cpspver_rand1", "sha": "603f54c139db91c8", "val": "c0"}
-{"go_ok": true, "id": 405, "key": "", "kind": "cpspver", "map": -1, "pos": 0, "seed": "cp1_stateProofVerificationContext", "sha": "11a36b1ceca3b275", "val": ""}
+{"go_ok": true, "go_val": "11a36b1ceca3b275", "id": 405, "key": "", "kind": "cpspver", "map": -1, "pos": 0, "seed": "cp1_stateProofVerificationContext", "sha": "11a36b1ceca3b275", "val": ""}
 {"go_ok": false, "id": 406, "key": "a170", "kind": "cpchunk", "map": 21, "pos": 1, "seed": "cpchunk_rand0", "sha": "e4b2c94fed5e3976", "val": "cfabd1af2214711f80"}
-{"go_ok": true, "id": 407, "key": "a27a7a", "kind": "cpchunk", "map": 6, "pos": 1, "seed": "cp0_balances_4", "sha": "d89bb406776c1b1f", "val": "c0"}
+{"go_ok": true, "go_val": "d89bb406776c1b1f", "id": 407, "key": "a27a7a", "kind": "cpchunk", "map": 6, "pos": 1, "seed": "cp0_balances_4", "sha": "d89bb406776c1b1f", "val": "c0"}
 {"go_ok": false, "id": 408, "key": "a27a7a", "kind": "cpchunk", "map": 9, "pos": 17, "seed": "cpchunk_rand1", "sha": "449e1b1494ca71bf", "val": "81a16101"}
 {"go_ok": false, "id": 409, "key": "a16f", "kind": "cpchunk", "map": 10, "pos": 1, "seed": "cpchunk_rand1", "sha": "6e2345e2370e6e8c", "val": "c3"}
 {"go_ok": false, "id": 410, "key": "a27569", "kind": "cpchunk", "map": 2, "pos": 4, "seed": "cp1_balances_1", "sha": "2b8859c4726d06c4", "val": "07"}
 {"go_ok": false, "id": 411, "key": "ad62616c616e636573526f756e64", "kind": "cpheader", "map": 2, "pos": 2, "seed": "cpheader_rand1", "sha": "e19b77516614516b", "val": "cf5e2b0e92c3aefc9d"}
 {"go_ok": false, "id": 412, "key": "a27a7a", "kind": "cpchunk", "map": 11, "pos": 0, "seed": "cpchunk_rand2", "sha": "1f1c0d3edf0b0644", "val": "c3"}
-{"go_ok": true, "id": 413, "key": "a27a7a", "kind": "cpchunk", "map": 36, "pos": 0, "seed": "cpchunk_rand3", "sha": "eb8710398c03cffc", "val": "c40100"}
+{"go_ok": true, "go_val": "77dea38e7457d8a9", "id": 413, "key": "a27a7a", "kind": "cpchunk", "map": 36, "pos": 0, "seed": "cpchunk_rand3", "sha": "eb8710398c03cffc", "val": "c40100"}
 {"go_ok": false, "id": 414, "key": "a27a7a", "kind": "cpchunk", "map": 2, "pos": 7, "seed": "cpchunk_rand1", "sha": "c92e6a2f8586e3c6", "val": "80"}
 {"go_ok": false, "id": 415, "key": "a27a7a", "kind": "cpchunk", "map": 1, "pos": 2, "seed": "cp1_balances_4", "sha": "38e71083aac5a7de", "val": "a178"}
 {"go_ok": false, "id": 416, "key": "a27a7a", "kind": "cpchunk", "map": 22, "pos": 29, "seed": "cpchunk_rand0", "sha": "b124fbe82f614df1", "val": "a178"}
@@ -421,14 +421,14 @@
 {"go_ok": false, "id": 420, "key": "a3726e64", "kind": "cpchunk", "map": 22, "pos": 21, "seed": "cpchunk_rand2", "sha": "4d2bda832d80e4b4", "val": "cfbae68507435ed449"}
 {"go_ok": false, "id": 421, "key": "a166", "kind": "cpchunk", "map": 12, "pos": 0, "seed": "cpchunk_rand3", "sha": "b0670f5cc6b17d46", "val": "cfb36d1bbd255803fd"}
 {"go_ok": false, "id": 422, "key": "a27a7a", "kind": "cpchunk", "map": 12, "pos": 0, "seed": "cp0_balances_1", "sha": "6845c2d0016e1613", "val": "01"}
-{"go_ok": true, "id": 423, "key": "a27a7a", "kind": "cpchunk", "map": 12, "pos": 0, "seed": "cpchunk_rand2", "sha": "217cd8ebd88be2d4", "val": "80"}
+{"go_ok": true, "go_val": "9185dedb1c6e2d24", "id": 423, "key": "a27a7a", "kind": "cpchunk", "map": 12, "pos": 0, "seed": "cpchunk_rand2", "sha": "217cd8ebd88be2d4", "val": "80"}
 {"go_ok": false, "id": 424, "key": "a27a7a", "kind": "cpchunk", "map": 24, "pos": 1, "seed": "cpchunk_rand1", "sha": "a0cf4839c7c263ab", "val": "81a16101"}
 {"go_ok": false, "id": 425, "key": "a27a7a", "kind": "cpchunk", "map": 28, "pos": 0, "seed": "cpchunk_rand2", "sha": "aa7feba76a0c3ea6", "val": "80"}
 {"go_ok": false, "id": 426, "key": "a570726f746f", "kind": "cpchunk", "map": 5, "pos": 0, "seed": "cp1_balances_4", "sha": "0ae41e7f3967c699", "val": "d95968747470733a2f2f6769746875622e636f6d2f616c676f72616e64666f756e646174696f6e2f73706563732f747265652f37336334336234613936393933393038383463353165326139353938643439653238333733643130"}
 {"go_ok": false, "id": 427, "key": "a27a7a", "kind": "cpchunk", "map": 6, "pos": 1, "seed": "cpchunk_rand2", "sha": "6e51f128e5570935", "val": "a178"}
 {"go_ok": false, "id": 428, "key": "a27a7a", "kind": "cpchunk", "map": 1, "pos": 0, "seed": "cp0_balances_2", "sha": "2560d02bf97fad00", "val": "81a16101"}
 {"go_ok": false, "id": 429, "key": "a27a7a", "kind": "cpchunk", "map": 1, "pos": 2, "seed": "cp1_balances_1", "sha": "bed50ef2e1fc3894", "val": "c40100"}
-{"go_ok": true, "id": 430, "key": "", "kind": "cpheader", "map": -1, "pos": 0, "seed": "cpheader_rand1", "sha": "5bc73e3ec01d1889", "val": ""}
+{"go_ok": true, "go_val": "5bc73e3ec01d1889", "id": 430, "key": "", "kind": "cpheader", "map": -1, "pos": 0, "seed": "cpheader_rand1", "sha": "5bc73e3ec01d1889", "val": ""}
 {"go_ok": false, "id": 431, "key": "a172", "kind": "cpchunk", "map": 28, "pos": 2, "seed": "cpchunk_rand2", "sha": "280ab0ef459027ba", "val": "c4019c"}
 {"go_ok": false, "id": 432, "key": "a776657273696f6e", "kind": "cpheader", "map": 1, "pos": 0, "seed": "cpheader_rand0", "sha": "4b48a1269352ce8d", "val": "cf6834e724053c9cc3"}
 {"go_ok": false, "id": 433, "key": "a145", "kind": "cpchunk", "map": 5, "pos": 1, "seed": "cp1_balances_3", "sha": "dfd389f5fe9ab52a", "val": "cd2710"}
@@ -436,8 +436,8 @@
 {"go_ok": false, "id": 435, "key": "a27a7a", "kind": "cpchunk", "map": 9, "pos": 6, "seed": "cp0_balances_1", "sha": "c63f773a52f55c68", "val": "c0"}
 {"go_ok": false, "id": 436, "key": "a27a7a", "kind": "cpchunk", "map": 15, "pos": 23, "seed": "cpchunk_rand2", "sha": "776d829d8016a4f3", "val": "80"}
 {"go_ok": false, "id": 437, "key": "a142", "kind": "cpchunk", "map": 14, "pos": 1, "seed": "cpchunk_rand2", "sha": "54211fbfb609c0aa", "val": "c420bbeee9b90a84dbb3c57d16f545ffa942f88eb50eb38e3f331c1ec003f4a6eb85"}
-{"go_ok": true, "id": 438, "key": "a461646472", "kind": "cpchunk", "map": 6, "pos": 4, "seed": "cp1_balances_3", "sha": "63534a3919b9afcd", "val": "c4201fd652630ea07f61fad97e6dd3db1e9d45b91095ce72023db93efaafbc54375c"}
-{"go_ok": true, "id": 439, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cp1_balances_2", "sha": "2d9b8b860e110f30", "val": ""}
+{"go_ok": true, "go_val": "63534a3919b9afcd", "id": 438, "key": "a461646472", "kind": "cpchunk", "map": 6, "pos": 4, "seed": "cp1_balances_3", "sha": "63534a3919b9afcd", "val": "c4201fd652630ea07f61fad97e6dd3db1e9d45b91095ce72023db93efaafbc54375c"}
+{"go_ok": true, "go_val": "2d9b8b860e110f30", "id": 439, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cp1_balances_2", "sha": "2d9b8b860e110f30", "val": ""}
 {"go_ok": false, "id": 440, "key": "a27a7a", "kind": "cpchunk", "map": 33, "pos": 2, "seed": "cpchunk_rand0", "sha": "bec573ee31900750", "val": "01"}
 {"go_ok": false, "id": 441, "key": "a27a7a", "kind": "cpspver", "map": 1, "pos": 3, "seed": "cpspver_rand2", "sha": "5d12059e0311d5cc", "val": "a178"}
 {"go_ok": false, "id": 442, "key": "a27a7a", "kind": "cpheader", "map": 0, "pos": 2, "seed": "cpheader_rand3", "sha": "cc568d0488451ab3", "val": "80"}
@@ -446,19 +446,19 @@
 {"go_ok": false, "id": 445, "key": "a17a", "kind": "cpchunk", "map": 13, "pos": 1, "seed": "cp0_balances_1", "sha": "e28a983c47f9475b", "val": "cd0496"}
 {"go_ok": false, "id": 446, "key": "ad62616c616e636573526f756e64", "kind": "cpheader", "map": 2, "pos": 0, "seed": "cpheader_rand3", "sha": "cf8b1a684e618951", "val": "cfbecb6850af0c817f"}
 {"go_ok": false, "id": 447, "key": "a178", "kind": "cpchunk", "map": 15, "pos": 1, "seed": "cpchunk_rand0", "sha": "e44040e67bb1fc89", "val": "ce494b5a90"}
-{"go_ok": true, "id": 448, "key": "a27a7a", "kind": "cpchunk", "map": 2, "pos": 4, "seed": "cp0_balances_3", "sha": "db7617d759fe9437", "val": "a178"}
+{"go_ok": true, "go_val": "db7617d759fe9437", "id": 448, "key": "a27a7a", "kind": "cpchunk", "map": 2, "pos": 4, "seed": "cp0_balances_3", "sha": "db7617d759fe9437", "val": "a178"}
 {"go_ok": false, "id": 449, "key": "a162", "kind": "cpchunk", "map": 0, "pos": 0, "seed": "cp1_balances_1", "sha": "12aa79bc48c96ae7", "val": "cf000000e8e55dbe17"}
 {"go_ok": false, "id": 450, "key": "a27a7a", "kind": "cpheader", "map": 0, "pos": 1, "seed": "cp0_content", "sha": "1880afb9b201c009", "val": "c3"}
-{"go_ok": true, "id": 451, "key": "a16c", "kind": "cpchunk", "map": 19, "pos": 0, "seed": "cp1_balances_1", "sha": "c48b486422627478", "val": "ce000f3e83"}
+{"go_ok": true, "go_val": "00d11705c17db5d4", "id": 451, "key": "a16c", "kind": "cpchunk", "map": 19, "pos": 0, "seed": "cp1_balances_1", "sha": "c48b486422627478", "val": "ce000f3e83"}
 {"go_ok": false, "id": 452, "key": "a165", "kind": "cpchunk", "map": 35, "pos": 0, "seed": "cpchunk_rand3", "sha": "296913678e9ceae5", "val": "be9b468a4f823783dad9f5f96b84913dd2f348f907144a382f8d00c8b77c3c"}
 {"go_ok": false, "id": 453, "key": "a27a7a", "kind": "cpchunk", "map": 9, "pos": 24, "seed": "cpchunk_rand0", "sha": "f066800cfa841eba", "val": "a178"}
 {"go_ok": false, "id": 454, "key": "a163", "kind": "cpchunk", "map": 29, "pos": 4, "seed": "cpchunk_rand2", "sha": "8d4d78a707bf5a5f", "val": "c3"}
 {"go_ok": false, "id": 455, "key": "a16e", "kind": "cpchunk", "map": 14, "pos": 3, "seed": "cpchunk_rand0", "sha": "e7839f0787d39523", "val": "cf577af15d6c217516"}
-{"go_ok": true, "id": 456, "key": "a27a7a", "kind": "cpchunk", "map": 6, "pos": 8, "seed": "cp0_balances_3", "sha": "72b84374700e4d48", "val": "c40100"}
+{"go_ok": true, "go_val": "72b84374700e4d48", "id": 456, "key": "a27a7a", "kind": "cpchunk", "map": 6, "pos": 8, "seed": "cp0_balances_3", "sha": "72b84374700e4d48", "val": "c40100"}
 {"go_ok": false, "id": 457, "key": "a164", "kind": "cpchunk", "map": 6, "pos": 0, "seed": "cpchunk_rand0", "sha": "eb44df4920651482", "val": "a717edfa4a07521e"}
 {"go_ok": false, "id": 458, "key": "a27a7a", "kind": "cpchunk", "map": 2, "pos": 6, "seed": "cpchunk_rand0", "sha": "cf52bddaeb9b3baf", "val": "c0"}
 {"go_ok": false, "id": 459, "key": "a27a7a", "kind": "cpchunk", "map": 28, "pos": 2, "seed": "cpchunk_rand0", "sha": "6dfc7f29569d80bf", "val": "81a16101"}
-{"go_ok": true, "id": 460, "key": "a27a7a", "kind": "cpchunk", "map": 32, "pos": 4, "seed": "cpchunk_rand0", "sha": "a1135d1918e3e192", "val": "80"}
+{"go_ok": true, "go_val": "57b723dec561150a", "id": 460, "key": "a27a7a", "kind": "cpchunk", "map": 32, "pos": 4, "seed": "cpchunk_rand0", "sha": "a1135d1918e3e192", "val": "80"}
 {"go_ok": false, "id": 461, "key": "a15a", "kind": "cpchunk", "map": 22, "pos": 16, "seed": "cpchunk_rand0", "sha": "41c6713374a4258e", "val": "cffc807d6c0dcf73a4"}
 {"go_ok": false, "id": 462, "key": "a27a7a", "kind": "cpchunk", "map": 16, "pos": 1, "seed": "cpchunk_rand2", "sha": "9e8fec45d799ac8b", "val": "c3"}
 {"go_ok": false, "id": 463, "key": "a27a7a", "kind": "cpchunk", "map": 21, "pos": 2, "seed": "cpchunk_rand1", "sha": "ddcaff4ac4568f22", "val": "81a16101"}
@@ -468,55 +468,55 @@
 {"go_ok": false, "id": 467, "key": "a143", "kind": "cpchunk", "map": 3, "pos": 1, "seed": "cpchunk_rand2", "sha": "8c9d4d20eca633a9", "val": "c3"}
 {"go_ok": false, "id": 468, "key": "a27a7a", "kind": "cpchunk", "map": 13, "pos": 0, "seed": "cpchunk_rand3", "sha": "8e3de0191e117938", "val": "01"}
 {"go_ok": false, "id": 469, "key": "a27a7a", "kind": "cpchunk", "map": 27, "pos": 1, "seed": "cpchunk_rand2", "sha": "41d79c1656824f1f", "val": "01"}
-{"go_ok": true, "id": 470, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cpchunk_rand3", "sha": "993c5872b833dba4", "val": ""}
+{"go_ok": true, "go_val": "7aaf7d6a863d9a5b", "id": 470, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cpchunk_rand3", "sha": "993c5872b833dba4", "val": ""}
 {"go_ok": false, "id": 471, "key": "a17a", "kind": "cpchunk", "map": 1, "pos": 0, "seed": "cp0_balances_1", "sha": "e2b2a1965b3108bf", "val": "cd049c"}
 {"go_ok": false, "id": 472, "key": "a27a7a", "kind": "cpchunk", "map": 12, "pos": 1, "seed": "cp1_balances_1", "sha": "e46c9eacc864081a", "val": "80"}
 {"go_ok": false, "id": 473, "key": "a27a7a", "kind": "cpchunk", "map": 1, "pos": 1, "seed": "cp1_balances_2", "sha": "c49d8350db04bd66", "val": "81a16101"}
-{"go_ok": true, "id": 474, "key": "", "kind": "cpspver", "map": -1, "pos": 0, "seed": "cpspver_rand1", "sha": "8d6051d106cb8d19", "val": ""}
+{"go_ok": true, "go_val": "8d6051d106cb8d19", "id": 474, "key": "", "kind": "cpspver", "map": -1, "pos": 0, "seed": "cpspver_rand1", "sha": "8d6051d106cb8d19", "val": ""}
 {"go_ok": false, "id": 475, "key": "a3726e64", "kind": "cpchunk", "map": 2, "pos": 15, "seed": "cpchunk_rand0", "sha": "9a99a8b7458c9449", "val": "cf99121c2dfbf4ef31"}
 {"go_ok": false, "id": 476, "key": "a163", "kind": "cpchunk", "map": 26, "pos": 0, "seed": "cpchunk_rand2", "sha": "116f3fde1aa5de10", "val": "c3"}
 {"go_ok": false, "id": 477, "key": "a27a7a", "kind": "cpchunk", "map": 17, "pos": 15, "seed": "cpchunk_rand0", "sha": "2e20406b393c5350", "val": "c3"}
 {"go_ok": false, "id": 478, "key": "a776657273696f6e", "kind": "cpheader", "map": 2, "pos": 0, "seed": "cp1_content", "sha": "08c3882fa523d29b", "val": "cc83"}
 {"go_ok": false, "id": 479, "key": "a178", "kind": "cpchunk", "map": 5, "pos": 0, "seed": "cpchunk_rand0", "sha": "c258be01106ed766", "val": "cea4504518"}
 {"go_ok": false, "id": 480, "key": "a16a", "kind": "cpchunk", "map": 19, "pos": 0, "seed": "cpchunk_rand0", "sha": "6fce69278d1f5090", "val": "c420b3aa654c57b9d311aa7723ec056b1b8c75f3f3da71272e5fba69d8788ccc94ae"}
-{"go_ok": true, "id": 481, "key": "a177", "kind": "cpchunk", "map": 30, "pos": 6, "seed": "cpchunk_rand1", "sha": "ce93766325a909f7", "val": "cfb987b5bdafe95bbc"}
+{"go_ok": true, "go_val": "1d6db752f054f974", "id": 481, "key": "a177", "kind": "cpchunk", "map": 30, "pos": 6, "seed": "cpchunk_rand1", "sha": "ce93766325a909f7", "val": "cfb987b5bdafe95bbc"}
 {"go_ok": false, "id": 482, "key": "a144", "kind": "cpchunk", "map": 5, "pos": 2, "seed": "cp0_balances_3", "sha": "ca85b60c2a49a95a", "val": "ce000f45b0"}
-{"go_ok": true, "id": 483, "key": "a164", "kind": "cpchunk", "map": 32, "pos": 0, "seed": "cpchunk_rand3", "sha": "2d2b0ef3181a6a78", "val": "b86cb1811895c4a9cefcbbfc133be7186470ad2f9ef7fa8210"}
+{"go_ok": true, "go_val": "1a2af679e70f395c", "id": 483, "key": "a164", "kind": "cpchunk", "map": 32, "pos": 0, "seed": "cpchunk_rand3", "sha": "2d2b0ef3181a6a78", "val": "b86cb1811895c4a9cefcbbfc133be7186470ad2f9ef7fa8210"}
 {"go_ok": false, "id": 484, "key": "a570726f746f", "kind": "cpchunk", "map": 3, "pos": 1, "seed": "cp1_balances_4", "sha": "8699a5bac7413709", "val": "d95968747470733a2f2f6769746875622e636f6d2f616c676f72616e64666f756e646174696f6e2f73706563732f747265652f37336334336234613936393933393038383463353165326139353938643439653238333733643130"}
-{"go_ok": true, "id": 485, "key": "a27a7a", "kind": "cpchunk", "map": 5, "pos": 0, "seed": "cpchunk_rand1", "sha": "ed7a4b91891ac0c7", "val": "c0"}
+{"go_ok": true, "go_val": "ab32d1decfe541f9", "id": 485, "key": "a27a7a", "kind": "cpchunk", "map": 5, "pos": 0, "seed": "cpchunk_rand1", "sha": "ed7a4b91891ac0c7", "val": "c0"}
 {"go_ok": false, "id": 486, "key": "a163", "kind": "cpchunk", "map": 13, "pos": 1, "seed": "cpchunk_rand2", "sha": "305100dbb9231a2a", "val": "82cf1e2e2351c82db2f2de001da141cf5e40b22578cfa1eda142c420b2a657609acf5d9ad2df5733da8b1ef2bc2af0ca17c7a1d8c8572142138a7680a143c3a144c3a161cf1503ea951ca0ad8fa162ce803528dca163c3a164d935308735a97bba317344e4696b42df4a6743fab2a4925adbee4e7c006297476bd9b7bb7551a4d3c64bb701a897d122d60ab3d0dd3847a165ac599376a258130e1d1b6c4029a166d9328cffca0dc971f07831591b58062b1cb73ce443ff5986fd696a8d4fa97243dd62fe08864a6da7123860d458840f10c1fe5ddda167c4206c0e1aeb50234fc21c9ca591306335c18ea9eb12baf2d83f2934e25ce714f5b0a168c4209a85dfb6816a3aeb20d6128ddf0bd4c6c88cd8046b2f10ffae22d1d6f5731f44a169c4202026d26b0e1e311efb1bd9cd06a93d4c151df5422fe4fd7f3fffa8012459aab2a16ac4205e0428ef47574adc81a9870aba8dc4a84f6affbd2e63890ac3e944af03a0983aa16bc4205e8069815e666660a4ab67f89f1cd95c26df69ad8a460e69366ae58b18cb0f49a16ccfc91dc5729e903463a16ecf4a444131ac9f3f46a16fcf89ba01045fd16019a17081a75d9f179813633983a27462ba5ff9292c3c34322c9d8a55be732fa4a49e1524692713a6829cd6a27474cf2762f30b57429640a27569cf43378770026f503ea171c401dca172c4019ca17381d937ab14fb25452260a6f619ce5f6f027d191bd4c229327a1de3abf7aad8e08d561f0d3654de3fb6181ddba334e37775d8a863649e5717027d80a174cfd3ff3044129e32f7a175cf55ef05eb3a55909ba176cfbab0d04d558d6cc7a177cf4f1861e9d468d3cca178ce3f66bd9fa1793ca17acf25afabd3592d9eb1cf37cd116e4e66c7dade001ca141cf2e8b87a9dff7ba77a142c4208bdf8b8c09d64ea6c426b18436f610f269c12b218a689d75a02f7f3651fb30e5a144c3a161cf8fc03d3d2a29bd72a162ceec86eebaa163c3a164d93790ab4b145b97c61aebc92cfae0ce19c12102173be660def71e276a178ff48049dae8cc43d787f472a113e3712e9a2f82b854574be6a6c5a165d922208f0c1a06edd7cb071d17782e47975d52a7e9e55d75b2f5c920d9a468c240fe9e44a166ac5370bac112b201551a41c560a167c4206fedb3e114131f08d3b91cfa21f864bc50471fb5c46d437778aed6429c845beda168c420042b5b135a69cd94aeb0c8103a7d4b6f340ecca5a873a2a04d6b9c6958b2f521a169c420a87e5bc4ec5741da84db6c179b4664f881d9a5cedced242d4a454abd320fd738a16ac420ad1a8425e8cc2c8677338282b60014767bf366489e0f6339910a1291792aedbda16bc420efcebacb0509973312c51d4e7dab38c6e2d635930651dc8b21bd7775e986777fa16ccfc9097e1c2e322d2ca16ecf135511e510be003ea16fcfed29be239ba958b0a17081a11383a27462affa4203bb887d1743b50b645623899ca27474cf13a99a0581c8ac4fa27569cfbd0e117c72ca8254a171c40177a172c401e0a17381d9214efa79510aabc1c52f91600c205c03fd7b65fe8eec90176730d2bbb3583425030380a174cf69f4c0a6d0d7e93ca175cfecb03e3f23839559a176cff27f1b7a5dc33ceda177cf5a3525c51d465053a178cee02acfdba17949a17acf9cd340af56864962"}
 {"go_ok": false, "id": 487, "key": "a27a7a", "kind": "cpchunk", "map": 0, "pos": 1, "seed": "cp1_balances_3", "sha": "77d294d4fff4da18", "val": "c40100"}
-{"go_ok": true, "id": 488, "key": "a464617461", "kind": "cpchunk", "map": 6, "pos": 1, "seed": "cp1_balances_4", "sha": "66cfd9921558dba4", "val": "83a66f6e6c696e65cf00016bdab165ec00a570726f746fd95968747470733a2f2f6769746875622e636f6d2f616c676f72616e64666f756e646174696f6e2f73706563732f747265652f37336334336234613936393933393038383463353165326139353938643439653238333733643130a67277646c766ccc9b"}
+{"go_ok": true, "go_val": "66cfd9921558dba4", "id": 488, "key": "a464617461", "kind": "cpchunk", "map": 6, "pos": 1, "seed": "cp1_balances_4", "sha": "66cfd9921558dba4", "val": "83a66f6e6c696e65cf00016bdab165ec00a570726f746fd95968747470733a2f2f6769746875622e636f6d2f616c676f72616e64666f756e646174696f6e2f73706563732f747265652f37336334336234613936393933393038383463353165326139353938643439653238333733643130a67277646c766ccc9b"}
 {"go_ok": false, "id": 489, "key": "a3766c76", "kind": "cpchunk", "map": 17, "pos": 20, "seed": "cpchunk_rand1", "sha": "e916c6a492bceaec", "val": "cf44acacbb22180a76"}
 {"go_ok": false, "id": 490, "key": "a16b", "kind": "cpchunk", "map": 18, "pos": 0, "seed": "cpchunk_rand1", "sha": "82f7c8562be96d0a", "val": "c401b6"}
-{"go_ok": true, "id": 491, "key": "a27a7a", "kind": "cpchunk", "map": 32, "pos": 0, "seed": "cpchunk_rand1", "sha": "c057f94c9a0a4b67", "val": "81a16101"}
+{"go_ok": true, "go_val": "1cd42345be4f0a32", "id": 491, "key": "a27a7a", "kind": "cpchunk", "map": 32, "pos": 0, "seed": "cpchunk_rand1", "sha": "c057f94c9a0a4b67", "val": "81a16101"}
 {"go_ok": false, "id": 492, "key": "a27a7a", "kind": "cpchunk", "map": 23, "pos": 0, "seed": "cpchunk_rand1", "sha": "f3598d85009c0121", "val": "c3"}
-{"go_ok": true, "id": 493, "key": "a16e", "kind": "cpchunk", "map": 30, "pos": 8, "seed": "cpchunk_rand2", "sha": "2f2d2fc142ace3be", "val": "cf39cb959a248cb932"}
+{"go_ok": true, "go_val": "e8a3bea22f8cc91f", "id": 493, "key": "a16e", "kind": "cpchunk", "map": 30, "pos": 8, "seed": "cpchunk_rand2", "sha": "2f2d2fc142ace3be", "val": "cf39cb959a248cb932"}
 {"go_ok": false, "id": 494, "key": "a27a7a", "kind": "cpspver", "map": 0, "pos": 1, "seed": "cpspver_rand3", "sha": "68735f14784d82a8", "val": "c3"}
 {"go_ok": false, "id": 495, "key": "a17a", "kind": "cpchunk", "map": 33, "pos": 1, "seed": "cpchunk_rand3", "sha": "112422102c92c300", "val": "cfd6e3e1a2064c57fc"}
 {"go_ok": false, "id": 496, "key": "a17a", "kind": "cpchunk", "map": 23, "pos": 0, "seed": "cpchunk_rand0", "sha": "46505ba04a19a4c7", "val": "cfe5840f2d8224b876"}
-{"go_ok": true, "id": 497, "key": "a27a7a", "kind": "cpchunk", "map": 13, "pos": 0, "seed": "cp0_balances_1", "sha": "9ff71407944a0a44", "val": "80"}
-{"go_ok": true, "id": 498, "key": "a27a7a", "kind": "cpchunk", "map": 34, "pos": 3, "seed": "cpchunk_rand1", "sha": "022ebd955327898e", "val": "c0"}
-{"go_ok": true, "id": 499, "key": "a27a7a", "kind": "cpchunk", "map": 36, "pos": 2, "seed": "cpchunk_rand1", "sha": "1be071aa3a715ef5", "val": "c0"}
+{"go_ok": true, "go_val": "31f6caafb992cbe6", "id": 497, "key": "a27a7a", "kind": "cpchunk", "map": 13, "pos": 0, "seed": "cp0_balances_1", "sha": "9ff71407944a0a44", "val": "80"}
+{"go_ok": true, "go_val": "399c2e9a23e94f74", "id": 498, "key": "a27a7a", "kind": "cpchunk", "map": 34, "pos": 3, "seed": "cpchunk_rand1", "sha": "022ebd955327898e", "val": "c0"}
+{"go_ok": true, "go_val": "89f304ccf5c6d3d2", "id": 499, "key": "a27a7a", "kind": "cpchunk", "map": 36, "pos": 2, "seed": "cpchunk_rand1", "sha": "1be071aa3a715ef5", "val": "c0"}
 {"go_ok": false, "id": 500, "key": "a27a7a", "kind": "cpchunk", "map": 35, "pos": 1, "seed": "cpchunk_rand2", "sha": "7d645425f16e82d9", "val": "81a16101"}
 {"go_ok": false, "id": 501, "key": "a27a7a", "kind": "cpchunk", "map": 23, "pos": 1, "seed": "cpchunk_rand2", "sha": "10a687c85e59c62f", "val": "c3"}
 {"go_ok": false, "id": 502, "key": "a570726f746f", "kind": "cpchunk", "map": 1, "pos": 1, "seed": "cp0_balances_4", "sha": "ce39027c5a010ccc", "val": "d95968747470733a2f2f6769746875622e636f6d2f616c676f72616e64666f756e646174696f6e2f73706563732f747265652f37336334336234613936393933393038383463353165326139353938643439653238333733643130"}
-{"go_ok": true, "id": 503, "key": "", "kind": "cpspver", "map": -1, "pos": 0, "seed": "cpspver_rand3", "sha": "5094ed835b075fb3", "val": ""}
-{"go_ok": true, "id": 504, "key": "a27a7a", "kind": "cpchunk", "map": 2, "pos": 7, "seed": "cp1_balances_3", "sha": "1da7c07804d1da52", "val": "c40100"}
+{"go_ok": true, "go_val": "5094ed835b075fb3", "id": 503, "key": "", "kind": "cpspver", "map": -1, "pos": 0, "seed": "cpspver_rand3", "sha": "5094ed835b075fb3", "val": ""}
+{"go_ok": true, "go_val": "1da7c07804d1da52", "id": 504, "key": "a27a7a", "kind": "cpchunk", "map": 2, "pos": 7, "seed": "cp1_balances_3", "sha": "1da7c07804d1da52", "val": "c40100"}
 {"go_ok": false, "id": 505, "key": "a27a7a", "kind": "cpchunk", "map": 16, "pos": 2, "seed": "cpchunk_rand1", "sha": "e74c9c12144a75dc", "val": "01"}
 {"go_ok": false, "id": 506, "key": "a27a7a", "kind": "cpchunk", "map": 29, "pos": 3, "seed": "cpchunk_rand2", "sha": "d89177500bb38fc0", "val": "01"}
 {"go_ok": false, "id": 507, "key": "a27a7a", "kind": "cpheader", "map": 2, "pos": 2, "seed": "cp0_content", "sha": "78606969222172fc", "val": "c40100"}
-{"go_ok": true, "id": 508, "key": "a27a7a", "kind": "cpchunk", "map": 6, "pos": 1, "seed": "cp1_balances_4", "sha": "b36f467c7fb3d6f9", "val": "c3"}
+{"go_ok": true, "go_val": "b36f467c7fb3d6f9", "id": 508, "key": "a27a7a", "kind": "cpchunk", "map": 6, "pos": 1, "seed": "cp1_balances_4", "sha": "b36f467c7fb3d6f9", "val": "c3"}
 {"go_ok": false, "id": 509, "key": "a16c", "kind": "cpchunk", "map": 8, "pos": 1, "seed": "cp1_balances_1", "sha": "db14a6c3b30af5ef", "val": "ce000f481e"}
 {"go_ok": false, "id": 510, "key": "a165", "kind": "cpchunk", "map": 24, "pos": 2, "seed": "cpchunk_rand3", "sha": "fba7f303f27e13eb", "val": "b4178c59c9d35d5ab510cca6ddd8d7dfdd808d45de"}
 {"go_ok": false, "id": 511, "key": "a27a7a", "kind": "cpchunk", "map": 16, "pos": 0, "seed": "cpchunk_rand0", "sha": "41c87196d1a73d62", "val": "c40100"}
 {"go_ok": false, "id": 512, "key": "a3727764", "kind": "cpheader", "map": 0, "pos": 4, "seed": "cp0_content", "sha": "9865d36fec6aa34b", "val": "ce03d10df8"}
 {"go_ok": false, "id": 513, "key": "a27a7a", "kind": "cpheader", "map": 1, "pos": 4, "seed": "cp1_content", "sha": "52d161446fb13a09", "val": "c3"}
-{"go_ok": true, "id": 514, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cp0_balances_1", "sha": "6874d7bf09506cc7", "val": ""}
+{"go_ok": true, "go_val": "f2aee068ee2b1904", "id": 514, "key": "", "kind": "cpchunk", "map": -1, "pos": 0, "seed": "cp0_balances_1", "sha": "6874d7bf09506cc7", "val": ""}
 {"go_ok": false, "id": 515, "key": "a161", "kind": "cpchunk", "map": 16, "pos": 4, "seed": "cp1_balances_1", "sha": "4c4b5f38a6b68a0f", "val": "c42007154a9a1ba2638cf9257dd7acab79a4f6adce20b2cc00729c529c506779c8a4"}
 {"go_ok": false, "id": 516, "key": "a16a", "kind": "cpchunk", "map": 10, "pos": 1, "seed": "cpchunk_rand3", "sha": "e3b69c090663b779", "val": "c420e95de5c216196e661169be2ae945d5669d422e067f71a3f4c72eb5b782b79ac2"}
 {"go_ok": false, "id": 517, "key": "a27a7a", "kind": "cpchunk", "map": 5, "pos": 2, "seed": "cp1_balances_1", "sha": "5945711c072a6c6e", "val": "c0"}
-{"go_ok": true, "id": 518, "key": "a27a7a", "kind": "cpchunk", "map": 34, "pos": 0, "seed": "cpchunk_rand2", "sha": "07c02706a9c85876", "val": "c3"}
+{"go_ok": true, "go_val": "50225167d597723a", "id": 518, "key": "a27a7a", "kind": "cpchunk", "map": 34, "pos": 0, "seed": "cpchunk_rand2", "sha": "07c02706a9c85876", "val": "c3"}
 {"go_ok": false, "id": 519, "key": "a27a7a", "kind": "cpchunk", "map": 3, "pos": 0, "seed": "cp0_balances_1", "sha": "fbcb3a2dec5cc95d", "val": "a178"}
 {"go_ok": false, "id": 520, "key": "a27a7a", "kind": "cpchunk", "map": 4, "pos": 4, "seed": "cpchunk_rand2", "sha": "c789e7e04644d6bb", "val": "c3"}
 {"go_ok": false, "id": 521, "key": "a27a7a", "kind": "cpchunk", "map": 33, "pos": 1, "seed": "cpchunk_rand2", "sha": "6ccf704277b37380", "val": "a178"}
@@ -528,14 +528,14 @@
 {"go_ok": false, "id": 527, "key": "a27a7a", "kind": "cpchunk", "map": 0, "pos": 0, "seed": "cp0_balances_2", "sha": "16f7cf9cec36f7b4", "val": "c0"}
 {"go_ok": false, "id": 528, "key": "a461646472", "kind": "cpchunk", "map": 25, "pos": 1, "seed": "cpchunk_rand1", "sha": "8c45be63859bbfc5", "val": "c4201264feebcdd48857e5dded11d097af4cdfcc544d7489f3839c9f2209a8182085"}
 {"go_ok": false, "id": 529, "key": "a176", "kind": "cpchunk", "map": 0, "pos": 1, "seed": "cp1_balances_2", "sha": "e38fc1c51a7083a8", "val": "c420492521efce5e0e8a9d9768a3fb143bed7f8a716435bd49d4cf5ef22af6776d48"}
-{"go_ok": true, "id": 530, "key": "a27a7a", "kind": "cpchunk", "map": 10, "pos": 1, "seed": "cpchunk_rand0", "sha": "e248074a3c545caa", "val": "80"}
+{"go_ok": true, "go_val": "315f3e07f6e045d8", "id": 530, "key": "a27a7a", "kind": "cpchunk", "map": 10, "pos": 1, "seed": "cpchunk_rand0", "sha": "e248074a3c545caa", "val": "80"}
 {"go_ok": false, "id": 531, "key": "a27a7a", "kind": "cpchunk", "map": 8, "pos": 3, "seed": "cpchunk_rand3", "sha": "b4539a3b8fadcb46", "val": "80"}
 {"go_ok": false, "id": 532, "key": "a27a7a", "kind": "cpchunk", "map": 19, "pos": 0, "seed": "cp0_balances_1", "sha": "c012036dffef9efc", "val": "01"}
 {"go_ok": false, "id": 533, "key": "a27a7a", "kind": "cpchunk", "map": 31, "pos": 5, "seed": "cpchunk_rand3", "sha": "e525e4ebecedd780", "val": "c40100"}
 {"go_ok": false, "id": 534, "key": "a570726f746f", "kind": "cpchunk", "map": 14, "pos": 2, "seed": "cpchunk_rand1", "sha": "2f7a44972101116d", "val": "a178"}
 {"go_ok": false, "id": 535, "key": "a27a7a", "kind": "cpchunk", "map": 15, "pos": 15, "seed": "cpchunk_rand3", "sha": "44c692cf6f856f5a", "val": "c0"}
 {"go_ok": false, "id": 536, "key": "a16c", "kind": "cpchunk", "map": 17, "pos": 0, "seed": "cp1_balances_1", "sha": "a54b20140fd14b0e", "val": "82a2747402a275690a"}
-{"go_ok": true, "id": 537, "key": "a27a7a", "kind": "cpchunk", "map": 30, "pos": 7, "seed": "cpchunk_rand0", "sha": "70958057ebeadc90", "val": "c0"}
+{"go_ok": true, "go_val": "d0a4f4467e6d88a9", "id": 537, "key": "a27a7a", "kind": "cpchunk", "map": 30, "pos": 7, "seed": "cpchunk_rand0", "sha": "70958057ebeadc90", "val": "c0"}
 {"go_ok": false, "id": 538, "key": "a170", "kind": "cpchunk", "map": 13, "pos": 0, "seed": "cpchunk_rand3", "sha": "7179ca56f45ff764", "val": "81aafdf9e31aec111f98c79583a27462ac47b7e4e693edd550afb22370a27474cf75a3fe7a788ca3f6a27569cfdbb6b479789a93f7"}
 {"go_ok": false, "id": 539, "key": "a27a7a", "kind": "cpchunk", "map": 24, "pos": 0, "seed": "cpchunk_rand0", "sha": "dc043772aa1925b3", "val": "01"}
 {"go_ok": false, "id": 540, "key": "a165", "kind": "cpchunk", "map": 35, "pos": 2, "seed": "cpchunk_rand1", "sha": "5d41451a5b457308", "val": "c3"}
@@ -546,9 +546,256 @@
 {"go_ok": false, "id": 545, "key": "a27a7a", "kind": "cpchunk", "map": 8, "pos": 3, "seed": "cp0_balances_1", "sha": "16cca4cb361c9256", "val": "01"}
 {"go_ok": false, "id": 546, "key": "a27a7a", "kind": "cpchunk", "map": 7, "pos": 1, "seed": "cp1_balances_1", "sha": "997c42b990f9b0b6", "val": "80"}
 {"go_ok": false, "id": 547, "key": "a27a7a", "kind": "cpspver", "map": 1, "pos": 0, "seed": "cp1_stateProofVerificationContext", "sha": "a74166fc4c56414f", "val": "c3"}
-{"go_ok": true, "id": 548, "key": "a27a7a", "kind": "cpchunk", "map": 30, "pos": 9, "seed": "cpchunk_rand1", "sha": "764529188d0f06e1", "val": "c0"}
+{"go_ok": true, "go_val": "3781fa254e2f2ec2", "id": 548, "key": "a27a7a", "kind": "cpchunk", "map": 30, "pos": 9, "seed": "cpchunk_rand1", "sha": "764529188d0f06e1", "val": "c0"}
 {"go_ok": false, "id": 549, "key": "a27a7a", "kind": "cpchunk", "map": 1, "pos": 3, "seed": "cp0_balances_3", "sha": "494bab766b3a8015", "val": "a178"}
 {"go_ok": false, "id": 550, "key": "a164", "kind": "cpchunk", "map": 7, "pos": 1, "seed": "cp0_balances_1", "sha": "f3b4d476ef0ebf99", "val": "ce1e2added"}
 {"go_ok": false, "id": 551, "key": "a164", "kind": "cpchunk", "map": 13, "pos": 0, "seed": "cp1_balances_1", "sha": "58434599b01049d8", "val": "ce116831f6"}
 {"go_ok": false, "id": 552, "key": "a27a7a", "kind": "cpchunk", "map": 18, "pos": 1, "seed": "cpchunk_rand3", "sha": "52ea0ffef7ae1fa5", "val": "c3"}
 {"go_ok": false, "id": 553, "key": "a570726f746f", "kind": "cpchunk", "map": 3, "pos": 1, "seed": "cp0_balances_4", "sha": "95703702a0d10889", "val": "d95968747470733a2f2f6769746875622e636f6d2f616c676f72616e64666f756e646174696f6e2f73706563732f747265652f37336334336234613936393933393038383463353165326139353938643439653238333733643130"}
+{"go_ok": true, "go_val": "2fa3072c7e49d175", "id": 554, "key": "a161", "kind": "cpchunk", "map": 15, "pos": 1, "seed": "cp0_balances_1", "sha": "32f4df6bfb40217d", "val": "c0"}
+{"go_ok": true, "go_val": "5a2bce5b2eb5c85c", "id": 555, "key": "a461646472", "kind": "cpchunk", "map": 5, "pos": 3, "seed": "cp1_balances_3", "sha": "7bc12b97ab01c541", "val": "c40100"}
+{"go_ok": true, "go_val": "a9236748f4cb82fe", "id": 556, "key": "a176", "kind": "cpchunk", "map": 28, "pos": 2, "seed": "cpchunk_rand0", "sha": "565a82f784a9a1e1", "val": "c40100"}
+{"go_ok": true, "go_val": "58655c7b1a046ac6", "id": 557, "key": "a570726f746f", "kind": "cpchunk", "map": 36, "pos": 2, "seed": "cpchunk_rand1", "sha": "e22fdb35803c950c", "val": "c40100"}
+{"go_ok": true, "go_val": "6528d1f91c7a83f8", "id": 558, "key": "a27569", "kind": "cpchunk", "map": 26, "pos": 3, "seed": "cpchunk_rand0", "sha": "a811eafd5beee42c", "val": "cfef250b2176f9912b"}
+{"go_ok": true, "go_val": "8a8e0683299d4c79", "id": 559, "key": "b634585cce5f44eeee88e33367cbab232b759aa00ba9fa", "kind": "cpchunk", "map": 7, "pos": 0, "seed": "cpchunk_rand3", "sha": "ad58b4955fae9716", "val": "80"}
+{"go_ok": true, "go_val": "28e5bcfc9869eb0b", "id": 560, "key": "a36d6f6e", "kind": "cpheader", "map": 2, "pos": 1, "seed": "cp0_content", "sha": "a12acfbae56ff69b", "val": "c0"}
+{"go_ok": true, "go_val": "21bf95a2fe180c40", "id": 561, "key": "a36d6f6e", "kind": "cpheader", "map": 2, "pos": 2, "seed": "cpheader_rand2", "sha": "3a4fba7c15127505", "val": "c0"}
+{"go_ok": true, "go_val": "05c367d252cae97b", "id": 562, "key": "a26b76", "kind": "cpchunk", "map": 0, "pos": 1, "seed": "cpchunk_rand0", "sha": "190d82c904e1e3a2", "val": "c0"}
+{"go_ok": true, "go_val": "946879f4db6bd601", "id": 563, "key": "d939fe377b6a8955458ef08040d8d1be510918178f9795b1098a071c8da3ee5c6b12180b161302b658dab92a77033e596acd37c8cb7fad706d3d02", "kind": "cpchunk", "map": 12, "pos": 1, "seed": "cpchunk_rand3", "sha": "ff3f26406573997a", "val": "c0"}
+{"go_ok": true, "go_val": "55268852cf798bef", "id": 564, "key": "a145", "kind": "cpchunk", "map": 30, "pos": 11, "seed": "cpchunk_rand1", "sha": "6e138e3ad83504da", "val": "c0"}
+{"go_ok": true, "go_val": "1ba783d8c5b654db", "id": 565, "key": "a16c", "kind": "cpchunk", "map": 4, "pos": 1, "seed": "cp0_balances_1", "sha": "350fe5ab4fb76843", "val": "01"}
+{"go_ok": true, "go_val": "502e7338b9b2f3c1", "id": 566, "key": "a36d6f6e", "kind": "cpheader", "map": 2, "pos": 2, "seed": "cpheader_rand3", "sha": "a018ef7b3b485caf", "val": "c0"}
+{"go_ok": false, "id": 567, "key": "a16c", "kind": "cpchunk", "map": 13, "pos": 1, "seed": "cp1_balances_1", "sha": "3a6a14460eb26b63", "val": "ce000f3e83"}
+{"go_ok": true, "go_val": "8a439e2e7c0143f6", "id": 568, "key": "a16c", "kind": "cpchunk", "map": 13, "pos": 0, "seed": "cp0_balances_1", "sha": "9b88ee80c9824b7c", "val": "82a2747402a275690e"}
+{"go_ok": true, "go_val": "17332b4315c629d5", "id": 569, "key": "a67277646c766c", "kind": "cpchunk", "map": 2, "pos": 3, "seed": "cp1_balances_4", "sha": "17332b4315c629d5", "val": "cc9c"}
+{"go_ok": true, "go_val": "f6ca8e2afff5e821", "id": 570, "key": "a2626c", "kind": "cpchunk", "map": 0, "pos": 1, "seed": "cp1_balances_1", "sha": "2f515a2f0781c88c", "val": "9281a161c42007154a9a1ba2638cf9257dd7acab79a4f6adce20b2cc00729c529c506779c8a481a161c42007509cc7d610ac7003894be228def5dbbdb1e03e9f0813faee5a79c7aec6daa3"}
+{"go_ok": true, "go_val": "8f1b059e9912ef86", "id": 571, "key": "b1626c6f636b486561646572446967657374", "kind": "cpheader", "map": 0, "pos": 6, "seed": "cp0_content", "sha": "eea054aa37cc161f", "val": "c0"}
+{"go_ok": true, "go_val": "a2e90e9ff4170090", "id": 572, "key": "a27474", "kind": "cpchunk", "map": 8, "pos": 1, "seed": "cpchunk_rand0", "sha": "8fa14ae33c0d30e9", "val": "c0"}
+{"go_ok": true, "go_val": "ed4b0ffb9a7120ad", "id": 573, "key": "a176", "kind": "cpchunk", "map": 2, "pos": 0, "seed": "cp0_balances_2", "sha": "912f92fd4db58069", "val": "c0"}
+{"go_ok": false, "id": 574, "key": "a16c", "kind": "cpchunk", "map": 6, "pos": 1, "seed": "cp1_balances_1", "sha": "bcf45aa422bb8247", "val": "01"}
+{"go_ok": false, "id": 575, "key": "a162", "kind": "cpchunk", "map": 1, "pos": 3, "seed": "cp0_balances_1", "sha": "c2b7e7a203937852", "val": "cf000000e8f2c6b2c9"}
+{"go_ok": true, "go_val": "df2dca5d4d8a72a7", "id": 576, "key": "a36f7270", "kind": "cpchunk", "map": 0, "pos": 1, "seed": "cp1_balances_4", "sha": "ebdf623f3d6db45e", "val": "9281a46461746183a66f6e6c696e65cf00016bdab165ec00a570726f746fd95968747470733a2f2f6769746875622e636f6d2f616c676f72616e64666f756e646174696f6e2f73706563732f747265652f37336334336234613936393933393038383463353165326139353938643439653238333733643130a67277646c766ccc9b81a46461746183a66f6e6c696e65cf00016bdac93d7000a570726f746fd95968747470733a2f2f6769746875622e636f6d2f616c676f72616e64666f756e646174696f6e2f73706563732f747265652f37336334336234613936393933393038383463353165326139353938643439653238333733643130a67277646c766ccc9c"}
+{"go_ok": true, "go_val": "ed4b0ffb9a7120ad", "id": 577, "key": "a176", "kind": "cpchunk", "map": 1, "pos": 0, "seed": "cp0_balances_2", "sha": "f1bc9b49092d8d9f", "val": "c401ff"}
+{"go_ok": true, "go_val": "77c0683a5bb981ae", "id": 578, "key": "cf6b15907b2a617eba", "kind": "cpchunk", "map": 3, "pos": 0, "seed": "cpchunk_rand2", "sha": "b505632307d50bc7", "val": "c0"}
+{"go_ok": true, "go_val": "f2aee068ee2b1904", "id": 579, "key": "cd03e9", "kind": "cpchunk", "map": 17, "pos": 0, "seed": "cp0_balances_1", "sha": "59cde7edec8cff78", "val": "81a16cce000f44cd"}
+{"go_ok": true, "go_val": "d7ec796acaeb0a63", "id": 580, "key": "b2c247a104b2408e571c7dcb0f3590a04fd7f2", "kind": "cpchunk", "map": 7, "pos": 1, "seed": "cpchunk_rand0", "sha": "976ab61e0a7b8f23", "val": "80"}
+{"go_ok": true, "go_val": "7496f1c28597c770", "id": 581, "key": "a36d6f6e", "kind": "cpheader", "map": 2, "pos": 0, "seed": "cp1_content", "sha": "c61e273ee5cfc16f", "val": "cf00003a3986e13968"}
+{"go_ok": false, "id": 582, "key": "a163", "kind": "cpchunk", "map": 1, "pos": 2, "seed": "cpchunk_rand2", "sha": "00132365ad5805fc", "val": "cf7ca4c2e3a937a32d"}
+{"go_ok": true, "go_val": "529e3bd6ea99980a", "id": 583, "key": "a570726f746f", "kind": "cpchunk", "map": 2, "pos": 2, "seed": "cp0_balances_4", "sha": "529e3bd6ea99980a", "val": "c401ff"}
+{"go_ok": true, "go_val": "3fd7d9caf0dc65d1", "id": 584, "key": "a170", "kind": "cpchunk", "map": 4, "pos": 26, "seed": "cpchunk_rand2", "sha": "e4df2454a06fbbe4", "val": "80"}
+{"go_ok": true, "go_val": "e3b2aaf51a34be47", "id": 585, "key": "a36d6f6e", "kind": "cpheader", "map": 4, "pos": 0, "seed": "cp0_content", "sha": "19a8e2d739f1e4de", "val": "cf00003a3cbb2ea09f"}
+{"go_ok": true, "go_val": "08a2f3e5c60d9ef7", "id": 586, "key": "b4d3693c6080fe6dd0618873de544be61570924117", "kind": "cpchunk", "map": 20, "pos": 1, "seed": "cpchunk_rand0", "sha": "869bdbf7cc2c352f", "val": "81a27462d936f5325ebdb1076b1dd575601c6f9e8b52f7db1189769a67373c17da4073d0b016259168af3142dd49756b1ec254f4aa95e58e06ce4992"}
+{"go_ok": true, "go_val": "5434f26756998f12", "id": 587, "key": "d921bf5fbb65f75d5ce9557db0ac158e0e00e647b5970070875f9b20f5b3ee94b4c6e1", "kind": "cpchunk", "map": 5, "pos": 1, "seed": "cpchunk_rand3", "sha": "a1f577357ee0291a", "val": "c0"}
+{"go_ok": true, "go_val": "95c7e1ec96f063a4", "id": 588, "key": "cd03ea", "kind": "cpchunk", "map": 3, "pos": 1, "seed": "cp1_balances_1", "sha": "e13be83ec6e1f0b2", "val": "83a16e01a17081a16c81a2747402a17acd0259"}
+{"go_ok": true, "go_val": "eb05d7c904fc73d8", "id": 589, "key": "a161", "kind": "cpchunk", "map": 15, "pos": 2, "seed": "cp1_balances_1", "sha": "6866e988db9c0572", "val": "c42007509cc7d610ac7003894be228def5dbbdb1e03e9f0813faee5a79c7aec6daa3"}
+{"go_ok": true, "go_val": "2bc4f6580ca50d18", "id": 590, "key": "a75d9f1798136339", "kind": "cpchunk", "map": 18, "pos": 0, "seed": "cpchunk_rand2", "sha": "892c7d9892494775", "val": "80"}
+{"go_ok": true, "go_val": "ed4b0ffb9a7120ad", "id": 591, "key": "a26b76", "kind": "cpchunk", "map": 0, "pos": 0, "seed": "cp0_balances_2", "sha": "b9c431cc25c82851", "val": "9281a16bc41462783a00000000000003ea62000000000000002581a16bc41462783a00000000000003ea620000000000000031"}
+{"go_ok": true, "go_val": "cac133d9dff95cbe", "id": 592, "key": "a27077", "kind": "cpspver", "map": 1, "pos": 4, "seed": "cpspver_rand0", "sha": "eadb85ed51e4a071", "val": "c0"}
+{"go_ok": true, "go_val": "4e8983543b9acb2e", "id": 593, "key": "a3727764", "kind": "cpheader", "map": 2, "pos": 2, "seed": "cpheader_rand0", "sha": "9d9750b31cf737df", "val": "c0"}
+{"go_ok": true, "go_val": "b11b9498814012a4", "id": 594, "key": "a17a", "kind": "cpchunk", "map": 9, "pos": 4, "seed": "cpchunk_rand2", "sha": "5cc59343b49027f5", "val": "cf25afabd3592d9eb1"}
+{"go_ok": true, "go_val": "22c4b62862197eff", "id": 595, "key": "b9ca28d158e2c069318c6487b1a31e27392a79d414abb15222eb", "kind": "cpchunk", "map": 23, "pos": 0, "seed": "cpchunk_rand3", "sha": "5f918819f5fa329b", "val": "c0"}
+{"go_ok": true, "go_val": "20537a5dc4c8d4bc", "id": 596, "key": "a464617461", "kind": "cpchunk", "map": 33, "pos": 2, "seed": "cpchunk_rand2", "sha": "b82e1523b6f1822b", "val": "c0"}
+{"go_ok": true, "go_val": "820d7d0378177d01", "id": 597, "key": "a170", "kind": "cpchunk", "map": 12, "pos": 1, "seed": "cp1_balances_1", "sha": "2af411c75a800f8a", "val": "81a16c82a2747402a2756907"}
+{"go_ok": true, "go_val": "c76ede5c2f7141ac", "id": 598, "key": "a570726f746f", "kind": "cpchunk", "map": 34, "pos": 1, "seed": "cpchunk_rand0", "sha": "b5ffd067420e39b1", "val": "c401ff"}
+{"go_ok": true, "go_val": "8f8ff770f7a9f224", "id": 599, "key": "a67277646c766c", "kind": "cpheader", "map": 1, "pos": 2, "seed": "cpheader_rand2", "sha": "14e18f89d56bd171", "val": "c0"}
+{"go_ok": true, "go_val": "cb55d86ad616137b", "id": 600, "key": "a144", "kind": "cpchunk", "map": 32, "pos": 6, "seed": "cpchunk_rand3", "sha": "512f2584c6ee4020", "val": "cfd40b9dc14965e7fd"}
+{"go_ok": true, "go_val": "eac6fed16c5a0d5a", "id": 601, "key": "a170", "kind": "cpchunk", "map": 5, "pos": 1, "seed": "cp0_balances_1", "sha": "f0cc61f029ba91bc", "val": "81a16c82a2747402a2756906"}
+{"go_ok": true, "go_val": "63e21856481878e4", "id": 602, "key": "d9297e75e3f6ee3567b7cd325a450ca9eaafdd0326b8da99682c36c05584717b7196bfe9c28339c90d2757", "kind": "cpchunk", "map": 25, "pos": 1, "seed": "cpchunk_rand0", "sha": "51b25fb1efbae5c2", "val": "80"}
+{"go_ok": true, "go_val": "7496f1c28597c770", "id": 603, "key": "a66f6e6c696e65", "kind": "cpheader", "map": 1, "pos": 1, "seed": "cp1_content", "sha": "229bb72bba7970bc", "val": "80"}
+{"go_ok": true, "go_val": "9bd1d487396f9cc4", "id": 604, "key": "d92b272f85b17746cbc14c0f4cdde2a60f0cd22e004f4aee25a054a7981f3afbde63086bd57dd5bb3ed369399d", "kind": "cpchunk", "map": 7, "pos": 1, "seed": "cpchunk_rand2", "sha": "83b5103efe3c18bf", "val": "c0"}
+{"go_ok": true, "go_val": "726c793a530fb3a4", "id": 605, "key": "a16e", "kind": "cpchunk", "map": 19, "pos": 3, "seed": "cp0_balances_1", "sha": "79bb1085807adebf", "val": "c0"}
+{"go_ok": true, "go_val": "e3b2aaf51a34be47", "id": 606, "key": "a76e6f7470617274", "kind": "cpheader", "map": 1, "pos": 1, "seed": "cp0_content", "sha": "22be99a6b777c1dc", "val": "80"}
+{"go_ok": false, "id": 607, "key": "a176", "kind": "cpchunk", "map": 27, "pos": 2, "seed": "cpchunk_rand3", "sha": "aefe803154d1fa35", "val": "cff1cb838ca404fb4a"}
+{"go_ok": true, "go_val": "c925ad75e5f95fa7", "id": 608, "key": "b0d848e463d014bbb0ff7db0d55a2fbcd8", "kind": "cpchunk", "map": 18, "pos": 1, "seed": "cpchunk_rand3", "sha": "96f07b5635c8e03f", "val": "80"}
+{"go_ok": true, "go_val": "cb31410b7c2b9653", "id": 609, "key": "a16c", "kind": "cpchunk", "map": 4, "pos": 2, "seed": "cp1_balances_1", "sha": "45b3373c0e271760", "val": "01"}
+{"go_ok": true, "go_val": "2b36282a1291eec8", "id": 610, "key": "a16b", "kind": "cpchunk", "map": 9, "pos": 29, "seed": "cpchunk_rand1", "sha": "4360dfad7034c9ee", "val": "c42004f82da3b49c97ba89951afebda9d77d5d1de6fc5d98a8715fdc19588036eada"}
+{"go_ok": true, "go_val": "712a4eaa8c8cdb07", "id": 611, "key": "a67277646c766c", "kind": "cpchunk", "map": 36, "pos": 3, "seed": "cpchunk_rand2", "sha": "59b8ac0d935028d7", "val": "c0"}
+{"go_ok": true, "go_val": "301af5b22c0cf4cd", "id": 612, "key": "a66f6e6c696e65", "kind": "cpchunk", "map": 6, "pos": 0, "seed": "cp1_balances_4", "sha": "301af5b22c0cf4cd", "val": "c0"}
+{"go_ok": false, "id": 613, "key": "cf1560b3124a2e34bb", "kind": "cpchunk", "map": 16, "pos": 2, "seed": "cpchunk_rand3", "sha": "1e4c99fe24d243b5", "val": "80"}
+{"go_ok": true, "go_val": "46043e8b98f9cd39", "id": 614, "key": "a67277646c766c", "kind": "cpchunk", "map": 34, "pos": 2, "seed": "cpchunk_rand3", "sha": "771af06e5841f3b6", "val": "c0"}
+{"go_ok": true, "go_val": "6a269fa006da0845", "id": 615, "key": "a36e6f62", "kind": "cpchunk", "map": 5, "pos": 1, "seed": "cp0_balances_3", "sha": "66ed329dbfd59da6", "val": "cf000000e8d4ad5bed"}
+{"go_ok": true, "go_val": "2351e37b6f3873b6", "id": 616, "key": "a142", "kind": "cpchunk", "map": 32, "pos": 8, "seed": "cpchunk_rand1", "sha": "257ffe34f4a2a406", "val": "c42076ec14c926983a07c6cea26827aede5b3b80f0042bf66a6add3223f542c1dd22"}
+{"go_ok": true, "go_val": "94d7e0dd9ab826e6", "id": 617, "key": "a27077", "kind": "cpspver", "map": 1, "pos": 1, "seed": "cpspver_rand2", "sha": "d4dcf5f65b397dc5", "val": "c0"}
+{"go_ok": true, "go_val": "95c7e1ec96f063a4", "id": 618, "key": "cd03ea", "kind": "cpchunk", "map": 17, "pos": 1, "seed": "cp1_balances_1", "sha": "09fc797d3eb82b0f", "val": "81a16e01"}
+{"go_ok": true, "go_val": "4950d4078e831f17", "id": 619, "key": "a27474", "kind": "cpchunk", "map": 13, "pos": 1, "seed": "cpchunk_rand2", "sha": "5e17ed9a5225a681", "val": "cf13a99a0581c8ac4f"}
+{"go_ok": true, "go_val": "7b10329edd328bf6", "id": 620, "key": "a27474", "kind": "cpchunk", "map": 14, "pos": 2, "seed": "cp0_balances_1", "sha": "6b8c0124e3224a24", "val": "c0"}
+{"go_ok": true, "go_val": "d11e85959f7a6383", "id": 621, "key": "a17a", "kind": "cpchunk", "map": 4, "pos": 22, "seed": "cpchunk_rand1", "sha": "dbb4fd3708c0b2e1", "val": "cf55e08f64194c63f2"}
+{"go_ok": true, "go_val": "7496f1c28597c770", "id": 622, "key": "a36d6f6e", "kind": "cpheader", "map": 4, "pos": 0, "seed": "cp1_content", "sha": "9d3e60f4d87ab069", "val": "cf00003a3986e13968"}
+{"go_ok": true, "go_val": "d22441829f70c595", "id": 623, "key": "a164", "kind": "cpchunk", "map": 9, "pos": 2, "seed": "cp1_balances_1", "sha": "8af378ba7604a3c7", "val": "c0"}
+{"go_ok": true, "go_val": "70240b78c2fced24", "id": 624, "key": "cf37cd116e4e66c7da", "kind": "cpchunk", "map": 16, "pos": 2, "seed": "cpchunk_rand2", "sha": "3deb8045321f009a", "val": "81a141cf2e8b87a9dff7ba77"}
+{"go_ok": true, "go_val": "3b6c7d4245a04ba3", "id": 625, "key": "ad62616c616e636573526f756e64", "kind": "cpheader", "map": 0, "pos": 11, "seed": "cpheader_rand1", "sha": "028d7061948d2154", "val": "c0"}
+{"go_ok": true, "go_val": "10d4e1b17de1510e", "id": 626, "key": "a27077", "kind": "cpspver", "map": 2, "pos": 2, "seed": "cp1_stateProofVerificationContext", "sha": "aa44176d939300b7", "val": "cf00016cbeb46af3d6"}
+{"go_ok": true, "go_val": "8e5f593ccade11c3", "id": 627, "key": "a172", "kind": "cpchunk", "map": 4, "pos": 24, "seed": "cpchunk_rand0", "sha": "d0d30e7adc924c56", "val": "c401c8"}
+{"go_ok": true, "go_val": "dd0ca3531eab568e", "id": 628, "key": "a164", "kind": "cpchunk", "map": 16, "pos": 4, "seed": "cp0_balances_1", "sha": "78e9e65210e6317b", "val": "ce1e2added"}
+{"go_ok": true, "go_val": "f672585410e2317c", "id": 629, "key": "a5ded9d99630", "kind": "cpchunk", "map": 10, "pos": 1, "seed": "cpchunk_rand0", "sha": "311fb780ac46b10a", "val": "80"}
+{"go_ok": false, "id": 630, "key": "a163", "kind": "cpchunk", "map": 15, "pos": 15, "seed": "cpchunk_rand1", "sha": "0a663798718e07a8", "val": "c3"}
+{"go_ok": true, "go_val": "67c6b1a22987ac1b", "id": 631, "key": "a16e", "kind": "cpchunk", "map": 19, "pos": 3, "seed": "cp1_balances_1", "sha": "18b71d0eb22e7152", "val": "c0"}
+{"go_ok": true, "go_val": "05c367d252cae97b", "id": 632, "key": "a176", "kind": "cpchunk", "map": 27, "pos": 0, "seed": "cpchunk_rand0", "sha": "f6ed19efd42bdc11", "val": "c40100"}
+{"go_ok": false, "id": 633, "key": "a163", "kind": "cpchunk", "map": 1, "pos": 3, "seed": "cpchunk_rand0", "sha": "43b1536b65d6efa6", "val": "cfa97643957d3f9967"}
+{"go_ok": true, "go_val": "ffd23cd7d50b7430", "id": 634, "key": "a461646472", "kind": "cpchunk", "map": 29, "pos": 1, "seed": "cpchunk_rand3", "sha": "2c0a8a92c306645c", "val": "c40100"}
+{"go_ok": true, "go_val": "83cb3f842a206480", "id": 635, "key": "a27077", "kind": "cpspver", "map": 3, "pos": 2, "seed": "cp0_stateProofVerificationContext", "sha": "d42f92fd2b43f45d", "val": "cf00016be01839d400"}
+{"go_ok": true, "go_val": "6ea3090379ebe884", "id": 636, "key": "a17a", "kind": "cpchunk", "map": 16, "pos": 3, "seed": "cp1_balances_1", "sha": "7fa9fda7e2895b37", "val": "c0"}
+{"go_ok": true, "go_val": "ae1cea2823d9c1ee", "id": 637, "key": "a27474", "kind": "cpchunk", "map": 11, "pos": 2, "seed": "cpchunk_rand1", "sha": "a6e894b7cce25fe8", "val": "cfc53305c81ceb2034"}
+{"go_ok": true, "go_val": "fff1efeec65044a5", "id": 638, "key": "d93d779378492f3d6f4c724e8e93bbd68aca7cc4d32a2cdb5e663744030abacfdca47e6bedf2d20c56476e02b951e50a702d4e94b49e5abaf505e93aa104b8", "kind": "cpchunk", "map": 20, "pos": 0, "seed": "cpchunk_rand3", "sha": "3b16428e0e4c86ca", "val": "c0"}
+{"go_ok": false, "id": 639, "key": "a162", "kind": "cpchunk", "map": 14, "pos": 3, "seed": "cpchunk_rand3", "sha": "798f3b502483e346", "val": "ce1b973920"}
+{"go_ok": true, "go_val": "7496f1c28597c770", "id": 640, "key": "a36d6f6e", "kind": "cpheader", "map": 3, "pos": 0, "seed": "cp1_content", "sha": "3933985f48668d9b", "val": "c0"}
+{"go_ok": true, "go_val": "d611914ef08da15d", "id": 641, "key": "a33eacb2", "kind": "cpchunk", "map": 25, "pos": 1, "seed": "cpchunk_rand3", "sha": "78b61780eccf399e", "val": "80"}
+{"go_ok": true, "go_val": "6a7a9e1794a90fa9", "id": 642, "key": "a16b", "kind": "cpchunk", "map": 28, "pos": 2, "seed": "cpchunk_rand3", "sha": "e3c42faf8a0502bc", "val": "c42080be5f05c5c7b965528028469ec6499b2fc942a422f925c59728bbcb094dfba1"}
+{"go_ok": true, "go_val": "3e89252bcb1f4bc7", "id": 643, "key": "ad6163636f756e7473436f756e74", "kind": "cpheader", "map": 0, "pos": 3, "seed": "cpheader_rand3", "sha": "148ef03f1bcb8585", "val": "c0"}
+{"go_ok": true, "go_val": "11a36b1ceca3b275", "id": 644, "key": "a176", "kind": "cpspver", "map": 1, "pos": 2, "seed": "cp1_stateProofVerificationContext", "sha": "34bdae6fb4598bcc", "val": "c401ff"}
+{"go_ok": true, "go_val": "7b6b2478f939811a", "id": 645, "key": "a176", "kind": "cpspver", "map": 2, "pos": 4, "seed": "cp0_stateProofVerificationContext", "sha": "71d6055733c56350", "val": "c0"}
+{"go_ok": true, "go_val": "4704b3dc4b4db474", "id": 646, "key": "a464617461", "kind": "cpchunk", "map": 29, "pos": 2, "seed": "cpchunk_rand0", "sha": "32fd3e85b1069c8b", "val": "83a66f6e6c696e65cff5fbee6c792768afa570726f746fa1b3a67277646c766ccff15c00cfdb1b2a6f"}
+{"go_ok": true, "go_val": "417544e572a4b662", "id": 647, "key": "a464617461", "kind": "cpchunk", "map": 5, "pos": 0, "seed": "cp0_balances_4", "sha": "6fc82dc9cf308e96", "val": "81a66f6e6c696e65cf00016beecf3d4c00"}
+{"go_ok": true, "go_val": "76be8b528d0075f7", "id": 648, "key": "a36f7270", "kind": "cpchunk", "map": 0, "pos": 1, "seed": "cp0_balances_4", "sha": "261abfb412eaaefd", "val": "c0"}
+{"go_ok": true, "go_val": "05c367d252cae97b", "id": 649, "key": "cf4d4a4bd8a9c76029", "kind": "cpchunk", "map": 16, "pos": 0, "seed": "cpchunk_rand0", "sha": "17f75492e596fe89", "val": "80"}
+{"go_ok": true, "go_val": "28f2c9b74bae7460", "id": 650, "key": "a163", "kind": "cpchunk", "map": 15, "pos": 4, "seed": "cpchunk_rand3", "sha": "8ee475797a5bf2e6", "val": "cfb4363ee3e55b88e0"}
+{"go_ok": true, "go_val": "55f3a2fee7c9708c", "id": 651, "key": "a159", "kind": "cpchunk", "map": 30, "pos": 6, "seed": "cpchunk_rand3", "sha": "5c15ab0a21ae7163", "val": "cf832e222747396c68"}
+{"go_ok": true, "go_val": "66aa9cefc3e60cc0", "id": 652, "key": "a36d6f6e", "kind": "cpheader", "map": 2, "pos": 2, "seed": "cpheader_rand1", "sha": "923ecfe854f690b0", "val": "c0"}
+{"go_ok": true, "go_val": "05c367d252cae97b", "id": 653, "key": "cf411cf06bd2691b79", "kind": "cpchunk", "map": 3, "pos": 1, "seed": "cpchunk_rand0", "sha": "099c93c4288ab1f3", "val": "c0"}
+{"go_ok": true, "go_val": "6194d29ac158c2b6", "id": 654, "key": "a464617461", "kind": "cpchunk", "map": 3, "pos": 1, "seed": "cp1_balances_4", "sha": "f45527b638771394", "val": "80"}
+{"go_ok": true, "go_val": "c108ec09a87a3a4b", "id": 655, "key": "a27474", "kind": "cpchunk", "map": 19, "pos": 1, "seed": "cpchunk_rand2", "sha": "306b124358bc4ac6", "val": "cf13a99a0581c8ac4f"}
+{"go_ok": true, "go_val": "08a590ceb684c93c", "id": 656, "key": "a145", "kind": "cpchunk", "map": 32, "pos": 11, "seed": "cpchunk_rand0", "sha": "7442ab979dbfa134", "val": "cf2704123a3b515311"}
+{"go_ok": true, "go_val": "2d9b8b860e110f30", "id": 657, "key": "a176", "kind": "cpchunk", "map": 3, "pos": 1, "seed": "cp1_balances_2", "sha": "9ff726a327675725", "val": "c401ff"}
+{"go_ok": true, "go_val": "7a55a57ee71c7435", "id": 658, "key": "a173", "kind": "cpchunk", "map": 17, "pos": 9, "seed": "cpchunk_rand3", "sha": "73d155e7c44c7ed3", "val": "81d939fe377b6a8955458ef08040d8d1be510918178f9795b1098a071c8da3ee5c6b12180b161302b658dab92a77033e596acd37c8cb7fad706d3d0280"}
+{"go_ok": true, "go_val": "77bd254623a171de", "id": 659, "key": "d9214efa79510aabc1c52f91600c205c03fd7b65fe8eec90176730d2bbb35834250303", "kind": "cpchunk", "map": 25, "pos": 0, "seed": "cpchunk_rand2", "sha": "dee085ca5f7ebafd", "val": "c0"}
+{"go_ok": true, "go_val": "76be8b528d0075f7", "id": 660, "key": "a3737064", "kind": "cpspver", "map": 0, "pos": 1, "seed": "cpspver_rand3", "sha": "ac7e16ff2f69cfe5", "val": "90"}
+{"go_ok": true, "go_val": "7a942c79bf12395e", "id": 661, "key": "a3737064", "kind": "cpspver", "map": 0, "pos": 1, "seed": "cp0_stateProofVerificationContext", "sha": "20c9adadc47a0bfb", "val": "9484a27077cf00016cbeb46af3d6a77370726f756e64cd0200a176d95968747470733a2f2f6769746875622e636f6d2f616c676f72616e64666f756e646174696f6e2f73706563732f747265652f37336334336234613936393933393038383463353165326139353938643439653238333733643130a27663c4409fa293d34d7f0bbb52a9b77c58a3a6eba7374376ce98a4f6cb77bd89901844bdba5ff45baad986a0d574ac924032ef2712dd2bebb36d4ba5a890c2d75ab7e80b84a27077cf00016be01839d400a77370726f756e64cd0300a176d95968747470733a2f2f6769746875622e636f6d2f616c676f72616e64666f756e646174696f6e2f73706563732f747265652f37336334336234613936393933393038383463353165326139353938643439653238333733643130a27663c4403fa9138fefd6daa44fa3086b8ef4ff5fb4c8f15dcaa4461945c0983af73dbddbfdeab601ee4ff6720800fbc511d0a6983eb9eb134c28cbadf1e08bbca963964d84a27077cf00016cd356a5b2c1a77370726f756e64cd0400a176d95968747470733a2f2f6769746875622e636f6d2f616c676f72616e64666f756e646174696f6e2f73706563732f747265652f37336334336234613936393933393038383463353165326139353938643439653238333733643130a27663c4401dc7ae81af27d60c1702058773e3fb2d716b8100a75b46005113b10c7a1d444582ef90ec9322fcacca705db6dc417ec5aa5ba164edd36451e34beb965c3e19d184a27077cf00016cbeb46af3d6a77370726f756e64cd0200a176d95968747470733a2f2f6769746875622e636f6d2f616c676f72616e64666f756e646174696f6e2f73706563732f747265652f37336334336234613936393933393038383463353165326139353938643439653238333733643130a27663c4409fa293d34d7f0bbb52a9b77c58a3a6eba7374376ce98a4f6cb77bd89901844bdba5ff45baad986a0d574ac924032ef2712dd2bebb36d4ba5a890c2d75ab7e80b"}
+{"go_ok": true, "go_val": "3b5c99cef151abc1", "id": 662, "key": "a145", "kind": "cpchunk", "map": 2, "pos": 8, "seed": "cp1_balances_3", "sha": "3b5c99cef151abc1", "val": "c0"}
+{"go_ok": true, "go_val": "e3c8f93a5ccc3b5d", "id": 663, "key": "ad6163636f756e7473436f756e74", "kind": "cpheader", "map": 0, "pos": 9, "seed": "cp1_content", "sha": "3bf84b3eab696f37", "val": "c0"}
+{"go_ok": true, "go_val": "77c0683a5bb981ae", "id": 664, "key": "a16b", "kind": "cpchunk", "map": 27, "pos": 0, "seed": "cpchunk_rand2", "sha": "cb064aa87e64f58a", "val": "c401ff"}
+{"go_ok": true, "go_val": "64d19d639f20b226", "id": 665, "key": "a26b76", "kind": "cpchunk", "map": 0, "pos": 1, "seed": "cp1_balances_2", "sha": "c6f6ef23aecd655b", "val": "9482a16bc41462783a00000000000003ea620000000000000025a176c4200b0bec5ddff2a99c34be7945032f1f0cc53cd332f81ac205e2a94dbcd196883582a16bc41462783a00000000000003ea62000000000000002ba176c420492521efce5e0e8a9d9768a3fb143bed7f8a716435bd49d4cf5ef22af6776d4882a16bc41462783a00000000000003ea620000000000000030a176c4206fa3f233fe07bd783c254e7c219f30c4f0bf9e0b68e76aa8ded52fec9e7db03c82a16bc41462783a00000000000003ea620000000000000025a176c4200b0bec5ddff2a99c34be7945032f1f0cc53cd332f81ac205e2a94dbcd1968835"}
+{"go_ok": true, "go_val": "07eb2d70d2b2e5cc", "id": 666, "key": "a175", "kind": "cpchunk", "map": 22, "pos": 5, "seed": "cpchunk_rand0", "sha": "b40f6e143e4ba9e7", "val": "cf997c3495e5cab06c"}
+{"go_ok": true, "go_val": "ce7b1e6c66724360", "id": 667, "key": "b3f498924d43146f46b7e66666a3bab1e3dd6f59", "kind": "cpchunk", "map": 10, "pos": 1, "seed": "cpchunk_rand1", "sha": "a3ebced9d082d066", "val": "c0"}
+{"go_ok": true, "go_val": "82de21fec7f2461b", "id": 668, "key": "a3726e64", "kind": "cpchunk", "map": 33, "pos": 2, "seed": "cpchunk_rand0", "sha": "dc09a781c44e8dde", "val": "c0"}
+{"go_ok": true, "go_val": "6de180d777d1dc70", "id": 669, "key": "a27474", "kind": "cpchunk", "map": 13, "pos": 0, "seed": "cpchunk_rand0", "sha": "adf5a90a038d81a5", "val": "c0"}
+{"go_ok": true, "go_val": "f6a1ce2c855c3d2f", "id": 670, "key": "a146", "kind": "cpchunk", "map": 30, "pos": 11, "seed": "cpchunk_rand2", "sha": "098598fee9f72a57", "val": "c440c7c9959e95b46097108623785d3aa1a2dc7d9199ed154be81247e37f60bad31460066021b2bfc55549398ec72fc24e6c9d69e75a82681ab5ee63afb92a116f50"}
+{"go_ok": true, "go_val": "ae998c0fcbe56146", "id": 671, "key": "a6b7ca68a1559d", "kind": "cpchunk", "map": 18, "pos": 1, "seed": "cpchunk_rand0", "sha": "d7bafbcc90369cf0", "val": "80"}
+{"go_ok": true, "go_val": "864723ac0d765357", "id": 672, "key": "a166", "kind": "cpchunk", "map": 9, "pos": 7, "seed": "cp0_balances_1", "sha": "753b1f95af5f071d", "val": "c0"}
+{"go_ok": true, "go_val": "76be8b528d0075f7", "id": 673, "key": "a26f61", "kind": "cpchunk", "map": 0, "pos": 1, "seed": "cp0_balances_3", "sha": "3635a0dadcf45e2e", "val": "90"}
+{"go_ok": true, "go_val": "417544e572a4b662", "id": 674, "key": "a3726e64", "kind": "cpchunk", "map": 3, "pos": 1, "seed": "cp0_balances_4", "sha": "4c2d607522405586", "val": "c0"}
+{"go_ok": true, "go_val": "d31dc3c6dc443f5b", "id": 675, "key": "a27077", "kind": "cpspver", "map": 1, "pos": 4, "seed": "cp0_stateProofVerificationContext", "sha": "ec4cb171fe106ea5", "val": "cf00016be01839d400"}
+{"go_ok": true, "go_val": "03068ebe1818b136", "id": 676, "key": "d9221b1b89e5118a8eb103c0931114b9032d06ba29cce6cfec844d04afa9cac46905b784", "kind": "cpchunk", "map": 5, "pos": 1, "seed": "cpchunk_rand0", "sha": "0cf1f496051a467a", "val": "c0"}
+{"go_ok": true, "go_val": "0c947b76f9efb49e", "id": 677, "key": "a570726f746f", "kind": "cpchunk", "map": 4, "pos": 2, "seed": "cp1_balances_4", "sha": "0c947b76f9efb49e", "val": "c401ff"}
+{"go_ok": false, "id": 678, "key": "a161", "kind": "cpchunk", "map": 1, "pos": 1, "seed": "cpchunk_rand3", "sha": "1a134404250d4a86", "val": "cf0bd0b1b763e4417c"}
+{"go_ok": true, "go_val": "05c367d252cae97b", "id": 679, "key": "a3766c76", "kind": "cpchunk", "map": 31, "pos": 3, "seed": "cpchunk_rand0", "sha": "ce5649c11ecf3158", "val": "cf0b79be1fadd71629"}
+{"go_ok": true, "go_val": "4aa532e24f9b06f4", "id": 680, "key": "a27474", "kind": "cpchunk", "map": 21, "pos": 1, "seed": "cp0_balances_1", "sha": "2602b6e592f4ba01", "val": "c0"}
+{"go_ok": true, "go_val": "6c226936f3bf6b1a", "id": 681, "key": "a166", "kind": "cpchunk", "map": 2, "pos": 2, "seed": "cp0_balances_1", "sha": "fd3cf301cec2ac13", "val": "c0"}
+{"go_ok": true, "go_val": "0e65927fcabf2109", "id": 682, "key": "a27474", "kind": "cpchunk", "map": 21, "pos": 0, "seed": "cpchunk_rand1", "sha": "72d40f29074158ae", "val": "cfc53305c81ceb2034"}
+{"go_ok": true, "go_val": "cca443259a5509d4", "id": 683, "key": "a16b", "kind": "cpchunk", "map": 2, "pos": 2, "seed": "cp1_balances_2", "sha": "e2472aefb0d7ae94", "val": "c0"}
+{"go_ok": true, "go_val": "fdad9dbdaa6c1bdc", "id": 684, "key": "a27462", "kind": "cpchunk", "map": 11, "pos": 2, "seed": "cpchunk_rand3", "sha": "e9aab59bd84a3250", "val": "d93ffac09adbe53fd898cfa59adf0079f389c9a2f660f4751ea27eb8744fde99fa691ef0f638931ef959a63b0f493c61b4b699f7a515fae367b54870ee1e038a8a"}
+{"go_ok": true, "go_val": "d2fbc294d4554814", "id": 685, "key": "a0", "kind": "cpchunk", "map": 20, "pos": 0, "seed": "cpchunk_rand1", "sha": "0946645308fd5581", "val": "81a27462a87e2833a15f70531c"}
+{"go_ok": true, "go_val": "bb3a61a89713888f", "id": 686, "key": "a464617461", "kind": "cpchunk", "map": 35, "pos": 2, "seed": "cpchunk_rand0", "sha": "012bb0e39cc6c960", "val": "8ba141c42076849696ad7d54bca7e4a1dc90d9b96b0b7d9286185307b8d63abe149b637e58a142c4204df9bcb92fd6a5d1b8059d01a48bb1f2646e1734b0a1369966fb79922eb41f62a143cf6ed7f1bcd43e0f03a144cff9f646c127a5eabba145cf7460b7dc8740d517a146c440b25d2f2804d19e8b24fdb88fe99f8b432fb409bc8b24cd56020f477365b043f68dad94a57316800bf133551c1c1bcbe8ff18f3f9ee71344dc6a1f0b5799c4de3a156cf0fd31f235b54adada157cf5a33f1d294d5a65ba158c3a159cf34c74a163926b237a15acf0d28922a77d8bbfb"}
+{"go_ok": true, "go_val": "cbd55c52eac7d02b", "id": 687, "key": "a27474", "kind": "cpchunk", "map": 14, "pos": 1, "seed": "cp1_balances_1", "sha": "11e4997f923f38d8", "val": "c0"}
+{"go_ok": true, "go_val": "665c684af3b100f3", "id": 688, "key": "a461646472", "kind": "cpchunk", "map": 31, "pos": 1, "seed": "cpchunk_rand3", "sha": "1f8645950f44ee10", "val": "c0"}
+{"go_ok": true, "go_val": "3b4537d674411656", "id": 689, "key": "d922dd63fc817717a5dee08548c73153a970aa19202a50f80e2e0ee090eb0d8e85d33c7c", "kind": "cpchunk", "map": 5, "pos": 1, "seed": "cpchunk_rand2", "sha": "ec0a85c123a0b747", "val": "81a27462d924488baef8afb435b6e49153f143adf3d5d2342dbbd44c2f466b81ab328f138b1056fa4b92"}
+{"go_ok": true, "go_val": "f9daaaa7e5eda57f", "id": 690, "key": "d9244e7e6c2b70aa48ea42e5b6af2a86df1f302876b4253fc3b79350ae8360a86f597cb1991e", "kind": "cpchunk", "map": 7, "pos": 1, "seed": "cpchunk_rand1", "sha": "2fb383a81ad948f8", "val": "80"}
+{"go_ok": true, "go_val": "7aaf7d6a863d9a5b", "id": 691, "key": "a464617461", "kind": "cpchunk", "map": 35, "pos": 0, "seed": "cpchunk_rand3", "sha": "d4c562401172cf03", "val": "83a66f6e6c696e65cf8d54da0c44dcfbd6a570726f746fa1b9a67277646c766ccfeee546ba84b71071"}
+{"go_ok": true, "go_val": "97f085a369d591e6", "id": 692, "key": "a15a", "kind": "cpchunk", "map": 2, "pos": 4, "seed": "cp0_balances_3", "sha": "97f085a369d591e6", "val": "c0"}
+{"go_ok": false, "id": 693, "key": "a16d", "kind": "cpchunk", "map": 2, "pos": 2, "seed": "cpchunk_rand2", "sha": "dca303be300f829c", "val": "c3"}
+{"go_ok": true, "go_val": "08c2266f88d5cfee", "id": 694, "key": "a17a", "kind": "cpchunk", "map": 18, "pos": 0, "seed": "cp1_balances_1", "sha": "13ea5c34ba31e926", "val": "cd0298"}
+{"go_ok": false, "id": 695, "key": "a162", "kind": "cpchunk", "map": 8, "pos": 2, "seed": "cp0_balances_1", "sha": "06bf3f5958c74d97", "val": "c0"}
+{"go_ok": true, "go_val": "cc6d18f4a8e592e4", "id": 696, "key": "a163", "kind": "cpchunk", "map": 14, "pos": 3, "seed": "cpchunk_rand1", "sha": "d84ce7a3db09ea96", "val": "82cf2ef05da0f8b7faa3de001ca141cf4481ec90905fcd40a142c42081a08b9af295d90dfd61b1cce87fa9cdb0e75f20b8c1696426112548a314d41fa144c3a161cf3375190dee2764efa162ce5937d340a163c3a164d92458229990361eb66f5893f344137e336b3193550564cc7da724d8a5b931195e5267d031f8a165d930cf2bddc2652d0b7e5852253cd5631e5e20b370a6758cfa184ae12539198ee7a443f1727fda2912ef18661c64b59e7f0ba166d92071b61f28b2d7f8d248ce8a29062523984c7d015253cef05dd15fe08050f46cdaa167c42026b5a6f37eda48b094c94df5e76983661f63778ba896262b17788e9291c115a9a168c4203e579a27beb2bfe8a0237c4e77dc7f22d2c2eaadf4005adcdcc46bab0dd660b3a169c4204585b642aa1ab4c1730a602df7e7c9f20006ac73c04cac171912dece03f0b00da16ac420e545899f79c3121228c7039bf063850e4c3b4c4a774a3d9def4a31aadcbd23bda16bc42073ea4f35b1e8e8a8291f03a5c2e6ff76be2ef1fe2c3eb5394672771bb64b30cea16ccff50f8245e2563259a16ecfa8cb580e16c120daa16fcf649cb158dbaf1f75a17081b332c25989083d7b0e88e6aa455e2244008abad880a171c40173a172c40166a17381d9244e7e6c2b70aa48ea42e5b6af2a86df1f302876b4253fc3b79350ae8360a86f597cb1991e83a27462af1a11bae2ea9d0992b72edbdce60bb4a27474cfc53305c81ceb2034a27569cf73130f0bed4bc431a174cfd47984322f1236bba175cfb636ee60ed02cfc8a176cff89ada5db71f8f0da177cfb987b5bdafe95bbca178ce41265982a179ccc1a17acf96977a27b680b035cf441d93114ddc38e4de001da141cfe88f8d90522b60d8a142c42056a942f55b57c3258ecac0ead80cdefcb276f2c2741a2ae2bfc4be9c0f8228d1a143c3a144c3a161cf99cf6839b4aaaeefa162ceb011e39ca163c3a164b2932917cb7f8ba0944c09345ebc27e27e6663a165d929f56f7892f0bc6c89c46d40ad9be2b0737f13c53ebccbce2dac4b20aea36846e0ed95287209dbcac9aea166b1805684cf2d1ac3ff0cb5cf786d68b046d3a167c420a88918cac4e43ae123dd1ab7198381723d9040bb7fbff49eba3f95ce822b38b3a168c420587079810e00a3987369ef2aa1ab5594fab2c345983d76d569ba432c4981cf99a169c420f38f97084aa80371c052571e5a5e150e0cda9012ae85e332d7ee4a9687ccd5dca16ac420e8617a8b33d1e337086a88474e4a1fd7b1a97b67a17093f0069058c1029b12afa16bc4207752ca80d8b80f2caecfed1319d60954302236bd2360e8918d44af17cd3b8863a16ccf7860496bc90a1ae2a16ecfb5bf02991401c256a16fcfb7959b67141faf94a17081b3f498924d43146f46b7e66666a3bab1e3dd6f5983a27462a616b3db7d0737a27474cfcbbd757a8fd4876aa27569cf5184c11388b91c67a171c401b7a172c40179a17381b4e3186480e55c36942836f43191bc7260753d1d0080a174cf1acda3749f9085f2a175cff5348258f860c569a176cf5b314293f4022fa7a177cfc448ca9ad96ca408a178cef672c6c6a17961a17acf55e08f64194c63f2"}
+{"go_ok": true, "go_val": "77c0683a5bb981ae", "id": 697, "key": "a3766c76", "kind": "cpchunk", "map": 31, "pos": 4, "seed": "cpchunk_rand2", "sha": "4ad9704ac99d1d16", "val": "c0"}
+{"go_ok": true, "go_val": "6a269fa006da0845", "id": 698, "key": "a464617461", "kind": "cpchunk", "map": 1, "pos": 0, "seed": "cp0_balances_3", "sha": "e9f0baabcfecedfc", "val": "81a141c420a1183598dcb7734d80c582a6cf91561c684f5ff4422a04b03f44ff6846c7e082"}
+{"go_ok": true, "go_val": "57142d636dd20b19", "id": 699, "key": "a178", "kind": "cpchunk", "map": 22, "pos": 11, "seed": "cpchunk_rand3", "sha": "858bee94a2656ba1", "val": "c0"}
+{"go_ok": true, "go_val": "aeedb688827faa09", "id": 700, "key": "b9cb240708b20268ade1e9335ea6ded1e2fcdcb0005f62031587", "kind": "cpchunk", "map": 10, "pos": 0, "seed": "cpchunk_rand2", "sha": "bb954c6ae080bca3", "val": "c0"}
+{"go_ok": false, "id": 701, "key": "a169", "kind": "cpchunk", "map": 15, "pos": 22, "seed": "cpchunk_rand0", "sha": "fb8918e792bad3a5", "val": "c420155d942c6c1569caf1373aeaf8d4053372ff70c4d24fe9c5b67943462dc58114"}
+{"go_ok": true, "go_val": "5da7cd455e697962", "id": 702, "key": "a170", "kind": "cpchunk", "map": 12, "pos": 2, "seed": "cp0_balances_1", "sha": "77343cb76f097104", "val": "81a16c82a2747402a275690e"}
+{"go_ok": true, "go_val": "ce1002a6dcd980d2", "id": 703, "key": "aafdf9e31aec111f98c795", "kind": "cpchunk", "map": 10, "pos": 0, "seed": "cpchunk_rand3", "sha": "d82cebd18638567e", "val": "c0"}
+{"go_ok": true, "go_val": "a746c2ba3d896b50", "id": 704, "key": "a66f6e6c696e65", "kind": "cpchunk", "map": 6, "pos": 3, "seed": "cp0_balances_4", "sha": "a746c2ba3d896b50", "val": "c0"}
+{"go_ok": true, "go_val": "addb219f50064f42", "id": 705, "key": "a16b", "kind": "cpchunk", "map": 27, "pos": 2, "seed": "cpchunk_rand1", "sha": "23c8dcc0206edd1f", "val": "c40100"}
+{"go_ok": true, "go_val": "4860b567fc133ac7", "id": 706, "key": "a113", "kind": "cpchunk", "map": 23, "pos": 0, "seed": "cpchunk_rand2", "sha": "ac495b907c2461a6", "val": "c0"}
+{"go_ok": true, "go_val": "a856aa01176754f3", "id": 707, "key": "a464617461", "kind": "cpchunk", "map": 33, "pos": 1, "seed": "cpchunk_rand1", "sha": "3a29e2b7ced8f299", "val": "8ba141c420726933f0b2b78b03b69cd607a2456c4c773066763b76f4503635910198ce5229a142c420292142bab3494e99cdd6e0cd9ce4e864d7400e4cbb06c4831adc3aba0bb09997a143cf76387eb4cdb31869a144cfa9b07881a2c520f4a145cf26c1f9b3545a6631a146c44013de403ba5f469e66c80452b00e3f19d4b66212ddf95c043dc390d21331d9e5c1aa28d2ec044a428544af24dd1b87129ddc19a9114260a6307d266ba1b649abea156cfebb2feff6bf7d565a157cff91a2f3eb0cd3d15a158c3a159cfb4fa3f22e61a04c8a15acf40bebfd7a6c90e8a"}
+{"go_ok": true, "go_val": "59ab1559d062461a", "id": 708, "key": "a3757064", "kind": "cpchunk", "map": 29, "pos": 4, "seed": "cpchunk_rand2", "sha": "f5b3b14906d52e5d", "val": "c0"}
+{"go_ok": false, "id": 709, "key": "a166", "kind": "cpchunk", "map": 2, "pos": 22, "seed": "cpchunk_rand3", "sha": "ac1aa855afa4fd45", "val": "b7db38ec6c28b2dde56832cccbca606692bb18f24fb0f1cf"}
+{"go_ok": true, "go_val": "ad1be76effbeb7fb", "id": 710, "key": "a3727764", "kind": "cpheader", "map": 3, "pos": 2, "seed": "cp0_content", "sha": "cd3524d4a92cf855", "val": "ce17d78400"}
+{"go_ok": true, "go_val": "590927d54f1bd8f3", "id": 711, "key": "cf5226abcb856e3457", "kind": "cpchunk", "map": 16, "pos": 0, "seed": "cpchunk_rand1", "sha": "d391af98718d67df", "val": "c0"}
+{"go_ok": true, "go_val": "923f7f5d57db1b5d", "id": 712, "key": "a178", "kind": "cpchunk", "map": 22, "pos": 5, "seed": "cpchunk_rand1", "sha": "81867bd0b2175847", "val": "cefdfafa17"}
+{"go_ok": false, "id": 713, "key": "cd03e9", "kind": "cpchunk", "map": 10, "pos": 2, "seed": "cp1_balances_1", "sha": "f10d63dd6f55f0a5", "val": "80"}
+{"go_ok": true, "go_val": "43f1a18f1a72c8aa", "id": 714, "key": "a174", "kind": "cpchunk", "map": 9, "pos": 16, "seed": "cpchunk_rand0", "sha": "9a86e323a383a740", "val": "cff305ee5d6eec884a"}
+{"go_ok": true, "go_val": "a7628c28d246d48a", "id": 715, "key": "a173", "kind": "cpchunk", "map": 17, "pos": 1, "seed": "cpchunk_rand0", "sha": "b83b1466c3c2b268", "val": "81d92e7d619887661634f79906fb7511fd5cd7f5b83822f7086a1bb82c3e40a9f73f6ecb4fe8c152af40dc30ec4e4fc08383a27462bb24bcea0e554fb68d275e36971d57e0f4ca1abd1ab4a4c52eda4079a27474cf6ea116808baccfb4a27569cffc0529672129b60e"}
+{"go_ok": true, "go_val": "49aecc0ab85378f8", "id": 716, "key": "a27474", "kind": "cpchunk", "map": 21, "pos": 0, "seed": "cp1_balances_1", "sha": "202d7d7c17133059", "val": "c0"}
+{"go_ok": true, "go_val": "184c1e9273368829", "id": 717, "key": "b4e3186480e55c36942836f43191bc7260753d1d00", "kind": "cpchunk", "map": 12, "pos": 1, "seed": "cpchunk_rand1", "sha": "6f44c8d43f0abc67", "val": "c0"}
+{"go_ok": true, "go_val": "590927d54f1bd8f3", "id": 718, "key": "a36f7270", "kind": "cpchunk", "map": 0, "pos": 0, "seed": "cpchunk_rand1", "sha": "256e99f32a219549", "val": "9382a46461746183a66f6e6c696e65cf15d8c65adf83aa5aa570726f746fa1aaa67277646c766ccfea989e1e9d438caaa3726e64cfb81b876f97cdf3bc82a46461746183a66f6e6c696e65cf41b367fb86600e99a570726f746fa178a67277646c766ccf24d9010741c71b51a3726e64cfa7850c3078dcef2282a46461746183a66f6e6c696e65cf15d8c65adf83aa5aa570726f746fa1aaa67277646c766ccfea989e1e9d438caaa3726e64cfb81b876f97cdf3bc"}
+{"go_ok": true, "go_val": "5760212b64cced45", "id": 719, "key": "a157", "kind": "cpchunk", "map": 30, "pos": 8, "seed": "cpchunk_rand0", "sha": "403e037fc4f3bf3e", "val": "c0"}
+{"go_ok": true, "go_val": "1682454659a88f54", "id": 720, "key": "a3757064", "kind": "cpchunk", "map": 3, "pos": 3, "seed": "cp0_balances_3", "sha": "76975a84ac3eee06", "val": "c0"}
+{"go_ok": true, "go_val": "250be8561da03aec", "id": 721, "key": "cd03e9", "kind": "cpchunk", "map": 10, "pos": 2, "seed": "cp0_balances_1", "sha": "561ac3f0e2c23ca2", "val": "82a16cce000f3e22a17acd0481"}
+{"go_ok": true, "go_val": "6210d6266baa08b3", "id": 722, "key": "a17a", "kind": "cpchunk", "map": 2, "pos": 14, "seed": "cpchunk_rand1", "sha": "1e8aa2b465713a46", "val": "cf4e1c36564e1fa944"}
+{"go_ok": true, "go_val": "7aaf7d6a863d9a5b", "id": 723, "key": "cf37dc4fbefae31adb", "kind": "cpchunk", "map": 3, "pos": 0, "seed": "cpchunk_rand3", "sha": "ac53018735db1344", "val": "80"}
+{"go_ok": true, "go_val": "10e4c0d8be2f4729", "id": 724, "key": "ab626c6f636b73526f756e64", "kind": "cpheader", "map": 0, "pos": 8, "seed": "cpheader_rand0", "sha": "4a65e4ccceae53d4", "val": "c0"}
+{"go_ok": true, "go_val": "d81f615b60e958bd", "id": 725, "key": "d9355966fe70ab0cf937df0282b9eb94704c5d7f9784b2c0ed8f577f94bf8af93d550578be936dd30792a4a065257ed180b4c647689b9f", "kind": "cpchunk", "map": 23, "pos": 0, "seed": "cpchunk_rand1", "sha": "d3e1081fbf84ef0c", "val": "81a27462d922e0afbc768ecdeee42e0e27402acf310aec37e24858b77de385ad29ae0af4a550d5e2"}
+{"go_ok": true, "go_val": "05c367d252cae97b", "id": 726, "key": "a162", "kind": "cpchunk", "map": 14, "pos": 1, "seed": "cpchunk_rand0", "sha": "bee107578ab4c589", "val": "c0"}
+{"go_ok": true, "go_val": "ece05a9bcfd052b5", "id": 727, "key": "a27474", "kind": "cpchunk", "map": 24, "pos": 0, "seed": "cpchunk_rand2", "sha": "6f46f99ac24ffbbc", "val": "cf2762f30b57429640"}
+{"go_ok": true, "go_val": "e87396a0722ad6b9", "id": 728, "key": "a178", "kind": "cpchunk", "map": 9, "pos": 25, "seed": "cpchunk_rand3", "sha": "89f6d99b3fcce750", "val": "c0"}
+{"go_ok": true, "go_val": "bd82468bb07fe7c5", "id": 729, "key": "a570726f746f", "kind": "cpchunk", "map": 36, "pos": 1, "seed": "cpchunk_rand3", "sha": "9298265490160dce", "val": "c0"}
+{"go_ok": true, "go_val": "a81f7dfe642628f5", "id": 730, "key": "a464617461", "kind": "cpchunk", "map": 31, "pos": 2, "seed": "cpchunk_rand1", "sha": "da79e77fee3237ba", "val": "83a66f6e6c696e65cf15d8c65adf83aa5aa570726f746fa1aaa67277646c766ccfea989e1e9d438caa"}
+{"go_ok": true, "go_val": "1b4e2bd38bbb35cc", "id": 731, "key": "a3737064", "kind": "cpspver", "map": 0, "pos": 0, "seed": "cpspver_rand0", "sha": "dab4b711cad84d45", "val": "9181a27077cf3476e072dc7008c9"}
+{"go_ok": true, "go_val": "08a9135cfa240708", "id": 732, "key": "aa6361746368706f696e74", "kind": "cpheader", "map": 0, "pos": 0, "seed": "cpheader_rand2", "sha": "217674b0cc997708", "val": "c401ff"}
+{"go_ok": true, "go_val": "8f3032330ad9d3fc", "id": 733, "key": "a27569", "kind": "cpchunk", "map": 8, "pos": 1, "seed": "cpchunk_rand3", "sha": "0dae28ca98cdb36a", "val": "cff8c16be71cab952f"}
+{"go_ok": true, "go_val": "b2903cd248823e45", "id": 734, "key": "a157", "kind": "cpchunk", "map": 6, "pos": 9, "seed": "cp1_balances_3", "sha": "b2903cd248823e45", "val": "c0"}
+{"go_ok": true, "go_val": "1b65502c5a44ad3b", "id": 735, "key": "a16a", "kind": "cpchunk", "map": 15, "pos": 6, "seed": "cpchunk_rand2", "sha": "2618fe8f8ecaf767", "val": "cfc0a1b2f3e3d0426c"}
+{"go_ok": true, "go_val": "8268ca0a58317111", "id": 736, "key": "a27462", "kind": "cpchunk", "map": 24, "pos": 1, "seed": "cpchunk_rand1", "sha": "d3702cfccc907be6", "val": "c401ff"}
+{"go_ok": false, "id": 737, "key": "a16c", "kind": "cpchunk", "map": 20, "pos": 0, "seed": "cp1_balances_1", "sha": "941c3526f69a861d", "val": "01"}
+{"go_ok": true, "go_val": "0977e7e785fe122f", "id": 738, "key": "a461646472", "kind": "cpchunk", "map": 3, "pos": 1, "seed": "cp1_balances_3", "sha": "e0ef4881949295af", "val": "c42022a808f3b72ad9f92cf2dfa45cae014fe460ac14a06b0a040f34e0e64eed27df"}
+{"go_ok": false, "id": 739, "key": "a16c", "kind": "cpchunk", "map": 11, "pos": 1, "seed": "cp1_balances_1", "sha": "9c527d83a15cff34", "val": "82a2747402a275690a"}
+{"go_ok": true, "go_val": "77c0683a5bb981ae", "id": 740, "key": "a3726e64", "kind": "cpchunk", "map": 35, "pos": 1, "seed": "cpchunk_rand2", "sha": "e2f2c5c9b73bc26e", "val": "cf9143f40f5eca7aba"}
+{"go_ok": true, "go_val": "77c0683a5bb981ae", "id": 741, "key": "a162", "kind": "cpchunk", "map": 14, "pos": 1, "seed": "cpchunk_rand2", "sha": "58204e2feb1e6d27", "val": "ceec86eeba"}
+{"go_ok": true, "go_val": "8d6051d106cb8d19", "id": 742, "key": "a176", "kind": "cpspver", "map": 1, "pos": 0, "seed": "cpspver_rand1", "sha": "f78bbfca0b26d111", "val": "c401ff"}
+{"go_ok": true, "go_val": "d4ed5ffc4db1f853", "id": 743, "key": "a27569", "kind": "cpchunk", "map": 24, "pos": 1, "seed": "cpchunk_rand3", "sha": "f07f99d066690959", "val": "cf4ee58b03bb35bd00"}
+{"go_ok": true, "go_val": "eb5a0d037e0a31a5", "id": 744, "key": "a27474", "kind": "cpchunk", "map": 8, "pos": 1, "seed": "cpchunk_rand1", "sha": "ea16eb0bbabf4f8d", "val": "cf3f7370597081c4a7"}
+{"go_ok": true, "go_val": "f2aee068ee2b1904", "id": 745, "key": "a2626c", "kind": "cpchunk", "map": 0, "pos": 0, "seed": "cp0_balances_1", "sha": "bac94a2b595fbed4", "val": "9483a161c42007154a9a1ba2638cf9257dd7acab79a4f6adce20b2cc00729c529c506779c8a4a16287a162cf000000e8f2e3864fa163cd01fca164ce1e496486a16601a16a01a16c01a17acd049ca16382cd03e982a16cce000f3e22a17acd0481cd03ea83a16e01a17081a16c82a2747402a275690ea17acd049c83a161c42007509cc7d610ac7003894be228def5dbbdb1e03e9f0813faee5a79c7aec6daa3a16287a162cf000000e8f2c6b2c9a163cd01faa164ce1e2addeda16601a16a01a16c01a17acd0496a16382cd03e982a16cce000f3755a17acd0486cd03ea83a16e01a17081a16c82a2747402a2756905a17acd046f83a161c42009a9e346104d70852dbef7a103925d2bade0acb4511de17941b98fdd5f57efcba16287a162cf000000e8f2e65d23a163cd01fca164ce1e49655da16601a16a01a16c01a17acd049ca16382cd03e982a16cce000f44cda17acd046fcd03ea83a16e01a17081a16c82a2747402a2756906a17acd047a83a161c42007154a9a1ba2638cf9257dd7acab79a4f6adce20b2cc00729c529c506779c8a4a16287a162cf000000e8f2e3864fa163cd01fca164ce1e496486a16601a16a01a16c01a17acd049ca16382cd03e982a16cce000f3e22a17acd0481cd03ea83a16e01a17081a16c82a2747402a275690ea17acd049c"}
+{"go_ok": true, "go_val": "51ffee5f469121e9", "id": 746, "key": "a26f61", "kind": "cpchunk", "map": 0, "pos": 3, "seed": "cpchunk_rand2", "sha": "4f520f02b2b01975", "val": "c0"}
+{"go_ok": true, "go_val": "76be8b528d0075f7", "id": 747, "key": "a26f61", "kind": "cpchunk", "map": 0, "pos": 1, "seed": "cp1_balances_3", "sha": "706499db6ab152bc", "val": "c0"}
+{"go_ok": true, "go_val": "f2aee068ee2b1904", "id": 748, "key": "cd03e9", "kind": "cpchunk", "map": 3, "pos": 0, "seed": "cp0_balances_1", "sha": "c0d7015466daadee", "val": "81a16cce000f3e22"}
+{"go_ok": true, "go_val": "c681588c5b9fe584", "id": 749, "key": "a570726f746f", "kind": "cpchunk", "map": 34, "pos": 2, "seed": "cpchunk_rand2", "sha": "4ce3bbe335583e88", "val": "c401ff"}
+{"go_ok": true, "go_val": "6ad971a81737e59e", "id": 750, "key": "a161", "kind": "cpchunk", "map": 8, "pos": 2, "seed": "cp1_balances_1", "sha": "1adeecf92d465cf9", "val": "c0"}
+{"go_ok": true, "go_val": "c8ee39496c92729d", "id": 751, "key": "b332c25989083d7b0e88e6aa455e2244008abad8", "kind": "cpchunk", "map": 5, "pos": 1, "seed": "cpchunk_rand1", "sha": "69be390074d7215f", "val": "80"}
+{"go_ok": true, "go_val": "2608e0264830c13c", "id": 752, "key": "a27569", "kind": "cpchunk", "map": 6, "pos": 1, "seed": "cpchunk_rand2", "sha": "5db6eff5286485c5", "val": "cfbd0e117c72ca8254"}
+{"go_ok": true, "go_val": "0bd73d0a6bc80b4e", "id": 753, "key": "a3726e64", "kind": "cpchunk", "map": 1, "pos": 0, "seed": "cp1_balances_4", "sha": "6988c0ef8d56c906", "val": "cd016b"}
+{"go_ok": true, "go_val": "5c0d0bf20e9c7011", "id": 754, "key": "a76e6f7470617274", "kind": "cpheader", "map": 1, "pos": 2, "seed": "cpheader_rand3", "sha": "bb8af8dd045c995d", "val": "80"}
+{"go_ok": true, "go_val": "d054ca954dbd89ba", "id": 755, "key": "a464617461", "kind": "cpchunk", "map": 1, "pos": 1, "seed": "cp0_balances_4", "sha": "d1a57143352fd8b3", "val": "80"}
+{"go_ok": true, "go_val": "2d9b8b860e110f30", "id": 756, "key": "a176", "kind": "cpchunk", "map": 1, "pos": 0, "seed": "cp1_balances_2", "sha": "ce50e722076e98ab", "val": "c420492521efce5e0e8a9d9768a3fb143bed7f8a716435bd49d4cf5ef22af6776d48"}
+{"go_ok": true, "go_val": "ff89102a66b09a57", "id": 757, "key": "a142", "kind": "cpchunk", "map": 17, "pos": 6, "seed": "cpchunk_rand1", "sha": "671122fa2d3188a5", "val": "c42056a942f55b57c3258ecac0ead80cdefcb276f2c2741a2ae2bfc4be9c0f8228d1"}
+{"go_ok": true, "go_val": "990e6b40c60338e7", "id": 758, "key": "a464617461", "kind": "cpchunk", "map": 33, "pos": 2, "seed": "cpchunk_rand3", "sha": "e39940319959b005", "val": "80"}
+{"go_ok": true, "go_val": "93177a5c5dbb9795", "id": 759, "key": "a16d", "kind": "cpchunk", "map": 2, "pos": 3, "seed": "cpchunk_rand0", "sha": "3c6cb3964ecc7da4", "val": "c0"}
+{"go_ok": true, "go_val": "590927d54f1bd8f3", "id": 760, "key": "a163", "kind": "cpchunk", "map": 1, "pos": 4, "seed": "cpchunk_rand1", "sha": "89ed19e859e805e4", "val": "80"}
+{"go_ok": true, "go_val": "f058f0a4610ee2d2", "id": 761, "key": "a16a", "kind": "cpchunk", "map": 17, "pos": 5, "seed": "cpchunk_rand2", "sha": "8a1c28ea343250be", "val": "c401ff"}
+{"go_ok": true, "go_val": "77c0683a5bb981ae", "id": 762, "key": "a16b", "kind": "cpchunk", "map": 28, "pos": 0, "seed": "cpchunk_rand2", "sha": "136bebae0a5d4c1d", "val": "c40100"}
+{"go_ok": true, "go_val": "20a0979c86514a91", "id": 763, "key": "a27474", "kind": "cpchunk", "map": 21, "pos": 1, "seed": "cpchunk_rand0", "sha": "0bb794b76e3f47bc", "val": "cf6ea116808baccfb4"}
+{"go_ok": true, "go_val": "b9c41784eb6d7af7", "id": 764, "key": "a162", "kind": "cpchunk", "map": 2, "pos": 7, "seed": "cp1_balances_1", "sha": "5773f4e87d754efa", "val": "cf000000e8e602ac20"}
+{"go_ok": true, "go_val": "65c4419748cd585f", "id": 765, "key": "a8f68d73c30049dbab", "kind": "cpchunk", "map": 12, "pos": 1, "seed": "cpchunk_rand2", "sha": "f0acb2ecd95375a4", "val": "81a27462b9ff4af3265540aa76f753f947142599376416d355f55fd6418f"}
+{"go_ok": false, "id": 766, "key": "a16c", "kind": "cpchunk", "map": 18, "pos": 1, "seed": "cp0_balances_1", "sha": "bb78f0bac9caaf30", "val": "c0"}
+{"go_ok": true, "go_val": "ad6c10f346a044c7", "id": 767, "key": "a464617461", "kind": "cpchunk", "map": 5, "pos": 1, "seed": "cp1_balances_4", "sha": "543524c53661422a", "val": "83a66f6e6c696e65cf00016bdab165ec00a570726f746fd95968747470733a2f2f6769746875622e636f6d2f616c676f72616e64666f756e646174696f6e2f73706563732f747265652f37336334336234613936393933393038383463353165326139353938643439653238333733643130a67277646c766ccc9b"}
+{"go_ok": true, "go_val": "bd1286b8757feee7", "id": 768, "key": "a27474", "kind": "cpchunk", "map": 7, "pos": 2, "seed": "cp0_balances_1", "sha": "8d926207e61182c3", "val": "c0"}
+{"go_ok": true, "go_val": "f105dd916d9e589b", "id": 769, "key": "d92e7d619887661634f79906fb7511fd5cd7f5b83822f7086a1bb82c3e40a9f73f6ecb4fe8c152af40dc30ec4e4fc083", "kind": "cpchunk", "map": 12, "pos": 1, "seed": "cpchunk_rand0", "sha": "82d2213bbf663ea5", "val": "80"}
+{"go_ok": true, "go_val": "21321188a723b5c9", "id": 770, "key": "a27569", "kind": "cpchunk", "map": 7, "pos": 1, "seed": "cp1_balances_1", "sha": "4886cc82fac2321f", "val": "0a"}
+{"go_ok": true, "go_val": "3334bf8e4f1c530b", "id": 771, "key": "a67277646c766c", "kind": "cpchunk", "map": 36, "pos": 2, "seed": "cpchunk_rand0", "sha": "ffe6d9971e6cf386", "val": "c0"}
+{"go_ok": false, "id": 772, "key": "a176", "kind": "cpchunk", "map": 28, "pos": 0, "seed": "cpchunk_rand1", "sha": "c5c8eb433a4168fa", "val": "cf5b314293f4022fa7"}
+{"go_ok": true, "go_val": "7e5b7b5be77eba10", "id": 773, "key": "a67277646c766c", "kind": "cpchunk", "map": 4, "pos": 1, "seed": "cp0_balances_4", "sha": "7e5b7b5be77eba10", "val": "c0"}
+{"go_ok": true, "go_val": "590927d54f1bd8f3", "id": 774, "key": "cf441d93114ddc38e4", "kind": "cpchunk", "map": 3, "pos": 0, "seed": "cpchunk_rand1", "sha": "9458bd75d596a58e", "val": "c0"}
+{"go_ok": true, "go_val": "360936e0dd4c8083", "id": 775, "key": "d93b9f45b464fd7b0048cf2a253f6793013c3a930e1fafc868dd35294c549c4a3fd396d70579fd8b44107feead092e60fcd0f619958f5a5a677f7a627d", "kind": "cpchunk", "map": 23, "pos": 0, "seed": "cpchunk_rand0", "sha": "67a7a75e8cb3980d", "val": "80"}
+{"go_ok": true, "go_val": "9aba2c260c06176c", "id": 776, "key": "a161", "kind": "cpchunk", "map": 4, "pos": 25, "seed": "cpchunk_rand3", "sha": "de714f8290e64aa8", "val": "c0"}
+{"go_ok": true, "go_val": "88a9be26095ff655", "id": 777, "key": "a77370726f756e64", "kind": "cpspver", "map": 1, "pos": 4, "seed": "cpspver_rand3", "sha": "31291637ce404bd4", "val": "c0"}
+{"go_ok": true, "go_val": "1a80e4a4b844b3e9", "id": 778, "key": "b36df18dc1aaa58680bfcfc55b15da334ef2a428", "kind": "cpchunk", "map": 25, "pos": 1, "seed": "cpchunk_rand1", "sha": "ebfc837cc3c23c8b", "val": "c0"}
+{"go_ok": true, "go_val": "5e5a0d94db148f74", "id": 779, "key": "a168", "kind": "cpchunk", "map": 22, "pos": 20, "seed": "cpchunk_rand2", "sha": "8e55d34926e52703", "val": "c4209a85dfb6816a3aeb20d6128ddf0bd4c6c88cd8046b2f10ffae22d1d6f5731f44"}
+{"go_ok": true, "go_val": "590927d54f1bd8f3", "id": 780, "key": "a464617461", "kind": "cpchunk", "map": 35, "pos": 0, "seed": "cpchunk_rand1", "sha": "ce924d2c84dc3843", "val": "83a66f6e6c696e65cf15d8c65adf83aa5aa570726f746fa1aaa67277646c766ccfea989e1e9d438caa"}
+{"go_ok": false, "id": 781, "key": "a16c", "kind": "cpchunk", "map": 11, "pos": 0, "seed": "cp0_balances_1", "sha": "1a441077df6c2a63", "val": "82a2747402a2756906"}
+{"go_ok": true, "go_val": "3021cf61217ace11", "id": 782, "key": "a3737064", "kind": "cpspver", "map": 0, "pos": 0, "seed": "cpspver_rand2", "sha": "d814e23a5bdf1510", "val": "9284a27077cfeea7c6037cbc7072a77370726f756e64cf10ca3d7d5b9638e5a176a1a1a27663c401ea84a27077cfeea7c6037cbc7072a77370726f756e64cf10ca3d7d5b9638e5a176a1a1a27663c401ea"}
+{"go_ok": true, "go_val": "96039ae33609f911", "id": 783, "key": "a27462", "kind": "cpchunk", "map": 19, "pos": 0, "seed": "cpchunk_rand3", "sha": "15afa1124c3fa48b", "val": "c401ff"}
+{"go_ok": true, "go_val": "856ff64362f89ad6", "id": 784, "key": "a66f6e6c696e65", "kind": "cpchunk", "map": 34, "pos": 1, "seed": "cpchunk_rand1", "sha": "94064c3dd7f89aaf", "val": "c0"}
+{"go_ok": true, "go_val": "e7b81f2a29792258", "id": 785, "key": "a16c", "kind": "cpchunk", "map": 6, "pos": 1, "seed": "cp0_balances_1", "sha": "cc94c46017577101", "val": "82a2747402a2756905"}
+{"go_ok": true, "go_val": "03fce54788ee2f1f", "id": 786, "key": "a66f6e6c696e65", "kind": "cpheader", "map": 1, "pos": 0, "seed": "cpheader_rand0", "sha": "0a24feb0ee14b055", "val": "81a36d6f6ecf6fe98707c0eee01c"}
+{"go_ok": true, "go_val": "56bbe98117076e19", "id": 787, "key": "a145", "kind": "cpchunk", "map": 32, "pos": 3, "seed": "cpchunk_rand2", "sha": "bc680cd40267e17b", "val": "cf0225c673c86d4a4a"}
+{"go_ok": false, "id": 788, "key": "a16c", "kind": "cpchunk", "map": 20, "pos": 1, "seed": "cp0_balances_1", "sha": "fa2f0d50924b7031", "val": "01"}
+{"go_ok": true, "go_val": "811dca70cd9ed8b0", "id": 789, "key": "d937ab14fb25452260a6f619ce5f6f027d191bd4c229327a1de3abf7aad8e08d561f0d3654de3fb6181ddba334e37775d8a863649e5717027d", "kind": "cpchunk", "map": 20, "pos": 1, "seed": "cpchunk_rand2", "sha": "0101683851536af2", "val": "c0"}
+{"go_ok": true, "go_val": "590927d54f1bd8f3", "id": 790, "key": "a3757064", "kind": "cpchunk", "map": 29, "pos": 1, "seed": "cpchunk_rand1", "sha": "6cf1e4445a956308", "val": "cf373027043f43680a"}
+{"go_ok": true, "go_val": "76be8b528d0075f7", "id": 791, "key": "a3737064", "kind": "cpspver", "map": 0, "pos": 1, "seed": "cp1_stateProofVerificationContext", "sha": "f8b5d989ec92fa6e", "val": "c0"}
+{"go_ok": true, "go_val": "76be8b528d0075f7", "id": 792, "key": "a3737064", "kind": "cpspver", "map": 0, "pos": 1, "seed": "cpspver_rand1", "sha": "43e45277a86350d0", "val": "90"}
+{"go_ok": true, "go_val": "842dc2ca60a4f3e7", "id": 793, "key": "a161", "kind": "cpchunk", "map": 1, "pos": 3, "seed": "cp1_balances_1", "sha": "9716a31335b4146f", "val": "c0"}
+{"go_ok": true, "go_val": "7aaf7d6a863d9a5b", "id": 794, "key": "a36f7270", "kind": "cpchunk", "map": 0, "pos": 0, "seed": "cpchunk_rand3", "sha": "238b6adc52c1039b", "val": "90"}
+{"go_ok": true, "go_val": "6ff5b336310e7d3f", "id": 795, "key": "d9364779aca742af4f4c4471d100aa0711bea24026d7bd608c7b66befcd601babfef4f92659b746ec9e40440cfe897b945840aa4e931d1d9", "kind": "cpchunk", "map": 18, "pos": 0, "seed": "cpchunk_rand1", "sha": "2ccf7ab96e6710f6", "val": "80"}
+{"go_ok": true, "go_val": "b93d9a94284d6743", "id": 796, "key": "a17a", "kind": "cpchunk", "map": 5, "pos": 3, "seed": "cp1_balances_1", "sha": "945003a930776239", "val": "cd026f"}
+{"go_ok": true, "go_val": "ed4b0ffb9a7120ad", "id": 797, "key": "a176", "kind": "cpchunk", "map": 3, "pos": 0, "seed": "cp0_balances_2", "sha": "705aed05ee8ea0a7", "val": "c401ff"}
+{"go_ok": true, "go_val": "3f2c0fa59e75d7d8", "id": 798, "key": "a159", "kind": "cpchunk", "map": 6, "pos": 3, "seed": "cp0_balances_3", "sha": "3f2c0fa59e75d7d8", "val": "c0"}
+{"go_ok": true, "go_val": "5bc73e3ec01d1889", "id": 799, "key": "a76e6f7470617274", "kind": "cpheader", "map": 1, "pos": 0, "seed": "cpheader_rand1", "sha": "fa9df526d2832b1b", "val": "80"}
+{"go_ok": true, "go_val": "f66d082b16911c7c", "id": 800, "key": "a461646472", "kind": "cpchunk", "map": 1, "pos": 5, "seed": "cp1_balances_3", "sha": "d898f65ee77dd437", "val": "c42022a808f3b72ad9f92cf2dfa45cae014fe460ac14a06b0a040f34e0e64eed27df"}

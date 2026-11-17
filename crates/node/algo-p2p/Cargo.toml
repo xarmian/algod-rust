@@ -30,6 +30,9 @@ libp2p-stream = "0.5.0-alpha"
 # `algo_network::identity`'s netidentity challenge/response/verification
 # scheme in hybrid mode, mirroring go's `network/p2p.PeerIDChallengeSigner`.
 ed25519-dalek.workspace = true
+# go-msgp string reader of the peer meta headers (`msgp.ReadStringBytes`:
+# str / bin / nil, arbitrary bytes kept losslessly, issue #2421)
+algo-types.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 futures-util.workspace = true

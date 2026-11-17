@@ -56,9 +56,21 @@ with its own seeds.jsonl / cases.jsonl in the crate whose test replays it:
              libp2p peer meta headers (network/p2pMetainfo.go)
 
 In the non-consensus sets a transplant only inserts a key the destination map
-does not already have: go decodes a repeated key *into* the already decoded
-field (merging nested structs and slice elements), a semantic these fixtures
-are not about (issue #2421).
+does not already have. Repeated keys have their own cases (issue #2421), after
+the transplants: a key the map already has, again, with a value
+derived from its first one (a map with fewer entries or none, a shorter array
+whose elements have fewer entries, a shorter byte string, nil) or another map's
+value under the same key. go decodes a repeated key *into* the already decoded
+field: a scalar is overwritten, a nested struct and a map are merged, a slice
+is re-sliced and decoded element by element into the existing elements when
+the old capacity allows it (else it is a fresh slice), a `[N]byte` keeps the
+bytes past a shorter value, nil clears. So every accepted case also carries
+`go_val`, the sha256 prefix of go's re-encode of the decoded value, and the
+ledger / network / p2p replaying tests compare it with algod-rust's decoded
+value, re-encoded. Repeated-key cases are generated only for a set's
+`repeat_kinds`: not yet for the consensus kinds and `txsync`, whose
+`SignedTxn` / block / vote readers still replace a repeated field (DIV-004,
+issue #2424).
 """
 import argparse
 import hashlib
@@ -451,12 +463,66 @@ def make_cases(seeds, rng, per_map, cap=None, pinned=(), fresh_keys_only=False):
     for seed, m, pos, key, val in pinned:
         if seed in by_name:
             cases.append((by_name[seed], m, pos, key, val))
+    return finish_cases(cases)
+
+
+def repeated_values(b, vs, ve):
+    """Values for a second occurrence of the key whose first value is b[vs:ve]."""
+    v = b[vs:ve]
+    out = [bytes([0xC0])]
+    mh = map_header(v, 0)
+    if mh is not None:
+        n, hl = mh
+        out.append(bytes([0x80]))
+        if n > 1:
+            out.append(encode_map_len(1) + v[hl : skip(v, skip(v, hl))])
+    elif 0x90 <= v[0] <= 0x9F or v[0] in (0xDC, 0xDD):
+        items = array_items(v)
+        out.append(encode_array_len(0))
+        # fewer elements, each with only its first entry: decoded into the
+        # existing elements, so go keeps their other fields
+        shrunk = []
+        for it in items[: max(1, len(items) - 1)]:
+            ih = map_header(it, 0)
+            if ih is not None and ih[0] > 1:
+                it = encode_map_len(1) + it[ih[1] : skip(it, skip(it, ih[1]))]
+            shrunk.append(it)
+        out.append(encode_array_len(len(shrunk)) + b"".join(shrunk))
+        out.append(encode_array_len(len(items) + 1) + b"".join(items) + (items[0] if items else b""))
+    elif v[0] in (0xC4, 0xC5, 0xC6) or 0xA0 <= v[0] <= 0xBF or v[0] in (0xD9, 0xDA, 0xDB):
+        out.append(bytes([0xC4, 0x01, 0x00]))
+        out.append(bytes([0xC4, 0x01, 0xFF]))
+    return out
+
+
+def make_repeat_cases(seeds, rng, cap):
+    """Per map of every seed, one case: a key the map already has, again (see
+    the module docstring). Ids continue after the transplant cases."""
+    cases = []
+    for s in seeds:
+        b = bytes.fromhex(s["hex"])
+        same_key = {}
+        for start, hl, entries, end in walk_maps(b):
+            for ks, vs, ve in entries:
+                same_key.setdefault(b[ks:vs], []).append(b[vs:ve])
+        for m, (start, hl, entries, end) in enumerate(walk_maps(b)):
+            if not entries:
+                continue
+            ks, vs, ve = rng.choice(entries)
+            key = b[ks:vs]
+            vals = repeated_values(b, vs, ve) + [x for x in same_key[key] if x != b[vs:ve]]
+            cases.append((s, m, rng.randint(0, len(entries)), key, rng.choice(vals)))
+    rng.shuffle(cases)
+    return cases[:cap]
+
+
+def finish_cases(cases, first_id=0):
     out = []
     for n, (s, m, pos, key, val) in enumerate(cases):
         mut = mutate(bytes.fromhex(s["hex"]), m, pos, key, val)
         out.append(
             {
-                "id": n,
+                "id": first_id + n,
                 "seed": s["name"],
                 "kind": s["kind"],
                 "map": m,
@@ -474,7 +540,11 @@ def attach_verdicts(go_algorand, cases):
     rows = [{"name": str(c["id"]), "kind": c["kind"], "hex": c["_hex"]} for c in cases]
     res = run_go(go_algorand, rows)
     for c in cases:
-        c["go_ok"] = bool(res[str(c["id"])]["ok"])
+        r = res[str(c["id"])]
+        c["go_ok"] = bool(r["ok"])
+        if c["go_ok"]:
+            # go's decoded value, re-encoded (issue #2421)
+            c["go_val"] = hashlib.sha256(bytes.fromhex(r.get("enc", ""))).hexdigest()[:16]
     return cases
 
 
@@ -604,6 +674,8 @@ SETS = {
         "fuzz_xor": 0x2394,
         "pinned": PINNED,
         "fresh": False,
+        # the consensus readers do not merge a repeated key yet (DIV-004, #2424)
+        "repeat_kinds": set(),
     },
     "ledger": {
         "dir": fixture_dir("core", "algo-ledger"),
@@ -614,6 +686,7 @@ SETS = {
         "fuzz_xor": 23961,
         "pinned": (),
         "fresh": True,
+        "repeat_kinds": {"cpheader", "cpchunk", "cpspver"},
     },
     "network": {
         "dir": fixture_dir("node", "algo-network"),
@@ -624,6 +697,8 @@ SETS = {
         "fuzz_xor": 23962,
         "pinned": (),
         "fresh": True,
+        # txsync goes through the consensus SignedTxn reader (DIV-004, #2424)
+        "repeat_kinds": {"idchal", "idresp", "idverify"},
     },
     "p2p": {
         "dir": fixture_dir("node", "algo-p2p"),
@@ -634,6 +709,7 @@ SETS = {
         "fuzz_xor": 23963,
         "pinned": (),
         "fresh": True,
+        "repeat_kinds": {"peermeta"},
     },
 }
 
@@ -670,6 +746,13 @@ def run_set(name, st, go, a):
         n = int(a.fuzz[0])
         rng = random.Random(n ^ st["fuzz_xor"])
         cases = make_cases(seeds, rng, per_map=40, cap=n, pinned=st["pinned"], fresh_keys_only=st["fresh"])
+        rep = []
+        rep_seeds = [s for s in seeds if s["kind"] in st["repeat_kinds"]]
+        for _ in range(64 if rep_seeds else 0):
+            if len(rep) >= n:
+                break
+            rep += make_repeat_cases(rep_seeds, rng, n - len(rep))
+        cases += finish_cases(rep, first_id=len(cases))
         cases = attach_verdicts(go, cases)
         out = a.fuzz[1] if name == "consensus" else f"{a.fuzz[1]}.{name}"
         with open(out, "w", encoding="utf-8", newline="\n") as f:
@@ -680,6 +763,9 @@ def run_set(name, st, go, a):
     cases = make_cases(
         seeds, random.Random(st["rng"]), a.per_map, a.cap, pinned=st["pinned"], fresh_keys_only=st["fresh"]
     )
+    rep_seeds = [s for s in seeds if s["kind"] in st["repeat_kinds"]]
+    rep = make_repeat_cases(rep_seeds, random.Random(st["rng"] ^ 0x2421), a.repeat_cap)
+    cases += finish_cases(rep, first_id=len(cases))
     cases = attach_verdicts(go, cases)
     text = dump(cases)
     path = cases_path(st)
@@ -707,6 +793,7 @@ def main():
     ap.add_argument("--set", action="append", choices=sorted(SETS), help="fixture set(s); default: all")
     ap.add_argument("--per-map", type=int, default=2)
     ap.add_argument("--cap", type=int, default=4000)
+    ap.add_argument("--repeat-cap", type=int, default=1500, help="repeated-key cases per set (issue #2421)")
     ap.add_argument("--go-algorand", default=os.environ.get("GO_ALGORAND_DIR"))
     a = ap.parse_args()
     if not a.go_algorand:

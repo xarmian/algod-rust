@@ -24,7 +24,8 @@
 // rpcs package and runs there. Issue #2394.
 //
 // For every {"name","kind","hex"} row of $STRICT_IN it runs go's real
-// protocol.Decode of that type and writes {"name","ok","err"} to $STRICT_OUT:
+// protocol.Decode of that type and writes {"name","ok","err","enc"} to
+// $STRICT_OUT (`enc`: the hex of go's re-encode of the decoded value, #2421):
 //
 //	blockcert    rpcs.EncodedBlockCert     (catchup / REST msgpack blocks)
 //	block        bookkeeping.Block         (block DB, proposal block part)
@@ -77,6 +78,9 @@ func TestStrictDecodeOracleRpcs(t *testing.T) {
 		Name string `json:"name"`
 		Ok   bool   `json:"ok"`
 		Err  string `json:"err"`
+		// go's canonical re-encode of the decoded value (accepted rows
+		// only): pins what a repeated key decodes to (issue #2421)
+		Enc string `json:"enc,omitempty"`
 	}
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 1<<20), 1<<28)
@@ -99,40 +103,46 @@ func TestStrictDecodeOracleRpcs(t *testing.T) {
 				enc.Encode(o)
 			}()
 			var derr error
+			var val []byte
+			dec := func(m msgp.Unmarshaler) {
+				if derr = protocol.Decode(b, m); derr == nil {
+					val = protocol.Encode(m.(msgp.Marshaler))
+				}
+			}
 			switch r.Kind {
 			case "blockcert":
-				var v EncodedBlockCert
-				derr = protocol.Decode(b, &v)
+				dec(&EncodedBlockCert{})
 			case "block":
-				var v bookkeeping.Block
-				derr = protocol.Decode(b, &v)
+				dec(&bookkeeping.Block{})
 			case "header":
-				var v bookkeeping.BlockHeader
-				derr = protocol.Decode(b, &v)
+				dec(&bookkeeping.BlockHeader{})
 			case "stxn":
-				var v transactions.SignedTxn
-				derr = protocol.Decode(b, &v)
+				dec(&transactions.SignedTxn{})
 			case "stxninblock":
-				var v transactions.SignedTxnInBlock
-				derr = protocol.Decode(b, &v)
+				dec(&transactions.SignedTxnInBlock{})
 			case "txn":
-				var v transactions.Transaction
-				derr = protocol.Decode(b, &v)
+				dec(&transactions.Transaction{})
 			case "applydata":
-				var v transactions.ApplyData
-				derr = protocol.Decode(b, &v)
+				dec(&transactions.ApplyData{})
 			case "evaldelta":
-				var v transactions.EvalDelta
-				derr = protocol.Decode(b, &v)
+				dec(&transactions.EvalDelta{})
 			case "txsync":
+				// the go-codec decode, then each transaction's msgp encode
 				var v []transactions.SignedTxn
-				derr = protocol.DecodeReflect(b, &v)
+				if derr = protocol.DecodeReflect(b, &v); derr == nil {
+					val = []byte{}
+					for i := range v {
+						val = append(val, protocol.Encode(&v[i])...)
+					}
+				}
 			default:
 				t.Fatalf("unknown kind %q", r.Kind)
 			}
 			o.Ok = derr == nil
 			if derr != nil {
 				o.Err = derr.Error()
+			} else {
+				o.Enc = hex.EncodeToString(val)
 			}
 		}()
 	}

@@ -19,30 +19,49 @@
 //! kind of rpcs_oracle_test.go.txt).
 
 use algo_network::identity::{
+    attach_challenge_header, attach_response_header, build_identity_verification,
     decode_identity_challenge_response_signed, decode_identity_challenge_signed,
     decode_identity_verification_message_signed,
 };
 use algo_network::tx_sync_client::decode_tx_sync_response;
+use base64::Engine;
 
 #[path = "../../../../scripts/strict-decode/replay.rs"]
 mod replay;
 
-use replay::{verdict, Verdicts};
+use replay::{valued, verdict, Verdicts};
 
+fn unb64(s: String) -> Vec<u8> {
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .expect("the header is base64")
+}
+
+/// Each decoded value is re-encoded with the node's own go-canonical encoder
+/// (the header / message it sends), which must give go's decoded value.
 fn verdicts(kind: &str, b: &[u8]) -> Verdicts {
     match kind {
         "idchal" => vec![(
             "decode_identity_challenge_signed",
-            verdict(decode_identity_challenge_signed(b)),
+            valued(decode_identity_challenge_signed(b), |v| {
+                unb64(attach_challenge_header(v))
+            }),
         )],
         "idresp" => vec![(
             "decode_identity_challenge_response_signed",
-            verdict(decode_identity_challenge_response_signed(b)),
+            valued(decode_identity_challenge_response_signed(b), |v| {
+                unb64(attach_response_header(v))
+            }),
         )],
         "idverify" => vec![(
             "decode_identity_verification_message_signed",
-            verdict(decode_identity_verification_message_signed(b)),
+            valued(decode_identity_verification_message_signed(b), |v| {
+                build_identity_verification(v)[2..].to_vec()
+            }),
         )],
+        // verdict only: the transactions go through the consensus
+        // `SignedTransaction` reader, which does not merge a repeated key
+        // like go yet (DIV-004, #2424)
         "txsync" => vec![(
             "decode_tx_sync_response",
             verdict(decode_tx_sync_response(b)),
@@ -52,7 +71,7 @@ fn verdicts(kind: &str, b: &[u8]) -> Verdicts {
 }
 
 /// Every committed mutant (and, with `STRICT_FUZZ_FILE`, every fuzz case): go's
-/// verdict equals algod-rust's.
+/// verdict and decoded value equal algod-rust's.
 #[test]
 fn identity_and_tx_sync_decoders_match_go_on_every_mutated_message() {
     replay::replay_committed_and_fuzz(env!("CARGO_MANIFEST_DIR"), "network", verdicts);

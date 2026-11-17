@@ -715,23 +715,34 @@ pub fn read_bool(rd: &mut &[u8]) -> Result<bool> {
 /// string then lives on in every following header as `nextproto`.
 #[inline]
 pub fn read_string(rd: &mut &[u8]) -> Result<String> {
-    // go `msgp.ReadStringZC` (used by every generated `string` field) maps
-    // nil to "" (issue #2046).
-    if rd.first() == Some(&0xc0) {
-        *rd = &rd[1..];
-        return Ok(String::new());
+    read_go_string_bytes(rd).map(|b| crate::raw_text::encode(&b).into_owned())
+}
+
+/// The bytes of a go `string` field as `msgp.ReadStringZC` (used by every
+/// generated `string` field) reads them: `str`, `nil` ("", issue #2046) and,
+/// go-codec compat (its fallback `readBytesBytes(b, nil, true, false)`), a
+/// `bin` or an explicit uint8 array, but not a map (issue #2421).
+#[inline]
+fn read_go_string_bytes<'a>(rd: &mut &'a [u8]) -> Result<std::borrow::Cow<'a, [u8]>> {
+    match rd.first() {
+        // the common shape, borrowed
+        Some(0xa0..=0xbf | 0xd9 | 0xda | 0xdb) => {
+            let len = rmp::decode::read_str_len(rd)
+                .map_err(|e| codec_err(format!("read_string str_len: {e}")))?
+                as usize;
+            if rd.len() < len {
+                return Err(codec_err(format!(
+                    "read_string: need {len} bytes, have {}",
+                    rd.len()
+                )));
+            }
+            let (s, rest) = rd.split_at(len);
+            *rd = rest;
+            Ok(std::borrow::Cow::Borrowed(s))
+        }
+        Some(0x80..=0x8f | 0xde | 0xdf) => Err(codec_err("read_string: a map is not a string")),
+        _ => read_go_byte_container(rd).map(|g| g.data),
     }
-    let len = rmp::decode::read_str_len(rd)
-        .map_err(|e| codec_err(format!("read_string str_len: {e}")))? as usize;
-    if rd.len() < len {
-        return Err(codec_err(format!(
-            "read_string: need {len} bytes, have {}",
-            rd.len()
-        )));
-    }
-    let s = crate::raw_text::encode(&rd[..len]).into_owned();
-    *rd = &rd[len..];
-    Ok(s)
 }
 
 /// Read a msgpack `str`-format value as raw bytes, without requiring UTF-8
@@ -747,22 +758,8 @@ pub fn read_string(rd: &mut &[u8]) -> Result<String> {
 /// `AssetParams` unit_name/asset_name/url).
 #[inline]
 pub fn read_str_bytes(rd: &mut &[u8]) -> Result<Vec<u8>> {
-    // nil -> "" like go's `ReadStringZC` (issue #2046).
-    if rd.first() == Some(&0xc0) {
-        *rd = &rd[1..];
-        return Ok(Vec::new());
-    }
-    let len = rmp::decode::read_str_len(rd)
-        .map_err(|e| codec_err(format!("read_str_bytes str_len: {e}")))? as usize;
-    if rd.len() < len {
-        return Err(codec_err(format!(
-            "read_str_bytes: need {len} bytes, have {}",
-            rd.len()
-        )));
-    }
-    let v = rd[..len].to_vec();
-    *rd = &rd[len..];
-    Ok(v)
+    // `msgp.ReadStringZC`: nil -> "" (issue #2046), bin / uint8 array too
+    read_go_string_bytes(rd).map(std::borrow::Cow::into_owned)
 }
 
 // ── go-msgp-compatible byte readers (issue #2046) ──────────────
@@ -908,17 +905,34 @@ pub fn read_bytes_as_bytebuf_go_compat(rd: &mut &[u8]) -> Result<ByteBuf> {
 /// N elements (`ArrayError`).
 #[inline]
 pub fn read_fixed_bytes_go_compat<const N: usize>(rd: &mut &[u8]) -> Result<[u8; N]> {
+    let mut arr = [0u8; N];
+    read_fixed_bytes_into_go_compat(rd, &mut arr)?;
+    Ok(arr)
+}
+
+/// go `msgp.ReadExactBytes(b, into)` into an already decoded `[N]byte`
+/// (issue #2421: a repeated key decodes into the populated field): `nil`
+/// zeroes it, any other value overwrites only its first `min(encoded, N)`
+/// bytes and leaves the rest as they were (a shorter repeated value keeps the
+/// earlier tail). An explicit array of more than N elements is an error.
+#[inline]
+pub fn read_fixed_bytes_into_go_compat(rd: &mut &[u8], into: &mut [u8]) -> Result<()> {
+    if rd.first() == Some(&0xc0) {
+        *rd = &rd[1..];
+        into.fill(0);
+        return Ok(());
+    }
     let g = read_go_byte_container(rd)?;
-    if g.from_array && g.data.len() > N {
+    if g.from_array && g.data.len() > into.len() {
         return Err(codec_err(format!(
-            "read_fixed_bytes_go_compat: array of {} elements for [{N}]byte",
-            g.data.len()
+            "read_fixed_bytes_go_compat: array of {} elements for [{}]byte",
+            g.data.len(),
+            into.len()
         )));
     }
-    let mut arr = [0u8; N];
-    let n = g.data.len().min(N);
-    arr[..n].copy_from_slice(&g.data[..n]);
-    Ok(arr)
+    let n = g.data.len().min(into.len());
+    into[..n].copy_from_slice(&g.data[..n]);
+    Ok(())
 }
 
 /// A `basics.Address` field (go: `Address.UnmarshalMsg` -> `ReadExactBytes`).
@@ -1374,9 +1388,11 @@ mod tests {
         assert_eq!(read_string(&mut rd).unwrap(), "x");
         let mut rd: &[u8] = &[0xc0];
         assert!(read_str_bytes(&mut rd).unwrap().is_empty());
-        // ... but a bin is not a string in go (no mbin case in ReadStringZC).
-        assert!(read_string(&mut &[0xc4u8, 1, 65][..]).is_err());
-        assert!(read_str_bytes(&mut &[0xc4u8, 1, 65][..]).is_err());
+        // ... and a bin is one too: ReadStringZC has no mbin case, but its
+        // default branch falls back to go-codec's `readBytesBytes` (issue
+        // #2421; go's oracle accepts a `bin` catchpoint label).
+        assert_eq!(read_string(&mut &[0xc4u8, 1, 65][..]).unwrap(), "A");
+        assert_eq!(read_str_bytes(&mut &[0xc4u8, 1, 65][..]).unwrap(), b"A");
     }
 
     #[test]
@@ -1701,6 +1717,49 @@ mod tests {
         assert!(
             format!("{err:?}").contains("no matching struct field"),
             "got: {err:?}"
+        );
+    }
+
+    /// go `msgp.ReadStringZC`: `str`, `nil`, and (go-codec compat) `bin` or a
+    /// uint8 array, but not a map (issue #2421).
+    #[test]
+    fn read_string_accepts_go_string_forms() {
+        for (enc, want) in [
+            (&b"\xa2hi"[..], "hi"),
+            (&b"\xc0"[..], ""),
+            (&b"\xc4\x02hi"[..], "hi"),
+            (&b"\x92\x68\x69"[..], "hi"),
+        ] {
+            let mut rd = enc;
+            assert_eq!(read_string(&mut rd).unwrap(), want, "{enc:02x?}");
+            assert!(rd.is_empty());
+            let mut rd = enc;
+            assert_eq!(read_str_bytes(&mut rd).unwrap(), want.as_bytes());
+        }
+        let mut rd = &b"\x81\x01\x02"[..];
+        assert!(read_string(&mut rd).is_err());
+        // a non-UTF-8 bin is kept losslessly
+        let mut rd = &b"\xc4\x01\xff"[..];
+        let s = read_string(&mut rd).unwrap();
+        assert_eq!(&*crate::raw_text::decode(&s), b"\xff");
+    }
+
+    /// go `msgp.ReadExactBytes(b, into)`: a shorter value overwrites only its
+    /// prefix, nil zeroes, a longer explicit array is an error (issue #2421).
+    #[test]
+    fn read_fixed_bytes_into_keeps_the_tail() {
+        let mut a = [7u8; 4];
+        read_fixed_bytes_into_go_compat(&mut &b"\xc4\x01\x01"[..], &mut a).unwrap();
+        assert_eq!(a, [1, 7, 7, 7]);
+        read_fixed_bytes_into_go_compat(&mut &b"\x92\x02\x03"[..], &mut a).unwrap();
+        assert_eq!(a, [2, 3, 7, 7]);
+        read_fixed_bytes_into_go_compat(&mut &b"\xc4\x06\x01\x02\x03\x04\x05\x06"[..], &mut a)
+            .unwrap();
+        assert_eq!(a, [1, 2, 3, 4]);
+        read_fixed_bytes_into_go_compat(&mut &b"\xc0"[..], &mut a).unwrap();
+        assert_eq!(a, [0; 4]);
+        assert!(
+            read_fixed_bytes_into_go_compat(&mut &b"\x95\x01\x01\x01\x01\x01"[..], &mut a).is_err()
         );
     }
 }

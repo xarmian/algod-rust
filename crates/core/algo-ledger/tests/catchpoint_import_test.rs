@@ -174,7 +174,9 @@ fn make_app_resource(aidx: u64) -> (u64, ByteBuf) {
 
 /// Build a non-owning resource (no ownership flag).
 fn make_non_owning_resource(aidx: u64) -> (u64, ByteBuf) {
-    let blob = vec![0x80]; // empty map, resource_flags defaults to 0
+    // a held, not owned asset (`l` amount 5, resource_flags 0): an empty
+    // `{}` is neither an asset nor an app, which go's restore rejects (#2421)
+    let blob = vec![0x81, 0xa1, b'l', 0x05];
     (aidx, ByteBuf::from(blob))
 }
 
@@ -692,12 +694,11 @@ fn test_creator_table_population() {
     resources4.insert(app_aidx2, app_blob2);
 
     // addr1: 1 owned+held asset resource. addr2: 1 owned+held app resource.
-    // addr3: a non-owning resource with no set fields, which counts as
-    // neither an asset nor an app resource (see is_empty_asset_fields /
-    // is_empty_app_fields), so its totals stay all-zero. addr4: one of each.
+    // addr3: a held, not owned asset resource (one asset holding, no
+    // creator row). addr4: one of each.
     let balance1 = make_balance_record(addr1, account_data_totals_blob(1, 1, 0, 0), resources1);
     let balance2 = make_balance_record(addr2, account_data_totals_blob(0, 0, 1, 1), resources2);
-    let balance3 = make_balance_record(addr3, empty_account_data_blob(), resources3);
+    let balance3 = make_balance_record(addr3, account_data_totals_blob(0, 1, 0, 0), resources3);
     let balance4 = make_balance_record(addr4, account_data_totals_blob(1, 1, 1, 1), resources4);
 
     let chunk = CatchpointSnapshotChunkV6 {

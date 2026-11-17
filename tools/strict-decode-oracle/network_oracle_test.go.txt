@@ -25,7 +25,8 @@
 // Issue #2396.
 //
 // For every {"name","kind","hex"} row of $STRICT_IN it runs go's real decode of
-// that message and writes {"name","ok","err"} to $STRICT_OUT:
+// that message and writes {"name","ok","err","enc"} to $STRICT_OUT (`enc`: the
+// hex of go's re-encode of the decoded value, issue #2421):
 //
 //	idchal    identityChallengeSigned          protocol.Decode (netidentity.go,
 //	          VerifyRequestAndAttachResponse, after the base64 header decode)
@@ -73,6 +74,9 @@ func TestStrictDecodeOracleNetwork(t *testing.T) {
 		Name string `json:"name"`
 		Ok   bool   `json:"ok"`
 		Err  string `json:"err"`
+		// go's canonical re-encode of the decoded value (accepted rows
+		// only): pins what a repeated key decodes to (issue #2421)
+		Enc string `json:"enc,omitempty"`
 	}
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 1<<20), 1<<28)
@@ -95,25 +99,39 @@ func TestStrictDecodeOracleNetwork(t *testing.T) {
 				enc.Encode(o)
 			}()
 			var derr error
+			var val msgp.Marshaler
 			switch r.Kind {
 			case "idchal":
 				var v identityChallengeSigned
-				derr = protocol.Decode(b, &v)
+				derr, val = protocol.Decode(b, &v), &v
 			case "idresp":
 				var v identityChallengeResponseSigned
-				derr = protocol.Decode(b, &v)
+				derr, val = protocol.Decode(b, &v), &v
 			case "idverify":
 				var v identityVerificationMessageSigned
-				derr = protocol.Decode(b, &v)
+				derr, val = protocol.Decode(b, &v), &v
 			case "peermeta":
 				var v peerMetaHeaders
 				_, derr = v.UnmarshalMsg(b)
+				// nil and empty are the same to every reader of the
+				// headers (p2pMetainfo.go): encode both as empty
+				if v == nil {
+					v = peerMetaHeaders{}
+				}
+				for k := range v {
+					if v[k] == nil {
+						v[k] = peerMetaValues{}
+					}
+				}
+				val = &v
 			default:
 				t.Fatalf("unknown kind %q", r.Kind)
 			}
 			o.Ok = derr == nil
 			if derr != nil {
 				o.Err = derr.Error()
+			} else {
+				o.Enc = hex.EncodeToString(val.MarshalMsg(nil))
 			}
 		}()
 	}

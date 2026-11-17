@@ -12,6 +12,10 @@
 //! (pre-order) of a seed, and the fixture's `sha` pins that both produce the
 //! same bytes. `verdicts(kind, bytes)` returns every algod-rust entry point
 //! that reads `kind` with its accept/reject result; each must equal go's.
+//! An entry point that also returns its decoded value, re-encoded the way go
+//! encodes it ([`valued`]), must match go's decoded value too: the case's
+//! `go_val` is the sha256 prefix of go's re-encode (issue #2421, what a
+//! repeated key decodes to).
 
 use std::collections::BTreeMap;
 
@@ -140,8 +144,19 @@ fn mutate(b: &[u8], map: i64, pos: usize, key: &[u8], val: &[u8]) -> Vec<u8> {
 }
 
 /// A decoder result as a verdict.
-pub fn verdict<T, E: std::fmt::Debug>(r: Result<T, E>) -> Result<(), String> {
-    r.map(|_| ()).map_err(|e| format!("{e:?}"))
+#[allow(dead_code)] // not every replaying test has a verdict-only entry point
+pub fn verdict<T, E: std::fmt::Debug>(r: Result<T, E>) -> Result<Option<Vec<u8>>, String> {
+    r.map(|_| None).map_err(|e| format!("{e:?}"))
+}
+
+/// A decoder result as a verdict plus its decoded value, encoded like go's
+/// `protocol.Encode` of the same go value.
+#[allow(dead_code)]
+pub fn valued<T, E: std::fmt::Debug>(
+    r: Result<T, E>,
+    encode: impl FnOnce(&T) -> Vec<u8>,
+) -> Result<Option<Vec<u8>>, String> {
+    r.map(|v| Some(encode(&v))).map_err(|e| format!("{e:?}"))
 }
 
 /// `tests/fixtures/strict_decode/<name>` of the crate under test.
@@ -157,7 +172,7 @@ pub fn rows(text: &str) -> Vec<Value> {
         .collect()
 }
 
-pub type Verdicts = Vec<(&'static str, Result<(), String>)>;
+pub type Verdicts = Vec<(&'static str, Result<Option<Vec<u8>>, String>)>;
 
 /// Replay `cases` (mutants of the crate's `seeds.jsonl`) through `verdicts`
 /// and fail with every case where an algod-rust entry point disagrees with go.
@@ -200,6 +215,23 @@ pub fn replay(
         let go_ok = c["go_ok"].as_bool().expect("go_ok");
         accepted += go_ok as usize;
         for (path, rust) in verdicts(kind, &mutant) {
+            if let (true, Ok(Some(enc))) = (go_ok, &rust) {
+                let got = hex::encode(&Sha256::digest(enc)[..8]);
+                let want = c["go_val"].as_str().expect("an accepted case has go_val");
+                if got != want {
+                    mismatches.push(format!(
+                        "{what} case {} ({kind}, seed {}, map {}, pos {}, key {}, val {}): {path} decodes another value than go (re-encoded, first 96 bytes: {})",
+                        c["id"],
+                        c["seed"].as_str().unwrap_or_default(),
+                        c["map"],
+                        c["pos"],
+                        c["key"].as_str().unwrap_or_default(),
+                        c["val"].as_str().unwrap_or_default(),
+                        hex::encode(&enc[..enc.len().min(96)]),
+                    ));
+                }
+                continue;
+            }
             if rust.is_ok() != go_ok {
                 mismatches.push(format!(
                     "{what} case {} ({kind}, seed {}, map {}, pos {}, key {}, val {}): go {} but {path} {}{}",

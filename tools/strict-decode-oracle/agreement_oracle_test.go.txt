@@ -25,7 +25,8 @@
 // there. Issue #2394.
 //
 // For every {"name","kind","hex"} row of $STRICT_IN it runs go's real network
-// decode of that message kind and writes {"name","ok","err"} to $STRICT_OUT:
+// decode of that message kind and writes {"name","ok","err","enc"} to
+// $STRICT_OUT (`enc`: the hex of go's re-encode of the decoded value, #2421):
 //
 //	payload  protocol.Decode into transmittedPayload      (decodeProposal, the "PP" handler)
 //	vote     protocol.Decode into unauthenticatedVote     (decodeVote, the "AV" handler)
@@ -70,6 +71,9 @@ func TestStrictDecodeOracleAgreement(t *testing.T) {
 		Name string `json:"name"`
 		Ok   bool   `json:"ok"`
 		Err  string `json:"err"`
+		// go's canonical re-encode of the decoded value (accepted rows
+		// only): pins what a repeated key decodes to (issue #2421)
+		Enc string `json:"enc,omitempty"`
 	}
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 1<<20), 1<<28)
@@ -92,25 +96,36 @@ func TestStrictDecodeOracleAgreement(t *testing.T) {
 				enc.Encode(o)
 			}()
 			var derr error
+			var val []byte
 			switch r.Kind {
 			case "payload":
 				var v transmittedPayload
-				derr = protocol.Decode(b, &v)
+				if derr = protocol.Decode(b, &v); derr == nil {
+					val = protocol.Encode(&v)
+				}
 			case "vote":
 				var v unauthenticatedVote
-				derr = protocol.Decode(b, &v)
+				if derr = protocol.Decode(b, &v); derr == nil {
+					val = protocol.Encode(&v)
+				}
 			case "bundle":
 				var v unauthenticatedBundle
-				derr = protocol.Decode(b, &v)
+				if derr = protocol.Decode(b, &v); derr == nil {
+					val = protocol.Encode(&v)
+				}
 			case "cert":
 				var c Certificate
-				derr = protocol.Decode(b, &c)
+				if derr = protocol.Decode(b, &c); derr == nil {
+					val = protocol.Encode(&c)
+				}
 			default:
 				t.Fatalf("unknown kind %q", r.Kind)
 			}
 			o.Ok = derr == nil
 			if derr != nil {
 				o.Err = derr.Error()
+			} else {
+				o.Enc = hex.EncodeToString(val)
 			}
 		}()
 	}

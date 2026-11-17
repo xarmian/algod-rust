@@ -608,9 +608,11 @@ pub fn attach_challenge_header(challenge_signed: &IdentityChallengeSigned) -> St
 // go reads the three messages with `protocol.Decode` (`network/netidentity.go`),
 // i.e. their generated `UnmarshalMsg`: a key the struct lacks is
 // `msgp.ErrNoField`, `nil` is a zero struct, a struct may also be a positional
-// array, a `[32]byte` / `[64]byte` is read with `msgp.ReadExactBytes` (zero
-// padded) and `PublicAddress` is bounded by `maxAddressLen`. A repeated key is
-// decoded again into the same field (a nested struct is merged, as go does).
+// array, a `[32]byte` / `[64]byte` is read with `msgp.ReadExactBytes` and
+// `PublicAddress` is bounded by `maxAddressLen`. A repeated key is decoded
+// again INTO the same field, as go does (issue #2421): a nested struct keeps
+// the fields the repeat does not mention (a `nil` one is reset), and a
+// `[N]byte` keeps the bytes past a shorter repeated value (`nil` zeroes it).
 
 /// go `maxAddressLen` (`network/netidentity.go`): the `allocbound` of
 /// `identityChallenge.PublicAddress`.
@@ -691,17 +693,38 @@ fn read_go_key<'a>(rd: &mut &'a [u8]) -> Result<&'a [u8], IdentityError> {
     Ok(body)
 }
 
-fn read_exact<const N: usize>(rd: &mut &[u8]) -> Result<Vec<u8>, IdentityError> {
-    algo_types::go_msgp::read_fixed_bytes_go_compat::<N>(rd)
-        .map(|a| a.to_vec())
-        .map_err(wire_err)
+/// A `[N]byte` field decoded into its current value, as go's
+/// `msgp.ReadExactBytes(b, z.X[:])` does: a repeated key with a shorter value
+/// keeps the earlier tail, `nil` zeroes it (issue #2421).
+fn read_exact_into<const N: usize>(rd: &mut &[u8], v: &mut Vec<u8>) -> Result<(), IdentityError> {
+    let mut a = [0u8; N];
+    let n = v.len().min(N);
+    a[..n].copy_from_slice(&v[..n]);
+    algo_types::go_msgp::read_fixed_bytes_into_go_compat(rd, &mut a).map_err(wire_err)?;
+    *v = a.to_vec();
+    Ok(())
+}
+
+/// A nested struct decoded again under a repeated key keeps what the repeat
+/// does not mention, but a `nil` map header resets it (go: `(*z) = T{}`).
+fn take_nil_reset<T: Default>(rd: &mut &[u8], v: &mut T) -> bool {
+    if rd.first() == Some(&0xc0) {
+        *rd = &rd[1..];
+        *v = T::default();
+        true
+    } else {
+        false
+    }
 }
 
 fn read_challenge(rd: &mut &[u8], v: &mut IdentityChallenge) -> Result<(), IdentityError> {
+    if take_nil_reset(rd, v) {
+        return Ok(());
+    }
     read_go_struct(rd, "identityChallenge", &["pk", "c", "a"], |k, rd| {
         match k {
-            b"pk" => v.key = read_exact::<32>(rd)?,
-            b"c" => v.challenge = read_exact::<CHALLENGE_SIZE>(rd)?,
+            b"pk" => read_exact_into::<32>(rd, &mut v.key)?,
+            b"c" => read_exact_into::<CHALLENGE_SIZE>(rd, &mut v.challenge)?,
             b"a" => {
                 algo_types::go_msgp::check_go_bytes_bound(rd, MAX_ADDRESS_LEN).map_err(wire_err)?;
                 v.public_address =
@@ -717,15 +740,18 @@ fn read_challenge_response(
     rd: &mut &[u8],
     v: &mut IdentityChallengeResponse,
 ) -> Result<(), IdentityError> {
+    if take_nil_reset(rd, v) {
+        return Ok(());
+    }
     read_go_struct(
         rd,
         "identityChallengeResponse",
         &["pk", "c", "rc"],
         |k, rd| {
             match k {
-                b"pk" => v.key = read_exact::<32>(rd)?,
-                b"c" => v.challenge = read_exact::<CHALLENGE_SIZE>(rd)?,
-                b"rc" => v.response_challenge = read_exact::<CHALLENGE_SIZE>(rd)?,
+                b"pk" => read_exact_into::<32>(rd, &mut v.key)?,
+                b"c" => read_exact_into::<CHALLENGE_SIZE>(rd, &mut v.challenge)?,
+                b"rc" => read_exact_into::<CHALLENGE_SIZE>(rd, &mut v.response_challenge)?,
                 _ => return Ok(false),
             }
             Ok(true)
@@ -737,9 +763,12 @@ fn read_verification_message(
     rd: &mut &[u8],
     v: &mut IdentityVerificationMessage,
 ) -> Result<(), IdentityError> {
+    if take_nil_reset(rd, v) {
+        return Ok(());
+    }
     read_go_struct(rd, "identityVerificationMessage", &["rc"], |k, rd| {
         match k {
-            b"rc" => v.response_challenge = read_exact::<CHALLENGE_SIZE>(rd)?,
+            b"rc" => read_exact_into::<CHALLENGE_SIZE>(rd, &mut v.response_challenge)?,
             _ => return Ok(false),
         }
         Ok(true)
@@ -762,7 +791,7 @@ pub fn decode_identity_challenge_signed(
         |k, rd| {
             match k {
                 b"ic" => read_challenge(rd, &mut msg)?,
-                b"sig" => signature = read_exact::<64>(rd)?,
+                b"sig" => read_exact_into::<64>(rd, &mut signature)?,
                 _ => return Ok(false),
             }
             Ok(true)
@@ -786,7 +815,7 @@ pub fn decode_identity_challenge_response_signed(
         |k, rd| {
             match k {
                 b"icr" => read_challenge_response(rd, &mut msg)?,
-                b"sig" => signature = read_exact::<64>(rd)?,
+                b"sig" => read_exact_into::<64>(rd, &mut signature)?,
                 _ => return Ok(false),
             }
             Ok(true)
@@ -811,7 +840,7 @@ pub fn decode_identity_verification_message_signed(
         |k, rd| {
             match k {
                 b"ivm" => read_verification_message(rd, &mut msg)?,
-                b"sig" => signature = read_exact::<64>(rd)?,
+                b"sig" => read_exact_into::<64>(rd, &mut signature)?,
                 _ => return Ok(false),
             }
             Ok(true)

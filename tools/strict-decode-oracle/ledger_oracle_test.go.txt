@@ -26,7 +26,8 @@
 //
 // For every {"name","kind","hex"} row of $STRICT_IN it runs what go's catchpoint
 // restore does with that catchpoint file section (ledger/catchupaccessor.go)
-// and writes {"name","ok","err"} to $STRICT_OUT:
+// and writes {"name","ok","err","enc"} to $STRICT_OUT (`enc`: the hex of go's
+// re-encode of the decoded value, issue #2421):
 //
 //	cpheader  content.msgpack: protocol.Decode into CatchpointFileHeader
 //	          (processStagingContent)
@@ -48,6 +49,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"sort"
 	"testing"
 
 	"github.com/algorand/go-algorand/config"
@@ -80,6 +82,9 @@ func TestStrictDecodeOracleLedger(t *testing.T) {
 		Name string `json:"name"`
 		Ok   bool   `json:"ok"`
 		Err  string `json:"err"`
+		// go's canonical re-encode of the decoded value (accepted rows
+		// only): pins what a repeated key decodes to (issue #2421)
+		Enc string `json:"enc,omitempty"`
 	}
 	proto := config.Consensus[protocol.ConsensusCurrentVersion]
 	sc := bufio.NewScanner(in)
@@ -103,25 +108,50 @@ func TestStrictDecodeOracleLedger(t *testing.T) {
 				enc.Encode(o)
 			}()
 			var derr error
+			var val []byte
 			switch r.Kind {
 			case "cpheader":
 				var v CatchpointFileHeader
-				derr = protocol.Decode(b, &v)
+				if derr = protocol.Decode(b, &v); derr == nil {
+					val = protocol.Encode(&v)
+				}
 			case "cpchunk":
+				// the chunk, then every decoded account blob and every
+				// decoded resource blob (ascending creatable index)
 				var v CatchpointSnapshotChunkV6
 				derr = protocol.Decode(b, &v)
 				if derr == nil {
-					_, derr = prepareNormalizedBalancesV6(v.Balances, proto)
+					var nb []trackerdb.NormalizedAccountBalance
+					nb, derr = prepareNormalizedBalancesV6(v.Balances, proto)
+					if derr == nil {
+						val = protocol.Encode(&v)
+						for i := range nb {
+							val = append(val, protocol.Encode(&nb[i].AccountData)...)
+							idx := make([]basics.CreatableIndex, 0, len(nb[i].Resources))
+							for k := range nb[i].Resources {
+								idx = append(idx, k)
+							}
+							sort.Slice(idx, func(a, c int) bool { return idx[a] < idx[c] })
+							for _, k := range idx {
+								rd := nb[i].Resources[k]
+								val = append(val, protocol.Encode(&rd)...)
+							}
+						}
+					}
 				}
 			case "cpspver":
 				var v catchpointStateProofVerificationContext
-				derr = protocol.Decode(b, &v)
+				if derr = protocol.Decode(b, &v); derr == nil {
+					val = protocol.Encode(&v)
+				}
 			default:
 				t.Fatalf("unknown kind %q", r.Kind)
 			}
 			o.Ok = derr == nil
 			if derr != nil {
 				o.Err = derr.Error()
+			} else {
+				o.Enc = hex.EncodeToString(val)
 			}
 		}()
 	}
