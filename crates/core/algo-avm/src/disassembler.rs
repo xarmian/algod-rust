@@ -193,6 +193,8 @@ fn immediates_of(spec: &OpSpec) -> Imms {
 /// Label numbers by branch target (go's `labels map[int]string`, whose names
 /// are always `label<N>`): a pc-indexed table for the targets inside the
 /// program (and its end), a map for the rest (a branch may name any offset).
+/// The table covers at most [`DENSE_LABEL_TARGETS`] offsets, far above any
+/// real program, so an oversized input cannot make it allocate in proportion.
 struct Labels {
     /// `near[target]` is the label number, 0 when there is none (numbers start at 1).
     near: Vec<u32>,
@@ -202,7 +204,7 @@ struct Labels {
 impl Labels {
     fn new(program_len: usize) -> Self {
         Self {
-            near: vec![0; program_len + 1],
+            near: vec![0; (program_len + 1).min(DENSE_LABEL_TARGETS)],
             far: HashMap::new(),
         }
     }
@@ -227,6 +229,9 @@ impl Labels {
         }
     }
 }
+
+/// Size cap of [`Labels`]' pc-indexed table and of the text reservation basis.
+const DENSE_LABEL_TARGETS: usize = 1 << 16;
 
 /// Append `label<n>`.
 fn push_label(out: &mut String, n: u32) {
@@ -314,7 +319,7 @@ fn disassemble_pass(
         bytec: Vec::new(),
     };
     // The text is a few times the bytecode; one reservation saves most regrowth.
-    let mut body = String::with_capacity(program.len() * 4);
+    let mut body = String::with_capacity(program.len().min(DENSE_LABEL_TARGETS) * 4);
     let mut offsets = Vec::new();
     let mut has_stateful_ops = false;
     // go resolves version 0 against the v1 opcode set.
@@ -1097,6 +1102,21 @@ bytec 4 // \"last\"\n";
     // `bytecode::parse` likewise only validates that the two offset bytes
     // are physically present, not that the resulting target is in range.
     // -------------------------------------------------------------------
+
+    // #2411: the pc-indexed label table and its map fallback behave as one map.
+    #[test]
+    fn labels_table_and_map_agree_on_every_target_kind() {
+        let mut l = Labels::new(10);
+        for (target, n) in [(0i64, 1u32), (10, 2), (11, 3), (-1, 4), (i64::MIN, 5)] {
+            assert_eq!(l.get(target), None);
+            l.insert(target, n);
+            assert_eq!(l.get(target), Some(n), "target {target}");
+        }
+        assert!(l.far.contains_key(&11) && l.far.contains_key(&-1));
+        assert_eq!(l.get(5), None);
+        let big = Labels::new(usize::MAX - 1);
+        assert_eq!(big.near.len(), DENSE_LABEL_TARGETS);
+    }
 
     #[test]
     fn test_disassemble_bad_branch() {
