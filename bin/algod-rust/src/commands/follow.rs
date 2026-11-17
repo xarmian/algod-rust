@@ -23,7 +23,6 @@ use std::path::Path;
 use algo_conformance::{compare_block, ConformanceReport};
 use algo_rest_client::{AlgodClient, BlockSource};
 use algo_types::Round;
-use chrono::Utc;
 use tracing::{error, info};
 
 pub async fn run(
@@ -40,7 +39,7 @@ pub async fn run(
     let status = client.get_status().await?;
     let mut current_round = Round(status.last_round);
     let mut results = Vec::new();
-    let started_at = Utc::now().to_rfc3339();
+    let started_at = crate::timefmt::now_rfc3339();
 
     // Fetch genesis info and prev_timestamp from the current round's block.
     let init_raw = client.get_block_raw(current_round).await?;
@@ -100,7 +99,7 @@ pub async fn run(
         // Write periodic reports every 100 rounds
         if let Some(dir) = report_dir {
             if results.len() >= 100 {
-                let finished_at = Utc::now().to_rfc3339();
+                let finished_at = crate::timefmt::now_rfc3339();
                 let report = ConformanceReport::new(
                     std::mem::take(&mut results),
                     started_at.clone(),

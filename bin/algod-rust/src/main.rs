@@ -27,6 +27,7 @@ mod live_catchup;
 mod log_setup;
 mod node_interface_impl;
 mod shutdown;
+mod timefmt;
 
 use clap::Parser;
 

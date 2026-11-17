@@ -753,7 +753,7 @@ fn spawn_ws_peer(
                         tag,
                         payload,
                         peer_id.to_string(),
-                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+                        crate::timefmt::now_unix_nanos(),
                     );
                     // Issue #1987 diagnostics: what arrived on the stream and what
                     // the handler did with it (agreement traffic only; votes/
@@ -2824,7 +2824,7 @@ impl P2pTransport {
                                         tag,
                                         message.data,
                                         propagation_source.to_string(),
-                                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+                                        crate::timefmt::now_unix_nanos(),
                                     );
                                     let out = mux.handle(msg).await;
                                     // Issue #1491: a registered handler
@@ -4537,7 +4537,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "algo-p2p-stream-order-test-{}-{}",
             std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            crate::timefmt::now_unix_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
 

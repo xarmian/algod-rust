@@ -28,7 +28,6 @@ use algo_network::{
     TaggedMessageHandler, WebsocketNetwork, WebsocketNetworkConfig, DEFAULT_GOSSIP_FANOUT,
 };
 use async_trait::async_trait;
-use chrono::Utc;
 use serde_json::json;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -76,8 +75,8 @@ impl MessageHandler for CaptureHandler {
 
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
         let tag_str = msg.tag.as_str();
-        let now = Utc::now();
-        let ts = now.format("%Y%m%dT%H%M%S%.3fZ").to_string();
+        let now = time::OffsetDateTime::now_utc();
+        let ts = crate::timefmt::compact_millis_z(now);
         let filename = format!("{}_{ts}_{seq}.bin", tag_str.trim());
         let filepath = self.output_dir.join(&filename);
         let size = msg.data.len();
@@ -95,7 +94,7 @@ impl MessageHandler for CaptureHandler {
                 filename,
                 tag: tag_str.to_string(),
                 size,
-                timestamp: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                timestamp: crate::timefmt::rfc3339_millis_z(now),
                 sequence: seq,
             };
             self.manifest.lock().await.push(entry);
@@ -210,7 +209,7 @@ pub async fn run(
     let manifest = json!({
         "relay_addr": relay_addr,
         "genesis_id": genesis_id,
-        "captured_at": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "captured_at": crate::timefmt::rfc3339_millis_z(time::OffsetDateTime::now_utc()),
         "message_count": entries.len(),
         "messages": *entries,
     });
