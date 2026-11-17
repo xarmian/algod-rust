@@ -105,7 +105,7 @@ jobs:
         run: |
           set -euo pipefail
           case "$EVENT" in
-            pull_request) REF="$PR_REGISTRY_SHA"; REST=0; BENCH_RUNS=1 ;;
+            pull_request) REF="$PR_REGISTRY_SHA"; REST=40; BENCH_RUNS=1 ;;
             workflow_dispatch) REF="${IN_REGISTRY_REF:-main}"; REST="${IN_REST:-300}"; BENCH_RUNS=3 ;;
             *) REF="main"; REST=300; BENCH_RUNS=3 ;;
           esac
