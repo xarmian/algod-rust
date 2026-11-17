@@ -40,6 +40,7 @@ pub mod groups;
 pub mod kmdcontrol;
 pub mod nodecontrol;
 pub mod resource_resolution;
+pub mod wallet_token;
 
 /// goal-rust — CLI for interacting with Algorand.
 ///

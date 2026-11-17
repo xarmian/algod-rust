@@ -2729,37 +2729,16 @@ pub(crate) fn resolve_wallet_and_init(
             }
         };
 
-    let password = match password_flag {
-        Some(p) => p.to_string(),
-        None => read_password_for(&wallet_name)?,
-    };
-
-    let handle = rt
-        .block_on(client.init_wallet(&wallet_id, &password))
-        .map_err(|e| format!("Request failed: {}", kmd_msg(&e)))?
-        .wallet_handle_token;
+    let (handle, password) = crate::wallet_token::wallet_handle_and_password(
+        rt,
+        client,
+        &accounts.data_dir,
+        &wallet_id,
+        &wallet_name,
+        password_flag,
+        true,
+    )?;
     Ok((handle, wallet_name, password))
-}
-
-fn read_password_for(wallet_name: &str) -> Result<String, String> {
-    use std::io::{BufRead, IsTerminal, Write};
-    let stdin = std::io::stdin();
-    if stdin.is_terminal() {
-        print!("Please enter the password for wallet '{wallet_name}': ");
-        let _ = std::io::stdout().flush();
-        let pw = rpassword::read_password().map_err(|e| format!("Request failed: {e}"))?;
-        println!();
-        Ok(pw)
-    } else {
-        let mut line = String::new();
-        stdin
-            .lock()
-            .read_line(&mut line)
-            .map_err(|e| format!("Request failed: {e}"))?;
-        let trimmed = line.strip_suffix('\n').unwrap_or(&line);
-        let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
-        Ok(trimmed.to_string())
-    }
 }
 
 pub(crate) fn kmd_msg(e: &KmdError) -> String {

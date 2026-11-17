@@ -30,6 +30,9 @@
 
 #![allow(dead_code)] // utilities are picked up per-test-binary
 
+#[cfg(unix)]
+pub mod pty;
+
 use std::path::PathBuf;
 
 /// Absolute path of `tests/fixtures/parity/<name>.txt`.

@@ -30,12 +30,14 @@
 
 #![cfg(unix)]
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+
+mod common;
+use common::pty::{run, Stdin};
 
 const GOAL_RUST_BIN: &str = env!("CARGO_BIN_EXE_goal-rust");
 
@@ -43,6 +45,10 @@ const GOAL_RUST_BIN: &str = env!("CARGO_BIN_EXE_goal-rust");
 const ZERO_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon invest";
 
 const SOURCE: &str = "#pragma version 8\nint 1\nreturn\n";
+
+/// What a password prompt leaves on stdout: go prints the prompt, then a
+/// newline after the typed line.
+const PROMPT_OUT: &str = "Please enter the password for wallet 'w': \n";
 
 /// go's `protocol.Encode` of the signed LogicSig of `SOURCE`'s program.
 const GO_LSIG_B64: &str = "gqFsxAQIgQFDo3NpZ8RAZKYC2baKVvMn9rJLPkysusWXTfh9lAc7RogmSOcGUHuVRRIw4AhJ7O3rAqKWeDvtmNi8PQWXfkXa5bnVW7grBA==";
@@ -152,26 +158,25 @@ fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
-/// `goal-rust -d <dd> <args>`, `stdin` as the password prompt's input.
+/// `goal-rust -d <dd> <args>`; a non-empty `stdin` is the first line typed
+/// into a pseudo-terminal at each password prompt (neither go's `goal` nor
+/// goal-rust reads a password from a pipe, issue #2391), an empty one is
+/// `/dev/null`.
 fn goal(dd: &Path, args: &[&str], stdin: &str) -> std::process::Output {
-    let mut child = Command::new(GOAL_RUST_BIN)
-        .arg("-d")
-        .arg(dd)
-        .args(args)
-        .current_dir(dd)
-        .env_remove("ALGORAND_DATA")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn goal-rust");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .unwrap();
-    child.wait_with_output().expect("goal-rust output")
+    use std::os::unix::process::ExitStatusExt;
+    let mode = match stdin.lines().next() {
+        Some(line) => Stdin::Pty {
+            prompt: "Please enter the password for wallet",
+            line,
+        },
+        None => Stdin::Null,
+    };
+    let ran = run(Path::new(GOAL_RUST_BIN), dd, args, mode);
+    std::process::Output {
+        status: std::process::ExitStatus::from_raw(ran.code.unwrap_or(255) << 8),
+        stdout: ran.stdout,
+        stderr: ran.stderr,
+    }
 }
 
 fn import_zero_key(dd: &Path) -> String {
@@ -216,7 +221,7 @@ fn compile_sign_writes_the_signed_logicsig_like_go() {
         "pw\n",
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
-    assert_eq!(text(&out.stdout), "");
+    assert_eq!(text(&out.stdout), PROMPT_OUT);
     assert_eq!(std::fs::read(dd.join("p.teal.tok")).unwrap(), want);
 
     // The record round-trips through `-D`: the program and go's inspection.
@@ -245,7 +250,7 @@ fn compile_sign_writes_the_signed_logicsig_like_go() {
         "pw\n",
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
-    assert_eq!(out.stdout, want);
+    assert_eq!(out.stdout, [PROMPT_OUT.as_bytes(), &want[..]].concat());
 
     // `-n` writes nothing.
     std::fs::remove_file(dd.join("o.lsig")).unwrap();
@@ -277,7 +282,7 @@ fn compile_sign_uses_and_announces_the_default_account() {
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(
         text(&out.stdout),
-        format!("will use default account: {addr}\n")
+        format!("{PROMPT_OUT}will use default account: {addr}\n{PROMPT_OUT}")
     );
     let want = base64::engine::general_purpose::STANDARD
         .decode(GO_LSIG_B64)

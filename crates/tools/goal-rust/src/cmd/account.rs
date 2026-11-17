@@ -33,7 +33,7 @@
 //! use accountList.json's `DefaultWalletID`; if no default, fall back
 //! to "single wallet auto-promotes to default"; else error.
 
-use std::io::{BufRead, IsTerminal};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -68,9 +68,6 @@ const ERROR_NAME_DOESNT_EXIST: &str = "An account named '{}' does not exist.";
 /// Mirrors Go's generic `errorRequestFail` template
 /// (`messages.go:46`).
 const ERROR_REQUEST_FAIL: &str = "Request failed: {}";
-
-/// Mirrors `messages.go:194` for the wallet-password prompt.
-const PROMPT_EXISTING_PASSWORD: &str = "Please enter the password for wallet '{}': ";
 
 /// Mirrors Go's `Could not contact kmd; is it running?` error path.
 const ERROR_KMD_UNREACHABLE: &str = "Could not contact kmd; is it running?";
@@ -124,7 +121,7 @@ pub fn run_new(args: NewArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>
     }
 
     // Resolve wallet + open handle.
-    let (wallet_id, _wallet_name, _password) = match resolve_wallet_and_init(
+    let (wallet_id, _wallet_name, _password) = match resolve_wallet_no_password(
         &rt,
         &client,
         &mut accounts,
@@ -675,6 +672,29 @@ fn resolve_wallet_and_init(
     wallet_flag: Option<&str>,
     password_flag: Option<&str>,
 ) -> Result<(String, String, String), ()> {
+    resolve_wallet(rt, client, accounts, wallet_flag, password_flag, true)
+}
+
+/// `getWalletHandleMaybePassword(.., getPassword = false)`: callers that need
+/// no password (go's `ensureWalletHandle`).
+fn resolve_wallet_no_password(
+    rt: &tokio::runtime::Runtime,
+    client: &KmdClient,
+    accounts: &mut AccountsList,
+    wallet_flag: Option<&str>,
+    password_flag: Option<&str>,
+) -> Result<(String, String, String), ()> {
+    resolve_wallet(rt, client, accounts, wallet_flag, password_flag, false)
+}
+
+fn resolve_wallet(
+    rt: &tokio::runtime::Runtime,
+    client: &KmdClient,
+    accounts: &mut AccountsList,
+    wallet_flag: Option<&str>,
+    password_flag: Option<&str>,
+    get_password: bool,
+) -> Result<(String, String, String), ()> {
     // 1. Resolve wallet ID + name.
     let (wallet_id, wallet_name) = match wallet_flag {
         Some(name) => {
@@ -742,46 +762,26 @@ fn resolve_wallet_and_init(
         }
     };
 
-    // 2. Resolve password.
-    let password = match password_flag {
-        Some(p) => p.to_string(),
-        None => read_password_for(&wallet_name)?,
-    };
-
-    // 3. Init handle.
-    let handle = rt
-        .block_on(client.init_wallet(&wallet_id, &password))
-        .map_err(|e| {
-            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&kmd_msg(&e)]));
-        })?
-        .wallet_handle_token;
+    // 2. The (cached) wallet handle token and the password.
+    let (handle, password) = crate::wallet_token::wallet_handle_and_password(
+        rt,
+        client,
+        &accounts.data_dir,
+        &wallet_id,
+        &wallet_name,
+        password_flag,
+        get_password,
+    )
+    .map_err(|e| {
+        eprintln!("{e}");
+    })?;
     Ok((handle, wallet_name, password))
 }
 
 fn read_password_for(wallet_name: &str) -> Result<String, ()> {
-    let stdin = std::io::stdin();
-    if stdin.is_terminal() {
-        use std::io::Write;
-        print!(
-            "{}",
-            format_message(PROMPT_EXISTING_PASSWORD, &[wallet_name])
-        );
-        let _ = std::io::stdout().flush();
-        let pw = rpassword::read_password().map_err(|e| {
-            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
-        })?;
-        println!();
-        Ok(pw)
-    } else {
-        let mut line = String::new();
-        if let Err(e) = stdin.lock().read_line(&mut line) {
-            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
-            return Err(());
-        }
-        let trimmed = line.strip_suffix('\n').unwrap_or(&line);
-        let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
-        Ok(trimmed.to_string())
-    }
+    crate::wallet_token::read_password_for(wallet_name).map_err(|e| {
+        eprintln!("{e}");
+    })
 }
 
 fn kmd_msg(e: &KmdError) -> String {
@@ -884,7 +884,7 @@ pub fn run_import(
     let expanded = expand_seed_to_sk(&seed);
 
     // Resolve wallet + open handle.
-    let (handle, _wallet_name, _password) = match resolve_wallet_and_init(
+    let (handle, _wallet_name, _password) = match resolve_wallet_no_password(
         &rt,
         &client,
         &mut accounts,
@@ -2031,7 +2031,7 @@ pub fn run_multisig_new(
         Err(()) => return ExitCode::from(1),
     };
     let mut accounts = AccountsList::load(&data_dir_path);
-    let (handle, _wallet_name, _pw) = match resolve_wallet_and_init(
+    let (handle, _wallet_name, _pw) = match resolve_wallet_no_password(
         &rt,
         &client,
         &mut accounts,
@@ -2142,7 +2142,7 @@ pub fn run_multisig_info(
     // we don't have; mirror the other read-leaves and let
     // resolve_wallet_and_init prompt on TTY when --password is
     // omitted. Unencrypted wallets still work via `--password ''`.
-    let (handle, _wallet_name, _pw) = match resolve_wallet_and_init(
+    let (handle, _wallet_name, _pw) = match resolve_wallet_no_password(
         &rt,
         &client,
         &mut accounts,
@@ -2247,7 +2247,7 @@ pub fn run_importrootkey(
                     Err(()) => return ExitCode::from(1),
                 }
             } else {
-                let (h, _wallet_name, _pw) = match resolve_wallet_and_init(
+                let (h, _wallet_name, _pw) = match resolve_wallet_no_password(
                     &rt,
                     &client,
                     &mut accounts,
