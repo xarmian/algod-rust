@@ -1,0 +1,17 @@
+{"code":1,"name":"cold stdin is a pipe","outfile":false,"stderr":"Couldn't read password: inappropriate ioctl for device\n","stdout":"Please enter the password for wallet 'w': "}
+{"code":1,"name":"cold stdin is /dev/null","outfile":false,"stderr":"Couldn't read password: inappropriate ioctl for device\n","stdout":"Please enter the password for wallet 'w': "}
+{"cache":"absent","name":"cache after the failed reads"}
+{"code":1,"name":"cold wrong password","outfile":false,"stderr":"Couldn't get token for wallet 'w' (ID: <WALLET_ID>): failed to decrypt blob\n","stdout":"Please enter the password for wallet 'w': \n"}
+{"cache":"absent","name":"cache after the wrong password"}
+{"code":1,"name":"cold unknown account","outfile":false,"stderr":"Couldn't sign tx with kmd: key not found (for multisig accounts, write tx to file and sign manually)\n","stdout":"Please enter the password for wallet 'w': \n"}
+{"cache":["<WALLET_ID>:<TOKEN>"],"mode":"600","name":"cache after the first token","pretty":true}
+{"code":0,"name":"cached success","outfile":true,"stderr":"","stdout":"Please enter the password for wallet 'w': \n"}
+{"code":1,"name":"cached wrong password","outfile":false,"stderr":"Couldn't sign tx with kmd: failed to decrypt blob (for multisig accounts, write tx to file and sign manually)\n","stdout":"Please enter the password for wallet 'w': \n"}
+{"code":1,"name":"cached unknown account","outfile":false,"stderr":"Couldn't sign tx with kmd: key not found (for multisig accounts, write tx to file and sign manually)\n","stdout":"Please enter the password for wallet 'w': \n"}
+{"code":1,"name":"cached stdin is a pipe","outfile":false,"stderr":"Couldn't read password: inappropriate ioctl for device\n","stdout":"Please enter the password for wallet 'w': "}
+{"code":1,"name":"cached stdin is /dev/null","outfile":false,"stderr":"Couldn't read password: inappropriate ioctl for device\n","stdout":"Please enter the password for wallet 'w': "}
+{"code":1,"name":"stale token wrong password","outfile":false,"stderr":"Couldn't get token for wallet 'w' (ID: <WALLET_ID>): failed to decrypt blob\n","stdout":"Please enter the password for wallet 'w': \n"}
+{"code":0,"name":"stale token success","outfile":true,"stderr":"","stdout":"Please enter the password for wallet 'w': \n"}
+{"cache":["<WALLET_ID>:<TOKEN>"],"mode":"600","name":"cache after the stale token","pretty":true}
+{"code":0,"name":"cold success","outfile":true,"stderr":"","stdout":"Please enter the password for wallet 'w': \n"}
+{"cache":["<WALLET_ID>:<TOKEN>"],"mode":"600","name":"cache after the cold success","pretty":true}

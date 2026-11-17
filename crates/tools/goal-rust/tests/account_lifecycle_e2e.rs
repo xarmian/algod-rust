@@ -26,6 +26,8 @@
 #![cfg(unix)]
 
 use std::io::Write;
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -553,10 +555,10 @@ fn account_dump_writes_outfile_when_o_flag_given() {
     );
 }
 
-/// Sanity guard: feeding `wallet new` an explicit stdin password line
-/// works for `account new` too.
+/// go reads the wallet password with `terminal.ReadPassword` only (issue
+/// #2391): a stdin that is a pipe fails with go's text, a terminal works.
 #[test]
-fn account_new_reads_password_from_non_tty_stdin() {
+fn account_new_password_comes_from_a_terminal_only() {
     let (_t, dd, kmd_dir) = setup_data_dir();
     let _g = spawn_kmd(&kmd_dir);
     create_default_wallet(&dd);
@@ -564,7 +566,7 @@ fn account_new_reads_password_from_non_tty_stdin() {
     let mut child = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args(["account", "new", "from-stdin"])
+        .args(["account", "new", "from-pipe"])
         .env_remove("ALGORAND_DATA")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -573,10 +575,22 @@ fn account_new_reads_password_from_non_tty_stdin() {
         .expect("spawn");
     child.stdin.as_mut().unwrap().write_all(b"pw\n").unwrap();
     let out = child.wait_with_output().expect("wait");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success(),
-        "stdin-password path must succeed; stdout={stdout:?}",
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Couldn't read password: inappropriate ioctl for device\n"
     );
-    assert!(stdout.starts_with("Created new account with address "));
+
+    let out = common::pty::run(
+        Path::new(GOAL_RUST_BIN),
+        &dd,
+        &["account", "new", "from-tty"],
+        common::pty::Stdin::Pty {
+            prompt: "Please enter the password for wallet",
+            line: "pw",
+        },
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.code, Some(0), "stdout={stdout:?}");
+    assert!(stdout.contains("Created new account with address "));
 }

@@ -243,3 +243,8 @@ jobs:
           # fixtures/clerk_sign_lsig.jsonl is go's output (a stale one fails
           # sign_lsig_fixture_matches_go_goal).
           MIXED_CLUSTER=1 cargo test -p goal-rust --test clerk_sign_lsig_e2e -- --nocapture
+          # #2391: go's wallet handle token cache and terminal-only password
+          # input, seen through `clerk compile -s` against a kmd-rust with the
+          # password typed into a pty; fixtures/clerk_wallet_token.jsonl is go's
+          # output (a stale one fails wallet_token_fixture_matches_go_goal).
+          MIXED_CLUSTER=1 cargo test -p goal-rust --test clerk_wallet_token_e2e -- --nocapture

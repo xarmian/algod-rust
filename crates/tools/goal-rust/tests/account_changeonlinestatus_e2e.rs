@@ -30,6 +30,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use base64::Engine as _;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -498,11 +500,12 @@ fn renewpartkey_register_submits_online_keyreg() {
     wire_algod(&dd, port);
 
     // renewpartkey has no -w/--password flags (mirrors Go); the --register step
-    // prompts for the default wallet's password, so pipe it via stdin.
-    let mut child = Command::new(GOAL_RUST_BIN)
-        .arg("-d")
-        .arg(&dd)
-        .args([
+    // prompts for the default wallet's password, typed into a pseudo-terminal
+    // (go's `terminal.ReadPassword` reads no pipe, issue #2391).
+    let out = common::pty::run(
+        Path::new(GOAL_RUST_BIN),
+        &dd,
+        &[
             "account",
             "renewpartkey",
             "-a",
@@ -510,23 +513,16 @@ fn renewpartkey_register_submits_online_keyreg() {
             "--roundLastValid",
             "5000",
             "--register",
-        ])
-        .env_remove("ALGORAND_DATA")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn renewpartkey");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"pw\n")
-        .expect("write password to stdin");
-    let out = child.wait_with_output().expect("renewpartkey output");
+        ],
+        common::pty::Stdin::Pty {
+            prompt: "Please enter the password for wallet",
+            line: "pw",
+        },
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success(),
+    assert_eq!(
+        out.code,
+        Some(0),
         "renewpartkey --register failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
