@@ -1135,7 +1135,7 @@ teal-corpus-fetch:
 ## Needs `make libsodium` in ../go-algorand first (see CLAUDE.md).
 teal-corpus-parity:
 	@test -d $(TEAL_CORPUS_WORK)/corpus/programs || { echo "no corpus: run 'make teal-corpus-fetch' first" >&2; exit 2; }
-	bash tools/teal-corpus/build.sh $(TEAL_CORPUS_WORK)/teal-corpus-go
+	bash tools/teal-corpus/build.sh $(CURDIR)/$(TEAL_CORPUS_WORK)/teal-corpus-go
 	cargo build -p teal-corpus --release
 	GO_DRIVER=$(CURDIR)/$(TEAL_CORPUS_WORK)/teal-corpus-go RUST_DRIVER=$(CURDIR)/target/release/teal-corpus \
 		bash scripts/teal-corpus/run_drivers.sh $(TEAL_CORPUS_WORK)/corpus $(TEAL_CORPUS_WORK)/out $(TEAL_CORPUS_STAGES)
