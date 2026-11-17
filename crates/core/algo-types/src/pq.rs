@@ -132,8 +132,21 @@ impl PQSig {
             match crate::rmp_decode::read_key_bytes(rd)? {
                 b"sch" => s.scheme = crate::rmp_decode::read_fixed_bytes_go_compat::<2>(rd)?,
                 b"slt" => s.salt = PQAddressSalt(crate::rmp_decode::read_u8_val(rd)?),
-                b"pk" => s.public_key = crate::rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?,
-                b"sig" => s.signature = crate::rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?,
+                // go's `allocbound=crypto.MaxPQPublicKeySize` / `MaxPQSignatureSize`.
+                b"pk" => {
+                    crate::rmp_decode::check_go_bytes_bound(
+                        rd,
+                        crate::rmp_decode::MAX_PQ_PUBLIC_KEY_SIZE,
+                    )?;
+                    s.public_key = crate::rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?
+                }
+                b"sig" => {
+                    crate::rmp_decode::check_go_bytes_bound(
+                        rd,
+                        crate::rmp_decode::MAX_PQ_SIGNATURE_SIZE,
+                    )?;
+                    s.signature = crate::rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?
+                }
                 other => crate::rmp_decode::unknown_key(rd, other)?,
             }
         }

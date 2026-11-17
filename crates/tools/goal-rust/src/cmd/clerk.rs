@@ -1159,9 +1159,10 @@ fn write_goal_file(filename: &str, data: &[u8]) -> std::io::Result<()> {
 fn disassemble_file(fname: &str, outname: &str) -> Result<(), String> {
     let mut program = read_goal_file(fname).map_err(|e| format!("{fname}: {e}"))?;
     let mut extra = String::new();
-    // go first tries to parse the file as a msgpack LogicSig.
-    if let Ok(lsig) = algo_codec::decode_logicsig(&program) {
-        program = lsig.logic.to_vec();
+    // go first tries to parse the file as a msgpack LogicSig, with the strict
+    // msgp-generated decoder (`protocol.Decode`): see `algo_codec::decode_logicsig_go`.
+    if let Ok(lsig) = algo_codec::decode_logicsig_go(&program) {
+        program = lsig.logic.clone();
         // A signed or argument-carrying LogicSig also prints its inspection
         // (`lsigToInspect` of the record without its program), clerk.go:1041-1046.
         if lsig_has_authorization(&lsig) {
@@ -1184,12 +1185,12 @@ fn disassemble_file(fname: &str, outname: &str) -> Result<(), String> {
 
 /// go's `!lsig.Sig.Blank() || !lsig.Msig.Blank() || !lsig.LMsig.Blank() ||
 /// !lsig.PQsig.Blank() || len(lsig.Args) > 0` (clerk.go:1041).
-fn lsig_has_authorization(lsig: &algo_types::LogicSig) -> bool {
+fn lsig_has_authorization(lsig: &algo_codec::GoLogicSig) -> bool {
     lsig.sig != [0u8; 64]
-        || lsig.msig.as_ref().is_some_and(|m| !msig_blank(m))
-        || lsig.lmsig.as_ref().is_some_and(|m| !msig_blank(m))
-        || lsig.pqsig.as_ref().is_some_and(|p| !p.blank())
-        || lsig.args.as_ref().is_some_and(|a| !a.is_empty())
+        || !msig_blank(&lsig.msig)
+        || !msig_blank(&lsig.lmsig)
+        || !lsig.pqsig.blank()
+        || !lsig.args.is_empty()
 }
 
 /// `crypto.MultisigSig.Blank()`: no version, threshold or subsignature.
@@ -1199,6 +1200,8 @@ fn msig_blank(m: &algo_types::MultisigSig) -> bool {
 
 /// A value of go-codec's JSON output, enough for `inspectLogicSig`.
 enum Json {
+    /// A nil `[]byte` (`null`), as go-codec writes it.
+    Null,
     Str(String),
     Num(u64),
     Obj(Vec<(&'static str, Json)>),
@@ -1211,6 +1214,7 @@ impl Json {
     fn write(&self, depth: usize, out: &mut String) {
         let pad = |n: usize| "  ".repeat(n);
         match self {
+            Json::Null => out.push_str("null"),
             Json::Str(v) => {
                 out.push('"');
                 out.push_str(v);
@@ -1290,18 +1294,23 @@ fn msig_inspect_json(m: &algo_types::MultisigSig) -> Option<Json> {
 /// `string(protocol.EncodeJSON(lsigToInspect(lsig with Logic = nil)))`
 /// (clerk.go:1042-1045): the members `arg`, `lmsig`, `msig`, `pqsig`, `sig` in
 /// canonical (sorted) order, empty ones omitted. The program itself is left out.
-fn lsig_inspect_json(lsig: &algo_types::LogicSig) -> String {
+fn lsig_inspect_json(lsig: &algo_codec::GoLogicSig) -> String {
     let mut members: Vec<(&'static str, Json)> = Vec::new();
-    if let Some(args) = lsig.args.as_ref().filter(|a| !a.is_empty()) {
-        members.push(("arg", Json::Arr(args.iter().map(|a| b64(a)).collect())));
+    if !lsig.args.is_empty() {
+        let args = lsig
+            .args
+            .iter()
+            .map(|a| a.as_deref().map_or(Json::Null, b64))
+            .collect();
+        members.push(("arg", Json::Arr(args)));
     }
-    if let Some(j) = lsig.lmsig.as_ref().and_then(msig_inspect_json) {
+    if let Some(j) = msig_inspect_json(&lsig.lmsig) {
         members.push(("lmsig", j));
     }
-    if let Some(j) = lsig.msig.as_ref().and_then(msig_inspect_json) {
+    if let Some(j) = msig_inspect_json(&lsig.msig) {
         members.push(("msig", j));
     }
-    if let Some(pq) = lsig.pqsig.as_ref().filter(|p| !p.blank()) {
+    if let Some(pq) = Some(&lsig.pqsig).filter(|p| !p.blank()) {
         let mut m = Vec::new();
         if !pq.public_key.is_empty() {
             m.push(("pk", b64(&pq.public_key)));

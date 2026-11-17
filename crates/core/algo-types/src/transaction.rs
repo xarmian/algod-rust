@@ -1659,8 +1659,13 @@ impl MultisigSig {
             match rmp_decode::read_key_bytes(rd)? {
                 b"v" => s.version = rmp_decode::read_u8_val(rd)?,
                 b"thr" => s.threshold = rmp_decode::read_u8_val(rd)?,
+                // go bounds `subsig` by `maxMultisig` (255) before reading it.
                 b"subsig" => {
-                    s.subsigs = rmp_decode::read_vec(rd, MultisigSubsig::decode_from_reader)?
+                    s.subsigs = rmp_decode::read_vec_bounded(
+                        rd,
+                        rmp_decode::MAX_MULTISIG,
+                        MultisigSubsig::decode_from_reader,
+                    )?
                 }
                 other => rmp_decode::unknown_key(rd, other)?,
             }
@@ -1722,20 +1727,31 @@ impl LogicSig {
         let mut s = Self::default();
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
+                // The allocation bounds are go's (`allocbound` tags of
+                // `transactions.LogicSig`): a record over one never decodes (#2390).
                 b"l" => {
+                    rmp_decode::check_go_bytes_bound(rd, rmp_decode::MAX_LOGIC_SIG_MAX_SIZE)?;
                     s.logic = rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?;
                 }
                 b"sig" => s.sig = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?,
-                b"msig" => s.msig = rmp_decode::read_optional(rd, MultisigSig::decode_from_reader)?,
+                // go's `Msig` is a `MultisigSig` value whose `v`/`thr`/`subsig` are
+                // required: `nil` is its zero value and fails, it is not "absent" (#2390).
+                b"msig" => s.msig = Some(MultisigSig::decode_from_reader(rd)?),
                 b"arg" => {
-                    s.args = rmp_decode::read_optional_vec(
+                    s.args = rmp_decode::read_optional_vec_bounded(
                         rd,
-                        rmp_decode::read_bytes_as_bytebuf_go_compat,
+                        rmp_decode::EVAL_MAX_ARGS,
+                        |rd| {
+                            rmp_decode::check_go_bytes_bound(
+                                rd,
+                                rmp_decode::MAX_LOGIC_SIG_ARG_SIZE,
+                            )?;
+                            rmp_decode::read_bytes_as_bytebuf_go_compat(rd)
+                        },
                     )?
                 }
-                b"lmsig" => {
-                    s.lmsig = rmp_decode::read_optional(rd, MultisigSig::decode_from_reader)?
-                }
+                // As `msig`: a `nil` `lmsig` fails the required checks (#2390).
+                b"lmsig" => s.lmsig = Some(MultisigSig::decode_from_reader(rd)?),
                 b"pqsig" => {
                     s.pqsig = rmp_decode::read_optional(rd, crate::pq::PQSig::decode_from_reader)?
                 }
@@ -2461,9 +2477,8 @@ impl SignedTransaction {
                 (4, b'l') if key == b"lsig" => {
                     s.lsig = rmp_decode::read_optional(rd, LogicSig::decode_from_reader)?
                 }
-                (4, b'm') if key == b"msig" => {
-                    s.msig = rmp_decode::read_optional(rd, MultisigSig::decode_from_reader)?
-                }
+                // As in `LogicSig`: a `nil` `msig` fails the required checks (#2390).
+                (4, b'm') if key == b"msig" => s.msig = Some(MultisigSig::decode_from_reader(rd)?),
                 (5, b'p') if key == b"pqsig" => {
                     s.pqsig = rmp_decode::read_optional(rd, crate::pq::PQSig::decode_from_reader)?
                 }

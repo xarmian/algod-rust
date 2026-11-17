@@ -99,6 +99,25 @@ pub fn read_key_bytes<'a>(rd: &mut &'a [u8]) -> Result<&'a [u8]> {
     Ok(key)
 }
 
+// ── go's msgp allocation bounds for LogicSig (issue #2390) ─────
+
+/// `bounds.MaxLogicSigMaxSize` (`config/bounds`): the maximum, over every
+/// consensus version, of `LogicSigMaxSize * MaxTxGroupSize` (1000 * 16) and
+/// `MaxAbsoluteLogicSigProgramSize` (16000 since v40). The generated
+/// `LogicSig` decoder rejects a larger `l` (`allocbound`).
+pub const MAX_LOGIC_SIG_MAX_SIZE: usize = 16_000;
+/// `transactions.EvalMaxArgs`: most elements of `LogicSig.Args`.
+pub const EVAL_MAX_ARGS: usize = 255;
+/// `transactions.MaxLogicSigArgSize` (`config.MaxAVMBytesSize`): longest element
+/// of `LogicSig.Args`.
+pub const MAX_LOGIC_SIG_ARG_SIZE: usize = 4096;
+/// `crypto.maxMultisig`: most `subsig` entries of a `MultisigSig`.
+pub const MAX_MULTISIG: usize = 255;
+/// `crypto.MaxPQPublicKeySize` (`FalconPublicKeySize`).
+pub const MAX_PQ_PUBLIC_KEY_SIZE: usize = 1793;
+/// `crypto.MaxPQSignatureSize` (`FalconMaxSignatureSize`, the CT signature).
+pub const MAX_PQ_SIGNATURE_SIZE: usize = 1538;
+
 // ── Skip value ─────────────────────────────────────────────────
 
 /// Matches go-algorand v4.7.2-stable's `msgp.DefaultUnmarshalState.AllowableDepth`
@@ -944,6 +963,75 @@ pub fn read_optional_vec<T>(
         Ok(None)
     } else {
         read_vec(rd, decode_fn).map(Some)
+    }
+}
+
+/// Fail like go's generated decoders when a byte string claims more than
+/// `bound` bytes: they read `msgp.ReadBytesBytesHeader` and compare it to the
+/// field's `allocbound` before reading the value (`msgp.ErrOverflow`). Peeks; the
+/// value is not consumed. The size is the encoded length of a `bin`/`str`, the
+/// element count of an array (a map counts twice its pairs) and 0 for `nil`.
+pub fn check_go_bytes_bound(rd: &[u8], bound: usize) -> Result<()> {
+    let short = || codec_err("check_go_bytes_bound: truncated input");
+    let be = |n: usize| -> Result<usize> {
+        let b = rd.get(1..1 + n).ok_or_else(short)?;
+        Ok(b.iter().fold(0usize, |a, &x| (a << 8) | x as usize))
+    };
+    let lead = *rd.first().ok_or_else(short)?;
+    let size = match lead {
+        0xa0..=0xbf => (lead & 0x1f) as usize,
+        0x90..=0x9f => (lead & 0x0f) as usize,
+        0x80..=0x8f => 2 * (lead & 0x0f) as usize,
+        0xc0 => 0,
+        0xc4 | 0xd9 => be(1)?,
+        0xc5 | 0xda | 0xdc => be(2)?,
+        0xc6 | 0xdb | 0xdd => be(4)?,
+        0xde => 2 * be(2)?,
+        0xdf => 2 * be(4)?,
+        other => {
+            return Err(codec_err(format!(
+                "check_go_bytes_bound: unexpected marker 0x{other:02x}"
+            )))
+        }
+    };
+    if size > bound {
+        return Err(codec_err(format!(
+            "check_go_bytes_bound: length {size} exceeds the allocation bound {bound}"
+        )));
+    }
+    Ok(())
+}
+
+/// [`read_vec`] for a list go bounds by an `allocbound`: more than `max`
+/// elements is `msgp.ErrOverflow`, checked before any element is read.
+#[inline]
+pub fn read_vec_bounded<T>(
+    rd: &mut &[u8],
+    max: usize,
+    decode_fn: impl Fn(&mut &[u8]) -> Result<T>,
+) -> Result<Vec<T>> {
+    let mut peek = *rd;
+    let len = rmp::decode::read_array_len(&mut peek)
+        .map_err(|e| codec_err(format!("read_vec_bounded array_len: {e}")))? as usize;
+    if len > max {
+        return Err(codec_err(format!(
+            "read_vec_bounded: {len} elements exceed the allocation bound {max}"
+        )));
+    }
+    read_vec(rd, decode_fn)
+}
+
+/// [`read_optional_vec`] with [`read_vec_bounded`]'s bound.
+#[inline]
+pub fn read_optional_vec_bounded<T>(
+    rd: &mut &[u8],
+    max: usize,
+    decode_fn: impl Fn(&mut &[u8]) -> Result<T>,
+) -> Result<Option<Vec<T>>> {
+    if try_read_nil(rd) {
+        Ok(None)
+    } else {
+        read_vec_bounded(rd, max, decode_fn).map(Some)
     }
 }
 
