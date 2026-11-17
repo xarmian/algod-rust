@@ -185,8 +185,8 @@ def ascii_strs(b):
 
     go's randomiser fills Go strings (transaction type, genesis id, log lines,
     ...) with arbitrary bytes, and go accepts non-UTF-8 `str` values anywhere;
-    algod-rust's string readers refuse them (a separate, documented difference
-    in docs/BYTES_DECODE_PARITY.md that this fixture is not about), so the
+    algod-rust's string readers (`read_string`) refuse them: a separate
+    difference, tracked in its own issue, that this fixture is not about, so the
     random seeds keep their strings ASCII and the verdicts isolate unknown keys.
     """
     out = bytearray(b)
