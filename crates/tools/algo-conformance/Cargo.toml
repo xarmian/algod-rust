@@ -15,7 +15,6 @@ algo-rest-client.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-chrono.workspace = true
 hex.workspace = true
 serde_bytes.workspace = true
 
