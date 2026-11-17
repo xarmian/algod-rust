@@ -249,6 +249,10 @@ pub struct OpStream {
     pub version: u8,
     /// Errors accumulated during assembly.
     pub errors: Vec<AssemblyError>,
+    /// A Go runtime panic go's assembler would hit on this input (an
+    /// unchecked index), recorded instead of panicking; assembly stops at the
+    /// statement that set it. See [`AssembleFailure::Panic`].
+    pub(crate) panic: Option<String>,
     /// Non-fatal warnings accumulated during assembly. Assembly can still
     /// succeed (`Ok`) with warnings present.
     pub warnings: Vec<AssemblyWarning>,
@@ -326,6 +330,7 @@ impl OpStream {
             program: Vec::new(),
             version: ASSEMBLER_NO_VERSION, // will be set by pragma or default
             errors: Vec::new(),
+            panic: None,
             warnings: Vec::new(),
             offset_to_source: HashMap::new(),
             pending: Vec::new(),
@@ -1598,16 +1603,50 @@ fn process_statement(ops: &mut OpStream, current: &[Tok]) {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Why [`assemble_string_checked`] failed.
+#[derive(Debug, Clone)]
+pub enum AssembleFailure {
+    /// Ordinary assembly errors (go's `OpStream.Errors`).
+    Errors(Vec<AssemblyError>),
+    /// go's assembler would panic on this input (`typeStores`/`typeLoads` with
+    /// a constant scratch index >= 256: `runtime error: index out of range
+    /// [N] with length 256`). The text is go's panic message. Callers that
+    /// mirror go's observable behaviour (the REST compile handler drops the
+    /// connection, the corpus driver records a panic row) match on this.
+    Panic(String),
+}
+
 /// Assemble a TEAL program from source text into AVM bytecode.
 ///
 /// Returns an `OpStream` containing the assembled `program` bytes and any
-/// errors. If there are errors, `program` will be empty.
+/// errors. If there are errors, `program` will be empty. A condition on which
+/// go's assembler panics is reported as a single error carrying go's panic
+/// text; use [`assemble_string_checked`] to tell it apart.
 pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
+    assemble_string_checked(text).map_err(|f| match f {
+        AssembleFailure::Errors(e) => e,
+        AssembleFailure::Panic(message) => vec![AssemblyError {
+            line: 0,
+            col: 0,
+            message,
+        }],
+    })
+}
+
+/// [`assemble_string`] with the go-panic condition kept as a typed variant.
+pub fn assemble_string_checked(text: &str) -> Result<OpStream, AssembleFailure> {
+    assemble_core(text).map_err(|ops| match ops.panic.clone() {
+        Some(p) => AssembleFailure::Panic(p),
+        None => AssembleFailure::Errors(ops.errors),
+    })
+}
+
+fn assemble_core(text: &str) -> Result<OpStream, Box<OpStream>> {
     let mut ops = OpStream::new();
 
     if text.trim().is_empty() {
         ops.record_error(0, 0, "Cannot assemble empty program text".into());
-        return Err(ops.errors);
+        return Err(Box::new(ops));
     }
 
     // First pass: parse lines, emit preliminary bytecode
@@ -1648,6 +1687,10 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
         while !current.is_empty() || !rest.is_empty() {
             if !current.is_empty() {
                 process_statement(&mut ops, &current);
+                if ops.panic.is_some() {
+                    // go's assembler has panicked: nothing after it runs.
+                    return Err(Box::new(ops));
+                }
             }
             let next = next_statement(&ops, rest);
             current = next.0;
@@ -1683,7 +1726,7 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
     ops.resolve_labels();
 
     if !ops.errors.is_empty() {
-        return Err(ops.errors.clone());
+        return Err(Box::new(ops));
     }
 
     // Prepend version byte and constant blocks, auto-salting a v13+
@@ -1695,7 +1738,7 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
         }
         Err(message) => {
             ops.record_error(ops.source_line, 0, message);
-            return Err(ops.errors.clone());
+            return Err(Box::new(ops));
         }
     }
 

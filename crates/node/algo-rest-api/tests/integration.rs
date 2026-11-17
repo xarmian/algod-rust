@@ -9409,39 +9409,52 @@ async fn teal_compile_error_returns_400() {
 }
 
 /// go's `TealCompile` panics inside `logic.AssembleString` for a constant
-/// scratch index >= 256 (`typeStores`/`typeLoads`); the panic is not
-/// recovered by any middleware, so net/http drops the connection with no
-/// response (probed against the real handler, issue #2381). algod-rust answers
-/// 400 with an assembly error instead and keeps serving (DIV-013).
+/// scratch index >= 256 (`typeStores`/`typeLoads`). No middleware recovers it,
+/// so net/http drops the connection: the client sees no HTTP response at all
+/// (probed against the real handler, issue #2381) while the node keeps serving.
+/// algod-rust must match that without panicking.
+async fn raw_compile(server: &TestServer, source: &str) -> std::io::Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(server.addr).await?;
+    let req = format!(
+        "POST /v2/teal/compile HTTP/1.1\r\nHost: x\r\nX-Algo-API-Token: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        server.api_token,
+        source.len(),
+        source
+    );
+    s.write_all(req.as_bytes()).await?;
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).await?;
+    Ok(out)
+}
+
 #[tokio::test]
-async fn teal_compile_constant_scratch_index_out_of_range_is_400() {
+async fn teal_compile_constant_scratch_index_out_of_range_drops_the_connection() {
     let server = TestServer::start(mock_with_developer_api()).await;
 
     for source in [
-        "#pragma version 14\nint 300\nbyte 0x\nstores",
-        "#pragma version 14\nint 300\nloads\npop\nint 1",
+        "#pragma version 14@@int 300@@byte 0x@@stores",
+        "#pragma version 14@@int 300@@loads@@pop@@int 1",
+        "#pragma version 14@@#pragma typetrack false@@int 300@@byte 0x@@stores",
     ] {
-        let resp = server
-            .client
-            .post(server.url("/v2/teal/compile"))
-            .header("X-Algo-API-Token", &server.api_token)
-            .body(source)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400, "{source:?}");
-        let body = resp.text().await.unwrap();
-        assert!(body.contains("scratch index"), "{body}");
+        let source = source.replace("@@", "\n");
+        // A transport error or an empty read: never an HTTP response.
+        if let Ok(bytes) = raw_compile(&server, &source).await {
+            assert!(
+                bytes.is_empty(),
+                "{source:?}: got a response: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
     }
 
-    // 255 is the last valid slot and the server is still alive.
+    // The node keeps serving: 255 is the last valid slot, and a fresh
+    // connection works.
     let resp = server
         .client
         .post(server.url("/v2/teal/compile"))
         .header("X-Algo-API-Token", &server.api_token)
-        .body(
-            "#pragma version 14\nint 255\nbyte 0x\nstores\nint 1",
-        )
+        .body("#pragma version 14\nint 255\nbyte 0x\nstores\nint 1")
         .send()
         .await
         .unwrap();

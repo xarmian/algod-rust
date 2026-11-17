@@ -124,6 +124,12 @@ pub struct Row {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<bool>,
+    /// Not serialized. `panic` records go's own panic text for an input on
+    /// which go's assembler panics (a constant scratch index >= 256) and this
+    /// port reports the same condition as a typed value, without panicking:
+    /// the row is byte-identical to go's, and is not a robustness failure.
+    #[serde(skip)]
+    pub mirrors_go_panic: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warnings: Option<Vec<Diag>>,
 }
@@ -197,7 +203,7 @@ pub fn process(op: Operation, input: &Input) -> Row {
                     return row;
                 }
             };
-            match algo_avm::assembler::assemble_string(source) {
+            match algo_avm::assembler::assemble_string_checked(source) {
                 Ok(ops) => {
                     row.ok = true;
                     row.bytecode_b64 =
@@ -220,7 +226,11 @@ pub fn process(op: Operation, input: &Input) -> Row {
                         );
                     }
                 }
-                Err(errors) => {
+                Err(algo_avm::assembler::AssembleFailure::Panic(msg)) => {
+                    row.panic = Some(msg);
+                    row.mirrors_go_panic = true;
+                }
+                Err(algo_avm::assembler::AssembleFailure::Errors(errors)) => {
                     row.errors = Some(
                         errors
                             .iter()
@@ -316,7 +326,7 @@ where
 /// True when any row is a recorded panic or timeout.
 pub fn has_robustness_failure(rows: &[Row]) -> bool {
     rows.iter()
-        .any(|r| r.panic.is_some() || r.timeout == Some(true))
+        .any(|r| (r.panic.is_some() && !r.mirrors_go_panic) || r.timeout == Some(true))
 }
 
 /// Header line plus one line per row, newline-terminated.
@@ -349,10 +359,9 @@ pub struct DiffReport {
     /// Rows, on either side, that record a panic or a timeout. These count as
     /// failures even when both sides agree.
     pub robustness_failures: usize,
-    /// Rows that match the one documented Go-panic / Rust-error pairing
-    /// (DIV-013, see [`is_div013`]); counted neither as a mismatch nor as a
-    /// robustness failure.
-    pub known_divergences: usize,
+    /// Rows equal on both sides that record the same panic (go's assembler
+    /// panics and the port reports the identical typed condition, #2381).
+    pub both_panic_identical: usize,
     pub left_header: Value,
     pub right_header: Value,
     /// One `{sha256, operation, field, first_diff, left, right}` per differing row.
@@ -411,36 +420,15 @@ fn first_diff(field: &str, l: &Value, r: &Value) -> Value {
     }
 }
 
-/// DIVERGENCE DIV-013: the one pairing of a Go panic with a Rust error that is
-/// intended. go's assembler indexes `scratchSpace[idx]` unchecked and panics
-/// with `index out of range [N] with length 256` for a constant scratch index
-/// N >= 256 (`typeStores`/`typeLoads`); algod-rust reports an assembly error
-/// `{op}: constant scratch index N is out of range (must be < 256)`. `go` is
-/// the Go driver's row, `rust` the Rust driver's; a Rust panic never matches.
-pub fn is_div013(go: &Value, rust: &Value) -> bool {
-    let Some(msg) = go.get("panic").and_then(Value::as_str) else {
-        return false;
-    };
-    let Some(n) = msg
-        .strip_prefix("runtime error: index out of range [")
+/// True for a `panic` row carrying go's assembler panic for a constant scratch
+/// index >= 256 (`runtime error: index out of range [N] with length 256`),
+/// the one panic the Rust assembler reproduces as a typed condition.
+fn is_assembler_scratch_panic(row: &Value) -> bool {
+    row.get("panic")
+        .and_then(Value::as_str)
+        .and_then(|m| m.strip_prefix("runtime error: index out of range ["))
         .and_then(|m| m.strip_suffix("] with length 256"))
-        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-    else {
-        return false;
-    };
-    if rust.get("ok") != Some(&Value::Bool(false)) || rust.get("panic").is_some() {
-        return false;
-    }
-    let needle = format!("constant scratch index {n} is out of range");
-    rust.get("errors")
-        .and_then(Value::as_array)
-        .is_some_and(|es| {
-            es.iter().any(|e| {
-                e.get("message")
-                    .and_then(Value::as_str)
-                    .is_some_and(|m| m.contains(&needle))
-            })
-        })
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Compare two driver outputs row by row (headers are ignored except for the
@@ -465,29 +453,27 @@ pub fn diff_files(left: &Path, right: &Path) -> Result<DiffReport, String> {
     let (mut identical, mut both_error_identical) = (0, 0);
     let is_robustness_failure =
         |v: &Value| v.get("panic").is_some() || v.get("timeout") == Some(&Value::Bool(true));
-    // `left` is the Go driver's output, `right` the Rust driver's.
-    let known: BTreeSet<&String> = lrows
-        .iter()
-        .filter(|(sha, l)| rrows.get(*sha).is_some_and(|r| is_div013(l, r)))
-        .map(|(sha, _)| sha)
-        .collect();
+    // A panic row that is byte-equal on both sides AND is go's assembler
+    // scratch-index panic is parity (the port reports that panic as a typed
+    // value, #2381); every other panic, one-sided or differing panics, and
+    // every timeout are robustness failures.
+    let mirrored = |sha: &String| match (lrows.get(sha), rrows.get(sha)) {
+        (Some(a), Some(b)) => a == b && is_assembler_scratch_panic(a),
+        _ => false,
+    };
     let robustness_failures = lrows
         .iter()
-        .filter(|(sha, _)| !known.contains(*sha))
-        .map(|(_, v)| v)
-        .chain(rrows.values())
-        .filter(|v| is_robustness_failure(v))
+        .chain(rrows.iter())
+        .filter(|(sha, v)| is_robustness_failure(v) && !mirrored(sha))
         .count();
+    let both_panic_identical = shas.iter().filter(|sha| mirrored(sha)).count();
     for sha in &shas {
-        if known.contains(*sha) {
-            continue;
-        }
         let (l, r) = (lrows.get(*sha), rrows.get(*sha));
         let (field, fd, lv, rv) = match (l, r) {
             (Some(a), Some(b)) if a == b => {
                 if a.get("ok") == Some(&Value::Bool(true)) {
                     identical += 1;
-                } else if !is_robustness_failure(a) {
+                } else if !is_robustness_failure(a) && !is_assembler_scratch_panic(a) {
                     both_error_identical += 1;
                 }
                 continue;
@@ -530,7 +516,7 @@ pub fn diff_files(left: &Path, right: &Path) -> Result<DiffReport, String> {
         identical,
         both_error_identical,
         robustness_failures,
-        known_divergences: known.len(),
+        both_panic_identical,
         left_header: lh,
         right_header: rh,
         mismatches,

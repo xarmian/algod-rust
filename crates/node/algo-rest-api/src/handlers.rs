@@ -3598,9 +3598,16 @@ pub async fn teal_compile<N: NodeInterface>(
     };
 
     // Assemble the TEAL source
-    let ops = match algo_avm::assembler::assemble_string(source) {
+    let ops = match algo_avm::assembler::assemble_string_checked(source) {
         Ok(ops) => ops,
-        Err(errors) => {
+        // go's assembler panics here and no handler/middleware recovers, so
+        // net/http drops the connection without answering (the node keeps
+        // serving). Match that without panicking: abort the connection.
+        Err(algo_avm::assembler::AssembleFailure::Panic(msg)) => {
+            tracing::warn!(panic = %msg, "teal compile: go's assembler would panic; dropping the connection");
+            return crate::error_envelope::aborted_connection_response();
+        }
+        Err(algo_avm::assembler::AssembleFailure::Errors(errors)) => {
             let mut sb = String::new();
             for err in &errors {
                 if !sb.is_empty() {

@@ -154,10 +154,10 @@ fn main() {
                     rep.mismatches.len(),
                     rep.robustness_failures
                 );
-                if rep.known_divergences > 0 {
+                if rep.both_panic_identical > 0 {
                     eprintln!(
-                        "diff {}: {} rows are the documented DIV-013 Go-panic/Rust-error pairing (excluded from mismatches and panics)",
-                        rep.operation, rep.known_divergences
+                        "diff {}: {} rows are the same panic on both sides (go's assembler panic, mirrored as a typed condition)",
+                        rep.operation, rep.both_panic_identical
                     );
                 }
                 i32::from(!rep.mismatches.is_empty() || rep.robustness_failures > 0)
