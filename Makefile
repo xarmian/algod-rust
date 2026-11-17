@@ -37,7 +37,7 @@ P2P_INTEROP_1V1_CLUSTER := ops/mixed-cluster-p2p-1v1
 .PHONY: p2p-interop-1v1-up p2p-interop-1v1-down p2p-interop-1v1-status p2p-interop-1v1-soak-test
 .PHONY: phase6-cluster-up phase6-cluster-down phase6-cluster-status
 .PHONY: consensus-analyzer-test consensus-negative-test
-.PHONY: teal-corpus-fetch teal-corpus-parity
+.PHONY: teal-corpus-fetch teal-corpus-parity teal-corpus-stats teal-corpus-history
 
 ## ── Build & Test ──────────────────────────────────────────────
 
@@ -1140,6 +1140,21 @@ teal-corpus-parity:
 	GO_DRIVER=$(CURDIR)/$(TEAL_CORPUS_WORK)/teal-corpus-go RUST_DRIVER=$(CURDIR)/target/release/teal-corpus \
 		bash scripts/teal-corpus/run_drivers.sh $(TEAL_CORPUS_WORK)/corpus $(TEAL_CORPUS_WORK)/out $(TEAL_CORPUS_STAGES)
 
+## Issue #2371: one deterministic stats.json (corpus shape, version and opcode
+## histograms with the never-seen opcodes, per-stage agreement, fixed-point and
+## registry-hash rates, error classes) from the outputs `teal-corpus-parity` left
+## in $(TEAL_CORPUS_WORK)/out. Schema: scripts/teal-corpus/stats.py.
+TEAL_CORPUS_MACHINE ?= $(shell uname -srm)
+teal-corpus-stats:
+	@test -f $(TEAL_CORPUS_WORK)/out/disassemble.go.jsonl || { echo "no driver outputs: run 'make teal-corpus-parity' first" >&2; exit 2; }
+	$(TEAL_CORPUS_WORK)/teal-corpus-go opcodes > $(TEAL_CORPUS_WORK)/out/opcodes.json
+	python3 -I scripts/teal-corpus/stats.py build $(TEAL_CORPUS_WORK)/corpus $(TEAL_CORPUS_WORK)/out \
+		--opcodes $(TEAL_CORPUS_WORK)/out/opcodes.json --commit "$$(git rev-parse HEAD)" --machine "$(TEAL_CORPUS_MACHINE)"
+
+## Append (or replace the same-day row of) this run to docs/teal-corpus/history.csv.
+teal-corpus-history: teal-corpus-stats
+	python3 -I scripts/teal-corpus/stats.py history $(TEAL_CORPUS_WORK)/out/stats.json docs/teal-corpus/history.csv
+
 ## ── Help ─────────────────────────────────────────────────────
 
 help:
@@ -1279,6 +1294,8 @@ help:
 	@echo "TEAL corpus parity (Phase 25):"
 	@echo "  make teal-corpus-fetch    Fetch the ARC56Registry and extract the corpus (network)"
 	@echo "  make teal-corpus-parity   Go-vs-Rust corpus comparison (TEAL_CORPUS_STAGES=disassemble|assemble|reassemble|source)"
+	@echo "  make teal-corpus-stats    stats.json of the last parity run; teal-corpus-history appends docs/teal-corpus/history.csv"
+	@echo "  make bench-compare TIERS=teal-corpus   Go-vs-Rust assembler/disassembler timings on the corpus (equality-gated)"
 	@echo ""
 	@echo "Archival Node:"
 	@echo "  make archival-up      Start archival Go node (docker)"
