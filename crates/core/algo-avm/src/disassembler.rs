@@ -46,7 +46,7 @@ use crate::opcode::{self, ImmKind, Mode, OpSpec};
 /// `AssembleString(Disassemble(program))` produces the same bytecode for the
 /// programs the assembler can express.
 pub fn disassemble(program: &[u8]) -> Result<String, String> {
-    disassemble_instrumented(program).map(|(text, _)| text.replace("intc_0", "intc 0"))
+    disassemble_instrumented(program).map(|(text, _)| text)
 }
 
 /// go's `disassembleInstrumented`: the text of [`disassemble`] and, for every
