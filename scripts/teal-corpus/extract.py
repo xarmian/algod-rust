@@ -28,7 +28,7 @@ import os
 import shutil
 import sys
 
-KINDS = (("approval", "approval-programs"), ("clear", "clear-programs"))
+KINDS = (("approval", "approval-programs-moved"), ("clear", "clear-programs-moved"))
 SUFFIX = ".arc56.json"
 DEFAULT_WORK = "teal-corpus-work"
 
