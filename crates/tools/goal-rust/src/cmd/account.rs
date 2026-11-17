@@ -221,21 +221,21 @@ pub fn run_list(args: ListArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBu
     let mut rows: Vec<AccountRow> = Vec::new();
     let mut had_kmd_error = false;
     for w in &wallets {
-        // For each wallet, open a handle. Use the supplied password
-        // (or prompt once per wallet on TTY). If init fails, log + skip.
-        let pw = match &args.password {
-            Some(p) => p.clone(),
-            None => match read_password_for(&w.name) {
-                Ok(p) => p,
-                Err(()) => return ExitCode::from(1),
-            },
-        };
-        let handle = match rt.block_on(client.init_wallet(&w.id, &pw)) {
-            Ok(r) => r.wallet_handle_token,
+        // go's `ensureWalletHandle` (getPassword = false): the cached handle
+        // token, a prompt only when none could be had without the password.
+        let (handle, _pw) = match crate::wallet_token::wallet_handle_and_password(
+            &rt,
+            &client,
+            &data_dir_path,
+            &w.id,
+            &w.name,
+            args.password.as_deref(),
+            false,
+        ) {
+            Ok(r) => r,
             Err(e) => {
-                eprintln!("Could not open wallet '{}': {}", w.name, kmd_msg(&e));
-                had_kmd_error = true;
-                continue;
+                eprintln!("{e}");
+                return ExitCode::from(1);
             }
         };
         let key_list = match rt.block_on(client.list_keys(&handle)) {
@@ -247,7 +247,6 @@ pub fn run_list(args: ListArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBu
                     kmd_msg(&e)
                 );
                 had_kmd_error = true;
-                let _ = rt.block_on(client.release_wallet_handle(&handle));
                 continue;
             }
         };
@@ -265,11 +264,9 @@ pub fn run_list(args: ListArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBu
                     kmd_msg(&e)
                 );
                 had_kmd_error = true;
-                let _ = rt.block_on(client.release_wallet_handle(&handle));
                 continue;
             }
         };
-        let _ = rt.block_on(client.release_wallet_handle(&handle));
 
         for addr in key_list {
             rows.push(AccountRow {
@@ -776,12 +773,6 @@ fn resolve_wallet(
         eprintln!("{e}");
     })?;
     Ok((handle, wallet_name, password))
-}
-
-fn read_password_for(wallet_name: &str) -> Result<String, ()> {
-    crate::wallet_token::read_password_for(wallet_name).map_err(|e| {
-        eprintln!("{e}");
-    })
 }
 
 fn kmd_msg(e: &KmdError) -> String {
