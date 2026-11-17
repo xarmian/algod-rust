@@ -971,20 +971,7 @@ const STDIN_STDOUT: &str = "-";
 /// stdin source → the literal `<stdin>`; stdout output → the source
 /// file's absolute path (there is no output directory to be relative to).
 ///
-/// This resolves a TEAL runtime error's PC back to the right `.teal` file
-/// when go-algorand's local assembler (`logic.AssembleString`) builds the
-/// source map. goal-rust's `clerk compile` currently compiles via the
-/// node's `/v2/teal/compile` endpoint rather than assembling locally (see
-/// `run_compile`'s doc comment), so there is no live call site to attach
-/// this to yet — ported ahead of that work so `TestDeterminePathToSourceFromSourceMap`
-/// parity is pinned now.
-///
-/// `#[allow(dead_code)]`: no production call site until local TEAL
-/// assembly + source-map generation is ported (see the doc comment
-/// above); exercised directly by this module's unit tests in the
-/// meantime, mirroring the precedent at
-/// `crate::cmd::wallet::format_data_dir_error`.
-#[allow(dead_code)]
+/// Used by `clerk compile -m`, which records it as the source map's source.
 pub(crate) fn determine_path_to_source_from_source_map(
     source_file: &str,
     out_file: &str,
@@ -1076,26 +1063,24 @@ fn relative_path(base: &Path, target: &Path) -> String {
     rel.to_string_lossy().into_owned()
 }
 
-/// `clerk compile [files...] [-o out] [-n]`.
+/// `clerk compile [files...] [-o out] [-n] [-m] [-D]`.
 ///
-/// Mirrors Go's `compileCmd` (clerk.go:1090) output/flag surface. Each input
-/// file's TEAL source is compiled, the raw program bytes are written to
-/// `<file>.tok` (or `-o`/`-`), and the contract address is printed as
-/// `<file>: <address>` unless the output target is stdout.
+/// Mirrors Go's `compileCmd` (clerk.go:1065). Like Go, the TEAL source is
+/// assembled **locally** (`logic.AssembleString`, here `algo_avm::assembler`):
+/// no node, data dir or developer API is involved. The raw program bytes are
+/// written to `<file>.tok` (or `-o`/`-`), `-m` also writes the source map to
+/// `<out>.map`, and the contract address is printed as `<file>: <address>`
+/// unless the output target is stdout. `-D` disassembles each (binary) input
+/// instead. Assembler errors and warnings go to stderr exactly as go's
+/// `assembleFileImpl` prints them (`ReportMultipleErrors`, then
+/// `<N> warning[s]`).
 ///
-/// **Intentional divergence from Go (TASK-291 scope):** Go's `goal clerk
-/// compile` assembles *locally* via `logic.AssembleString` (works offline,
-/// independent of any node), whereas this leaf is specified to compile via the
-/// node's `POST /v2/teal/compile` endpoint. Consequences, by design:
-/// it requires a reachable algod data dir + a running node, and the node must
-/// have `EnableDeveloperAPI=true` (else the endpoint 404s, surfaced here as
-/// `Could not assemble: ...`).
-/// Compiling against the node guarantees the produced bytecode matches the
-/// exact assembler the target node runs; the assembler itself
-/// (`algo_avm::assembler`) is byte-identical to go-algorand's, so for a given
-/// program the result equals Go's local-compile output (verified for parity).
-pub fn run_compile(args: crate::groups::clerk::CompileArgs, cli_d: Vec<PathBuf>) -> ExitCode {
-    match run_compile_inner(args, cli_d) {
+/// **Not implemented:** `-s/--sign` (wallet-signed LogicSig record), and `-D` of
+/// a *signed* LogicSig file, whose extra `LogicSig: {...}` inspection line needs
+/// the LogicSig-signing/inspect work; both are reported as an error rather than
+/// silently ignored.
+pub fn run_compile(args: crate::groups::clerk::CompileArgs, _cli_d: Vec<PathBuf>) -> ExitCode {
+    match run_compile_inner(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
             eprintln!("{msg}");
@@ -1104,29 +1089,67 @@ pub fn run_compile(args: crate::groups::clerk::CompileArgs, cli_d: Vec<PathBuf>)
     }
 }
 
-fn run_compile_inner(
-    args: crate::groups::clerk::CompileArgs,
-    cli_d: Vec<PathBuf>,
-) -> Result<(), String> {
-    // With no input files Go's compileCmd iterates an empty list — a no-op that
-    // never contacts a node. Mirror that and skip data-dir/client setup.
-    if args.files.is_empty() {
-        return Ok(());
+/// Read `fname` (`-` is stdin), like goal's `readFile`.
+fn read_goal_file(fname: &str) -> std::io::Result<Vec<u8>> {
+    if fname == STDIN_STDOUT {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf)?;
+        Ok(buf)
+    } else {
+        std::fs::read(fname)
     }
-    let data_dir_path = data_dir::ensure_single_data_dir(&cli_d).map_err(|e| e.to_string())?;
-    let algod = build_algod_client_for_dir(&data_dir_path)?;
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("Error processing command: {e}"))?;
+}
 
+/// Write `data` to `filename` (`-` is stdout), like goal's `writeFile`.
+fn write_goal_file(filename: &str, data: &[u8]) -> std::io::Result<()> {
+    if filename == STDIN_STDOUT {
+        use std::io::Write;
+        std::io::stdout().write_all(data)
+    } else {
+        std::fs::write(filename, data)
+    }
+}
+
+/// `disassembleFile` (clerk.go:1029).
+fn disassemble_file(fname: &str, outname: &str) -> Result<(), String> {
+    let mut program = read_goal_file(fname).map_err(|e| format!("{fname}: {e}"))?;
+    // go first tries to parse the file as a msgpack LogicSig.
+    if let Ok(lsig) = algo_codec::decode_logicsig(&program) {
+        let signed = lsig.sig != [0u8; 64]
+            || lsig.msig.is_some()
+            || lsig.lmsig.is_some()
+            || lsig.pqsig.is_some()
+            || lsig.args.as_ref().is_some_and(|a| !a.is_empty());
+        if signed {
+            return Err(format!(
+                "{fname}: disassembling a signed LogicSig is not supported by goal-rust"
+            ));
+        }
+        program = lsig.logic.to_vec();
+    }
+    let text =
+        algo_avm::disassembler::disassemble(&program).map_err(|e| format!("{fname}: {e}"))?;
+    let out = if outname.is_empty() {
+        STDIN_STDOUT
+    } else {
+        outname
+    };
+    write_goal_file(out, text.as_bytes()).map_err(|e| format!("{outname}: {e}"))
+}
+
+fn run_compile_inner(args: crate::groups::clerk::CompileArgs) -> Result<(), String> {
     for fname in &args.files {
         let fname_str = fname.to_string_lossy().to_string();
-        // Resolve the output target the same way Go does (clerk.go:1100-1108):
+        if args.disassemble {
+            disassemble_file(&fname_str, args.outfile.as_deref().unwrap_or(""))?;
+            continue;
+        }
+        // Resolve the output target the same way Go does (clerk.go:1075-1082):
         // -o wins; else stdout for stdin source, else "<file>.tok".
         let outname = match args.outfile.as_deref() {
-            Some(o) => o.to_string(),
-            None => {
+            Some(o) if !o.is_empty() => o.to_string(),
+            _ => {
                 if fname_str == STDIN_STDOUT {
                     STDIN_STDOUT.to_string()
                 } else {
@@ -1136,44 +1159,79 @@ fn run_compile_inner(
         };
         let should_print_address = outname != STDIN_STDOUT;
 
-        // Read the TEAL source (stdin for "-").
-        let source = if fname_str == STDIN_STDOUT {
-            use std::io::Read;
-            let mut buf = Vec::new();
-            std::io::stdin()
-                .read_to_end(&mut buf)
-                .map_err(|e| format!("{fname_str}: {e}"))?;
-            buf
-        } else {
-            std::fs::read(fname).map_err(|e| format!("{fname_str}: {e}"))?
-        };
-
-        // Compile via the node. A 404 means the node has the developer API
-        // disabled; surface it like Go's "Could not assemble".
-        let result = rt
-            .block_on(algod.teal_compile(&source))
-            .map_err(|e| format!("Could not assemble: {e}"))?;
-        let program = base64::engine::general_purpose::STANDARD
-            .decode(&result.result)
-            .map_err(|e| format!("{fname_str}: node returned an undecodable program: {e}"))?;
-
-        // Write the binary program unless --no-out (clerk.go:1138-1143).
-        if !args.no_out {
-            if outname == STDIN_STDOUT {
-                use std::io::Write;
-                std::io::stdout()
-                    .write_all(&program)
-                    .map_err(|e| format!("{outname}: {e}"))?;
-            } else {
-                // Go writes the compile output with 0666 perms (clerk.go:1140).
-                std::fs::write(&outname, &program).map_err(|e| format!("{outname}: {e}"))?;
+        // assembleFileWithMap (clerk.go:998): read, assemble, report.
+        let source = read_goal_file(&fname_str).map_err(|e| format!("{fname_str}: {e}"))?;
+        let text = String::from_utf8(source).map_err(|e| format!("{fname_str}: {e}"))?;
+        let ops = match algo_avm::assembler::assemble_string_reported(&text) {
+            Ok(ops) => ops,
+            Err((algo_avm::assembler::AssembleFailure::Panic(msg), _)) => {
+                // go's assembler panics here (exit status 2 with a goroutine trace).
+                eprintln!("panic: {msg}");
+                return Err(format!("{fname_str}: assembler panic"));
             }
+            Err((algo_avm::assembler::AssembleFailure::Errors(errors), warnings)) => {
+                eprint!(
+                    "{}",
+                    algo_avm::assembler::report_multiple_errors(&fname_str, &errors, &warnings)
+                );
+                let err = if errors.len() == 1
+                    && errors[0].line == 0
+                    && errors[0].col == 0
+                    && errors[0].message == "Cannot assemble empty program text"
+                {
+                    // go's `parseText` returns this one error as is, not `1 error: ...`.
+                    errors[0].message.clone()
+                } else if errors.len() == 1 {
+                    let e = &errors[0];
+                    format!(
+                        "1 error: {}",
+                        algo_avm::assembler::go_source_error_string(e.line, e.col, &e.message)
+                    )
+                } else {
+                    format!("{} errors", errors.len())
+                };
+                return Err(format!("{fname_str}: {err}"));
+            }
+        };
+        if !ops.warnings.is_empty() {
+            for w in &ops.warnings {
+                eprintln!(
+                    "{}",
+                    algo_avm::assembler::go_source_error_string(w.line, w.col, &w.message)
+                );
+            }
+            let plural = if ops.warnings.len() == 1 { "" } else { "s" };
+            eprintln!("{} warning{plural}", ops.warnings.len());
         }
+        let path_to_source = determine_path_to_source_from_source_map(&fname_str, &outname)
+            .map_err(|e| format!("Could not assemble: {e}"))?;
+        let program = &ops.program;
 
-        // Print "<file>: <address>" unless writing to stdout (clerk.go:1157-1161).
-        // The node already returns the program hash as an Algorand address.
+        // Write the binary program unless --no-out (clerk.go:1112-1117).
+        if !args.no_out {
+            write_goal_file(&outname, program).map_err(|e| format!("{outname}: {e}"))?;
+        }
+        // Source map (clerk.go:1118-1131): json.Marshal, so HTML-escaped.
+        if args.map {
+            if outname == STDIN_STDOUT {
+                return Err(format!("{outname}: cannot print map to stdout"));
+            }
+            let map_name = format!("{outname}.map");
+            let source_map =
+                algo_avm::sourcemap::get_source_map(vec![path_to_source], &ops.offset_to_source);
+            let json = serde_json::to_string(&source_map)
+                .map(|j| algo_codec::escape_json_like_go(&j))
+                .map_err(|e| format!("{map_name}: {e}"))?;
+            std::fs::write(&map_name, json).map_err(|e| format!("{map_name}: {e}"))?;
+        }
+        // Print "<file>: <address>" unless writing to stdout (clerk.go:1132-1136).
         if should_print_address {
-            println!("{fname_str}: {}", result.hash);
+            use sha2::{Digest, Sha512_256};
+            let mut hasher = Sha512_256::new();
+            hasher.update(b"Program");
+            hasher.update(program);
+            let digest: [u8; 32] = hasher.finalize().into();
+            println!("{fname_str}: {}", Address(digest).to_algorand_string());
         }
     }
     Ok(())

@@ -21,6 +21,8 @@
 mod canonical;
 mod digest;
 pub mod hash;
+mod json_escape;
+pub use json_escape::escape_json_like_go;
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub use canonical::payset_txid_hash_runs;

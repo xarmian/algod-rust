@@ -9461,6 +9461,151 @@ async fn teal_compile_constant_scratch_index_out_of_range_drops_the_connection()
     assert_eq!(resp.status(), 200);
 }
 
+async fn post_teal(server: &TestServer, path: &str, body: Vec<u8>) -> (u16, String) {
+    let resp = server
+        .client
+        .post(server.url(path))
+        .header("X-Algo-API-Token", &server.api_token)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap();
+    (status, text.trim_end_matches('\n').to_string())
+}
+
+/// `TealCompile` answers a failed assembly with `ReportMultipleErrors`
+/// (`assembler.go`): `1 error: <e>\n` for a lone error, else one
+/// newline-terminated `line[:col]: msg` per error; `sourceError.Error()` omits the
+/// column when it is 0 (#2370, live-verified against go v5.0.5-stable).
+#[tokio::test]
+async fn teal_compile_error_body_matches_go_report_multiple_errors() {
+    let server = TestServer::start(mock_with_developer_api()).await;
+
+    let (status, body) = post_teal(
+        &server,
+        "/v2/teal/compile",
+        b"#pragma version 8\nbogus\n".to_vec(),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(
+        body,
+        "{\"message\":\"1 error: 2: unknown opcode: bogus\\n\"}"
+    );
+
+    let (status, body) = post_teal(
+        &server,
+        "/v2/teal/compile",
+        b"#pragma version 8\nbogus\nbogus\n".to_vec(),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(
+        body,
+        "{\"message\":\"2: unknown opcode: bogus\\n3: unknown opcode: bogus\\n\"}"
+    );
+
+    let (status, body) = post_teal(&server, "/v2/teal/compile", Vec::new()).await;
+    assert_eq!(status, 400);
+    assert_eq!(
+        body,
+        "{\"message\":\"1 error: 0: Cannot assemble empty program text\\n\"}"
+    );
+
+    // Only the first 10 errors are reported.
+    let many = format!("#pragma version 8\n{}", "bogus\n".repeat(11));
+    let (_, body) = post_teal(&server, "/v2/teal/compile", many.into_bytes()).await;
+    assert_eq!(body.matches("unknown opcode: bogus").count(), 10);
+}
+
+/// go encodes responses with `encoding/json`, which escapes `<`, `>` and `&`
+/// (`<`, `>`, `&`): the source map's `<body>` source name and a
+/// disassembled `&&` are byte-visible (#2370).
+#[tokio::test]
+async fn teal_responses_html_escape_like_go_and_order_the_source_map() {
+    let server = TestServer::start(mock_with_developer_api()).await;
+
+    let (status, body) = post_teal(
+        &server,
+        "/v2/teal/compile?sourcemap=true",
+        b"#pragma version 8\nint 1\nint 1\n&&\n".to_vec(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        body.contains(
+            "\"sourcemap\":{\"version\":3,\"sources\":[\"\\u003cbody\\u003e\"],\"names\":[],\"mappings\":"
+        ),
+        "{body}"
+    );
+
+    let (status, body) = post_teal(
+        &server,
+        "/v2/teal/disassemble",
+        vec![8, 0x81, 1, 0x81, 1, 0x10],
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(body.contains("\\u0026\\u0026"), "{body}");
+    assert!(!body.contains('&'), "{body}");
+}
+
+/// `?sourcemap=` is bound by oapi-codegen's `BindQueryParameter` with
+/// `strconv.ParseBool` before the handler (and its `EnableDeveloperAPI` check)
+/// runs (#2370).
+#[tokio::test]
+async fn teal_compile_sourcemap_query_binds_like_go() {
+    let server = TestServer::start(mock_with_developer_api()).await;
+    let src = b"#pragma version 8\nint 1\n".to_vec();
+
+    for (q, has_map) in [("1", true), ("T", true), ("False", false), ("0", false)] {
+        let (status, body) = post_teal(
+            &server,
+            &format!("/v2/teal/compile?sourcemap={q}"),
+            src.clone(),
+        )
+        .await;
+        assert_eq!(status, 200, "sourcemap={q}");
+        assert_eq!(body.contains("sourcemap"), has_map, "sourcemap={q}: {body}");
+    }
+
+    let (status, body) =
+        post_teal(&server, "/v2/teal/compile?sourcemap=garbage", src.clone()).await;
+    assert_eq!(status, 400);
+    assert_eq!(
+        body,
+        "{\"message\":\"Invalid format for parameter sourcemap: error binding string parameter: strconv.ParseBool: parsing \\\"garbage\\\": invalid syntax\"}"
+    );
+
+    let (status, body) = post_teal(
+        &server,
+        "/v2/teal/compile?sourcemap=true&sourcemap=false",
+        src,
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(
+        body,
+        "{\"message\":\"Invalid format for parameter sourcemap: multiple values for single value parameter 'sourcemap'\"}"
+    );
+}
+
+/// An over-limit body is rejected with `http.MaxBytesReader`'s error text (#2370).
+#[tokio::test]
+async fn teal_endpoints_over_limit_body_uses_go_error_text() {
+    let server = TestServer::start(mock_with_developer_api()).await;
+    for path in ["/v2/teal/compile", "/v2/teal/disassemble"] {
+        let (status, body) = post_teal(&server, path, vec![b'a'; 512 * 1024 + 1]).await;
+        assert_eq!(status, 400, "{path}");
+        assert_eq!(
+            body, "{\"message\":\"http: request body too large\"}",
+            "{path}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn teal_disassemble_happy_path() {
     let server = TestServer::start(mock_with_developer_api()).await;

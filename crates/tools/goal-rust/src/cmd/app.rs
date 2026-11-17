@@ -286,9 +286,9 @@ const ON_COMPLETION_UPDATE_APPLICATION: u64 = 4;
 /// Go's `mustParseProgArgs` (`application.go:472-494`): exactly one of the
 /// (uncompiled TEAL) / (compiled bytecode) pair is required for each
 /// program; the uncompiled source is compiled via the node's
-/// `POST /v2/teal/compile` (see `crate::cmd::clerk::run_compile` for the
-/// same pattern; goal-rust compiles server-side rather than with a local
-/// assembler, unlike Go's `cmd/goal compile`).
+/// `POST /v2/teal/compile` (goal-rust compiles server-side here rather than
+/// with a local assembler as Go's `assembleFile` does; `clerk compile` itself
+/// assembles locally).
 fn resolve_programs(
     algod: &AlgodClient,
     rt: &tokio::runtime::Runtime,

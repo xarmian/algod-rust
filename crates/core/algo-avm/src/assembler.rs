@@ -1633,6 +1633,68 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
     })
 }
 
+/// go's `sourceError.Error()` (`assembler.go`): `line:col: msg`, or `line: msg`
+/// when the column is 0.
+pub fn go_source_error_string(line: usize, col: usize, message: &str) -> String {
+    if col != 0 {
+        format!("{line}:{col}: {message}")
+    } else {
+        format!("{line}: {message}")
+    }
+}
+
+/// go's `OpStream.ReportMultipleErrors(fname, w)` (`assembler.go`): the text the
+/// `/v2/teal/compile` handler returns as the 400 `message` (`fname` empty) and
+/// `goal clerk compile` writes to stderr (`fname` the source file). A lone error
+/// with no warnings is `[fname: ]1 error: <e>\n`; otherwise the first 10 errors
+/// then the first 10 warnings, one per line, each newline-terminated and
+/// prefixed `fname: ` when `fname` is not empty.
+pub fn report_multiple_errors(
+    fname: &str,
+    errors: &[AssemblyError],
+    warnings: &[AssemblyWarning],
+) -> String {
+    let prefix = if fname.is_empty() {
+        String::new()
+    } else {
+        format!("{fname}: ")
+    };
+    if errors.len() == 1 && warnings.is_empty() {
+        let e = &errors[0];
+        return format!(
+            "{prefix}1 error: {}\n",
+            go_source_error_string(e.line, e.col, &e.message)
+        );
+    }
+    let mut out = String::new();
+    for e in errors.iter().take(10) {
+        out.push_str(&prefix);
+        out.push_str(&go_source_error_string(e.line, e.col, &e.message));
+        out.push('\n');
+    }
+    for w in warnings.iter().take(10) {
+        out.push_str(&prefix);
+        out.push_str(&go_source_error_string(w.line, w.col, &w.message));
+        out.push('\n');
+    }
+    out
+}
+
+/// [`assemble_string_checked`] that also returns the warnings of a failed
+/// assembly (go keeps `OpStream.Warnings` on failure and
+/// [`report_multiple_errors`] prints them).
+pub fn assemble_string_reported(
+    text: &str,
+) -> Result<OpStream, (AssembleFailure, Vec<AssemblyWarning>)> {
+    assemble_core(text).map_err(|ops| {
+        let failure = match ops.panic.clone() {
+            Some(p) => AssembleFailure::Panic(p),
+            None => AssembleFailure::Errors(ops.errors),
+        };
+        (failure, ops.warnings)
+    })
+}
+
 /// [`assemble_string`] with the go-panic condition kept as a typed variant.
 pub fn assemble_string_checked(text: &str) -> Result<OpStream, AssembleFailure> {
     assemble_core(text).map_err(|ops| match ops.panic.clone() {
