@@ -139,7 +139,7 @@ def error_class(row):
     if msg is None:
         errs = row.get("errors") or []
         msg = errs[0].get("message", "") if errs and isinstance(errs[0], dict) else ""
-    msg = UNPARSED.sub(r"X", QUOTED.sub('"X"', msg))
+    msg = UNPARSED.sub(r"\g<1>X", QUOTED.sub('"X"', msg))
     msg = NUM.sub(lambda m: "0xN" if m.group(0).startswith("0x") else "N", msg)
     return msg[:100] or "(empty)"
 
