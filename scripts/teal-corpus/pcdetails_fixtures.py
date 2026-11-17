@@ -114,6 +114,13 @@ def extra_cases():
         "pcdetails-constants",
         prog(8, "20 02 07 08", "26 01 02 6869", "22", "28", "23", "44"),
     )
+    # go's TestPcDetails (eval_test.go) sources, assembled at the current
+    # LogicVersion: `int 1; int 2; -`, `int 1; err`, `int 1; dup; int 2; -; +`
+    # and `b end; end:`.
+    add("pcd_go_test_sub", "pcdetails-go-test", prog(14, "81 01", "81 02", "09"))
+    add("pcd_go_test_err", "pcdetails-go-test", prog(14, "81 01", "00"))
+    add("pcd_go_test_dup", "pcdetails-go-test", prog(14, "81 01", "49", "81 02", "09", "08"))
+    add("pcd_go_test_branch_to_end", "pcdetails-go-test", prog(14, "42" + varint(0).hex()))
     return c
 
 
