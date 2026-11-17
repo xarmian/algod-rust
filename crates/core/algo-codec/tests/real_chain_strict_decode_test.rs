@@ -57,7 +57,15 @@ fn replay(dir: &str) -> Option<usize> {
             .1;
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, block).unwrap();
-        decode_block(&buf).unwrap_or_else(|e| panic!("{dir} record {n}: decode_block: {e:?}"));
+        let blk =
+            decode_block(&buf).unwrap_or_else(|e| panic!("{dir} record {n}: decode_block: {e:?}"));
+        // go wrote these blocks canonically: what algod-rust decodes (go's
+        // value, issue #2424: `dt` / `spt` included) re-encodes to the same
+        // bytes, so every block hash and payset commitment is unchanged
+        assert!(
+            algo_codec::canonical_encode_block(&blk) == buf,
+            "{dir} record {n}: the canonical re-encode differs from go's bytes"
+        );
         n += 1;
     }
     eprintln!("{dir}: {n} blocks, {certs} with a certificate");

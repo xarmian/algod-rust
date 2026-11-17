@@ -29,7 +29,7 @@ use base64::Engine;
 #[path = "../../../../scripts/strict-decode/replay.rs"]
 mod replay;
 
-use replay::{valued, verdict, Verdicts};
+use replay::{valued, Verdicts};
 
 fn unb64(s: String) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
@@ -59,12 +59,14 @@ fn verdicts(kind: &str, b: &[u8]) -> Verdicts {
                 build_identity_verification(v)[2..].to_vec()
             }),
         )],
-        // verdict only: the transactions go through the consensus
-        // `SignedTransaction` reader, which does not merge a repeated key
-        // like go yet (DIV-004, #2424)
+        // go re-encodes each decoded `SignedTxn` (issue #2424)
         "txsync" => vec![(
             "decode_tx_sync_response",
-            verdict(decode_tx_sync_response(b)),
+            valued(decode_tx_sync_response(b), |txns| {
+                txns.iter()
+                    .flat_map(algo_codec::canonical_encode_signed_transaction)
+                    .collect()
+            }),
         )],
         other => panic!("unknown kind {other}"),
     }

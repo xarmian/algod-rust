@@ -235,12 +235,15 @@ impl TxSyncPeerClient for HttpTxSyncClient {
 /// `protocol.CodecHandle` has `ErrorIfNoField = true`: a key `SignedTxn` lacks
 /// (including the block-only `hgi`/`hgh`/`ApplyData` keys of a
 /// `SignedTxnInBlock`) fails the whole response (issue #2396). `nil` is an
-/// empty response, and trailing bytes are ignored as go-codec does.
+/// empty response, and trailing bytes are ignored as go-codec does. go-codec
+/// is not msgp: it checks no `required` field and no `allocbound`, and decodes
+/// a repeated map entry into the existing one (issue #2424,
+/// [`algo_types::go_codec_reflect`]).
 ///
 /// Synchronous: the strict-unknown-fields mode is thread-local and must not be
 /// held across an `.await`.
 pub fn decode_tx_sync_response(bytes: &[u8]) -> Result<Vec<SignedTransaction>, String> {
-    let _strict = algo_types::strict_unknown_fields(bytes);
+    let _strict = algo_types::go_codec_reflect(bytes);
     let mut rd = bytes;
     if rd.first() == Some(&0xc0) {
         return Ok(Vec::new());

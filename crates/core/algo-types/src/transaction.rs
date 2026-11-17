@@ -1538,11 +1538,33 @@ use crate::rmp_decode;
 /// Type alias for decoder methods to avoid shadowing serde's Result usage.
 type DecodeResult<T> = algo_error::Result<T>;
 
+/// The public `decode_from_reader` of a type with a `decode_into`: one
+/// [`rmp_decode::DecodeSession`] around a decode into the zero value.
+macro_rules! decode_via_into {
+    () => {
+        /// Decode from a msgpack map using raw rmp.
+        pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+            let _session = rmp_decode::decode_session();
+            let mut s = Self::default();
+            Self::decode_into(rd, &mut s)?;
+            Ok(s)
+        }
+
+        /// Decode from msgpack bytes.
+        pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+            let mut rd = data;
+            Self::decode_from_reader(&mut rd)
+        }
+    };
+}
+
 impl StateSchema {
-    /// Decode from a msgpack map using raw rmp.
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
-        let mut s = Self::default();
+    decode_via_into!();
+
+    /// Decode into an already decoded value, as go's generated `UnmarshalMsg`
+    /// does (issue #2424, see [`rmp_decode::read_struct_map_len`]).
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
                 b"nui" => s.num_uint = rmp_decode::read_u64(rd)?,
@@ -1550,20 +1572,15 @@ impl StateSchema {
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
-        Ok(s)
-    }
-
-    /// Decode from msgpack bytes.
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
+        Ok(())
     }
 }
 
 impl BoxRef {
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
-        let mut s = Self::default();
+    decode_via_into!();
+
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
                 b"i" => s.index = rmp_decode::read_u64(rd)?,
@@ -1574,19 +1591,15 @@ impl BoxRef {
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
-        Ok(s)
-    }
-
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
+        Ok(())
     }
 }
 
 impl AssetParams {
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
-        let mut s = Self::default();
+    decode_via_into!();
+
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
                 b"t" => s.total = rmp_decode::read_u64(rd)?,
@@ -1598,51 +1611,31 @@ impl AssetParams {
                 b"un" => s.unit_name = rmp_decode::read_str_bytes(rd)?,
                 b"an" => s.asset_name = rmp_decode::read_str_bytes(rd)?,
                 b"au" => s.url = rmp_decode::read_str_bytes(rd)?,
-                b"am" => {
-                    s.metadata_hash =
-                        rmp_decode::read_optional(rd, rmp_decode::read_fixed_bytes_go_compat::<32>)?
-                }
-                b"m" => {
-                    s.manager = rmp_decode::read_optional(rd, rmp_decode::read_address_go_compat)?
-                }
-                b"r" => {
-                    s.reserve = rmp_decode::read_optional(rd, rmp_decode::read_address_go_compat)?
-                }
-                b"f" => {
-                    s.freeze = rmp_decode::read_optional(rd, rmp_decode::read_address_go_compat)?
-                }
-                b"c" => {
-                    s.clawback = rmp_decode::read_optional(rd, rmp_decode::read_address_go_compat)?
-                }
+                b"am" => rmp_decode::read_fixed_into_opt(rd, &mut s.metadata_hash)?,
+                b"m" => rmp_decode::read_address_into_opt(rd, &mut s.manager)?,
+                b"r" => rmp_decode::read_address_into_opt(rd, &mut s.reserve)?,
+                b"f" => rmp_decode::read_address_into_opt(rd, &mut s.freeze)?,
+                b"c" => rmp_decode::read_address_into_opt(rd, &mut s.clawback)?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
-        Ok(s)
-    }
-
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
+        Ok(())
     }
 }
 
 impl MultisigSubsig {
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
-        let mut s = Self::default();
+    decode_via_into!();
+
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"pk" => s.public_key = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?,
-                b"s" => s.signature = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?,
+                b"pk" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.public_key)?,
+                b"s" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.signature)?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
-        Ok(s)
-    }
-
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
+        Ok(())
     }
 }
 
@@ -1652,20 +1645,23 @@ impl MultisigSig {
         self.version == 0 && self.threshold == 0 && self.subsigs.is_empty()
     }
 
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
-        let mut s = Self::default();
+    decode_via_into!();
+
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
                 b"v" => s.version = rmp_decode::read_u8_val(rd)?,
                 b"thr" => s.threshold = rmp_decode::read_u8_val(rd)?,
                 // go bounds `subsig` by `maxMultisig` (255) before reading it.
                 b"subsig" => {
-                    s.subsigs = rmp_decode::read_vec_bounded(
+                    rmp_decode::read_slice_into(
                         rd,
+                        &mut s.subsigs,
                         rmp_decode::MAX_MULTISIG,
-                        MultisigSubsig::decode_from_reader,
-                    )?
+                        MultisigSubsig::default,
+                        MultisigSubsig::decode_into,
+                    )?;
                 }
                 other => rmp_decode::unknown_key(rd, other)?,
             }
@@ -1691,13 +1687,16 @@ impl MultisigSig {
                 context: "rmp_decode".into(),
             });
         }
-        Ok(s)
+        Ok(())
     }
+}
 
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
-    }
+/// One `LogicSig.Args` element: go bounds it by `MaxLogicSigArgSize` before
+/// reading it.
+fn read_lsig_arg(rd: &mut &[u8], e: &mut ByteBuf) -> DecodeResult<()> {
+    rmp_decode::check_go_bytes_bound(rd, rmp_decode::MAX_LOGIC_SIG_ARG_SIZE)?;
+    *e = rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?;
+    Ok(())
 }
 
 impl LogicSig {
@@ -1718,13 +1717,14 @@ impl LogicSig {
         !self.logic.is_empty()
     }
 
+    decode_via_into!();
+
     /// Decode a LogicSig. Like go's `LogicSig.UnmarshalMsgWithState`, `l` is
     /// NOT a required field: an orphan LogicSig (no program) decodes cleanly
     /// and is rejected later by `logicSigGroupSizeCheck` /
     /// `LogicSig.Logic empty` (issue #2041).
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
-        let mut s = Self::default();
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
                 // The allocation bounds are go's (`allocbound` tags of
@@ -1733,105 +1733,88 @@ impl LogicSig {
                     rmp_decode::check_go_bytes_bound(rd, rmp_decode::MAX_LOGIC_SIG_MAX_SIZE)?;
                     s.logic = rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?;
                 }
-                b"sig" => s.sig = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?,
+                b"sig" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.sig)?,
                 // go's `Msig` is a `MultisigSig` value whose `v`/`thr`/`subsig` are
                 // required: `nil` is its zero value and fails, it is not "absent" (#2390).
-                b"msig" => s.msig = Some(MultisigSig::decode_from_reader(rd)?),
-                b"arg" => {
-                    s.args = rmp_decode::read_optional_vec_bounded(
-                        rd,
-                        rmp_decode::EVAL_MAX_ARGS,
-                        |rd| {
-                            rmp_decode::check_go_bytes_bound(
-                                rd,
-                                rmp_decode::MAX_LOGIC_SIG_ARG_SIZE,
-                            )?;
-                            rmp_decode::read_bytes_as_bytebuf_go_compat(rd)
-                        },
-                    )?
+                b"msig" => {
+                    rmp_decode::read_struct_into_opt(rd, &mut s.msig, MultisigSig::decode_into)?
                 }
+                b"arg" => rmp_decode::read_slice_into_opt(
+                    rd,
+                    &mut s.args,
+                    rmp_decode::EVAL_MAX_ARGS,
+                    ByteBuf::new,
+                    read_lsig_arg,
+                )?,
                 // As `msig`: a `nil` `lmsig` fails the required checks (#2390).
-                b"lmsig" => s.lmsig = Some(MultisigSig::decode_from_reader(rd)?),
-                b"pqsig" => {
-                    s.pqsig = rmp_decode::read_optional(rd, crate::pq::PQSig::decode_from_reader)?
+                b"lmsig" => {
+                    rmp_decode::read_struct_into_opt(rd, &mut s.lmsig, MultisigSig::decode_into)?
                 }
+                b"pqsig" => rmp_decode::read_struct_into_opt(
+                    rd,
+                    &mut s.pqsig,
+                    crate::pq::PQSig::decode_into,
+                )?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
-        Ok(s)
-    }
-
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
+        Ok(())
     }
 }
 
 impl HeartbeatProof {
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
-        let mut s = Self::default();
+    decode_via_into!();
+
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"s" => s.sig = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?,
-                b"p" => s.pk = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?,
-                b"p2" => s.pk2 = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?,
-                b"p1s" => s.pk1_sig = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?,
-                b"p2s" => s.pk2_sig = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?,
+                b"s" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.sig)?,
+                b"p" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.pk)?,
+                b"p2" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.pk2)?,
+                b"p1s" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.pk1_sig)?,
+                b"p2s" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.pk2_sig)?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
-        Ok(s)
-    }
-
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
+        Ok(())
     }
 }
 
 impl HeartbeatTxnFields {
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
-        let mut s = Self::default();
+    decode_via_into!();
+
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"a" => s.address = rmp_decode::read_address_go_compat(rd)?,
+                b"a" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.address.0)?,
                 b"prf" => {
-                    s.proof = rmp_decode::read_optional(rd, HeartbeatProof::decode_from_reader)?
+                    rmp_decode::read_struct_into_opt(rd, &mut s.proof, HeartbeatProof::decode_into)?
                 }
-                b"sd" => s.seed = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?,
-                b"vid" => s.vote_id = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?,
+                b"sd" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.seed)?,
+                b"vid" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.vote_id)?,
                 b"kd" => s.key_dilution = rmp_decode::read_u64(rd)?,
                 b"c" => s.hb_challenge_discount = rmp_decode::read_bool(rd)?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
-        Ok(s)
-    }
-
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
+        Ok(())
     }
 }
 
 impl HashFactory {
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
-        let mut s = Self::default();
+    decode_via_into!();
+
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
                 b"t" => s.hash_type = rmp_decode::read_u16(rd)?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
-        Ok(s)
-    }
-
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
+        Ok(())
     }
 }
 
@@ -1840,184 +1823,154 @@ impl HashFactory {
 /// go's `ReadBytesBytes` decodes a nil element as an empty slice, which
 /// re-encodes as `bin` len 0 -- NOT as nil. Returning `None` here would
 /// re-encode as nil and change TxIDs / group IDs / Merkle leaves (#2046).
-fn read_optional_bytebuf(rd: &mut &[u8]) -> DecodeResult<Option<ByteBuf>> {
-    rmp_decode::read_bytes_as_bytebuf_go_compat(rd).map(Some)
+fn read_bytes_elem_into(rd: &mut &[u8], e: &mut Option<ByteBuf>) -> DecodeResult<()> {
+    *e = Some(rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?);
+    Ok(())
 }
 
 /// go `crypto.FalconPublicKey` is `[FalconPublicKeySize]byte`
 /// (`crypto/falconWrapper.go`), read with `ReadExactBytes`: any encoded
 /// length is padded/truncated to this size, and an all-zero key is the zero
-/// value (omitted on encode, i.e. an empty `ByteBuf` here).
+/// value (omitted on encode, i.e. an empty `ByteBuf` here). A repeated key
+/// keeps the bytes past a shorter value, like every `[N]byte`.
 const FALCON_PUBLIC_KEY_SIZE: usize = 1793;
 
-fn read_falcon_public_key(rd: &mut &[u8]) -> DecodeResult<ByteBuf> {
-    let k = rmp_decode::read_fixed_bytes_go_compat::<FALCON_PUBLIC_KEY_SIZE>(rd)?;
-    Ok(if k.iter().all(|&b| b == 0) {
+fn read_falcon_public_key_into(rd: &mut &[u8], key: &mut ByteBuf) -> DecodeResult<()> {
+    let mut k = [0u8; FALCON_PUBLIC_KEY_SIZE];
+    if key.len() == FALCON_PUBLIC_KEY_SIZE {
+        k.copy_from_slice(key);
+    }
+    rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut k)?;
+    *key = if k.iter().all(|&b| b == 0) {
         ByteBuf::new()
     } else {
         ByteBuf::from(k.to_vec())
-    })
+    };
+    Ok(())
 }
 
 impl MerkleProof {
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
-        let mut s = Self::default();
+    decode_via_into!();
+
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"pth" => s.path = rmp_decode::read_optional_vec(rd, read_optional_bytebuf)?,
-                b"hsh" => {
-                    s.hash_factory = rmp_decode::read_optional(rd, HashFactory::decode_from_reader)?
-                }
+                b"pth" => rmp_decode::read_slice_into_opt(
+                    rd,
+                    &mut s.path,
+                    usize::MAX,
+                    || None,
+                    read_bytes_elem_into,
+                )?,
+                b"hsh" => rmp_decode::read_struct_into_opt(
+                    rd,
+                    &mut s.hash_factory,
+                    HashFactory::decode_into,
+                )?,
                 b"td" => s.tree_depth = rmp_decode::read_u8_val(rd)?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
-        Ok(s)
-    }
-
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
+        Ok(())
     }
 }
 
 impl FalconVerifier {
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
-        let mut s = Self::default();
+    decode_via_into!();
+
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"k" => s.public_key = read_falcon_public_key(rd)?,
+                b"k" => read_falcon_public_key_into(rd, &mut s.public_key)?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
-        Ok(s)
-    }
-
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
+        Ok(())
     }
 }
 
 impl MerkleSignature {
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
-        let mut s = Self::default();
+    decode_via_into!();
+
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
                 b"sig" => s.signature = rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?,
                 b"idx" => s.vector_commitment_index = rmp_decode::read_u64(rd)?,
-                b"prf" => s.proof = rmp_decode::read_optional(rd, MerkleProof::decode_from_reader)?,
-                b"vkey" => {
-                    s.verifying_key =
-                        rmp_decode::read_optional(rd, FalconVerifier::decode_from_reader)?
+                b"prf" => {
+                    rmp_decode::read_struct_into_opt(rd, &mut s.proof, MerkleProof::decode_into)?
                 }
+                b"vkey" => rmp_decode::read_struct_into_opt(
+                    rd,
+                    &mut s.verifying_key,
+                    FalconVerifier::decode_into,
+                )?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
-        Ok(s)
-    }
-
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
+        Ok(())
     }
 }
 
 impl SigSlotCommit {
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
-        let mut s = Self::default();
+    decode_via_into!();
+
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"s" => s.sig = rmp_decode::read_optional(rd, MerkleSignature::decode_from_reader)?,
+                b"s" => {
+                    rmp_decode::read_struct_into_opt(rd, &mut s.sig, MerkleSignature::decode_into)?
+                }
                 b"l" => s.l = rmp_decode::read_u64(rd)?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
-        Ok(s)
-    }
-
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
+        Ok(())
     }
 }
 
 impl MerkleSignatureVerifier {
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let mut s = Self::default();
-        Self::decode_into(rd, &mut s)?;
-        Ok(s)
-    }
+    decode_via_into!();
 
     /// Decode into an already populated verifier: go's generated decoder
     /// keeps the fields a repeated key's map does not mention (issue #2397,
     /// a duplicated `p` carrying `{}`), a map-header nil zeroes it.
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        if rmp_decode::try_read_nil(rd) {
-            *s = Self::default();
-            return Ok(());
-        }
-        let len = rmp_decode::read_map_len(rd)?;
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"cmt" => s.commitment = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?,
+                b"cmt" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.commitment)?,
                 b"lf" => s.key_lifetime = rmp_decode::read_u64(rd)?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         Ok(())
     }
-
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
-    }
 }
 
 impl Participant {
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let mut s = Self::default();
-        Self::decode_into(rd, &mut s)?;
-        Ok(s)
-    }
+    decode_via_into!();
 
     /// Decode into an already populated participant (see
     /// [`MerkleSignatureVerifier::decode_into`]); the `required` check runs on
     /// the merged result, like go's.
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        if rmp_decode::try_read_nil(rd) {
-            *s = Self::default();
-        } else {
-            Self::merge_map(rd, s)?;
-        }
-        Self::check_required(s)
-    }
-
-    fn merge_map(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_map_len(rd)?;
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"p" => {
-                    if rmp_decode::try_read_nil(rd) {
-                        s.pk = None;
-                    } else {
-                        let mut v = s.pk.take().unwrap_or_default();
-                        MerkleSignatureVerifier::decode_into(rd, &mut v)?;
-                        s.pk = Some(v);
-                    }
-                }
+                b"p" => rmp_decode::read_struct_into_opt(
+                    rd,
+                    &mut s.pk,
+                    MerkleSignatureVerifier::decode_into,
+                )?,
                 b"w" => s.weight = rmp_decode::read_u64(rd)?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
-        Ok(())
-    }
-
-    fn check_required(s: &Self) -> DecodeResult<()> {
         // go-algorand v4.7.2-stable marks `basics.Participant.PK` `codec:",required"`: the
         // generated decoder rejects `PK.MsgIsZero()` regardless of key presence on the wire,
         // so also reject an explicit-but-all-zero verifier, not just an absent "p" key.
@@ -2033,95 +1986,293 @@ impl Participant {
         }
         Ok(())
     }
-
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
-    }
 }
 
 impl Reveal {
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
-        let mut s = Self::default();
+    decode_via_into!();
+
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"s" => {
-                    s.sig_slot = rmp_decode::read_optional(rd, SigSlotCommit::decode_from_reader)?
-                }
+                b"s" => rmp_decode::read_struct_into_opt(
+                    rd,
+                    &mut s.sig_slot,
+                    SigSlotCommit::decode_into,
+                )?,
+                // a repeated `p` merges into the populated participant like
+                // go's decoder (issue #2397)
                 b"p" => {
-                    if rmp_decode::try_read_nil(rd) {
-                        s.part = None;
-                    } else {
-                        // a repeated `p` merges into the populated participant
-                        // like go's decoder (issue #2397)
-                        let mut v = s.part.take().unwrap_or_default();
-                        Participant::decode_into(rd, &mut v)?;
-                        s.part = Some(v);
-                    }
+                    rmp_decode::read_struct_into_opt(rd, &mut s.part, Participant::decode_into)?
                 }
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         // go-algorand v4.7.2-stable marks `stateproof.Reveal.Part` `codec:",required"`. The
         // "PK present but zero" sub-case is already caught above by Participant's own
-        // required-PK check, propagated through the `?` on the `read_optional` call.
+        // required-PK check.
         if rmp_decode::required_fields_checked() && s.part.is_none() {
             return Err(algo_error::AlgoError::Codec {
                 source: "missing required field 'p'".into(),
                 context: "rmp_decode".into(),
             });
         }
-        Ok(s)
-    }
-
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
+        Ok(())
     }
 }
 
 impl StateProofBody {
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
-        let mut s = Self::default();
+    decode_via_into!();
+
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
                 b"c" => s.sig_commit = rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?,
                 b"w" => s.signed_weight = rmp_decode::read_u64(rd)?,
-                b"S" => {
-                    s.sig_proofs = rmp_decode::read_optional(rd, MerkleProof::decode_from_reader)?
-                }
-                b"P" => {
-                    s.part_proofs = rmp_decode::read_optional(rd, MerkleProof::decode_from_reader)?
-                }
+                b"S" => rmp_decode::read_struct_into_opt(
+                    rd,
+                    &mut s.sig_proofs,
+                    MerkleProof::decode_into,
+                )?,
+                b"P" => rmp_decode::read_struct_into_opt(
+                    rd,
+                    &mut s.part_proofs,
+                    MerkleProof::decode_into,
+                )?,
                 b"v" => s.merkle_signature_salt_version = rmp_decode::read_u8_val(rd)?,
-                b"r" => {
-                    if rmp_decode::try_read_nil(rd) {
-                        s.reveals = None;
-                    } else {
-                        s.reveals = Some(rmp_decode::read_u64_map(rd, Reveal::decode_from_reader)?);
+                // msgp: a map is reused, a repeated `r` adds entries, each
+                // value fresh; go-codec decodes a repeated entry into the
+                // existing one (see `Reveal::decode_into_map_entry`)
+                b"r" if rmp_decode::reflect_mode() => read_reveals_reflect(rd, &mut s.reveals)?,
+                b"r" => rmp_decode::read_u64_map_into(rd, &mut s.reveals, |rd| {
+                    let mut r = Reveal::default();
+                    Reveal::decode_into(rd, &mut r)?;
+                    Ok(r)
+                })?,
+                b"pr" => rmp_decode::read_slice_into_opt(
+                    rd,
+                    &mut s.positions_to_reveal,
+                    usize::MAX,
+                    || 0,
+                    |rd, e| {
+                        *e = rmp_decode::read_u64(rd)?;
+                        Ok(())
+                    },
+                )?,
+                other => rmp_decode::unknown_key(rd, other)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+// ── go-codec (`protocol.DecodeReflect`) map entries (issue #2424) ──────
+//
+// go-codec decodes a repeated key of a `map[uint64]Reveal` INTO the entry
+// already there, which reflection sees as an unaddressable value: it can
+// still write integers (and copy into an existing `[]byte`), but any `nil`,
+// any `[N]byte` and any slice it would have to grow fail the whole decode.
+// Read from go v5.0.5-stable's tx-sync decoder with the strict-decode
+// oracle; only the tx-sync response (`go_codec_reflect`) decodes this way.
+
+/// go-codec's error for a value it cannot set.
+fn unaddressable() -> algo_error::AlgoError {
+    algo_error::AlgoError::Codec {
+        source: "reflect: reflect.Value.Set using unaddressable value".into(),
+        context: "rmp_decode".into(),
+    }
+}
+
+/// A struct inside an unaddressable map entry: `nil` cannot be set.
+fn unaddr_struct_len(rd: &mut &[u8]) -> DecodeResult<u32> {
+    if rmp_decode::is_nil(rd) {
+        return Err(unaddressable());
+    }
+    rmp_decode::read_map_len(rd)
+}
+
+/// An integer inside an unaddressable map entry (`nil` cannot be set).
+fn unaddr_u64(rd: &mut &[u8]) -> DecodeResult<u64> {
+    if rmp_decode::is_nil(rd) {
+        return Err(unaddressable());
+    }
+    rmp_decode::read_u64(rd)
+}
+
+/// A `[]byte` inside an unaddressable map entry: the decoded bytes are
+/// copied over the existing slice's prefix, its length unchanged.
+fn unaddr_bytes(rd: &mut &[u8], dst: &mut ByteBuf) -> DecodeResult<()> {
+    if rmp_decode::is_nil(rd) {
+        return Err(unaddressable());
+    }
+    let b = rmp_decode::read_bytes_go_compat(rd)?;
+    let n = b.len().min(dst.len());
+    dst[..n].copy_from_slice(&b[..n]);
+    Ok(())
+}
+
+/// A `[N]byte` inside an unaddressable map entry: go-codec cannot slice it.
+fn unaddr_array(rd: &mut &[u8]) -> algo_error::AlgoError {
+    if rmp_decode::is_nil(rd) {
+        unaddressable()
+    } else {
+        algo_error::AlgoError::Codec {
+            source: "reflect.Value.Slice: slice of unaddressable array".into(),
+            context: "rmp_decode".into(),
+        }
+    }
+}
+
+/// The `map[uint64]Reveal` of a state proof, decoded the way go-codec does.
+fn read_reveals_reflect(
+    rd: &mut &[u8],
+    slot: &mut Option<std::collections::BTreeMap<u64, Reveal>>,
+) -> DecodeResult<()> {
+    if rmp_decode::try_read_nil(rd) {
+        *slot = None;
+        return Ok(());
+    }
+    let n = rmp_decode::read_map_len(rd)?;
+    let map = slot.get_or_insert_with(std::collections::BTreeMap::new);
+    for _ in 0..n {
+        let key = rmp_decode::read_u64(rd)?;
+        match map.get_mut(&key) {
+            // a nil entry is stored as the zero value
+            Some(r) if rmp_decode::try_read_nil(rd) => *r = Reveal::default(),
+            Some(r) => Reveal::decode_into_map_entry(rd, r)?,
+            None => {
+                let mut r = Reveal::default();
+                Reveal::decode_into(rd, &mut r)?;
+                map.insert(key, r);
+            }
+        }
+    }
+    Ok(())
+}
+
+impl Reveal {
+    /// go-codec's decode of a repeated `Reveals` entry into the existing
+    /// (unaddressable) one; see the section comment.
+    fn decode_into_map_entry(rd: &mut &[u8], r: &mut Self) -> DecodeResult<()> {
+        for _ in 0..rmp_decode::read_map_len(rd)? {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"s" => {
+                    let slot = r.sig_slot.get_or_insert_with(SigSlotCommit::default);
+                    for _ in 0..unaddr_struct_len(rd)? {
+                        match rmp_decode::read_key_bytes(rd)? {
+                            b"s" => {
+                                let sig = slot.sig.get_or_insert_with(MerkleSignature::default);
+                                merkle_signature_into_map_entry(rd, sig)?;
+                            }
+                            b"l" => slot.l = unaddr_u64(rd)?,
+                            other => rmp_decode::unknown_key(rd, other)?,
+                        }
                     }
                 }
-                b"pr" => {
-                    s.positions_to_reveal = rmp_decode::read_optional_vec(rd, rmp_decode::read_u64)?
+                b"p" => {
+                    let part = r.part.get_or_insert_with(Participant::default);
+                    for _ in 0..unaddr_struct_len(rd)? {
+                        match rmp_decode::read_key_bytes(rd)? {
+                            b"p" => {
+                                let pk =
+                                    part.pk.get_or_insert_with(MerkleSignatureVerifier::default);
+                                for _ in 0..unaddr_struct_len(rd)? {
+                                    match rmp_decode::read_key_bytes(rd)? {
+                                        b"cmt" => return Err(unaddr_array(rd)),
+                                        b"lf" => pk.key_lifetime = unaddr_u64(rd)?,
+                                        other => rmp_decode::unknown_key(rd, other)?,
+                                    }
+                                }
+                            }
+                            b"w" => part.weight = unaddr_u64(rd)?,
+                            other => rmp_decode::unknown_key(rd, other)?,
+                        }
+                    }
                 }
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
-        Ok(s)
-    }
-
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
+        Ok(())
     }
 }
 
+/// [`Reveal::decode_into_map_entry`] for the entry's `MerkleSignature`.
+fn merkle_signature_into_map_entry(rd: &mut &[u8], sig: &mut MerkleSignature) -> DecodeResult<()> {
+    for _ in 0..unaddr_struct_len(rd)? {
+        match rmp_decode::read_key_bytes(rd)? {
+            b"sig" => unaddr_bytes(rd, &mut sig.signature)?,
+            b"idx" => sig.vector_commitment_index = unaddr_u64(rd)?,
+            b"prf" => {
+                let prf = sig.proof.get_or_insert_with(MerkleProof::default);
+                for _ in 0..unaddr_struct_len(rd)? {
+                    match rmp_decode::read_key_bytes(rd)? {
+                        // a slice it cannot grow: at most its length, each
+                        // element (addressable) decoded as usual
+                        b"pth" => {
+                            if rmp_decode::is_nil(rd) {
+                                return Err(unaddressable());
+                            }
+                            let (n, _) = rmp_decode::read_go_array_header(rd)?;
+                            let path = prf.path.get_or_insert_with(Vec::new);
+                            if n > path.len() {
+                                return Err(algo_error::AlgoError::Codec {
+                                    source: "cannot decode into non-settable slice".into(),
+                                    context: "rmp_decode".into(),
+                                });
+                            }
+                            for e in &mut path[..n] {
+                                read_bytes_elem_into(rd, e)?;
+                            }
+                        }
+                        b"hsh" => {
+                            let hf = prf.hash_factory.get_or_insert_with(HashFactory::default);
+                            for _ in 0..unaddr_struct_len(rd)? {
+                                match rmp_decode::read_key_bytes(rd)? {
+                                    b"t" => {
+                                        let v = unaddr_u64(rd)?;
+                                        hf.hash_type = u16::try_from(v).map_err(|_| {
+                                            algo_error::AlgoError::Codec {
+                                                source: format!("value {v} overflows u16").into(),
+                                                context: "rmp_decode".into(),
+                                            }
+                                        })?;
+                                    }
+                                    other => rmp_decode::unknown_key(rd, other)?,
+                                }
+                            }
+                        }
+                        b"td" => {
+                            let v = unaddr_u64(rd)?;
+                            prf.tree_depth =
+                                u8::try_from(v).map_err(|_| algo_error::AlgoError::Codec {
+                                    source: format!("value {v} overflows u8").into(),
+                                    context: "rmp_decode".into(),
+                                })?;
+                        }
+                        other => rmp_decode::unknown_key(rd, other)?,
+                    }
+                }
+            }
+            b"vkey" => {
+                for _ in 0..unaddr_struct_len(rd)? {
+                    match rmp_decode::read_key_bytes(rd)? {
+                        b"k" => return Err(unaddr_array(rd)),
+                        other => rmp_decode::unknown_key(rd, other)?,
+                    }
+                }
+            }
+            other => rmp_decode::unknown_key(rd, other)?,
+        }
+    }
+    Ok(())
+}
+
 impl StateProofMessage {
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
-        let mut s = Self::default();
+    decode_via_into!();
+
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
                 b"b" => {
@@ -2134,19 +2285,15 @@ impl StateProofMessage {
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
-        Ok(s)
-    }
-
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
+        Ok(())
     }
 }
 
 impl HoldingRef {
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
-        let mut s = Self::default();
+    decode_via_into!();
+
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
                 b"d" => s.address = rmp_decode::read_u64(rd)?,
@@ -2154,19 +2301,15 @@ impl HoldingRef {
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
-        Ok(s)
-    }
-
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
+        Ok(())
     }
 }
 
 impl LocalsRef {
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
-        let mut s = Self::default();
+    decode_via_into!();
+
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
                 b"d" => s.address = rmp_decode::read_u64(rd)?,
@@ -2174,36 +2317,31 @@ impl LocalsRef {
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
-        Ok(s)
-    }
-
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
+        Ok(())
     }
 }
 
 impl ResourceRef {
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
-        let mut s = Self::default();
+    decode_via_into!();
+
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"d" => s.address = rmp_decode::read_address_go_compat(rd)?,
+                b"d" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.address.0)?,
                 b"s" => s.asset = rmp_decode::read_u64(rd)?,
                 b"p" => s.app = rmp_decode::read_u64(rd)?,
-                b"h" => s.holding = rmp_decode::read_optional(rd, HoldingRef::decode_from_reader)?,
-                b"l" => s.locals = rmp_decode::read_optional(rd, LocalsRef::decode_from_reader)?,
-                b"b" => s.box_ref = rmp_decode::read_optional(rd, BoxRef::decode_from_reader)?,
+                b"h" => {
+                    rmp_decode::read_struct_into_opt(rd, &mut s.holding, HoldingRef::decode_into)?
+                }
+                b"l" => {
+                    rmp_decode::read_struct_into_opt(rd, &mut s.locals, LocalsRef::decode_into)?
+                }
+                b"b" => rmp_decode::read_struct_into_opt(rd, &mut s.box_ref, BoxRef::decode_into)?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
-        Ok(s)
-    }
-
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
+        Ok(())
     }
 }
 
@@ -2266,53 +2404,82 @@ impl Transaction {
 
 // ── Transaction decoder ────────────────────────────────────────
 
+/// A `uint64` slice element (`basics.AssetIndex` / `AppIndex`), overwritten.
+fn read_u64_elem_into(rd: &mut &[u8], e: &mut u64) -> DecodeResult<()> {
+    *e = rmp_decode::read_u64(rd)?;
+    Ok(())
+}
+
+/// A `basics.Address` slice element, read with `ReadExactBytes` into the
+/// element already there.
+fn read_address_elem_into(rd: &mut &[u8], e: &mut Address) -> DecodeResult<()> {
+    rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut e.0)
+}
+
 impl Transaction {
-    /// Decode a Transaction from a msgpack map using raw rmp.
+    decode_via_into!();
+
+    /// Decode a Transaction from a msgpack map into an already decoded value
+    /// (issue #2424: a repeated key decodes into the populated field).
     ///
     /// Uses two-level key dispatch: (key_len, first_byte) for O(1) routing
     /// instead of linear byte-slice comparison across all 49 fields.
-    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
-        let mut t = Self::default();
+    pub(crate) fn decode_into(rd: &mut &[u8], t: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, t)?;
         for _ in 0..len {
             let key = rmp_decode::read_key_bytes(rd)?;
             match (key.len(), key.first().copied().unwrap_or(0)) {
                 // ── 2-byte keys ──────────────────────────────────
-                (2, b'a') if key == b"al" => {
-                    t.access = rmp_decode::read_optional_vec(rd, ResourceRef::decode_from_reader)?
-                }
+                (2, b'a') if key == b"al" => rmp_decode::read_slice_into_opt(
+                    rd,
+                    &mut t.access,
+                    usize::MAX,
+                    ResourceRef::default,
+                    ResourceRef::decode_into,
+                )?,
                 (2, b'f') if key == b"fv" => t.first_valid = Round(rmp_decode::read_u64(rd)?),
                 (2, b'g') if key == b"gh" => {
-                    t.genesis_hash = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
+                    rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut t.genesis_hash)?
                 }
-                (2, b'h') if key == b"hb" => {
-                    t.heartbeat =
-                        rmp_decode::read_optional(rd, HeartbeatTxnFields::decode_from_reader)?
-                }
+                // go's `*HeartbeatTxnFields` is a pointer
+                (2, b'h') if key == b"hb" => rmp_decode::read_pointer_into(
+                    rd,
+                    &mut t.heartbeat,
+                    HeartbeatTxnFields::decode_into,
+                )?,
                 (2, b'l') if key == b"lv" => t.last_valid = Round(rmp_decode::read_u64(rd)?),
                 (2, b'l') if key == b"lx" => {
-                    t.lease = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
+                    rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut t.lease)?
                 }
-                (2, b's') if key == b"sp" => {
-                    t.state_proof =
-                        rmp_decode::read_optional(rd, StateProofBody::decode_from_reader)?
-                }
+                (2, b's') if key == b"sp" => rmp_decode::read_struct_into_opt(
+                    rd,
+                    &mut t.state_proof,
+                    StateProofBody::decode_into,
+                )?,
                 // ── 3-byte keys ──────────────────────────────────
                 (3, b'a') if key == b"amt" => t.amount = rmp_decode::read_u64(rd)?,
                 (3, b'f') if key == b"fee" => t.fee = rmp_decode::read_u64(rd)?,
                 (3, b'g') if key == b"gen" => t.genesis_id = rmp_decode::read_string(rd)?,
                 (3, b'g') if key == b"grp" => {
-                    t.group = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
+                    rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut t.group)?
                 }
-                (3, b'r') if key == b"rcv" => t.receiver = rmp_decode::read_address_go_compat(rd)?,
-                (3, b's') if key == b"snd" => t.sender = rmp_decode::read_address_go_compat(rd)?,
+                (3, b'r') if key == b"rcv" => {
+                    rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut t.receiver.0)?
+                }
+                (3, b's') if key == b"snd" => {
+                    rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut t.sender.0)?
+                }
                 // ── 4-byte keys ──────────────────────────────────
                 (4, b'a') => match key {
                     b"aamt" => t.asset_amount = rmp_decode::read_u64(rd)?,
                     b"afrz" => t.asset_frozen = rmp_decode::read_bool(rd)?,
-                    b"apaa" => {
-                        t.app_arguments = rmp_decode::read_optional_vec(rd, read_optional_bytebuf)?
-                    }
+                    b"apaa" => rmp_decode::read_slice_into_opt(
+                        rd,
+                        &mut t.app_arguments,
+                        usize::MAX,
+                        || None,
+                        read_bytes_elem_into,
+                    )?,
                     b"apan" => t.on_completion = rmp_decode::read_u64(rd)?,
                     b"apap" => {
                         t.approval_program = rmp_decode::read_optional(
@@ -2320,33 +2487,51 @@ impl Transaction {
                             rmp_decode::read_bytes_as_bytebuf_go_compat,
                         )?
                     }
-                    b"apar" => {
-                        t.asset_params =
-                            rmp_decode::read_optional(rd, AssetParams::decode_from_reader)?
-                    }
-                    b"apas" => {
-                        t.foreign_assets = rmp_decode::read_optional_vec(rd, rmp_decode::read_u64)?
-                    }
-                    b"apat" => {
-                        t.accounts =
-                            rmp_decode::read_optional_vec(rd, rmp_decode::read_address_go_compat)?
-                    }
-                    b"apbx" => {
-                        t.boxes = rmp_decode::read_optional_vec(rd, BoxRef::decode_from_reader)?
-                    }
+                    b"apar" => rmp_decode::read_struct_into_opt(
+                        rd,
+                        &mut t.asset_params,
+                        AssetParams::decode_into,
+                    )?,
+                    b"apas" => rmp_decode::read_slice_into_opt(
+                        rd,
+                        &mut t.foreign_assets,
+                        usize::MAX,
+                        || 0,
+                        read_u64_elem_into,
+                    )?,
+                    b"apat" => rmp_decode::read_slice_into_opt(
+                        rd,
+                        &mut t.accounts,
+                        usize::MAX,
+                        Address::default,
+                        read_address_elem_into,
+                    )?,
+                    b"apbx" => rmp_decode::read_slice_into_opt(
+                        rd,
+                        &mut t.boxes,
+                        usize::MAX,
+                        BoxRef::default,
+                        BoxRef::decode_into,
+                    )?,
                     b"apep" => t.extra_program_pages = rmp_decode::read_u32(rd)?,
-                    b"apfa" => {
-                        t.foreign_apps = rmp_decode::read_optional_vec(rd, rmp_decode::read_u64)?
-                    }
-                    b"apgs" => {
-                        t.global_state_schema =
-                            rmp_decode::read_optional(rd, StateSchema::decode_from_reader)?
-                    }
+                    b"apfa" => rmp_decode::read_slice_into_opt(
+                        rd,
+                        &mut t.foreign_apps,
+                        usize::MAX,
+                        || 0,
+                        read_u64_elem_into,
+                    )?,
+                    b"apgs" => rmp_decode::read_struct_into_opt(
+                        rd,
+                        &mut t.global_state_schema,
+                        StateSchema::decode_into,
+                    )?,
                     b"apid" => t.application_id = rmp_decode::read_u64(rd)?,
-                    b"apls" => {
-                        t.local_state_schema =
-                            rmp_decode::read_optional(rd, StateSchema::decode_from_reader)?
-                    }
+                    b"apls" => rmp_decode::read_struct_into_opt(
+                        rd,
+                        &mut t.local_state_schema,
+                        StateSchema::decode_into,
+                    )?,
                     b"aprv" => t.reject_version = rmp_decode::read_u64(rd)?,
                     b"apsu" => {
                         t.clear_state_program = rmp_decode::read_optional(
@@ -2354,20 +2539,13 @@ impl Transaction {
                             rmp_decode::read_bytes_as_bytebuf_go_compat,
                         )?
                     }
-                    b"arcv" => {
-                        t.asset_receiver =
-                            rmp_decode::read_optional(rd, rmp_decode::read_address_go_compat)?
-                    }
-                    b"asnd" => {
-                        t.asset_sender =
-                            rmp_decode::read_optional(rd, rmp_decode::read_address_go_compat)?
-                    }
+                    b"arcv" => rmp_decode::read_address_into_opt(rd, &mut t.asset_receiver)?,
+                    b"asnd" => rmp_decode::read_address_into_opt(rd, &mut t.asset_sender)?,
                     _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 (4, b'c') if key == b"caid" => t.config_asset = rmp_decode::read_u64(rd)?,
                 (4, b'f') if key == b"fadd" => {
-                    t.freeze_account =
-                        rmp_decode::read_optional(rd, rmp_decode::read_address_go_compat)?
+                    rmp_decode::read_address_into_opt(rd, &mut t.freeze_account)?
                 }
                 (4, b'f') if key == b"faid" => t.freeze_asset = rmp_decode::read_u64(rd)?,
                 (4, b'n') if key == b"note" => {
@@ -2379,44 +2557,37 @@ impl Transaction {
                 (4, b'x') if key == b"xaid" => t.xaid = rmp_decode::read_u64(rd)?,
                 // ── 5-byte keys ──────────────────────────────────
                 (5, b'c') if key == b"close" => {
-                    t.close_remainder_to = rmp_decode::read_address_go_compat(rd)?
+                    rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut t.close_remainder_to.0)?
                 }
                 (5, b'r') if key == b"rekey" => {
-                    t.rekey_to = rmp_decode::read_optional(rd, rmp_decode::read_address_go_compat)?
+                    rmp_decode::read_address_into_opt(rd, &mut t.rekey_to)?
                 }
-                (5, b's') if key == b"spmsg" => {
-                    t.state_proof_message =
-                        rmp_decode::read_optional(rd, StateProofMessage::decode_from_reader)?
-                }
+                (5, b's') if key == b"spmsg" => rmp_decode::read_struct_into_opt(
+                    rd,
+                    &mut t.state_proof_message,
+                    StateProofMessage::decode_into,
+                )?,
                 // ── 6-byte keys ──────────────────────────────────
                 (6, b'a') if key == b"aclose" => {
-                    t.asset_close_to =
-                        rmp_decode::read_optional(rd, rmp_decode::read_address_go_compat)?
+                    rmp_decode::read_address_into_opt(rd, &mut t.asset_close_to)?
                 }
                 (6, b's') if key == b"selkey" => {
-                    t.selection_pk =
-                        rmp_decode::read_optional(rd, rmp_decode::read_fixed_bytes_go_compat::<32>)?
+                    rmp_decode::read_fixed_into_opt(rd, &mut t.selection_pk)?
                 }
                 (6, b's') if key == b"sptype" => t.state_proof_type = rmp_decode::read_u64(rd)?,
                 (6, b'v') if key == b"votekd" => t.vote_key_dilution = rmp_decode::read_u64(rd)?,
                 // ── 7-byte keys ──────────────────────────────────
                 (7, b'n') if key == b"nonpart" => t.non_participation = rmp_decode::read_bool(rd)?,
                 (7, b's') if key == b"sprfkey" => {
-                    t.state_proof_pk =
-                        rmp_decode::read_optional(rd, rmp_decode::read_fixed_bytes_go_compat::<64>)?
+                    rmp_decode::read_fixed_into_opt(rd, &mut t.state_proof_pk)?
                 }
                 (7, b'v') => match key {
                     b"votefst" => t.vote_first = rmp_decode::read_u64(rd)?,
-                    b"votekey" => {
-                        t.vote_pk = rmp_decode::read_optional(
-                            rd,
-                            rmp_decode::read_fixed_bytes_go_compat::<32>,
-                        )?
-                    }
+                    b"votekey" => rmp_decode::read_fixed_into_opt(rd, &mut t.vote_pk)?,
                     b"votelst" => t.vote_last = rmp_decode::read_u64(rd)?,
                     _ => rmp_decode::unknown_key(rd, key)?,
                 },
-                // Unknown fields are skipped
+                // go's msgp decoder: msgp.ErrNoField (issue #2394)
                 _ => rmp_decode::unknown_key(rd, key)?,
             }
         }
@@ -2437,13 +2608,7 @@ impl Transaction {
                 context: "rmp_decode".into(),
             });
         }
-        Ok(t)
-    }
-
-    /// Decode a Transaction from msgpack bytes.
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
+        Ok(())
     }
 }
 
@@ -2469,19 +2634,27 @@ impl SignedTransaction {
     ///
     /// Uses two-level key dispatch: (key_len, first_byte) for fast routing.
     pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        Self::decode_impl(rd, true)
-    }
-
-    /// An inner transaction of an eval delta, go's `SignedTxnWithAD`: a
-    /// `SignedTxnInBlock` without the `hgi`/`hgh` genesis flags.
-    pub(crate) fn decode_inner_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        Self::decode_impl(rd, false)
-    }
-
-    fn decode_impl(rd: &mut &[u8], genesis_flags: bool) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
+        let _session = rmp_decode::decode_session();
         let mut s = Self::default();
-        let mut has_txn = false;
+        Self::decode_into(rd, &mut s, true)?;
+        Ok(s)
+    }
+
+    /// Decode a SignedTransaction from msgpack bytes.
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+
+    /// Decode into an already decoded value (issue #2424). `genesis_flags`:
+    /// a `SignedTxnInBlock` (`hgi`/`hgh`); without them go's `SignedTxnWithAD`,
+    /// an inner transaction of an eval delta.
+    pub(crate) fn decode_into(
+        rd: &mut &[u8],
+        s: &mut Self,
+        genesis_flags: bool,
+    ) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             let key = rmp_decode::read_key_bytes(rd)?;
             // Block-only keys (ApplyData and the genesis flags): go's SignedTxn
@@ -2507,8 +2680,7 @@ impl SignedTransaction {
             match (key.len(), key.first().copied().unwrap_or(0)) {
                 (2, b'c') if key == b"ca" => s.closing_amount = rmp_decode::read_u64(rd)?,
                 (2, b'd') if key == b"dt" => {
-                    s.eval_delta =
-                        rmp_decode::read_checked_optional_rmpv(rd, &crate::msgp_schema::EVAL_DELTA)?
+                    crate::go_eval_delta::read_eval_delta_into(rd, &mut s.eval_delta)?
                 }
                 (2, b'r') => match key {
                     b"rs" => s.sender_rewards = rmp_decode::read_u64(rd)?,
@@ -2523,12 +2695,9 @@ impl SignedTransaction {
                     _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 (3, b's') if key == b"sig" => {
-                    s.sig = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?
+                    rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.sig)?
                 }
-                (3, b't') if key == b"txn" => {
-                    s.txn = Transaction::decode_from_reader(rd)?;
-                    has_txn = true;
-                }
+                (3, b't') if key == b"txn" => Transaction::decode_into(rd, &mut s.txn)?,
                 (4, b'a') if key == b"apid" => {
                     s.apply_data_application_id = rmp_decode::read_u64(rd)?
                 }
@@ -2536,33 +2705,33 @@ impl SignedTransaction {
                     s.apply_data_config_asset = rmp_decode::read_u64(rd)?
                 }
                 (4, b'l') if key == b"lsig" => {
-                    s.lsig = rmp_decode::read_optional(rd, LogicSig::decode_from_reader)?
+                    rmp_decode::read_struct_into_opt(rd, &mut s.lsig, LogicSig::decode_into)?
                 }
                 // As in `LogicSig`: a `nil` `msig` fails the required checks (#2390).
-                (4, b'm') if key == b"msig" => s.msig = Some(MultisigSig::decode_from_reader(rd)?),
-                (5, b'p') if key == b"pqsig" => {
-                    s.pqsig = rmp_decode::read_optional(rd, crate::pq::PQSig::decode_from_reader)?
+                (4, b'm') if key == b"msig" => {
+                    rmp_decode::read_struct_into_opt(rd, &mut s.msig, MultisigSig::decode_into)?
                 }
+                (5, b'p') if key == b"pqsig" => rmp_decode::read_struct_into_opt(
+                    rd,
+                    &mut s.pqsig,
+                    crate::pq::PQSig::decode_into,
+                )?,
                 (4, b's') if key == b"sgnr" => {
-                    s.auth_addr = rmp_decode::read_optional(rd, rmp_decode::read_address_go_compat)?
+                    rmp_decode::read_address_into_opt(rd, &mut s.auth_addr)?
                 }
                 _ => rmp_decode::unknown_key(rd, key)?,
             }
         }
-        // The serde path requires `txn` (no #[serde(default)]), so validate here.
-        if rmp_decode::required_fields_checked() && !has_txn {
+        // go's `SignedTxn.Txn` is `required` (`Txn.MsgIsZero()`): a zero
+        // transaction never decodes (its own required `type`/`snd` already
+        // fail when it is present), so a missing `txn` is the remaining case.
+        if rmp_decode::required_fields_checked() && s.txn.txn_type.is_empty() {
             return Err(algo_error::AlgoError::Codec {
                 source: "SignedTransaction: missing required 'txn' field".into(),
                 context: "rmp_decode".into(),
             });
         }
-        Ok(s)
-    }
-
-    /// Decode a SignedTransaction from msgpack bytes.
-    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
-        let mut rd = data;
-        Self::decode_from_reader(&mut rd)
+        Ok(())
     }
 }
 

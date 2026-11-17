@@ -75,7 +75,7 @@ use std::io::Cursor;
 
 use algo_codec::canonical_encode_unauthenticated_proposal;
 use algo_consensus_crypto::OneTimeSignature;
-use algo_types::{Address, Block, Digest, Round};
+use algo_types::{go_msgp, Address, Block, Digest, Round};
 
 use crate::bundle::{EquivocationVoteAuthenticator, UnauthenticatedBundle, VoteAuthenticator};
 use crate::credential::{Credential, HashableCredential, UnauthenticatedCredential};
@@ -379,15 +379,12 @@ fn encode_vote_authenticator(auth: &VoteAuthenticator) -> Vec<u8> {
 fn encode_equivocation_vote_authenticator(auth: &EquivocationVoteAuthenticator) -> Vec<u8> {
     let mut buf = Vec::with_capacity(768);
 
-    // sig has omitemptycheckstruct; check if both sigs are zero
-    let sigs_zero = ots_is_zero(&auth.sigs[0]) && ots_is_zero(&auth.sigs[1]);
-
-    let mut count: u8 = 3; // cred, props, snd always present
-    if !sigs_zero {
-        count += 1;
-    }
-
-    rmp::encode::write_map_len(&mut buf, count as u32).unwrap();
+    // go's generated `equivocationVoteAuthenticator.MarshalMsg` writes all
+    // four fields: the struct is not omitempty and `omitemptycheckstruct`
+    // has no effect on an array field (`zb0003Len := uint32(4)`, no mask).
+    // Omitting an all-zero `sig` pair (as this encoder did before issue
+    // #2424) changed the bundle bytes go would have produced.
+    rmp::encode::write_map_len(&mut buf, 4).unwrap();
 
     // Fields sorted: "cred", "props", "sig", "snd"
     write_str_key(&mut buf, "cred");
@@ -399,13 +396,11 @@ fn encode_equivocation_vote_authenticator(auth: &EquivocationVoteAuthenticator) 
     buf.extend_from_slice(&encode_proposal_value(&auth.proposals[0]));
     buf.extend_from_slice(&encode_proposal_value(&auth.proposals[1]));
 
-    if !sigs_zero {
-        write_str_key(&mut buf, "sig");
-        // [2]OneTimeSignature -> fixarray(2)
-        rmp::encode::write_array_len(&mut buf, 2).unwrap();
-        buf.extend_from_slice(&encode_one_time_signature(&auth.sigs[0]));
-        buf.extend_from_slice(&encode_one_time_signature(&auth.sigs[1]));
-    }
+    write_str_key(&mut buf, "sig");
+    // [2]OneTimeSignature -> fixarray(2)
+    rmp::encode::write_array_len(&mut buf, 2).unwrap();
+    buf.extend_from_slice(&encode_one_time_signature(&auth.sigs[0]));
+    buf.extend_from_slice(&encode_one_time_signature(&auth.sigs[1]));
 
     write_str_key(&mut buf, "snd");
     rmp::encode::write_bin(&mut buf, &auth.sender.0).unwrap();
@@ -583,46 +578,57 @@ pub fn encode_compound_message(cm: &CompoundMessage) -> Vec<u8> {
 /// 2. Scan the map a second time to extract the proposal-specific fields
 ///    (`oper`, `oprop`, `sdpf`) and the optional prior vote (`pv`).
 pub fn decode_compound_message(bytes: &[u8]) -> Result<CompoundMessage, CodecError> {
+    let _session = go_msgp::decode_session();
     // Step 1: Decode block fields (skips unknown keys). Use the
     // rnd-tolerant wrapper so transmittedPayload fixtures with
     // round=0 (which omit the `rnd` key via omitempty) still parse.
     let block = decode_block_allowing_missing_rnd(bytes, &[b"oper", b"oprop", b"sdpf", b"pv"])?;
 
     // Step 2: Scan the map to extract proposal-specific fields and prior vote.
-    let mut cursor = Cursor::new(bytes);
-    let map_len = rmp::decode::read_map_len(&mut cursor)
-        .map_err(|e| CodecError::Decode(format!("compound message map: {e}")))?;
-
-    let mut original_period = Period(0);
-    let mut original_proposer = Address([0u8; 32]);
-    let mut seed_proof = [0u8; VRF_PROOF_SIZE];
+    let mut proposal = UnauthenticatedProposal {
+        block,
+        ..UnauthenticatedProposal::default()
+    };
     let mut prior_vote = UnauthenticatedVote::default();
-
-    for _ in 0..map_len {
-        let key = read_str_key(&mut cursor)?;
-        match key {
-            "oper" => original_period = Period(read_uint64(&mut cursor)?),
-            "oprop" => original_proposer = Address(read_bin_fixed::<32>(&mut cursor)?),
-            "sdpf" => seed_proof = read_bin_fixed::<VRF_PROOF_SIZE>(&mut cursor)?,
-            "pv" => prior_vote = decode_vote_from_cursor(&mut cursor)?,
-            _ => {
-                // A block field: the strict block decode above already
-                // rejected every key go's `transmittedPayload` lacks.
-                skip_value(&mut cursor)?;
-            }
-        }
-    }
-
+    proposal_fields_into(&mut &bytes[..], &mut proposal, Some(&mut prior_vote)).map_err(go_err)?;
     Ok(CompoundMessage {
         vote: prior_vote,
-        proposal: UnauthenticatedProposal {
-            block,
-            seed_proof,
-            original_period,
-            original_proposer,
-            ..UnauthenticatedProposal::default()
-        },
+        proposal,
     })
+}
+
+/// The second pass over an `unauthenticatedProposal` / `transmittedPayload`
+/// map: its own fields (`oper`, `oprop`, `sdpf` and, for a payload, `pv`),
+/// each decoded into the current value like go's (a repeated key merges);
+/// the block fields were read by the block decoder, which also rejected
+/// every key the message lacks.
+fn proposal_fields_into(
+    rd: &mut &[u8],
+    p: &mut UnauthenticatedProposal,
+    mut prior_vote: Option<&mut UnauthenticatedVote>,
+) -> GoResult<()> {
+    if let [0xc0, rest @ ..] = *rd {
+        // go: a nil message is the zero value (the block decoder agreed)
+        *rd = rest;
+        return Ok(());
+    }
+    for _ in 0..go_msgp::read_map_len(rd)? {
+        match go_msgp::read_key_bytes(rd)? {
+            b"oper" => p.original_period = Period(go_msgp::read_u64(rd)?),
+            b"oprop" => fixed_into(rd, &mut p.original_proposer.0)?,
+            b"sdpf" => fixed_into(rd, &mut p.seed_proof)?,
+            b"pv" if prior_vote.is_some() => {
+                vote_into(rd, prior_vote.as_deref_mut().expect("checked"))?
+            }
+            // A block field: the strict block decode already rejected every
+            // key go's message lacks.
+            _ => match fast_skip_len(rd) {
+                Some(len) => *rd = &rd[len..],
+                None => go_msgp::skip_value(rd)?,
+            },
+        }
+    }
+    Ok(())
 }
 
 // ── Decoding helpers ─────────────────────────────────────────────────────
@@ -699,13 +705,6 @@ fn read_str_key_slow(cursor: &mut Cursor<&[u8]>) -> Result<String, CodecError> {
 /// much larger, depth limit and error).
 const FAST_SKIP_MAX_DEPTH: usize = 32;
 
-/// Skip one msgpack value without building it (go: `msgp.Skip`).
-///
-/// A well-formed value nested at most [`FAST_SKIP_MAX_DEPTH`] containers deep
-/// is skipped by [`fast_skip_len`]; everything else (malformed or truncated
-/// input, a reserved marker, deeper nesting) is handed to
-/// `rmpv::decode::read_value` exactly as before, so the accepted inputs, the
-/// bytes consumed and the error texts are unchanged (issue #2317).
 /// go's `msgp.ErrNoField`: a key the struct lacks fails the whole decode
 /// (issue #2394).
 #[cold]
@@ -715,20 +714,10 @@ fn unknown_field(key: &str) -> CodecError {
     ))
 }
 
-fn skip_value(cursor: &mut Cursor<&[u8]>) -> Result<(), CodecError> {
-    let buf: &[u8] = cursor.get_ref();
-    let pos = (cursor.position() as usize).min(buf.len());
-    if let Some(len) = fast_skip_len(&buf[pos..]) {
-        cursor.set_position((pos + len) as u64);
-        return Ok(());
-    }
-    rmpv::decode::read_value(cursor)
-        .map(drop)
-        .map_err(|e| CodecError::Decode(format!("skip field: {e}")))
-}
-
 /// Encoded length of the msgpack value at the start of `buf`, or `None` when
-/// it is not complete and well formed within [`FAST_SKIP_MAX_DEPTH`].
+/// it is not complete and well formed within [`FAST_SKIP_MAX_DEPTH`] (the
+/// caller then falls back to the general skipper). Skips a proposal's block
+/// fields without building them (go: `msgp.Skip`, issue #2317).
 fn fast_skip_len(buf: &[u8]) -> Option<usize> {
     fn be16(buf: &[u8], pos: usize) -> Option<usize> {
         Some(u16::from_be_bytes([*buf.get(pos)?, *buf.get(pos + 1)?]) as usize)
@@ -941,279 +930,306 @@ fn read_bool(cursor: &mut Cursor<&[u8]>) -> Result<bool, CodecError> {
     }
 }
 
-/// Decode a ProposalValue from cursor position.
-fn decode_proposal_value(cursor: &mut Cursor<&[u8]>) -> Result<ProposalValue, CodecError> {
-    let map_len = rmp::decode::read_map_len(cursor)
-        .map_err(|e| CodecError::Decode(format!("proposal value map: {e}")))?;
+// ── Decoding INTO the populated value (issue #2424) ─────────────────────
+//
+// go's generated `UnmarshalMsg` decodes a repeated map key again INTO the
+// field it already filled: a nested struct is merged (a `nil` resets it), a
+// `[N]byte` keeps the bytes past a shorter value, a slice is re-sliced
+// within its capacity (each element decoded into the element already
+// there), a fixed array `[2]T` takes at most two elements into the leading
+// ones. The readers below work on the remaining input slice with the
+// `algo_types::go_msgp` primitives that implement exactly that.
 
-    let mut pv = BOTTOM;
-    for _ in 0..map_len {
-        let key = read_str_key(cursor)?;
-        match key {
-            "dig" => pv.block_digest = Digest(read_bin_fixed::<32>(cursor)?),
-            "encdig" => pv.encoding_digest = Digest(read_bin_fixed::<32>(cursor)?),
-            "oper" => pv.original_period = Period(read_uint64(cursor)?),
-            "oprop" => pv.original_proposer = Address(read_bin_fixed::<32>(cursor)?),
-            _ => return Err(unknown_field(key)),
-        }
-    }
+type GoResult<T> = algo_error::Result<T>;
 
-    Ok(pv)
+/// go's `bounds.MaxVoteThreshold`: most votes / equivocation votes of a
+/// bundle.
+const MAX_BUNDLE_ARRAY_LEN: usize = 10_000;
+
+fn go_err(e: algo_error::AlgoError) -> CodecError {
+    CodecError::Decode(e.to_string())
 }
 
-/// Decode a RawVote from cursor position.
-fn decode_raw_vote(cursor: &mut Cursor<&[u8]>) -> Result<RawVote, CodecError> {
-    let map_len = rmp::decode::read_map_len(cursor)
-        .map_err(|e| CodecError::Decode(format!("raw vote map: {e}")))?;
+/// Run a slice reader at the cursor position and advance the cursor past
+/// what it consumed.
+#[inline]
+fn at_cursor<T>(
+    cursor: &mut Cursor<&[u8]>,
+    f: impl FnOnce(&mut &[u8]) -> GoResult<T>,
+) -> Result<T, CodecError> {
+    let buf: &[u8] = cursor.get_ref();
+    let pos = (cursor.position() as usize).min(buf.len());
+    let mut rd = &buf[pos..];
+    let before = rd.len();
+    let v = f(&mut rd).map_err(go_err)?;
+    cursor.set_position((pos + before - rd.len()) as u64);
+    Ok(v)
+}
 
-    let mut rv = RawVote {
+/// A `[N]byte` field decoded into its current value (`msgp.ReadExactBytes`),
+/// with a fast path for the `bin8` of exactly N bytes go's encoder writes.
+#[inline]
+fn fixed_into(rd: &mut &[u8], into: &mut [u8]) -> GoResult<()> {
+    let n = into.len();
+    if n <= u8::MAX as usize && rd.len() >= n + 2 && rd[0] == 0xc4 && rd[1] as usize == n {
+        into.copy_from_slice(&rd[2..2 + n]);
+        *rd = &rd[2 + n..];
+        return Ok(());
+    }
+    go_msgp::read_fixed_bytes_into_go_compat(rd, into)
+}
+
+fn zero_ots() -> OneTimeSignature {
+    OneTimeSignature {
+        sig: [0u8; 64],
+        pk: [0u8; 32],
+        pk_sig_old: [0u8; 64],
+        pk2: [0u8; 32],
+        pk1_sig: [0u8; 64],
+        pk2_sig: [0u8; 64],
+    }
+}
+
+fn zero_raw_vote() -> RawVote {
+    RawVote {
         sender: Address([0u8; 32]),
         round: Round(0),
         period: Period(0),
         step: Step(0),
         proposal: BOTTOM,
-    };
-
-    for _ in 0..map_len {
-        let key = read_str_key(cursor)?;
-        match key {
-            "per" => rv.period = Period(read_uint64(cursor)?),
-            "prop" => rv.proposal = decode_proposal_value(cursor)?,
-            "rnd" => rv.round = Round(read_uint64(cursor)?),
-            "snd" => rv.sender = Address(read_bin_fixed::<32>(cursor)?),
-            "step" => rv.step = Step(read_uint64(cursor)?),
-            _ => return Err(unknown_field(key)),
-        }
     }
-
-    Ok(rv)
 }
 
-/// Decode an UnauthenticatedCredential from cursor position.
-fn decode_unauthenticated_credential(
-    cursor: &mut Cursor<&[u8]>,
-) -> Result<UnauthenticatedCredential, CodecError> {
-    let map_len = rmp::decode::read_map_len(cursor)
-        .map_err(|e| CodecError::Decode(format!("credential map: {e}")))?;
+fn zero_vote_authenticator() -> VoteAuthenticator {
+    VoteAuthenticator {
+        sender: Address([0u8; 32]),
+        cred: UnauthenticatedCredential::new([0u8; VRF_PROOF_SIZE]),
+        sig: zero_ots(),
+    }
+}
 
-    let mut proof = [0u8; VRF_PROOF_SIZE];
+fn zero_equivocation_vote_authenticator() -> EquivocationVoteAuthenticator {
+    EquivocationVoteAuthenticator {
+        sender: Address([0u8; 32]),
+        cred: UnauthenticatedCredential::new([0u8; VRF_PROOF_SIZE]),
+        sigs: [zero_ots(), zero_ots()],
+        proposals: [BOTTOM, BOTTOM],
+    }
+}
 
-    for _ in 0..map_len {
-        let key = read_str_key(cursor)?;
-        match key {
-            "pf" => proof = read_bin_fixed::<VRF_PROOF_SIZE>(cursor)?,
-            _ => return Err(unknown_field(key)),
+/// A struct's map header: `nil` resets the value to `zero` (go
+/// `(*z) = T{}`) and reads as no entries.
+#[inline]
+fn struct_map_len<T>(rd: &mut &[u8], s: &mut T, zero: impl FnOnce() -> T) -> GoResult<u32> {
+    if let [0xc0, rest @ ..] = *rd {
+        *rd = rest;
+        *s = zero();
+        return Ok(0);
+    }
+    // DIVERGENCE DIV-004: only the map form is read; go's struct-from-array
+    // branch (ReadArrayHeaderBytes fallback) is intentionally not supported.
+    go_msgp::read_map_len(rd)
+}
+
+/// `proposalValue` decoded into `pv`.
+fn proposal_value_into(rd: &mut &[u8], pv: &mut ProposalValue) -> GoResult<()> {
+    for _ in 0..struct_map_len(rd, pv, || BOTTOM)? {
+        match go_msgp::read_key_bytes(rd)? {
+            b"dig" => fixed_into(rd, &mut pv.block_digest.0)?,
+            b"encdig" => fixed_into(rd, &mut pv.encoding_digest.0)?,
+            b"oper" => pv.original_period = Period(go_msgp::read_u64(rd)?),
+            b"oprop" => fixed_into(rd, &mut pv.original_proposer.0)?,
+            key => return Err(go_msgp::no_matching_field_error(key)),
         }
     }
+    Ok(())
+}
 
-    Ok(UnauthenticatedCredential::new(proof))
+/// `rawVote` decoded into `rv`.
+fn raw_vote_into(rd: &mut &[u8], rv: &mut RawVote) -> GoResult<()> {
+    for _ in 0..struct_map_len(rd, rv, zero_raw_vote)? {
+        match go_msgp::read_key_bytes(rd)? {
+            b"per" => rv.period = Period(go_msgp::read_u64(rd)?),
+            b"prop" => proposal_value_into(rd, &mut rv.proposal)?,
+            b"rnd" => rv.round = Round(go_msgp::read_u64(rd)?),
+            b"snd" => fixed_into(rd, &mut rv.sender.0)?,
+            b"step" => rv.step = Step(go_msgp::read_u64(rd)?),
+            key => return Err(go_msgp::no_matching_field_error(key)),
+        }
+    }
+    Ok(())
+}
+
+/// `committee.UnauthenticatedCredential` decoded into `c`.
+fn credential_into(rd: &mut &[u8], c: &mut UnauthenticatedCredential) -> GoResult<()> {
+    for _ in 0..struct_map_len(rd, c, || {
+        UnauthenticatedCredential::new([0u8; VRF_PROOF_SIZE])
+    })? {
+        match go_msgp::read_key_bytes(rd)? {
+            b"pf" => fixed_into(rd, &mut c.proof)?,
+            key => return Err(go_msgp::no_matching_field_error(key)),
+        }
+    }
+    Ok(())
+}
+
+/// `crypto.OneTimeSignature` decoded into `sig`.
+fn one_time_signature_into(rd: &mut &[u8], sig: &mut OneTimeSignature) -> GoResult<()> {
+    for _ in 0..struct_map_len(rd, sig, zero_ots)? {
+        match go_msgp::read_key_bytes(rd)? {
+            b"p" => fixed_into(rd, &mut sig.pk)?,
+            b"p1s" => fixed_into(rd, &mut sig.pk1_sig)?,
+            b"p2" => fixed_into(rd, &mut sig.pk2)?,
+            b"p2s" => fixed_into(rd, &mut sig.pk2_sig)?,
+            b"ps" => fixed_into(rd, &mut sig.pk_sig_old)?,
+            b"s" => fixed_into(rd, &mut sig.sig)?,
+            key => return Err(go_msgp::no_matching_field_error(key)),
+        }
+    }
+    Ok(())
+}
+
+/// `unauthenticatedVote` decoded into `vote`.
+fn vote_into(rd: &mut &[u8], vote: &mut UnauthenticatedVote) -> GoResult<()> {
+    for _ in 0..struct_map_len(rd, vote, UnauthenticatedVote::default)? {
+        match go_msgp::read_key_bytes(rd)? {
+            b"cred" => credential_into(rd, &mut vote.cred)?,
+            b"r" => raw_vote_into(rd, &mut vote.raw_vote)?,
+            b"sig" => one_time_signature_into(rd, &mut vote.sig)?,
+            key => return Err(go_msgp::no_matching_field_error(key)),
+        }
+    }
+    Ok(())
+}
+
+/// `voteAuthenticator` decoded into `auth`.
+fn vote_authenticator_into(rd: &mut &[u8], auth: &mut VoteAuthenticator) -> GoResult<()> {
+    for _ in 0..struct_map_len(rd, auth, zero_vote_authenticator)? {
+        match go_msgp::read_key_bytes(rd)? {
+            b"cred" => credential_into(rd, &mut auth.cred)?,
+            b"sig" => one_time_signature_into(rd, &mut auth.sig)?,
+            b"snd" => fixed_into(rd, &mut auth.sender.0)?,
+            key => return Err(go_msgp::no_matching_field_error(key)),
+        }
+    }
+    Ok(())
+}
+
+/// `equivocationVoteAuthenticator` decoded into `auth`; `sig` / `props`
+/// are go `[2]T` arrays (at most two elements, decoded into the leading
+/// ones).
+fn equivocation_vote_authenticator_into(
+    rd: &mut &[u8],
+    auth: &mut EquivocationVoteAuthenticator,
+) -> GoResult<()> {
+    for _ in 0..struct_map_len(rd, auth, zero_equivocation_vote_authenticator)? {
+        match go_msgp::read_key_bytes(rd)? {
+            b"cred" => credential_into(rd, &mut auth.cred)?,
+            b"props" => {
+                go_msgp::read_fixed_array_into(rd, &mut auth.proposals, proposal_value_into)?
+            }
+            b"sig" => go_msgp::read_fixed_array_into(rd, &mut auth.sigs, one_time_signature_into)?,
+            b"snd" => fixed_into(rd, &mut auth.sender.0)?,
+            key => return Err(go_msgp::no_matching_field_error(key)),
+        }
+    }
+    Ok(())
+}
+
+/// `unauthenticatedBundle` decoded into `bundle`.
+fn bundle_into(rd: &mut &[u8], bundle: &mut UnauthenticatedBundle) -> GoResult<()> {
+    for _ in 0..struct_map_len(rd, bundle, UnauthenticatedBundle::default)? {
+        match go_msgp::read_key_bytes(rd)? {
+            b"eqv" => {
+                go_msgp::read_slice_into(
+                    rd,
+                    &mut bundle.equivocation_votes,
+                    MAX_BUNDLE_ARRAY_LEN,
+                    zero_equivocation_vote_authenticator,
+                    equivocation_vote_authenticator_into,
+                )?;
+            }
+            b"per" => bundle.period = Period(go_msgp::read_u64(rd)?),
+            b"prop" => proposal_value_into(rd, &mut bundle.proposal)?,
+            b"rnd" => bundle.round = Round(go_msgp::read_u64(rd)?),
+            b"step" => bundle.step = Step(go_msgp::read_u64(rd)?),
+            b"vote" => {
+                go_msgp::read_slice_into(
+                    rd,
+                    &mut bundle.votes,
+                    MAX_BUNDLE_ARRAY_LEN,
+                    zero_vote_authenticator,
+                    vote_authenticator_into,
+                )?;
+            }
+            key => return Err(go_msgp::no_matching_field_error(key)),
+        }
+    }
+    Ok(())
+}
+
+/// Decode a ProposalValue from cursor position.
+fn decode_proposal_value(cursor: &mut Cursor<&[u8]>) -> Result<ProposalValue, CodecError> {
+    at_cursor(cursor, |rd| {
+        let mut pv = BOTTOM;
+        proposal_value_into(rd, &mut pv)?;
+        Ok(pv)
+    })
+}
+
+/// Decode a RawVote from cursor position.
+fn decode_raw_vote(cursor: &mut Cursor<&[u8]>) -> Result<RawVote, CodecError> {
+    at_cursor(cursor, |rd| {
+        let mut rv = zero_raw_vote();
+        raw_vote_into(rd, &mut rv)?;
+        Ok(rv)
+    })
 }
 
 /// Decode a OneTimeSignature from cursor position.
 fn decode_one_time_signature(cursor: &mut Cursor<&[u8]>) -> Result<OneTimeSignature, CodecError> {
-    let map_len = rmp::decode::read_map_len(cursor)
-        .map_err(|e| CodecError::Decode(format!("OTS map: {e}")))?;
+    at_cursor(cursor, |rd| {
+        let mut sig = zero_ots();
+        one_time_signature_into(rd, &mut sig)?;
+        Ok(sig)
+    })
+}
 
-    let mut sig = OneTimeSignature {
-        sig: [0u8; 64],
-        pk: [0u8; 32],
-        pk_sig_old: [0u8; 64],
-        pk2: [0u8; 32],
-        pk1_sig: [0u8; 64],
-        pk2_sig: [0u8; 64],
-    };
+#[cfg(test)]
+fn decode_unauthenticated_credential(
+    cursor: &mut Cursor<&[u8]>,
+) -> Result<UnauthenticatedCredential, CodecError> {
+    at_cursor(cursor, |rd| {
+        let mut c = UnauthenticatedCredential::new([0u8; VRF_PROOF_SIZE]);
+        credential_into(rd, &mut c)?;
+        Ok(c)
+    })
+}
 
-    for _ in 0..map_len {
-        let key = read_str_key(cursor)?;
-        match key {
-            "p" => sig.pk = read_bin_fixed::<32>(cursor)?,
-            "p1s" => sig.pk1_sig = read_bin_fixed::<64>(cursor)?,
-            "p2" => sig.pk2 = read_bin_fixed::<32>(cursor)?,
-            "p2s" => sig.pk2_sig = read_bin_fixed::<64>(cursor)?,
-            "ps" => sig.pk_sig_old = read_bin_fixed::<64>(cursor)?,
-            "s" => sig.sig = read_bin_fixed::<64>(cursor)?,
-            _ => return Err(unknown_field(key)),
-        }
-    }
-
-    Ok(sig)
+#[cfg(test)]
+fn decode_equivocation_vote_authenticator(
+    cursor: &mut Cursor<&[u8]>,
+) -> Result<EquivocationVoteAuthenticator, CodecError> {
+    at_cursor(cursor, |rd| {
+        let mut a = zero_equivocation_vote_authenticator();
+        equivocation_vote_authenticator_into(rd, &mut a)?;
+        Ok(a)
+    })
 }
 
 /// Decode an UnauthenticatedVote from wire-format msgpack bytes.
 pub fn decode_vote(bytes: &[u8]) -> Result<UnauthenticatedVote, CodecError> {
-    let mut cursor = Cursor::new(bytes);
-    decode_vote_from_cursor(&mut cursor)
-}
-
-/// Decode an UnauthenticatedVote from cursor position.
-fn decode_vote_from_cursor(cursor: &mut Cursor<&[u8]>) -> Result<UnauthenticatedVote, CodecError> {
-    let map_len = rmp::decode::read_map_len(cursor)
-        .map_err(|e| CodecError::Decode(format!("vote map: {e}")))?;
-
+    let _session = go_msgp::decode_session();
     let mut vote = UnauthenticatedVote::default();
-
-    for _ in 0..map_len {
-        let key = read_str_key(cursor)?;
-        match key {
-            "cred" => vote.cred = decode_unauthenticated_credential(cursor)?,
-            "r" => vote.raw_vote = decode_raw_vote(cursor)?,
-            "sig" => vote.sig = decode_one_time_signature(cursor)?,
-            _ => return Err(unknown_field(key)),
-        }
-    }
-
+    vote_into(&mut &bytes[..], &mut vote).map_err(go_err)?;
     Ok(vote)
-}
-
-/// Decode a VoteAuthenticator from cursor position.
-fn decode_vote_authenticator(cursor: &mut Cursor<&[u8]>) -> Result<VoteAuthenticator, CodecError> {
-    let map_len = rmp::decode::read_map_len(cursor)
-        .map_err(|e| CodecError::Decode(format!("vote auth map: {e}")))?;
-
-    let mut sender = Address([0u8; 32]);
-    let mut cred = UnauthenticatedCredential::new([0u8; VRF_PROOF_SIZE]);
-    let mut sig = OneTimeSignature {
-        sig: [0u8; 64],
-        pk: [0u8; 32],
-        pk_sig_old: [0u8; 64],
-        pk2: [0u8; 32],
-        pk1_sig: [0u8; 64],
-        pk2_sig: [0u8; 64],
-    };
-
-    for _ in 0..map_len {
-        let key = read_str_key(cursor)?;
-        match key {
-            "cred" => cred = decode_unauthenticated_credential(cursor)?,
-            "sig" => sig = decode_one_time_signature(cursor)?,
-            "snd" => sender = Address(read_bin_fixed::<32>(cursor)?),
-            _ => return Err(unknown_field(key)),
-        }
-    }
-
-    Ok(VoteAuthenticator { sender, cred, sig })
-}
-
-/// Decode an EquivocationVoteAuthenticator from cursor position.
-fn decode_equivocation_vote_authenticator(
-    cursor: &mut Cursor<&[u8]>,
-) -> Result<EquivocationVoteAuthenticator, CodecError> {
-    let map_len = rmp::decode::read_map_len(cursor)
-        .map_err(|e| CodecError::Decode(format!("equivocation auth map: {e}")))?;
-
-    let mut sender = Address([0u8; 32]);
-    let mut cred = UnauthenticatedCredential::new([0u8; VRF_PROOF_SIZE]);
-    let mut sigs = [
-        OneTimeSignature {
-            sig: [0u8; 64],
-            pk: [0u8; 32],
-            pk_sig_old: [0u8; 64],
-            pk2: [0u8; 32],
-            pk1_sig: [0u8; 64],
-            pk2_sig: [0u8; 64],
-        },
-        OneTimeSignature {
-            sig: [0u8; 64],
-            pk: [0u8; 32],
-            pk_sig_old: [0u8; 64],
-            pk2: [0u8; 32],
-            pk1_sig: [0u8; 64],
-            pk2_sig: [0u8; 64],
-        },
-    ];
-    let mut proposals = [BOTTOM, BOTTOM];
-
-    for _ in 0..map_len {
-        let key = read_str_key(cursor)?;
-        match key {
-            "cred" => cred = decode_unauthenticated_credential(cursor)?,
-            "props" => {
-                let arr_len = rmp::decode::read_array_len(cursor)
-                    .map_err(|e| CodecError::Decode(format!("props array: {e}")))?;
-                if arr_len != 2 {
-                    return Err(CodecError::Format(format!(
-                        "expected 2 proposals, got {arr_len}"
-                    )));
-                }
-                proposals[0] = decode_proposal_value(cursor)?;
-                proposals[1] = decode_proposal_value(cursor)?;
-            }
-            "sig" => {
-                let arr_len = rmp::decode::read_array_len(cursor)
-                    .map_err(|e| CodecError::Decode(format!("sig array: {e}")))?;
-                if arr_len != 2 {
-                    return Err(CodecError::Format(format!(
-                        "expected 2 signatures, got {arr_len}"
-                    )));
-                }
-                sigs[0] = decode_one_time_signature(cursor)?;
-                sigs[1] = decode_one_time_signature(cursor)?;
-            }
-            "snd" => sender = Address(read_bin_fixed::<32>(cursor)?),
-            _ => return Err(unknown_field(key)),
-        }
-    }
-
-    Ok(EquivocationVoteAuthenticator {
-        sender,
-        cred,
-        sigs,
-        proposals,
-    })
 }
 
 /// Decode an UnauthenticatedBundle from wire-format msgpack bytes.
 pub fn decode_bundle(bytes: &[u8]) -> Result<UnauthenticatedBundle, CodecError> {
-    // Go uses allocbound=bounds.MaxVoteThreshold which is typically 10_000.
-    const MAX_BUNDLE_ARRAY_LEN: u32 = 10_000;
-
-    let mut cursor = Cursor::new(bytes);
-    let map_len = rmp::decode::read_map_len(&mut cursor)
-        .map_err(|e| CodecError::Decode(format!("bundle map: {e}")))?;
-
+    let _session = go_msgp::decode_session();
     let mut bundle = UnauthenticatedBundle::default();
-
-    for _ in 0..map_len {
-        let key = read_str_key(&mut cursor)?;
-        match key {
-            "eqv" => {
-                let arr_len = rmp::decode::read_array_len(&mut cursor)
-                    .map_err(|e| CodecError::Decode(format!("eqv array: {e}")))?;
-                if arr_len > MAX_BUNDLE_ARRAY_LEN {
-                    return Err(CodecError::Format(format!(
-                        "eqv array length {} exceeds maximum {}",
-                        arr_len, MAX_BUNDLE_ARRAY_LEN
-                    )));
-                }
-                let mut evs = Vec::with_capacity(arr_len as usize);
-                for _ in 0..arr_len {
-                    evs.push(decode_equivocation_vote_authenticator(&mut cursor)?);
-                }
-                bundle.equivocation_votes = evs;
-            }
-            "per" => bundle.period = Period(read_uint64(&mut cursor)?),
-            "prop" => bundle.proposal = decode_proposal_value(&mut cursor)?,
-            "rnd" => bundle.round = Round(read_uint64(&mut cursor)?),
-            "step" => bundle.step = Step(read_uint64(&mut cursor)?),
-            "vote" => {
-                let arr_len = rmp::decode::read_array_len(&mut cursor)
-                    .map_err(|e| CodecError::Decode(format!("vote array: {e}")))?;
-                if arr_len > MAX_BUNDLE_ARRAY_LEN {
-                    return Err(CodecError::Format(format!(
-                        "vote array length {} exceeds maximum {}",
-                        arr_len, MAX_BUNDLE_ARRAY_LEN
-                    )));
-                }
-                let mut vs = Vec::with_capacity(arr_len as usize);
-                for _ in 0..arr_len {
-                    vs.push(decode_vote_authenticator(&mut cursor)?);
-                }
-                bundle.votes = vs;
-            }
-            _ => return Err(unknown_field(key)),
-        }
-    }
-
+    bundle_into(&mut &bytes[..], &mut bundle).map_err(go_err)?;
     Ok(bundle)
 }
 
@@ -1786,55 +1802,11 @@ pub fn decode_authenticated_bundle(bytes: &[u8]) -> Result<AuthenticatedBundle, 
 fn decode_unauthenticated_bundle_from_cursor(
     cursor: &mut Cursor<&[u8]>,
 ) -> Result<UnauthenticatedBundle, CodecError> {
-    const MAX_BUNDLE_ARRAY_LEN: u32 = 10_000;
-
-    let map_len = rmp::decode::read_map_len(cursor)
-        .map_err(|e| CodecError::Decode(format!("unauth bundle map: {e}")))?;
-
-    let mut bundle = UnauthenticatedBundle::default();
-
-    for _ in 0..map_len {
-        let key = read_str_key(cursor)?;
-        match key {
-            "eqv" => {
-                let arr_len = rmp::decode::read_array_len(cursor)
-                    .map_err(|e| CodecError::Decode(format!("eqv array: {e}")))?;
-                if arr_len > MAX_BUNDLE_ARRAY_LEN {
-                    return Err(CodecError::Format(format!(
-                        "eqv array length {} exceeds maximum {}",
-                        arr_len, MAX_BUNDLE_ARRAY_LEN
-                    )));
-                }
-                let mut evs = Vec::with_capacity(arr_len as usize);
-                for _ in 0..arr_len {
-                    evs.push(decode_equivocation_vote_authenticator(cursor)?);
-                }
-                bundle.equivocation_votes = evs;
-            }
-            "per" => bundle.period = Period(read_uint64(cursor)?),
-            "prop" => bundle.proposal = decode_proposal_value(cursor)?,
-            "rnd" => bundle.round = Round(read_uint64(cursor)?),
-            "step" => bundle.step = Step(read_uint64(cursor)?),
-            "vote" => {
-                let arr_len = rmp::decode::read_array_len(cursor)
-                    .map_err(|e| CodecError::Decode(format!("vote array: {e}")))?;
-                if arr_len > MAX_BUNDLE_ARRAY_LEN {
-                    return Err(CodecError::Format(format!(
-                        "vote array length {} exceeds maximum {}",
-                        arr_len, MAX_BUNDLE_ARRAY_LEN
-                    )));
-                }
-                let mut vs = Vec::with_capacity(arr_len as usize);
-                for _ in 0..arr_len {
-                    vs.push(decode_vote_authenticator(cursor)?);
-                }
-                bundle.votes = vs;
-            }
-            _ => return Err(unknown_field(key)),
-        }
-    }
-
-    Ok(bundle)
+    at_cursor(cursor, |rd| {
+        let mut bundle = UnauthenticatedBundle::default();
+        bundle_into(rd, &mut bundle)?;
+        Ok(bundle)
+    })
 }
 
 // ── UnauthenticatedProposal wire codec ───────────────────────────────────
@@ -1872,6 +1844,7 @@ pub fn encode_unauthenticated_proposal(p: &UnauthenticatedProposal) -> Vec<u8> {
 pub fn decode_unauthenticated_proposal(
     bytes: &[u8],
 ) -> Result<UnauthenticatedProposal, CodecError> {
+    let _session = go_msgp::decode_session();
     // Step 1: decode block fields (skips unknown keys).
     //
     // `Block::decode_from_bytes` requires `rnd` to be present, but
@@ -1880,36 +1853,13 @@ pub fn decode_unauthenticated_proposal(
     // block decoder can complete — round stays Round(0) either way.
     let block = decode_block_allowing_missing_rnd(bytes, &[b"oper", b"oprop", b"sdpf"])?;
 
-    // Step 2: scan the map to extract proposal-specific fields.
-    let mut cursor = Cursor::new(bytes);
-    let map_len = rmp::decode::read_map_len(&mut cursor)
-        .map_err(|e| CodecError::Decode(format!("uproposal map: {e}")))?;
-
-    let mut original_period = Period(0);
-    let mut original_proposer = Address([0u8; 32]);
-    let mut seed_proof = [0u8; VRF_PROOF_SIZE];
-
-    for _ in 0..map_len {
-        let key = read_str_key(&mut cursor)?;
-        match key {
-            "oper" => original_period = Period(read_uint64(&mut cursor)?),
-            "oprop" => original_proposer = Address(read_bin_fixed::<32>(&mut cursor)?),
-            "sdpf" => seed_proof = read_bin_fixed::<VRF_PROOF_SIZE>(&mut cursor)?,
-            _ => {
-                // A block field: the strict block decode above already
-                // rejected every key go's `unauthenticatedProposal` lacks.
-                skip_value(&mut cursor)?;
-            }
-        }
-    }
-
-    Ok(UnauthenticatedProposal {
+    // Step 2: the proposal's own fields.
+    let mut proposal = UnauthenticatedProposal {
         block,
-        seed_proof,
-        original_period,
-        original_proposer,
         ..UnauthenticatedProposal::default()
-    })
+    };
+    proposal_fields_into(&mut &bytes[..], &mut proposal, None).map_err(go_err)?;
+    Ok(proposal)
 }
 
 /// Run `Block::decode_from_bytes`, with a fallback that synthesizes
@@ -2823,25 +2773,6 @@ mod skip_tests {
                 );
             }
             (None, None) => {}
-        }
-        // `skip_value` always agrees with rmpv, whichever path it took.
-        let mut c = Cursor::new(buf);
-        let skipped = skip_value(&mut c);
-        match reference(buf) {
-            Some((_, consumed)) => {
-                skipped.expect("skip_value accepts what rmpv accepts");
-                assert_eq!(c.position() as usize, consumed);
-            }
-            None => {
-                let mut r = Cursor::new(buf);
-                let want = rmpv::decode::read_value(&mut r).unwrap_err();
-                let want = CodecError::Decode(format!("skip field: {want}"));
-                assert_eq!(
-                    format!("{:?}", skipped.unwrap_err()),
-                    format!("{want:?}"),
-                    "error for {buf:02x?}"
-                );
-            }
         }
     }
 

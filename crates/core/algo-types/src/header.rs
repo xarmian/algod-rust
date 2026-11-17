@@ -295,117 +295,156 @@ impl Default for BlockHeader {
 /// Type alias for decoder methods to avoid shadowing serde's Result usage.
 type DecodeResult<T> = algo_error::Result<T>;
 
+/// `bounds.MaxProposedExpiredOnlineAccounts` (32 since v31): go's
+/// `allocbound` of `partupdrmv`.
+pub(crate) const MAX_PROPOSED_EXPIRED_ONLINE_ACCOUNTS: usize = 32;
+/// `bounds.MaxMarkAbsent` (`Payouts.MaxMarkAbsent`, 32): `partupdabs`.
+pub(crate) const MAX_MARK_ABSENT: usize = 32;
+
+/// A `basics.Address` slice element, read with `ReadExactBytes` into the
+/// element already there.
+pub(crate) fn read_address_elem_into(rd: &mut &[u8], e: &mut Address) -> DecodeResult<()> {
+    rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut e.0)
+}
+
+/// The key dispatch of a `bookkeeping.BlockHeader` field into `$h` (a
+/// `BlockHeader` or a `Block`, which carry the same header fields), shared
+/// by both readers. Every field is decoded INTO its current value, as go's
+/// generated `UnmarshalMsg` does (issue #2424). `$extra` arms come first,
+/// `$fallback` arms last.
+macro_rules! header_key_match {
+    ($h:ident, $key:ident, $rd:ident, { $($extra:tt)* }, { $($fallback:tt)* }) => {
+        match ($key.len(), $key.first().copied().unwrap_or(0)) {
+            $($extra)*
+            // ── 2-byte keys ──────────────────────────────────
+            (2, b'b') if $key == b"bi" => $h.bonus = rmp_decode::read_u64($rd)?,
+            (2, b'c') if $key == b"ct" => $h.congestion_tax = rmp_decode::read_u64($rd)?,
+            (2, b'f') if $key == b"fc" => $h.fees_collected = rmp_decode::read_u64($rd)?,
+            (2, b'g') if $key == b"gh" => {
+                rmp_decode::read_fixed_bytes_into_go_compat($rd, &mut $h.genesis_hash)?
+            }
+            (2, b'l') if $key == b"ld" => $h.load = rmp_decode::read_u64($rd)?,
+            (2, b'p') if $key == b"pp" => $h.proposer_payout = rmp_decode::read_u64($rd)?,
+            (2, b't') if $key == b"tc" => $h.txn_counter = rmp_decode::read_u64($rd)?,
+            (2, b't') if $key == b"ts" => $h.timestamp = rmp_decode::read_i64($rd)?,
+            // ── 3-byte keys ──────────────────────────────────
+            (3, b'g') if $key == b"gen" => $h.genesis_id = rmp_decode::read_string($rd)?,
+            (3, b'p') if $key == b"prp" => {
+                rmp_decode::read_fixed_bytes_into_go_compat($rd, &mut $h.proposer.0)?
+            }
+            // Canonically/omitempty-encoded blocks omit "rnd" entirely at
+            // round 0 (the genesis block): the zero value is the default.
+            (3, b'r') if $key == b"rnd" => $h.round = Round(rmp_decode::read_u64($rd)?),
+            (3, b'r') if $key == b"rwd" => {
+                rmp_decode::read_fixed_bytes_into_go_compat($rd, &mut $h.rewards_pool.0)?
+            }
+            // go's map, decoded and re-encoded the way go does (issue #2424)
+            (3, b's') if $key == b"spt" => crate::go_eval_delta::read_state_proof_tracking_into(
+                $rd,
+                &mut $h.state_proof_tracking,
+            )?,
+            (3, b't') if $key == b"txn" => {
+                rmp_decode::read_fixed_bytes_into_go_compat($rd, &mut $h.txn_commitment)?
+            }
+            // ── 4-byte keys ──────────────────────────────────
+            (4, b'e') if $key == b"earn" => $h.rewards_level = rmp_decode::read_u64($rd)?,
+            (4, b'f') if $key == b"fees" => {
+                rmp_decode::read_fixed_bytes_into_go_compat($rd, &mut $h.fee_sink.0)?
+            }
+            (4, b'f') if $key == b"frac" => $h.rewards_residue = rmp_decode::read_u64($rd)?,
+            (4, b'p') if $key == b"prev" => {
+                rmp_decode::read_fixed_bytes_into_go_compat($rd, &mut $h.branch)?
+            }
+            (4, b'r') if $key == b"rate" => $h.rewards_rate = rmp_decode::read_u64($rd)?,
+            (4, b's') if $key == b"seed" => {
+                rmp_decode::read_fixed_bytes_into_go_compat($rd, &mut $h.seed)?
+            }
+            // ── 5-byte keys ──────────────────────────────────
+            (5, b'p') if $key == b"proto" => {
+                $h.current_protocol = rmp_decode::read_string($rd)?
+            }
+            // ── 6-byte keys ──────────────────────────────────
+            (6, b'r') if $key == b"rwcalr" => {
+                $h.rewards_recalculation_round = Round(rmp_decode::read_u64($rd)?)
+            }
+            (6, b't') if $key == b"txn256" => {
+                rmp_decode::read_fixed_bytes_into_go_compat($rd, &mut $h.txn256)?
+            }
+            (6, b't') if $key == b"txn512" => {
+                rmp_decode::read_fixed_bytes_into_go_compat($rd, &mut $h.txn512)?
+            }
+            // ── 7-byte keys ──────────────────────────────────
+            (7, b'n') if $key == b"nextyes" => {
+                $h.next_protocol_approvals = rmp_decode::read_u64($rd)?
+            }
+            (7, b'p') if $key == b"prev512" => {
+                rmp_decode::read_fixed_bytes_into_go_compat($rd, &mut $h.prev512)?
+            }
+            // ── 9-byte keys ──────────────────────────────────
+            (9, b'n') if $key == b"nextproto" => {
+                $h.next_protocol = rmp_decode::read_string($rd)?
+            }
+            // ── 10-byte keys ─────────────────────────────────
+            (10, b'n') if $key == b"nextswitch" => {
+                $h.next_protocol_switch_on = Round(rmp_decode::read_u64($rd)?)
+            }
+            (10, b'n') if $key == b"nextbefore" => {
+                $h.next_protocol_vote_before = Round(rmp_decode::read_u64($rd)?)
+            }
+            (10, b'p') if $key == b"partupdrmv" => rmp_decode::read_slice_into_opt(
+                $rd,
+                &mut $h.expired_participation_accounts,
+                $crate::header::MAX_PROPOSED_EXPIRED_ONLINE_ACCOUNTS,
+                Address::default,
+                $crate::header::read_address_elem_into,
+            )?,
+            (10, b'p') if $key == b"partupdabs" => rmp_decode::read_slice_into_opt(
+                $rd,
+                &mut $h.absent_participation_accounts,
+                $crate::header::MAX_MARK_ABSENT,
+                Address::default,
+                $crate::header::read_address_elem_into,
+            )?,
+            // ── upgrade* keys ────────────────────────────────
+            (11, b'u') if $key == b"upgradeprop" => {
+                $h.upgrade_propose = rmp_decode::read_string($rd)?
+            }
+            (12, b'u') if $key == b"upgradedelay" => {
+                $h.upgrade_delay = rmp_decode::read_u64($rd)?
+            }
+            (10, b'u') if $key == b"upgradeyes" => {
+                $h.upgrade_approve = rmp_decode::read_bool($rd)?
+            }
+            $($fallback)*
+        }
+    };
+}
+pub(crate) use header_key_match;
+
 impl BlockHeader {
     /// Decode a BlockHeader from a msgpack map using raw rmp.
     ///
     /// Uses two-level key dispatch: (key_len, first_byte) for fast routing.
     pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
+        let _session = rmp_decode::decode_session();
         let mut h = Self::default();
+        Self::decode_into(rd, &mut h)?;
+        Ok(h)
+    }
+
+    /// Decode into an already decoded header (issue #2424). A missing `rnd`
+    /// means round 0: go-algorand's msgpack omits zero-valued fields, and the
+    /// **genesis block** is the one header that carries round 0.
+    pub(crate) fn decode_into(rd: &mut &[u8], h: &mut Self) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, h)?;
         for _ in 0..len {
             let key = rmp_decode::read_key_bytes(rd)?;
-            match (key.len(), key.first().copied().unwrap_or(0)) {
-                // ── 2-byte keys ──────────────────────────────────
-                (2, b'b') if key == b"bi" => h.bonus = rmp_decode::read_u64(rd)?,
-                (2, b'c') if key == b"ct" => h.congestion_tax = rmp_decode::read_u64(rd)?,
-                (2, b'f') if key == b"fc" => h.fees_collected = rmp_decode::read_u64(rd)?,
-                (2, b'g') if key == b"gh" => {
-                    h.genesis_hash = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
-                }
-                (2, b'l') if key == b"ld" => h.load = rmp_decode::read_u64(rd)?,
-                (2, b'p') if key == b"pp" => h.proposer_payout = rmp_decode::read_u64(rd)?,
-                (2, b't') => match key {
-                    b"tc" => h.txn_counter = rmp_decode::read_u64(rd)?,
-                    b"ts" => h.timestamp = rmp_decode::read_i64(rd)?,
-                    _ => rmp_decode::unknown_key(rd, key)?,
-                },
-                // ── 3-byte keys ──────────────────────────────────
-                (3, b'g') if key == b"gen" => h.genesis_id = rmp_decode::read_string(rd)?,
-                (3, b'p') if key == b"prp" => h.proposer = rmp_decode::read_address_go_compat(rd)?,
-                (3, b'r') => match key {
-                    b"rnd" => {
-                        h.round = Round(rmp_decode::read_u64(rd)?);
-                    }
-                    b"rwd" => h.rewards_pool = rmp_decode::read_address_go_compat(rd)?,
-                    _ => rmp_decode::unknown_key(rd, key)?,
-                },
-                (3, b's') if key == b"spt" => {
-                    h.state_proof_tracking = rmp_decode::read_checked_optional_rmpv(
-                        rd,
-                        &crate::msgp_schema::STATE_PROOF_TRACKING,
-                    )?
-                }
-                (3, b't') if key == b"txn" => {
-                    h.txn_commitment = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
-                }
-                // ── 4-byte keys ──────────────────────────────────
-                (4, b'e') if key == b"earn" => h.rewards_level = rmp_decode::read_u64(rd)?,
-                (4, b'f') => match key {
-                    b"fees" => h.fee_sink = rmp_decode::read_address_go_compat(rd)?,
-                    b"frac" => h.rewards_residue = rmp_decode::read_u64(rd)?,
-                    _ => rmp_decode::unknown_key(rd, key)?,
-                },
-                (4, b'p') if key == b"prev" => {
-                    h.branch = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
-                }
-                (4, b'r') if key == b"rate" => h.rewards_rate = rmp_decode::read_u64(rd)?,
-                (4, b's') if key == b"seed" => {
-                    h.seed = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
-                }
-                // ── 5-byte keys ──────────────────────────────────
-                (5, b'p') if key == b"proto" => h.current_protocol = rmp_decode::read_string(rd)?,
-                // ── 6-byte keys ──────────────────────────────────
-                (6, b'r') if key == b"rwcalr" => {
-                    h.rewards_recalculation_round = Round(rmp_decode::read_u64(rd)?)
-                }
-                (6, b't') => match key {
-                    b"txn256" => h.txn256 = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?,
-                    b"txn512" => h.txn512 = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?,
-                    _ => rmp_decode::unknown_key(rd, key)?,
-                },
-                // ── 7-byte keys ──────────────────────────────────
-                (7, b'n') if key == b"nextyes" => {
-                    h.next_protocol_approvals = rmp_decode::read_u64(rd)?
-                }
-                (7, b'p') if key == b"prev512" => {
-                    h.prev512 = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?
-                }
-                // ── 9-byte keys ──────────────────────────────────
-                (9, b'n') if key == b"nextproto" => h.next_protocol = rmp_decode::read_string(rd)?,
-                // ── 10-byte keys ─────────────────────────────────
-                (10, b'n') => match key {
-                    b"nextswitch" => h.next_protocol_switch_on = Round(rmp_decode::read_u64(rd)?),
-                    b"nextbefore" => h.next_protocol_vote_before = Round(rmp_decode::read_u64(rd)?),
-                    _ => rmp_decode::unknown_key(rd, key)?,
-                },
-                (10, b'p') => match key {
-                    b"partupdrmv" => {
-                        h.expired_participation_accounts =
-                            rmp_decode::read_optional_vec(rd, rmp_decode::read_address_go_compat)?
-                    }
-                    b"partupdabs" => {
-                        h.absent_participation_accounts =
-                            rmp_decode::read_optional_vec(rd, rmp_decode::read_address_go_compat)?
-                    }
-                    _ => rmp_decode::unknown_key(rd, key)?,
-                },
-                // ── upgrade* keys ────────────────────────────────
-                (_, b'u') => match key {
-                    b"upgradeprop" => h.upgrade_propose = rmp_decode::read_string(rd)?,
-                    b"upgradedelay" => h.upgrade_delay = rmp_decode::read_u64(rd)?,
-                    b"upgradeyes" => h.upgrade_approve = rmp_decode::read_bool(rd)?,
-                    _ => rmp_decode::unknown_key(rd, key)?,
-                },
+            header_key_match!(h, key, rd, {}, {
                 // go's msgp decoder: msgp.ErrNoField (issue #2394)
                 _ => rmp_decode::unknown_key(rd, key)?,
-            }
+            });
         }
-        // A missing `rnd` means round 0: go-algorand's msgpack omits zero-valued
-        // fields, and the **genesis block** is the one header that carries round
-        // 0 (so `rnd` is absent). `h.round` is already the `Round::default()` of
-        // 0, so we accept it rather than erroring — non-genesis blocks all have
-        // round > 0 and therefore always include `rnd`.
-        Ok(h)
+        Ok(())
     }
 
     /// Decode a BlockHeader from msgpack bytes.

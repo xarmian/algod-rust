@@ -56,8 +56,8 @@ with its own seeds.jsonl / cases.jsonl in the crate whose test replays it:
              libp2p peer meta headers (network/p2pMetainfo.go)
 
 In the non-consensus sets a transplant only inserts a key the destination map
-does not already have. Repeated keys have their own cases (issue #2421), after
-the transplants: a key the map already has, again, with a value
+does not already have. Repeated keys have their own cases (issues #2421,
+#2424), after the transplants: a key the map already has, again, with a value
 derived from its first one (a map with fewer entries or none, a shorter array
 whose elements have fewer entries, a shorter byte string, nil) or another map's
 value under the same key. go decodes a repeated key *into* the already decoded
@@ -67,10 +67,10 @@ the old capacity allows it (else it is a fresh slice), a `[N]byte` keeps the
 bytes past a shorter value, nil clears. So every accepted case also carries
 `go_val`, the sha256 prefix of go's re-encode of the decoded value, and the
 ledger / network / p2p replaying tests compare it with algod-rust's decoded
-value, re-encoded. Repeated-key cases are generated only for a set's
-`repeat_kinds`: not yet for the consensus kinds and `txsync`, whose
-`SignedTxn` / block / vote readers still replace a repeated field (DIV-004,
-issue #2424).
+value, re-encoded. Repeated-key cases are generated for a set's
+`repeat_kinds`: every kind since issue #2424 (the consensus readers and the
+tx-sync reader merge a repeated key like go), and the consensus set's
+algo-agreement test compares decoded values too.
 """
 import argparse
 import hashlib
@@ -674,8 +674,21 @@ SETS = {
         "fuzz_xor": 0x2394,
         "pinned": PINNED,
         "fresh": False,
-        # the consensus readers do not merge a repeated key yet (DIV-004, #2424)
-        "repeat_kinds": set(),
+        # issue #2424: the consensus readers merge a repeated key like go
+        "repeat_kinds": {
+            "payload",
+            "vote",
+            "bundle",
+            "cert",
+            "blockcert",
+            "block",
+            "header",
+            "stxn",
+            "stxninblock",
+            "txn",
+            "applydata",
+            "evaldelta",
+        },
     },
     "ledger": {
         "dir": fixture_dir("core", "algo-ledger"),
@@ -697,8 +710,7 @@ SETS = {
         "fuzz_xor": 23962,
         "pinned": (),
         "fresh": True,
-        # txsync goes through the consensus SignedTxn reader (DIV-004, #2424)
-        "repeat_kinds": {"idchal", "idresp", "idverify"},
+        "repeat_kinds": {"idchal", "idresp", "idverify", "txsync"},
     },
     "p2p": {
         "dir": fixture_dir("node", "algo-p2p"),

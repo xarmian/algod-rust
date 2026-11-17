@@ -86,7 +86,7 @@ jobs:
           cargo test -p algo-agreement --test strict_unknown_fields_go_parity rust_decoders_match_go
           cargo test -p algo-ledger -p algo-network -p algo-p2p --test strict_unknown_fields_go_parity
 
-      - name: Differential fuzz against go (about 60k + 18k non-consensus mutants)
+      - name: Differential fuzz against go (about 160k consensus + 40k non-consensus mutants)
         run: |
           set -euo pipefail
           python3 scripts/strict-decode/strict_decode_fixtures.py --fuzz 100000 "$RUNNER_TEMP/fuzz.jsonl" \

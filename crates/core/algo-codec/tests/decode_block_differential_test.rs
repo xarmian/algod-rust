@@ -35,13 +35,14 @@
 //! | D transaction without `type` | accepts | rejects at decode | decodes, fails later |
 //! | E nil where an integer, boolean or struct belongs | rejects ("unit value") | zero value | zero value (DIV-004, #2065) |
 //! | F `[N]byte` field of another length | rejects ("expected N bytes") | `ReadExactBytes`: copies `min(len, N)` bytes | same (`docs/BYTES_DECODE_PARITY.md`) |
-//! | G a repeated key | rejects (`duplicate field`) | last value wins (DIV-004) | decodes into the populated field |
+//! | G a repeated key | rejects (`duplicate field`) | decodes into the populated field (#2424) | decodes into the populated field |
 //! | H a key the struct lacks (a substitution renames a key) | ignores it | rejects (issue #2394) | rejects (`msgp.ErrNoField`) |
 //! | I a wrong-typed key or value (an integer for a map, an empty map for an integer) in `state_proof_tracking`, the one field serde keeps opaque and the hand reader types (#2394) | accepts | rejects | rejects (`ReadUint64Bytes` `TypeError`) |
 //! | H a key the struct lacks (a substitution renames a key) | ignores it | rejects (issue #2394) | rejects (`msgp.ErrNoField`) |
 //! | I a wrong-typed key or value (an integer for a map, an empty map for an integer) in `state_proof_tracking`, the one field serde keeps opaque and the hand reader types (#2394) | accepts | rejects | rejects (`ReadUint64Bytes` `TypeError`) |
 //! | J a non-UTF-8 byte in a go `string` field value (`gen`, `proto`, `nextproto`, `upgradeprop`, txn `type`; a substitution of a string's marker or content) | rejects (`Utf8Error`) | keeps the bytes losslessly (#2397) | keeps the bytes (`ReadStringBytes`) |
 //! | K a `bin` or uint8 array where a go `string` field value belongs (a substitution of the string's marker) | rejects ("invalid type ... expected a string") | reads its bytes (#2421) | reads its bytes (`ReadStringZC` falls back to go-codec's `readBytesBytes`) |
+//! | L a fixmap where a slice belongs (a substitution of the array marker) | rejects ("invalid type: map, expected a sequence") | reads it as the interleaved key/value array (#2424) | same (`msgp.ReadArrayHeaderBytes`, go-codec compat) |
 //!
 //! G cannot arise from the single-byte substitutions below and is pinned by
 //! `a_repeated_key_is_accepted_by_the_hand_reader_only`.
@@ -107,6 +108,7 @@ struct Tally {
     class_i: usize,
     class_j: usize,
     class_k: usize,
+    class_l: usize,
 }
 
 /// Compare the two decoders on `bytes` (mutated at `at`, or `usize::MAX`).
@@ -165,8 +167,13 @@ fn compare(label: &str, bytes: &[u8], at: usize, t: &mut Tally) {
                 && msg.contains("expected a string")
             {
                 t.class_k += 1;
+            } else if at != usize::MAX
+                && matches!(bytes[at], 0x80..=0x8f)
+                && msg.contains("expected a sequence")
+            {
+                t.class_l += 1;
             } else {
-                panic!("{label}: the hand reader accepts, serde rejects, outside classes E, F, J and K: {msg}");
+                panic!("{label}: the hand reader accepts, serde rejects, outside classes E, F, J, K and L: {msg}");
             }
         }
     }
@@ -315,7 +322,8 @@ fn the_depth_bound_is_unchanged() {
     }
 }
 
-/// Class G.
+/// Class G: a scalar repeat is last-wins, a `[N]byte` repeat keeps the bytes
+/// past a shorter value (go's `ReadExactBytes` into the populated field).
 #[test]
 fn a_repeated_key_is_accepted_by_the_hand_reader_only() {
     // {"rnd": 1, "rnd": 2}
@@ -324,6 +332,14 @@ fn a_repeated_key_is_accepted_by_the_hand_reader_only() {
     ];
     assert!(decode_block_serde(&dup).is_err());
     assert_eq!(decode_block(&dup).unwrap().round, algo_types::Round(2));
+    // {"seed": 32 x 0x11, "seed": [0xaa]}
+    let mut dup = vec![0x82, 0xa4, b's', b'e', b'e', b'd', 0xc4, 32];
+    dup.extend([0x11; 32]);
+    dup.extend([0xa4, b's', b'e', b'e', b'd', 0xc4, 1, 0xaa]);
+    assert!(decode_block_serde(&dup).is_err());
+    let mut want = [0x11; 32];
+    want[0] = 0xaa;
+    assert_eq!(decode_block(&dup).unwrap().seed, want);
 }
 
 /// Every block of the committed real-chain corpora and every go-captured block
