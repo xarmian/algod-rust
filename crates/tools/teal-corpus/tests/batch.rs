@@ -184,3 +184,49 @@ fn hung_workers_beyond_the_limit_stop_the_batch_with_recorded_row_errors() {
     assert_eq!(ran.load(Ordering::SeqCst), 2, "no further hung worker");
     assert!(teal_corpus::has_robustness_failure(&rows));
 }
+
+// #2411: workers claim their own inputs and the supervisor only wakes at the
+// running input's deadline, so the timeout must be per input (measured from
+// that input's start), never per batch or per worker.
+#[test]
+fn the_timeout_is_per_input_even_when_the_batch_runs_longer_than_it() {
+    let mut inputs: Vec<Input> = (0..12).map(|n| input(&format!("s{n:02}"))).collect();
+    inputs.push(input("zz-hang"));
+    let started = std::time::Instant::now();
+    let rows = run_batch(inputs, 1, Duration::from_millis(150), |i| {
+        if i.sha256 == "zz-hang" {
+            std::thread::sleep(Duration::from_secs(30));
+        } else {
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        ok_row(i)
+    });
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(rows.len(), 13);
+    assert!(
+        rows[..12].iter().all(|r| r.ok),
+        "12 x 40 ms inputs under a 150 ms per-input budget all finish"
+    );
+    assert_eq!(rows[12].timeout, Some(true));
+}
+
+// #2411: a panicking input does not cost the worker: the next inputs run on
+// the same thread (one worker per job, no respawn).
+#[test]
+fn a_panic_keeps_the_worker() {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    let ids = Arc::new(Mutex::new(HashSet::new()));
+    let ids2 = Arc::clone(&ids);
+    let inputs = vec![input("a"), input("b-boom"), input("c"), input("d")];
+    let rows = run_batch(inputs, 1, Duration::from_secs(5), move |i| {
+        ids2.lock().unwrap().insert(std::thread::current().id());
+        if i.sha256 == "b-boom" {
+            panic!("kaboom");
+        }
+        ok_row(i)
+    });
+    assert_eq!(rows.iter().filter(|r| r.ok).count(), 3);
+    assert_eq!(rows[1].panic.as_deref(), Some("kaboom"));
+    assert_eq!(ids.lock().unwrap().len(), 1);
+}

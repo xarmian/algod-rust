@@ -48,8 +48,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde::Serialize;
@@ -282,39 +282,109 @@ impl Default for BatchOptions {
     }
 }
 
-type Outcome = Result<Row, String>;
 type Handles = Vec<std::thread::JoinHandle<()>>;
 
-/// A long-lived worker thread that runs inputs one at a time.
+/// What a job's supervisor sees of its worker.
+#[derive(Default)]
+struct SlotState {
+    /// The input index the worker is running and when it started it.
+    current: Option<(usize, Instant)>,
+    /// Set by the supervisor when `current` overran its timeout: the worker
+    /// drops that input's row and exits.
+    abandoned: bool,
+    /// Set by the worker as it exits, however it exits.
+    exited: bool,
+}
+
+/// The state one worker shares with its supervisor.
+#[derive(Default)]
+struct Slot {
+    state: Mutex<SlotState>,
+    /// Signalled only when the worker exits (never per input).
+    exited: Condvar,
+}
+
+impl Slot {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SlotState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Everything a worker thread needs; workers may outlive the batch (hung past
+/// their timeout), so it is shared, not borrowed.
+struct Shared<F> {
+    f: F,
+    inputs: Vec<Input>,
+    next: AtomicUsize,
+    results: Mutex<Vec<Row>>,
+}
+
+impl<F> Shared<F> {
+    /// The next unclaimed input index, if any.
+    fn claim(&self) -> Option<usize> {
+        let i = self.next.fetch_add(1, Ordering::Relaxed);
+        (i < self.inputs.len()).then_some(i)
+    }
+
+    fn push(&self, row: Row) {
+        self.results
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(row);
+    }
+}
+
+/// Marks the slot exited and wakes the supervisor when the worker returns or
+/// unwinds.
+struct ExitGuard(Arc<Slot>);
+
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        self.0.lock().exited = true;
+        self.0.exited.notify_all();
+    }
+}
+
+/// A long-lived worker thread: it runs `first`, then claims inputs itself
+/// until none are left, so there is no thread hand-off per input.
 struct Worker {
-    input_tx: mpsc::Sender<Arc<Input>>,
-    result_rx: mpsc::Receiver<Outcome>,
+    slot: Arc<Slot>,
     handle: std::thread::JoinHandle<()>,
 }
 
-fn spawn_worker<F>(f: &Arc<F>, stack_bytes: usize) -> io::Result<Worker>
+fn spawn_worker<F>(shared: &Arc<Shared<F>>, first: usize, stack_bytes: usize) -> io::Result<Worker>
 where
     F: Fn(&Input) -> Row + Send + Sync + 'static,
 {
-    let (input_tx, input_rx) = mpsc::channel::<Arc<Input>>();
-    let (result_tx, result_rx) = mpsc::channel::<Outcome>();
-    let f = Arc::clone(f);
+    let slot = Arc::new(Slot::default());
+    let worker_slot = Arc::clone(&slot);
+    let shared = Arc::clone(shared);
     let handle = std::thread::Builder::new()
         .stack_size(stack_bytes)
         .spawn(move || {
-            while let Ok(input) = input_rx.recv() {
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&input)));
-                // The runner gave up on this input (timeout): exit.
-                if result_tx.send(r.map_err(|p| panic_message(&*p))).is_err() {
-                    break;
+            let _exit = ExitGuard(Arc::clone(&worker_slot));
+            let mut next = Some(first);
+            while let Some(i) = next {
+                worker_slot.lock().current = Some((i, Instant::now()));
+                let input = &shared.inputs[i];
+                let r =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (shared.f)(input)));
+                {
+                    let mut st = worker_slot.lock();
+                    // The supervisor gave up on this input (timeout): exit.
+                    if st.abandoned {
+                        return;
+                    }
+                    st.current = None;
                 }
+                shared.push(match r {
+                    Ok(row) => row,
+                    Err(p) => failure_row(&input.sha256, Some(panic_message(&*p)), None),
+                });
+                next = shared.claim();
             }
         })?;
-    Ok(Worker {
-        input_tx,
-        result_rx,
-        handle,
-    })
+    Ok(Worker { slot, handle })
 }
 
 /// Workers whose input overran its timeout. They cannot be killed. Their
@@ -373,69 +443,48 @@ fn failure_row(sha256: &str, panic: Option<String>, timeout: Option<bool>) -> Ro
     }
 }
 
-/// Close a worker's input channel and wait for it (it exits on the closed channel).
-fn retire(worker: &mut Option<Worker>) {
-    if let Some(w) = worker.take() {
-        drop(w.input_tx);
-        let _ = w.handle.join();
-    }
-}
-
-fn run_one<F>(
-    worker: &mut Option<Worker>,
-    f: &Arc<F>,
-    input: &Arc<Input>,
-    o: &BatchOptions,
-    abandoned: &Abandoned,
-) -> Row
-where
-    F: Fn(&Input) -> Row + Send + Sync + 'static,
-{
-    let sha = input.sha256.as_str();
-    if worker.is_none() {
-        let live = abandoned.live();
-        if live >= o.max_abandoned {
-            return failure_row(
-                sha,
-                Some(format!(
-                    "abandoned worker limit reached ({live} workers hung past the {:?} timeout); input not run",
-                    o.timeout
-                )),
-                None,
-            );
-        }
-        match spawn_worker(f, o.stack_bytes) {
-            Ok(w) => *worker = Some(w),
-            Err(e) => {
-                return failure_row(
-                    sha,
-                    Some(format!("failed to spawn worker thread: {e}")),
+/// Wait for `w` to exit, or for its current input to overrun `o.timeout` (the
+/// worker is then abandoned). Wakes only at the running input's deadline and
+/// when the worker exits.
+fn supervise<F>(w: Worker, shared: &Shared<F>, o: &BatchOptions, abandoned: &Abandoned) {
+    let mut st = w.slot.lock();
+    loop {
+        if st.exited {
+            // A worker only exits with an input in hand when that input's
+            // thread died outside `catch_unwind`.
+            let lost = st.current.take();
+            drop(st);
+            let _ = w.handle.join();
+            if let Some((i, _)) = lost {
+                shared.push(failure_row(
+                    &shared.inputs[i].sha256,
+                    Some("worker thread vanished".to_string()),
                     None,
-                )
+                ));
             }
+            return;
         }
-    }
-    let w = worker.as_ref().expect("worker spawned above");
-    if w.input_tx.send(Arc::clone(input)).is_err() {
-        retire(worker);
-        return failure_row(sha, Some("worker thread vanished".to_string()), None);
-    }
-    match w.result_rx.recv_timeout(o.timeout) {
-        Ok(Ok(row)) => row,
-        Ok(Err(msg)) => failure_row(sha, Some(msg), None),
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            if let Some(w) = worker.take() {
-                // Closing both channels makes the worker exit once it returns.
-                drop(w.input_tx);
-                drop(w.result_rx);
-                abandoned.add(w.handle);
+        let wait = match st.current {
+            Some((i, started)) => {
+                let elapsed = started.elapsed();
+                if elapsed >= o.timeout {
+                    st.abandoned = true;
+                    drop(st);
+                    shared.push(failure_row(&shared.inputs[i].sha256, None, Some(true)));
+                    abandoned.add(w.handle);
+                    return;
+                }
+                o.timeout - elapsed
             }
-            failure_row(sha, None, Some(true))
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            retire(worker);
-            failure_row(sha, Some("worker thread vanished".to_string()), None)
-        }
+            // Between two inputs: the next one starts at once.
+            None => o.timeout,
+        };
+        st = w
+            .slot
+            .exited
+            .wait_timeout(st, wait)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
 }
 
@@ -447,34 +496,59 @@ where
 /// `JoinHandle` was dropped, crashed with SIGSEGV on 200k+ input batches: glibc
 /// unmaps a stack above its stack-cache size as the thread exits, and
 /// `pthread_detach` on that exiting thread reads the unmapped descriptor, #2382.)
-/// A worker that overruns its timeout is abandoned and replaced, at most
-/// `o.max_abandoned` at a time; a failed spawn and a refused input are recorded
-/// as row errors.
+/// Each worker claims its own inputs and each job's supervisor sleeps until the
+/// running input's deadline or the worker's exit, so no input pays a
+/// cross-thread hand-off (issue #2411: two futex wake-ups per input were a
+/// quarter of the disassemble batch). A worker that overruns its timeout is
+/// abandoned and replaced, at most `o.max_abandoned` at a time; a failed spawn
+/// and a refused input are recorded as row errors.
 pub fn run_batch_with<F>(inputs: Vec<Input>, o: &BatchOptions, f: F) -> Vec<Row>
 where
     F: Fn(&Input) -> Row + Send + Sync + 'static,
 {
-    let f = Arc::new(f);
-    let inputs: Vec<Arc<Input>> = inputs.into_iter().map(Arc::new).collect();
-    let results: Mutex<Vec<Row>> = Mutex::new(Vec::with_capacity(inputs.len()));
-    let next = AtomicUsize::new(0);
+    let n = inputs.len();
+    let shared = Arc::new(Shared {
+        f,
+        inputs,
+        next: AtomicUsize::new(0),
+        results: Mutex::new(Vec::with_capacity(n)),
+    });
     let abandoned = Abandoned::default();
     std::thread::scope(|s| {
-        for _ in 0..o.jobs.max(1).min(inputs.len().max(1)) {
+        for _ in 0..o.jobs.max(1).min(n.max(1)) {
             s.spawn(|| {
-                let mut worker: Option<Worker> = None;
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(input) = inputs.get(i) else { break };
-                    let row = run_one(&mut worker, &f, input, o, &abandoned);
-                    results.lock().unwrap_or_else(|e| e.into_inner()).push(row);
+                while let Some(i) = shared.claim() {
+                    let live = abandoned.live();
+                    if live >= o.max_abandoned {
+                        shared.push(failure_row(
+                            &shared.inputs[i].sha256,
+                            Some(format!(
+                                "abandoned worker limit reached ({live} workers hung past the {:?} timeout); input not run",
+                                o.timeout
+                            )),
+                            None,
+                        ));
+                        continue;
+                    }
+                    let w = match spawn_worker(&shared, i, o.stack_bytes) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            shared.push(failure_row(
+                                &shared.inputs[i].sha256,
+                                Some(format!("failed to spawn worker thread: {e}")),
+                                None,
+                            ));
+                            continue;
+                        }
+                    };
+                    // When the worker ran out of inputs the next claim fails too.
+                    supervise(w, &shared, o, &abandoned);
                 }
-                retire(&mut worker);
             });
         }
     });
     abandoned.leak_rest();
-    let mut rows = results.into_inner().unwrap_or_else(|e| e.into_inner());
+    let mut rows = std::mem::take(&mut *shared.results.lock().unwrap_or_else(|e| e.into_inner()));
     rows.sort_by(|a, b| a.sha256.cmp(&b.sha256));
     rows
 }

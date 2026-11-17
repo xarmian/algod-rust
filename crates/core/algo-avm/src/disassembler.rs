@@ -31,6 +31,7 @@
 //! call's `Details` text is the one of the disassembly (issue #2375).
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use crate::bytecode;
 use crate::fields;
@@ -67,13 +68,13 @@ fn disassemble_instrumented(program: &[u8]) -> Result<(String, Vec<(usize, usize
     if pass.rerun {
         // A back-jump named a label that did not exist yet: go runs the whole
         // disassembly again with every label found by the first pass.
-        let labels = std::mem::take(&mut pass.pending);
-        pass = disassemble_pass(program, version, vlen as usize, Some(labels))?;
+        pass = disassemble_pass(program, version, vlen as usize, Some(pass.pending))?;
         if pass.rerun {
             return Err("rerun even though we had labels".to_string());
         }
     }
-    let mut text = format!("#pragma version {version}\n");
+    let mut text = String::with_capacity(pass.body.len() + 48);
+    let _ = writeln!(text, "#pragma version {version}");
     // If reassembling this program at its own version would auto-salt it
     // by default (i.e. it's a v13+ stateless program whose hash happens to
     // be on-curve — either untouched legacy bytes, or bytes an explicit
@@ -126,6 +127,7 @@ fn varint(buf: &[u8]) -> (i64, i64) {
 
 /// One go `immediate` of an opcode: its kind and, for the single-byte kinds,
 /// the name go prints in decode errors.
+#[derive(Clone, Copy)]
 enum Imm {
     Byte(&'static str),
     Int8(&'static str),
@@ -137,8 +139,27 @@ enum Imm {
     Labels,
 }
 
+/// The immediates of an opcode (at most three), without a heap allocation.
+struct Imms {
+    items: [Imm; 3],
+    len: usize,
+}
+
+impl Imms {
+    fn one(imm: Imm) -> Self {
+        Self {
+            items: [imm; 3],
+            len: 1,
+        }
+    }
+
+    fn as_slice(&self) -> &[Imm] {
+        &self.items[..self.len]
+    }
+}
+
 /// The immediates of `spec` as go's `OpDetails.Immediates` lists them.
-fn immediates_of(spec: &OpSpec) -> Vec<Imm> {
+fn immediates_of(spec: &OpSpec) -> Imms {
     let names = bytecode::uint8_immediate_names(spec.name).unwrap_or(&[]);
     let byte = |i: usize| {
         let n = names.get(i).copied().unwrap_or("?");
@@ -148,18 +169,73 @@ fn immediates_of(spec: &OpSpec) -> Vec<Imm> {
             Imm::Byte(n)
         }
     };
+    let bytes = |len: usize| Imms {
+        items: [byte(0), byte(1), byte(2)],
+        len,
+    };
     match spec.imm {
-        ImmKind::None => vec![],
-        ImmKind::Uint8 => vec![byte(0)],
-        ImmKind::Uint8Uint8 => vec![byte(0), byte(1)],
-        ImmKind::Uint8Uint8Uint8 => vec![byte(0), byte(1), byte(2)],
-        ImmKind::Int16 | ImmKind::BranchVarint => vec![Imm::Label],
-        ImmKind::Varuint => vec![Imm::Int],
-        ImmKind::VaruintBytes => vec![Imm::Bytes],
-        ImmKind::IntcBlock | ImmKind::PushInts => vec![Imm::Ints],
-        ImmKind::BytecBlock | ImmKind::PushBytess => vec![Imm::Bytess],
-        ImmKind::Labels => vec![Imm::Labels],
+        ImmKind::None => Imms {
+            items: [Imm::Int; 3],
+            len: 0,
+        },
+        ImmKind::Uint8 => bytes(1),
+        ImmKind::Uint8Uint8 => bytes(2),
+        ImmKind::Uint8Uint8Uint8 => bytes(3),
+        ImmKind::Int16 | ImmKind::BranchVarint => Imms::one(Imm::Label),
+        ImmKind::Varuint => Imms::one(Imm::Int),
+        ImmKind::VaruintBytes => Imms::one(Imm::Bytes),
+        ImmKind::IntcBlock | ImmKind::PushInts => Imms::one(Imm::Ints),
+        ImmKind::BytecBlock | ImmKind::PushBytess => Imms::one(Imm::Bytess),
+        ImmKind::Labels => Imms::one(Imm::Labels),
     }
+}
+
+/// Label numbers by branch target (go's `labels map[int]string`, whose names
+/// are always `label<N>`): a pc-indexed table for the targets inside the
+/// program (and its end), a map for the rest (a branch may name any offset).
+/// The table covers at most [`DENSE_LABEL_TARGETS`] offsets, far above any
+/// real program, so an oversized input cannot make it allocate in proportion.
+struct Labels {
+    /// `near[target]` is the label number, 0 when there is none (numbers start at 1).
+    near: Vec<u32>,
+    far: HashMap<i64, u32>,
+}
+
+impl Labels {
+    fn new(program_len: usize) -> Self {
+        Self {
+            near: vec![0; (program_len + 1).min(DENSE_LABEL_TARGETS)],
+            far: HashMap::new(),
+        }
+    }
+
+    fn get(&self, target: i64) -> Option<u32> {
+        match usize::try_from(target).ok().and_then(|t| self.near.get(t)) {
+            Some(&0) => None,
+            Some(&n) => Some(n),
+            None => self.far.get(&target).copied(),
+        }
+    }
+
+    fn insert(&mut self, target: i64, n: u32) {
+        match usize::try_from(target)
+            .ok()
+            .and_then(|t| self.near.get_mut(t))
+        {
+            Some(slot) => *slot = n,
+            None => {
+                self.far.insert(target, n);
+            }
+        }
+    }
+}
+
+/// Size cap of [`Labels`]' pc-indexed table and of the text reservation basis.
+const DENSE_LABEL_TARGETS: usize = 1 << 16;
+
+/// Append `label<n>`.
+fn push_label(out: &mut String, n: u32) {
+    let _ = write!(out, "label{n}");
 }
 
 /// How a single-byte immediate resolves through go's `FieldGroup.Names`.
@@ -219,7 +295,7 @@ struct Pass {
     offsets: Vec<(usize, usize)>,
     has_stateful_ops: bool,
     rerun: bool,
-    pending: HashMap<i64, String>,
+    pending: Labels,
 }
 
 /// One run of go's `disassembleInstrumented` loop over `program`. `labels` is
@@ -229,7 +305,7 @@ fn disassemble_pass(
     program: &[u8],
     version: u8,
     vlen: usize,
-    labels: Option<HashMap<i64, String>>,
+    labels: Option<Labels>,
 ) -> Result<Pass, String> {
     let mut d = Dis {
         program,
@@ -237,12 +313,13 @@ fn disassemble_pass(
         next_pc: 0,
         version,
         label_count: 0,
-        pending: labels.unwrap_or_default(),
+        pending: labels.unwrap_or_else(|| Labels::new(program.len())),
         rerun: false,
         intc: Vec::new(),
         bytec: Vec::new(),
     };
-    let mut body = String::new();
+    // The text is a few times the bytecode; one reservation saves most regrowth.
+    let mut body = String::with_capacity(program.len().min(DENSE_LABEL_TARGETS) * 4);
     let mut offsets = Vec::new();
     let mut has_stateful_ops = false;
     // go resolves version 0 against the v1 opcode set.
@@ -284,14 +361,13 @@ fn disassemble_pass(
         // that the disassembly can be validly reassembled (go-algorand PR
         // #6594): one that is never the target of a callsub gets a fresh label
         // here, which also forces the rerun that prints it.
-        if spec.name == "proto" && !d.pending.contains_key(&(d.pc as i64)) {
+        if spec.name == "proto" && d.pending.get(d.pc as i64).is_none() {
             d.label_count += 1;
-            let label = format!("label{}", d.label_count);
-            d.put_label(label, d.pc as i64);
+            d.put_label(d.label_count, d.pc as i64);
         }
         offsets.push((d.pc, body.len()));
-        let line = d.instruction(spec)?;
-        body.push_str(&line);
+        // On an error the whole pass fails, so a partly written line never shows.
+        d.instruction(spec, &mut body)?;
         body.push('\n');
         d.pc = d.next_pc;
     }
@@ -310,15 +386,15 @@ struct Dis<'a> {
     pc: usize,
     next_pc: usize,
     version: u8,
-    label_count: usize,
-    pending: HashMap<i64, String>,
+    label_count: u32,
+    pending: Labels,
     rerun: bool,
     intc: Vec<u64>,
     bytec: Vec<&'a [u8]>,
 }
 
 impl<'a> Dis<'a> {
-    fn put_label(&mut self, label: String, target: i64) {
+    fn put_label(&mut self, label: u32, target: i64) {
         self.pending.insert(target, label);
         if target <= self.pc as i64 {
             self.rerun = true;
@@ -326,28 +402,28 @@ impl<'a> Dis<'a> {
     }
 
     fn output_label_if_needed(&self, out: &mut String) {
-        if let Some(label) = self.pending.get(&(self.pc as i64)) {
-            out.push_str(label);
+        if let Some(label) = self.pending.get(self.pc as i64) {
+            push_label(out, label);
             out.push_str(":\n");
         }
     }
 
-    /// The label name of `target`, allocating the next one on first sight.
-    fn label_for(&mut self, target: i64) -> String {
-        if let Some(known) = self.pending.get(&target) {
-            return known.clone();
+    /// The label number of `target`, allocating the next one on first sight.
+    fn label_for(&mut self, target: i64) -> u32 {
+        if let Some(known) = self.pending.get(target) {
+            return known;
         }
         self.label_count += 1;
-        let label = format!("label{}", self.label_count);
-        self.put_label(label.clone(), target);
+        let label = self.label_count;
+        self.put_label(label, target);
         label
     }
 
-    /// go's `disassemble`: the text of the single instruction at `self.pc`,
-    /// setting `self.next_pc` past it.
-    fn instruction(&mut self, spec: &'static OpSpec) -> Result<String, String> {
+    /// go's `disassemble`: appends the text of the single instruction at
+    /// `self.pc` to `out`, setting `self.next_pc` past it.
+    fn instruction(&mut self, spec: &'static OpSpec, out: &mut String) -> Result<(), String> {
         let program = self.program;
-        let mut out = spec.name.to_string();
+        out.push_str(spec.name);
         let mut pc = self.pc + 1;
         if spec.sub_opcode != 0 {
             pc += 1; // skip the sub-opcode byte; immediates follow
@@ -355,13 +431,13 @@ impl<'a> Dis<'a> {
         let varint_branch = self.version >= opcode::VARINT_BRANCH_VERSION
             && opcode::is_varint_branch_opcode(spec.opcode);
         let imms = if varint_branch {
-            vec![Imm::Label]
+            Imms::one(Imm::Label)
         } else {
             immediates_of(spec)
         };
-        for (idx, imm) in imms.iter().enumerate() {
+        for (idx, imm) in imms.as_slice().iter().enumerate() {
             out.push(' ');
-            match imm {
+            match *imm {
                 Imm::Byte(name) | Imm::Int8(name) => {
                     if pc + 1 > program.len() {
                         return Err(format!(
@@ -376,18 +452,18 @@ impl<'a> Dis<'a> {
                             return Err(format!("invalid immediate {name} for {}: {b}", spec.name));
                         }
                         Group::None if matches!(imm, Imm::Int8(_)) => {
-                            out.push_str(&(b as i8).to_string());
+                            let _ = write!(out, "{}", b as i8);
                         }
-                        Group::None => out.push_str(&b.to_string()),
+                        Group::None => {
+                            let _ = write!(out, "{b}");
+                        }
                     }
                     if spec.name == "intc" && (b as usize) < self.intc.len() {
-                        out.push_str(&format!(" // {}", self.intc[b as usize]));
+                        let _ = write!(out, " // {}", self.intc[b as usize]);
                     }
                     if spec.name == "bytec" && (b as usize) < self.bytec.len() {
-                        out.push_str(&format!(
-                            " // {}",
-                            guess_byte_format(self.bytec[b as usize])
-                        ));
+                        out.push_str(" // ");
+                        push_guess_byte_format(out, self.bytec[b as usize]);
                     }
                     pc += 1;
                 }
@@ -414,7 +490,8 @@ impl<'a> Dis<'a> {
                         // back-jump from the instruction start
                         target = (pc as i64 - 1).wrapping_add(offset);
                     }
-                    out.push_str(&self.label_for(target));
+                    let label = self.label_for(target);
+                    push_label(out, label);
                     pc += offset_len;
                 }
                 Imm::Int => {
@@ -422,7 +499,7 @@ impl<'a> Dis<'a> {
                     if n <= 0 {
                         return Err(format!("could not decode immediate uint for {}", spec.name));
                     }
-                    out.push_str(&val.to_string());
+                    let _ = write!(out, "{val}");
                     pc += n as usize;
                 }
                 Imm::Bytes => {
@@ -442,22 +519,20 @@ impl<'a> Dis<'a> {
                         ));
                     }
                     let constant = &program[pc..end as usize];
-                    out.push_str(&format!(
-                        "0x{} // {}",
-                        bytes_to_hex(constant),
-                        guess_byte_format(constant)
-                    ));
+                    out.push_str("0x");
+                    push_hex(out, constant);
+                    out.push_str(" // ");
+                    push_guess_byte_format(out, constant);
                     pc = end as usize;
                 }
                 Imm::Ints => {
                     let (ints, next) = parse_int_imm_args(program, pc)?;
-                    out.push_str(
-                        &ints
-                            .iter()
-                            .map(u64::to_string)
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                    );
+                    for (i, v) in ints.iter().enumerate() {
+                        if i > 0 {
+                            out.push(' ');
+                        }
+                        let _ = write!(out, "{v}");
+                    }
                     if spec.name == "intcblock" {
                         self.intc = ints;
                     }
@@ -465,13 +540,13 @@ impl<'a> Dis<'a> {
                 }
                 Imm::Bytess => {
                     let (items, next) = parse_byte_imm_args(program, pc)?;
-                    out.push_str(
-                        &items
-                            .iter()
-                            .map(|b| format!("0x{}", bytes_to_hex(b)))
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                    );
+                    for (i, b) in items.iter().enumerate() {
+                        if i > 0 {
+                            out.push(' ');
+                        }
+                        out.push_str("0x");
+                        push_hex(out, b);
+                    }
                     if spec.name == "bytecblock" {
                         self.bytec = items;
                     }
@@ -480,9 +555,13 @@ impl<'a> Dis<'a> {
                 Imm::Labels => {
                     let (targets, next) =
                         parse_labels(program, pc).map_err(|e| format!("{e} for {}", spec.name))?;
-                    let labels: Vec<String> =
-                        targets.into_iter().map(|t| self.label_for(t)).collect();
-                    out.push_str(&labels.join(" "));
+                    for (i, t) in targets.into_iter().enumerate() {
+                        if i > 0 {
+                            out.push(' ');
+                        }
+                        let label = self.label_for(t);
+                        push_label(out, label);
+                    }
                     pc = next;
                 }
             }
@@ -490,17 +569,18 @@ impl<'a> Dis<'a> {
         if let Some(n) = spec.name.strip_prefix("intc_") {
             let idx = n.bytes().next().map(|b| usize::from(b.wrapping_sub(b'0')));
             if let Some(v) = idx.and_then(|i| self.intc.get(i)) {
-                out.push_str(&format!(" // {v}"));
+                let _ = write!(out, " // {v}");
             }
         }
         if let Some(n) = spec.name.strip_prefix("bytec_") {
             let idx = n.bytes().next().map(|b| usize::from(b.wrapping_sub(b'0')));
             if let Some(v) = idx.and_then(|i| self.bytec.get(i)) {
-                out.push_str(&format!(" // {}", guess_byte_format(v)));
+                out.push_str(" // ");
+                push_guess_byte_format(out, v);
             }
         }
         self.next_pc = pc;
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -606,49 +686,55 @@ pub fn pc_details(program: &[u8], pc: usize) -> String {
         .replace('\n', "; ")
 }
 
-/// Format a byte slice for display, matching go-algorand's `guessByteFormat`.
-fn guess_byte_format(bytes: &[u8]) -> String {
+/// Append a byte slice formatted for display, matching go-algorand's
+/// `guessByteFormat`.
+fn push_guess_byte_format(out: &mut String, bytes: &[u8]) {
     if bytes.len() == 32 {
         // Could be an Algorand address — encode as addr
-        let addr = encode_algorand_address(bytes);
-        return format!("addr {}", addr);
+        out.push_str("addr ");
+        push_algorand_address(out, bytes);
+        return;
     }
     if all_printable_ascii(bytes) {
         // go's `%#v` of a string: only the quote and the backslash need
         // escaping inside printable ASCII.
-        let mut quoted = String::with_capacity(bytes.len() + 2);
-        quoted.push('"');
+        out.reserve(bytes.len() + 2);
+        out.push('"');
         for &b in bytes {
             if b == b'"' || b == b'\\' {
-                quoted.push('\\');
+                out.push('\\');
             }
-            quoted.push(char::from(b));
+            out.push(char::from(b));
         }
-        quoted.push('"');
-        return quoted;
+        out.push('"');
+        return;
     }
-    format!("0x{}", bytes_to_hex(bytes))
+    out.push_str("0x");
+    push_hex(out, bytes);
 }
 
 fn all_printable_ascii(bytes: &[u8]) -> bool {
     bytes.iter().all(|&b| (32..=126).contains(&b))
 }
 
-fn bytes_to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+/// Append the lowercase hex of `bytes` (go's `hex.EncodeToString`).
+fn push_hex(out: &mut String, bytes: &[u8]) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    out.reserve(bytes.len() * 2);
+    for &b in bytes {
+        out.push(char::from(DIGITS[usize::from(b >> 4)]));
+        out.push(char::from(DIGITS[usize::from(b & 0x0f)]));
+    }
 }
 
-/// Encode 32 bytes as an Algorand address (base32 with checksum).
-fn encode_algorand_address(pubkey: &[u8]) -> String {
+/// Append 32 bytes as an Algorand address (base32 with checksum).
+fn push_algorand_address(out: &mut String, pubkey: &[u8]) {
     use sha2::{Digest, Sha512_256};
     let hash = Sha512_256::digest(pubkey);
-    let checksum = &hash[28..32];
-
-    let mut addr_bytes = Vec::with_capacity(36);
-    addr_bytes.extend_from_slice(pubkey);
-    addr_bytes.extend_from_slice(checksum);
-
-    data_encoding::BASE32_NOPAD.encode(&addr_bytes)
+    let mut addr_bytes = [0u8; 36];
+    addr_bytes[..32].copy_from_slice(pubkey);
+    addr_bytes[32..].copy_from_slice(&hash[28..32]);
+    data_encoding::BASE32_NOPAD.encode_append(&addr_bytes, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,6 +1102,21 @@ bytec 4 // \"last\"\n";
     // `bytecode::parse` likewise only validates that the two offset bytes
     // are physically present, not that the resulting target is in range.
     // -------------------------------------------------------------------
+
+    // #2411: the pc-indexed label table and its map fallback behave as one map.
+    #[test]
+    fn labels_table_and_map_agree_on_every_target_kind() {
+        let mut l = Labels::new(10);
+        for (target, n) in [(0i64, 1u32), (10, 2), (11, 3), (-1, 4), (i64::MIN, 5)] {
+            assert_eq!(l.get(target), None);
+            l.insert(target, n);
+            assert_eq!(l.get(target), Some(n), "target {target}");
+        }
+        assert!(l.far.contains_key(&11) && l.far.contains_key(&-1));
+        assert_eq!(l.get(5), None);
+        let big = Labels::new(usize::MAX - 1);
+        assert_eq!(big.near.len(), DENSE_LABEL_TARGETS);
+    }
 
     #[test]
     fn test_disassemble_bad_branch() {
