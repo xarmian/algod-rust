@@ -414,3 +414,45 @@ fn assemble_non_utf8_sources_equal_the_go_driver_rows() {
         assert_eq!(*row(&got, w["sha256"].as_str().unwrap()), w);
     }
 }
+
+/// Issue #2371: `--timings` writes a per-program wall-clock table next to the
+/// rows without changing the rows (the benchmark tier reads it).
+#[test]
+fn timings_file_has_one_entry_per_input_and_leaves_rows_unchanged() {
+    let dir = scratch("timings");
+    let (plain, timed, timings) = (
+        dir.join("plain.jsonl"),
+        dir.join("timed.jsonl"),
+        dir.join("timings.json"),
+    );
+    assert_eq!(run_driver("disassemble", &plain, "1").status.code(), Some(0));
+    let res = bin()
+        .arg("disassemble")
+        .arg("--corpus")
+        .arg(fixture())
+        .arg("--out")
+        .arg(&timed)
+        .args(["--jobs", "1", "--timings"])
+        .arg(&timings)
+        .output()
+        .expect("spawn teal-corpus");
+    assert_eq!(res.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read(&plain).unwrap(),
+        std::fs::read(&timed).unwrap(),
+        "--timings must not change the output rows"
+    );
+    let t: Value = serde_json::from_slice(&std::fs::read(&timings).unwrap()).unwrap();
+    assert_eq!(t["schema"], "teal-corpus-timings/v1");
+    assert_eq!(t["impl"], "algod-rust");
+    assert_eq!(t["operation"], "disassemble");
+    assert_eq!(t["jobs"], 1);
+    assert_eq!(t["inputs"], 4);
+    assert!(t["input_bytes"].as_u64().unwrap() > 0);
+    assert!(t["wall_ns"].as_u64().unwrap() > 0);
+    let per = t["per_program_ns"].as_object().unwrap();
+    assert_eq!(per.len(), 4);
+    for r in rows(&plain) {
+        assert!(per.contains_key(r["sha256"].as_str().unwrap()));
+    }
+}
