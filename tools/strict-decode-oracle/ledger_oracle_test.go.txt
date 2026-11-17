@@ -1,0 +1,195 @@
+// Copyright (C) 2019-2026 Algorand Foundation Ltd.
+// Modifications Copyright (C) 2026 Algod DAO
+// This file is part of algod-rust, a modified work based on go-algorand
+// (https://github.com/algorand/go-algorand).
+//
+// algod-rust is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// algod-rust is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with algod-rust.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// This file is NOT part of any Go module here: it is a template that
+// scripts/strict-decode/strict_decode_fixtures.py copies, as
+// zz_strict_decode_oracle_test.go, into the pinned go-algorand checkout's
+// ledger package (the catchpoint types are unexported) and runs there.
+// Issue #2396.
+//
+// For every {"name","kind","hex"} row of $STRICT_IN it runs what go's catchpoint
+// restore does with that catchpoint file section (ledger/catchupaccessor.go)
+// and writes {"name","ok","err"} to $STRICT_OUT:
+//
+//	cpheader  content.msgpack: protocol.Decode into CatchpointFileHeader
+//	          (processStagingContent)
+//	cpchunk   balances.N.msgpack: protocol.Decode into CatchpointSnapshotChunkV6,
+//	          then prepareNormalizedBalancesV6, which decodes every msgp.Raw
+//	          account (`b`) and resource (`c`) blob (processStagingBalances)
+//	cpspver   stateProofVerificationContext.msgpack: protocol.Decode into
+//	          catchpointStateProofVerificationContext
+//	          (processStagingStateProofVerificationContext)
+//
+// and, with $STRICT_SEEDS_OUT, writes fully populated random seeds.
+
+package ledger
+
+import (
+	"bufio"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"math/rand"
+	"os"
+	"testing"
+
+	"github.com/algorand/go-algorand/config"
+	"github.com/algorand/go-algorand/data/basics"
+	"github.com/algorand/go-algorand/ledger/encoded"
+	"github.com/algorand/go-algorand/ledger/ledgercore"
+	"github.com/algorand/go-algorand/ledger/store/trackerdb"
+	"github.com/algorand/go-algorand/protocol"
+	"github.com/algorand/msgp/msgp"
+)
+
+func TestStrictDecodeOracleLedger(t *testing.T) {
+	in, err := os.Open(os.Getenv("STRICT_IN"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	out, err := os.Create(os.Getenv("STRICT_OUT"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+
+	type row struct {
+		Name string `json:"name"`
+		Kind string `json:"kind"`
+		Hex  string `json:"hex"`
+	}
+	type res struct {
+		Name string `json:"name"`
+		Ok   bool   `json:"ok"`
+		Err  string `json:"err"`
+	}
+	proto := config.Consensus[protocol.ConsensusCurrentVersion]
+	sc := bufio.NewScanner(in)
+	sc.Buffer(make([]byte, 1<<20), 1<<28)
+	enc := json.NewEncoder(out)
+	for sc.Scan() {
+		var r row
+		if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
+			t.Fatal(err)
+		}
+		b, err := hex.DecodeString(r.Hex)
+		if err != nil {
+			t.Fatal(err)
+		}
+		func() {
+			o := res{Name: r.Name}
+			defer func() {
+				if x := recover(); x != nil {
+					o.Ok, o.Err = false, fmt.Sprintf("panic: %v", x)
+				}
+				enc.Encode(o)
+			}()
+			var derr error
+			switch r.Kind {
+			case "cpheader":
+				var v CatchpointFileHeader
+				derr = protocol.Decode(b, &v)
+			case "cpchunk":
+				var v CatchpointSnapshotChunkV6
+				derr = protocol.Decode(b, &v)
+				if derr == nil {
+					_, derr = prepareNormalizedBalancesV6(v.Balances, proto)
+				}
+			case "cpspver":
+				var v catchpointStateProofVerificationContext
+				derr = protocol.Decode(b, &v)
+			default:
+				t.Fatalf("unknown kind %q", r.Kind)
+			}
+			o.Ok = derr == nil
+			if derr != nil {
+				o.Err = derr.Error()
+			}
+		}()
+	}
+}
+
+// TestStrictDecodeSeedsLedger writes $STRICT_SEEDS_OUT: go-encoded, fully
+// populated (protocol.RandomizeObject) values per kind. A chunk's msgp.Raw
+// fields hold the encoding of a random value of the type go decodes them into
+// (or, for `oa` / `orp`, stores), as the catchpoint writer produces them.
+func TestStrictDecodeSeedsLedger(t *testing.T) {
+	path := os.Getenv("STRICT_SEEDS_OUT")
+	if path == "" {
+		t.Skip("STRICT_SEEDS_OUT not set")
+	}
+	out, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	enc := json.NewEncoder(out)
+	rand.Seed(2396)
+	random := func(tmpl any) msgp.Marshaler {
+		o, err := protocol.RandomizeObject(tmpl, protocol.RandomizeObjectWithMaxCollectionLen(2))
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, ok := o.(msgp.Marshaler)
+		if !ok {
+			t.Fatalf("%T is not a msgp.Marshaler", o)
+		}
+		return m
+	}
+	emit := func(kind string, i int, m msgp.Marshaler) {
+		enc.Encode(map[string]string{"name": fmt.Sprintf("%s_rand%d", kind, i), "kind": kind, "hex": hex.EncodeToString(protocol.Encode(m))})
+	}
+	for i := 0; i < 4; i++ {
+		emit("cpheader", i, random(&CatchpointFileHeader{}))
+		emit("cpspver", i, random(&catchpointStateProofVerificationContext{}))
+
+		var chunk CatchpointSnapshotChunkV6
+		for j := 0; j < 2; j++ {
+			var addr basics.Address
+			rand.Read(addr[:])
+			bal := encoded.BalanceRecordV6{
+				Address:              addr,
+				AccountData:          protocol.Encode(random(&trackerdb.BaseAccountData{})),
+				Resources:            map[uint64]msgp.Raw{},
+				ExpectingMoreEntries: j == 0,
+			}
+			for k := 0; k < 2; k++ {
+				bal.Resources[uint64(rand.Int63())] = protocol.Encode(random(&trackerdb.ResourcesData{}))
+			}
+			chunk.Balances = append(chunk.Balances, bal)
+			chunk.KVs = append(chunk.KVs, *random(&encoded.KVRecordV6{}).(*encoded.KVRecordV6))
+			// RandomizeObject refuses msgp.Raw fields: fill these by hand
+			oa := encoded.OnlineAccountRecordV6{
+				UpdateRound:             basics.Round(rand.Uint64()),
+				NormalizedOnlineBalance: rand.Uint64(),
+				VoteLastValid:           basics.Round(rand.Uint64()),
+				Data:                    protocol.Encode(random(&trackerdb.BaseOnlineAccountData{})),
+			}
+			rand.Read(oa.Address[:])
+			chunk.OnlineAccounts = append(chunk.OnlineAccounts, oa)
+			chunk.OnlineRoundParams = append(chunk.OnlineRoundParams, encoded.OnlineRoundParamsRecordV6{
+				Round: basics.Round(rand.Uint64()),
+				Data:  protocol.Encode(random(&ledgercore.OnlineRoundParamsData{})),
+			})
+		}
+		emit("cpchunk", i, &chunk)
+	}
+}

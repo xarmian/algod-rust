@@ -5,7 +5,7 @@
 # (https://github.com/algorand/go-algorand).
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Generate the committed strict-unknown-field parity fixtures (issue #2394).
+"""Generate the committed strict-unknown-field parity fixtures (issues #2394, #2396).
 
 go-algorand decodes every msgpack message with generated msgp decoders (or
 `protocol.CodecHandle`, `ErrorIfNoField = true`): a key the target struct does
@@ -40,6 +40,25 @@ eventually) with go's verdicts to OUT for a one-off differential fuzz run:
     STRICT_FUZZ_FILE=OUT cargo test -p algo-agreement --test strict_unknown_fields_go_parity fuzz_file
 
 The go-algorand checkout needs its libsodium built (`make libsodium`).
+
+Fixture sets (`--set`, default: all). `consensus` is the set described above;
+the others (issue #2396) cover go's non-consensus msgpack entry points, each
+with its own seeds.jsonl / cases.jsonl in the crate whose test replays it:
+
+  consensus  crates/core/algo-agreement/tests/fixtures/strict_decode/
+  ledger     crates/core/algo-ledger/tests/fixtures/strict_decode/
+             catchpoint file header / balances chunk / SP verification context
+             (ledger/catchupaccessor.go), test `strict_unknown_fields_go_parity`
+  network    crates/node/algo-network/tests/fixtures/strict_decode/
+             identity challenge / response / verification (network/netidentity.go)
+             and the tx-sync response (rpcs/httpTxSync.go, protocol.DecodeReflect)
+  p2p        crates/node/algo-p2p/tests/fixtures/strict_decode/
+             libp2p peer meta headers (network/p2pMetainfo.go)
+
+In the non-consensus sets a transplant only inserts a key the destination map
+does not already have: go decodes a repeated key *into* the already decoded
+field (merging nested structs and slice elements), a semantic these fixtures
+are not about (issue #2421).
 """
 import argparse
 import hashlib
@@ -53,18 +72,29 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
-FIX = os.path.join(ROOT, "crates", "core", "algo-agreement", "tests", "fixtures", "strict_decode")
-SEEDS = os.path.join(FIX, "seeds.jsonl")
-CASES = os.path.join(FIX, "cases.jsonl")
 ORACLE = os.path.join(ROOT, "tools", "strict-decode-oracle")
-PKGS = {
-    "agreement": ("agreement_oracle_test.go.txt", {"payload", "vote", "bundle", "cert"}),
-    "rpcs": (
-        "rpcs_oracle_test.go.txt",
-        {"blockcert", "block", "header", "stxn", "stxninblock", "txn", "applydata", "evaldelta"},
-    ),
+# go package -> (oracle template, the oracle test's name suffix)
+TEMPLATES = {
+    "agreement": ("agreement_oracle_test.go.txt", "Agreement"),
+    "rpcs": ("rpcs_oracle_test.go.txt", "Rpcs"),
+    "ledger": ("ledger_oracle_test.go.txt", "Ledger"),
+    "network": ("network_oracle_test.go.txt", "Network"),
+}
+# kind -> go package whose oracle decodes it
+KIND_PKG = {
+    **{k: "agreement" for k in ("payload", "vote", "bundle", "cert")},
+    **{
+        k: "rpcs"
+        for k in ("blockcert", "block", "header", "stxn", "stxninblock", "txn", "applydata", "evaldelta", "txsync")
+    },
+    **{k: "ledger" for k in ("cpheader", "cpchunk", "cpspver")},
+    **{k: "network" for k in ("idchal", "idresp", "idverify", "peermeta")},
 }
 DST = "zz_strict_decode_oracle_test.go"
+
+
+def fixture_dir(*crate):
+    return os.path.join(ROOT, "crates", *crate, "tests", "fixtures", "strict_decode")
 
 # ── raw msgpack walking (offsets only: leaves keep their original bytes) ─────
 
@@ -320,14 +350,17 @@ def real_seeds():
 # ── go oracle ─────────────────────────────────────────────────────────────
 
 
-def run_go(go_algorand, rows, seeds_out=None):
-    """rows: [{"name","kind","hex"}] -> {name: {"ok","err"}}; seeds_out: list to fill with random seeds."""
+def run_go(go_algorand, rows, seeds_out=None, seed_tests=None):
+    """rows: [{"name","kind","hex"}] -> {name: {"ok","err"}}; seeds_out: list to
+    fill with random seeds from the `seed_tests` ({package: go test name})."""
     res = {}
+    seed_tests = seed_tests or {}
+    pkgs = sorted({KIND_PKG[r["kind"]] for r in rows} | (set(seed_tests) if seeds_out is not None else set()))
     with tempfile.TemporaryDirectory() as tmp:
-        for pkg, (template, kinds) in PKGS.items():
-            sub = [r for r in rows if r["kind"] in kinds]
-            if not sub and seeds_out is None:
-                continue
+        for pkg in pkgs:
+            template, suffix = TEMPLATES[pkg]
+            sub = [r for r in rows if KIND_PKG[r["kind"]] == pkg]
+            want_seeds = seeds_out is not None and pkg in seed_tests
             dst = os.path.join(go_algorand, pkg, DST)
             inp, outp, sd = (os.path.join(tmp, f"{pkg}.{x}") for x in ("in", "out", "seeds"))
             with open(inp, "w", encoding="utf-8") as f:
@@ -336,16 +369,17 @@ def run_go(go_algorand, rows, seeds_out=None):
             shutil.copyfile(os.path.join(ORACLE, template), dst)
             try:
                 env = dict(os.environ, STRICT_IN=inp, STRICT_OUT=outp)
-                if seeds_out is not None:
+                run = f"^TestStrictDecodeOracle{suffix}$"
+                if want_seeds:
                     env["STRICT_SEEDS_OUT"] = sd
-                run = "^TestStrictDecodeOracle|^TestStrictDecodeSeeds" if seeds_out is not None else "^TestStrictDecodeOracle"
+                    run += f"|^{seed_tests[pkg]}$"
                 subprocess.run(["go", "test", "-count=1", "-run", run, "./" + pkg], cwd=go_algorand, env=env, check=True)
             finally:
                 os.remove(dst)
             for line in open(outp, encoding="utf-8"):
                 r = json.loads(line)
                 res[r["name"]] = r
-            if seeds_out is not None:
+            if want_seeds:
                 seeds_out.extend(json.loads(l) for l in open(sd, encoding="utf-8"))
     return res
 
@@ -389,7 +423,7 @@ def donor_entries(b):
     return out
 
 
-def make_cases(seeds, rng, per_map, cap=None):
+def make_cases(seeds, rng, per_map, cap=None, pinned=(), fresh_keys_only=False):
     """Per map of every seed, `per_map` mutants: an unknown key `zz` (any value
     kind), then *transplants*, a real (key, value) entry of another map of the
     same seed. A transplant is well typed, so where the key is valid in the
@@ -401,18 +435,20 @@ def make_cases(seeds, rng, per_map, cap=None):
         donors = donor_entries(b)
         cases.append((s, -1, 0, b"", b""))
         for m, (start, hl, entries, end) in enumerate(walk_maps(b)):
+            present = {b[ks:vs] for ks, vs, ve in entries}
+            fresh = [d for d in donors if d[0] not in present] if fresh_keys_only else donors
             for j in range(per_map):
                 pos = rng.randint(0, len(entries))
-                if j == 0 or not donors:
+                if j == 0 or not fresh:
                     cases.append((s, m, pos, str_key("zz"), rng.choice(VALUES)))
                 else:
-                    k, v = rng.choice(donors)
+                    k, v = rng.choice(fresh)
                     cases.append((s, m, pos, k, v))
     rng.shuffle(cases)
     if cap is not None:
         cases = cases[:cap]
     by_name = {s["name"]: s for s in seeds}
-    for seed, m, pos, key, val in PINNED:
+    for seed, m, pos, key, val in pinned:
         if seed in by_name:
             cases.append((by_name[seed], m, pos, key, val))
     out = []
@@ -448,15 +484,227 @@ def dump(cases):
     )
 
 
-def read_seeds():
-    return [json.loads(l) for l in open(SEEDS, encoding="utf-8") if l.strip()]
+# ── non-consensus real seeds (issue #2396) ────────────────────────────────
+
+
+def encode_str(raw):
+    if len(raw) < 32:
+        return bytes([0xA0 | len(raw)]) + raw
+    assert len(raw) < 256
+    return b"\xd9" + bytes([len(raw)]) + raw
+
+
+def encode_array_len(n):
+    if n < 16:
+        return bytes([0x90 | n])
+    return b"\xdc" + n.to_bytes(2, "big")
+
+
+def truncate_arrays(b, n):
+    """A top-level map whose array values keep only their first `n` items."""
+    cnt, hl = map_header(b, 0)
+    j, out = hl, []
+    for _ in range(cnt):
+        ks = j
+        vs = skip(b, ks)
+        ve = skip(b, vs)
+        v = b[vs:ve]
+        if 0x90 <= v[0] <= 0x9F or v[0] in (0xDC, 0xDD):
+            items = array_items(v)[:n]
+            v = encode_array_len(len(items)) + b"".join(items)
+        out.append(b[ks:vs] + v)
+        j = ve
+    return encode_map_len(cnt) + b"".join(out)
+
+
+CATCHPOINT_TARS = [
+    os.path.join(ROOT, "benchmarks", "corpus", "small-catchpoint", "catchpoint.tar"),
+    os.path.join(ROOT, "benchmarks", "go-replay", "testdata", "small-catchpoint-1000.tar"),
+]
+
+
+def real_seeds_ledger():
+    """Sections of the committed go-written small catchpoints (arrays cut to
+    their first three records, to keep the fixture small)."""
+    import tarfile
+
+    seeds = []
+    for t, path in enumerate(CATCHPOINT_TARS):
+        with tarfile.open(path) as tar:
+            for m in tar.getmembers():
+                data = tar.extractfile(m).read()
+                tag = f"cp{t}_{m.name.replace('.msgpack', '').replace('.', '_')}"
+                if m.name == "content.msgpack":
+                    seeds.append({"name": tag, "kind": "cpheader", "hex": data.hex()})
+                elif m.name == "stateProofVerificationContext.msgpack":
+                    seeds.append({"name": tag, "kind": "cpspver", "hex": truncate_arrays(data, 3).hex()})
+                elif m.name.startswith("balances."):
+                    seeds.append({"name": tag, "kind": "cpchunk", "hex": truncate_arrays(data, 3).hex()})
+    return seeds
+
+
+def real_seeds_network():
+    """tx-sync responses built from the consensus set's signed transactions."""
+    cons = [s for s in read_seeds(SETS["consensus"]) if s["kind"] == "stxn" and "_rand" not in s["name"]]
+    seeds = []
+    for k in range(min(4, len(cons))):
+        group = [bytes.fromhex(s["hex"]) for s in cons[k : k + 1 + k % 3]]
+        raw = encode_array_len(len(group)) + b"".join(group)
+        seeds.append({"name": f"txsync_real{k}", "kind": "txsync", "hex": raw.hex()})
+    return seeds
+
+
+def real_seeds_p2p():
+    """Peer meta headers shaped like go's writePeerMetaHeaders output."""
+
+    def headers(pairs):
+        out = encode_map_len(len(pairs))
+        for k, vs in pairs:
+            out += encode_str(k.encode()) + encode_array_len(len(vs))
+            out += b"".join(encode_str(v.encode()) for v in vs)
+        return out
+
+    full = [
+        ("Genesisid", ["testnet-v1.0"]),
+        ("X-Algorand-Instancename", ["8c46b5b5ac2b"]),
+        ("X-Algorand-Location", [""]),
+        ("X-Algorand-Nodefeatures", ["gossip"]),
+        ("X-Algorand-Telid", ["7e5e3a4f-5a5a-4f0e-8c7a-2f6b9d0e1a11"]),
+        ("X-Algorand-Version", ["2.2"]),
+        ("X-Algorand-Versionsupported", ["2.2", "2.1"]),
+    ]
+    return [
+        {"name": "peermeta_real0", "kind": "peermeta", "hex": headers(full).hex()},
+        {"name": "peermeta_real1", "kind": "peermeta", "hex": headers([("X-Algorand-Version", ["2.2"])]).hex()},
+    ]
+
+
+# ── fixture sets ──────────────────────────────────────────────────────────
+
+SETS = {
+    "consensus": {
+        "dir": fixture_dir("core", "algo-agreement"),
+        "kinds": {
+            "payload",
+            "vote",
+            "bundle",
+            "cert",
+            "blockcert",
+            "block",
+            "header",
+            "stxn",
+            "stxninblock",
+            "txn",
+            "applydata",
+            "evaldelta",
+        },
+        "seed_tests": {"agreement": "TestStrictDecodeSeedsAgreement", "rpcs": "TestStrictDecodeSeedsRpcs"},
+        "real": real_seeds,
+        "rng": 2394,
+        "fuzz_xor": 0x2394,
+        "pinned": PINNED,
+        "fresh": False,
+    },
+    "ledger": {
+        "dir": fixture_dir("core", "algo-ledger"),
+        "kinds": {"cpheader", "cpchunk", "cpspver"},
+        "seed_tests": {"ledger": "TestStrictDecodeSeedsLedger"},
+        "real": real_seeds_ledger,
+        "rng": 23961,
+        "fuzz_xor": 23961,
+        "pinned": (),
+        "fresh": True,
+    },
+    "network": {
+        "dir": fixture_dir("node", "algo-network"),
+        "kinds": {"idchal", "idresp", "idverify", "txsync"},
+        "seed_tests": {"network": "TestStrictDecodeSeedsNetwork", "rpcs": "TestStrictDecodeSeedsTxSync"},
+        "real": real_seeds_network,
+        "rng": 23962,
+        "fuzz_xor": 23962,
+        "pinned": (),
+        "fresh": True,
+    },
+    "p2p": {
+        "dir": fixture_dir("node", "algo-p2p"),
+        "kinds": {"peermeta"},
+        "seed_tests": {"network": "TestStrictDecodeSeedsNetwork"},
+        "real": real_seeds_p2p,
+        "rng": 23963,
+        "fuzz_xor": 23963,
+        "pinned": (),
+        "fresh": True,
+    },
+}
+
+
+def seeds_path(st):
+    return os.path.join(st["dir"], "seeds.jsonl")
+
+
+def cases_path(st):
+    return os.path.join(st["dir"], "cases.jsonl")
+
+
+def read_seeds(st):
+    return [json.loads(l) for l in open(seeds_path(st), encoding="utf-8") if l.strip()]
+
+
+def run_set(name, st, go, a):
+    os.makedirs(st["dir"], exist_ok=True)
+    if a.regen_seeds or not os.path.exists(seeds_path(st)):
+        rand = []
+        run_go(go, [], seeds_out=rand, seed_tests=st["seed_tests"])
+        rand = [s for s in rand if s["kind"] in st["kinds"]]
+        seeds = st["real"]() + rand
+        # a seed go itself rejects would only test the baseline: keep go-accepted ones
+        v = run_go(go, [{"name": s["name"], "kind": s["kind"], "hex": s["hex"]} for s in seeds])
+        seeds = [s for s in seeds if v[s["name"]]["ok"]]
+        with open(seeds_path(st), "w", encoding="utf-8", newline="\n") as f:
+            for s in seeds:
+                f.write(json.dumps(s, sort_keys=True) + "\n")
+        print(f"wrote {seeds_path(st)} ({len(seeds)} seeds)")
+
+    seeds = read_seeds(st)
+    if a.fuzz:
+        n = int(a.fuzz[0])
+        rng = random.Random(n ^ st["fuzz_xor"])
+        cases = make_cases(seeds, rng, per_map=40, cap=n, pinned=st["pinned"], fresh_keys_only=st["fresh"])
+        cases = attach_verdicts(go, cases)
+        out = a.fuzz[1] if name == "consensus" else f"{a.fuzz[1]}.{name}"
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
+            f.write(dump(cases))
+        print(f"wrote {out} ({len(cases)} cases, {sum(c['go_ok'] for c in cases)} accepted by go)")
+        return
+
+    cases = make_cases(
+        seeds, random.Random(st["rng"]), a.per_map, a.cap, pinned=st["pinned"], fresh_keys_only=st["fresh"]
+    )
+    cases = attach_verdicts(go, cases)
+    text = dump(cases)
+    path = cases_path(st)
+    if a.check:
+        cur = open(path, encoding="utf-8", newline="").read()
+        if cur != text:
+            sys.exit(f"{path} is stale; rerun without --check")
+        print(f"{name}: up to date")
+        return
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    print(f"wrote {path} ({len(cases)} cases, {sum(c['go_ok'] for c in cases)} accepted by go)")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--check", action="store_true", help="fail when cases.jsonl is stale")
+    ap.add_argument("--check", action="store_true", help="fail when a cases.jsonl is stale")
     ap.add_argument("--regen-seeds", action="store_true", help="rewrite the go-random seeds (not reproducible)")
-    ap.add_argument("--fuzz", nargs=2, metavar=("N", "OUT"), help="write N extra random cases with go verdicts")
+    ap.add_argument(
+        "--fuzz",
+        nargs=2,
+        metavar=("N", "OUT"),
+        help="write N extra random cases per set with go verdicts to OUT (consensus) and OUT.<set>",
+    )
+    ap.add_argument("--set", action="append", choices=sorted(SETS), help="fixture set(s); default: all")
     ap.add_argument("--per-map", type=int, default=2)
     ap.add_argument("--cap", type=int, default=4000)
     ap.add_argument("--go-algorand", default=os.environ.get("GO_ALGORAND_DIR"))
@@ -464,40 +712,8 @@ def main():
     if not a.go_algorand:
         sys.exit("set GO_ALGORAND_DIR or pass --go-algorand (a v5.0.5-stable checkout with libsodium built)")
     go = os.path.abspath(a.go_algorand)
-    os.makedirs(FIX, exist_ok=True)
-
-    if a.regen_seeds or not os.path.exists(SEEDS):
-        rand = []
-        run_go(go, [], seeds_out=rand)
-        seeds = real_seeds() + rand
-        # a seed go itself rejects would only test the baseline: keep go-accepted ones
-        v = run_go(go, [{"name": s["name"], "kind": s["kind"], "hex": s["hex"]} for s in seeds])
-        seeds = [s for s in seeds if v[s["name"]]["ok"]]
-        with open(SEEDS, "w", encoding="utf-8", newline="\n") as f:
-            for s in seeds:
-                f.write(json.dumps(s, sort_keys=True) + "\n")
-        print(f"wrote {SEEDS} ({len(seeds)} seeds)")
-
-    seeds = read_seeds()
-    if a.fuzz:
-        cases = make_cases(seeds, random.Random(int(a.fuzz[0]) ^ 0x2394), per_map=40, cap=int(a.fuzz[0]))
-        cases = attach_verdicts(go, cases)
-        with open(a.fuzz[1], "w", encoding="utf-8", newline="\n") as f:
-            f.write(dump(cases))
-        print(f"wrote {a.fuzz[1]} ({len(cases)} cases, {sum(c['go_ok'] for c in cases)} accepted by go)")
-        return
-
-    cases = attach_verdicts(go, make_cases(seeds, random.Random(2394), a.per_map, a.cap))
-    text = dump(cases)
-    if a.check:
-        cur = open(CASES, encoding="utf-8", newline="").read()
-        if cur != text:
-            sys.exit(f"{CASES} is stale; rerun without --check")
-        print("up to date")
-        return
-    with open(CASES, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-    print(f"wrote {CASES} ({len(cases)} cases, {sum(c['go_ok'] for c in cases)} accepted by go)")
+    for name in a.set or list(SETS):
+        run_set(name, SETS[name], go, a)
 
 
 if __name__ == "__main__":

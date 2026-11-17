@@ -43,7 +43,8 @@ use std::path::Path;
 use flate2::read::GzDecoder;
 
 use super::types::{
-    CatchpointError, CatchpointFileHeader, CatchpointSnapshotChunkV6, CATCHPOINT_FILE_VERSION_V6,
+    CatchpointError, CatchpointFileHeader, CatchpointSnapshotChunkV6,
+    CatchpointStateProofVerificationWrapper, CATCHPOINT_FILE_VERSION_V6,
     CATCHPOINT_FILE_VERSION_V7, CATCHPOINT_FILE_VERSION_V8,
 };
 
@@ -429,8 +430,7 @@ fn process_entry<R: Read>(
 
     if path == CONTENT_FILENAME {
         let data = read_entry_bytes(entry)?;
-        let header: CatchpointFileHeader = rmp_serde::from_slice(&data)
-            .map_err(|e| CatchpointError::DecodeError(format!("header msgpack: {e}")))?;
+        let header = decode_catchpoint_header(&data)?;
 
         // V6, V7, and V8 (issues #752, #766) are supported: this crate's
         // chunk/SP-verification handling is driven entirely by which tar
@@ -457,140 +457,43 @@ fn process_entry<R: Read>(
         // Chunk data may be Snappy-frame-compressed. Detect and decompress if so.
         let decoded_data = snappy_decompress_if_needed(raw_data)?;
 
-        let mut chunk: CatchpointSnapshotChunkV6 = rmp_serde::from_slice(&decoded_data)
-            .map_err(|e| CatchpointError::DecodeError(format!("chunk msgpack: {e}")))?;
-
-        patch_msgp_raw_fields_for_non_utf8_strings(&decoded_data, &mut chunk)?;
-
-        Ok(Some(CatchpointEntry::Chunk(chunk)))
+        Ok(Some(CatchpointEntry::Chunk(decode_catchpoint_chunk(
+            &decoded_data,
+        )?)))
     } else {
         tracing::debug!("catchpoint: skipping unknown tar entry: {}", path);
         Ok(None)
     }
 }
 
-/// Issue #1636 (seventh investigation round): fix up any `msgp.Raw`-typed
-/// field (`BalanceRecordV6.account_data`/`.resources[*]`,
-/// `OnlineAccountRecordV6.data`, `OnlineRoundParamsRecordV6.data`) whose
-/// raw bytes the primary `rmp_serde::from_slice::<CatchpointSnapshotChunkV6>`
-/// decode above got wrong for a msgpack `str` field containing non-UTF8
-/// bytes (real Algorand app local-state/box keys are arbitrary
-/// smart-contract-chosen bytes with no UTF-8 guarantee).
-///
-/// Root cause: `rmp_serde`'s `Deserializer` (`rmp-serde-1.3.1/src/decode.rs`
-/// `read_str_data`), when it hits a `str` marker whose payload fails UTF-8
-/// validation, calls `visitor.visit_bytes(buf)` as a fallback — the exact
-/// same visitor method it would call for a genuine `bin` field. By the time
-/// this reaches `rmpv::Value`'s own `Deserialize` impl (used by
-/// `types::deserialize_msgp_raw`/`deserialize_msgp_raw_map`), the two cases
-/// are indistinguishable and both become `Value::Binary`, which re-encodes
-/// using the `bin` type marker — silently rewriting the original `str8`
-/// (`0xd9`)/`str16`/`str32` marker byte to `bin8` (`0xc4`)/`bin16`/`bin32`,
-/// changing the raw bytes go-algorand's `AccountHashBuilderV6`/
-/// `ResourcesHashBuilderV6`/`KvHashBuilderV6` hash over (go's own encoder
-/// always uses `str` for a Go `string` field regardless of UTF-8 validity,
-/// and never re-decodes+re-encodes these fields at all — it hashes the
-/// original wire bytes directly). This is NOT specific to `rmpv::Value`'s
-/// re-encoder (already hardened by `types::write_value_str_preserving`) —
-/// the corruption happens one step earlier, during `rmp_serde`'s decode
-/// itself, before any of this crate's re-encoding logic ever runs, so no
-/// amount of fixing the re-encoder alone can recover the lost type-marker
-/// information.
-///
-/// The fix: `rmpv::decode::read_value` (used directly on the same
-/// `decoded_data` bytes, bypassing `rmp_serde`/serde's `Deserializer`
-/// abstraction entirely) does NOT have this hazard — it reads the msgpack
-/// `str`/`bin` markers directly and faithfully preserves an invalid-UTF8
-/// `str` as `Value::String` with its raw bytes recoverable via
-/// `Utf8String::as_bytes()` (see `types::write_value_str_preserving`'s doc
-/// comment and the issue #1636 seventh-round unit tests for the byte-level
-/// proof). So: decode the identical `decoded_data` a second time via
-/// `rmpv::decode::read_value` into a faithful `Value` tree, walk it to find
-/// each `msgp.Raw` field's *already-correct* sub-`Value` by direct map/array
-/// navigation (never through another `Deserializer`/`Visitor` round trip,
-/// which would reintroduce the exact same ambiguity — `rmpv::Value`'s own
-/// `impl Deserializer for Value` has the identical `visit_byte_buf`
-/// collapse), re-encode each one with `write_value_str_preserving`, and
-/// overwrite the (possibly-wrong) bytes the primary decode produced.
-///
-/// A second full decode of every chunk is a real cost, but this runs once
-/// per catchpoint import (not a hot per-round path), and correctness of the
-/// hashed bytes is non-negotiable for a consensus-critical catchpoint
-/// label — see issue #1636's seventh investigation round for the
-/// cross-implementation evidence (against go-algorand's own reference
-/// import code, on identical real mainnet catchpoint bytes) that pinned
-/// this down as the actual root cause of a deterministic wrong-label bug.
-fn patch_msgp_raw_fields_for_non_utf8_strings(
-    decoded_data: &[u8],
-    chunk: &mut CatchpointSnapshotChunkV6,
-) -> Result<(), CatchpointError> {
-    let native = rmpv::decode::read_value(&mut &decoded_data[..])
-        .map_err(|e| CatchpointError::DecodeError(format!("chunk msgpack (native pass): {e}")))?;
-    let Some(map) = native.as_map() else {
-        return Ok(());
-    };
-
-    let reencode = |v: &rmpv::Value| -> Result<Vec<u8>, CatchpointError> {
-        let mut buf = Vec::new();
-        super::types::write_value_str_preserving(&mut buf, v).map_err(|e| {
-            CatchpointError::DecodeError(format!("re-encode msgp.Raw field (native pass): {e}"))
-        })?;
-        Ok(buf)
-    };
-
-    if let Some(bl) = map_get(map, "bl").and_then(|v| v.as_array()) {
-        for (i, native_balance) in bl.iter().enumerate() {
-            let Some(balance) = chunk.balances.get_mut(i) else {
-                break;
-            };
-            let Some(bmap) = native_balance.as_map() else {
-                continue;
-            };
-            if let Some(b) = map_get(bmap, "b") {
-                balance.account_data = serde_bytes::ByteBuf::from(reencode(b)?);
-            }
-            if let Some(c) = map_get(bmap, "c").and_then(|v| v.as_map()) {
-                for (k, v) in c {
-                    if let Some(aidx) = k.as_u64() {
-                        if let Some(existing) = balance.resources.get_mut(&aidx) {
-                            *existing = serde_bytes::ByteBuf::from(reencode(v)?);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(oa) = map_get(map, "oa").and_then(|v| v.as_array()) {
-        for (i, native_oa) in oa.iter().enumerate() {
-            let Some(rec) = chunk.online_accounts.get_mut(i) else {
-                break;
-            };
-            if let Some(data) = native_oa.as_map().and_then(|m| map_get(m, "data")) {
-                rec.data = serde_bytes::ByteBuf::from(reencode(data)?);
-            }
-        }
-    }
-
-    if let Some(orp) = map_get(map, "orp").and_then(|v| v.as_array()) {
-        for (i, native_orp) in orp.iter().enumerate() {
-            let Some(rec) = chunk.online_round_params.get_mut(i) else {
-                break;
-            };
-            if let Some(data) = native_orp.as_map().and_then(|m| map_get(m, "data")) {
-                rec.data = serde_bytes::ByteBuf::from(reencode(data)?);
-            }
-        }
-    }
-
-    Ok(())
+/// Decode a catchpoint file's `content.msgpack` (go: `processStagingContent`,
+/// `ledger/catchupaccessor.go`, `protocol.Decode` into `CatchpointFileHeader`).
+/// The version check is the caller's.
+pub fn decode_catchpoint_header(data: &[u8]) -> Result<CatchpointFileHeader, CatchpointError> {
+    super::msgp_compat::decode_catchpoint_file_header(data)
+        .map_err(|e| CatchpointError::DecodeError(format!("header msgpack: {e}")))
 }
 
-/// Look up a string key in a decoded `rmpv::Value::Map`'s entry list.
-fn map_get<'a>(map: &'a [(rmpv::Value, rmpv::Value)], key: &str) -> Option<&'a rmpv::Value> {
-    map.iter()
-        .find(|(k, _)| k.as_str() == Some(key))
-        .map(|(_, v)| v)
+/// Decode one (decompressed) `balances.N.msgpack` chunk (go:
+/// `processStagingBalances`, `protocol.Decode` into `CatchpointSnapshotChunkV6`).
+/// The `msgp.Raw` account / resource blobs are kept as their exact wire bytes
+/// (the bytes go hashes, issue #1636: a non-UTF-8 `str` keeps its marker); the
+/// importer decodes them (go: `prepareNormalizedBalancesV6`). Unknown keys,
+/// over-long slices and the rest of go's msgp rules: issue #2396.
+pub fn decode_catchpoint_chunk(data: &[u8]) -> Result<CatchpointSnapshotChunkV6, CatchpointError> {
+    super::msgp_compat::decode_catchpoint_snapshot_chunk(data)
+        .map_err(|e| CatchpointError::DecodeError(format!("chunk msgpack: {e}")))
+}
+
+/// Decode a catchpoint file's `stateProofVerificationContext.msgpack` (go:
+/// `processStagingStateProofVerificationContext`, `protocol.Decode` into
+/// `catchpointStateProofVerificationContext`).
+pub fn decode_state_proof_verification(
+    data: &[u8],
+) -> Result<CatchpointStateProofVerificationWrapper, CatchpointError> {
+    super::msgp_compat::decode_catchpoint_sp_verification(data).map_err(|e| {
+        CatchpointError::DecodeError(format!("state proof verification context msgpack: {e}"))
+    })
 }
 
 /// If `data` starts with a Snappy framing stream identifier, decompress it.

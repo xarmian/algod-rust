@@ -69,6 +69,7 @@ algo-build-info.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 serde_json.workspace = true
+hex.workspace = true
 rmpv.workspace = true
 tower.workspace = true
 tracing-subscriber.workspace = true

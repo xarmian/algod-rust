@@ -47,10 +47,9 @@ use super::checkpoint::ImportCheckpoint;
 use super::msgp_compat::{decode_base_account_data, decode_resources_data};
 use super::parser::{self, CatchpointEntry};
 use super::types::{
-    BalanceRecordV6, CatchpointError, CatchpointFileHeader, CatchpointSnapshotChunkV6,
-    CatchpointStateProofVerificationWrapper, KVRecordV6, OnlineAccountRecordV6,
-    OnlineRoundParamsRecordV6, RESOURCE_FLAGS_EMPTY_APP, RESOURCE_FLAGS_EMPTY_ASSET,
-    RESOURCE_FLAGS_OWNERSHIP,
+    BalanceRecordV6, CatchpointError, CatchpointFileHeader, CatchpointSnapshotChunkV6, KVRecordV6,
+    OnlineAccountRecordV6, OnlineRoundParamsRecordV6, RESOURCE_FLAGS_EMPTY_APP,
+    RESOURCE_FLAGS_EMPTY_ASSET, RESOURCE_FLAGS_OWNERSHIP,
 };
 use super::types::{CATCHPOINT_FILE_VERSION_V5, CATCHPOINT_FILE_VERSION_V7};
 use crate::rewards::normalized_online_balance;
@@ -1067,12 +1066,7 @@ impl<'a> CatchpointImporter<'a> {
     /// individual verification contexts. Each context is re-encoded and stored
     /// with its `lastattestedround` as the primary key.
     fn import_state_proof_verification(&self, raw_data: &[u8]) -> Result<(), CatchpointError> {
-        let wrapper: CatchpointStateProofVerificationWrapper = rmp_serde::from_slice(raw_data)
-            .map_err(|e| {
-                CatchpointError::DecodeError(format!(
-                    "state proof verification context msgpack: {e}"
-                ))
-            })?;
+        let wrapper = super::parser::decode_state_proof_verification(raw_data)?;
 
         if wrapper.data.is_empty() {
             return Ok(());
@@ -1751,6 +1745,7 @@ fn is_empty_app_fields(rd: &super::types::CatchpointResourcesData) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catchpoint::types::CatchpointStateProofVerificationWrapper;
     use crate::rewards::REWARD_UNITS;
     use serde_bytes::ByteBuf;
     use std::collections::HashMap;

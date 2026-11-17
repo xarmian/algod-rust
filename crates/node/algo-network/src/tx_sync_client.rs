@@ -222,13 +222,37 @@ impl TxSyncPeerClient for HttpTxSyncClient {
         }
 
         let bytes = self.read_bounded(response, deadline, timeout).await?;
-        let txns: Vec<SignedTransaction> =
-            rmp_serde::from_slice(&bytes).map_err(|e| TxSyncError::Peer {
-                peer: self.peer_addr.clone(),
-                message: format!("decode response: {e}"),
-            })?;
+        let txns = decode_tx_sync_response(&bytes).map_err(|e| TxSyncError::Peer {
+            peer: self.peer_addr.clone(),
+            message: format!("decode response: {e}"),
+        })?;
         Ok(signed_txns_to_groups(txns))
     }
+}
+
+/// Decode a tx-sync response body: go `protocol.DecodeReflect` into
+/// `[]transactions.SignedTxn` (`rpcs/httpTxSync.go`, `Sync`), whose
+/// `protocol.CodecHandle` has `ErrorIfNoField = true`: a key `SignedTxn` lacks
+/// (including the block-only `hgi`/`hgh`/`ApplyData` keys of a
+/// `SignedTxnInBlock`) fails the whole response (issue #2396). `nil` is an
+/// empty response, and trailing bytes are ignored as go-codec does.
+///
+/// Synchronous: the strict-unknown-fields mode is thread-local and must not be
+/// held across an `.await`.
+pub fn decode_tx_sync_response(bytes: &[u8]) -> Result<Vec<SignedTransaction>, String> {
+    let _strict = algo_types::strict_unknown_fields(bytes);
+    let mut rd = bytes;
+    if rd.first() == Some(&0xc0) {
+        return Ok(Vec::new());
+    }
+    let n = rmp::decode::read_array_len(&mut rd).map_err(|e| format!("txns array: {e}"))?;
+    let mut txns = Vec::with_capacity((n as usize).min(1024));
+    for i in 0..n {
+        txns.push(
+            SignedTransaction::decode_from_reader(&mut rd).map_err(|e| format!("txn {i}: {e}"))?,
+        );
+    }
+    Ok(txns)
 }
 
 impl HttpTxSyncClient {
