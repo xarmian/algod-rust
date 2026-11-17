@@ -12,7 +12,11 @@ name: Strict decode parity
 # decoders in the pinned go-algorand checkout and fails when the committed file
 # is stale, (2) replays them through algod-rust's decoders, and (3) runs a
 # larger one-off differential fuzz (every map of every seed, ~60k mutants) with
-# zero tolerated mismatches. go-algorand needs its libsodium fork built through
+# zero tolerated mismatches. Issue #2396 adds the non-consensus entry points
+# (fixture sets `ledger`, `network`, `p2p`): catchpoint file sections, the
+# identity handshake messages, the tx-sync response and the libp2p peer meta
+# headers, each replayed by a `strict_unknown_fields_go_parity` test of its
+# crate. go-algorand needs its libsodium fork built through
 # its own entry point (`make libsodium`, see CLAUDE.md).
 
 on:
@@ -22,6 +26,12 @@ on:
       - "scripts/strict-decode/**"
       - "crates/core/algo-agreement/tests/strict_unknown_fields_go_parity.rs"
       - "crates/core/algo-agreement/tests/fixtures/strict_decode/**"
+      - "crates/*/*/tests/strict_unknown_fields_go_parity.rs"
+      - "crates/*/*/tests/fixtures/strict_decode/**"
+      - "crates/core/algo-ledger/src/catchpoint/**"
+      - "crates/node/algo-network/src/identity.rs"
+      - "crates/node/algo-network/src/tx_sync_client.rs"
+      - "crates/node/algo-p2p/src/wsproto.rs"
       - "crates/core/algo-agreement/src/codec.rs"
       - "crates/core/algo-types/src/**"
       - "crates/core/algo-codec/src/lib.rs"
@@ -71,12 +81,18 @@ jobs:
             --go-algorand "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
 
       - name: algod-rust matches go on every committed mutant
-        run: cargo test -p algo-agreement --test strict_unknown_fields_go_parity rust_decoders_match_go
+        run: |
+          set -euo pipefail
+          cargo test -p algo-agreement --test strict_unknown_fields_go_parity rust_decoders_match_go
+          cargo test -p algo-ledger -p algo-network -p algo-p2p --test strict_unknown_fields_go_parity
 
-      - name: Differential fuzz against go (about 60k mutants)
+      - name: Differential fuzz against go (about 60k + 18k non-consensus mutants)
         run: |
           set -euo pipefail
           python3 scripts/strict-decode/strict_decode_fixtures.py --fuzz 100000 "$RUNNER_TEMP/fuzz.jsonl" \
             --go-algorand "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
           STRICT_FUZZ_FILE="$RUNNER_TEMP/fuzz.jsonl" \
             cargo test -p algo-agreement --test strict_unknown_fields_go_parity fuzz_file -- --nocapture
+          # the non-consensus sets (issue #2396) read $STRICT_FUZZ_FILE.<set>
+          STRICT_FUZZ_FILE="$RUNNER_TEMP/fuzz.jsonl" \
+            cargo test -p algo-ledger -p algo-network -p algo-p2p --test strict_unknown_fields_go_parity -- --nocapture

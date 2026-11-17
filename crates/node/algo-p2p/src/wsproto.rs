@@ -185,9 +185,84 @@ fn encode_headers(headers: &PeerMetaHeaders) -> Vec<u8> {
     rmp_serde::to_vec(headers).expect("BTreeMap<String, Vec<String>> is always serializable")
 }
 
-/// Decode go's `peerMetaHeaders` msgpack wire form back into a header map.
-fn decode_headers(bytes: &[u8]) -> Result<PeerMetaHeaders, WsProtoError> {
-    rmp_serde::from_slice(bytes).map_err(|e| WsProtoError::HeaderDecode(e.to_string()))
+/// go `maxHeaderKeys` (`network/p2pMetainfo.go`): the `allocbound` of `peerMetaHeaders`.
+const MAX_HEADER_KEYS: usize = 64;
+/// go `maxHeaderValues`: the `allocbound` of one header's `peerMetaValues`.
+const MAX_HEADER_VALUES: usize = 16;
+
+/// Decode go's `peerMetaHeaders` msgpack wire form back into a header map,
+/// as its generated `UnmarshalMsg` does (issue #2396): `nil` is an empty map
+/// or value list, at most [`MAX_HEADER_KEYS`] keys and [`MAX_HEADER_VALUES`]
+/// values per key (`msgp.ErrOverflow`), a value list may be written as a map
+/// (read as its interleaved key/value array, go-codec compat), keys and values are go strings
+/// (`msgp.ReadStringBytes`: any bytes, `nil` is ""; invalid UTF-8 is
+/// replaced, which go's own header lookups never match either), a repeated
+/// key replaces the earlier one, and trailing bytes are ignored.
+pub fn decode_headers(bytes: &[u8]) -> Result<PeerMetaHeaders, WsProtoError> {
+    let err = |m: String| WsProtoError::HeaderDecode(m);
+    let mut rd = bytes;
+    let mut out = PeerMetaHeaders::new();
+    if take_nil(&mut rd) {
+        return Ok(out);
+    }
+    let n =
+        rmp::decode::read_map_len(&mut rd).map_err(|e| err(format!("headers map: {e}")))? as usize;
+    if n > MAX_HEADER_KEYS {
+        return Err(err(format!("{n} headers overflow {MAX_HEADER_KEYS}")));
+    }
+    for _ in 0..n {
+        let key = read_go_string(&mut rd).map_err(err)?;
+        let values = if take_nil(&mut rd) {
+            Vec::new()
+        } else {
+            // go-codec compat in `msgp.ReadArrayHeaderBytes`: a map is read
+            // as its interleaved key/value array
+            let m = match rd.first() {
+                Some(0x80..=0x8f | 0xde | 0xdf) => {
+                    2 * rmp::decode::read_map_len(&mut rd)
+                        .map_err(|e| err(format!("header {key:?} values: {e}")))?
+                        as usize
+                }
+                _ => rmp::decode::read_array_len(&mut rd)
+                    .map_err(|e| err(format!("header {key:?} values: {e}")))?
+                    as usize,
+            };
+            if m > MAX_HEADER_VALUES {
+                return Err(err(format!(
+                    "header {key:?}: {m} values overflow {MAX_HEADER_VALUES}"
+                )));
+            }
+            (0..m)
+                .map(|_| read_go_string(&mut rd))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(err)?
+        };
+        out.insert(key, values);
+    }
+    Ok(out)
+}
+
+fn take_nil(rd: &mut &[u8]) -> bool {
+    if rd.first() == Some(&0xc0) {
+        *rd = &rd[1..];
+        true
+    } else {
+        false
+    }
+}
+
+/// go `msgp.ReadStringBytes`: a `str` (or `nil`, read as "") of any bytes.
+fn read_go_string(rd: &mut &[u8]) -> Result<String, String> {
+    if take_nil(rd) {
+        return Ok(String::new());
+    }
+    let len = rmp::decode::read_str_len(rd).map_err(|e| format!("string: {e}"))? as usize;
+    if rd.len() < len {
+        return Err(format!("string: need {len} bytes, have {}", rd.len()));
+    }
+    let s = String::from_utf8_lossy(&rd[..len]).into_owned();
+    *rd = &rd[len..];
+    Ok(s)
 }
 
 /// Write the 2-byte-length-prefixed msgpack peer-meta-headers message.

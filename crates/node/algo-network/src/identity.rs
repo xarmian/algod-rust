@@ -204,7 +204,7 @@ pub struct IdentityChallengeSigned {
     pub msg: IdentityChallenge,
 
     /// Ed25519 signature over `"NIC" || canonical_encode(msg)`. Go codec tag: `sig`.
-    #[serde(rename = "sig", with = "serde_bytes")]
+    #[serde(rename = "sig", default, with = "serde_bytes")]
     pub signature: Vec<u8>,
 }
 
@@ -261,7 +261,7 @@ pub struct IdentityChallengeResponseSigned {
     pub msg: IdentityChallengeResponse,
 
     /// Ed25519 signature over `"NIR" || canonical_encode(msg)`. Go codec tag: `sig`.
-    #[serde(rename = "sig", with = "serde_bytes")]
+    #[serde(rename = "sig", default, with = "serde_bytes")]
     pub signature: Vec<u8>,
 }
 
@@ -308,7 +308,7 @@ pub struct IdentityVerificationMessageSigned {
     pub msg: IdentityVerificationMessage,
 
     /// Ed25519 signature over `"NIV" || canonical_encode(msg)`. Go codec tag: `sig`.
-    #[serde(rename = "sig", with = "serde_bytes")]
+    #[serde(rename = "sig", default, with = "serde_bytes")]
     pub signature: Vec<u8>,
 }
 
@@ -601,6 +601,226 @@ pub fn attach_challenge_header(challenge_signed: &IdentityChallengeSigned) -> St
     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &encoded)
 }
 
+// ---------------------------------------------------------------------------
+// Wire decoding: go's generated msgp decoders (issue #2396)
+// ---------------------------------------------------------------------------
+//
+// go reads the three messages with `protocol.Decode` (`network/netidentity.go`),
+// i.e. their generated `UnmarshalMsg`: a key the struct lacks is
+// `msgp.ErrNoField`, `nil` is a zero struct, a struct may also be a positional
+// array, a `[32]byte` / `[64]byte` is read with `msgp.ReadExactBytes` (zero
+// padded) and `PublicAddress` is bounded by `maxAddressLen`. A repeated key is
+// decoded again into the same field (a
+// nested struct is merged, as go does).
+
+/// go `maxAddressLen` (`network/netidentity.go`): the `allocbound` of
+/// `identityChallenge.PublicAddress`.
+const MAX_ADDRESS_LEN: usize = 256 + 32;
+
+fn wire_err(msg: impl std::fmt::Display) -> IdentityError {
+    IdentityError::MsgpackDecode(rmp_serde::decode::Error::Syntax(msg.to_string()))
+}
+
+/// Read one go msgp struct from `rd`: map form (each key handed to `field`,
+/// which returns `false` for a key the struct lacks) or positional array form
+/// (element `i` read as `names[i]`, more elements than fields is an error).
+fn read_go_struct(
+    rd: &mut &[u8],
+    what: &str,
+    names: &[&str],
+    mut field: impl FnMut(&[u8], &mut &[u8]) -> Result<bool, IdentityError>,
+) -> Result<(), IdentityError> {
+    let marker = *rd
+        .first()
+        .ok_or_else(|| wire_err(format!("{what}: unexpected end")))?;
+    match marker {
+        0xc0 => {
+            *rd = &rd[1..];
+            Ok(())
+        }
+        0x80..=0x8f | 0xde | 0xdf => {
+            let n = rmp::decode::read_map_len(rd).map_err(|e| wire_err(format!("{what}: {e}")))?;
+            for _ in 0..n {
+                let key = read_go_key(rd)?;
+                if !field(key, rd)? {
+                    return Err(wire_err(format!(
+                        "no matching struct field found when decoding stream map with key {}",
+                        String::from_utf8_lossy(key)
+                    )));
+                }
+            }
+            Ok(())
+        }
+        0x90..=0x9f | 0xdc | 0xdd => {
+            let n = rmp::decode::read_array_len(rd).map_err(|e| wire_err(format!("{what}: {e}")))?
+                as usize;
+            if n > names.len() {
+                return Err(wire_err(format!("{what}: too many array fields: {n}")));
+            }
+            for name in &names[..n] {
+                field(name.as_bytes(), rd)?;
+            }
+            Ok(())
+        }
+        other => Err(wire_err(format!(
+            "{what}: expected a map, got 0x{other:02x}"
+        ))),
+    }
+}
+
+/// A map key (`msgp.ReadMapKeyZC`: `str` or `bin`).
+fn read_go_key<'a>(rd: &mut &'a [u8]) -> Result<&'a [u8], IdentityError> {
+    let (hdr, len) = match *rd.first().ok_or_else(|| wire_err("key: unexpected end"))? {
+        m @ 0xa0..=0xbf => (1, (m & 0x1f) as usize),
+        0xd9 | 0xc4 => (
+            2,
+            *rd.get(1).ok_or_else(|| wire_err("key: truncated"))? as usize,
+        ),
+        0xda | 0xc5 => (
+            3,
+            u16::from_be_bytes([
+                *rd.get(1).ok_or_else(|| wire_err("key: truncated"))?,
+                *rd.get(2).ok_or_else(|| wire_err("key: truncated"))?,
+            ]) as usize,
+        ),
+        other => return Err(wire_err(format!("key: unexpected marker 0x{other:02x}"))),
+    };
+    let body = rd
+        .get(hdr..hdr + len)
+        .ok_or_else(|| wire_err("key: truncated"))?;
+    *rd = &rd[hdr + len..];
+    Ok(body)
+}
+
+fn read_exact<const N: usize>(rd: &mut &[u8]) -> Result<Vec<u8>, IdentityError> {
+    algo_types::go_msgp::read_fixed_bytes_go_compat::<N>(rd)
+        .map(|a| a.to_vec())
+        .map_err(wire_err)
+}
+
+fn read_challenge(rd: &mut &[u8], v: &mut IdentityChallenge) -> Result<(), IdentityError> {
+    read_go_struct(rd, "identityChallenge", &["pk", "c", "a"], |k, rd| {
+        match k {
+            b"pk" => v.key = read_exact::<32>(rd)?,
+            b"c" => v.challenge = read_exact::<CHALLENGE_SIZE>(rd)?,
+            b"a" => {
+                algo_types::go_msgp::check_go_bytes_bound(rd, MAX_ADDRESS_LEN).map_err(wire_err)?;
+                v.public_address =
+                    algo_types::go_msgp::read_bytes_go_compat(rd).map_err(wire_err)?;
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })
+}
+
+fn read_challenge_response(
+    rd: &mut &[u8],
+    v: &mut IdentityChallengeResponse,
+) -> Result<(), IdentityError> {
+    read_go_struct(
+        rd,
+        "identityChallengeResponse",
+        &["pk", "c", "rc"],
+        |k, rd| {
+            match k {
+                b"pk" => v.key = read_exact::<32>(rd)?,
+                b"c" => v.challenge = read_exact::<CHALLENGE_SIZE>(rd)?,
+                b"rc" => v.response_challenge = read_exact::<CHALLENGE_SIZE>(rd)?,
+                _ => return Ok(false),
+            }
+            Ok(true)
+        },
+    )
+}
+
+fn read_verification_message(
+    rd: &mut &[u8],
+    v: &mut IdentityVerificationMessage,
+) -> Result<(), IdentityError> {
+    read_go_struct(rd, "identityVerificationMessage", &["rc"], |k, rd| {
+        match k {
+            b"rc" => v.response_challenge = read_exact::<CHALLENGE_SIZE>(rd)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })
+}
+
+/// Decode a signed identity challenge (Message 1, after the base64 header
+/// decode): go `protocol.Decode` into `identityChallengeSigned`
+/// (`network/netidentity.go`, `VerifyRequestAndAttachResponse`).
+pub fn decode_identity_challenge_signed(
+    b: &[u8],
+) -> Result<IdentityChallengeSigned, IdentityError> {
+    let mut rd = b;
+    let mut msg = IdentityChallenge::default();
+    let mut signature = Vec::new();
+    read_go_struct(
+        &mut rd,
+        "identityChallengeSigned",
+        &["ic", "sig"],
+        |k, rd| {
+            match k {
+                b"ic" => read_challenge(rd, &mut msg)?,
+                b"sig" => signature = read_exact::<64>(rd)?,
+                _ => return Ok(false),
+            }
+            Ok(true)
+        },
+    )?;
+    Ok(IdentityChallengeSigned { msg, signature })
+}
+
+/// Decode a signed identity challenge response (Message 2): go
+/// `protocol.Decode` into `identityChallengeResponseSigned` (`VerifyResponse`).
+pub fn decode_identity_challenge_response_signed(
+    b: &[u8],
+) -> Result<IdentityChallengeResponseSigned, IdentityError> {
+    let mut rd = b;
+    let mut msg = IdentityChallengeResponse::default();
+    let mut signature = Vec::new();
+    read_go_struct(
+        &mut rd,
+        "identityChallengeResponseSigned",
+        &["icr", "sig"],
+        |k, rd| {
+            match k {
+                b"icr" => read_challenge_response(rd, &mut msg)?,
+                b"sig" => signature = read_exact::<64>(rd)?,
+                _ => return Ok(false),
+            }
+            Ok(true)
+        },
+    )?;
+    Ok(IdentityChallengeResponseSigned { msg, signature })
+}
+
+/// Decode a signed identity verification message (Message 3, without the
+/// `NI` tag): go `protocol.Decode` into `identityVerificationMessageSigned`
+/// (`identityVerificationHandler`).
+pub fn decode_identity_verification_message_signed(
+    b: &[u8],
+) -> Result<IdentityVerificationMessageSigned, IdentityError> {
+    let mut rd = b;
+    let mut msg = IdentityVerificationMessage::default();
+    let mut signature = Vec::new();
+    read_go_struct(
+        &mut rd,
+        "identityVerificationMessageSigned",
+        &["ivm", "sig"],
+        |k, rd| {
+            match k {
+                b"ivm" => read_verification_message(rd, &mut msg)?,
+                b"sig" => signature = read_exact::<64>(rd)?,
+                _ => return Ok(false),
+            }
+            Ok(true)
+        },
+    )?;
+    Ok(IdentityVerificationMessageSigned { msg, signature })
+}
+
 /// Decode, verify, and respond to an identity challenge from an HTTP header.
 ///
 /// Given a base64-encoded signed challenge from the request, this function:
@@ -636,7 +856,7 @@ pub fn verify_challenge_and_respond(
         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, header_value)?;
 
     // Decode msgpack
-    let signed: IdentityChallengeSigned = rmp_serde::from_slice(&msg_bytes)?;
+    let signed = decode_identity_challenge_signed(&msg_bytes)?;
 
     // Extract and verify the public key
     let peer_pk_bytes: [u8; 32] = signed.msg.key[..]
@@ -716,7 +936,7 @@ pub fn verify_challenge_response(
         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, response_header)?;
 
     // Decode msgpack
-    let signed: IdentityChallengeResponseSigned = rmp_serde::from_slice(&msg_bytes)?;
+    let signed = decode_identity_challenge_response_signed(&msg_bytes)?;
 
     // Check original challenge matches (Go: netidentity.go line 287)
     if signed.msg.challenge.as_slice() != expected_challenge.as_slice() {
@@ -786,7 +1006,7 @@ pub fn verify_identity_verification(
     peer_key: &VerifyingKey,
 ) -> Result<(), IdentityError> {
     // Decode msgpack
-    let signed: IdentityVerificationMessageSigned = rmp_serde::from_slice(payload)?;
+    let signed = decode_identity_verification_message_signed(payload)?;
 
     // Check challenge matches (Go: line 421)
     if signed.msg.response_challenge.as_slice() != expected_challenge.as_slice() {

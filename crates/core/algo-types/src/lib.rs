@@ -61,9 +61,9 @@ pub use rmp_decode::{check_msgpack_depth, msgpack_value_len};
 /// wire decoders in other crates (issue #2063); see `docs/BYTES_DECODE_PARITY.md`.
 pub mod go_msgp {
     pub use crate::rmp_decode::{
-        read_address_go_compat, read_bytes_go_compat, read_fixed_bytes_go_compat,
-        EVAL_MAX_ARGS, MAX_LOGIC_SIG_ARG_SIZE, MAX_LOGIC_SIG_MAX_SIZE, MAX_MULTISIG,
-        MAX_PQ_PUBLIC_KEY_SIZE, MAX_PQ_SIGNATURE_SIZE,
+        check_go_bytes_bound, read_address_go_compat, read_bytes_go_compat,
+        read_fixed_bytes_go_compat, read_string, EVAL_MAX_ARGS, MAX_LOGIC_SIG_ARG_SIZE,
+        MAX_LOGIC_SIG_MAX_SIZE, MAX_MULTISIG, MAX_PQ_PUBLIC_KEY_SIZE, MAX_PQ_SIGNATURE_SIZE,
     };
 }
 pub use rmp_decode::{
