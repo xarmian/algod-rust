@@ -76,6 +76,7 @@ hyper-util = { version = "0.1", features = ["tokio", "service"] }
 libc.workspace = true
 
 [dev-dependencies]
+teal-corpus = { path = "../../crates/tools/teal-corpus" }
 algo-ledger = { workspace = true, features = ["test-hooks"] }
 tokio = { workspace = true, features = ["test-util"] }
 serde_bytes = "0.11"

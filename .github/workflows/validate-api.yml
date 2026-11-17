@@ -89,7 +89,19 @@ jobs:
           shared-key: validate-api
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # Issue #2370: live_teal_corpus_parity sends a seeded sample of the
+      # ARC56Registry TEAL corpus through both nodes' /v2/teal/* handlers. The
+      # registry is fetched shallow at the recorded SHA (scripts/teal-corpus/fetch.py);
+      # bump the pin together with the offline tier's corpus.
+      - name: Fetch the TEAL corpus (ARC56Registry at the recorded SHA)
+        run: |
+          python3 -I scripts/teal-corpus/fetch.py --ref 11b5518f7fd02dea46adc645c880aeac15601a65 --work-dir teal-corpus-work
+          python3 -I scripts/teal-corpus/extract.py --work-dir teal-corpus-work
+
       - name: Run dual-node parity suite
+        env:
+          TEAL_CORPUS_DIR: ${{ github.workspace }}/teal-corpus-work/corpus
+          TEAL_CORPUS_REQUIRED: "1"
         run: make validate-api
 
       - name: Dump node logs on failure

@@ -114,10 +114,13 @@ pub fn error_response_for_status(status: StatusCode, msg: impl Into<String>) -> 
     error_response(status, msg)
 }
 
+pub use algo_codec::escape_json_like_go;
+
 /// Build a JSON error response with the given status code and message.
 fn error_response(status: StatusCode, msg: impl Into<String>) -> Response {
     let body = ErrorResponse::new(msg);
     let json = serde_json::to_string(&body)
+        .map(|j| escape_json_like_go(&j))
         .unwrap_or_else(|_| r#"{"message":"internal error"}"#.to_string());
     (status, [("content-type", "application/json")], json).into_response()
 }
@@ -151,6 +154,7 @@ fn error_response_with_data(
         message: msg.into(),
     };
     let json = serde_json::to_string(&body)
+        .map(|j| escape_json_like_go(&j))
         .unwrap_or_else(|_| r#"{"message":"internal error"}"#.to_string());
     (status, [("content-type", "application/json")], json).into_response()
 }

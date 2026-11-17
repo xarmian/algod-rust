@@ -210,6 +210,7 @@ validate-api-up:
 	@cargo test --release -p algod-rust --test live_auth_parity --no-run
 	@cargo test --release -p algod-rust --test live_headers_parity --no-run
 	@cargo test --release -p algod-rust --test live_endpoint_sweep --no-run
+	@cargo test --release -p algod-rust --test live_teal_corpus_parity --no-run
 	@cargo test --release -p algod-rust --test live_txn_cross_verification --no-run
 	@cargo test --release -p algod-rust --test live_box_pagination_parity --no-run
 	@cargo test --release -p algod-rust --test live_state_delta_parity --no-run
@@ -271,6 +272,9 @@ validate-api-logs:
 ## Bring up the dual-node harness, run every live parity suite
 ## (bin/algod-rust/tests/live_go_parity.rs, live_msgpack_parity.rs,
 ## live_auth_parity.rs, live_headers_parity.rs, live_endpoint_sweep.rs,
+## live_teal_corpus_parity.rs (issue #2370: a corpus sample through /v2/teal/compile
+## and /disassemble; skips unless TEAL_CORPUS_DIR holds a corpus from
+## `make teal-corpus-fetch`, fails instead when TEAL_CORPUS_REQUIRED=1),
 ## live_txn_cross_verification.rs, live_varint_branch_parity.rs,
 ## live_box_pagination_parity.rs, live_longpoll_parity.rs,
 ## live_online_circulation_expiry.rs, live_state_proof_voters_parity.rs,
@@ -337,6 +341,7 @@ validate-api:
 	 cargo test --release -p algod-rust --test live_auth_parity -- --ignored --nocapture && \
 	 cargo test --release -p algod-rust --test live_headers_parity -- --ignored --nocapture && \
 	 cargo test --release -p algod-rust --test live_endpoint_sweep -- --ignored --nocapture && \
+	 cargo test --release -p algod-rust --test live_teal_corpus_parity -- --ignored --nocapture && \
 	 cargo test --release -p algod-rust --test live_txn_cross_verification -- --ignored --nocapture --test-threads=1 && \
 	 cargo test --release -p algod-rust --test live_varint_branch_parity -- --ignored --nocapture --test-threads=1 && \
 	 cargo test --release -p algod-rust --test live_fee_size_pricing_parity -- --ignored --nocapture --test-threads=1 && \

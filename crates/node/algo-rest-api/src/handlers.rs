@@ -3559,13 +3559,60 @@ pub async fn get_txn_group_deltas_for_round<N: NodeInterface>(
 /// Matches go-algorand's `MaxTealSourceBytes = 512 * 1024`.
 const MAX_TEAL_BODY_BYTES: usize = 512 * 1024;
 
-/// Query parameters for the TEAL compile endpoint.
-#[derive(Debug, Deserialize)]
-pub struct TealCompileParams {
-    /// When true, include a source map in the response.
-    #[serde(default)]
-    pub sourcemap: Option<bool>,
+/// go's `strconv.Quote` for the characters a query value can plausibly carry.
+fn go_quote(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", c as u32))
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
+
+/// go's `runtime.BindQueryParameter("form", true, false, "sourcemap", ...)`
+/// for an optional `*bool` (`generated/nonparticipating/public/routes.go`): no
+/// value is `None`, more than one value and an unparsable one (`strconv.ParseBool`
+/// accepts `1 t T TRUE true True 0 f F FALSE false False`) are the 400 message
+/// go's wrapper returns *before* the handler (and its `EnableDeveloperAPI`
+/// check) runs.
+fn bind_sourcemap_param(pairs: &[(String, String)]) -> Result<Option<bool>, String> {
+    let values: Vec<&str> = pairs
+        .iter()
+        .filter(|(k, _)| k == "sourcemap")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    let value = match values.as_slice() {
+        [] => return Ok(None),
+        [v] => *v,
+        _ => {
+            return Err(
+                "Invalid format for parameter sourcemap: multiple values for single value parameter 'sourcemap'"
+                    .to_string(),
+            )
+        }
+    };
+    match value {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Ok(Some(true)),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Ok(Some(false)),
+        v => Err(format!(
+            "Invalid format for parameter sourcemap: error binding string parameter: strconv.ParseBool: parsing {}: invalid syntax",
+            go_quote(v)
+        )),
+    }
+}
+
+/// go's `http.MaxBytesReader` error text, which `badRequest` returns verbatim.
+const REQUEST_BODY_TOO_LARGE: &str = "http: request body too large";
 
 /// Compile TEAL source to AVM bytecode.
 ///
@@ -3575,9 +3622,15 @@ pub struct TealCompileParams {
 /// Matches go-algorand's `Handlers.TealCompile`.
 pub async fn teal_compile<N: NodeInterface>(
     State(node): State<AppState<N>>,
-    Query(params): Query<TealCompileParams>,
+    Query(pairs): Query<Vec<(String, String)>>,
     body: axum::body::Bytes,
 ) -> Response {
+    // go binds the query parameter before the handler runs.
+    let sourcemap_requested = match bind_sourcemap_param(&pairs) {
+        Ok(v) => v.unwrap_or(false),
+        Err(msg) => return error::bad_request(msg),
+    };
+
     // Check if developer API is enabled
     if !node.enable_developer_api() {
         return crate::error_envelope::plain_text_response(
@@ -3588,7 +3641,7 @@ pub async fn teal_compile<N: NodeInterface>(
 
     // Enforce body size limit
     if body.len() > MAX_TEAL_BODY_BYTES {
-        return error::bad_request("request body too large");
+        return error::bad_request(REQUEST_BODY_TOO_LARGE);
     }
 
     // Parse body as UTF-8 source text
@@ -3598,24 +3651,19 @@ pub async fn teal_compile<N: NodeInterface>(
     };
 
     // Assemble the TEAL source
-    let ops = match algo_avm::assembler::assemble_string_checked(source) {
+    let ops = match algo_avm::assembler::assemble_string_reported(source) {
         Ok(ops) => ops,
         // go's assembler panics here and no handler/middleware recovers, so
         // net/http drops the connection without answering (the node keeps
         // serving). Match that without panicking: abort the connection.
-        Err(algo_avm::assembler::AssembleFailure::Panic(msg)) => {
+        Err((algo_avm::assembler::AssembleFailure::Panic(msg), _)) => {
             tracing::warn!(panic = %msg, "teal compile: go's assembler would panic; dropping the connection");
             return crate::error_envelope::aborted_connection_response();
         }
-        Err(algo_avm::assembler::AssembleFailure::Errors(errors)) => {
-            let mut sb = String::new();
-            for err in &errors {
-                if !sb.is_empty() {
-                    sb.push('\n');
-                }
-                sb.push_str(&err.to_string());
-            }
-            return error::bad_request(sb);
+        Err((algo_avm::assembler::AssembleFailure::Errors(errors), warnings)) => {
+            return error::bad_request(algo_avm::assembler::report_multiple_errors(
+                "", &errors, &warnings,
+            ));
         }
     };
 
@@ -3633,22 +3681,25 @@ pub async fn teal_compile<N: NodeInterface>(
     // Base64-encode the compiled program
     let result = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ops.program);
 
-    // Build source map if requested
-    let sourcemap = if params.sourcemap.unwrap_or(false) {
-        let sm =
-            algo_avm::sourcemap::get_source_map(vec!["<body>".to_string()], &ops.offset_to_source);
-        Some(serde_json::to_value(sm).unwrap_or(serde_json::Value::Null))
-    } else {
-        None
-    };
-
-    let response = models::CompileResponse {
+    // `CompileResponseWithSourceMap`: hash, result, then the source map in go's
+    // struct field order (version, sources, names, mappings).
+    #[derive(serde::Serialize)]
+    struct CompileOut {
+        hash: String,
+        result: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sourcemap: Option<algo_avm::sourcemap::SourceMap>,
+    }
+    let sourcemap = sourcemap_requested.then(|| {
+        algo_avm::sourcemap::get_source_map(vec!["<body>".to_string()], &ops.offset_to_source)
+    });
+    let response = CompileOut {
         hash: hash_str,
         result,
         sourcemap,
     };
 
-    match serde_json::to_vec(&response) {
+    match serde_json::to_string(&response).map(|j| error::escape_json_like_go(&j)) {
         Ok(bytes) => (
             StatusCode::OK,
             [("content-type", "application/json")],
@@ -3683,7 +3734,7 @@ pub async fn teal_disassemble<N: NodeInterface>(
 
     // Enforce body size limit
     if body.len() > MAX_TEAL_BODY_BYTES {
-        return error::bad_request("request body too large");
+        return error::bad_request(REQUEST_BODY_TOO_LARGE);
     }
 
     // Disassemble the program
@@ -3694,7 +3745,7 @@ pub async fn teal_disassemble<N: NodeInterface>(
 
     let response = models::DisassembleResponse { result: program };
 
-    match serde_json::to_vec(&response) {
+    match serde_json::to_string(&response).map(|j| error::escape_json_like_go(&j)) {
         Ok(bytes) => (
             StatusCode::OK,
             [("content-type", "application/json")],

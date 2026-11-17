@@ -514,19 +514,12 @@ pub struct TealsignArgs {
     pub set_lsig_arg_idx: i64,
 }
 
-/// `clerk compile [files...] [-o out] [-n] [-s] [-w wallet] [-a account]`.
+/// `clerk compile [files...] [-o out] [-n] [-m] [-D]`.
 ///
-/// Mirrors Go's `compileCmd` (clerk.go:1090). Each input file's TEAL source is
-/// compiled via `POST /v2/teal/compile`; by default the raw program bytes are
-/// written to `<file>.tok` and the program's contract address is printed as
-/// `<file>: <address>`. `-o`/`--outfile` overrides the binary output path (use
-/// `-` for stdout, which suppresses the address line, matching Go).
-///
-/// **Out of scope (documented):** Go's `-D/--disassemble` and `-m/--map`
-/// (source map) sub-modes and `-s/--sign` (emit a wallet-signed LogicSig
-/// record) are not implemented here — the `--sign` LogicSig-signing path lands
-/// with the other LogicSig/multisig signing work, so the sign flags are omitted
-/// from this leaf.
+/// Mirrors Go's `compileCmd` (clerk.go:1065): TEAL is assembled locally (no node
+/// needed), the program bytes go to `<file>.tok` and `<file>: <address>` is
+/// printed; `-m` also writes the source map, `-D` disassembles instead.
+/// `-s/--sign` (wallet-signed LogicSig record) is not implemented.
 #[derive(Args, Debug)]
 pub struct CompileArgs {
     /// TEAL source files to compile (Go's positional `[input file ...]`).
@@ -541,6 +534,12 @@ pub struct CompileArgs {
     /// the program's contract address.
     #[arg(short = 'n', long = "no-out")]
     pub no_out: bool,
+    /// Write the source map to `<out>.map` (Go `-m/--map`).
+    #[arg(short = 'm', long = "map")]
+    pub map: bool,
+    /// Disassemble a compiled program instead of compiling (Go `-D/--disassemble`).
+    #[arg(short = 'D', long = "disassemble")]
+    pub disassemble: bool,
 }
 
 /// `wallet` is the group-level `-w` (Go's persistent clerk flag); leaves that
