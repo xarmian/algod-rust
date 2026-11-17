@@ -413,8 +413,7 @@ Every row where Go is faster with non-overlapping ranges, and who owns it
 | `micro avm/app-state-box` | 1.26x | [#2320](https://github.com/xarmian/algod-rust/issues/2320): per-call setup costs (bytecode parse, machine construction, allocation) |
 | `micro agreement/sortition-select-f128` | 1.22x | [#2321](https://github.com/xarmian/algod-rust/issues/2321): software f128; measured, division is not the lever (PERF_PHASE23.md row 9) |
 | `rest account_hot` p50 | 1.03x | [#2340](https://github.com/xarmian/algod-rust/issues/2340) |
-| `teal-corpus assemble-sources/all`, `assemble-disassembled/all` (wall, MB/s, p50, p99) | 1.24x, 1.26x (p50 1.30x, 1.33x) | [#2410](https://github.com/xarmian/algod-rust/issues/2410): per-call fixed cost on the typical small program (the 20 largest sources are level); profile first |
-| `teal-corpus disassemble/all` wall, MB/s | 1.08x | [#2411](https://github.com/xarmian/algod-rust/issues/2411): 0.04 s in total; p50 is inconclusive and Rust is ahead on p99 (1.20x) and on the 20 largest programs (1.12x) |
+| `teal-corpus assemble-disassembled/all` wall, MB/s; `assemble-sources/all`, `assemble-disassembled/all` p50, p99 | 1.05x; p50 1.11x to 1.13x, p99 1.09x to 1.14x | [#2410](https://github.com/xarmian/algod-rust/issues/2410): per-call fixed cost on the typical small program (the 20 largest sources are now Rust 1.05x, `assemble-sources/all` wall is inconclusive); profile first. The #2411 driver fix below removed about 0.18 s of dispatch overhead from these rows (2026-11-17, `RUNS=10`) |
 | `localnet` `fixed` p95/p99, `ladder-50` p50/p95/p99 latency | 1.23x, 1.05x to 1.07x | round-quantised noise (see Headline), no node cost |
 
 The first baseline's findings are closed: #2145 (certificate authentication on
@@ -446,17 +445,33 @@ The `teal-corpus` tier (`make bench-compare TIERS=teal-corpus`) times go-algoran
 and algod-rust's TEAL disassembler and assembler, single-threaded, over the
 3,692 programs / 3,687 sources of the ARC56Registry (`e75e509c`), gated on
 byte-identical outputs. Run on 2026-11-17 on the same machine as above (go
-`v5.0.5-stable`, algod-rust `8af88af3`, `RUNS=10`, gate green, zero mismatches).
+`v5.0.5-stable`, algod-rust `73317092` = #2411, `RUNS=10`, gate green, zero
+mismatches; the first run, `8af88af3`, in brackets).
 Full report, stats, history and reproduction: [TEAL_CORPUS_PARITY.md](TEAL_CORPUS_PARITY.md).
 
 | Workload | Metric | Go | Rust | Faster |
 |---|---|---|---|---|
-| `disassemble/all` | wall | 0.486 s | 0.525 s | Go 1.08x ([#2411](https://github.com/xarmian/algod-rust/issues/2411)) |
-| `disassemble/all` | p50 / p99 per program | 44.6 / 1,105 us | 46.2 / 919 us | inconclusive / Rust 1.20x |
-| `assemble-disassembled/all` | wall | 1.080 s | 1.355 s | Go 1.26x ([#2410](https://github.com/xarmian/algod-rust/issues/2410)) |
-| `assemble-sources/all` | wall | 1.127 s | 1.394 s | Go 1.24x ([#2410](https://github.com/xarmian/algod-rust/issues/2410)) |
-| `disassemble/top20` | wall | 42.2 ms | 37.5 ms | Rust 1.12x |
-| `assemble-sources/top20` | wall | 83.6 ms | 83.9 ms | inconclusive |
+| `disassemble/all` | wall | 0.470 s | 0.108 s | Rust 4.34x (was Go 1.08x, [#2411](https://github.com/xarmian/algod-rust/issues/2411)) |
+| `disassemble/all` | p50 / p99 per program | 43.7 / 1,048 us | 10.1 / 283 us | Rust 4.33x / Rust 3.70x |
+| `assemble-disassembled/all` | wall | 1.025 s | 1.079 s | Go 1.05x (was 1.26x, [#2410](https://github.com/xarmian/algod-rust/issues/2410)) |
+| `assemble-sources/all` | wall | 1.074 s | 1.123 s | inconclusive (was Go 1.24x, [#2410](https://github.com/xarmian/algod-rust/issues/2410)) |
+| `disassemble/top20` | wall | 42.7 ms | 13.2 ms | Rust 3.24x (was 1.12x) |
+| `assemble-sources/top20` | wall | 86.8 ms | 82.4 ms | Rust 1.05x (was inconclusive) |
+
+Where the #2411 change came from (profile and split measurement on the issue):
+the batch wall clock of `disassemble/all` was 0.47 s on both sides, but of
+Rust's, 0.36 s was the disassembler (go's: 0.41 s) and 0.11 s, 30 us per
+input, was the driver handing every input to its worker thread over a channel
+and the row back over another (two futex wake-ups per input; go's 11 us per
+input is a goroutine run on the same P). The driver's workers now claim their
+own inputs and the per-job supervisor only wakes at a deadline or the worker's
+exit: dispatch overhead 110.5 ms to 2.3 ms, and the per-program time fell from
+359 to 322 ms with it (the worker no longer sleeps between inputs). The
+disassembler writes every line into the output in place (no `String` per
+instruction, no `format!` per hex byte, labels as numbers in a pc-indexed table
+instead of a `HashMap<i64, String>`): 359 to 121 ms on its own. Together: 469 ms
+to 104 ms against go's 451 ms, rows byte-identical with go's on every run. The
+assembler rows gained from the driver change alone (same dispatch path).
 
 ## Regression detection and CI
 

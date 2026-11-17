@@ -130,30 +130,34 @@ make teal-corpus-fetch
 make bench-compare TIERS=teal-corpus RUNS=10 BENCH_CLEAN=1 BENCH_RUN_DIR=bench-results/teal-corpus
 ```
 
-Results of the run above (`RUNS=10`, medians, 95% CI of the median in
-`report.md`; the gate passed on every run of every workload):
+Results (`RUNS=10`, medians, 95% CI of the median in `report.md`; the gate
+passed on every run of every workload), 2026-11-17, go `v5.0.5-stable`,
+algod-rust `73317092` (issue #2411), the first run (`8af88af3`) in brackets:
 
 | Workload | Metric | Go | Rust | Faster |
 |---|---|---|---|---|
-| `disassemble/all` | wall | 0.486 s | 0.525 s | Go 1.08x |
-| | MB/s | 6.48 | 5.99 | Go 1.08x |
-| | p50 / p99 per program | 44.6 / 1,105 us | 46.2 / 919 us | inconclusive / Rust 1.20x |
-| `assemble-disassembled/all` | wall | 1.080 s | 1.355 s | Go 1.26x |
-| | MB/s | 19.27 | 15.35 | Go 1.26x |
-| | p50 / p99 per program | 107.6 / 2,465 us | 142.7 / 2,880 us | Go 1.33x / Go 1.17x |
-| `assemble-sources/all` | wall | 1.127 s | 1.394 s | Go 1.24x |
-| | MB/s | 50.34 | 40.68 | Go 1.24x |
-| | p50 / p99 per program | 113.3 / 2,625 us | 147.6 / 2,884 us | Go 1.30x / Go 1.10x |
-| `disassemble/top20` | wall | 42.2 ms | 37.5 ms | Rust 1.12x |
-| | p50 / p99 per program | 1,530 / 5,347 us | 1,542 / 4,613 us | inconclusive / Rust 1.16x |
-| `assemble-sources/top20` | wall | 83.6 ms | 83.9 ms | inconclusive |
-| | p50 / p99 per program | 3,387 / 11,917 us | 3,439 / 11,453 us | inconclusive / Rust 1.04x |
+| `disassemble/all` | wall | 0.470 s | 0.108 s | Rust 4.34x (Go 1.08x) |
+| | MB/s | 6.69 | 29.03 | Rust 4.34x (Go 1.08x) |
+| | p50 / p99 per program | 43.7 / 1,048 us | 10.1 / 283 us | Rust 4.33x / Rust 3.70x (inconclusive / Rust 1.20x) |
+| `assemble-disassembled/all` | wall | 1.025 s | 1.079 s | Go 1.05x (Go 1.26x) |
+| | MB/s | 20.31 | 19.29 | Go 1.05x (Go 1.26x) |
+| | p50 / p99 per program | 102.7 / 2,311 us | 114.2 / 2,630 us | Go 1.11x / Go 1.14x (Go 1.33x / Go 1.17x) |
+| `assemble-sources/all` | wall | 1.074 s | 1.123 s | inconclusive (Go 1.24x) |
+| | MB/s | 52.82 | 50.50 | inconclusive (Go 1.24x) |
+| | p50 / p99 per program | 108.0 / 2,513 us | 121.5 / 2,737 us | Go 1.13x / Go 1.09x (Go 1.30x / Go 1.10x) |
+| `disassemble/top20` | wall | 42.7 ms | 13.2 ms | Rust 3.24x (Rust 1.12x) |
+| | p50 / p99 per program | 1,591 / 5,307 us | 339 / 2,297 us | Rust 4.69x / Rust 2.31x |
+| `assemble-sources/top20` | wall | 86.8 ms | 82.4 ms | Rust 1.05x (inconclusive) |
+| | p50 / p99 per program | 3,567 / 12,411 us | 3,371 / 11,632 us | inconclusive / Rust 1.07x |
 
-Owners of the Go-faster rows: assembling is 1.24x to 1.26x slower on the
-corpus as a whole (small programs; the 20 largest sources are level), tracked in
-[#2410](https://github.com/xarmian/algod-rust/issues/2410); `disassemble/all` is
-1.08x slower in total while Rust is faster on the tail and on the largest programs,
-tracked in [#2411](https://github.com/xarmian/algod-rust/issues/2411). Both are
-filed with the measurement and an instruction to profile first; no optimisation
-is part of this change, and the corpus parity stays at zero mismatches.
+`wall_s` includes each driver's own per-input dispatch (go: a goroutine and a
+timer per input; Rust: long-lived workers that claim their own inputs under a
+per-job deadline supervisor). Before #2411 the Rust driver handed every input
+to its worker over a channel, 30 us per input against go's 11 us, which was
+the whole `disassemble/all` gap: the disassembler itself was already faster.
+`wall_s - sum(per-program)` measures it; the split is in
+[BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md#teal-corpus-tier-phase-25-2371).
+Assembling the typical small program is still 1.11x to 1.13x slower per program
+(p50), tracked in [#2410](https://github.com/xarmian/algod-rust/issues/2410);
+the corpus parity stays at zero mismatches.
 The run is one WSL2 desktop, so it is indicative, not a fixed reference.
