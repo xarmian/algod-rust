@@ -40,6 +40,11 @@ use std::process::{Command, Output};
 
 const GOAL_RUST_BIN: &str = env!("CARGO_BIN_EXE_goal-rust");
 
+// The records of the strict `LogicSig` decode (#2390), shared with algo-codec's tests.
+#[path = "../../../core/algo-codec/tests/common/lsig_cases.rs"]
+mod lsig_cases;
+use lsig_cases::{lsig_decode_cases, lsig_mutant_cases, lsig_mutant_cases_with};
+
 fn mixed_cluster_enabled() -> bool {
     matches!(std::env::var("MIXED_CLUSTER").as_deref(), Ok(v) if !v.is_empty() && v != "0")
 }
@@ -315,6 +320,18 @@ fn compile_matches_go_goal() {
     }
     // `-D` of signed LogicSig records (#2388) and of byte strings that are not.
     for (name, bytes) in lsig_files() {
+        cases.push(disassemble_case(&format!("D lsig {name}"), &bytes));
+    }
+    // Hand-made and damaged LogicSig records (#2390).
+    // `LSIG_MUTANTS_PER_BASE=4000` widens the seeded mutant search.
+    let mutants = match std::env::var("LSIG_MUTANTS_PER_BASE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(n) => lsig_mutant_cases_with(n),
+        None => lsig_mutant_cases(),
+    };
+    for (name, bytes) in lsig_decode_cases().into_iter().chain(mutants) {
         cases.push(disassemble_case(&format!("D lsig {name}"), &bytes));
     }
     if let Ok(dir) = std::env::var("TEAL_CORPUS_DIR") {
@@ -637,4 +654,138 @@ fn disassemble_prints_the_inspection_of_a_signed_logicsig() {
         "#pragma version 1\nkeccak256\nsha512_256\n"
     );
     assert_eq!(disassemble("empty map"), "// invalid version\n");
+}
+
+// ---- the strict `LogicSig` decode, committed (issue #2390) -------------------
+//
+// `fixtures/clerk_lsig_decode.jsonl` holds, for each record of
+// `lsig_cases.rs` whose input is at most `FIXTURE_MAX_INPUT` bytes, what go
+// v5.0.5-stable's `goal clerk compile -D` printed. goal-rust must print the
+// same (a default test, no go needed), and a `MIXED_CLUSTER=1` run re-checks the
+// file against a real go `goal`; `REGEN_LSIG_FIXTURE=1` rewrites it from go:
+//
+// ```bash
+// MIXED_CLUSTER=1 REGEN_LSIG_FIXTURE=1 cargo test -p goal-rust \
+//   --test clerk_compile_e2e lsig_decode_fixture_matches_go_goal
+// ```
+//
+// CI runs the check in `.github/workflows/teal-corpus-drivers.yml`.
+
+const LSIG_FIXTURE: &str = "tests/fixtures/clerk_lsig_decode.jsonl";
+/// Larger records are compared with go live only (`compile_matches_go_goal`).
+const FIXTURE_MAX_INPUT: usize = 2048;
+/// Longer output is stored as its SHA-256 and length.
+const FIXTURE_INLINE_OUTPUT: usize = 1024;
+
+fn lsig_fixture_cases() -> Vec<(String, Vec<u8>)> {
+    lsig_decode_cases()
+        .into_iter()
+        .chain(lsig_mutant_cases())
+        .filter(|(_, b)| b.len() <= FIXTURE_MAX_INPUT)
+        .collect()
+}
+
+/// The part of go's output that is kept, as one fixture row.
+fn fixture_row(name: &str, input: &[u8], run: &RunResult) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    let mut row = serde_json::Map::new();
+    row.insert("name".into(), name.into());
+    row.insert("input".into(), hex::encode(input).into());
+    row.insert("code".into(), run.0.into());
+    for (key, bytes) in [("stdout", &run.1), ("stderr", &run.2)] {
+        if bytes.is_empty() {
+            continue;
+        }
+        match std::str::from_utf8(bytes) {
+            Ok(t) if bytes.len() <= FIXTURE_INLINE_OUTPUT => {
+                row.insert(key.into(), t.into());
+            }
+            _ if bytes.len() > FIXTURE_INLINE_OUTPUT => {
+                row.insert(
+                    format!("{key}_sha256"),
+                    hex::encode(Sha256::digest(bytes)).into(),
+                );
+                row.insert(format!("{key}_len"), bytes.len().into());
+            }
+            _ => {
+                row.insert(format!("{key}_hex"), hex::encode(bytes).into());
+            }
+        }
+    }
+    serde_json::Value::Object(row)
+}
+
+fn read_fixture() -> Vec<serde_json::Value> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(LSIG_FIXTURE);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("fixture row is JSON"))
+        .collect()
+}
+
+fn disassemble_run(bin: &Path, name: &str, input: &[u8]) -> RunResult {
+    run_case(bin, &disassemble_case(name, input))
+}
+
+#[test]
+fn lsig_decode_fixture_matches_goal_rust() {
+    let cases = lsig_fixture_cases();
+    let fixture = read_fixture();
+    assert_eq!(
+        fixture.len(),
+        cases.len(),
+        "{LSIG_FIXTURE} is out of date: regenerate it (see the comment above LSIG_FIXTURE)"
+    );
+    let mut mismatches = Vec::new();
+    for ((name, input), want) in cases.iter().zip(&fixture) {
+        assert_eq!(want["name"], *name, "{LSIG_FIXTURE} is out of date");
+        assert_eq!(
+            want["input"],
+            hex::encode(input),
+            "{name}: {LSIG_FIXTURE} is out of date"
+        );
+        let got = fixture_row(
+            name,
+            input,
+            &disassemble_run(Path::new(GOAL_RUST_BIN), name, input),
+        );
+        if got != *want {
+            mismatches.push(format!("{name}:\n  go:   {want}\n  rust: {got}"));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {} records differ from go:\n{}",
+        mismatches.len(),
+        cases.len(),
+        mismatches.join("\n")
+    );
+}
+
+#[test]
+fn lsig_decode_fixture_matches_go_goal() {
+    if !mixed_cluster_enabled() {
+        eprintln!("Go-parity SKIPPED: set MIXED_CLUSTER=1");
+        return;
+    }
+    let Some(go_goal) = try_ensure_go_goal() else {
+        return;
+    };
+    let cases = lsig_fixture_cases();
+    let rows: Vec<serde_json::Value> = cases
+        .iter()
+        .map(|(name, input)| fixture_row(name, input, &disassemble_run(&go_goal, name, input)))
+        .collect();
+    let text: String = rows.iter().map(|r| format!("{r}\n")).collect();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(LSIG_FIXTURE);
+    if std::env::var("REGEN_LSIG_FIXTURE").is_ok_and(|v| !v.is_empty() && v != "0") {
+        std::fs::write(&path, text).expect("write the fixture");
+        return;
+    }
+    let committed = std::fs::read_to_string(&path).expect("fixture file");
+    assert!(
+        committed == text,
+        "{LSIG_FIXTURE} differs from go's output: regenerate it with REGEN_LSIG_FIXTURE=1"
+    );
 }

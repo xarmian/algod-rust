@@ -22,7 +22,9 @@ mod canonical;
 mod digest;
 pub mod hash;
 mod json_escape;
+mod logicsig_go;
 pub use json_escape::escape_json_like_go;
+pub use logicsig_go::{decode_logicsig_go, GoLogicSig};
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub use canonical::payset_txid_hash_runs;

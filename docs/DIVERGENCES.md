@@ -243,6 +243,20 @@ struct sent as an array and a transaction without `type` are rejected at decode
 only for non-canonical input no node emits, and never for a block whose digest
 a certificate authenticates).
 
+**`LogicSig` (#2390).** The `LogicSig` / `MultisigSig` / `PQSig` readers
+carry go's allocation bounds (`l` at most 16000 bytes, `arg` at most 255
+elements of at most 4096 bytes, `subsig` at most 255, `pqsig` `pk`/`sig` at
+most 1793/1538 bytes) and a `nil` `msig`/`lmsig` fails the `required` checks
+as go's zero `MultisigSig` does; before, a `SignedTxn` go refuses at decode
+with one of these reached evaluation here. The array form and merge-on-repeat
+of this entry still apply to them: `algo_codec::decode_logicsig_go` is a
+faithful port of go's decode (array form, merging, every msgp leniency) for
+tools that must accept exactly what go does (`goal clerk compile -D`), and
+`crates/core/algo-codec/tests/logicsig_go_decode_test.rs` pins, on the records
+of `tests/common/lsig_cases.rs` (also run through a real go `goal` in
+`crates/tools/goal-rust/tests/clerk_compile_e2e.rs`), that the consensus
+reader never accepts a record the port rejects.
+
 **What is identical.** All canonical input (go's encoder always writes a
 map with unique keys), nil -> zero for integers/bools/map headers, every
 byte-field form (`docs/BYTES_DECODE_PARITY.md`), unknown-key handling, and

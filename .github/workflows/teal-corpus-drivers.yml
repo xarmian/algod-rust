@@ -35,6 +35,9 @@ on:
       - "crates/core/algo-avm/src/eval.rs"
       - "crates/core/algo-avm/src/sourcemap.rs"
       - "scripts/teal-corpus/**"
+      - "crates/tools/goal-rust/**"
+      - "crates/core/algo-codec/src/logicsig_go.rs"
+      - "crates/core/algo-codec/tests/common/**"
       - ".github/workflows/teal-corpus-drivers.yml"
   push:
     branches: [main]
@@ -60,6 +63,9 @@ on:
       - "crates/core/algo-avm/src/eval.rs"
       - "crates/core/algo-avm/src/sourcemap.rs"
       - "scripts/teal-corpus/**"
+      - "crates/tools/goal-rust/**"
+      - "crates/core/algo-codec/src/logicsig_go.rs"
+      - "crates/core/algo-codec/tests/common/**"
       - ".github/workflows/teal-corpus-drivers.yml"
   workflow_dispatch:
 
@@ -194,3 +200,42 @@ jobs:
           # v8), random and truncated programs: zero mismatches, panics, timeouts.
           python3 scripts/teal-corpus/gen_synthetic.py "$RUNNER_TEMP/syn" --sweep-versions 8 --random 5000
           bash scripts/teal-corpus/run_drivers.sh "$RUNNER_TEMP/syn" "$RUNNER_TEMP/synout" disassemble
+
+  goal-clerk-compile-parity:
+    name: goal clerk compile -D parity against go's goal (LogicSig decode fixture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Go toolchain
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build go-algorand's libsodium fork
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool build-essential
+          # The e2e test builds `../go-algorand/cmd/goal` itself (try_ensure_go_goal),
+          # which needs the libsodium fork first (see CLAUDE.md).
+          git clone --branch "$GO_ALGORAND_REV" \
+            https://github.com/algorand/go-algorand.git \
+            "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
+          cd "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
+          make libsodium
+
+      - name: Run clerk compile through go's goal and goal-rust
+        run: |
+          set -euo pipefail
+          # #2388/#2390: `-D` of byte strings and of hand-made or damaged
+          # LogicSig records prints what go's goal prints, and the committed
+          # fixtures/clerk_lsig_decode.jsonl is exactly go's output (a stale
+          # fixture fails lsig_decode_fixture_matches_go_goal).
+          MIXED_CLUSTER=1 cargo test -p goal-rust --test clerk_compile_e2e -- --nocapture
