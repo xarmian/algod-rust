@@ -32,7 +32,7 @@
 #                            level); the block itself is untouched (issue
 #                            #2394). go's generated msgp decoder fails with
 #                            ErrNoField and drops the payload: "dropping
-#                            proposal that failed to decode: ... key zzunk".
+#                            proposal that failed to decode: Unknown field: zzunk".
 #                            Opt-in (CASES=unknown-field-proposal): the
 #                            honest copy is what the network commits, so the
 #                            evidence is that log line plus liveness.
@@ -351,10 +351,9 @@ run_case() {  # run_case <case>
     elif [ "$case" = "unknown-field-proposal" ]; then
         # go drops the payload at decode ("dropping proposal that failed to
         # decode", agreement/demux.go) without a disconnect, at WARN level.
-        if grep -F "dropping proposal that failed to decode" "$log" | grep -qF "no matching struct field found" \
-            && grep -F "dropping proposal that failed to decode" "$log" | grep -qF "zzunk"; then
+        if grep -F "dropping proposal that failed to decode" "$log" | grep -qF "Unknown field: zzunk"; then
             record "$case" "go-dropped-at-decode" pass \
-                "node logged 'dropping proposal that failed to decode ... no matching struct field found ... key zzunk'"
+                "node logged 'dropping proposal that failed to decode: Unknown field: zzunk'"
         else
             record "$case" "go-dropped-at-decode" fail \
                 "node never dropped the payload at decode for key zzunk (see $log)"
