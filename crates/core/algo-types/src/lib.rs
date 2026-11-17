@@ -31,6 +31,7 @@ pub mod genesis_restore;
 mod header;
 pub mod networks;
 pub mod pq;
+pub mod raw_text;
 pub(crate) mod msgp_schema;
 pub(crate) mod rmp_decode;
 mod round;

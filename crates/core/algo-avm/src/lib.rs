@@ -39,7 +39,7 @@ pub mod logicsig_context;
 pub mod machine;
 pub mod opcode;
 pub mod ops;
-pub mod raw_text;
+pub use algo_types::raw_text;
 pub mod sourcemap;
 pub mod tracer;
 pub mod txn_fields;

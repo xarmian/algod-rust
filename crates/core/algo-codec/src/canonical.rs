@@ -102,6 +102,20 @@ impl CanonicalMap {
         }
     }
 
+    /// A go `string` field that may hold arbitrary bytes (`gen`, `proto`,
+    /// `nextproto`, `upgradeprop`, `type`): `val` is in the lossless
+    /// [`algo_types::raw_text`] form the decoder produced, written back as the
+    /// original bytes (issue #2397).
+    fn add_raw_string(&mut self, key: &'static str, val: &str) {
+        if !val.is_empty() {
+            let start = self.arena.len();
+            let bytes = algo_types::raw_text::decode(val);
+            rmp::encode::write_str_len(&mut self.arena, bytes.len() as u32).unwrap();
+            self.arena.extend_from_slice(&bytes);
+            self.fields.push((key, start, self.arena.len()));
+        }
+    }
+
     fn add_bytes(&mut self, key: &'static str, val: &[u8]) {
         // Go's omitempty for []byte: omit when len == 0 (nil or empty) OR
         // when all bytes are zero (for fixed-size [N]byte fields like digests).
@@ -618,7 +632,7 @@ fn transaction_map(
     // Header fields
     m.add_u64("fee", tx.fee);
     m.add_u64("fv", tx.first_valid.0);
-    m.add_string("gen", genesis_id);
+    m.add_raw_string("gen", genesis_id);
     m.add_bytes("gh", genesis_hash);
     m.add_bytes("grp", group);
     if let Some(ref hb) = tx.heartbeat {
@@ -664,7 +678,7 @@ fn transaction_map(
     m.add_u64("sptype", tx.state_proof_type);
     m.add_option_fixed_bytes("sprfkey", &tx.state_proof_pk);
 
-    m.add_string("type", tx.txn_type.as_str());
+    m.add_raw_string("type", tx.txn_type.as_str());
 
     // Key registration (keyreg)
     m.add_u64("votefst", tx.vote_first);
@@ -804,11 +818,11 @@ pub fn canonical_encode_block_header_from_block(block: &Block) -> Vec<u8> {
     m.add_u64("fc", block.fees_collected);
     m.add_address("fees", &block.fee_sink);
     m.add_u64("frac", block.rewards_residue);
-    m.add_string("gen", &block.genesis_id);
+    m.add_raw_string("gen", &block.genesis_id);
     m.add_bytes("gh", &block.genesis_hash);
     m.add_u64("ld", block.load);
     m.add_u64("nextbefore", block.next_protocol_vote_before.0);
-    m.add_string("nextproto", &block.next_protocol);
+    m.add_raw_string("nextproto", &block.next_protocol);
     m.add_u64("nextswitch", block.next_protocol_switch_on.0);
     m.add_u64("nextyes", block.next_protocol_approvals);
     m.add_option_vec_address("partupdabs", &block.absent_participation_accounts);
@@ -816,7 +830,7 @@ pub fn canonical_encode_block_header_from_block(block: &Block) -> Vec<u8> {
     m.add_u64("pp", block.proposer_payout);
     m.add_bytes("prev", &block.branch);
     m.add_bytes("prev512", &block.prev512);
-    m.add_string("proto", &block.current_protocol);
+    m.add_raw_string("proto", &block.current_protocol);
     m.add_address("prp", &block.proposer);
     m.add_u64("rate", block.rewards_rate);
     m.add_u64("rnd", block.round.0);
@@ -830,7 +844,7 @@ pub fn canonical_encode_block_header_from_block(block: &Block) -> Vec<u8> {
     m.add_bytes("txn256", &block.txn256);
     m.add_bytes("txn512", &block.txn512);
     m.add_u64("upgradedelay", block.upgrade_delay);
-    m.add_string("upgradeprop", &block.upgrade_propose);
+    m.add_raw_string("upgradeprop", &block.upgrade_propose);
     m.add_bool("upgradeyes", block.upgrade_approve);
 
     m.encode()
@@ -855,11 +869,11 @@ pub fn canonical_encode_block(block: &Block) -> Vec<u8> {
     m.add_u64("fc", block.fees_collected);
     m.add_address("fees", &block.fee_sink);
     m.add_u64("frac", block.rewards_residue);
-    m.add_string("gen", &block.genesis_id);
+    m.add_raw_string("gen", &block.genesis_id);
     m.add_bytes("gh", &block.genesis_hash);
     m.add_u64("ld", block.load);
     m.add_u64("nextbefore", block.next_protocol_vote_before.0);
-    m.add_string("nextproto", &block.next_protocol);
+    m.add_raw_string("nextproto", &block.next_protocol);
     m.add_u64("nextswitch", block.next_protocol_switch_on.0);
     m.add_u64("nextyes", block.next_protocol_approvals);
     m.add_option_vec_address("partupdabs", &block.absent_participation_accounts);
@@ -867,7 +881,7 @@ pub fn canonical_encode_block(block: &Block) -> Vec<u8> {
     m.add_u64("pp", block.proposer_payout);
     m.add_bytes("prev", &block.branch);
     m.add_bytes("prev512", &block.prev512);
-    m.add_string("proto", &block.current_protocol);
+    m.add_raw_string("proto", &block.current_protocol);
     m.add_address("prp", &block.proposer);
     m.add_u64("rate", block.rewards_rate);
     m.add_u64("rnd", block.round.0);
@@ -896,7 +910,7 @@ pub fn canonical_encode_block(block: &Block) -> Vec<u8> {
     }
 
     m.add_u64("upgradedelay", block.upgrade_delay);
-    m.add_string("upgradeprop", &block.upgrade_propose);
+    m.add_raw_string("upgradeprop", &block.upgrade_propose);
     m.add_bool("upgradeyes", block.upgrade_approve);
 
     m.encode()
@@ -930,11 +944,11 @@ pub fn canonical_encode_unauthenticated_proposal(
     m.add_u64("fc", block.fees_collected);
     m.add_address("fees", &block.fee_sink);
     m.add_u64("frac", block.rewards_residue);
-    m.add_string("gen", &block.genesis_id);
+    m.add_raw_string("gen", &block.genesis_id);
     m.add_bytes("gh", &block.genesis_hash);
     m.add_u64("ld", block.load);
     m.add_u64("nextbefore", block.next_protocol_vote_before.0);
-    m.add_string("nextproto", &block.next_protocol);
+    m.add_raw_string("nextproto", &block.next_protocol);
     m.add_u64("nextswitch", block.next_protocol_switch_on.0);
     m.add_u64("nextyes", block.next_protocol_approvals);
 
@@ -947,7 +961,7 @@ pub fn canonical_encode_unauthenticated_proposal(
     m.add_u64("pp", block.proposer_payout);
     m.add_bytes("prev", &block.branch);
     m.add_bytes("prev512", &block.prev512);
-    m.add_string("proto", &block.current_protocol);
+    m.add_raw_string("proto", &block.current_protocol);
     m.add_address("prp", &block.proposer);
     m.add_u64("rate", block.rewards_rate);
     m.add_u64("rnd", block.round.0);
@@ -981,7 +995,7 @@ pub fn canonical_encode_unauthenticated_proposal(
     }
 
     m.add_u64("upgradedelay", block.upgrade_delay);
-    m.add_string("upgradeprop", &block.upgrade_propose);
+    m.add_raw_string("upgradeprop", &block.upgrade_propose);
     m.add_bool("upgradeyes", block.upgrade_approve);
 
     m.encode()
@@ -997,11 +1011,11 @@ pub fn canonical_encode_block_header(header: &BlockHeader) -> Vec<u8> {
     m.add_u64("fc", header.fees_collected);
     m.add_address("fees", &header.fee_sink);
     m.add_u64("frac", header.rewards_residue);
-    m.add_string("gen", &header.genesis_id);
+    m.add_raw_string("gen", &header.genesis_id);
     m.add_bytes("gh", &header.genesis_hash);
     m.add_u64("ld", header.load);
     m.add_u64("nextbefore", header.next_protocol_vote_before.0);
-    m.add_string("nextproto", &header.next_protocol);
+    m.add_raw_string("nextproto", &header.next_protocol);
     m.add_u64("nextswitch", header.next_protocol_switch_on.0);
     m.add_u64("nextyes", header.next_protocol_approvals);
     m.add_option_vec_address("partupdabs", &header.absent_participation_accounts);
@@ -1009,7 +1023,7 @@ pub fn canonical_encode_block_header(header: &BlockHeader) -> Vec<u8> {
     m.add_u64("pp", header.proposer_payout);
     m.add_bytes("prev", &header.branch);
     m.add_bytes("prev512", &header.prev512);
-    m.add_string("proto", &header.current_protocol);
+    m.add_raw_string("proto", &header.current_protocol);
     m.add_address("prp", &header.proposer);
     m.add_u64("rate", header.rewards_rate);
     m.add_u64("rnd", header.round.0);
@@ -1023,7 +1037,7 @@ pub fn canonical_encode_block_header(header: &BlockHeader) -> Vec<u8> {
     m.add_bytes("txn256", &header.txn256);
     m.add_bytes("txn512", &header.txn512);
     m.add_u64("upgradedelay", header.upgrade_delay);
-    m.add_string("upgradeprop", &header.upgrade_propose);
+    m.add_raw_string("upgradeprop", &header.upgrade_propose);
     m.add_bool("upgradeyes", header.upgrade_approve);
 
     m.encode()
@@ -1457,7 +1471,7 @@ pub struct OnlineRoundParamsData {
 pub fn canonical_encode_online_round_params_data(d: &OnlineRoundParamsData) -> Vec<u8> {
     let mut m = CanonicalMap::new();
     m.add_u64("online", d.online_supply);
-    m.add_string("proto", &d.current_protocol);
+    m.add_raw_string("proto", &d.current_protocol);
     m.add_u64("rwdlvl", d.rewards_level);
     m.encode()
 }

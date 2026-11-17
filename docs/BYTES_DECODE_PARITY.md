@@ -264,3 +264,45 @@ REST submission; for consensus input the acceptance of an extra key cannot
 change any hash (the key is dropped on re-encode) and only matters for a
 proposal that go would have rejected outright, which cannot gather a quorum
 of go votes. Not a regression of this work; recorded for completeness.
+
+## Issue #2397: go `string` fields are arbitrary bytes (non-UTF-8 `str`)
+
+`msgp.ReadStringBytes` / `ReadStringZC` bound the length only and never
+validate UTF-8, so go decodes a non-UTF-8 `str` value into any Go `string`
+field. `rmp_decode::read_string` rejected it, so a block go decodes failed to
+decode here. Affected fields (the only `read_string` callers): `gen` (block
+header and transaction), `proto`, `nextproto`, `upgradeprop`, transaction
+`type`. (EvalDelta `lg`/`bs` and the other raw `dt` subtrees already keep the
+bytes; asset `un`/`an`/`au` were handled by #2042.)
+
+**Fix.** `read_string` returns the bijective lossless `String` form of
+`algo_types::raw_text` (the module #2388 introduced for assembler source,
+moved from `algo-avm` and re-exported there): valid UTF-8 is unchanged, an
+invalid byte becomes a private-use character. The canonical encoder writes the
+five fields through `CanonicalMap::add_raw_string`, which turns that form back
+into the original bytes, so encode/hash/txid of every block that decoded before
+is unchanged and a non-UTF-8 value re-encodes byte-exactly. The `upgradeprop`
+length check uses `raw_text::raw_len` (go's `len(string)`).
+
+**Consensus relevance (decided).**
+
+| field | go's later checks | go accepts a non-UTF-8 value? |
+|---|---|---|
+| `gen` | `Block.PreCheck`/eval: must equal the ledger's genesis id | no |
+| `proto` | `config.Consensus[proto]` lookup (`ProcessUpgradeParams`: "previous protocol not supported") | no |
+| txn `type` | `Transaction.WellFormed`: unknown type rejected | no |
+| `upgradeprop` | `applyUpgradeVote` (`data/bookkeeping/block.go`): only length `<= MaxVersionStringLen` and no pending proposal | **yes, any byte string** |
+| `nextproto` | set from an accepted `upgradeprop`, then copied into every following header until the vote ends | **yes** |
+
+So a block with a non-UTF-8 `upgradeprop` is valid in go (a proposal need not
+name a known consensus version), and every header until the vote deadline
+carries it as `nextproto`: a Rust node that failed to decode it would fork
+off. Both fields are now lossless. For `gen`/`proto`/`type` go decodes and
+then rejects at validation, Rust now decodes and rejects at the same stage.
+
+**Proof.** `strict_unknown_fields_go_parity` (seeds are now go-encoded
+`RandomizeObject` values with their random non-UTF-8 strings, no ASCII
+sanitisation) replays every case against go's real decoders (red before the
+fix: 126 mismatches, all `read_string: invalid utf-8`);
+`non_utf8_string_fields_round_trip_byte_exact` re-encodes those seeds to the
+identical bytes; the real-chain corpus tests are unchanged.

@@ -371,3 +371,44 @@ fn fuzz_file() {
     let text = std::fs::read_to_string(&path).unwrap();
     replay(rows(&text), "fuzz");
 }
+
+// ── issue #2397: go `string` fields are arbitrary bytes ───────────────────
+
+/// A go-valid message whose `gen` / `proto` / `nextproto` / `upgradeprop` /
+/// `type` hold non-UTF-8 bytes (the random seeds) decodes, and re-encodes to
+/// the same canonical bytes: nothing is replaced by U+FFFD, so the block hash
+/// (and a later header's `nextproto`) stays go's.
+#[test]
+fn non_utf8_string_fields_round_trip_byte_exact() {
+    fn non_utf8_str(b: &[u8]) -> bool {
+        // a (fix)str marker followed by bytes that are not valid UTF-8
+        (0..b.len().saturating_sub(1)).any(|i| {
+            matches!(b[i], 0xa1..=0xbf)
+                && std::str::from_utf8(&b[i + 1..(i + 1 + (b[i] & 0x1f) as usize).min(b.len())])
+                    .is_err()
+        })
+    }
+    let mut checked = 0;
+    for (name, b) in seeds() {
+        if !name.contains("_rand") || !non_utf8_str(&b) {
+            continue;
+        }
+        if name.starts_with("header_") {
+            let h = BlockHeader::decode_from_bytes(&b).unwrap();
+            let re = algo_codec::canonical_encode_block_header(&h);
+            assert_eq!(re, b, "{name}: header re-encode differs");
+            checked += 1;
+        } else if name.starts_with("txn_") {
+            let t = Transaction::decode_from_bytes(&b).unwrap();
+            let re = algo_codec::canonical_encode_transaction(&t);
+            assert_eq!(re, b, "{name}: txn re-encode differs");
+            checked += 1;
+        } else if name.starts_with("block_") {
+            let blk = algo_codec::decode_block(&b).unwrap();
+            let re = algo_codec::canonical_encode_block(&blk);
+            assert_eq!(re, b, "{name}: block re-encode differs");
+            checked += 1;
+        }
+    }
+    assert!(checked >= 3, "no non-UTF-8 random header/block seed");
+}
