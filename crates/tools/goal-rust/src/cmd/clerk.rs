@@ -1786,7 +1786,7 @@ fn run_multisig_sign_inner(
                     &handle, &password, encoded, signer.0, partial, auth_addr,
                 ))
                 .map_err(|e| format!("Couldn't sign tx with kmd: {}", kmd_msg(&e)))?;
-            algo_codec::decode_multisig(&resp.multisig)
+            algo_codec::decode_multisig_go(&resp.multisig)
                 .map_err(|e| format!("kmd returned an undecodable multisig: {e}"))?
         };
 
@@ -1880,7 +1880,10 @@ fn run_multisig_signprogram_inner(
             return Err(collision.into());
         }
         let bytes = std::fs::read(file).map_err(|e| format!("{file}: {e}"))?;
-        lsig = algo_codec::decode_logicsig(&bytes).map_err(|e| format!("{file}: {e}"))?;
+        // go's `protocol.Decode(program, &lsig)` (multisig.go:187): strict, like `lsigFromArgs`.
+        lsig = algo_codec::decode_logicsig_go(&bytes)
+            .map_err(|e| format!("{file}: {e}"))?
+            .into_logicsig();
         program = lsig.logic.to_vec();
         if out_name.is_none() {
             out_name = Some(file.to_string());
@@ -1967,7 +1970,7 @@ fn run_multisig_signprogram_inner(
             use_legacy_msig,
         ))
         .map_err(|e| format!("Couldn't sign program with kmd: {}", kmd_msg(&e)))?;
-    let msig = algo_codec::decode_multisig(&resp.multisig)
+    let msig = algo_codec::decode_multisig_go(&resp.multisig)
         .map_err(|e| format!("kmd returned an undecodable multisig: {e}"))?;
 
     if use_legacy_msig {

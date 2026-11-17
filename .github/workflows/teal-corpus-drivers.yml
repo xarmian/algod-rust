@@ -239,3 +239,7 @@ jobs:
           # fixtures/clerk_lsig_decode.jsonl is exactly go's output (a stale
           # fixture fails lsig_decode_fixture_matches_go_goal).
           MIXED_CLUSTER=1 cargo test -p goal-rust --test clerk_compile_e2e -- --nocapture
+          # #2393: `clerk sign -L` decodes the LogicSig like go's lsigFromArgs;
+          # fixtures/clerk_sign_lsig.jsonl is go's output (a stale one fails
+          # sign_lsig_fixture_matches_go_goal).
+          MIXED_CLUSTER=1 cargo test -p goal-rust --test clerk_sign_lsig_e2e -- --nocapture
