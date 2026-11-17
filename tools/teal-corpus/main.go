@@ -53,7 +53,6 @@ import (
 	"sort"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/algorand/go-algorand/data/basics"
 	"github.com/algorand/go-algorand/data/transactions/logic"
@@ -66,10 +65,6 @@ var (
 )
 
 const schemaVersion = 1
-
-// invalidUTF8 is the error both drivers report for assembler input that is not
-// UTF-8 (the Rust assembler takes &str); line 0, column 0.
-const invalidUTF8 = "input is not valid UTF-8"
 
 type diag struct {
 	Col     int    `json:"col"`
@@ -160,10 +155,6 @@ func process(op string, in input) row {
 		}
 		r.Ok = true
 		r.Text = &text
-		return r
-	}
-	if !utf8.Valid(in.Bytes) {
-		r.Errors = []diag{{Message: invalidUTF8}}
 		return r
 	}
 	ops, err := logic.AssembleString(string(in.Bytes))

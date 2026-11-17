@@ -366,3 +366,51 @@ fn missing_corpus_directory_is_a_usage_error() {
         .unwrap();
     assert_eq!(res.status.code(), Some(2));
 }
+
+/// Sources that are not UTF-8 (issue #2388): go assembles any byte string, so
+/// both drivers do. The expected rows are the Go driver's own output for these
+/// four inputs (a literal that keeps its bytes, a comment that is ignored, two
+/// errors whose messages carry one U+FFFD per invalid byte, and a valid
+/// multi-byte literal).
+#[test]
+fn assemble_non_utf8_sources_equal_the_go_driver_rows() {
+    let dir = scratch("non-utf8");
+    let sources = dir.join("corpus/sources");
+    std::fs::create_dir_all(&sources).unwrap();
+    let inputs: [&[u8]; 4] = [
+        b"#pragma version 8\nbyte \"\xff\xfe\"\nint 1\n",
+        b"#pragma version 8\nint 1 // \xff\xfe comment\n",
+        b"#pragma version 8\nfoo\xff\nint 1\nbar\xe2\x82\n",
+        b"#pragma version 8\nbyte \"\xc3\xa9\"\nint 1\nint 1\n+\nreturn\n",
+    ];
+    for (i, src) in inputs.iter().enumerate() {
+        std::fs::write(sources.join(format!("{i}.teal")), src).unwrap();
+    }
+    let out = dir.join("rows.jsonl");
+    let res = bin()
+        .args(["assemble", "--corpus"])
+        .arg(dir.join("corpus"))
+        .arg("--out")
+        .arg(&out)
+        .args(["--jobs", "1"])
+        .output()
+        .expect("spawn teal-corpus");
+    assert_eq!(
+        res.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    let want: [&str; 4] = [
+        r#"{"bytecode_b64":"CIAC//6BAQ==","hash":"MFCZLYTBNJYZALFOIWR6GTHRV7FRWIZPI3NSVBI4YHIUEF5FDYXVBDL354","ok":true,"sha256":"34f95dc3137dd7491772889091dcc286e4a419fee3917b3d16c9ceb0168cf4fa","sourcemap":{"version":3,"sources":["<body>"],"names":[],"mappings":";AACA;;;;AACA"}}"#,
+        r#"{"bytecode_b64":"CIEB","hash":"PQOFFIOE4JA726ULBV4EQ23PNP3VGUP7KUB2UPK4CA6LWQ2RBMOX7PQRJM","ok":true,"sha256":"34f9aec451118531e5a5b10433903bfc35b4af06fbed9e1acb4531fb561b2fb0","sourcemap":{"version":3,"sources":["<body>"],"names":[],"mappings":";AACA"}}"#,
+        r#"{"errors":[{"col":0,"line":2,"message":"unknown opcode: foo�"},{"col":0,"line":4,"message":"unknown opcode: bar��"}],"ok":false,"sha256":"18baab47d7c160fc457f0319e61d7f01aac057c7a65d7cbe80514b37e2ae3638"}"#,
+        r#"{"bytecode_b64":"CCABAYACw6kiIghD","hash":"ZWINNQMHEMUVPEDKRQ3EPMKGP2WYYARSW7PVO7RT3DSMMEZE77ZS7CMOYQ","ok":true,"sha256":"cc35385260f178723cf8dc94c1cce06cd8410c00524f1f9cabba7e9dabd7487c","sourcemap":{"version":3,"sources":["<body>"],"names":[],"mappings":";;;;AACA;;;;AACA;AACA;AACA;AACA"}}"#,
+    ];
+    let got = rows(&out);
+    assert_eq!(got.len(), want.len());
+    for w in want {
+        let w: Value = serde_json::from_str(w).unwrap();
+        assert_eq!(*row(&got, w["sha256"].as_str().unwrap()), w);
+    }
+}

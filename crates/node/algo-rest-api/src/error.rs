@@ -80,6 +80,31 @@ pub fn bad_request(msg: impl Into<String>) -> Response {
     error_response(StatusCode::BAD_REQUEST, msg)
 }
 
+/// Return a 400 Bad Request JSON error response for a message that is a byte
+/// string rather than text (go's `%s` of a source token that was not UTF-8).
+///
+/// go's `encoding/json` writes each byte that is not part of a valid UTF-8
+/// sequence as the six-character escape `\ufffd`, and a valid U+FFFD as the
+/// character itself.
+pub fn bad_request_bytes(msg: &[u8]) -> Response {
+    let mut inner = String::with_capacity(msg.len() + 8);
+    for chunk in msg.utf8_chunks() {
+        let valid = serde_json::to_string(chunk.valid()).unwrap_or_else(|_| "\"\"".to_string());
+        // The surrounding quotes are not part of the string's content.
+        inner.push_str(&escape_json_like_go(&valid[1..valid.len() - 1]));
+        for _ in chunk.invalid() {
+            inner.push_str("\\ufffd");
+        }
+    }
+    let json = format!("{{\"message\":\"{inner}\"}}");
+    (
+        StatusCode::BAD_REQUEST,
+        [("content-type", "application/json")],
+        json,
+    )
+        .into_response()
+}
+
 /// Return a 404 Not Found JSON error response.
 pub fn not_found(msg: impl Into<String>) -> Response {
     error_response(StatusCode::NOT_FOUND, msg)

@@ -53,15 +53,12 @@ pub fn unicode_printable(s: &str) -> (bool, String) {
     (is_printable, printable_string)
 }
 
-/// Mirrors Go's `unicode.IsPrint`: a rune is printable if it is in one of
-/// the Letter, Mark, Number, Punctuation, Symbol, or (ASCII) Space
-/// categories. Rust's `char::is_control` covers exactly the complement for
-/// our purposes here (C0/C1 control codes, which is what every one of Go's
-/// `TestUnicodePrintable` cases exercises), plus the U+FEFF byte-order-mark
-/// which Go's table also excludes (`unicode.PrintRanges` — BOM is not a
-/// Cf-category exclusion Go carves out, it's simply not in `L/M/N/P/S/Zs`).
+/// Mirrors Go's `unicode.IsPrint` (letters, marks, numbers, punctuation,
+/// symbols and the ASCII space; not controls, format characters, private use,
+/// unassigned code points or non-ASCII spaces): the assembler's port, which
+/// also decides what `%#v` quotes.
 fn is_print(c: char) -> bool {
-    !c.is_control() && c != '\u{feff}'
+    algo_avm::assembler::go_is_print(c)
 }
 
 /// Mirrors go's `encodeBytesAsAppCallBytes` (`cmd/goal/formatting.go:203-209`):

@@ -9520,6 +9520,90 @@ async fn teal_compile_error_body_matches_go_report_multiple_errors() {
     assert_eq!(body.matches("unknown opcode: bogus").count(), 10);
 }
 
+/// go's `TealCompile` hands the raw body to `logic.AssembleString`, so a body
+/// that is not UTF-8 is assembled: a string literal keeps its bytes, a comment
+/// is ignored. Expected bodies come from go v5.0.5-stable (#2388).
+#[tokio::test]
+async fn teal_compile_assembles_non_utf8_bodies_like_go() {
+    let server = TestServer::start(mock_with_developer_api()).await;
+
+    let (status, body) = post_teal(
+        &server,
+        "/v2/teal/compile",
+        b"#pragma version 8\nbyte \"\xff\xfe\"\nint 1\n".to_vec(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        r#"{"hash":"MFCZLYTBNJYZALFOIWR6GTHRV7FRWIZPI3NSVBI4YHIUEF5FDYXVBDL354","result":"CIAC//6BAQ=="}"#
+    );
+
+    let (status, body) = post_teal(
+        &server,
+        "/v2/teal/compile",
+        b"#pragma version 8\nint 1 // \xff\xfe comment\n".to_vec(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        r#"{"hash":"PQOFFIOE4JA726ULBV4EQ23PNP3VGUP7KUB2UPK4CA6LWQ2RBMOX7PQRJM","result":"CIEB"}"#
+    );
+
+    // Valid private-use characters keep their bytes in a literal.
+    let (status, body) = post_teal(
+        &server,
+        "/v2/teal/compile",
+        b"#pragma version 8\nbyte \"\xf4\x8f\xbc\x80\xf4\x8f\xbf\xbf\"\nint 1\n".to_vec(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        r#"{"hash":"75T2IMQAQBOCL6YNO5KVOK2HFUJR2LA4QP3BDR4X3IUYCAEPZFVAAKK4VQ","result":"CIAI9I+8gPSPv7+BAQ=="}"#
+    );
+}
+
+/// An invalid byte in a failed compile's message is one `\ufffd` escape per
+/// byte in go's JSON (`encoding/json`); a valid U+FFFD or private-use character
+/// is written as is (#2388, go v5.0.5-stable bodies).
+#[tokio::test]
+async fn teal_compile_error_bodies_render_invalid_bytes_like_go() {
+    let server = TestServer::start(mock_with_developer_api()).await;
+    let cases: &[(&[u8], &str)] = &[
+        (
+            b"#pragma version 8\nfoo\xff\nint 1\n",
+            "{\"message\":\"1 error: 2: unknown opcode: foo\\ufffd\\n\"}",
+        ),
+        (
+            b"#pragma version 8\nint 1\n\xe2\x82 \n",
+            "{\"message\":\"1 error: 3: unknown opcode: \\ufffd\\ufffd\\n\"}",
+        ),
+        (
+            b"#pragma version 8\nint \xff\n",
+            "{\"message\":\"1 error: 2:4: unable to parse \\\"\\\\xff\\\" as integer\\n\"}",
+        ),
+        (
+            b"#pragma version 8\n#define \xff 1\nint 1\n",
+            "{\"message\":\"1 error: 2:8: \u{fffd} character not allowed in macro name\\n\"}",
+        ),
+        (
+            b"#pragma version 8\nfoo\xf4\x8f\xbc\x80\nint 1\n",
+            "{\"message\":\"1 error: 2: unknown opcode: foo\u{10FF00}\\n\"}",
+        ),
+        (
+            b"#pragma version 8\nbyte 0x\xffab\n",
+            "{\"message\":\"1 error: 2:5: byte encoding/hex: invalid byte: U+00FF '\u{ff}'\\n\"}",
+        ),
+    ];
+    for (source, want) in cases {
+        let (status, body) = post_teal(&server, "/v2/teal/compile", source.to_vec()).await;
+        assert_eq!(status, 400, "{source:?}: {body}");
+        assert_eq!(&body, want, "{source:?}");
+    }
+}
+
 /// go encodes responses with `encoding/json`, which escapes `<`, `>` and `&`
 /// (`<`, `>`, `&`): the source map's `<body>` source name and a
 /// disassembled `&&` are byte-visible (#2370).

@@ -514,20 +514,21 @@ pub struct TealsignArgs {
     pub set_lsig_arg_idx: i64,
 }
 
-/// `clerk compile [files...] [-o out] [-n] [-m] [-D]`.
+/// `clerk compile [files...] [-o out] [-n] [-m] [-D] [-s [-a account]] [-w wallet]`.
 ///
 /// Mirrors Go's `compileCmd` (clerk.go:1065): TEAL is assembled locally (no node
 /// needed), the program bytes go to `<file>.tok` and `<file>: <address>` is
-/// printed; `-m` also writes the source map, `-D` disassembles instead.
-/// `-s/--sign` (wallet-signed LogicSig record) is not implemented.
+/// printed; `-m` also writes the source map, `-D` disassembles instead, `-s`
+/// signs the program through kmd and writes a binary signed LogicSig record.
 #[derive(Args, Debug)]
 pub struct CompileArgs {
     /// TEAL source files to compile (Go's positional `[input file ...]`).
     #[arg(value_name = "FILE")]
     pub files: Vec<PathBuf>,
-    /// Filename to write the compiled program bytes to; `-` writes to stdout
-    /// and suppresses the address line (Go `-o/--outfile`). With more than one
-    /// input file this single path is reused, matching Go.
+    /// Filename to write the compiled program bytes (or, with `-s`, the signed
+    /// LogicSig) to; `-` writes to stdout and suppresses the address line (Go
+    /// `-o/--outfile`). With more than one input file this single path is
+    /// reused, matching Go.
     #[arg(short = 'o', long = "outfile")]
     pub outfile: Option<String>,
     /// Don't write the contract program binary (Go `-n/--no-out`); only print
@@ -540,6 +541,15 @@ pub struct CompileArgs {
     /// Disassemble a compiled program instead of compiling (Go `-D/--disassemble`).
     #[arg(short = 'D', long = "disassemble")]
     pub disassemble: bool,
+    /// Sign the program; the output is a binary signed LogicSig record (Go
+    /// `-s/--sign`). The wallet password is prompted for like goal does (and
+    /// also read from a non-terminal stdin, see #2391).
+    #[arg(short = 's', long = "sign")]
+    pub sign: bool,
+    /// Account address (or name) to sign the program with; the default
+    /// account when omitted (Go `-a/--account`).
+    #[arg(short = 'a', long = "account")]
+    pub account: Option<String>,
 }
 
 /// `wallet` is the group-level `-w` (Go's persistent clerk flag); leaves that
@@ -553,7 +563,9 @@ pub fn run(cmd: ClerkCmd, wallet: Option<String>) -> ExitCode {
         ClerkCmd::Split(args) => crate::cmd::clerk::run_split(args),
         ClerkCmd::Group(args) => crate::cmd::clerk::run_group(args),
         ClerkCmd::Rawsend(args) => crate::cmd::clerk::run_rawsend(args, datadirs()),
-        ClerkCmd::Compile(args) => crate::cmd::clerk::run_compile(args, datadirs()),
+        ClerkCmd::Compile(args) => {
+            crate::cmd::clerk::run_compile(args, wallet, datadirs(), kmddir())
+        }
         ClerkCmd::Multisig { cmd } => {
             let Some(cmd) = cmd else {
                 return crate::print_group_help(&["clerk", "multisig"]);

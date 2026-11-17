@@ -1063,7 +1063,7 @@ fn relative_path(base: &Path, target: &Path) -> String {
     rel.to_string_lossy().into_owned()
 }
 
-/// `clerk compile [files...] [-o out] [-n] [-m] [-D]`.
+/// `clerk compile [files...] [-o out] [-n] [-m] [-D] [-s [-a account]] [-w wallet]`.
 ///
 /// Mirrors Go's `compileCmd` (clerk.go:1065). Like Go, the TEAL source is
 /// assembled **locally** (`logic.AssembleString`, here `algo_avm::assembler`):
@@ -1075,18 +1075,62 @@ fn relative_path(base: &Path, target: &Path) -> String {
 /// `assembleFileImpl` prints them (`ReportMultipleErrors`, then
 /// `<N> warning[s]`).
 ///
-/// **Not implemented:** `-s/--sign` (wallet-signed LogicSig record), and `-D` of
-/// a *signed* LogicSig file, whose extra `LogicSig: {...}` inspection line needs
-/// the LogicSig-signing/inspect work; both are reported as an error rather than
-/// silently ignored.
-pub fn run_compile(args: crate::groups::clerk::CompileArgs, _cli_d: Vec<PathBuf>) -> ExitCode {
-    match run_compile_inner(args) {
+/// The source is any byte string, like go's `logic.AssembleString(string(text))`
+/// (issue #2388): a string literal keeps its raw bytes and an invalid byte in a
+/// comment is ignored; assembler diagnostics reach stderr with the source's
+/// bytes as they are. `-D` of a *signed* LogicSig file appends go's
+/// `LogicSig: {...}` inspection (`lsigToInspect`), and `-s` signs the program
+/// with the wallet's key through kmd (`SignProgramWithWallet`) and writes the
+/// binary signed LogicSig instead of the program.
+pub fn run_compile(
+    args: crate::groups::clerk::CompileArgs,
+    wallet: Option<String>,
+    cli_d: Vec<PathBuf>,
+    kmd_dir_flag: Option<PathBuf>,
+) -> ExitCode {
+    match run_compile_inner(args, wallet, cli_d, kmd_dir_flag) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
-            eprintln!("{msg}");
+            report_lines(&msg, ERROR_NON_PRINTABLE_CHARACTERS);
             ExitCode::from(1)
         }
     }
+}
+
+/// go's `errorNonPrintableCharacters` (cmd/goal/messages.go).
+const ERROR_NON_PRINTABLE_CHARACTERS: &str =
+    "One or more non-printable characters were omitted from the following error message:";
+
+/// go's `infoNonPrintableCharacters` (cmd/goal/messages.go).
+const INFO_NON_PRINTABLE_CHARACTERS: &str =
+    "One or more non-printable characters were omitted from the subsequent line:";
+
+/// Write raw bytes to stderr (go's `fmt.Fprint(os.Stderr, ...)`); a closed
+/// stderr is ignored like a failed `Fprint`.
+fn write_stderr(bytes: &[u8]) {
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(bytes);
+}
+
+/// go's `reportErrorln` / `reportWarnRawln` output (cmd/goal/commands.go):
+/// each line of the message goes through `unicodePrintable` (non-printable
+/// runes dropped, each invalid byte one U+FFFD) and a line that lost anything is
+/// preceded by `notice`. `msg` is in the lossless text form
+/// (`algo_avm::raw_text`), so the bytes of the source are the bytes go sees.
+fn report_lines(msg: &str, notice: &str) {
+    let bytes = algo_avm::raw_text::decode(msg);
+    let mut out = Vec::with_capacity(bytes.len() + 1);
+    for line in bytes.split(|&b| b == b'\n') {
+        let (printable, printable_line) =
+            crate::formatting::unicode_printable(&algo_avm::raw_text::go_lossy(line));
+        if !printable {
+            out.extend_from_slice(notice.as_bytes());
+            out.push(b'\n');
+        }
+        out.extend_from_slice(printable_line.as_bytes());
+        out.push(b'\n');
+    }
+    write_stderr(&out);
 }
 
 /// Read `fname` (`-` is stdin), like goal's `readFile`.
@@ -1114,22 +1158,22 @@ fn write_goal_file(filename: &str, data: &[u8]) -> std::io::Result<()> {
 /// `disassembleFile` (clerk.go:1029).
 fn disassemble_file(fname: &str, outname: &str) -> Result<(), String> {
     let mut program = read_goal_file(fname).map_err(|e| format!("{fname}: {e}"))?;
+    let mut extra = String::new();
     // go first tries to parse the file as a msgpack LogicSig.
     if let Ok(lsig) = algo_codec::decode_logicsig(&program) {
-        let signed = lsig.sig != [0u8; 64]
-            || lsig.msig.is_some()
-            || lsig.lmsig.is_some()
-            || lsig.pqsig.is_some()
-            || lsig.args.as_ref().is_some_and(|a| !a.is_empty());
-        if signed {
-            return Err(format!(
-                "{fname}: disassembling a signed LogicSig is not supported by goal-rust"
-            ));
-        }
         program = lsig.logic.to_vec();
+        // A signed or argument-carrying LogicSig also prints its inspection
+        // (`lsigToInspect` of the record without its program), clerk.go:1041-1046.
+        if lsig_has_authorization(&lsig) {
+            extra = format!("LogicSig: {}", lsig_inspect_json(&lsig));
+        }
     }
-    let text =
+    let mut text =
         algo_avm::disassembler::disassemble(&program).map_err(|e| format!("{fname}: {e}"))?;
+    if !extra.is_empty() {
+        text.push_str(&extra);
+        text.push('\n');
+    }
     let out = if outname.is_empty() {
         STDIN_STDOUT
     } else {
@@ -1138,9 +1182,214 @@ fn disassemble_file(fname: &str, outname: &str) -> Result<(), String> {
     write_goal_file(out, text.as_bytes()).map_err(|e| format!("{outname}: {e}"))
 }
 
-fn run_compile_inner(args: crate::groups::clerk::CompileArgs) -> Result<(), String> {
+/// go's `!lsig.Sig.Blank() || !lsig.Msig.Blank() || !lsig.LMsig.Blank() ||
+/// !lsig.PQsig.Blank() || len(lsig.Args) > 0` (clerk.go:1041).
+fn lsig_has_authorization(lsig: &algo_types::LogicSig) -> bool {
+    lsig.sig != [0u8; 64]
+        || lsig.msig.as_ref().is_some_and(|m| !msig_blank(m))
+        || lsig.lmsig.as_ref().is_some_and(|m| !msig_blank(m))
+        || lsig.pqsig.as_ref().is_some_and(|p| !p.blank())
+        || lsig.args.as_ref().is_some_and(|a| !a.is_empty())
+}
+
+/// `crypto.MultisigSig.Blank()`: no version, threshold or subsignature.
+fn msig_blank(m: &algo_types::MultisigSig) -> bool {
+    m.version == 0 && m.threshold == 0 && m.subsigs.is_empty()
+}
+
+/// A value of go-codec's JSON output, enough for `inspectLogicSig`.
+enum Json {
+    Str(String),
+    Num(u64),
+    Obj(Vec<(&'static str, Json)>),
+    Arr(Vec<Json>),
+}
+
+impl Json {
+    /// go-codec's `JSONHandle` layout (`Indent = 2`): one member per line,
+    /// `"key": value`, an empty object as `{}`.
+    fn write(&self, depth: usize, out: &mut String) {
+        let pad = |n: usize| "  ".repeat(n);
+        match self {
+            Json::Str(v) => {
+                out.push('"');
+                out.push_str(v);
+                out.push('"');
+            }
+            Json::Num(n) => out.push_str(&n.to_string()),
+            Json::Obj(members) if members.is_empty() => out.push_str("{}"),
+            Json::Obj(members) => {
+                out.push_str("{\n");
+                for (i, (k, v)) in members.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(",\n");
+                    }
+                    out.push_str(&pad(depth + 1));
+                    out.push('"');
+                    out.push_str(k);
+                    out.push_str("\": ");
+                    v.write(depth + 1, out);
+                }
+                out.push('\n');
+                out.push_str(&pad(depth));
+                out.push('}');
+            }
+            Json::Arr(items) if items.is_empty() => out.push_str("[]"),
+            Json::Arr(items) => {
+                out.push_str("[\n");
+                for (i, v) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(",\n");
+                    }
+                    out.push_str(&pad(depth + 1));
+                    v.write(depth + 1, out);
+                }
+                out.push('\n');
+                out.push_str(&pad(depth));
+                out.push(']');
+            }
+        }
+    }
+}
+
+fn b64(bytes: &[u8]) -> Json {
+    Json::Str(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+/// go's `inspectMultisigSig` (cmd/goal/inspect.go): members `subsig`, `thr`,
+/// `v`, each omitted when empty/zero (`omitempty,omitemptyarray`); a subsig's
+/// `pk` is an address and, like `s`, is omitted when zero.
+fn msig_inspect_json(m: &algo_types::MultisigSig) -> Option<Json> {
+    let mut members = Vec::new();
+    if !m.subsigs.is_empty() {
+        let subs = m
+            .subsigs
+            .iter()
+            .map(|s| {
+                let mut sub = Vec::new();
+                if s.public_key != [0u8; 32] {
+                    sub.push(("pk", Json::Str(Address(s.public_key).to_algorand_string())));
+                }
+                if s.signature != [0u8; 64] {
+                    sub.push(("s", b64(&s.signature)));
+                }
+                Json::Obj(sub)
+            })
+            .collect();
+        members.push(("subsig", Json::Arr(subs)));
+    }
+    if m.threshold != 0 {
+        members.push(("thr", Json::Num(u64::from(m.threshold))));
+    }
+    if m.version != 0 {
+        members.push(("v", Json::Num(u64::from(m.version))));
+    }
+    (!members.is_empty()).then_some(Json::Obj(members))
+}
+
+/// `string(protocol.EncodeJSON(lsigToInspect(lsig with Logic = nil)))`
+/// (clerk.go:1042-1045): the members `arg`, `lmsig`, `msig`, `pqsig`, `sig` in
+/// canonical (sorted) order, empty ones omitted. The program itself is left out.
+fn lsig_inspect_json(lsig: &algo_types::LogicSig) -> String {
+    let mut members: Vec<(&'static str, Json)> = Vec::new();
+    if let Some(args) = lsig.args.as_ref().filter(|a| !a.is_empty()) {
+        members.push(("arg", Json::Arr(args.iter().map(|a| b64(a)).collect())));
+    }
+    if let Some(j) = lsig.lmsig.as_ref().and_then(msig_inspect_json) {
+        members.push(("lmsig", j));
+    }
+    if let Some(j) = lsig.msig.as_ref().and_then(msig_inspect_json) {
+        members.push(("msig", j));
+    }
+    if let Some(pq) = lsig.pqsig.as_ref().filter(|p| !p.blank()) {
+        let mut m = Vec::new();
+        if !pq.public_key.is_empty() {
+            m.push(("pk", b64(&pq.public_key)));
+        }
+        if pq.scheme != [0u8; 2] {
+            m.push(("sch", b64(&pq.scheme)));
+        }
+        if !pq.signature.is_empty() {
+            m.push(("sig", b64(&pq.signature)));
+        }
+        if pq.salt.0 != 0 {
+            m.push(("slt", Json::Num(u64::from(pq.salt.0))));
+        }
+        members.push(("pqsig", Json::Obj(m)));
+    }
+    if lsig.sig != [0u8; 64] {
+        members.push(("sig", b64(&lsig.sig)));
+    }
+    let mut out = String::new();
+    Json::Obj(members).write(0, &mut out);
+    out
+}
+
+/// go's `reportErrorf` text for a failed wallet signature of the program.
+const ERROR_SIGNING_TX: &str =
+    "Couldn't sign tx with kmd: {} (for multisig accounts, write tx to file and sign manually)";
+
+/// The `-s` branch of `compileCmd` (clerk.go:1089-1111): sign `program` with
+/// the key of `account` (the default account when empty) through kmd and return
+/// the msgpack signed LogicSig.
+fn sign_program_to_lsig(
+    program: &[u8],
+    account: &mut String,
+    wallet: Option<&str>,
+    cli_d: &[PathBuf],
+    kmd_dir_flag: Option<&Path>,
+) -> Result<Vec<u8>, String> {
+    let data_dir_path = data_dir::ensure_single_data_dir(cli_d).map_err(|e| e.to_string())?;
+    let mut accounts = AccountsList::load(&data_dir_path);
+    let kmd = build_kmd_client(&data_dir_path, kmd_dir_flag)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Error processing command: {e}"))?;
+    let (handle, _wallet_name, password) =
+        resolve_wallet_and_init(&rt, &kmd, &mut accounts, wallet, None)?;
+
+    // Check if the account was specified, else use the default.
+    if account.is_empty() {
+        *account = accounts.default_account.clone();
+        if account.is_empty() {
+            return Err(
+                "no default account set. set one with 'goal account -f' or specify an account with '-a'."
+                    .to_string(),
+            );
+        }
+        println!("will use default account: {account}");
+    }
+    let signing_address = accounts.address_for(account);
+    let resp = rt
+        .block_on(kmd.sign_program(&handle, &password, &signing_address, program.to_vec()))
+        .map_err(|e| ERROR_SIGNING_TX.replacen("{}", &kmd_msg(&e), 1))?;
+    let sig: [u8; 64] = resp
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("kmd returned a {}-byte signature", resp.signature.len()))?;
+    let lsig = algo_types::LogicSig {
+        logic: serde_bytes::ByteBuf::from(program.to_vec()),
+        sig,
+        ..algo_types::LogicSig::default()
+    };
+    Ok(algo_codec::canonical_encode_logicsig(&lsig))
+}
+
+fn run_compile_inner(
+    args: crate::groups::clerk::CompileArgs,
+    wallet: Option<String>,
+    cli_d: Vec<PathBuf>,
+    kmd_dir_flag: Option<PathBuf>,
+) -> Result<(), String> {
+    // go keeps `account` in a flag variable: the default account is resolved
+    // (and announced) once, for the first file that is signed.
+    let mut account = args.account.clone().unwrap_or_default();
     for fname in &args.files {
         let fname_str = fname.to_string_lossy().to_string();
+        // Error texts are in the lossless text form (see `run_compile`).
+        let fname_enc = algo_avm::raw_text::encode_str(&fname_str).into_owned();
         if args.disassemble {
             disassemble_file(&fname_str, args.outfile.as_deref().unwrap_or(""))?;
             continue;
@@ -1160,20 +1409,18 @@ fn run_compile_inner(args: crate::groups::clerk::CompileArgs) -> Result<(), Stri
         let should_print_address = outname != STDIN_STDOUT;
 
         // assembleFileWithMap (clerk.go:998): read, assemble, report.
-        let source = read_goal_file(&fname_str).map_err(|e| format!("{fname_str}: {e}"))?;
-        let text = String::from_utf8(source).map_err(|e| format!("{fname_str}: {e}"))?;
-        let ops = match algo_avm::assembler::assemble_string_reported(&text) {
+        let source = read_goal_file(&fname_str).map_err(|e| format!("{fname_enc}: {e}"))?;
+        let ops = match algo_avm::assembler::assemble_bytes_reported(&source) {
             Ok(ops) => ops,
             Err((algo_avm::assembler::AssembleFailure::Panic(msg), _)) => {
                 // go's assembler panics here (exit status 2 with a goroutine trace).
                 eprintln!("panic: {msg}");
-                return Err(format!("{fname_str}: assembler panic"));
+                return Err(format!("{fname_enc}: assembler panic"));
             }
             Err((algo_avm::assembler::AssembleFailure::Errors(errors), warnings)) => {
-                eprint!(
-                    "{}",
-                    algo_avm::assembler::report_multiple_errors(&fname_str, &errors, &warnings)
-                );
+                write_stderr(&algo_avm::assembler::report_multiple_errors_bytes(
+                    &fname_str, &errors, &warnings,
+                ));
                 let err = if errors.len() == 1
                     && errors[0].line == 0
                     && errors[0].col == 0
@@ -1190,14 +1437,14 @@ fn run_compile_inner(args: crate::groups::clerk::CompileArgs) -> Result<(), Stri
                 } else {
                     format!("{} errors", errors.len())
                 };
-                return Err(format!("{fname_str}: {err}"));
+                return Err(format!("{fname_enc}: {err}"));
             }
         };
         if !ops.warnings.is_empty() {
             for w in &ops.warnings {
-                eprintln!(
-                    "{}",
-                    algo_avm::assembler::go_source_error_string(w.line, w.col, &w.message)
+                report_lines(
+                    &algo_avm::assembler::go_source_error_string(w.line, w.col, &w.message),
+                    INFO_NON_PRINTABLE_CHARACTERS,
                 );
             }
             let plural = if ops.warnings.len() == 1 { "" } else { "s" };
@@ -1207,9 +1454,22 @@ fn run_compile_inner(args: crate::groups::clerk::CompileArgs) -> Result<(), Stri
             .map_err(|e| format!("Could not assemble: {e}"))?;
         let program = &ops.program;
 
+        // `-s`: the output is the signed LogicSig record (clerk.go:1088-1111).
+        let outblob = if args.sign {
+            sign_program_to_lsig(
+                program,
+                &mut account,
+                wallet.as_deref(),
+                &cli_d,
+                kmd_dir_flag.as_deref(),
+            )?
+        } else {
+            program.clone()
+        };
+
         // Write the binary program unless --no-out (clerk.go:1112-1117).
         if !args.no_out {
-            write_goal_file(&outname, program).map_err(|e| format!("{outname}: {e}"))?;
+            write_goal_file(&outname, &outblob).map_err(|e| format!("{outname}: {e}"))?;
         }
         // Source map (clerk.go:1118-1131): json.Marshal, so HTML-escaped.
         if args.map {
@@ -1224,8 +1484,9 @@ fn run_compile_inner(args: crate::groups::clerk::CompileArgs) -> Result<(), Stri
                 .map_err(|e| format!("{map_name}: {e}"))?;
             std::fs::write(&map_name, json).map_err(|e| format!("{map_name}: {e}"))?;
         }
-        // Print "<file>: <address>" unless writing to stdout (clerk.go:1132-1136).
-        if should_print_address {
+        // Print "<file>: <address>" unless writing to stdout or signing
+        // (clerk.go:1132-1136).
+        if !args.sign && should_print_address {
             use sha2::{Digest, Sha512_256};
             let mut hasher = Sha512_256::new();
             hasher.update(b"Program");

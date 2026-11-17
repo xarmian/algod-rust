@@ -190,7 +190,12 @@ fn compile_reports_errors_like_go() {
 /// identical relative names: exit code, stdout, stderr and every file written
 /// must be identical.
 /// Exit code, stdout, stderr and the files a case writes.
-type RunResult = (Option<i32>, String, String, Vec<(String, Option<Vec<u8>>)>);
+type RunResult = (
+    Option<i32>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<(String, Option<Vec<u8>>)>,
+);
 
 /// `(label, bytes)` pairs.
 type Named = Vec<(String, Vec<u8>)>;
@@ -214,12 +219,7 @@ fn run_case(bin: &Path, case: &Case) -> RunResult {
         .iter()
         .map(|n| (n.clone(), std::fs::read(tmp.path().join(n)).ok()))
         .collect();
-    (
-        out.status.code(),
-        text(&out.stdout),
-        text(&out.stderr),
-        files,
-    )
+    (out.status.code(), out.stdout, out.stderr, files)
 }
 
 fn compile_case(name: &str, src: &[u8], extra: &[&str]) -> Case {
@@ -308,6 +308,15 @@ fn compile_matches_go_goal() {
         disassemble_case("D bad version", &[0xff, 0xff, 0xff]),
         disassemble_case("D empty", &[]),
     ];
+    // Sources that are not UTF-8 (#2388): go assembles any byte string.
+    for (name, src) in NON_UTF8_SOURCES {
+        cases.push(compile_case(name, src, &[]));
+        cases.push(compile_case(&format!("{name} -m"), src, &["-m"]));
+    }
+    // `-D` of signed LogicSig records (#2388) and of byte strings that are not.
+    for (name, bytes) in lsig_files() {
+        cases.push(disassemble_case(&format!("D lsig {name}"), &bytes));
+    }
     if let Ok(dir) = std::env::var("TEAL_CORPUS_DIR") {
         let want = std::env::var("TEAL_CORPUS_GOAL_SAMPLE")
             .ok()
@@ -327,7 +336,18 @@ fn compile_matches_go_goal() {
         let go = run_case(&go_goal, case);
         let rs = run_case(Path::new(GOAL_RUST_BIN), case);
         if go != rs {
-            mismatches.push(format!("{}:\n  go:   {go:?}\n  rust: {rs:?}", case.name));
+            mismatches.push(format!(
+                "{}:\n  go:   {:?} stdout={:?} stderr={:?} files={:?}\n  rust: {:?} stdout={:?} stderr={:?} files={:?}",
+                case.name,
+                go.0,
+                String::from_utf8_lossy(&go.1),
+                String::from_utf8_lossy(&go.2),
+                go.3,
+                rs.0,
+                String::from_utf8_lossy(&rs.1),
+                String::from_utf8_lossy(&rs.2),
+                rs.3,
+            ));
         }
     }
     println!(
@@ -336,4 +356,285 @@ fn compile_matches_go_goal() {
         mismatches.len()
     );
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+// ---- sources that are not UTF-8 (issue #2388) ------------------------------
+
+/// Sources whose bytes are not (all) UTF-8: go assembles them, keeping a string
+/// literal's bytes and ignoring a comment's, and reports the bytes of a bad
+/// token as they are.
+const NON_UTF8_SOURCES: &[(&str, &[u8])] = &[
+    ("literal", b"#pragma version 8\nbyte \"\xff\xfe\"\nint 1\n"),
+    ("comment", b"#pragma version 8\nint 1 // \xff\xfe\n"),
+    ("label", b"#pragma version 8\nint 1\n\xfe:\nint 1\n"),
+    ("unknown opcode", b"#pragma version 8\nfoo\xff\nint 1\n"),
+    (
+        "truncated sequence",
+        b"#pragma version 8\nint 1\n\xe2\x82 \n",
+    ),
+    ("two errors", b"#pragma version 8\nfoo\xff\nbar\xfe\n"),
+    ("int immediate", b"#pragma version 8\nint \xff\n"),
+    ("hex literal", b"#pragma version 8\nbyte 0x\xffab\n"),
+    ("macro name", b"#pragma version 8\n#define \xff 1\nint 1\n"),
+    (
+        "private use",
+        b"#pragma version 8\nfoo\xf4\x8f\xbc\x80\nint 1\n",
+    ),
+    ("whole file", b"\xff\xfe"),
+    (
+        "control character",
+        b"#pragma version 8\nfoo\x01bar\nint 1\n",
+    ),
+    (
+        "control character in a warning",
+        b"#pragma version 8\nbyte \"\x01\"\nint 1\nint 1\n+\nreturn\n",
+    ),
+    (
+        "warning with literal",
+        b"#pragma version 8\nbyte \"\xff\"\nint 1\nint 1\n+\nreturn\n",
+    ),
+];
+
+#[test]
+fn compile_assembles_non_utf8_source_like_go() {
+    let tmp = tempfile::tempdir().unwrap();
+    let goal = Path::new(GOAL_RUST_BIN);
+    std::fs::write(tmp.path().join("p.teal"), NON_UTF8_SOURCES[0].1).unwrap();
+
+    // The probe of #2388; the address is go's (`/v2/teal/compile` answers the
+    // same `hash` and `result` CIAC//6BAQ==).
+    let out = run(goal, tmp.path(), &["clerk", "compile", "p.teal"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "p.teal: MFCZLYTBNJYZALFOIWR6GTHRV7FRWIZPI3NSVBI4YHIUEF5FDYXVBDL354\n"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("p.teal.tok")).unwrap(),
+        vec![8, 0x80, 2, 0xff, 0xfe, 0x81, 1]
+    );
+
+    // A bad token is reported with its bytes by `ReportMultipleErrors` and, like
+    // every goal error line (`unicodePrintable`), as U+FFFD by `reportErrorf`.
+    std::fs::write(
+        tmp.path().join("bad.teal"),
+        b"#pragma version 8\nfoo\xff\nint 1\n",
+    )
+    .unwrap();
+    let out = run(goal, tmp.path(), &["clerk", "compile", "bad.teal"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        out.stderr,
+        b"bad.teal: 1 error: 2: unknown opcode: foo\xff\nbad.teal: 1 error: 2: unknown opcode: foo\xef\xbf\xbd\n".to_vec()
+    );
+}
+
+// ---- `-D` of a signed LogicSig (issue #2388) --------------------------------
+
+const PROGRAM: [u8; 3] = [8, 0x81, 1];
+
+fn sig64() -> [u8; 64] {
+    std::array::from_fn(|i| i as u8)
+}
+
+fn pk32(mul: usize) -> [u8; 32] {
+    std::array::from_fn(|i| (i * mul % 256) as u8)
+}
+
+fn lsig_base() -> algo_types::LogicSig {
+    algo_types::LogicSig {
+        logic: serde_bytes::ByteBuf::from(PROGRAM.to_vec()),
+        ..algo_types::LogicSig::default()
+    }
+}
+
+fn msig(threshold: u8, subs: &[([u8; 32], [u8; 64])]) -> algo_types::MultisigSig {
+    algo_types::MultisigSig {
+        version: 1,
+        threshold,
+        subsigs: subs
+            .iter()
+            .map(|(pk, s)| algo_types::MultisigSubsig {
+                public_key: *pk,
+                signature: *s,
+            })
+            .collect(),
+    }
+}
+
+/// LogicSig records (and byte strings that are not one) as `goal clerk compile
+/// -D` reads them.
+fn lsig_files() -> Vec<(String, Vec<u8>)> {
+    let enc = |l: &algo_types::LogicSig| algo_codec::canonical_encode_logicsig(l);
+    let args = |a: &[&[u8]]| {
+        Some(
+            a.iter()
+                .map(|x| serde_bytes::ByteBuf::from(x.to_vec()))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let mut v = vec![
+        ("unsigned".to_string(), enc(&lsig_base())),
+        (
+            "sig".into(),
+            enc(&algo_types::LogicSig {
+                sig: sig64(),
+                ..lsig_base()
+            }),
+        ),
+        (
+            "blank sig".into(),
+            enc(&algo_types::LogicSig {
+                sig: [0; 64],
+                ..lsig_base()
+            }),
+        ),
+        (
+            "args".into(),
+            enc(&algo_types::LogicSig {
+                args: args(&[b"\x01\x02", b"", b"hello"]),
+                ..lsig_base()
+            }),
+        ),
+        (
+            "sig and args".into(),
+            enc(&algo_types::LogicSig {
+                sig: sig64(),
+                args: args(&[b"\xff"]),
+                ..lsig_base()
+            }),
+        ),
+        (
+            "msig".into(),
+            enc(&algo_types::LogicSig {
+                msig: Some(msig(2, &[(pk32(3), sig64()), (pk32(7), [0; 64])])),
+                ..lsig_base()
+            }),
+        ),
+        (
+            "lmsig".into(),
+            enc(&algo_types::LogicSig {
+                lmsig: Some(msig(1, &[(pk32(3), sig64())])),
+                ..lsig_base()
+            }),
+        ),
+        (
+            "everything".into(),
+            enc(&algo_types::LogicSig {
+                sig: sig64(),
+                msig: Some(msig(2, &[(pk32(3), sig64())])),
+                lmsig: Some(msig(1, &[(pk32(7), sig64())])),
+                args: args(&[b"a"]),
+                ..lsig_base()
+            }),
+        ),
+        (
+            "pqsig".into(),
+            enc(&algo_types::LogicSig {
+                pqsig: Some(algo_types::PQSig {
+                    scheme: *b"fn",
+                    salt: algo_types::PQAddressSalt(3),
+                    public_key: serde_bytes::ByteBuf::from((0..20).collect::<Vec<u8>>()),
+                    signature: serde_bytes::ByteBuf::from((0..30).collect::<Vec<u8>>()),
+                }),
+                ..lsig_base()
+            }),
+        ),
+        (
+            "signed, no program".into(),
+            enc(&algo_types::LogicSig {
+                logic: serde_bytes::ByteBuf::new(),
+                sig: sig64(),
+                ..lsig_base()
+            }),
+        ),
+        (
+            "signed, program of an unknown version".into(),
+            enc(&algo_types::LogicSig {
+                logic: serde_bytes::ByteBuf::from(vec![99, 1, 2]),
+                sig: sig64(),
+                ..lsig_base()
+            }),
+        ),
+    ];
+    // Not LogicSig records: go falls back to disassembling the bytes.
+    v.push(("trailing bytes".into(), {
+        let mut b = enc(&lsig_base());
+        b.push(0);
+        b
+    }));
+    v.push(("empty map".into(), vec![0x80]));
+    v.push(("junk".into(), vec![1, 2, 3]));
+    v
+}
+
+#[test]
+fn disassemble_prints_the_inspection_of_a_signed_logicsig() {
+    let tmp = tempfile::tempdir().unwrap();
+    let goal = Path::new(GOAL_RUST_BIN);
+    let sig_b64 =
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==";
+    let files: std::collections::HashMap<_, _> = lsig_files().into_iter().collect();
+    let disassemble = |name: &str| -> String {
+        let f = tmp.path().join("x.lsig");
+        std::fs::write(&f, &files[name]).unwrap();
+        let out = run(goal, tmp.path(), &["clerk", "compile", "-D", "x.lsig"]);
+        assert!(out.status.success(), "{name}: {}", text(&out.stderr));
+        text(&out.stdout)
+    };
+    let head = "#pragma version 8\npushint 1\n";
+
+    // An unsigned record and a blank signature print only the program.
+    assert_eq!(disassemble("unsigned"), head);
+    assert_eq!(disassemble("blank sig"), head);
+
+    // Expected texts are go v5.0.5-stable's `goal clerk compile -D`.
+    assert_eq!(
+        disassemble("sig"),
+        format!("{head}LogicSig: {{\n  \"sig\": \"{sig_b64}\"\n}}\n")
+    );
+    assert_eq!(
+        disassemble("sig and args"),
+        format!(
+            "{head}LogicSig: {{\n  \"arg\": [\n    \"/w==\"\n  ],\n  \"sig\": \"{sig_b64}\"\n}}\n"
+        )
+    );
+    assert_eq!(
+        disassemble("args"),
+        format!("{head}LogicSig: {{\n  \"arg\": [\n    \"AQI=\",\n    \"\",\n    \"aGVsbG8=\"\n  ]\n}}\n")
+    );
+    assert_eq!(
+        disassemble("msig"),
+        format!(
+            "{head}LogicSig: {{\n  \"msig\": {{\n    \"subsig\": [\n      {{\n        \"pk\": \"AABQMCIMB4JBKGA3DYQSIJZKFUYDGNRZHQ7UERKIJNHFCVCXLJOYLCOB6Q\",\n        \"s\": \"{sig_b64}\"\n      }},\n      {{\n        \"pk\": \"AADQ4FI4EMVDCOB7IZGVIW3CNFYHO7UFRSJZVINIV63L3RGL2LM534AZPY\"\n      }}\n    ],\n    \"thr\": 2,\n    \"v\": 1\n  }}\n}}\n"
+        )
+    );
+    assert_eq!(
+        disassemble("pqsig"),
+        format!(
+            "{head}LogicSig: {{\n  \"pqsig\": {{\n    \"pk\": \"AAECAwQFBgcICQoLDA0ODxAREhM=\",\n    \"sch\": \"Zm4=\",\n    \"sig\": \"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwd\",\n    \"slt\": 3\n  }}\n}}\n"
+        )
+    );
+    // The members come out in go's canonical order: arg, lmsig, msig, pqsig, sig.
+    let all = disassemble("everything");
+    let at = |k: &str| {
+        all.find(&format!("\n  \"{k}\""))
+            .unwrap_or_else(|| panic!("{k} in {all}"))
+    };
+    assert!(at("arg") < at("lmsig") && at("lmsig") < at("msig") && at("msig") < at("sig"));
+    // A signed record without a program, and one with an unknown version.
+    assert_eq!(
+        disassemble("signed, no program"),
+        format!("// invalid version\nLogicSig: {{\n  \"sig\": \"{sig_b64}\"\n}}\n")
+    );
+    assert_eq!(
+        disassemble("signed, program of an unknown version"),
+        format!("// unsupported version 99\nLogicSig: {{\n  \"sig\": \"{sig_b64}\"\n}}\n")
+    );
+    // Bytes that are not a LogicSig record are disassembled as a program.
+    assert_eq!(
+        disassemble("junk"),
+        "#pragma version 1\nkeccak256\nsha512_256\n"
+    );
+    assert_eq!(disassemble("empty map"), "// invalid version\n");
 }
