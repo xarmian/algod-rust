@@ -190,8 +190,7 @@ fn hung_workers_beyond_the_limit_stop_the_batch_with_recorded_row_errors() {
 // that input's start), never per batch or per worker.
 #[test]
 fn the_timeout_is_per_input_even_when_the_batch_runs_longer_than_it() {
-    let inputs: Vec<Input> = (0..12).map(|n| input(&format!("s{n:02}"))).collect();
-    let mut inputs = inputs;
+    let mut inputs: Vec<Input> = (0..12).map(|n| input(&format!("s{n:02}"))).collect();
     inputs.push(input("zz-hang"));
     let started = std::time::Instant::now();
     let rows = run_batch(inputs, 1, Duration::from_millis(150), |i| {
