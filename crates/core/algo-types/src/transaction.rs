@@ -2421,6 +2421,16 @@ impl SignedTransaction {
     ///
     /// Uses two-level key dispatch: (key_len, first_byte) for fast routing.
     pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        Self::decode_impl(rd, true)
+    }
+
+    /// An inner transaction of an eval delta, go's `SignedTxnWithAD`: a
+    /// `SignedTxnInBlock` without the `hgi`/`hgh` genesis flags.
+    pub(crate) fn decode_inner_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        Self::decode_impl(rd, false)
+    }
+
+    fn decode_impl(rd: &mut &[u8], genesis_flags: bool) -> DecodeResult<Self> {
         let len = rmp_decode::read_map_len(rd)?;
         let mut s = Self::default();
         let mut has_txn = false;
@@ -2448,7 +2458,10 @@ impl SignedTransaction {
             }
             match (key.len(), key.first().copied().unwrap_or(0)) {
                 (2, b'c') if key == b"ca" => s.closing_amount = rmp_decode::read_u64(rd)?,
-                (2, b'd') if key == b"dt" => s.eval_delta = rmp_decode::read_optional_rmpv(rd)?,
+                (2, b'd') if key == b"dt" => {
+                    s.eval_delta =
+                        rmp_decode::read_checked_optional_rmpv(rd, &crate::msgp_schema::EVAL_DELTA)?
+                }
                 (2, b'r') => match key {
                     b"rs" => s.sender_rewards = rmp_decode::read_u64(rd)?,
                     b"rr" => s.receiver_rewards = rmp_decode::read_u64(rd)?,
@@ -2457,8 +2470,8 @@ impl SignedTransaction {
                 },
                 (3, b'a') if key == b"aca" => s.asset_closing_amount = rmp_decode::read_u64(rd)?,
                 (3, b'h') => match key {
-                    b"hgi" => s.has_genesis_id = rmp_decode::read_bool(rd)?,
-                    b"hgh" => s.has_genesis_hash = rmp_decode::read_bool(rd)?,
+                    b"hgi" if genesis_flags => s.has_genesis_id = rmp_decode::read_bool(rd)?,
+                    b"hgh" if genesis_flags => s.has_genesis_hash = rmp_decode::read_bool(rd)?,
                     _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 (3, b's') if key == b"sig" => {

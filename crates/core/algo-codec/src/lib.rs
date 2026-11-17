@@ -127,7 +127,21 @@ pub fn decode_signed_txn_stream(mut bytes: &[u8]) -> Result<Vec<SignedTransactio
 }
 
 /// Decode a block response from msgpack bytes (as returned by the REST API).
+///
+/// This is the catchup / block-fetch decode, go's `protocol.Decode` into
+/// `rpcs.EncodedBlockCert`: it uses the hand-written reader, so a key go's
+/// structs lack, anywhere in the block or its certificate, drops the response
+/// as go's `msgp.ErrNoField` does (the derived-serde decoder this used to be
+/// skipped them, issue #2394). [`decode_block_response_serde`] is the old path.
 pub fn decode_block_response(bytes: &[u8]) -> Result<BlockResponse> {
+    check_msgpack_depth(bytes)?;
+    BlockResponse::decode_from_bytes(bytes)
+}
+
+/// The derived-serde block-response decoder `decode_block_response` used before
+/// issue #2394, which ignores unknown keys. Kept as a differential reference;
+/// do not use it for new code.
+pub fn decode_block_response_serde(bytes: &[u8]) -> Result<BlockResponse> {
     check_msgpack_depth(bytes)?;
     rmp_serde::from_slice(bytes).map_err(|e| AlgoError::Codec {
         source: Box::new(e),

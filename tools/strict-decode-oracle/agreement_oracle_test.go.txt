@@ -1,0 +1,151 @@
+// Copyright (C) 2019-2026 Algorand Foundation Ltd.
+// Modifications Copyright (C) 2026 Algod DAO
+// This file is part of algod-rust, a modified work based on go-algorand
+// (https://github.com/algorand/go-algorand).
+//
+// algod-rust is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// algod-rust is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with algod-rust.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// This file is NOT part of any Go module here: it is a template that
+// scripts/strict-decode/strict_decode_fixtures.py copies, as
+// zz_strict_decode_oracle_test.go, into the pinned go-algorand checkout's
+// agreement package (the payload/vote/bundle decoders are unexported) and runs
+// there. Issue #2394.
+//
+// For every {"name","kind","hex"} row of $STRICT_IN it runs go's real network
+// decode of that message kind and writes {"name","ok","err"} to $STRICT_OUT:
+//
+//	payload  protocol.Decode into transmittedPayload      (decodeProposal, the "PP" handler)
+//	vote     protocol.Decode into unauthenticatedVote     (decodeVote, the "AV" handler)
+//	bundle   protocol.Decode into unauthenticatedBundle   (decodeBundle, the "VB" handler)
+//	cert     protocol.Decode into Certificate             (the block DB's cert)
+//
+// The handlers' wellFormed() checks run after the decode and are not part of it.
+
+package agreement
+
+import (
+	"bufio"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"math/rand"
+	"os"
+	"testing"
+
+	"github.com/algorand/go-algorand/protocol"
+	"github.com/algorand/msgp/msgp"
+)
+
+func TestStrictDecodeOracleAgreement(t *testing.T) {
+	in, err := os.Open(os.Getenv("STRICT_IN"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	out, err := os.Create(os.Getenv("STRICT_OUT"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+
+	type row struct {
+		Name string `json:"name"`
+		Kind string `json:"kind"`
+		Hex  string `json:"hex"`
+	}
+	type res struct {
+		Name string `json:"name"`
+		Ok   bool   `json:"ok"`
+		Err  string `json:"err"`
+	}
+	sc := bufio.NewScanner(in)
+	sc.Buffer(make([]byte, 1<<20), 1<<28)
+	enc := json.NewEncoder(out)
+	for sc.Scan() {
+		var r row
+		if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
+			t.Fatal(err)
+		}
+		b, err := hex.DecodeString(r.Hex)
+		if err != nil {
+			t.Fatal(err)
+		}
+		func() {
+			o := res{Name: r.Name}
+			defer func() {
+				if x := recover(); x != nil {
+					o.Ok, o.Err = false, fmt.Sprintf("panic: %v", x)
+				}
+				enc.Encode(o)
+			}()
+			var derr error
+			switch r.Kind {
+			case "payload":
+				var v transmittedPayload
+				derr = protocol.Decode(b, &v)
+			case "vote":
+				var v unauthenticatedVote
+				derr = protocol.Decode(b, &v)
+			case "bundle":
+				var v unauthenticatedBundle
+				derr = protocol.Decode(b, &v)
+			case "cert":
+				var c Certificate
+				derr = protocol.Decode(b, &c)
+			default:
+				t.Fatalf("unknown kind %q", r.Kind)
+			}
+			o.Ok = derr == nil
+			if derr != nil {
+				o.Err = derr.Error()
+			}
+		}()
+	}
+}
+
+// TestStrictDecodeSeedsAgreement writes $STRICT_SEEDS_OUT: one go-encoded,
+// fully populated (protocol.RandomizeObject) message per kind and seed.
+func TestStrictDecodeSeedsAgreement(t *testing.T) {
+	path := os.Getenv("STRICT_SEEDS_OUT")
+	if path == "" {
+		t.Skip("STRICT_SEEDS_OUT not set")
+	}
+	out, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	enc := json.NewEncoder(out)
+	n := 4
+	rand.Seed(2394)
+	emit := func(kind string, i int, tmpl any) {
+		o, err := protocol.RandomizeObject(tmpl, protocol.RandomizeObjectWithMaxCollectionLen(2))
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, ok := o.(msgp.Marshaler)
+		if !ok {
+			t.Fatalf("%T is not a msgp.Marshaler", o)
+		}
+		enc.Encode(map[string]string{"name": fmt.Sprintf("%s_rand%d", kind, i), "kind": kind, "hex": hex.EncodeToString(protocol.Encode(m))})
+	}
+	for i := 0; i < n; i++ {
+		emit("payload", i, &transmittedPayload{})
+		emit("vote", i, &unauthenticatedVote{})
+		emit("bundle", i, &unauthenticatedBundle{})
+		emit("cert", i, &Certificate{})
+	}
+}

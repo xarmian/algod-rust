@@ -430,6 +430,7 @@ algo-agreement-fuzz --case bad-vrf-proof --dry-run ...
 | `wrong-committee-weight` | nothing on the wire — an entirely honest vote for a `(round, 0, propose)` where the account wins **zero** seats (**0 bytes** differ) | `malformed proposal for (r, 0): … UnauthenticatedCredential.Verify: credential has weight 0` + `BadData` |
 | `wrong-ots-domain` | the correct one-time key signs the correct body under the `"PL"` domain instead of `"VO"` | `malformed vote for (r, 0, 255): unauthenticatedVote.verify: could not verify FS signature on vote by …` + `BadData` |
 | `malformed-proposal` | a genuine `PP` captured off the wire with one block field corrupted | `rejected block for (r, 0): proposalStore: no accepting blockAssembler found on payloadPresent`, and the corrupted block is never committed |
+| `unknown-field-proposal` (opt-in, `CASES=unknown-field-proposal`; issue #2394) | a genuine `PP` captured off the wire, block untouched, with **one unknown key** added to its first transaction (top level when the payset is empty) | `dropping proposal that failed to decode: Unknown field: zzunk` (`agreement/demux.go`, `msgp.ErrNoField`; WARN level, no disconnect); algod-rust's own `decode_compound_message` must refuse the same bytes (checked before injecting) |
 
 Each vote case is answered with `disconnectAction`
 (`agreement/player.go`, `voteMalformed`) → `disconnectBadData`

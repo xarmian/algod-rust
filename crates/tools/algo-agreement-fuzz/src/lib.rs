@@ -629,6 +629,56 @@ pub fn encode_compound_message(cm: &CompoundMessage) -> Vec<u8> {
     codec::encode_compound_message(cm)
 }
 
+/// Where [`with_unknown_field`] put its key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnknownFieldSite {
+    /// Inside the first `SignedTxnInBlock` of the payload's `txns`.
+    SignedTxn,
+    /// In the payload's top-level map (an empty payset has no transaction).
+    TopLevel,
+}
+
+/// The key [`with_unknown_field`] inserts: no go-algorand struct has it.
+pub const UNKNOWN_FIELD_KEY: &str = "zzunk";
+
+/// Case 4b (issue #2394): `encoded_pp` with one unknown key added to the
+/// first transaction (or the top-level map when the payset is empty).
+///
+/// The block content is unchanged, so the honest proposal is still the one the
+/// network commits; what differs is only that go's generated msgp decoder fails
+/// on the key (`msgp.ErrNoField`, logged as "dropping proposal that failed to
+/// decode") and drops the payload, which a node that skips unknown keys would
+/// not.
+pub fn with_unknown_field(encoded_pp: &[u8]) -> Result<(Vec<u8>, UnknownFieldSite), FuzzError> {
+    use rmpv::Value;
+    let bad = |m: &str| FuzzError::PreconditionViolated(format!("payload is not a PP map: {m}"));
+    let mut v = rmpv::decode::read_value(&mut &encoded_pp[..]).map_err(|e| bad(&e.to_string()))?;
+    let Value::Map(top) = &mut v else {
+        return Err(bad("not a map"));
+    };
+    let extra = (Value::from(UNKNOWN_FIELD_KEY), Value::from(1u64));
+    let first_txn = top
+        .iter_mut()
+        .find(|(k, _)| k.as_str() == Some("txns"))
+        .and_then(|(_, txns)| match txns {
+            Value::Array(a) => a.first_mut(),
+            _ => None,
+        });
+    let site = match first_txn {
+        Some(Value::Map(m)) => {
+            m.push(extra);
+            UnknownFieldSite::SignedTxn
+        }
+        _ => {
+            top.push(extra);
+            UnknownFieldSite::TopLevel
+        }
+    };
+    let mut out = Vec::new();
+    rmpv::encode::write_value(&mut out, &v).map_err(|e| bad(&e.to_string()))?;
+    Ok((out, site))
+}
+
 // ---------------------------------------------------------------------------
 // Small helpers shared with the binary
 // ---------------------------------------------------------------------------
@@ -1367,5 +1417,57 @@ mod tests {
         let v = synthetic_proposal_value(Address([9; 32]), Round(1), Period(2));
         assert_ne!(v.block_digest, Digest([0; 32]));
         assert_ne!(v.encoding_digest, v.block_digest);
+    }
+}
+
+#[cfg(test)]
+mod unknown_field_tests {
+    use super::*;
+
+    /// A canonical map with a `txns` array of one transaction map.
+    fn pp_like(with_txn: bool) -> Vec<u8> {
+        use rmpv::Value;
+        let txns = if with_txn {
+            Value::Array(vec![Value::Map(vec![(
+                Value::from("sig"),
+                Value::Binary(vec![7; 64]),
+            )])])
+        } else {
+            Value::Array(vec![])
+        };
+        let v = Value::Map(vec![
+            (Value::from("rnd"), Value::from(9u64)),
+            (Value::from("txns"), txns),
+        ]);
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, &v).unwrap();
+        out
+    }
+
+    #[test]
+    fn the_unknown_key_goes_into_the_first_transaction() {
+        let base = pp_like(true);
+        let (bad, site) = with_unknown_field(&base).unwrap();
+        assert_eq!(site, UnknownFieldSite::SignedTxn);
+        let key = [
+            &[0xa0 | UNKNOWN_FIELD_KEY.len() as u8][..],
+            UNKNOWN_FIELD_KEY.as_bytes(),
+        ]
+        .concat();
+        // the original bytes are all still there, plus the one entry (key + fixint 1)
+        assert_eq!(bad.len(), base.len() + key.len() + 1);
+        assert!(bad.windows(key.len()).any(|w| w == key));
+    }
+
+    #[test]
+    fn an_empty_payset_gets_the_key_at_the_top_level() {
+        let (bad, site) = with_unknown_field(&pp_like(false)).unwrap();
+        assert_eq!(site, UnknownFieldSite::TopLevel);
+        assert_eq!(bad[0], 0x83, "the top-level map grew from 2 to 3 entries");
+    }
+
+    #[test]
+    fn a_non_map_payload_is_refused() {
+        assert!(with_unknown_field(&[0x01]).is_err());
     }
 }

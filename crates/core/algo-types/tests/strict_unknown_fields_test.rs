@@ -130,12 +130,20 @@ fn a_clean_body_decodes_in_strict_mode() {
 
 #[test]
 fn unknown_key_at_the_signed_txn_level() {
-    check(&map(vec![("txn", txn(None)), sig(), ("zzz", uint(1))]), 226, "zzz");
+    check(
+        &map(vec![("txn", txn(None)), sig(), ("zzz", uint(1))]),
+        226,
+        "zzz",
+    );
 }
 
 #[test]
 fn unknown_key_inside_the_transaction() {
-    check(&map(vec![("txn", txn(Some(("zzz", uint(1))))), sig()]), 156, "zzz");
+    check(
+        &map(vec![("txn", txn(Some(("zzz", uint(1))))), sig()]),
+        156,
+        "zzz",
+    );
 }
 
 #[test]
@@ -186,13 +194,19 @@ fn in_block_only_keys_are_unknown_in_strict_mode() {
     check(&map(vec![("ca", uint(5)), sig(), t()]), 4, "ca");
     check(&map(vec![("apid", uint(5)), sig(), t()]), 6, "apid");
     // the first unknown key in stream order wins
-    check(&map(vec![("hgh", vec![0xc3]), ("hgi", vec![0xc3]), sig(), t()]), 5, "hgh");
+    check(
+        &map(vec![("hgh", vec![0xc3]), ("hgi", vec![0xc3]), sig(), t()]),
+        5,
+        "hgh",
+    );
 }
 
 /// Every key the SignedTransaction reader accepts only because blocks carry it.
 #[test]
 fn every_block_only_key_is_unknown_in_strict_mode() {
-    for key in ["ca", "dt", "rs", "rr", "rc", "aca", "hgi", "hgh", "apid", "caid"] {
+    for key in [
+        "ca", "dt", "rs", "rr", "rc", "aca", "hgi", "hgh", "apid", "caid",
+    ] {
         let body = map(vec![(key, uint(1)), sig(), ("txn", txn(None))]);
         let u = unknown(decode_strict(&body).expect_err(key));
         assert_eq!(u.key, key);
@@ -205,9 +219,8 @@ fn every_block_only_key_is_unknown_in_strict_mode() {
 /// heartbeat) are strict too, not just the SignedTxn envelope.
 #[test]
 fn unknown_key_inside_nested_transaction_structs_is_rejected() {
-    let nested = |outer: &'static str, inner: Vec<u8>| {
-        map(vec![("txn", txn(Some((outer, inner)))), sig()])
-    };
+    let nested =
+        |outer: &'static str, inner: Vec<u8>| map(vec![("txn", txn(Some((outer, inner)))), sig()]);
     let bad_map = || map(vec![("zzz", uint(1))]);
     let cases = vec![
         ("apar", bad_map()),
@@ -241,7 +254,10 @@ fn scan_mode_reaches_an_unknown_key_after_an_object_missing_required_fields() {
 
     // plain strict mode: the missing required field is the first error
     let err = decode_strict(&body).expect_err("missing snd");
-    assert!(matches!(&err, AlgoError::Codec { source, .. } if !source.is::<UnknownFieldError>()), "{err}");
+    assert!(
+        matches!(&err, AlgoError::Codec { source, .. } if !source.is::<UnknownFieldError>()),
+        "{err}"
+    );
 
     // scan mode runs on to the unknown key, at go's key position
     let _guard = strict_unknown_fields_scan(&body);
@@ -280,17 +296,26 @@ fn a_nested_strict_guard_does_not_inherit_scan_mode() {
     assert_eq!(u.key, "zzz");
 }
 
-/// Outside strict mode the readers still skip unknown keys (blocks, catchup).
+/// Outside strict mode an unknown key is still `msgp.ErrNoField` (issue #2394:
+/// go's block / catchup / gossip decoders reject it too); the guard only adds
+/// go's REST offset text. The block-only keys stay readable in the block form.
 #[test]
-fn without_the_guard_unknown_keys_are_still_skipped() {
+fn without_the_guard_unknown_keys_are_rejected_and_block_keys_read() {
     for body in [
         map(vec![("txn", txn(None)), sig(), ("zzz", uint(1))]),
         map(vec![("txn", txn(Some(("zzz", uint(1))))), sig()]),
-        map(vec![("hgi", vec![0xc3]), sig(), ("txn", txn(None))]),
     ] {
         let mut cur = &body[..];
-        SignedTransaction::decode_from_reader(&mut cur).expect("lenient decode");
+        let err = SignedTransaction::decode_from_reader(&mut cur).expect_err("unknown key");
+        assert!(
+            format!("{err:?}").contains("no matching struct field found"),
+            "{err:?}"
+        );
+        assert!(format!("{err:?}").contains("zzz"), "{err:?}");
     }
+    let block_form = map(vec![("hgi", vec![0xc3]), sig(), ("txn", txn(None))]);
+    let mut cur = &block_form[..];
+    SignedTransaction::decode_from_reader(&mut cur).expect("hgi is a SignedTxnInBlock key");
 }
 
 #[test]
@@ -298,5 +323,7 @@ fn the_guard_is_scoped_and_does_not_leak_to_a_later_decode() {
     let bad = map(vec![("txn", txn(None)), sig(), ("zzz", uint(1))]);
     assert!(decode_strict(&bad).is_err());
     let mut cur = &bad[..];
-    SignedTransaction::decode_from_reader(&mut cur).expect("lenient again after the guard dropped");
+    let err = SignedTransaction::decode_from_reader(&mut cur).expect_err("still unknown");
+    // no guard any more: the error carries no request-body offset
+    assert!(!format!("{err:?}").contains("pos "), "{err:?}");
 }

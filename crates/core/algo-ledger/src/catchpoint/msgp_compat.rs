@@ -225,6 +225,14 @@ fn read_raw_value(rd: &mut &[u8]) -> Result<Vec<u8>, CatchpointError> {
 }
 
 /// Skip a single msgpack value, advancing the reader past it.
+/// go's `msgp.ErrNoField`: a key the struct lacks fails the decode.
+#[cold]
+fn unknown_field(key: &str) -> CatchpointError {
+    CatchpointError::DecodeError(format!(
+        "no matching struct field found when decoding stream map with key {key}"
+    ))
+}
+
 fn skip_value(rd: &mut &[u8]) -> Result<(), CatchpointError> {
     let marker = peek_byte(rd)?;
     match marker {
@@ -616,7 +624,8 @@ pub fn decode_base_account_data(raw: &[u8]) -> Result<CatchpointBaseAccountData,
                     "E" => result.vote_key_dilution = read_u64(&mut rd)?,
                     "F" => result.state_proof_id = read_bytes_fixed::<64>(&mut rd)?,
                     "z" => result.update_round = read_u64(&mut rd)?,
-                    _ => skip_value(&mut rd)?,
+                    // go's msgp decoder: msgp.ErrNoField (issue #2394)
+                    other => return Err(unknown_field(other)),
                 }
             }
         }
@@ -772,7 +781,8 @@ pub fn decode_resources_data(raw: &[u8]) -> Result<CatchpointResourcesData, Catc
                     "B" => result.size_sponsor = read_bytes_fixed::<32>(&mut rd)?,
                     "C" => result.foreign_box_reads = read_bool(&mut rd)?,
                     "D" => result.family_box_access = read_bool(&mut rd)?,
-                    _ => skip_value(&mut rd)?,
+                    // go's msgp decoder: msgp.ErrNoField (issue #2394)
+                    other => return Err(unknown_field(other)),
                 }
             }
         }
@@ -921,7 +931,8 @@ pub fn decode_base_online_account_data(
                     "X" => result.incentive_eligible = read_bool(&mut rd)?,
                     "Y" => result.micro_algos = read_u64(&mut rd)?,
                     "Z" => result.rewards_base = read_u64(&mut rd)?,
-                    _ => skip_value(&mut rd)?,
+                    // go's msgp decoder: msgp.ErrNoField (issue #2394)
+                    other => return Err(unknown_field(other)),
                 }
             }
         }
@@ -1004,7 +1015,8 @@ pub fn decode_online_round_params_data(
                     "online" => result.online_supply = read_u64(&mut rd)?,
                     "rwdlvl" => result.rewards_level = read_u64(&mut rd)?,
                     "proto" => result.current_protocol = read_string(&mut rd)?,
-                    _ => skip_value(&mut rd)?,
+                    // go's msgp decoder: msgp.ErrNoField (issue #2394)
+                    other => return Err(unknown_field(other)),
                 }
             }
         }
@@ -1152,13 +1164,14 @@ mod tests {
     }
 
     #[test]
-    fn decode_base_account_data_unknown_keys_ignored() {
+    fn decode_base_account_data_unknown_keys_rejected() {
+        // go's generated decoder: msgp.ErrNoField (issue #2394)
         let raw = encode_map(&[
             ("b", rmpv::Value::from(42u64)),
             ("zzz_future", rmpv::Value::from(999u64)),
         ]);
-        let result = decode_base_account_data(&raw).unwrap();
-        assert_eq!(result.micro_algos, 42);
+        let err = decode_base_account_data(&raw).unwrap_err();
+        assert!(err.to_string().contains("zzz_future"), "{err}");
     }
 
     #[test]
@@ -1434,13 +1447,14 @@ mod tests {
     }
 
     #[test]
-    fn decode_resources_data_unknown_keys_ignored() {
+    fn decode_resources_data_unknown_keys_rejected() {
+        // go's generated decoder: msgp.ErrNoField (issue #2394)
         let raw = encode_map(&[
             ("a", rmpv::Value::from(100u64)),
             ("ZZZ", rmpv::Value::from(999u64)),
         ]);
-        let result = decode_resources_data(&raw).unwrap();
-        assert_eq!(result.total, 100);
+        let err = decode_resources_data(&raw).unwrap_err();
+        assert!(err.to_string().contains("ZZZ"), "{err}");
     }
 
     // -----------------------------------------------------------------------
