@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Algod DAO
+# (demo: touch a path-filtered file so the reverted tree runs the workflow)
 # SPDX-License-Identifier: MIT
 # See the LICENSE-MIT file in the repository root for the full license text.
 #
