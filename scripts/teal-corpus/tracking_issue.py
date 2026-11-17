@@ -32,9 +32,11 @@ def gh(args, run=subprocess.run):
 
 
 def find_open(repo, run=subprocess.run):
-    """The open tracking issue (exact title match), or None."""
+    """The open tracking issue (exact title match), or None. Listed by label and
+    matched client-side: the search index lags a just-created issue, a label
+    listing does not."""
     out = gh(["issue", "list", "--repo", repo, "--state", "open", "--label", "conformance", "--label", "avm",
-              "--search", f'"{TITLE}" in:title', "--json", "number,title", "--limit", "50"], run)
+              "--json", "number,title", "--limit", "200"], run)
     for issue in json.loads(out or "[]"):
         if issue.get("title") == TITLE:
             return issue
