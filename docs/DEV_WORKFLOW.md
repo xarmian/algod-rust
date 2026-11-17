@@ -1653,6 +1653,47 @@ a failure in between (no peer for B, a failed import) would leave a node whose
 tables and block rows disagree, while deleting the whole ledger has no partial
 state.
 
+## TEAL corpus parity: running the nightly check locally (Phase 25, issue #2372)
+
+The nightly workflow `.github/workflows/teal-corpus-parity.yml` is green only
+when algod-rust's TEAL disassembler and assembler match go-algorand's on the
+whole ARC56Registry corpus. Every step is a Makefile target, so the same check
+runs on a developer machine (Linux or WSL2; needs Go, cargo, python3, git, and
+`make libsodium` done once in `../go-algorand` at the pin, see `CLAUDE.md`):
+
+```bash
+make teal-corpus-fetch      # registry at main (TEAL_CORPUS_REGISTRY_REF=<sha> pins it), extract the corpus
+make teal-corpus-parity     # build both drivers, stages disassemble, reassemble, source; non-zero on any mismatch/panic/timeout
+make teal-corpus-gate       # stats.json + the nightly pass condition (extraction sane, every stage present, all zero)
+make teal-corpus-history    # optional: append this run to docs/teal-corpus/history.csv
+make bench-compare TIERS=teal-corpus RUNS=3   # informational go-vs-rust timings (equality-gated)
+```
+
+Output lands in `teal-corpus-work/` (`out/*.mismatches.jsonl` and `out/stats.json`).
+`python3 -I scripts/teal-corpus/gate.py bundle teal-corpus-work/corpus teal-corpus-work/out /tmp/repro`
+collects a reproducer directory per mismatching program (the program, its source
+and every driver row mentioning it), which is what the workflow uploads.
+
+The REST tier needs the dual-node harness: with `make validate-api-up` running,
+`TEAL_CORPUS_REST_OUT=$PWD/teal-corpus-work/out TEAL_CORPUS_REQUIRED=1 cargo test --release -p algod-rust --test live_teal_corpus_parity -- --ignored --nocapture`
+(`SAMPLE=all` for everything) writes `rest_sample.{go,rust}.jsonl`; the next
+`make teal-corpus-stats` then includes the `rest_sample` stage and
+`TEAL_CORPUS_REQUIRE_REST=1 make teal-corpus-gate` requires it.
+
+In CI: pull requests touching the assembler/disassembler/source-map sources, the
+drivers or `scripts/teal-corpus/**` run it against a pinned registry SHA
+(`PR_REGISTRY_SHA` in the workflow, so a registry change cannot turn an unrelated
+PR red) and skip the REST tier; the nightly schedule and `workflow_dispatch`
+(inputs `registry_ref`, `go_ref`, `rest_sample_size`; 0 skips REST) use the
+registry at `main`. A failing scheduled run opens or updates one tracking issue
+(labels `conformance`, `avm`, title "teal-corpus: nightly TEAL corpus parity check
+is failing") and the next green run closes it. Artifacts: `stats.json`,
+`*.mismatches.jsonl`, reproducer bundles, `history.csv` (the history row of the
+run; the workflow cannot push to `main`, so the row is appended to the committed
+CSV by the next commit that records a run). The pass-condition logic is
+`scripts/teal-corpus/gate.py`, tested by `scripts/teal-corpus/test_gate.py`,
+`test_tracking_issue.py` and `test_workflow.py`.
+
 ## Divergence hunts: diffing against public nodes
 
 `scripts/state_diff.py` compares one round (and any number of addresses)

@@ -1,0 +1,340 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: TEAL corpus parity
+
+# Issue #2372 (epic #2364, Phase 25). Green ONLY when algod-rust's TEAL
+# disassembler and assembler are in exact parity with the pinned go-algorand on
+# the then-current ARC56Registry corpus:
+#
+#   fetch (registry at a recorded SHA) -> extract -> extraction sanity gate
+#   -> `make teal-corpus-parity` (stages disassemble, reassemble, source:
+#      zero mismatches, panics, timeouts) -> `make teal-corpus-stats`
+#   -> REST sample against live dual nodes (nightly/dispatch, size 0 skips)
+#   -> informational go-vs-rust benchmark tier -> verdict + summary + history.
+#
+# The pass condition is scripts/teal-corpus/gate.py: no allow-list, no
+# continue-on-error on any gate (the benchmark tier is the one informational
+# step, by design), and an empty or failed extraction fails the job. A failing
+# scheduled run files or updates ONE tracking issue (labels conformance, avm);
+# the next green run comments on it and closes it.
+#
+# go-algorand is built through its own entry points: a sibling checkout at the
+# repo's pin (env GO_ALGORAND_REV), `make libsodium` first (CLAUDE.md, CI
+# Workflows), then tools/teal-corpus/build.sh.
+#
+# Pull requests run against a PINNED registry SHA (env PR_REGISTRY_SHA) so a
+# registry change can never turn an unrelated PR red; bump the pin together with
+# the committed docs/teal-corpus/history.csv. The REST sample needs the docker
+# dual-node harness (docker-compose.validate-api.yml); PR runs skip it
+# (validate-api.yml covers the REST tier on code changes).
+
+on:
+  schedule:
+    - cron: "27 1 * * *"
+  workflow_dispatch:
+    inputs:
+      registry_ref:
+        description: "ARC56Registry ref (branch, tag or 40-hex SHA); the SHA it resolves to is recorded"
+        default: "main"
+        required: false
+      go_ref:
+        description: "go-algorand ref (tag, branch or SHA); empty = the repo pin"
+        default: ""
+        required: false
+      rest_sample_size:
+        description: "REST sample size (a number or 'all'); 0 skips the live REST tier"
+        default: "300"
+        required: false
+  pull_request:
+    paths:
+      - "tools/teal-corpus/**"
+      - "tools/avm-op-types/**"
+      - "crates/tools/teal-corpus/**"
+      - "crates/core/algo-avm/src/assembler.rs"
+      - "crates/core/algo-avm/src/abi_verify.rs"
+      - "crates/core/algo-avm/src/disassembler.rs"
+      - "crates/core/algo-avm/src/type_track.rs"
+      - "crates/core/algo-avm/src/type_track_table.rs"
+      - "crates/core/algo-avm/src/fields.rs"
+      - "crates/core/algo-avm/src/bytecode.rs"
+      - "crates/core/algo-avm/src/opcode.rs"
+      - "crates/core/algo-avm/src/sourcemap.rs"
+      - "crates/core/algo-avm/src/eval.rs"
+      - "scripts/teal-corpus/**"
+      - "scripts/bench/tiers/teal-corpus.py"
+      - ".github/workflows/teal-corpus-parity.yml"
+
+concurrency:
+  group: teal-corpus-parity-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  GO_ALGORAND_REV: "v5.0.5-stable"
+  # Registry commit PR runs use (the one docs/teal-corpus/history.csv last recorded).
+  PR_REGISTRY_SHA: "e75e509cf2452fea5b0726e064f7445dedbeac07"
+  REGISTRY_REPO: "https://github.com/scholtz/ARC56Registry.git"
+  WORK: teal-corpus-work
+
+jobs:
+  parity:
+    name: Exact disassembly and compilation parity on the ARC56Registry corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Resolve parameters
+        id: params
+        env:
+          EVENT: ${{ github.event_name }}
+          IN_REGISTRY_REF: ${{ github.event.inputs.registry_ref }}
+          IN_GO_REF: ${{ github.event.inputs.go_ref }}
+          IN_REST: ${{ github.event.inputs.rest_sample_size }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            pull_request) REF="$PR_REGISTRY_SHA"; REST=0; BENCH_RUNS=1 ;;
+            workflow_dispatch) REF="${IN_REGISTRY_REF:-main}"; REST="${IN_REST:-300}"; BENCH_RUNS=3 ;;
+            *) REF="main"; REST=300; BENCH_RUNS=3 ;;
+          esac
+          GO_REF="${IN_GO_REF:-$GO_ALGORAND_REV}"
+          [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad registry ref"; exit 1; }
+          [[ "$GO_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad go-algorand ref"; exit 1; }
+          [[ "$REST" =~ ^([0-9]+|all)$ ]] || { echo "::error::rest_sample_size must be a number or 'all'"; exit 1; }
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+            SHA="$REF"
+          else
+            SHA="$(git ls-remote "$REGISTRY_REPO" "$REF" | head -n 1 | cut -f1)"
+          fi
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::cannot resolve registry ref $REF"; exit 1; }
+          {
+            echo "registry_ref=$REF"
+            echo "registry_sha=$SHA"
+            echo "go_ref=$GO_REF"
+            echo "rest=$REST"
+            echo "bench_runs=$BENCH_RUNS"
+          } >> "$GITHUB_OUTPUT"
+          echo "registry $REF -> $SHA; go-algorand $GO_REF; REST sample $REST"
+
+      - name: Install Go toolchain
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: tools/teal-corpus/go.sum
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: teal-corpus-parity
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check out go-algorand
+        env:
+          GO_REF: ${{ steps.params.outputs.go_ref }}
+        run: |
+          set -euo pipefail
+          # Sibling clone: tools/teal-corpus/go.mod replaces go-algorand with
+          # ../../../go-algorand and build.sh stamps its tag and commit. A tag or
+          # branch clones directly; a bare SHA falls back to a shallow fetch.
+          GA="$(dirname "$GITHUB_WORKSPACE")/go-algorand"
+          if ! git clone --depth 1 --branch "$GO_REF" https://github.com/algorand/go-algorand.git "$GA"; then
+            rm -rf "$GA"
+            git init -q "$GA"
+            git -C "$GA" remote add origin https://github.com/algorand/go-algorand.git
+            git -C "$GA" fetch -q --depth 1 origin "$GO_REF"
+            git -C "$GA" checkout -q --detach FETCH_HEAD
+          fi
+          echo "GO_ALGORAND_DIR=$GA" >> "$GITHUB_ENV"
+          echo "GO_ALGORAND_COMMIT=$(git -C "$GA" rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Cache go-algorand's libsodium build
+        id: libsodium-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.GO_ALGORAND_DIR }}/crypto/libs
+          key: teal-corpus-libsodium-${{ runner.os }}-${{ env.GO_ALGORAND_COMMIT }}
+
+      - name: Build go-algorand's libsodium fork
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.libsodium-cache.outputs.cache-hit }}" != "true" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends autoconf automake libtool build-essential
+          fi
+          # `make libsodium` is go-algorand's own entry point (CLAUDE.md); it is a
+          # no-op when the cached build is present.
+          make -C "$GO_ALGORAND_DIR" libsodium
+
+      - name: Cache the registry checkout
+        id: registry-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ env.WORK }}/registry
+            ${{ env.WORK }}/fetch.json
+          key: teal-corpus-registry-${{ steps.params.outputs.registry_sha }}
+
+      - name: Fetch the ARC56Registry at the recorded SHA
+        if: steps.registry-cache.outputs.cache-hit != 'true'
+        run: python3 -I scripts/teal-corpus/fetch.py --repo "$REGISTRY_REPO" --ref "${{ steps.params.outputs.registry_sha }}" --work-dir "$WORK"
+
+      - name: Extract the corpus
+        run: python3 -I scripts/teal-corpus/extract.py --work-dir "$WORK" --clean
+
+      # An empty corpus, a registry layout change (everything skipped) or a
+      # manifest that disagrees with the counts must never pass.
+      - name: Extraction sanity gate
+        run: python3 -I scripts/teal-corpus/gate.py extraction "$WORK/corpus"
+
+      # Stages disassemble, reassemble and source (Makefile TEAL_CORPUS_STAGES):
+      # exits non-zero on any mismatch, panic or timeout.
+      - name: Offline parity stages (go driver vs rust driver)
+        run: make teal-corpus-parity
+
+      - name: Statistics (stats.json)
+        if: ${{ !cancelled() && hashFiles('teal-corpus-work/out/disassemble.go.jsonl') != '' }}
+        run: make teal-corpus-stats
+
+      - name: Log in to Docker Hub (avoid the unauthenticated pull rate limit)
+        if: ${{ !cancelled() && steps.params.outputs.rest != '0' && env.DOCKERHUB_TOKEN != '' }}
+        continue-on-error: true  # rate-limit avoidance only, not a gate
+        uses: docker/login-action@v4
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+
+      # The live dual-node REST tier (#2370): a seeded sample through both nodes'
+      # /v2/teal/* handlers. It writes rest_sample.{go,rust}.jsonl, so the
+      # statistics below include the stage. Not run on PRs (size 0).
+      - name: REST sample (live go + algod-rust nodes)
+        if: ${{ !cancelled() && steps.params.outputs.rest != '0' && hashFiles('teal-corpus-work/corpus/manifest.jsonl') != '' }}
+        env:
+          TEAL_CORPUS_DIR: ${{ github.workspace }}/teal-corpus-work/corpus
+          TEAL_CORPUS_REQUIRED: "1"
+          TEAL_CORPUS_REST_OUT: ${{ github.workspace }}/teal-corpus-work/out
+          TEAL_CORPUS_GO_DRIVER: ${{ github.workspace }}/teal-corpus-work/teal-corpus-go
+          SAMPLE: ${{ steps.params.outputs.rest }}
+        run: |
+          set -euo pipefail
+          make validate-api-up
+          rc=0
+          cargo test --release -p algod-rust --test live_teal_corpus_parity -- --ignored --nocapture || rc=$?
+          make validate-api-down || true
+          exit $rc
+
+      - name: Statistics including the REST sample stage
+        if: ${{ !cancelled() && steps.params.outputs.rest != '0' && hashFiles('teal-corpus-work/out/rest_sample.go.jsonl') != '' }}
+        run: make teal-corpus-stats
+
+      # Informational: timings are published, a failure here never fails the job
+      # (the tier has its own equality gate; the parity gates above are the
+      # authority).
+      - name: Benchmark tier (informational)
+        if: ${{ !cancelled() && hashFiles('teal-corpus-work/corpus/manifest.jsonl') != '' && hashFiles('teal-corpus-work/teal-corpus-go') != '' }}
+        continue-on-error: true
+        env:
+          BENCH_OUT: ${{ github.workspace }}/teal-corpus-work/bench
+          BENCH_RUNS: ${{ steps.params.outputs.bench_runs }}
+          BENCH_TEAL_CORPUS_DIR: ${{ github.workspace }}/teal-corpus-work/corpus
+          BENCH_TEAL_GO_DRIVER: ${{ github.workspace }}/teal-corpus-work/teal-corpus-go
+          BENCH_TEAL_RUST_DRIVER: ${{ github.workspace }}/target/release/teal-corpus
+          BENCH_GO_ALGORAND_DIR: ${{ env.GO_ALGORAND_DIR }}
+        run: python3 scripts/bench/tiers/teal-corpus.py
+
+      - name: Reproducer bundles
+        if: ${{ !cancelled() }}
+        run: python3 -I scripts/teal-corpus/gate.py bundle "$WORK/corpus" "$WORK/out" "$WORK/repro"
+
+      - name: History row
+        if: ${{ !cancelled() && hashFiles('teal-corpus-work/out/stats.json') != '' }}
+        run: |
+          set -euo pipefail
+          python3 -I scripts/teal-corpus/stats.py history "$WORK/out/stats.json" docs/teal-corpus/history.csv
+          cp docs/teal-corpus/history.csv "$WORK/out/history.csv"
+          echo "history row:" && tail -n 1 docs/teal-corpus/history.csv
+
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        env:
+          REGISTRY_REF: ${{ steps.params.outputs.registry_ref }}
+          REST: ${{ steps.params.outputs.rest }}
+        run: |
+          set -uo pipefail
+          FLAGS=()
+          [ "$REST" != "0" ] && FLAGS+=(--require-rest)
+          BENCH=""
+          if [ -f "$WORK/bench/teal-corpus.json" ]; then
+            python3 -I scripts/teal-corpus/gate.py bench-table "$WORK/bench/teal-corpus.json" > "$WORK/bench.md" && BENCH="--bench $WORK/bench.md"
+          fi
+          python3 -I scripts/teal-corpus/gate.py summary --stats "$WORK/out/stats.json" --corpus "$WORK/corpus" \
+            --registry-ref "$REGISTRY_REF" $BENCH "${FLAGS[@]}" | tee "$WORK/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: teal-corpus-parity-${{ github.run_id }}
+          path: |
+            teal-corpus-work/out/stats.json
+            teal-corpus-work/out/*.mismatches.jsonl
+            teal-corpus-work/out/history.csv
+            teal-corpus-work/out/reassemble.summary.json
+            teal-corpus-work/repro/
+            teal-corpus-work/fetch.json
+            teal-corpus-work/corpus/corpus.json
+            teal-corpus-work/bench/
+            teal-corpus-work/summary.md
+          if-no-files-found: warn
+
+      # The pass condition. Re-derived from stats.json (not from the step
+      # outcomes above) so a stage that silently did not run, or a REST tier that
+      # produced no rows, fails the job too.
+      - name: Verdict (zero mismatches, panics, timeouts; nothing empty)
+        if: ${{ !cancelled() }}
+        env:
+          REST: ${{ steps.params.outputs.rest }}
+        run: |
+          set -euo pipefail
+          FLAGS=()
+          [ "$REST" != "0" ] && FLAGS+=(--require-rest)
+          python3 -I scripts/teal-corpus/gate.py extraction "$WORK/corpus"
+          python3 -I scripts/teal-corpus/gate.py verdict "$WORK/out/stats.json" "${FLAGS[@]}"
+
+      - name: Open or update the tracking issue
+        if: ${{ failure() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REF: ${{ steps.params.outputs.registry_ref }}
+          GO_REF: ${{ steps.params.outputs.go_ref }}
+          REST: ${{ steps.params.outputs.rest }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          FLAGS=()
+          [ "$REST" != "0" ] && FLAGS+=(--require-rest)
+          python3 -I scripts/teal-corpus/gate.py issue-body --stats "$WORK/out/stats.json" --corpus "$WORK/corpus" \
+            --run-url "$RUN_URL" --registry-ref "$REGISTRY_REF" --go-ref "$GO_REF" "${FLAGS[@]}" > "$RUNNER_TEMP/issue-body.md"
+          python3 -I scripts/teal-corpus/tracking_issue.py fail --repo "$GITHUB_REPOSITORY" \
+            --body-file "$RUNNER_TEMP/issue-body.md" --run-url "$RUN_URL"
+
+      - name: Close the tracking issue after a green run
+        if: ${{ success() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 -I scripts/teal-corpus/tracking_issue.py green --repo "$GITHUB_REPOSITORY" --run-url "$RUN_URL"

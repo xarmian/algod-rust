@@ -45,9 +45,11 @@ exercise; the synthetic corpora (`gen_synthetic*.py`, run in the
 | source (original ARC-56 sources) | 3,687 | 3,524 | 163 | 0 | 0 | 0 |
 
 "Identical error" is the number of inputs that both implementations reject with
-exactly the same ordered error list. The REST sample stage (#2370) writes its
-rows in the same shape; `stats.py` reports it as soon as `rest_sample.{go,rust}.jsonl`
-exist in the output directory, and omits it otherwise (it is omitted here).
+exactly the same ordered error list. The REST sample stage (#2370) is written by
+`live_teal_corpus_parity` when `TEAL_CORPUS_REST_OUT` names the output directory
+(one row per node-vs-node comparison, #2372); `stats.py` reports it as soon as
+`rest_sample.{go,rust}.jsonl` exist there, and omits it otherwise (it is omitted
+here; the nightly workflow runs it and requires it).
 
 | Rate | Go | Rust |
 |---|---|---|
@@ -98,7 +100,7 @@ make teal-corpus-history                            # appends (or replaces the s
 and commit the CSV (and, if wanted, `latest-stats.json`) with the change that
 motivates the run. A scheduled run that cannot push to `main` uploads its
 `stats.json` as a workflow artifact and the row is appended by the next commit
-that records a run (issue #2372 owns the nightly workflow).
+that records a run (`.github/workflows/teal-corpus-parity.yml`, issue #2372).
 
 ## Benchmark: `make bench-compare TIERS=teal-corpus`
 
