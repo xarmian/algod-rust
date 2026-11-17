@@ -425,7 +425,10 @@ fn timings_file_has_one_entry_per_input_and_leaves_rows_unchanged() {
         dir.join("timed.jsonl"),
         dir.join("timings.json"),
     );
-    assert_eq!(run_driver("disassemble", &plain, "1").status.code(), Some(0));
+    assert_eq!(
+        run_driver("disassemble", &plain, "1").status.code(),
+        Some(0)
+    );
     let res = bin()
         .arg("disassemble")
         .arg("--corpus")

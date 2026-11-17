@@ -111,17 +111,22 @@ fn run(op: Operation, a: RunArgs) -> i32 {
     let per_input: Arc<Mutex<BTreeMap<String, u64>>> = Arc::default();
     let record = a.timings.is_some().then(|| Arc::clone(&per_input));
     let started = Instant::now();
-    let rows = run_batch(inputs, jobs, Duration::from_millis(a.timeout_ms), move |i| {
-        let t = Instant::now();
-        let row = process(op, i);
-        if let Some(rec) = &record {
-            let ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            rec.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(i.sha256.clone(), ns);
-        }
-        row
-    });
+    let rows = run_batch(
+        inputs,
+        jobs,
+        Duration::from_millis(a.timeout_ms),
+        move |i| {
+            let t = Instant::now();
+            let row = process(op, i);
+            if let Some(rec) = &record {
+                let ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                rec.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(i.sha256.clone(), ns);
+            }
+            row
+        },
+    );
     let wall_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     if let Some(path) = &a.timings {
         let per = per_input.lock().unwrap_or_else(|e| e.into_inner()).clone();
