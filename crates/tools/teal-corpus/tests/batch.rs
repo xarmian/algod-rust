@@ -25,7 +25,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use teal_corpus::{run_batch, Input, Row};
+use teal_corpus::{run_batch, run_batch_with, BatchOptions, Input, Row};
 
 fn input(sha: &str) -> Input {
     Input {
@@ -96,4 +96,91 @@ fn panic_and_timeout_rows_make_the_batch_report_a_robustness_failure() {
     );
     assert!(teal_corpus::has_robustness_failure(&rows));
     assert!(!teal_corpus::has_robustness_failure(&rows[..1]));
+}
+
+// #2382: the batch used to spawn one 64 MiB-stack thread per input and drop its
+// JoinHandle (pthread_detach). glibc munmaps a stack larger than its 40 MiB
+// stack cache the moment the thread exits, and pthread_detach on a thread that
+// is exiting at that instant reads the already unmapped descriptor: SIGSEGV
+// (exit 139, no row) at 200k+ inputs. Workers are now long-lived: one thread per
+// job, reused for every input, joined at the end of the batch.
+#[test]
+fn inputs_are_processed_on_a_bounded_set_of_reused_worker_threads() {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    let ids = Arc::new(Mutex::new(HashSet::new()));
+    let ids2 = Arc::clone(&ids);
+    let inputs: Vec<Input> = (0..5000).map(|n| input(&format!("{n:05}"))).collect();
+    let rows = run_batch(inputs, 4, Duration::from_secs(30), move |i| {
+        ids2.lock().unwrap().insert(std::thread::current().id());
+        ok_row(i)
+    });
+    assert_eq!(rows.len(), 5000);
+    assert!(rows.iter().all(|r| r.ok));
+    let distinct = ids.lock().unwrap().len();
+    assert!(
+        distinct <= 4,
+        "one reusable worker per job, saw {distinct} worker threads"
+    );
+}
+
+#[test]
+fn a_large_trivial_batch_on_many_jobs_completes_without_crashing() {
+    let inputs: Vec<Input> = (0..100_000).map(|n| input(&format!("{n:06}"))).collect();
+    let rows = run_batch(inputs, 24, Duration::from_secs(30), ok_row);
+    assert_eq!(rows.len(), 100_000);
+    assert!(rows.iter().all(|r| r.ok));
+}
+
+#[test]
+fn a_worker_spawn_failure_is_a_recorded_row_error_not_a_crash() {
+    let opts = BatchOptions {
+        jobs: 2,
+        timeout: Duration::from_secs(5),
+        // Not a stack any platform can map: the spawn itself fails.
+        stack_bytes: usize::MAX / 4,
+        ..BatchOptions::default()
+    };
+    let rows = run_batch_with(vec![input("a"), input("b"), input("c")], &opts, ok_row);
+    assert_eq!(rows.len(), 3);
+    for r in &rows {
+        assert!(!r.ok);
+        let msg = r.panic.as_deref().expect("a row error");
+        assert!(msg.starts_with("failed to spawn worker thread"), "{msg}");
+    }
+    assert!(teal_corpus::has_robustness_failure(&rows));
+}
+
+#[test]
+fn hung_workers_beyond_the_limit_stop_the_batch_with_recorded_row_errors() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let ran = Arc::new(AtomicUsize::new(0));
+    let ran2 = Arc::clone(&ran);
+    let opts = BatchOptions {
+        jobs: 1,
+        timeout: Duration::from_millis(100),
+        max_abandoned: 2,
+        ..BatchOptions::default()
+    };
+    let inputs: Vec<Input> = (0..6).map(|n| input(&format!("h{n}"))).collect();
+    let started = std::time::Instant::now();
+    let rows = run_batch_with(inputs, &opts, move |i| {
+        ran2.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_secs(20));
+        ok_row(i)
+    });
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows.iter().filter(|r| r.timeout == Some(true)).count(), 2);
+    let refused: Vec<_> = rows
+        .iter()
+        .filter(|r| {
+            r.panic
+                .as_deref()
+                .is_some_and(|m| m.contains("abandoned worker limit"))
+        })
+        .collect();
+    assert_eq!(refused.len(), 4, "the other inputs are refused, not run");
+    assert_eq!(ran.load(Ordering::SeqCst), 2, "no further hung worker");
+    assert!(teal_corpus::has_robustness_failure(&rows));
 }

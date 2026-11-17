@@ -64,6 +64,9 @@ pub const INVALID_UTF8: &str = "input is not valid UTF-8";
 
 const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
 
+/// Default cap on workers hung past their timeout at once.
+pub const DEFAULT_MAX_ABANDONED: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
     Disassemble,
@@ -263,44 +266,201 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-fn run_one<F>(f: &Arc<F>, input: &Arc<Input>, timeout: Duration) -> Row
-where
-    F: Fn(&Input) -> Row + Send + Sync + 'static,
-{
-    let (tx, rx) = mpsc::channel();
-    let (f2, in2) = (Arc::clone(f), Arc::clone(input));
-    let spawned = std::thread::Builder::new()
-        .stack_size(WORKER_STACK_BYTES)
-        .spawn(move || {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f2(&in2)));
-            let _ = tx.send(r.map_err(|p| panic_message(&*p)));
-        });
-    let failure = |panic: Option<String>, timeout: Option<bool>| Row {
-        ok: false,
-        panic,
-        sha256: input.sha256.clone(),
-        timeout,
-        ..Row::default()
-    };
-    if let Err(e) = spawned {
-        return failure(Some(format!("failed to spawn worker thread: {e}")), None);
-    }
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(row)) => row,
-        Ok(Err(msg)) => failure(Some(msg), None),
-        // The overrunning thread cannot be killed; it is abandoned and the
-        // process exits once the batch is written.
-        Err(mpsc::RecvTimeoutError::Timeout) => failure(None, Some(true)),
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            failure(Some("worker thread vanished".to_string()), None)
+/// Knobs of [`run_batch_with`].
+#[derive(Debug, Clone)]
+pub struct BatchOptions {
+    /// Parallel workers (one long-lived thread each).
+    pub jobs: usize,
+    /// Per-input time budget.
+    pub timeout: Duration,
+    /// Stack size of a worker thread.
+    pub stack_bytes: usize,
+    /// Most workers that may be hung past their timeout at once. Beyond it the
+    /// remaining inputs are refused with a recorded row error instead of piling
+    /// up unkillable threads.
+    pub max_abandoned: usize,
+}
+
+impl Default for BatchOptions {
+    fn default() -> Self {
+        Self {
+            jobs: 1,
+            timeout: Duration::from_secs(10),
+            stack_bytes: WORKER_STACK_BYTES,
+            max_abandoned: DEFAULT_MAX_ABANDONED,
         }
     }
 }
 
-/// Run `f` over every input on `jobs` workers, each input on its own thread
-/// under `catch_unwind` with a per-input `timeout`. Rows come back sorted by
+type Outcome = Result<Row, String>;
+type Handles = Vec<std::thread::JoinHandle<()>>;
+
+/// A long-lived worker thread that runs inputs one at a time.
+struct Worker {
+    input_tx: mpsc::Sender<Arc<Input>>,
+    result_rx: mpsc::Receiver<Outcome>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+fn spawn_worker<F>(f: &Arc<F>, stack_bytes: usize) -> io::Result<Worker>
+where
+    F: Fn(&Input) -> Row + Send + Sync + 'static,
+{
+    let (input_tx, input_rx) = mpsc::channel::<Arc<Input>>();
+    let (result_tx, result_rx) = mpsc::channel::<Outcome>();
+    let f = Arc::clone(f);
+    let handle = std::thread::Builder::new()
+        .stack_size(stack_bytes)
+        .spawn(move || {
+            while let Ok(input) = input_rx.recv() {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&input)));
+                // The runner gave up on this input (timeout): exit.
+                if result_tx.send(r.map_err(|p| panic_message(&*p))).is_err() {
+                    break;
+                }
+            }
+        })?;
+    Ok(Worker {
+        input_tx,
+        result_rx,
+        handle,
+    })
+}
+
+/// Workers whose input overran its timeout. They cannot be killed. Their
+/// handles are kept (never dropped, which would `pthread_detach` a thread that
+/// may be exiting, the glibc race of #2382): finished ones are joined, hung ones
+/// are leaked at the end of the batch and die with the process.
+#[derive(Default)]
+struct Abandoned(Mutex<Handles>);
+
+impl Abandoned {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Handles> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn reap(list: &mut Handles) {
+        let mut hung = Vec::with_capacity(list.len());
+        for h in list.drain(..) {
+            if h.is_finished() {
+                let _ = h.join();
+            } else {
+                hung.push(h);
+            }
+        }
+        *list = hung;
+    }
+
+    fn add(&self, h: std::thread::JoinHandle<()>) {
+        let mut list = self.lock();
+        Self::reap(&mut list);
+        list.push(h);
+    }
+
+    /// Number of abandoned workers still running.
+    fn live(&self) -> usize {
+        let mut list = self.lock();
+        Self::reap(&mut list);
+        list.len()
+    }
+
+    fn leak_rest(&self) {
+        let mut list = self.lock();
+        Self::reap(&mut list);
+        for h in list.drain(..) {
+            std::mem::forget(h);
+        }
+    }
+}
+
+fn failure_row(sha256: &str, panic: Option<String>, timeout: Option<bool>) -> Row {
+    Row {
+        ok: false,
+        panic,
+        sha256: sha256.to_string(),
+        timeout,
+        ..Row::default()
+    }
+}
+
+/// Close a worker's input channel and wait for it (it exits on the closed channel).
+fn retire(worker: &mut Option<Worker>) {
+    if let Some(w) = worker.take() {
+        drop(w.input_tx);
+        let _ = w.handle.join();
+    }
+}
+
+fn run_one<F>(
+    worker: &mut Option<Worker>,
+    f: &Arc<F>,
+    input: &Arc<Input>,
+    o: &BatchOptions,
+    abandoned: &Abandoned,
+) -> Row
+where
+    F: Fn(&Input) -> Row + Send + Sync + 'static,
+{
+    let sha = input.sha256.as_str();
+    if worker.is_none() {
+        let live = abandoned.live();
+        if live >= o.max_abandoned {
+            return failure_row(
+                sha,
+                Some(format!(
+                    "abandoned worker limit reached ({live} workers hung past the {:?} timeout); input not run",
+                    o.timeout
+                )),
+                None,
+            );
+        }
+        match spawn_worker(f, o.stack_bytes) {
+            Ok(w) => *worker = Some(w),
+            Err(e) => {
+                return failure_row(
+                    sha,
+                    Some(format!("failed to spawn worker thread: {e}")),
+                    None,
+                )
+            }
+        }
+    }
+    let w = worker.as_ref().expect("worker spawned above");
+    if w.input_tx.send(Arc::clone(input)).is_err() {
+        retire(worker);
+        return failure_row(sha, Some("worker thread vanished".to_string()), None);
+    }
+    match w.result_rx.recv_timeout(o.timeout) {
+        Ok(Ok(row)) => row,
+        Ok(Err(msg)) => failure_row(sha, Some(msg), None),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            if let Some(w) = worker.take() {
+                // Closing both channels makes the worker exit once it returns.
+                drop(w.input_tx);
+                drop(w.result_rx);
+                abandoned.add(w.handle);
+            }
+            failure_row(sha, None, Some(true))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            retire(worker);
+            failure_row(sha, Some("worker thread vanished".to_string()), None)
+        }
+    }
+}
+
+/// Run `f` over every input on `o.jobs` long-lived worker threads (each input
+/// under `catch_unwind` with a per-input `o.timeout`). Rows come back sorted by
 /// sha256, independent of scheduling.
-pub fn run_batch<F>(inputs: Vec<Input>, jobs: usize, timeout: Duration, f: F) -> Vec<Row>
+///
+/// One thread per job is reused for every input. (A thread per input, whose
+/// `JoinHandle` was dropped, crashed with SIGSEGV on 200k+ input batches: glibc
+/// unmaps a stack above its stack-cache size as the thread exits, and
+/// `pthread_detach` on that exiting thread reads the unmapped descriptor, #2382.)
+/// A worker that overruns its timeout is abandoned and replaced, at most
+/// `o.max_abandoned` at a time; a failed spawn and a refused input are recorded
+/// as row errors.
+pub fn run_batch_with<F>(inputs: Vec<Input>, o: &BatchOptions, f: F) -> Vec<Row>
 where
     F: Fn(&Input) -> Row + Send + Sync + 'static,
 {
@@ -308,19 +468,38 @@ where
     let inputs: Vec<Arc<Input>> = inputs.into_iter().map(Arc::new).collect();
     let results: Mutex<Vec<Row>> = Mutex::new(Vec::with_capacity(inputs.len()));
     let next = AtomicUsize::new(0);
+    let abandoned = Abandoned::default();
     std::thread::scope(|s| {
-        for _ in 0..jobs.max(1).min(inputs.len().max(1)) {
-            s.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(input) = inputs.get(i) else { break };
-                let row = run_one(&f, input, timeout);
-                results.lock().unwrap_or_else(|e| e.into_inner()).push(row);
+        for _ in 0..o.jobs.max(1).min(inputs.len().max(1)) {
+            s.spawn(|| {
+                let mut worker: Option<Worker> = None;
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(input) = inputs.get(i) else { break };
+                    let row = run_one(&mut worker, &f, input, o, &abandoned);
+                    results.lock().unwrap_or_else(|e| e.into_inner()).push(row);
+                }
+                retire(&mut worker);
             });
         }
     });
+    abandoned.leak_rest();
     let mut rows = results.into_inner().unwrap_or_else(|e| e.into_inner());
     rows.sort_by(|a, b| a.sha256.cmp(&b.sha256));
     rows
+}
+
+/// [`run_batch_with`] with the default stack and abandoned-worker limit.
+pub fn run_batch<F>(inputs: Vec<Input>, jobs: usize, timeout: Duration, f: F) -> Vec<Row>
+where
+    F: Fn(&Input) -> Row + Send + Sync + 'static,
+{
+    let o = BatchOptions {
+        jobs,
+        timeout,
+        ..BatchOptions::default()
+    };
+    run_batch_with(inputs, &o, f)
 }
 
 /// True when any row is a recorded panic or timeout.
