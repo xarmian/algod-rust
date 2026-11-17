@@ -349,6 +349,10 @@ pub struct DiffReport {
     /// Rows, on either side, that record a panic or a timeout. These count as
     /// failures even when both sides agree.
     pub robustness_failures: usize,
+    /// Rows that match the one documented Go-panic / Rust-error pairing
+    /// (DIV-013, see [`is_div013`]); counted neither as a mismatch nor as a
+    /// robustness failure.
+    pub known_divergences: usize,
     pub left_header: Value,
     pub right_header: Value,
     /// One `{sha256, operation, field, first_diff, left, right}` per differing row.
@@ -407,6 +411,38 @@ fn first_diff(field: &str, l: &Value, r: &Value) -> Value {
     }
 }
 
+/// DIVERGENCE DIV-013: the one pairing of a Go panic with a Rust error that is
+/// intended. go's assembler indexes `scratchSpace[idx]` unchecked and panics
+/// with `index out of range [N] with length 256` for a constant scratch index
+/// N >= 256 (`typeStores`/`typeLoads`); algod-rust reports an assembly error
+/// `{op}: constant scratch index N is out of range (must be < 256)`. `go` is
+/// the Go driver's row, `rust` the Rust driver's; a Rust panic never matches.
+pub fn is_div013(go: &Value, rust: &Value) -> bool {
+    let Some(msg) = go.get("panic").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(n) = msg
+        .strip_prefix("runtime error: index out of range [")
+        .and_then(|m| m.strip_suffix("] with length 256"))
+        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    else {
+        return false;
+    };
+    if rust.get("ok") != Some(&Value::Bool(false)) || rust.get("panic").is_some() {
+        return false;
+    }
+    let needle = format!("constant scratch index {n} is out of range");
+    rust.get("errors")
+        .and_then(Value::as_array)
+        .is_some_and(|es| {
+            es.iter().any(|e| {
+                e.get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|m| m.contains(&needle))
+            })
+        })
+}
+
 /// Compare two driver outputs row by row (headers are ignored except for the
 /// operation, which must agree).
 pub fn diff_files(left: &Path, right: &Path) -> Result<DiffReport, String> {
@@ -429,12 +465,23 @@ pub fn diff_files(left: &Path, right: &Path) -> Result<DiffReport, String> {
     let (mut identical, mut both_error_identical) = (0, 0);
     let is_robustness_failure =
         |v: &Value| v.get("panic").is_some() || v.get("timeout") == Some(&Value::Bool(true));
+    // `left` is the Go driver's output, `right` the Rust driver's.
+    let known: BTreeSet<&String> = lrows
+        .iter()
+        .filter(|(sha, l)| rrows.get(*sha).is_some_and(|r| is_div013(l, r)))
+        .map(|(sha, _)| sha)
+        .collect();
     let robustness_failures = lrows
-        .values()
+        .iter()
+        .filter(|(sha, _)| !known.contains(*sha))
+        .map(|(_, v)| v)
         .chain(rrows.values())
         .filter(|v| is_robustness_failure(v))
         .count();
     for sha in &shas {
+        if known.contains(*sha) {
+            continue;
+        }
         let (l, r) = (lrows.get(*sha), rrows.get(*sha));
         let (field, fd, lv, rv) = match (l, r) {
             (Some(a), Some(b)) if a == b => {
@@ -483,6 +530,7 @@ pub fn diff_files(left: &Path, right: &Path) -> Result<DiffReport, String> {
         identical,
         both_error_identical,
         robustness_failures,
+        known_divergences: known.len(),
         left_header: lh,
         right_header: rh,
         mismatches,

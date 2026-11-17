@@ -154,6 +154,12 @@ fn main() {
                     rep.mismatches.len(),
                     rep.robustness_failures
                 );
+                if rep.known_divergences > 0 {
+                    eprintln!(
+                        "diff {}: {} rows are the documented DIV-013 Go-panic/Rust-error pairing (excluded from mismatches and panics)",
+                        rep.operation, rep.known_divergences
+                    );
+                }
                 i32::from(!rep.mismatches.is_empty() || rep.robustness_failures > 0)
             }
         },

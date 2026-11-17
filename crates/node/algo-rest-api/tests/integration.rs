@@ -9408,6 +9408,46 @@ async fn teal_compile_error_returns_400() {
     assert_eq!(resp.status(), 400);
 }
 
+/// go's `TealCompile` panics inside `logic.AssembleString` for a constant
+/// scratch index >= 256 (`typeStores`/`typeLoads`); the panic is not
+/// recovered by any middleware, so net/http drops the connection with no
+/// response (probed against the real handler, issue #2381). algod-rust answers
+/// 400 with an assembly error instead and keeps serving (DIV-013).
+#[tokio::test]
+async fn teal_compile_constant_scratch_index_out_of_range_is_400() {
+    let server = TestServer::start(mock_with_developer_api()).await;
+
+    for source in [
+        "#pragma version 14\nint 300\nbyte 0x\nstores",
+        "#pragma version 14\nint 300\nloads\npop\nint 1",
+    ] {
+        let resp = server
+            .client
+            .post(server.url("/v2/teal/compile"))
+            .header("X-Algo-API-Token", &server.api_token)
+            .body(source)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{source:?}");
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("scratch index"), "{body}");
+    }
+
+    // 255 is the last valid slot and the server is still alive.
+    let resp = server
+        .client
+        .post(server.url("/v2/teal/compile"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .body(
+            "#pragma version 14\nint 255\nbyte 0x\nstores\nint 1",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
 #[tokio::test]
 async fn teal_disassemble_happy_path() {
     let server = TestServer::start(mock_with_developer_api()).await;

@@ -456,6 +456,9 @@ struct Refined {
     args: Option<Vec<StackType>>,
     returns: Option<Vec<StackType>>,
     err: Option<String>,
+    /// `err` is reported even when type-error reporting is off
+    /// (`#pragma typetrack false`): it stands for a go panic, not a type error.
+    hard: bool,
 }
 
 fn any_types(n: usize) -> Vec<StackType> {
@@ -467,12 +470,28 @@ fn refined(args: Option<Vec<StackType>>, returns: Option<Vec<StackType>>) -> Ref
         args,
         returns,
         err: None,
+        hard: false,
     }
 }
 
 fn refine_err(msg: String) -> Refined {
     Refined {
         err: Some(msg),
+        ..Refined::default()
+    }
+}
+
+/// DIVERGENCE DIV-013: go's `typeStores`/`typeLoads` index `scratchSpace[idx]`
+/// unchecked and panic when a constant stack-top index is >= 256 (the panic
+/// kills the `/v2/teal/compile` connection, issue #2381). Reject the program
+/// with an assembly error instead; it could never run (`stores`/`loads` fail
+/// on such a slot).
+fn scratch_index_error(op: &str, idx: u64) -> Refined {
+    Refined {
+        err: Some(format!(
+            "{op}: constant scratch index {idx} is out of range (must be < 256)"
+        )),
+        hard: true,
         ..Refined::default()
     }
 }
@@ -670,11 +689,11 @@ fn run_refine(
             if top >= 1 {
                 if let Some(idx) = st(top - 1).const_int() {
                     let v = st(top);
-                    // go indexes `scratchSpace[idx]` unchecked (a panic for
-                    // idx >= 256); an out-of-range constant is ignored here.
-                    if let Some(slot) = pgm.scratch.get_mut(idx as usize) {
-                        *slot = v;
-                    }
+                    // DIVERGENCE DIV-013: go panics here for idx >= 256.
+                    let Some(slot) = pgm.scratch.get_mut(idx as usize) else {
+                        return scratch_index_error("stores", idx);
+                    };
+                    *slot = v;
                     return Refined::default();
                 }
             }
@@ -706,10 +725,11 @@ fn run_refine(
                 return Refined::default();
             }
             if let Some(v) = st(top).const_int() {
-                if let Some(slot) = pgm.scratch.get(v as usize) {
-                    return refined(None, Some(vec![*slot]));
-                }
-                return Refined::default();
+                // DIVERGENCE DIV-013: go panics here for v >= 256.
+                return match pgm.scratch.get(v as usize) {
+                    Some(slot) => refined(None, Some(vec![*slot])),
+                    None => scratch_index_error("loads", v),
+                };
             }
             let first = pgm.scratch[0];
             if pgm.scratch.iter().any(|s| *s != first) {
@@ -1070,7 +1090,12 @@ pub(crate) fn track_instruction(
             .and_then(|i| i.group);
         let r = run_refine(&spec.refine, &mut ops.known, args, txn_fields);
         if let Some(e) = r.err {
-            type_error(ops, col, e);
+            if r.hard {
+                let line = ops.stmt_line;
+                ops.record_error(line, col, e);
+            } else {
+                type_error(ops, col, e);
+            }
         }
         if let Some(a) = r.args {
             arg_types = a;
@@ -1169,6 +1194,49 @@ mod tests {
                 // `run_refine` debug-asserts on an unported name.
                 let _ = run_refine(v.refine, &mut p, &[], None);
             }
+        }
+    }
+
+    // go's `typeStores`/`typeLoads` index `scratchSpace[idx]` unchecked and
+    // panic for a constant index >= 256 (issue #2381, DIV-013). algod-rust
+    // reports an assembly error instead, even with `#pragma typetrack false`.
+    fn asm_err(src: &str) -> Vec<String> {
+        match crate::assembler::assemble_string(src) {
+            Ok(_) => Vec::new(),
+            Err(e) => e.iter().map(|x| x.message.clone()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_constant_scratch_index_of_256_or_more_is_an_assembly_error() {
+        for (src, op) in [
+            ("#pragma version 14\nint 300\nbyte 0x\nstores", "stores"),
+            (
+                "#pragma version 14\nint 256\nbyte 0x\nstores\nint 1",
+                "stores",
+            ),
+            ("#pragma version 14\nint 300\nloads\npop\nint 1", "loads"),
+            (
+                "#pragma version 14\n#pragma typetrack false\nint 300\nbyte 0x\nstores",
+                "stores",
+            ),
+        ] {
+            let errs = asm_err(src);
+            assert!(
+                errs.iter()
+                    .any(|m| m.contains(op) && m.contains("scratch index")),
+                "{src:?} -> {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_constant_scratch_index_below_256_still_assembles() {
+        for src in [
+            "#pragma version 14\nint 255\nbyte 0x\nstores\nint 1",
+            "#pragma version 14\nint 255\nloads\npop\nint 1",
+        ] {
+            assert_eq!(asm_err(src), Vec::<String>::new(), "{src:?}");
         }
     }
 }
