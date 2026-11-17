@@ -163,6 +163,10 @@ class Stats(Fixture):
         self.assertEqual(e["source"], {"unknown opcode: foo": 1})
         self.assertEqual(e["reassemble"], {'label "X" defined twice': 1})
 
+    def test_error_class_masks_unparsed_token_names(self):
+        row = {"ok": False, "errors": [{"message": "bytecblock arg did not parse: TMPL_APPROVAL_A"}]}
+        self.assertEqual(st.error_class(row), "bytecblock arg did not parse: X")
+
     def test_provenance(self):
         r = self.build()["run"]
         self.assertEqual(r["algod_rust_commit"], "deadbeef")

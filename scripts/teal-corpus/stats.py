@@ -45,7 +45,8 @@ stats.json, schema "teal-corpus-stats/v1":
               registry_hash_matching, registry_hash_compared, registry_hash_rate}
              from reassemble.summary.json (reassemble.py); null when absent.
   error_classes  {stage: {class: count}} over rows both sides reject
-             identically; classes mask numbers (`N`, `0xN`) and quoted strings.
+             identically; classes mask numbers (`N`, `0xN`), quoted strings and the
+             token of a `did not parse:` error (template variable names).
 
 `history` appends the headline numbers of a stats.json as one row of a CSV
 series (docs/teal-corpus/history.csv). The row key is (date, registry_sha,
@@ -70,6 +71,7 @@ STAGES = (("disassemble", "disassemble"), ("reassemble", "reassemble"),
 SCRATCH_PANIC = re.compile(r"^runtime error: index out of range \[[0-9]+\] with length 256$")
 NUM = re.compile(r"0x[0-9a-fA-F]+|[0-9]+")
 QUOTED = re.compile(r'"[^"]*"')
+UNPARSED = re.compile(r"(did not parse: ).*")
 HISTORY_FIELDS = (
     "date", "registry_sha", "algod_rust_commit", "go_algorand_tag", "programs", "approval", "clear", "shared",
     "distinct_sources", "total_bytes", "opcodes_seen", "opcodes_table",
@@ -137,7 +139,7 @@ def error_class(row):
     if msg is None:
         errs = row.get("errors") or []
         msg = errs[0].get("message", "") if errs and isinstance(errs[0], dict) else ""
-    msg = QUOTED.sub('"X"', msg)
+    msg = UNPARSED.sub(r"X", QUOTED.sub('"X"', msg))
     msg = NUM.sub(lambda m: "0xN" if m.group(0).startswith("0x") else "N", msg)
     return msg[:100] or "(empty)"
 
