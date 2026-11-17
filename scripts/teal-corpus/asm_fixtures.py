@@ -21,6 +21,7 @@ list with line and column, warnings). `--check` regenerates in memory and fails
 when the committed file is stale.
 """
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -40,6 +41,47 @@ ADDR32 = "0x" + "11" * 32
 # found between go and the previous assembler. One JSON object per line:
 # {"name", "class", "source"}. The expected output comes from the go driver.
 FRONTEND_CASES = os.path.join(HERE, "asm_frontend_cases.jsonl")
+
+# Sources that are not UTF-8 (issue #2388): go assembles any byte string. A case
+# whose source is not valid UTF-8 is stored as "source_b64" (base64 of the bytes)
+# instead of "source"; a message with an invalid byte carries one U+FFFD per byte,
+# the way go's encoding/json writes it.
+NON_UTF8_CASES = [
+    ("probe", b"#pragma version 8\nbyte \"\xff\xfe\"\nint 1\n"),
+    ("comment", b"#pragma version 8\nint 1 // \xff\xfe comment\n"),
+    ("label", b"#pragma version 8\nint 1 // ok\n\xfe:\nint 1\n"),
+    ("literal_valid_prefix", b"#pragma version 8\nbyte \"\xc3\xa9\xe2\"\nint 1\n"),
+    ("literal_private_use", b"#pragma version 8\nbyte \"\xf4\x8f\xbc\x80\xf4\x8f\xbf\xbf\"\nint 1\n"),
+    ("method_invalid_byte", b"#pragma version 8\nmethod \"\xff\"\n"),
+    ("method_signature_warning", b"#pragma version 13\nmethod \"\xe2\x82\"\n"),
+    ("unknown_opcode_suffix", b"#pragma version 8\nfoo\xff\nint 1\n"),
+    ("unknown_opcode_mnemonic", b"#pragma version 8\n\xff foo\nint 1\n"),
+    ("unknown_opcode_second_statement", b"#pragma version 8\nint 1; \xff; int 2\n"),
+    ("truncated_sequence", b"#pragma version 8\nint 1\n\xe2\x82 \n"),
+    ("invalid_then_ascii", b"#pragma version 8\n\xc3\x28 foo\n"),
+    ("two_errors", b"#pragma version 8\nfoo\xff\nbar\xfe\n"),
+    ("whole_file", b"\xff\xfe"),
+    ("private_use_opcode", b"#pragma version 8\nfoo\xf4\x8f\xbc\x80\nint 1\n"),
+    ("macro_name", b"#pragma version 8\n#define \xff 1\nint 1\n"),
+    ("macro_name_truncated", b"#pragma version 8\n#define a\xe2\x82 1\nint 1\n"),
+    ("int_immediate", b"#pragma version 8\nint \xff\n"),
+    ("int_immediate_suffix", b"#pragma version 8\nint 1\x80\n"),
+    ("hex_literal", b"#pragma version 8\nbyte 0x\xffab\n"),
+    ("hex_literal_private_use", b"#pragma version 8\nbyte 0x\xf4\x8f\xbc\x80\n"),
+    ("hex_escape", b"#pragma version 8\nbyte \"\\x\xff\xfe\"\n"),
+    ("escape_invalid_byte", b"#pragma version 8\nbyte \"a\\\xff\"\n"),
+    ("base64_paren", b"#pragma version 8\nbyte b64(\xff)\n"),
+    ("base64_argument", b"#pragma version 8\nbyte b64 \xff\xfe\n"),
+    ("base32_argument", b"#pragma version 8\nbyte b32 \xff\n"),
+    ("addr", b"#pragma version 8\naddr \xff\n"),
+    ("pragma_version", b"#pragma version \xff\n"),
+    ("pragma_directive", b"#pragma \xff 1\n"),
+    ("field_name", b"#pragma version 8\ntxn \xff\n"),
+    ("undefined_label", b"#pragma version 8\nint 1\nbnz L\xff\n"),
+    ("undefined_label_private_use", b"#pragma version 8\nint 1\nbnz L\xf4\x8f\xbf\xbf\n"),
+    ("columns_after_multibyte", b"#pragma version 8\n\xc3\xa9 foo\n"),
+    ("columns_after_invalid", b"#pragma version 8\nint 1; \xff; bogus\n"),
+]
 
 
 def cases():
@@ -209,7 +251,15 @@ def cases():
             if line.strip():
                 row = json.loads(line)
                 add(row["name"], row["class"], row["source"])
+
+    # -- sources that are not UTF-8 (issue #2388)
+    for name, src in NON_UTF8_CASES:
+        add("non_utf8_" + name, "non-utf8", src)
     return c
+
+
+def source_bytes(src):
+    return src if isinstance(src, bytes) else src.encode()
 
 
 def go_rows(go_driver, sources):
@@ -217,9 +267,9 @@ def go_rows(go_driver, sources):
         sdir = os.path.join(d, "sources")
         os.makedirs(sdir)
         for _name, _klass, src in sources:
-            sha = hashlib.sha256(src.encode()).hexdigest()
+            sha = hashlib.sha256(source_bytes(src)).hexdigest()
             with open(os.path.join(sdir, sha + ".teal"), "wb") as f:
-                f.write(src.encode())
+                f.write(source_bytes(src))
         out = os.path.join(d, "go.jsonl")
         subprocess.run(
             [go_driver, "assemble", "--corpus", d, "--out", out, "--jobs", "1"], check=True
@@ -242,12 +292,17 @@ def build(go_driver):
     lines = []
     seen = set()
     for name, klass, src in cs:
-        sha = hashlib.sha256(src.encode()).hexdigest()
+        sha = hashlib.sha256(source_bytes(src)).hexdigest()
         if sha in seen:
             sys.exit(f"case {name} duplicates another case's source")
         seen.add(sha)
         r = rows[sha]
-        out = {"name": name, "class": klass, "source": src, "ok": r["ok"]}
+        out = {"name": name, "class": klass, "ok": r["ok"]}
+        raw = source_bytes(src)
+        try:
+            out["source"] = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            out["source_b64"] = base64.b64encode(raw).decode()
         if r["ok"]:
             out["bytecode_b64"] = r["bytecode_b64"]
             if r.get("warnings"):

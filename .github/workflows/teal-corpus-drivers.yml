@@ -180,8 +180,10 @@ jobs:
           # Wrong immediates, bad literals and encodings, directives, macros and
           # odd whitespace, plus token-level mutations of the fixture sources
           # (#2369): zero mismatches in bytecode, source map, warnings and the
-          # ordered error list (line, column, text).
-          python3 scripts/teal-corpus/gen_synthetic_syntax.py "$RUNNER_TEMP/synsyntax" --count 20000 --mutate 20000 --mutate-from "$F"
+          # ordered error list (line, column, text). The corpus also holds sources
+          # that are not UTF-8 (templates at every kind of position and 20000
+          # byte-level mutations, #2388): go assembles any byte string.
+          python3 scripts/teal-corpus/gen_synthetic_syntax.py "$RUNNER_TEMP/synsyntax" --count 20000 --mutate 20000 --mutate-bytes 20000 --mutate-from "$F"
           bash scripts/teal-corpus/run_drivers.sh "$RUNNER_TEMP/synsyntax" "$RUNNER_TEMP/synsyntaxout" assemble
 
       - name: Disassembly parity on a synthetic adversarial corpus

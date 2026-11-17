@@ -21,7 +21,11 @@ gets wrong, in the layout the drivers read (`OUT/sources/<sha256>.teal`), for
 * ABI method signatures, addresses, base64/base32/hex/string literals, macro
   names and pragma variants (`extra_programs`);
 * `--mutate N`: token-level mutations (delete, duplicate, replace with junk,
-  truncate) of the original sources under `--mutate-from CORPUS/sources`.
+  truncate) of the original sources under `--mutate-from CORPUS/sources`;
+* sources that are not UTF-8 (`non_utf8_programs`, issue #2388): invalid and
+  truncated sequences, overlongs, surrogates and the valid private-use characters
+  that the Rust assembler's byte-preserving text form reserves, at every kind of
+  position (literal, comment, label, mnemonic, immediate, macro, pragma).
 
 Deterministic for a given seed.
 """
@@ -302,6 +306,61 @@ def extra_programs(versions):
     return out
 
 
+# Byte sequences that are not (all) valid UTF-8, plus valid ones that stress the
+# Rust assembler's lossless text form (U+10FF00..U+10FFFF are four-byte characters).
+BAD_BYTES = [
+    b"\xff", b"\xfe", b"\x80", b"\xc3\x28", b"\xe2\x82", b"\xe2\x82\xac\xe2", b"\xf0\x28\x8c\x28",
+    b"\xc0\xaf", b"\xed\xa0\x80", b"\xf4\x90\x80\x80", b"\xf4\x8f\xbc", b"\xf4",
+    b"\xf4\x8f\xbc\x80", b"\xf4\x8f\xbf\xbf", b"\xf4\x8f\xbc\x80\xff", b"\xff\xf4\x8f\xbc\x80",
+    b"\xef\xbf\xbd", b"\xc3\xa9\xff",
+]
+# Templates; `%s` is replaced by a byte sequence.
+NON_UTF8_TEMPLATES = [
+    b'byte "%s"\nint 1\n', b'byte "a%sb"\n', b'byte "\\%s"\n', b'byte "\\x%s"\n', b'byte "\\x1%s"\n',
+    b'int 1 // %s\n', b'// %s\nint 1\n', b'int 1 //%s', b'byte "x" // %s\n', b'byte "a//%s"\n',
+    b'%s:\nint 1\n', b'int 1\n%s: int 1\n', b'b %s\n%s:\nint 1\n', b'int 1\nbnz %s\n', b'b L%s\nL:\n',
+    b'%s\n', b'%s 1\n', b'%s foo\n', b'int 1\n%s\n', b'foo%s\n', b'int 1; %s; int 2\n', b'int 1;%s\n',
+    b'int %s\n', b'int 1%s\n', b'int 1 %s\n', b'int 0x%s\n', b'int 0%s\n',
+    b'byte 0x%s\n', b'byte 0x0%s\n', b'byte 0x%s0\n', b'byte b64(%s)\n', b'byte b64(AA%s)\n', b'byte b64 %s\n',
+    b'byte base64 AA%s\n', b'byte b32 %s\n', b'byte base32(%s)\n', b'byte b32(MFR%s)\n', b'byte %s\n', b'byte\n%s\n',
+    b'addr %s\n', b'addr AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA%s\n', b'method "%s"\n',
+    b'method "f(%s)void"\n', b'method %s\n', b'pushbytes "%s"\npop\nint 1\n', b'pushbytes %s\n',
+    b'pushint %s\n', b'bytecblock "%s"\n', b'bytecblock 0x01 %s\n', b'intcblock %s\n',
+    b'txn %s\n', b'txna Accounts %s\n', b'gtxn 0 %s\n', b'global %s\n', b'itxn_field %s\n', b'asset_holding_get %s\n',
+    b'#define %s 1\n', b'#define X %s\nX\n', b'#define X int 1 // %s\nX\n', b'#define X%s 1\n',
+    b'#define X 1\nX%s\n', b'#define X int 1\nX; %s\n', b'#define -%s 1\n',
+    b'#pragma %s\n', b'#pragma version %s\n', b'#pragma typetrack %s\n', b'#pragma autosalt %s\n',
+    b'#pragma version 8 %s\n', b'#pragma version 8 // %s\nint 1\n', b'#%s\n',
+    b'int 1\n%s%s\n', b'%s%s%s\n', b'int 1\n  %s  \n', b'\t%s\t\n',
+]
+
+
+def non_utf8_programs(versions):
+    out = []
+    for version in versions:
+        hdr = f"#pragma version {version}\n".encode()
+        for tmpl in NON_UTF8_TEMPLATES:
+            for bad in BAD_BYTES:
+                body = tmpl.replace(b"%s", bad)
+                out.append(hdr + body)
+                if version == versions[0]:
+                    out.append(body)
+    # Whole programs that are only invalid bytes, and a long line of them.
+    out.extend([b"\xff", b"\xff\xfe\xfd", b"\xf4\x8f\xbc\x80", b"\xf4\x8f\xbc", b"\xff" * 70000, b"a" * 100 + b"\xff" * 70000])
+    # Columns: valid multi-byte characters, then an error, with and without
+    # invalid bytes before it on the same line.
+    for lead in [b"\xc3\xa9", b"\xe2\x82\xac", b"\xf0\x9f\x98\x80", b"\xff", b"\xf4\x8f\xbc\x80"]:
+        out.append(b"#pragma version 8\n" + lead + b" foo\n")
+        out.append(b"#pragma version 8\nint 1; " + lead + b"; bogus\n")
+        out.append(b"#pragma version 8\nbyte \"" + lead + b"\" bogus\n")
+        out.append(b"#pragma version 8\nbyte \"" + lead + b"\"\nint 1\nbyte " + lead + b"\n")
+        out.append(b"#pragma version 8\nint " + lead + b"\nint 1 2\n")
+        out.append(b"#pragma version 8\nbytecblock \"" + lead + b"\"\nbytec_0 1\n")
+        out.append(b"#pragma version 8\nint 1\nbz " + lead + b"\n")
+        out.append(b"#pragma version 8\n" + lead + b"\nint 1\n")
+    return out
+
+
 def syntax_programs(rnd, versions, count):
     out = []
     for version in versions:
@@ -359,6 +418,28 @@ def mutate_sources(rnd, corpus, count):
     return out
 
 
+def mutate_bytes(rnd, corpus, count):
+    """Byte-level mutations of the original sources (issue #2388): insert, replace or
+    truncate at a random offset with sequences that are not UTF-8, so the invalid
+    bytes land in comments, string literals, identifiers and between tokens."""
+    srcs = sorted(Path(corpus, "sources").glob("*.teal"))
+    out = []
+    for _ in range(count):
+        data = bytearray(rnd.choice(srcs).read_bytes())
+        for _ in range(rnd.randint(1, 3)):
+            at = rnd.randrange(len(data) + 1)
+            bad = rnd.choice(BAD_BYTES)
+            r = rnd.random()
+            if r < 0.6:
+                data[at:at] = bad
+            elif r < 0.9:
+                data[at : at + rnd.randint(1, 3)] = bad
+            else:
+                del data[at:]
+        out.append(bytes(data))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
@@ -367,6 +448,7 @@ def main():
     ap.add_argument("--versions", default="3,8,13")
     ap.add_argument("--mutate", type=int, default=0)
     ap.add_argument("--mutate-from")
+    ap.add_argument("--mutate-bytes", type=int, default=0, help="byte-level non-UTF-8 mutations of --mutate-from")
     a = ap.parse_args()
     rnd = random.Random(a.seed)
     sdir = os.path.join(a.out, "sources")
@@ -376,8 +458,11 @@ def main():
     texts = syntax_programs(rnd, versions, a.count) + extra_programs(versions)
     if a.mutate:
         texts += mutate_sources(rnd, a.mutate_from, a.mutate)
+    texts += non_utf8_programs(versions)
+    if a.mutate_bytes:
+        texts += mutate_bytes(rnd, a.mutate_from, a.mutate_bytes)
     for text in texts:
-        data = text.encode()
+        data = text if isinstance(text, bytes) else text.encode()
         sha = hashlib.sha256(data).hexdigest()
         if sha in seen:
             continue

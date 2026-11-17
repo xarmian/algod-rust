@@ -3644,14 +3644,9 @@ pub async fn teal_compile<N: NodeInterface>(
         return error::bad_request(REQUEST_BODY_TOO_LARGE);
     }
 
-    // Parse body as UTF-8 source text
-    let source = match std::str::from_utf8(&body) {
-        Ok(s) => s,
-        Err(e) => return error::bad_request(e.to_string()),
-    };
-
-    // Assemble the TEAL source
-    let ops = match algo_avm::assembler::assemble_string_reported(source) {
+    // go assembles the raw body bytes (`logic.AssembleString(string(body))`):
+    // the source need not be UTF-8.
+    let ops = match algo_avm::assembler::assemble_bytes_reported(&body) {
         Ok(ops) => ops,
         // go's assembler panics here and no handler/middleware recovers, so
         // net/http drops the connection without answering (the node keeps
@@ -3661,7 +3656,7 @@ pub async fn teal_compile<N: NodeInterface>(
             return crate::error_envelope::aborted_connection_response();
         }
         Err((algo_avm::assembler::AssembleFailure::Errors(errors), warnings)) => {
-            return error::bad_request(algo_avm::assembler::report_multiple_errors(
+            return error::bad_request_bytes(&algo_avm::assembler::report_multiple_errors_bytes(
                 "", &errors, &warnings,
             ));
         }

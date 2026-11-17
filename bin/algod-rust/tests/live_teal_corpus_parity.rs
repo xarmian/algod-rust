@@ -43,6 +43,8 @@
 //! which the offline tier (#2367-#2369) proves equal to go's. The test also
 //! covers the request-size boundary (the largest corpus program plus synthetic
 //! bodies at and over `MaxTealSourceBytes`), a handful of handler edge cases
+//! (including compile bodies that are not UTF-8, which go assembles: a literal
+//! keeps its bytes and a failed compile's message carries `\ufffd`, #2388)
 //! and the go assembler panic (a constant scratch index >= 256) that makes go
 //! drop the connection (#2381): both nodes must give a transport error and keep
 //! serving.
@@ -932,18 +934,77 @@ async fn teal_corpus_rest_matches_go_and_offline() {
             Some(DEV_TOKEN),
         ),
     ];
-    // go assembles any byte string; algod-rust's assembler takes `&str` and the
-    // handler rejects a non-UTF-8 body (tracked in #2388), so this probe is opt-in until that is fixed.
+    // go assembles any byte string (`logic.AssembleString(string(body))`): a
+    // string literal keeps its bytes, a comment is ignored, and an invalid byte in
+    // an error message is one `\ufffd` of the JSON body (#2388).
     let mut edge = edge;
-    if std::env::var("TEAL_CORPUS_NON_UTF8").is_ok_and(|v| v == "1") {
-        edge.push((
+    let non_utf8: &[(&'static str, &[u8])] = &[
+        (
             "compile non-UTF-8 body",
+            b"#pragma version 8\nbyte \"\xff\xfe\"\nint 1\n",
+        ),
+        (
+            "compile non-UTF-8 comment",
+            b"#pragma version 8\nint 1 // \xff\xfe\n",
+        ),
+        (
+            "compile non-UTF-8 label",
+            b"#pragma version 8\nint 1\n\xfe:\nint 1\n",
+        ),
+        (
+            "compile non-UTF-8 sourcemap literal",
+            b"#pragma version 8\nbyte \"\xc3\xa9\xe2\"\nint 1\n",
+        ),
+        (
+            "compile private-use literal",
+            b"#pragma version 8\nbyte \"\xf4\x8f\xbc\x80\xf4\x8f\xbf\xbf\"\nint 1\n",
+        ),
+        (
+            "compile non-UTF-8 unknown opcode",
+            b"#pragma version 8\nfoo\xff\nint 1\n",
+        ),
+        (
+            "compile truncated sequence",
+            b"#pragma version 8\nint 1\n\xe2\x82 \n",
+        ),
+        (
+            "compile non-UTF-8 immediate",
+            b"#pragma version 8\nint \xff\n",
+        ),
+        (
+            "compile non-UTF-8 hex",
+            b"#pragma version 8\nbyte 0x\xffab\n",
+        ),
+        (
+            "compile non-UTF-8 macro name",
+            b"#pragma version 8\n#define \xff 1\nint 1\n",
+        ),
+        (
+            "compile private-use opcode",
+            b"#pragma version 8\nfoo\xf4\x8f\xbc\x80\nint 1\n",
+        ),
+        ("compile only invalid bytes", b"\xff\xfe"),
+        (
+            "compile two non-UTF-8 errors",
+            b"#pragma version 8\nfoo\xff\nbar\xfe\n",
+        ),
+    ];
+    for (name, body) in non_utf8 {
+        edge.push((
+            *name,
             reqwest::Method::POST,
             "/v2/teal/compile",
-            b"#pragma version 8\nbyte \"\xff\xfe\"\nint 1\n".to_vec(),
+            body.to_vec(),
             Some(DEV_TOKEN),
         ));
     }
+    edge.push((
+        "compile non-UTF-8 body with sourcemap",
+        reqwest::Method::POST,
+        "/v2/teal/compile?sourcemap=true",
+        b"#pragma version 8\nbyte \"\xff\xfe\"\nint 1\n".to_vec(),
+        Some(DEV_TOKEN),
+    ));
     for (name, method, path, body, token) in edge {
         let go = request(&c, Node::Go, method.clone(), path, body.clone(), token).await;
         let rust = request(&c, Node::Rust, method, path, body, token).await;

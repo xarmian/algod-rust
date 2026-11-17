@@ -40,9 +40,9 @@
 //! * a panic is `{"ok":false,"panic":msg,"sha256":..}`, a per-input time
 //!   budget overrun `{"ok":false,"sha256":..,"timeout":true}`.
 //!
-//! Non-UTF-8 assembler input is rejected identically by both drivers with the
-//! single error [`INVALID_UTF8`] at line 0 / column 0 (the Rust assembler takes
-//! `&str`; the REST handler layer is covered separately by #2370).
+//! Assembler input is any byte string, like go's `logic.AssembleString(string(body))`
+//! (issue #2388). A diagnostic message that carries an invalid byte is written the
+//! way go's `encoding/json` writes it: each such byte is one U+FFFD.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -58,9 +58,6 @@ use sha2::{Digest, Sha256, Sha512_256};
 
 /// Output schema version written to the header line.
 pub const SCHEMA_VERSION: u32 = 1;
-
-/// Error message used by both drivers for assembler input that is not UTF-8.
-pub const INVALID_UTF8: &str = "input is not valid UTF-8";
 
 const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
 
@@ -194,61 +191,54 @@ pub fn process(op: Operation, input: &Input) -> Row {
             }
             Err(e) => row.error = Some(e),
         },
-        Operation::Assemble => {
-            let source = match std::str::from_utf8(&input.bytes) {
-                Ok(s) => s,
-                Err(_) => {
-                    row.errors = Some(vec![Diag {
-                        col: 0,
-                        line: 0,
-                        message: INVALID_UTF8.to_string(),
-                    }]);
-                    return row;
-                }
-            };
-            match algo_avm::assembler::assemble_string_checked(source) {
-                Ok(ops) => {
-                    row.ok = true;
-                    row.bytecode_b64 =
-                        Some(base64::engine::general_purpose::STANDARD.encode(&ops.program));
-                    row.hash = Some(program_hash(&ops.program));
-                    row.sourcemap = Some(algo_avm::sourcemap::get_source_map(
-                        vec!["<body>".to_string()],
-                        &ops.offset_to_source,
-                    ));
-                    if !ops.warnings.is_empty() {
-                        row.warnings = Some(
-                            ops.warnings
-                                .iter()
-                                .map(|w| Diag {
-                                    col: w.col,
-                                    line: w.line,
-                                    message: w.message.clone(),
-                                })
-                                .collect(),
-                        );
-                    }
-                }
-                Err(algo_avm::assembler::AssembleFailure::Panic(msg)) => {
-                    row.panic = Some(msg);
-                    row.mirrors_go_panic = true;
-                }
-                Err(algo_avm::assembler::AssembleFailure::Errors(errors)) => {
-                    row.errors = Some(
-                        errors
+        Operation::Assemble => match algo_avm::assembler::assemble_bytes_checked(&input.bytes) {
+            Ok(ops) => {
+                row.ok = true;
+                row.bytecode_b64 =
+                    Some(base64::engine::general_purpose::STANDARD.encode(&ops.program));
+                row.hash = Some(program_hash(&ops.program));
+                row.sourcemap = Some(algo_avm::sourcemap::get_source_map(
+                    vec!["<body>".to_string()],
+                    &ops.offset_to_source,
+                ));
+                if !ops.warnings.is_empty() {
+                    row.warnings = Some(
+                        ops.warnings
                             .iter()
-                            .map(|e| Diag {
-                                col: e.col,
-                                line: e.line,
-                                message: e.message.clone(),
+                            .map(|w| Diag {
+                                col: w.col,
+                                line: w.line,
+                                message: go_json_message(&w.message_bytes()),
                             })
                             .collect(),
                     );
                 }
             }
-        }
+            Err(algo_avm::assembler::AssembleFailure::Panic(msg)) => {
+                row.panic = Some(msg);
+                row.mirrors_go_panic = true;
+            }
+            Err(algo_avm::assembler::AssembleFailure::Errors(errors)) => {
+                row.errors = Some(
+                    errors
+                        .iter()
+                        .map(|e| Diag {
+                            col: e.col,
+                            line: e.line,
+                            message: go_json_message(&e.message_bytes()),
+                        })
+                        .collect(),
+                );
+            }
+        },
     }
     row
+}
+
+/// A diagnostic message as go's `encoding/json` shows it (each byte that is not
+/// part of a valid UTF-8 sequence is one U+FFFD).
+fn go_json_message(bytes: &[u8]) -> String {
+    algo_avm::raw_text::go_lossy(bytes)
 }
 
 /// Silence the default panic message: panics are recorded in the row instead.

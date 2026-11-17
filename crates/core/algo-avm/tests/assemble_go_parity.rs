@@ -27,7 +27,7 @@
 //! case is the smallest source of one mismatch class the registry reassembly
 //! corpus run (and the type-tracking port) surfaced.
 
-use algo_avm::assembler::assemble_string;
+use algo_avm::assembler::assemble_bytes;
 use base64::Engine as _;
 use serde_json::Value;
 
@@ -49,6 +49,12 @@ fn diags(v: &Value) -> Vec<(u64, u64, String)> {
         .unwrap_or_default()
 }
 
+/// A message as go's `encoding/json` shows it (what the fixture stores): every
+/// byte that is not part of a valid UTF-8 sequence is one U+FFFD.
+fn go_json_message(bytes: &[u8]) -> String {
+    algo_avm::raw_text::go_lossy(bytes)
+}
+
 #[test]
 fn assemble_matches_go_on_every_regression_case() {
     let mut failures = Vec::new();
@@ -57,22 +63,40 @@ fn assemble_matches_go_on_every_regression_case() {
         n += 1;
         let case: Value = serde_json::from_str(line).expect("fixture row is JSON");
         let name = case["name"].as_str().expect("name");
-        let source = case["source"].as_str().expect("source");
-        let (got_ok, got_bytes, got_errors, got_warnings) = match assemble_string(source) {
+        // A source that is not UTF-8 is stored as `source_b64` (issue #2388).
+        let source: Vec<u8> = match case["source"].as_str() {
+            Some(s) => s.as_bytes().to_vec(),
+            None => base64::engine::general_purpose::STANDARD
+                .decode(case["source_b64"].as_str().expect("source or source_b64"))
+                .expect("source_b64 is base64"),
+        };
+        let (got_ok, got_bytes, got_errors, got_warnings) = match assemble_bytes(&source) {
             Ok(ops) => (
                 true,
                 base64::engine::general_purpose::STANDARD.encode(&ops.program),
                 vec![],
                 ops.warnings
                     .iter()
-                    .map(|w| (w.line as u64, w.col as u64, w.message.clone()))
+                    .map(|w| {
+                        (
+                            w.line as u64,
+                            w.col as u64,
+                            go_json_message(&w.message_bytes()),
+                        )
+                    })
                     .collect::<Vec<_>>(),
             ),
             Err(errs) => (
                 false,
                 String::new(),
                 errs.iter()
-                    .map(|e| (e.line as u64, e.col as u64, e.message.clone()))
+                    .map(|e| {
+                        (
+                            e.line as u64,
+                            e.col as u64,
+                            go_json_message(&e.message_bytes()),
+                        )
+                    })
                     .collect::<Vec<_>>(),
                 vec![],
             ),

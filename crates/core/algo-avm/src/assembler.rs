@@ -35,6 +35,7 @@ use sha2::{Digest, Sha512_256};
 
 use crate::fields;
 use crate::opcode::{self, ImmKind, Mode, OpSpec, MAX_AVM_VERSION};
+use crate::raw_text;
 use crate::type_track;
 
 /// The first AVM version where constant optimization is enabled.
@@ -132,6 +133,15 @@ pub struct AssemblyError {
     pub message: String,
 }
 
+impl AssemblyError {
+    /// The message as go renders it: the original bytes, which are not UTF-8
+    /// when the source held an invalid byte (go's `%s` of a source token).
+    /// `message` is the lossless form of these bytes (see [`crate::raw_text`]).
+    pub fn message_bytes(&self) -> Vec<u8> {
+        raw_text::decode(&self.message).into_owned()
+    }
+}
+
 impl std::fmt::Display for AssemblyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}: {}", self.line, self.col, self.message)
@@ -149,6 +159,13 @@ pub struct AssemblyWarning {
     pub line: usize,
     pub col: usize,
     pub message: String,
+}
+
+impl AssemblyWarning {
+    /// See [`AssemblyError::message_bytes`].
+    pub fn message_bytes(&self) -> Vec<u8> {
+        raw_text::decode(&self.message).into_owned()
+    }
 }
 
 impl std::fmt::Display for AssemblyWarning {
@@ -406,7 +423,7 @@ impl OpStream {
 
     /// go's `mnemonic.errorAfterf(...)`: just past the mnemonic token.
     pub(crate) fn err_after_mnemonic(&mut self, mnemonic: &str, msg: String) {
-        let (line, col) = (self.stmt_line, self.stmt_col + mnemonic.len());
+        let (line, col) = (self.stmt_line, self.stmt_col + raw_text::raw_len(mnemonic));
         self.record_error(line, col, msg);
     }
 
@@ -652,7 +669,10 @@ impl OpStream {
                         self.errors.push(AssemblyError {
                             line: lr.line,
                             col: lr.col,
-                            message: format!("reference to undefined label {:?}", lr.label),
+                            message: format!(
+                                "reference to undefined label {}",
+                                go_quote(&lr.label)
+                            ),
                         });
                         reported.insert(lr.label.clone());
                     }
@@ -665,8 +685,8 @@ impl OpStream {
                     line: lr.line,
                     col: lr.col,
                     message: format!(
-                        "label {:?} is a back reference, back jump support was introduced in v4",
-                        lr.label,
+                        "label {} is a back reference, back jump support was introduced in v4",
+                        go_quote(&lr.label),
                     ),
                 });
                 continue;
@@ -681,7 +701,7 @@ impl OpStream {
                 self.errors.push(AssemblyError {
                     line: lr.line,
                     col: lr.col,
-                    message: format!("label {:?} is too far away", lr.label),
+                    message: format!("label {} is too far away", go_quote(&lr.label)),
                 });
                 continue;
             }
@@ -696,7 +716,10 @@ impl OpStream {
                     self.errors.push(AssemblyError {
                         line: lr.line,
                         col: lr.col,
-                        message: format!("branch to start of same instruction: {:?} ", lr.label),
+                        message: format!(
+                            "branch to start of same instruction: {} ",
+                            go_quote(&lr.label)
+                        ),
                     });
                     continue;
                 }
@@ -715,7 +738,7 @@ impl OpStream {
                     self.errors.push(AssemblyError {
                         line: lr.line,
                         col: lr.col,
-                        message: format!("label {:?} is too far away", lr.label),
+                        message: format!("label {} is too far away", go_quote(&lr.label)),
                     });
                     continue;
                 }
@@ -732,8 +755,8 @@ impl OpStream {
                         line: lr.line,
                         col: lr.col,
                         message: format!(
-                            "internal error: branch varint size mismatch for label {:?}",
-                            lr.label
+                            "internal error: branch varint size mismatch for label {}",
+                            go_quote(&lr.label)
                         ),
                     });
                     continue;
@@ -747,7 +770,7 @@ impl OpStream {
                 self.errors.push(AssemblyError {
                     line: lr.line,
                     col: lr.col,
-                    message: format!("label {:?} is too far away", lr.label),
+                    message: format!("label {} is too far away", go_quote(&lr.label)),
                 });
                 continue;
             }
@@ -1188,19 +1211,24 @@ fn go_is_letter(c: char) -> bool {
 /// [`recheck_macro_names`], invoked the moment the version does become
 /// known, to re-validate every macro defined while it wasn't).
 fn check_macro_name(name: &str, ops: &OpStream) -> Result<(), String> {
-    let mut chars = name.chars();
-    let first = chars.next();
-    let second = chars.next();
-    for c in name.chars() {
+    // go ranges over the runes of the byte string: each invalid byte is a
+    // U+FFFD of its own.
+    let runes = raw_text::go_runes(name);
+    let first = runes.first().copied();
+    let second = runes.get(1).copied();
+    for &c in &runes {
         if !go_is_letter(c) && !go_is_digit(c) && !MACRO_NAME_OTHER_CHARS.contains(&c) {
-            return Err(format!("{c} character not allowed in macro name"));
+            return Err(format!(
+                "{} character not allowed in macro name",
+                raw_text::encode_str(&c.to_string())
+            ));
         }
     }
     if let Some(first) = first {
         if go_is_digit(first) {
             return Err(format!("Cannot begin macro name with number: {name}"));
         }
-        if name.len() > 1 && (first == '-' || first == '+') {
+        if raw_text::raw_len(name) > 1 && (first == '-' || first == '+') {
             if let Some(second) = second {
                 if go_is_digit(second) {
                     return Err(format!("Cannot begin macro name with number: {name}"));
@@ -1588,7 +1616,7 @@ fn process_statement(ops: &mut OpStream, current: &[Tok]) {
     let col = current[tok_idx].col;
     ops.stmt_col = col;
     ops.stmt_line = current[tok_idx].line;
-    ops.stmt_len = current[tok_idx].s.len();
+    ops.stmt_len = raw_text::raw_len(&current[tok_idx].s);
     ops.arg_cols = current[tok_idx + 1..].iter().map(|t| t.col).collect();
     ops.arg_lines = current[tok_idx + 1..].iter().map(|t| t.line).collect();
     ops.record_source_location(ops.stmt_line, col);
@@ -1623,14 +1651,27 @@ pub enum AssembleFailure {
 /// go's assembler panics is reported as a single error carrying go's panic
 /// text; use [`assemble_string_checked`] to tell it apart.
 pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
-    assemble_string_checked(text).map_err(|f| match f {
+    assemble_string_checked(text).map_err(failure_to_errors)
+}
+
+/// [`assemble_string`] for source that is not valid UTF-8: go's
+/// `logic.AssembleString(string(body))` takes any byte string (a string
+/// literal keeps its raw bytes, a comment is ignored), and so does this. An
+/// error message then carries the bytes as go prints them, read through
+/// [`AssemblyError::message_bytes`].
+pub fn assemble_bytes(text: &[u8]) -> Result<OpStream, Vec<AssemblyError>> {
+    assemble_bytes_checked(text).map_err(failure_to_errors)
+}
+
+fn failure_to_errors(f: AssembleFailure) -> Vec<AssemblyError> {
+    match f {
         AssembleFailure::Errors(e) => e,
         AssembleFailure::Panic(message) => vec![AssemblyError {
             line: 0,
             col: 0,
             message,
         }],
-    })
+    }
 }
 
 /// go's `sourceError.Error()` (`assembler.go`): `line:col: msg`, or `line: msg`
@@ -1649,11 +1690,16 @@ pub fn go_source_error_string(line: usize, col: usize, message: &str) -> String 
 /// with no warnings is `[fname: ]1 error: <e>\n`; otherwise the first 10 errors
 /// then the first 10 warnings, one per line, each newline-terminated and
 /// prefixed `fname: ` when `fname` is not empty.
+///
+/// The result is in the lossless form of [`crate::raw_text`] (identical to the
+/// plain text unless the source held invalid UTF-8); use
+/// [`report_multiple_errors_bytes`] for the bytes go writes.
 pub fn report_multiple_errors(
     fname: &str,
     errors: &[AssemblyError],
     warnings: &[AssemblyWarning],
 ) -> String {
+    let fname = raw_text::encode_str(fname);
     let prefix = if fname.is_empty() {
         String::new()
     } else {
@@ -1680,10 +1726,33 @@ pub fn report_multiple_errors(
     out
 }
 
+/// [`report_multiple_errors`] as the bytes go writes (the response `message`
+/// before JSON encoding, the text on goal's stderr).
+pub fn report_multiple_errors_bytes(
+    fname: &str,
+    errors: &[AssemblyError],
+    warnings: &[AssemblyWarning],
+) -> Vec<u8> {
+    raw_text::decode(&report_multiple_errors(fname, errors, warnings)).into_owned()
+}
+
 /// [`assemble_string_checked`] that also returns the warnings of a failed
 /// assembly (go keeps `OpStream.Warnings` on failure and
 /// [`report_multiple_errors`] prints them).
 pub fn assemble_string_reported(
+    text: &str,
+) -> Result<OpStream, (AssembleFailure, Vec<AssemblyWarning>)> {
+    assemble_encoded_reported(&raw_text::encode_str(text))
+}
+
+/// [`assemble_string_reported`] for source that is not valid UTF-8.
+pub fn assemble_bytes_reported(
+    text: &[u8],
+) -> Result<OpStream, (AssembleFailure, Vec<AssemblyWarning>)> {
+    assemble_encoded_reported(&raw_text::encode(text))
+}
+
+fn assemble_encoded_reported(
     text: &str,
 ) -> Result<OpStream, (AssembleFailure, Vec<AssemblyWarning>)> {
     assemble_core(text).map_err(|ops| {
@@ -1697,6 +1766,15 @@ pub fn assemble_string_reported(
 
 /// [`assemble_string`] with the go-panic condition kept as a typed variant.
 pub fn assemble_string_checked(text: &str) -> Result<OpStream, AssembleFailure> {
+    assemble_encoded_checked(&raw_text::encode_str(text))
+}
+
+/// [`assemble_string_checked`] for source that is not valid UTF-8.
+pub fn assemble_bytes_checked(text: &[u8]) -> Result<OpStream, AssembleFailure> {
+    assemble_encoded_checked(&raw_text::encode(text))
+}
+
+fn assemble_encoded_checked(text: &str) -> Result<OpStream, AssembleFailure> {
     assemble_core(text).map_err(|ops| match ops.panic.clone() {
         Some(p) => AssembleFailure::Panic(p),
         None => AssembleFailure::Errors(ops.errors),
@@ -1716,9 +1794,16 @@ fn assemble_core(text: &str) -> Result<OpStream, Box<OpStream>> {
     for (line_idx, line_text) in scanned_lines.into_iter().enumerate() {
         ops.source_line = line_idx + 1; // 1-based
 
-        let full_tokens = tokenize_line_with_cols(line_text);
+        let mut full_tokens = tokenize_line_with_cols(line_text);
         if full_tokens.is_empty() {
             continue;
+        }
+        // go's columns are byte offsets into the original text, where an
+        // invalid byte is one byte (here a four-byte raw character).
+        if raw_text::has_raw(line_text) {
+            for (col, _) in &mut full_tokens {
+                *col = raw_text::raw_len(&line_text[..*col]);
+            }
         }
         let tokens: Vec<Tok> = full_tokens
             .iter()
@@ -1993,7 +2078,7 @@ fn check_arg_count(ops: &mut OpStream, name: &str, args: &[&str], expected: usiz
     } else {
         (
             ops.arg_line(offered - 1),
-            ops.arg_col(offered - 1) + args[offered - 1].len(),
+            ops.arg_col(offered - 1) + raw_text::raw_len(args[offered - 1]),
         )
     };
     let msg = if expected == 1 {
@@ -2975,7 +3060,7 @@ impl DecodeError {
 }
 
 /// go's `hex.DecodeString` (encoding/hex.Decode).
-fn go_hex_decode(s: &str) -> Result<Vec<u8>, DecodeError> {
+fn go_hex_decode(src: &[u8]) -> Result<Vec<u8>, DecodeError> {
     fn nibble(c: u8) -> Option<u8> {
         match c {
             b'0'..=b'9' => Some(c - b'0'),
@@ -2984,7 +3069,6 @@ fn go_hex_decode(s: &str) -> Result<Vec<u8>, DecodeError> {
             _ => None,
         }
     }
-    let src = s.as_bytes();
     let mut out = Vec::with_capacity(src.len() / 2);
     let mut j = 1;
     while j < src.len() {
@@ -3010,13 +3094,12 @@ fn go_hex_decode(s: &str) -> Result<Vec<u8>, DecodeError> {
 /// go's `base64.StdEncoding.DecodeString` (padded, non-strict): an exact port
 /// of `Decode`/`decodeQuantum`, including the newline skipping and every
 /// `CorruptInputError` offset.
-fn go_base64_decode(s: &str) -> Result<Vec<u8>, DecodeError> {
+fn go_base64_decode(src: &[u8]) -> Result<Vec<u8>, DecodeError> {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut map = [0xffu8; 256];
     for (i, c) in ALPHABET.iter().enumerate() {
         map[*c as usize] = i as u8;
     }
-    let src = s.as_bytes();
     let mut out = Vec::with_capacity(src.len() / 4 * 3);
     let mut si = 0usize;
     while si < src.len() {
@@ -3091,13 +3174,17 @@ fn go_base64_decode(s: &str) -> Result<Vec<u8>, DecodeError> {
 
 /// go's `base32.StdEncoding.DecodeString` with padding `pad` (`Some(b'=')` or
 /// `None` for `NoPadding`): an exact port of `stripNewlines` and `decode`.
-fn go_base32_decode(s: &str, pad: Option<u8>) -> Result<Vec<u8>, DecodeError> {
+fn go_base32_decode(s: &[u8], pad: Option<u8>) -> Result<Vec<u8>, DecodeError> {
     const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     let mut map = [0xffu8; 256];
     for (i, c) in ALPHABET.iter().enumerate() {
         map[*c as usize] = i as u8;
     }
-    let buf: Vec<u8> = s.bytes().filter(|b| *b != b'\r' && *b != b'\n').collect();
+    let buf: Vec<u8> = s
+        .iter()
+        .copied()
+        .filter(|b| *b != b'\r' && *b != b'\n')
+        .collect();
     let olen = buf.len() as i64;
     // go compares with `byte(enc.padChar)`; NoPadding (-1) becomes 0xff.
     let pad_byte = pad.unwrap_or(0xff);
@@ -3169,7 +3256,7 @@ fn go_base32_decode(s: &str, pad: Option<u8>) -> Result<Vec<u8>, DecodeError> {
 
 /// go's `base32DecodeAnyPadding` (assembler.go:664): unpadded first, then
 /// padded; the unpadded attempt's error when both fail.
-fn go_base32_decode_any_padding(s: &str) -> Result<Vec<u8>, DecodeError> {
+fn go_base32_decode_any_padding(s: &[u8]) -> Result<Vec<u8>, DecodeError> {
     match go_base32_decode(s, None) {
         Ok(v) => Ok(v),
         Err(e) => go_base32_decode(s, Some(b'=')).map_err(|_| e),
@@ -3181,12 +3268,15 @@ fn go_base32_decode_any_padding(s: &str) -> Result<Vec<u8>, DecodeError> {
 /// the error text and the index of the token go blames.
 fn parse_binary_args(args: &[&str]) -> Result<(Vec<u8>, usize), (String, usize)> {
     let arg = args[0];
+    // go works on the bytes of the token: offsets in the errors are byte offsets.
+    let raw_arg = raw_text::decode(arg);
+    let raw: &[u8] = &raw_arg;
     let paren = || -> Result<(usize, usize), (String, usize)> {
-        let open = arg.find('(').unwrap_or(0);
-        let Some(close) = arg.find(')') else {
+        let open = raw.iter().position(|&b| b == b'(').unwrap_or(0);
+        let Some(close) = raw.iter().position(|&b| b == b')') else {
             return Err((format!("argument {arg} lacks closing parenthesis"), 0));
         };
-        if close != arg.len() - 1 {
+        if close != raw.len() - 1 {
             return Err((
                 format!("argument {arg} must end at first closing parenthesis"),
                 0,
@@ -3194,21 +3284,21 @@ fn parse_binary_args(args: &[&str]) -> Result<(Vec<u8>, usize), (String, usize)>
         }
         Ok((open, close))
     };
-    if arg.starts_with("base32(") || arg.starts_with("b32(") {
+    if raw.starts_with(b"base32(") || raw.starts_with(b"b32(") {
         let (open, close) = paren()?;
-        return match go_base32_decode_any_padding(&arg[open + 1..close]) {
+        return match go_base32_decode_any_padding(&raw[open + 1..close]) {
             Ok(v) => Ok((v, 1)),
             Err(e) => Err((e.shifted(open as i64 + 1).to_string(), 0)),
         };
     }
-    if arg.starts_with("base64(") || arg.starts_with("b64(") {
+    if raw.starts_with(b"base64(") || raw.starts_with(b"b64(") {
         let (open, close) = paren()?;
-        return match go_base64_decode(&arg[open + 1..close]) {
+        return match go_base64_decode(&raw[open + 1..close]) {
             Ok(v) => Ok((v, 1)),
             Err(e) => Err((e.shifted(open as i64 + 1).to_string(), 0)),
         };
     }
-    if let Some(hex) = arg.strip_prefix("0x") {
+    if let Some(hex) = raw.strip_prefix(b"0x") {
         return go_hex_decode(hex)
             .map(|v| (v, 1))
             .map_err(|e| (e.to_string(), 0));
@@ -3217,7 +3307,7 @@ fn parse_binary_args(args: &[&str]) -> Result<(Vec<u8>, usize), (String, usize)>
         if args.len() < 2 {
             return Err((format!("{arg} needs byte literal argument"), 0));
         }
-        return go_base32_decode_any_padding(args[1])
+        return go_base32_decode_any_padding(&raw_text::decode(args[1]))
             .map(|v| (v, 2))
             .map_err(|e| (e.to_string(), 1));
     }
@@ -3225,7 +3315,7 @@ fn parse_binary_args(args: &[&str]) -> Result<(Vec<u8>, usize), (String, usize)>
         if args.len() < 2 {
             return Err((format!("{arg} needs byte literal argument"), 0));
         }
-        return go_base64_decode(args[1])
+        return go_base64_decode(&raw_text::decode(args[1]))
             .map(|v| (v, 2))
             .map_err(|e| (e.to_string(), 1));
     }
@@ -3239,7 +3329,8 @@ fn parse_binary_args(args: &[&str]) -> Result<(Vec<u8>, usize), (String, usize)>
 
 /// go's `parseStringLiteral` (assembler.go:749-819), byte for byte.
 fn parse_string_literal(input: &str) -> Result<Vec<u8>, String> {
-    let bytes = input.as_bytes();
+    let raw_input = raw_text::decode(input);
+    let bytes: &[u8] = &raw_input;
     if bytes.is_empty() || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
         return Err("no quotes".into());
     }
@@ -3313,7 +3404,7 @@ fn parse_string_literal(input: &str) -> Result<Vec<u8>, String> {
 /// canonical rendering.
 fn unmarshal_checksum_address(address: &str) -> Result<Vec<u8>, String> {
     use sha2::{Digest, Sha512_256};
-    let decoded = go_base32_decode(address, None)
+    let decoded = go_base32_decode(&raw_text::decode(address), None)
         .map_err(|_| format!("failed to decode address {address} from base 32"))?;
     if decoded.len() < 32 {
         return Err(format!("decoded bad addr: {address}"));
@@ -3350,7 +3441,7 @@ fn go_scan_lines(text: &str) -> (Vec<&str>, bool) {
             Some(i) => (&rest[..i], &rest[i + 1..]),
             None => (rest, ""),
         };
-        if raw.len() >= MAX_SCAN_TOKEN_SIZE {
+        if raw_text::raw_len(raw) >= MAX_SCAN_TOKEN_SIZE {
             return (lines, true);
         }
         lines.push(raw.strip_suffix('\r').unwrap_or(raw));
@@ -3362,8 +3453,11 @@ fn go_scan_lines(text: &str) -> (Vec<&str>, bool) {
 /// go's `%#v` of a string (`strconv.Quote`): double quotes with Go's escapes.
 /// Printable characters are kept; the rest become `\xNN`, `\uNNNN` or
 /// `\UNNNNNNNN`.
+///
+/// `s` is source text in the lossless form of [`crate::raw_text`]: a byte that
+/// was not UTF-8 is quoted as `\xNN`, like go does for the byte string.
 pub(crate) fn go_quote(s: &str) -> String {
-    go_quote_bytes(s.as_bytes())
+    go_quote_bytes(&raw_text::decode(s))
 }
 
 /// `strconv.Quote` of a byte string: invalid UTF-8 bytes become `\xNN`.
@@ -3400,14 +3494,16 @@ pub(crate) fn go_quote_bytes(bytes: &[u8]) -> String {
 
 /// The method signature check of go's `asmMethod`.
 fn abi_verify_method_signature(sig: &[u8]) -> Result<(), String> {
-    crate::abi_verify::verify_method_signature(&String::from_utf8_lossy(sig))
+    // The signature may hold raw bytes; the checks work on the lossless form,
+    // so their messages (go's `%s` of the signature) keep the bytes.
+    crate::abi_verify::verify_method_signature(&raw_text::encode(sig))
 }
 
 /// go's `unicode.IsPrint`, approximated with Rust's own printability test
 /// (`char::escape_debug`), which excludes the same control, format, private
 /// use, unassigned and non-ASCII space characters; combining marks, which Go
 /// prints, are put back.
-fn go_is_print(c: char) -> bool {
+pub fn go_is_print(c: char) -> bool {
     if c == ' ' {
         return true;
     }
