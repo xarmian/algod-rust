@@ -33,6 +33,7 @@ make bench-compare TIERS=selftest RUNS=5
 - [The `localnet` tier](#the-localnet-tier)
 - [The `rest` tier](#the-rest-tier)
 - [The `catchup` tier](#the-catchup-tier)
+- [The `teal-corpus` tier](#the-teal-corpus-tier)
 - [CI workflow and published baseline](#ci-workflow-and-published-baseline)
 
 ## Quick start
@@ -1831,3 +1832,18 @@ failure leaves neither changed; a CRLF doc keeps its line endings. Each block st
 with a generated "Summary by tier" table counted from the same rows as its tables. Dedicated,
 quiet hardware gives the numbers worth publishing; CI-runner numbers are only
 for the regression warning.
+
+## The `teal-corpus` tier
+
+Issue #2371 (Phase 25, epic #2364). Times the TEAL disassembler and assembler of
+both implementations on the real-world ARC56Registry corpus with the batch
+drivers (`tools/teal-corpus`, `crates/tools/teal-corpus`), `--jobs 1`, one
+process per run. Needs the corpus (`make teal-corpus-fetch`, network; the work
+directory is gitignored), cargo and a pinned go-algorand checkout with libsodium;
+it builds both drivers itself (no `build_both.sh`). Workloads, metrics, the
+equality gate (timings withheld on any output difference, timeout or unmirrored
+panic) and the results are in [TEAL_CORPUS_PARITY.md](TEAL_CORPUS_PARITY.md).
+Environment: `BENCH_TEAL_CORPUS_DIR`, `BENCH_TEAL_TOPN` (20), `BENCH_TEAL_WARMUP`
+(1), `BENCH_TEAL_GO_DRIVER` / `BENCH_TEAL_RUST_DRIVER` (prebuilt drivers),
+`BENCH_TEAL_CORRUPT=1` (negative test: the tier must fail). Unit tests:
+`scripts/bench/test_teal_corpus_tier.py` (`make bench-compare-test`).

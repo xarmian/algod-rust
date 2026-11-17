@@ -1,0 +1,2 @@
+date,registry_sha,algod_rust_commit,go_algorand_tag,programs,approval,clear,shared,distinct_sources,total_bytes,opcodes_seen,opcodes_table,disassemble_compared,disassemble_mismatched,reassemble_compared,reassemble_mismatched,source_compared,source_mismatched,panics,timeouts,go_fixed_rate,rust_fixed_rate,registry_hash_rate
+2026-11-17,e75e509cf2452fea5b0726e064f7445dedbeac07,8af88af31996caccf70ef8f4f7d6145f378ffed1,v5.0.5-stable,3692,3669,21,2,3687,3145695,188,198,3692,0,3691,0,3687,0,0,0,0.993227,0.993227,1.0

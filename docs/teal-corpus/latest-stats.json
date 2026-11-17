@@ -1,0 +1,881 @@
+{
+  "avm_versions": {
+    "1": 1,
+    "10": 2482,
+    "11": 1166,
+    "12": 24,
+    "13": 15,
+    "8": 4
+  },
+  "corpus": {
+    "by_kind": {
+      "approval": 3669,
+      "clear": 21,
+      "shared": 2
+    },
+    "distinct_sources": 3687,
+    "fetched_at": "2026-11-17T13:51:14Z",
+    "programs": 3692,
+    "registry_hash_agreement": {
+      "matching": 3692,
+      "rate": 1.0,
+      "total": 3692
+    },
+    "registry_sha": "e75e509cf2452fea5b0726e064f7445dedbeac07",
+    "size": {
+      "max": 38414,
+      "min": 1,
+      "p50": 335,
+      "p90": 1900,
+      "p99": 7446
+    },
+    "total_bytes": 3145695
+  },
+  "error_classes": {
+    "disassemble": {
+      "illegal opcode 0xN": 1
+    },
+    "reassemble": {
+      "<= arg N wanted type uintN got []byte": 1,
+      "b& arg N wanted type []byte got uintN": 1,
+      "b<= arg N wanted type bigint got uintN": 1,
+      "b== arg N wanted type bigint got uintN": 3,
+      "b>= arg N wanted type bigint got uintN": 1,
+      "bnz labelN arg N wanted type uintN got []byte": 2,
+      "bytecblock arg N is too big (N bytes, limit N)": 1,
+      "concat arg N wanted type []byte got uintN": 2,
+      "extract N N arg N wanted type []byte got uintN": 4,
+      "extractN arg N wanted type []byte got uintN": 1,
+      "extract_uintN arg N wanted type []byte got uintN": 1,
+      "itxn_field ApplicationArgs arg N wanted type []byte got uintN": 1,
+      "loads arg N wanted type uintN got []byte": 5,
+      "substring end is before start": 1
+    },
+    "source": {
+      "bytecblock arg N is too big (N bytes, limit N)": 1,
+      "bytecblock arg did not parse: X": 80,
+      "empty pragma": 1,
+      "strconv.ParseUint: parsing \"X\": invalid syntax": 79,
+      "substring end is before start": 1,
+      "sumhashN opcode was introduced in vN": 1
+    }
+  },
+  "fixed_point": {
+    "go_fixed": 3666,
+    "go_rate": 0.993227,
+    "programs": 3691,
+    "registry_hash_compared": 3666,
+    "registry_hash_matching": 3666,
+    "registry_hash_rate": 1.0,
+    "rust_fixed": 3666,
+    "rust_rate": 0.993227
+  },
+  "opcodes": {
+    "coverage_rate": 0.949495,
+    "distinct_seen": 188,
+    "histogram": {
+      "!": {
+        "occurrences": 14532,
+        "programs": 3564
+      },
+      "!=": {
+        "occurrences": 2208,
+        "programs": 620
+      },
+      "%": {
+        "occurrences": 426,
+        "programs": 172
+      },
+      "&": {
+        "occurrences": 949,
+        "programs": 209
+      },
+      "&&": {
+        "occurrences": 2784,
+        "programs": 1793
+      },
+      "*": {
+        "occurrences": 6027,
+        "programs": 1127
+      },
+      "+": {
+        "occurrences": 14392,
+        "programs": 1886
+      },
+      "-": {
+        "occurrences": 15643,
+        "programs": 2459
+      },
+      "/": {
+        "occurrences": 1243,
+        "programs": 381
+      },
+      "<": {
+        "occurrences": 2473,
+        "programs": 645
+      },
+      "<=": {
+        "occurrences": 7102,
+        "programs": 1498
+      },
+      "==": {
+        "occurrences": 38655,
+        "programs": 2612
+      },
+      ">": {
+        "occurrences": 2179,
+        "programs": 505
+      },
+      ">=": {
+        "occurrences": 2221,
+        "programs": 657
+      },
+      "^": {
+        "occurrences": 78,
+        "programs": 32
+      },
+      "acct_params_get": {
+        "occurrences": 531,
+        "programs": 139
+      },
+      "addw": {
+        "occurrences": 156,
+        "programs": 21
+      },
+      "app_box_create": {
+        "occurrences": 5,
+        "programs": 5
+      },
+      "app_box_del": {
+        "occurrences": 4,
+        "programs": 4
+      },
+      "app_box_extract": {
+        "occurrences": 8,
+        "programs": 5
+      },
+      "app_box_get": {
+        "occurrences": 5,
+        "programs": 5
+      },
+      "app_box_len": {
+        "occurrences": 8,
+        "programs": 6
+      },
+      "app_box_put": {
+        "occurrences": 5,
+        "programs": 5
+      },
+      "app_box_replace": {
+        "occurrences": 5,
+        "programs": 5
+      },
+      "app_box_resize": {
+        "occurrences": 4,
+        "programs": 4
+      },
+      "app_box_splice": {
+        "occurrences": 4,
+        "programs": 4
+      },
+      "app_global_del": {
+        "occurrences": 35,
+        "programs": 21
+      },
+      "app_global_get": {
+        "occurrences": 3100,
+        "programs": 439
+      },
+      "app_global_get_ex": {
+        "occurrences": 14683,
+        "programs": 1341
+      },
+      "app_global_put": {
+        "occurrences": 14354,
+        "programs": 1839
+      },
+      "app_local_del": {
+        "occurrences": 54,
+        "programs": 18
+      },
+      "app_local_get": {
+        "occurrences": 33,
+        "programs": 11
+      },
+      "app_local_get_ex": {
+        "occurrences": 811,
+        "programs": 107
+      },
+      "app_local_put": {
+        "occurrences": 893,
+        "programs": 121
+      },
+      "app_opted_in": {
+        "occurrences": 39,
+        "programs": 23
+      },
+      "app_params_get": {
+        "occurrences": 961,
+        "programs": 260
+      },
+      "app_params_set": {
+        "occurrences": 12,
+        "programs": 7
+      },
+      "assert": {
+        "occurrences": 84418,
+        "programs": 3517
+      },
+      "asset_holding_get": {
+        "occurrences": 441,
+        "programs": 175
+      },
+      "asset_params_get": {
+        "occurrences": 338,
+        "programs": 83
+      },
+      "b": {
+        "occurrences": 16198,
+        "programs": 2716
+      },
+      "b!=": {
+        "occurrences": 897,
+        "programs": 233
+      },
+      "b%": {
+        "occurrences": 16751,
+        "programs": 446
+      },
+      "b&": {
+        "occurrences": 1274,
+        "programs": 268
+      },
+      "b*": {
+        "occurrences": 13062,
+        "programs": 348
+      },
+      "b+": {
+        "occurrences": 12454,
+        "programs": 732
+      },
+      "b-": {
+        "occurrences": 1755,
+        "programs": 392
+      },
+      "b/": {
+        "occurrences": 1828,
+        "programs": 259
+      },
+      "b<": {
+        "occurrences": 1011,
+        "programs": 329
+      },
+      "b<=": {
+        "occurrences": 314,
+        "programs": 110
+      },
+      "b==": {
+        "occurrences": 1536,
+        "programs": 380
+      },
+      "b>": {
+        "occurrences": 1314,
+        "programs": 336
+      },
+      "b>=": {
+        "occurrences": 702,
+        "programs": 275
+      },
+      "b^": {
+        "occurrences": 194,
+        "programs": 76
+      },
+      "balance": {
+        "occurrences": 51,
+        "programs": 34
+      },
+      "base64_decode": {
+        "occurrences": 6,
+        "programs": 4
+      },
+      "bitlen": {
+        "occurrences": 521,
+        "programs": 183
+      },
+      "block": {
+        "occurrences": 94,
+        "programs": 29
+      },
+      "bnz": {
+        "occurrences": 7052,
+        "programs": 2591
+      },
+      "box_create": {
+        "occurrences": 459,
+        "programs": 283
+      },
+      "box_del": {
+        "occurrences": 3241,
+        "programs": 754
+      },
+      "box_extract": {
+        "occurrences": 3612,
+        "programs": 271
+      },
+      "box_get": {
+        "occurrences": 6765,
+        "programs": 906
+      },
+      "box_len": {
+        "occurrences": 3381,
+        "programs": 520
+      },
+      "box_put": {
+        "occurrences": 5076,
+        "programs": 974
+      },
+      "box_replace": {
+        "occurrences": 1051,
+        "programs": 246
+      },
+      "box_resize": {
+        "occurrences": 116,
+        "programs": 78
+      },
+      "box_splice": {
+        "occurrences": 83,
+        "programs": 59
+      },
+      "bsqrt": {
+        "occurrences": 9,
+        "programs": 4
+      },
+      "btoi": {
+        "occurrences": 12336,
+        "programs": 1599
+      },
+      "bury": {
+        "occurrences": 15036,
+        "programs": 1398
+      },
+      "bytec": {
+        "occurrences": 37636,
+        "programs": 1139
+      },
+      "bytec_0": {
+        "occurrences": 36165,
+        "programs": 2663
+      },
+      "bytec_1": {
+        "occurrences": 14224,
+        "programs": 2157
+      },
+      "bytec_2": {
+        "occurrences": 10095,
+        "programs": 1747
+      },
+      "bytec_3": {
+        "occurrences": 7834,
+        "programs": 1455
+      },
+      "bytecblock": {
+        "occurrences": 2664,
+        "programs": 2664
+      },
+      "bz": {
+        "occurrences": 20528,
+        "programs": 3254
+      },
+      "bzero": {
+        "occurrences": 8159,
+        "programs": 1983
+      },
+      "b|": {
+        "occurrences": 5774,
+        "programs": 1186
+      },
+      "b~": {
+        "occurrences": 66,
+        "programs": 35
+      },
+      "callsub": {
+        "occurrences": 20304,
+        "programs": 1754
+      },
+      "concat": {
+        "occurrences": 66334,
+        "programs": 2973
+      },
+      "cover": {
+        "occurrences": 13498,
+        "programs": 1416
+      },
+      "dig": {
+        "occurrences": 83016,
+        "programs": 2233
+      },
+      "divmodw": {
+        "occurrences": 75,
+        "programs": 21
+      },
+      "divw": {
+        "occurrences": 136,
+        "programs": 29
+      },
+      "dup": {
+        "occurrences": 75232,
+        "programs": 3371
+      },
+      "dup2": {
+        "occurrences": 737,
+        "programs": 368
+      },
+      "dupn": {
+        "occurrences": 2851,
+        "programs": 978
+      },
+      "ec_add": {
+        "occurrences": 70,
+        "programs": 18
+      },
+      "ec_map_to": {
+        "occurrences": 1,
+        "programs": 1
+      },
+      "ec_multi_scalar_mul": {
+        "occurrences": 8,
+        "programs": 8
+      },
+      "ec_pairing_check": {
+        "occurrences": 17,
+        "programs": 17
+      },
+      "ec_scalar_mul": {
+        "occurrences": 74,
+        "programs": 18
+      },
+      "ec_subgroup_check": {
+        "occurrences": 31,
+        "programs": 7
+      },
+      "ecdsa_pk_decompress": {
+        "occurrences": 3,
+        "programs": 2
+      },
+      "ecdsa_pk_recover": {
+        "occurrences": 15,
+        "programs": 14
+      },
+      "ecdsa_verify": {
+        "occurrences": 3,
+        "programs": 2
+      },
+      "ed25519verify": {
+        "occurrences": 7,
+        "programs": 7
+      },
+      "ed25519verify_bare": {
+        "occurrences": 17,
+        "programs": 15
+      },
+      "err": {
+        "occurrences": 6195,
+        "programs": 3298
+      },
+      "exp": {
+        "occurrences": 28,
+        "programs": 16
+      },
+      "expw": {
+        "occurrences": 18,
+        "programs": 5
+      },
+      "extract": {
+        "occurrences": 24795,
+        "programs": 1932
+      },
+      "extract3": {
+        "occurrences": 19238,
+        "programs": 914
+      },
+      "extract_uint16": {
+        "occurrences": 10007,
+        "programs": 1240
+      },
+      "extract_uint32": {
+        "occurrences": 107,
+        "programs": 38
+      },
+      "extract_uint64": {
+        "occurrences": 8029,
+        "programs": 896
+      },
+      "falcon_verify": {
+        "occurrences": 9,
+        "programs": 9
+      },
+      "frame_bury": {
+        "occurrences": 12329,
+        "programs": 729
+      },
+      "frame_dig": {
+        "occurrences": 45759,
+        "programs": 1484
+      },
+      "gaids": {
+        "occurrences": 6,
+        "programs": 3
+      },
+      "getbit": {
+        "occurrences": 1845,
+        "programs": 489
+      },
+      "getbyte": {
+        "occurrences": 286,
+        "programs": 104
+      },
+      "gitxn": {
+        "occurrences": 70,
+        "programs": 41
+      },
+      "gitxna": {
+        "occurrences": 54,
+        "programs": 4
+      },
+      "gitxnas": {
+        "occurrences": 15,
+        "programs": 1
+      },
+      "gload": {
+        "occurrences": 256,
+        "programs": 53
+      },
+      "gloads": {
+        "occurrences": 50,
+        "programs": 5
+      },
+      "gloadss": {
+        "occurrences": 2,
+        "programs": 1
+      },
+      "global": {
+        "occurrences": 7274,
+        "programs": 1142
+      },
+      "gtxn": {
+        "occurrences": 720,
+        "programs": 138
+      },
+      "gtxns": {
+        "occurrences": 8161,
+        "programs": 1965
+      },
+      "gtxnsa": {
+        "occurrences": 365,
+        "programs": 142
+      },
+      "gtxnsas": {
+        "occurrences": 93,
+        "programs": 36
+      },
+      "intc": {
+        "occurrences": 13211,
+        "programs": 502
+      },
+      "intc_0": {
+        "occurrences": 82867,
+        "programs": 3280
+      },
+      "intc_1": {
+        "occurrences": 42494,
+        "programs": 3127
+      },
+      "intc_2": {
+        "occurrences": 24160,
+        "programs": 2479
+      },
+      "intc_3": {
+        "occurrences": 12939,
+        "programs": 1688
+      },
+      "intcblock": {
+        "occurrences": 3285,
+        "programs": 3285
+      },
+      "itob": {
+        "occurrences": 19748,
+        "programs": 2342
+      },
+      "itxn": {
+        "occurrences": 1704,
+        "programs": 441
+      },
+      "itxn_begin": {
+        "occurrences": 4422,
+        "programs": 912
+      },
+      "itxn_field": {
+        "occurrences": 29124,
+        "programs": 912
+      },
+      "itxn_next": {
+        "occurrences": 460,
+        "programs": 103
+      },
+      "itxn_submit": {
+        "occurrences": 4396,
+        "programs": 912
+      },
+      "itxna": {
+        "occurrences": 58,
+        "programs": 11
+      },
+      "itxnas": {
+        "occurrences": 38,
+        "programs": 15
+      },
+      "json_ref": {
+        "occurrences": 10,
+        "programs": 3
+      },
+      "keccak256": {
+        "occurrences": 321,
+        "programs": 146
+      },
+      "len": {
+        "occurrences": 38203,
+        "programs": 2795
+      },
+      "load": {
+        "occurrences": 4476,
+        "programs": 1563
+      },
+      "loads": {
+        "occurrences": 516,
+        "programs": 119
+      },
+      "log": {
+        "occurrences": 15786,
+        "programs": 3183
+      },
+      "match": {
+        "occurrences": 4494,
+        "programs": 3632
+      },
+      "mimc": {
+        "occurrences": 7,
+        "programs": 6
+      },
+      "min_balance": {
+        "occurrences": 21,
+        "programs": 12
+      },
+      "mulw": {
+        "occurrences": 316,
+        "programs": 57
+      },
+      "online_stake": {
+        "occurrences": 9,
+        "programs": 8
+      },
+      "pop": {
+        "occurrences": 7965,
+        "programs": 1375
+      },
+      "popn": {
+        "occurrences": 694,
+        "programs": 234
+      },
+      "poseidon2": {
+        "occurrences": 8,
+        "programs": 4
+      },
+      "proto": {
+        "occurrences": 7335,
+        "programs": 1557
+      },
+      "pushbytes": {
+        "occurrences": 25507,
+        "programs": 3508
+      },
+      "pushbytess": {
+        "occurrences": 2657,
+        "programs": 2432
+      },
+      "pushint": {
+        "occurrences": 32815,
+        "programs": 3348
+      },
+      "pushints": {
+        "occurrences": 327,
+        "programs": 125
+      },
+      "replace2": {
+        "occurrences": 4110,
+        "programs": 1739
+      },
+      "replace3": {
+        "occurrences": 1491,
+        "programs": 243
+      },
+      "retsub": {
+        "occurrences": 10239,
+        "programs": 1749
+      },
+      "return": {
+        "occurrences": 23203,
+        "programs": 3684
+      },
+      "select": {
+        "occurrences": 4551,
+        "programs": 706
+      },
+      "setbit": {
+        "occurrences": 2525,
+        "programs": 851
+      },
+      "setbyte": {
+        "occurrences": 58,
+        "programs": 4
+      },
+      "sha256": {
+        "occurrences": 2654,
+        "programs": 397
+      },
+      "sha3_256": {
+        "occurrences": 3,
+        "programs": 3
+      },
+      "sha512": {
+        "occurrences": 8,
+        "programs": 4
+      },
+      "sha512_256": {
+        "occurrences": 42,
+        "programs": 23
+      },
+      "shl": {
+        "occurrences": 128,
+        "programs": 51
+      },
+      "shr": {
+        "occurrences": 184,
+        "programs": 27
+      },
+      "sqrt": {
+        "occurrences": 22,
+        "programs": 16
+      },
+      "store": {
+        "occurrences": 7051,
+        "programs": 1586
+      },
+      "stores": {
+        "occurrences": 465,
+        "programs": 79
+      },
+      "substring": {
+        "occurrences": 197,
+        "programs": 78
+      },
+      "substring3": {
+        "occurrences": 3864,
+        "programs": 479
+      },
+      "swap": {
+        "occurrences": 56480,
+        "programs": 2930
+      },
+      "switch": {
+        "occurrences": 353,
+        "programs": 347
+      },
+      "txn": {
+        "occurrences": 36737,
+        "programs": 3667
+      },
+      "txna": {
+        "occurrences": 30864,
+        "programs": 3630
+      },
+      "txnas": {
+        "occurrences": 491,
+        "programs": 120
+      },
+      "uncover": {
+        "occurrences": 48294,
+        "programs": 2054
+      },
+      "voter_params_get": {
+        "occurrences": 11,
+        "programs": 6
+      },
+      "vrf_verify": {
+        "occurrences": 5,
+        "programs": 5
+      },
+      "|": {
+        "occurrences": 94,
+        "programs": 32
+      },
+      "||": {
+        "occurrences": 90,
+        "programs": 63
+      },
+      "~": {
+        "occurrences": 32,
+        "programs": 17
+      }
+    },
+    "never_seen": [
+      "arg",
+      "arg_0",
+      "arg_1",
+      "arg_2",
+      "arg_3",
+      "args",
+      "gaid",
+      "gtxna",
+      "gtxnas",
+      "sumhash512"
+    ],
+    "not_in_table": [],
+    "table_size": 198
+  },
+  "run": {
+    "algod_rust_commit": "8af88af31996caccf70ef8f4f7d6145f378ffed1",
+    "go_algorand_commit": "31186e99a69e74483ad95e9ce872903b74758abf",
+    "go_algorand_tag": "v5.0.5-stable",
+    "machine": "Linux 6.18.58.1-microsoft-standard-WSL2 x86_64"
+  },
+  "schema": "teal-corpus-stats/v1",
+  "stages": {
+    "disassemble": {
+      "compared": 3692,
+      "identical": 3691,
+      "identical_error": 1,
+      "identical_panic_mirrored": 0,
+      "mismatched": 0,
+      "panics": 0,
+      "timeouts": 0
+    },
+    "reassemble": {
+      "compared": 3691,
+      "identical": 3666,
+      "identical_error": 25,
+      "identical_panic_mirrored": 0,
+      "mismatched": 0,
+      "panics": 0,
+      "timeouts": 0
+    },
+    "source": {
+      "compared": 3687,
+      "identical": 3524,
+      "identical_error": 163,
+      "identical_panic_mirrored": 0,
+      "mismatched": 0,
+      "panics": 0,
+      "timeouts": 0
+    }
+  }
+}
