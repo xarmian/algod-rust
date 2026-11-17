@@ -25,12 +25,14 @@
 //! `disassemble`): one forward pass over the raw bytes that numbers labels in
 //! the order each branch target is first met, re-runs itself once when a
 //! backward jump names a label that was not yet known, and reports exactly
-//! go's error strings (issue #2367, epic #2364). [`pc_details`] renders the
-//! already-parsed program of a running machine instead.
+//! go's error strings (issue #2367, epic #2364). [`pc_details`] is a port of
+//! go's `pcDetails` and runs the same engine (go's `disassembleInstrumented`,
+//! [`disassemble_instrumented`] here), so the label numbering of a failed app
+//! call's `Details` text is the one of the disassembly (issue #2375).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use crate::bytecode::{self, Immediates, Instruction, Program};
+use crate::bytecode;
 use crate::fields;
 use crate::opcode::{self, ImmKind, Mode, OpSpec};
 
@@ -44,12 +46,21 @@ use crate::opcode::{self, ImmKind, Mode, OpSpec};
 /// `AssembleString(Disassemble(program))` produces the same bytecode for the
 /// programs the assembler can express.
 pub fn disassemble(program: &[u8]) -> Result<String, String> {
+    disassemble_instrumented(program).map(|(text, _)| text)
+}
+
+/// go's `disassembleInstrumented`: the text of [`disassemble`] and, for every
+/// instruction, `(pc, text offset)` -- go's `pcOffset`: the byte offset of the
+/// instruction (version prefix included) and where its line starts in the
+/// text, after the label line that precedes it. A program with an undecodable
+/// or unsupported version yields its single comment line and no offsets.
+fn disassemble_instrumented(program: &[u8]) -> Result<(String, Vec<(usize, usize)>), String> {
     let (version, vlen) = uvarint(program);
     if vlen <= 0 {
-        return Ok("// invalid version\n".to_string());
+        return Ok(("// invalid version\n".to_string(), Vec::new()));
     }
     if version > u64::from(opcode::MAX_AVM_VERSION) {
-        return Ok(format!("// unsupported version {version}\n"));
+        return Ok((format!("// unsupported version {version}\n"), Vec::new()));
     }
     let version = version as u8;
     let mut pass = disassemble_pass(program, version, vlen as usize, None)?;
@@ -73,8 +84,14 @@ pub fn disassemble(program: &[u8]) -> Result<String, String> {
     if crate::assembler::default_auto_salt_applies(version, pass.has_stateful_ops, program) {
         text.push_str("#pragma autosalt false\n");
     }
+    let header_len = text.len();
     text.push_str(&pass.body);
-    Ok(text)
+    let offsets = pass
+        .offsets
+        .into_iter()
+        .map(|(pc, off)| (pc, off + header_len))
+        .collect();
+    Ok((text, offsets))
 }
 
 /// go's `binary.Uvarint`: the value and the bytes read, `0` when `buf` ends
@@ -198,6 +215,8 @@ fn group_name(op: &str, imm_idx: usize, b: u8) -> Group {
 
 struct Pass {
     body: String,
+    /// go's `pcOffset` with offsets into `body` (no header yet).
+    offsets: Vec<(usize, usize)>,
     has_stateful_ops: bool,
     rerun: bool,
     pending: HashMap<i64, String>,
@@ -224,6 +243,7 @@ fn disassemble_pass(
         bytec: Vec::new(),
     };
     let mut body = String::new();
+    let mut offsets = Vec::new();
     let mut has_stateful_ops = false;
     // go resolves version 0 against the v1 opcode set.
     let ceiling = version.max(1);
@@ -269,6 +289,7 @@ fn disassemble_pass(
             let label = format!("label{}", d.label_count);
             d.put_label(label, d.pc as i64);
         }
+        offsets.push((d.pc, body.len()));
         let line = d.instruction(spec)?;
         body.push_str(&line);
         body.push('\n');
@@ -277,6 +298,7 @@ fn disassemble_pass(
     d.output_label_if_needed(&mut body);
     Ok(Pass {
         body,
+        offsets,
         has_stateful_ops,
         rerun: d.rerun,
         pending: d.pending,
@@ -562,384 +584,26 @@ fn parse_labels(program: &[u8], pos: usize) -> Result<(Vec<i64>, usize), String>
 }
 
 /// go's `pcDetails` (`data/transactions/logic/eval.go`): the disassembly of
-/// the instruction at byte offset `pc` (the version byte counts) and of up to
-/// two instructions before it, with newlines turned into `; `. This is the
-/// `opcodes=` of the `Details` go prints for a failed application call in
-/// simulate. Empty when `pc` is not the start of an instruction.
-pub fn pc_details(parsed: &Program, pc: usize) -> String {
-    let Ok((text, offsets)) = disassemble_parsed(parsed) else {
+/// the instruction at byte offset `pc` of the raw `program` (the version prefix
+/// counts) and of up to two instructions before it, newlines turned into `; `.
+/// This is the `opcodes=` of the `Details` go prints for a failed application
+/// call in simulate. Empty when `pc` is not the start of an instruction or the
+/// program does not disassemble.
+pub fn pc_details(program: &[u8], pc: usize) -> String {
+    const MAX_ADDITIONAL_OPCODES: usize = 2;
+    let Ok((text, offsets)) = disassemble_instrumented(program) else {
         return String::new();
     };
-    const MAX_ADDITIONAL_OPCODES: usize = 2;
-    for (i, (opc, _)) in offsets.iter().enumerate() {
-        if *opc != pc {
-            continue;
-        }
-        let start = i.saturating_sub(MAX_ADDITIONAL_OPCODES);
-        let start_text = offsets[start].1;
-        let end_text = offsets.get(i + 1).map_or(text.len(), |(_, off)| *off);
-        return text[start_text..end_text]
-            .trim_end_matches('\n')
-            .replace('\n', "; ");
-    }
-    String::new()
-}
-
-/// The disassembly of `parsed`, and for every instruction the pair `(byte
-/// offset with the version byte, offset of its text)` (go's `pcOffset`: after
-/// the label line that precedes it). Used by [`pc_details`] only; it renders a
-/// program that already parsed, so unlike [`disassemble`] it never meets a
-/// malformed one.
-fn disassemble_parsed(parsed: &Program) -> Result<(String, Vec<(usize, usize)>), String> {
-    let header = if parsed.version < 128 { 1 } else { 2 };
-    let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(parsed.instructions.len());
-
-    // Two-pass disassembly:
-    // Pass 1: identify branch targets and assign labels
-    // Pass 2: emit TEAL text
-
-    let labels = collect_labels(parsed);
-    let intc = collect_intc_block(parsed);
-    let bytec = collect_bytec_block(parsed);
-
-    let mut out = String::new();
-    out.push_str(&format!("#pragma version {}\n", parsed.version));
-    for instr in &parsed.instructions {
-        // Emit label if this offset is a branch target
-        if let Some(label) = labels.get(&instr.offset) {
-            out.push_str(&format!("{}:\n", label));
-        }
-
-        let spec = opcode::resolve_spec(instr.opcode, instr.sub_opcode);
-        let name = spec.map(|s| s.name).unwrap_or("???");
-
-        let mut line = name.to_string();
-
-        match &instr.immediates {
-            Immediates::None => {
-                // intc_N and bytec_N comments
-                if name.starts_with("intc_") {
-                    let idx = (name.as_bytes()[name.len() - 1] - b'0') as usize;
-                    if idx < intc.len() {
-                        line.push_str(&format!(" // {}", intc[idx]));
-                    }
-                } else if name.starts_with("bytec_") {
-                    let idx = (name.as_bytes()[name.len() - 1] - b'0') as usize;
-                    if idx < bytec.len() {
-                        line.push_str(&format!(" // {}", guess_byte_format(&bytec[idx])));
-                    }
-                }
-            }
-            Immediates::Uint8(b) => {
-                // Try field name resolution
-                if let Some(field_name) = fields::field_name_for_opcode(name, 0, *b) {
-                    line.push_str(&format!(" {}", field_name));
-                } else if name == "frame_dig" || name == "frame_bury" {
-                    // int8 immediate
-                    line.push_str(&format!(" {}", *b as i8));
-                } else if fields::opcode_immediate_is_field(name, 0) {
-                    // This position resolves through a named field group,
-                    // but the byte doesn't name any known field -- matches
-                    // go-algorand's `Disassemble` ("invalid immediate %s
-                    // for %s", assembler.go) instead of silently printing
-                    // the raw byte.
-                    return Err(format!("invalid immediate f for {}", name));
-                } else {
-                    line.push_str(&format!(" {}", b));
-                }
-                // intc/bytec comments
-                if name == "intc" && (*b as usize) < intc.len() {
-                    line.push_str(&format!(" // {}", intc[*b as usize]));
-                }
-                if name == "bytec" && (*b as usize) < bytec.len() {
-                    line.push_str(&format!(" // {}", guess_byte_format(&bytec[*b as usize])));
-                }
-            }
-            Immediates::Uint8Pair(a, b) => {
-                // First immediate
-                if let Some(field_name) = fields::field_name_for_opcode(name, 0, *a) {
-                    line.push_str(&format!(" {}", field_name));
-                } else if fields::opcode_immediate_is_field(name, 0) {
-                    return Err(format!("invalid immediate f for {}", name));
-                } else {
-                    line.push_str(&format!(" {}", a));
-                }
-                // Second immediate
-                if let Some(field_name) = fields::field_name_for_opcode(name, 1, *b) {
-                    line.push_str(&format!(" {}", field_name));
-                } else if fields::opcode_immediate_is_field(name, 1) {
-                    return Err(format!("invalid immediate f for {}", name));
-                } else {
-                    line.push_str(&format!(" {}", b));
-                }
-            }
-            Immediates::Uint8Triple(a, b, c) => {
-                // First immediate
-                if let Some(field_name) = fields::field_name_for_opcode(name, 0, *a) {
-                    line.push_str(&format!(" {}", field_name));
-                } else if fields::opcode_immediate_is_field(name, 0) {
-                    return Err(format!("invalid immediate f for {}", name));
-                } else {
-                    line.push_str(&format!(" {}", a));
-                }
-                // Second immediate
-                if let Some(field_name) = fields::field_name_for_opcode(name, 1, *b) {
-                    line.push_str(&format!(" {}", field_name));
-                } else if fields::opcode_immediate_is_field(name, 1) {
-                    return Err(format!("invalid immediate f for {}", name));
-                } else {
-                    line.push_str(&format!(" {}", b));
-                }
-                // Third immediate
-                line.push_str(&format!(" {}", c));
-            }
-            Immediates::Int16(_offset) => {
-                // Branch instruction — use label
-                let target = compute_branch_target(instr);
-                if let Some(label) = labels.get(&target) {
-                    line.push_str(&format!(" {}", label));
-                } else {
-                    // Fallback: use raw target
-                    line.push_str(&format!(" {}", target));
-                }
-            }
-            Immediates::BranchVarint(offset, varint_len) => {
-                // bnz/bz/b/callsub at LogicSigVersion >= 13 — use label.
-                let target = bytecode::varint_branch_target(instr.offset, *varint_len, *offset);
-                let target = if target >= 0 { target as usize } else { 0 };
-                if let Some(label) = labels.get(&target) {
-                    line.push_str(&format!(" {}", label));
-                } else {
-                    line.push_str(&format!(" {}", target));
-                }
-            }
-            Immediates::Varuint(val) => {
-                line.push_str(&format!(" {}", val));
-            }
-            Immediates::Bytes(bytes) => {
-                let hex_str = bytes_to_hex(bytes);
-                let fmt = guess_byte_format(bytes);
-                line.push_str(&format!(" 0x{} // {}", hex_str, fmt));
-            }
-            Immediates::IntBlock(vals) => {
-                for v in vals {
-                    line.push(' ');
-                    line.push_str(&format!("{}", v));
-                }
-            }
-            Immediates::ByteBlock(entries) => {
-                for bv in entries {
-                    line.push(' ');
-                    line.push_str(&format!("0x{}", bytes_to_hex(bv)));
-                }
-            }
-            Immediates::PushInts(vals) => {
-                for v in vals {
-                    line.push_str(&format!(" {}", v));
-                }
-            }
-            Immediates::PushBytess(entries) => {
-                for bv in entries {
-                    line.push_str(&format!(" 0x{}", bytes_to_hex(bv)));
-                }
-            }
-            Immediates::Labels(offsets) => {
-                // switch/match — resolve each offset to a label
-                let end_of_instr = compute_labels_end(instr, offsets.len());
-                for offset in offsets {
-                    let target = (end_of_instr as isize + *offset as isize) as usize;
-                    if let Some(label) = labels.get(&target) {
-                        line.push_str(&format!(" {}", label));
-                    } else {
-                        line.push_str(&format!(" {}", target));
-                    }
-                }
-            }
-        }
-
-        offsets.push((header + instr.offset, out.len()));
-        out.push_str(&line);
-        out.push('\n');
-    }
-
-    // Emit any trailing label
-    let end_offset = parsed
-        .instructions
-        .last()
-        .map(|i| i.offset + instruction_size(i))
-        .unwrap_or(0);
-    if let Some(label) = labels.get(&end_offset) {
-        out.push_str(&format!("{}:\n", label));
-    }
-
-    Ok((out, offsets))
-}
-
-/// Compute the branch target (offset within the code section) for a branch instruction.
-fn compute_branch_target(instr: &Instruction) -> usize {
-    if let Immediates::Int16(offset) = instr.immediates {
-        // Target = end of this instruction + offset
-        // Instruction is: opcode (1 byte) + offset (2 bytes) = 3 bytes from instr.offset
-        let end_of_instr = instr.offset + 3;
-        (end_of_instr as isize + offset as isize) as usize
-    } else {
-        0
-    }
-}
-
-/// Compute the end offset for a Labels (switch/match) instruction.
-fn compute_labels_end(instr: &Instruction, count: usize) -> usize {
-    // Layout: opcode (1) + count (1) + count*2 bytes of offsets
-    instr.offset + 1 + 1 + count * 2
-}
-
-/// Compute the total size (in bytes) of an instruction including its immediates.
-///
-/// Only used for the program's final trailing-label offset (line ~194);
-/// mid-program instruction boundaries come from `Instruction::offset`
-/// itself, not from summing sizes.
-fn instruction_size(instr: &Instruction) -> usize {
-    // Header is 2 bytes (prefix + sub-opcode) for a multi-byte "prefix
-    // opcode" instruction (e.g. the `app_box_*` family at 0xd4), 1 byte
-    // otherwise -- must match `header_len` in `opcode::resolve`/
-    // `bytecode::parse`. Every match arm below assumes a 1-byte header, so
-    // add the extra byte up front rather than in each arm.
-    let header_extra = if instr.sub_opcode.is_some() { 1 } else { 0 };
-    header_extra
-        + match &instr.immediates {
-            Immediates::None => 1,
-            Immediates::Uint8(_) => 2,
-            Immediates::Uint8Pair(_, _) => 2 + 1,
-            Immediates::Uint8Triple(_, _, _) => 4,
-            Immediates::Int16(_) => 3,
-            Immediates::Varuint(v) => 1 + varuint_size(*v),
-            Immediates::Bytes(b) => 1 + varuint_size(b.len() as u64) + b.len(),
-            Immediates::IntBlock(vals) => {
-                1 + varuint_size(vals.len() as u64)
-                    + vals.iter().map(|v| varuint_size(*v)).sum::<usize>()
-            }
-            Immediates::ByteBlock(entries) => {
-                1 + varuint_size(entries.len() as u64)
-                    + entries
-                        .iter()
-                        .map(|b| varuint_size(b.len() as u64) + b.len())
-                        .sum::<usize>()
-            }
-            Immediates::PushInts(vals) => {
-                1 + varuint_size(vals.len() as u64)
-                    + vals.iter().map(|v| varuint_size(*v)).sum::<usize>()
-            }
-            Immediates::PushBytess(entries) => {
-                1 + varuint_size(entries.len() as u64)
-                    + entries
-                        .iter()
-                        .map(|b| varuint_size(b.len() as u64) + b.len())
-                        .sum::<usize>()
-            }
-            Immediates::Labels(offsets) => 1 + 1 + offsets.len() * 2,
-            Immediates::BranchVarint(_, len) => 1 + len,
-        }
-}
-
-fn varuint_size(mut v: u64) -> usize {
-    let mut size = 0;
-    loop {
-        size += 1;
-        v >>= 7;
-        if v == 0 {
-            break;
-        }
-    }
-    size
-}
-
-/// Collect all branch targets from the program and assign label names.
-fn collect_labels(program: &Program) -> HashMap<usize, String> {
-    let mut targets: Vec<usize> = Vec::new();
-    let mut seen: HashSet<usize> = HashSet::new();
-
-    for instr in &program.instructions {
-        match &instr.immediates {
-            Immediates::Int16(offset) => {
-                let target = compute_branch_target(instr);
-                if seen.insert(target) {
-                    targets.push(target);
-                }
-                let _ = offset;
-            }
-            Immediates::Labels(offsets) => {
-                let end_of_instr = compute_labels_end(instr, offsets.len());
-                for offset in offsets {
-                    let target = (end_of_instr as isize + *offset as isize) as usize;
-                    if seen.insert(target) {
-                        targets.push(target);
-                    }
-                }
-            }
-            Immediates::BranchVarint(offset, varint_len) => {
-                let target = bytecode::varint_branch_target(instr.offset, *varint_len, *offset);
-                if target >= 0 {
-                    let target = target as usize;
-                    if seen.insert(target) {
-                        targets.push(target);
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        // A `proto` marks a subroutine entry point. go-algorand's
-        // disassembler always synthesizes a label immediately before a
-        // `proto` that isn't already a recorded branch target (e.g. a
-        // subroutine reached only by `b`, skipping over it, rather than by
-        // `callsub`) — see assembler.go's `disassembleInstrumented`, fixed by
-        // go-algorand PR #6594. Without this, a dead subroutine's `proto`
-        // would disassemble with no preceding label, which go-algorand's
-        // stricter assembler (a `typeProto` "unreachable from previous PC"
-        // check that algod-rust does not yet implement) rejects on
-        // reassembly. Mirror the label regardless, so disassembly text
-        // matches go-algorand's and a future stricter check doesn't
-        // reintroduce this exact bug.
-        if opcode::lookup(instr.opcode).map(|s| s.name) == Some("proto")
-            && seen.insert(instr.offset)
-        {
-            targets.push(instr.offset);
-        }
-    }
-
-    // Sort targets and assign label names
-    targets.sort();
-    let mut labels = HashMap::new();
-    for (i, &target) in targets.iter().enumerate() {
-        labels.insert(target, format!("label{}", i + 1));
-    }
-    labels
-}
-
-/// Extract the intcblock values from the program (if present).
-fn collect_intc_block(program: &Program) -> Vec<u64> {
-    for instr in &program.instructions {
-        if instr.opcode == 0x20 {
-            // intcblock
-            if let Immediates::IntBlock(vals) = &instr.immediates {
-                return vals.clone();
-            }
-        }
-    }
-    Vec::new()
-}
-
-/// Extract the bytecblock values from the program (if present).
-fn collect_bytec_block(program: &Program) -> Vec<Vec<u8>> {
-    for instr in &program.instructions {
-        if instr.opcode == 0x26 {
-            // bytecblock
-            if let Immediates::ByteBlock(entries) = &instr.immediates {
-                return entries.clone();
-            }
-        }
-    }
-    Vec::new()
+    let Some(i) = offsets.iter().position(|(opc, _)| *opc == pc) else {
+        return String::new();
+    };
+    let start = offsets[i.saturating_sub(MAX_ADDITIONAL_OPCODES)].1;
+    let end = offsets.get(i + 1).map_or(text.len(), |(_, off)| *off);
+    let window = &text[start..end];
+    window
+        .strip_suffix('\n')
+        .unwrap_or(window)
+        .replace('\n', "; ")
 }
 
 /// Format a byte slice for display, matching go-algorand's `guessByteFormat`.

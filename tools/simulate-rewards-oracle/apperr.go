@@ -143,6 +143,97 @@ ident: retsub`},
 	{"txn_logs_index", `txna Logs 0; pop; int 1`},
 	{"arg_gate_box_create_wrong_type", `int 5; callsub ident; int 10; box_create; pop; int 1; return
 ident: retsub`},
+	// Failure Details (`opcodes=`) text of go's pcDetails, which numbers labels
+	// in the order each branch target is first met, not by address (#2375).
+	// The first branch names the higher-addressed target label1.
+	{"pcdetails_labels_out_of_order_assert", `int 1
+bnz first
+err
+second:
+int 5
+int 0
+assert
+first:
+int 1
+bnz second
+int 1`},
+	// The failing opcode directly follows a label: the label line is part of the
+	// window.
+	{"pcdetails_labels_out_of_order_err_at_label", `int 1
+bnz first
+err
+second:
+err
+first:
+int 1
+bnz second
+int 1`},
+	// A loop (back-jump rewinds the disassembly once) with a forward label
+	// met before it.
+	{"pcdetails_back_jump_loop", `int 1
+bnz start
+done:
+int 0
+assert
+int 1
+return
+start:
+int 2
+loop:
+int 1
+-
+dup
+bnz loop
+pop
+b done`},
+	// callsub targets and a proto entry point that no callsub names.
+	{"pcdetails_proto_callsub_labels", `b main
+unused:
+proto 0 0
+retsub
+main:
+int 3
+callsub add_one
+callsub fail_sub
+int 1
+return
+add_one:
+proto 1 1
+frame_dig -1
+int 1
++
+retsub
+fail_sub:
+proto 1 0
+frame_dig -1
+int 0
+assert
+retsub`},
+	{"pcdetails_switch_labels_descending", `int 2
+switch c0 c1 c2
+err
+c0:
+int 1
+return
+c1:
+int 1
+return
+c2:
+int 0
+assert
+int 1`},
+	{"pcdetails_match_labels", `byte "b"
+byte "a"
+byte "b"
+match m_a m_b
+err
+m_b:
+int 1
+return
+m_a:
+int 0
+assert
+int 1`},
 }
 
 // appErrGroups: atomic groups of application creation calls (app ids 1001,

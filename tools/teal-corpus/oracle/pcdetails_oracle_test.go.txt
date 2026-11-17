@@ -1,0 +1,93 @@
+// Copyright (C) 2019-2026 Algorand Foundation Ltd.
+// Modifications Copyright (C) 2026 Algod DAO
+// This file is part of algod-rust, a modified work based on go-algorand
+// (https://github.com/algorand/go-algorand).
+//
+// algod-rust is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// algod-rust is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with algod-rust.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// This file is NOT part of the tools/teal-corpus module: it is a template that
+// scripts/teal-corpus/pcdetails_fixtures.py copies, as
+// zz_pcdetails_oracle_test.go, into the pinned go-algorand checkout's
+// data/transactions/logic package (pcDetails is unexported) and runs there.
+// Issue #2375, epic #2364.
+//
+// For every {"name","program_hex"} row of $PCDETAILS_IN it calls go's real
+// `(*EvalContext).pcDetails` once for every pc in 0..=len(program)+1 and writes
+// {"name","program_hex","details":[...],"text":...} to $PCDETAILS_OUT,
+// `details[pc]` being the text pcDetails returns when the evaluator stopped at
+// byte offset pc and `text` go's Disassemble of the program ("" on error).
+
+package logic
+
+import (
+	"bufio"
+	"encoding/hex"
+	"encoding/json"
+	"os"
+	"testing"
+)
+
+func TestPcDetailsOracle(t *testing.T) {
+	in, err := os.Open(os.Getenv("PCDETAILS_IN"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	out, err := os.Create(os.Getenv("PCDETAILS_OUT"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+
+	type row struct {
+		Name       string   `json:"name"`
+		ProgramHex string   `json:"program_hex"`
+		Details    []string `json:"details"`
+		Text       string   `json:"text"`
+	}
+	sc := bufio.NewScanner(in)
+	sc.Buffer(make([]byte, 1<<20), 1<<26)
+	for sc.Scan() {
+		var r row
+		if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
+			t.Fatal(err)
+		}
+		program, err := hex.DecodeString(r.ProgramHex)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Text, _ = Disassemble(program)
+		r.Details = make([]string, 0, len(program)+2)
+		for pc := 0; pc <= len(program)+1; pc++ {
+			cx := EvalContext{}
+			cx.program = program
+			cx.pc = pc
+			gotPC, det := cx.pcDetails()
+			if gotPC != pc {
+				t.Fatalf("%s: pcDetails returned pc %d for %d", r.Name, gotPC, pc)
+			}
+			r.Details = append(r.Details, det)
+		}
+		line, err := json.Marshal(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out.Write(append(line, '\n'))
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatal(err)
+	}
+}

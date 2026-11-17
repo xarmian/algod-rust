@@ -541,6 +541,60 @@
       ]
     },
     {
+      "name": "pcdetails_labels_out_of_order_assert",
+      "source": "#pragma version 10\nint 1\nbnz first\nerr\nsecond:\nint 5\nint 0\nassert\nfirst:\nint 1\nbnz second\nint 1",
+      "group_msgpack": "gaN0eG6KpGFwYXDEEwogAQEiQAAGAIEFgQBEIkD/9yKkYXBzdcQDCoEBo2ZlZc0D6KJmdgGjZ2VuvXNpbXVsYXRlLWFwcC1lcnJvcnMtb3JhY2xlLXYxomdoxCAg+LECkPXMoG4ScUdpp6C0LB5qPHgc0gTat0rWfMMwa6Jsds0D6KRub3RlxCRwY2RldGFpbHNfbGFiZWxzX291dF9vZl9vcmRlcl9hc3NlcnSjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGw=",
+      "failure_message": "transaction 76FCKN2ZBPKPQE4YFMT4LQQI5AOFGG6IXYHKUULC2PGU7IVZTNAA: logic eval error: assert failed pc=13. Details: app=1001, pc=13, opcodes=pushint 5; pushint 0; assert; label1:",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "pcdetails_labels_out_of_order_err_at_label",
+      "source": "#pragma version 10\nint 1\nbnz first\nerr\nsecond:\nerr\nfirst:\nint 1\nbnz second\nint 1",
+      "group_msgpack": "gaN0eG6KpGFwYXDEDwogAQEiQAACAAAiQP/7IqRhcHN1xAMKgQGjZmVlzQPoomZ2AaNnZW69c2ltdWxhdGUtYXBwLWVycm9ycy1vcmFjbGUtdjGiZ2jEICD4sQKQ9cygbhJxR2mnoLQsHmo8eBzSBNq3StZ8wzBromx2zQPopG5vdGXEKnBjZGV0YWlsc19sYWJlbHNfb3V0X29mX29yZGVyX2Vycl9hdF9sYWJlbKNzbmTEIAoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKpHR5cGWkYXBwbA==",
+      "failure_message": "transaction OM6EYIRDFAFBAIPPA7DTRZ6NNH43QPH5XSYRDHAKPAFLGLLZY7IQ: logic eval error: err opcode executed. Details: app=1001, pc=9, opcodes=bnz label1; err; label2:; err; label1:",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "pcdetails_back_jump_loop",
+      "source": "#pragma version 10\nint 1\nbnz start\ndone:\nint 0\nassert\nint 1\nreturn\nstart:\nint 2\nloop:\nint 1\n-\ndup\nbnz loop\npop\nb done",
+      "group_msgpack": "gaN0eG6KpGFwYXDEGQogAQEiQAAFgQBEIkOBAiIJSUD/+khC/++kYXBzdcQDCoEBo2ZlZc0D6KJmdgGjZ2VuvXNpbXVsYXRlLWFwcC1lcnJvcnMtb3JhY2xlLXYxomdoxCAg+LECkPXMoG4ScUdpp6C0LB5qPHgc0gTat0rWfMMwa6Jsds0D6KRub3RlxBhwY2RldGFpbHNfYmFja19qdW1wX2xvb3Cjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGw=",
+      "failure_message": "transaction 24CTMRZUYO4LLYPHREQQF35CXOKY7AE6VDLN4R4OSMVZICCY6SFQ: logic eval error: assert failed pc=10. Details: app=1001, pc=10, opcodes=bnz label1; label3:; pushint 0; assert",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "pcdetails_proto_callsub_labels",
+      "source": "#pragma version 10\nb main\nunused:\nproto 0 0\nretsub\nmain:\nint 3\ncallsub add_one\ncallsub fail_sub\nint 1\nreturn\nadd_one:\nproto 1 1\nframe_dig -1\nint 1\n+\nretsub\nfail_sub:\nproto 1 0\nframe_dig -1\nint 0\nassert\nretsub",
+      "group_msgpack": "gaN0eG6KpGFwYXDEJgogAQFCAASKAACJgQOIAAWIAAoiQ4oBAYv/IgiJigEAi/+BAESJpGFwc3XEAwqBAaNmZWXNA+iiZnYBo2dlbr1zaW11bGF0ZS1hcHAtZXJyb3JzLW9yYWNsZS12MaJnaMQgIPixApD1zKBuEnFHaaegtCweajx4HNIE2rdK1nzDMGuibHbNA+ikbm90ZcQecGNkZXRhaWxzX3Byb3RvX2NhbGxzdWJfbGFiZWxzo3NuZMQgCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgqkdHlwZaRhcHBs",
+      "failure_message": "transaction UA5XLMI4ASJSE7UK272OV33X2G6Z2AEGYAOL433TNP43FJYNLAQA: logic eval error: assert failed pc=36. Details: app=1001, pc=36, opcodes=frame_dig -1; pushint 0; assert",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "pcdetails_switch_labels_descending",
+      "source": "#pragma version 10\nint 2\nswitch c0 c1 c2\nerr\nc0:\nint 1\nreturn\nc1:\nint 1\nreturn\nc2:\nint 0\nassert\nint 1",
+      "group_msgpack": "gaN0eG6KpGFwYXDEFwogAQGBAo0DAAEAAwAFACJDIkOBAEQipGFwc3XEAwqBAaNmZWXNA+iiZnYBo2dlbr1zaW11bGF0ZS1hcHAtZXJyb3JzLW9yYWNsZS12MaJnaMQgIPixApD1zKBuEnFHaaegtCweajx4HNIE2rdK1nzDMGuibHbNA+ikbm90ZcQicGNkZXRhaWxzX3N3aXRjaF9sYWJlbHNfZGVzY2VuZGluZ6NzbmTEIAoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKpHR5cGWkYXBwbA==",
+      "failure_message": "transaction C36GPZ3N2K3RSKT5I6U4R6VGY252FPJICSH3DOSIFDLSK7KYCMNQ: logic eval error: assert failed pc=21. Details: app=1001, pc=21, opcodes=return; label3:; pushint 0; assert",
+      "failed_at": [
+        0
+      ]
+    },
+    {
+      "name": "pcdetails_match_labels",
+      "source": "#pragma version 10\nbyte \"b\"\nbyte \"a\"\nbyte \"b\"\nmatch m_a m_b\nerr\nm_b:\nint 1\nreturn\nm_a:\nint 0\nassert\nint 1",
+      "group_msgpack": "gaN0eG6KpGFwYXDEGgogAQEmAQFiKIABYSiOAgADAAEAIkOBAEQipGFwc3XEAwqBAaNmZWXNA+iiZnYBo2dlbr1zaW11bGF0ZS1hcHAtZXJyb3JzLW9yYWNsZS12MaJnaMQgIPixApD1zKBuEnFHaaegtCweajx4HNIE2rdK1nzDMGuibHbNA+ikbm90ZcQWcGNkZXRhaWxzX21hdGNoX2xhYmVsc6NzbmTEIAoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKpHR5cGWkYXBwbA==",
+      "failure_message": "transaction 62O3JW4Z7RIH3V7QYYVV7AOSJT3OHQA2JNIQP654BGS5V53C4D3A: logic eval error: assert failed pc=24. Details: app=1001, pc=24, opcodes=return; label1:; pushint 0; assert",
+      "failed_at": [
+        0
+      ]
+    },
+    {
       "name": "gaid_ahead_of_current",
       "source": "#pragma version 10\ngaid 1; pop; int 1\n---\n#pragma version 10\nint 1",
       "group_msgpack": "gaN0eG6LpGFwYXDEBgo8AUiBAaRhcHN1xAMKgQGjZmVlzQPoomZ2AaNnZW69c2ltdWxhdGUtYXBwLWVycm9ycy1vcmFjbGUtdjGiZ2jEICD4sQKQ9cygbhJxR2mnoLQsHmo8eBzSBNq3StZ8wzBro2dycMQgAp5/w2zCxO+N6xuVwBZVRDS6L6ZaM+ZMxlofq84qbdGibHbNA+ikbm90ZcQXZ2FpZF9haGVhZF9vZl9jdXJyZW50LTCjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGyBo3R4boukYXBhcMQDCoEBpGFwc3XEAwqBAaNmZWXNA+iiZnYBo2dlbr1zaW11bGF0ZS1hcHAtZXJyb3JzLW9yYWNsZS12MaJnaMQgIPixApD1zKBuEnFHaaegtCweajx4HNIE2rdK1nzDMGujZ3JwxCACnn/DbMLE743rG5XAFlVENLovploz5kzGWh+rzipt0aJsds0D6KRub3RlxBdnYWlkX2FoZWFkX29mX2N1cnJlbnQtMaNzbmTEIAoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKpHR5cGWkYXBwbA==",

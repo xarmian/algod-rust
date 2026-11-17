@@ -213,6 +213,7 @@ fn attach_eval_error_details(
 /// a `Clone`-friendly carrier rather than the `AlgoError` itself.
 fn app_call_error_detail(
     err: AlgoError,
+    program: &[u8],
     machine: &AvmMachine,
     group_index: usize,
     app_index: u64,
@@ -224,8 +225,7 @@ fn app_call_error_detail(
         .expect("attach_eval_error_details always produces AlgoError::AvmLogicSig");
     // go's simulate prints the opcodes around the failing pc (`pcDetails`) in
     // an app call's failure details.
-    detail.opcodes =
-        Some(crate::disassembler::pc_details(&machine.program, detail.pc).into_boxed_str());
+    detail.opcodes = Some(crate::disassembler::pc_details(program, detail.pc).into_boxed_str());
     (message, detail)
 }
 
@@ -329,7 +329,7 @@ pub fn run_approval_program(
             // (issue #1135).
             let app_index = ctx.current_app_id();
             let (message, detail) =
-                app_call_error_detail(e, &machine, ctx.group_index(), app_index);
+                app_call_error_detail(e, program, &machine, ctx.group_index(), app_index);
 
             // Preserve whatever global/local state, logs, and inner
             // transactions accumulated before the failing opcode, matching
@@ -453,7 +453,8 @@ pub fn run_clear_state_program(
             // by this EvalDelta-suppression rule -- see the `scratch` field
             // doc.
             let app_index = ctx.current_app_id();
-            let (msg, detail) = app_call_error_detail(e, &machine, ctx.group_index(), app_index);
+            let (msg, detail) =
+                app_call_error_detail(e, program, &machine, ctx.group_index(), app_index);
             let mut result = AvmResult::empty();
             result.coverage = machine.opcode_coverage();
             result.scratch = scratch_snapshot(&machine.scratch);
@@ -671,7 +672,8 @@ pub fn run_approval_program_with_tracer(
             // Attach structured diagnostics before consuming `e` -- see the
             // matching comment in the non-tracer variant above.
             let app_index = ctx.current_app_id();
-            let (msg, detail) = app_call_error_detail(e, &machine, ctx.group_index(), app_index);
+            let (msg, detail) =
+                app_call_error_detail(e, program, &machine, ctx.group_index(), app_index);
             tracer.after_program(ProgramType::Approval, false, Some(&msg));
             tracer.record_program_cost(ProgramType::Approval, machine.cost);
 
@@ -773,7 +775,8 @@ pub fn run_clear_state_program_with_tracer(
         }
         Err(e) => {
             let app_index = ctx.current_app_id();
-            let (msg, detail) = app_call_error_detail(e, &machine, ctx.group_index(), app_index);
+            let (msg, detail) =
+                app_call_error_detail(e, program, &machine, ctx.group_index(), app_index);
             tracer.after_program(ProgramType::ClearState, false, Some(&msg));
             tracer.record_program_cost(ProgramType::ClearState, machine.cost);
             // Does NOT preserve partial state on error — see the matching
