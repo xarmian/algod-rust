@@ -216,7 +216,10 @@ impl Labels {
     }
 
     fn insert(&mut self, target: i64, n: u32) {
-        match usize::try_from(target).ok().and_then(|t| self.near.get_mut(t)) {
+        match usize::try_from(target)
+            .ok()
+            .and_then(|t| self.near.get_mut(t))
+        {
             Some(slot) => *slot = n,
             None => {
                 self.far.insert(target, n);

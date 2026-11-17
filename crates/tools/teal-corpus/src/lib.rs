@@ -367,7 +367,8 @@ where
             while let Some(i) = next {
                 worker_slot.lock().current = Some((i, Instant::now()));
                 let input = &shared.inputs[i];
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (shared.f)(input)));
+                let r =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (shared.f)(input)));
                 {
                     let mut st = worker_slot.lock();
                     // The supervisor gave up on this input (timeout): exit.
