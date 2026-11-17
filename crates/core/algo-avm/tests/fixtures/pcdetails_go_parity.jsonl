@@ -1,0 +1,138 @@
+{"class": "label-order", "details": ["", "bz label1", "", "", "bz label1; err", "bz label1; err; err", "err; err; err; label1:", "err; err; label1:; return", "", ""], "name": "label_single_forward", "program_hex": "0841000300000043"}
+{"class": "label-order", "details": ["", "switch label1 label2 label3; label3:", "", "", "", "", "", "", "", "switch label1 label2 label3; label3:; err; label2:", "switch label1 label2 label3; label3:; err; label2:; err; label1:", "err; label2:; err; label1:; err", "", ""], "name": "label_switch_descending", "program_hex": "088d03000200010000000000"}
+{"class": "label-order", "details": ["", "b label1", "", "", "b label1; b label1; label1:", "", "", "b label1; b label1; label1:; err", "b label1; label1:; err; err", "err; err; err", "err; err; err", "", ""], "name": "label_two_branches_reversed", "program_hex": "0842000342000000000000"}
+{"class": "label-order", "details": ["", "match label1 label1", "", "", "", "", "", "match label1 label1; err", "match label1 label1; err; err; label1:", "err; err; label1:; return", "", ""], "name": "label_match_duplicate_targets", "program_hex": "088e0200020002000043"}
+{"class": "label-order", "details": ["", "intc_0", "intc_0; bz label1", "", "", "intc_0; bz label1; return", "", ""], "name": "label_backward_loop", "program_hex": "082241fffc43"}
+{"class": "label-order", "details": ["", "pushint 1", "", "pushint 1; b label1", "", "", "pushint 1; b label1; pushint 2", "", "b label1; pushint 2; return", "", ""], "name": "label_into_instruction", "program_hex": "088101420001810243"}
+{"class": "label-order", "details": ["", "b label1; label1:", "", "", "", ""], "name": "label_trailing", "program_hex": "08420000"}
+{"class": "label-order", "details": ["", "b label1", "", "", "b label1; return", "", ""], "name": "label_negative_target", "program_hex": "0842ff0043"}
+{"class": "label-order", "details": ["", "intc_0", "intc_0; bnz label1", "", "", "intc_0; bnz label1; b label2; label1:", "", "", "bnz label1; b label2; label1:; return", "b label2; label1:; return; b label3", "", "", "return; b label3; return", "", ""], "name": "label_mixed_repeat", "program_hex": "08224000034200034342fff843"}
+{"class": "label-order", "details": ["", "b label1; label2:", "", "", "b label1; label2:; proto 1 1; label1:", "", "", "b label1; label2:; proto 1 1; label1:; retsub", "proto 1 1; label1:; retsub; return", "", ""], "name": "label_proto_unreferenced", "program_hex": "084200038a01018943"}
+{"class": "label-order", "details": ["", "b label1; label2:", "", "", "b label1; label2:; proto 0 0", "", "", "b label1; label2:; proto 0 0; retsub", "proto 0 0; retsub; b label3; label4:", "", "", "retsub; b label3; label4:; proto 1 1; label3:", "", "", "b label3; label4:; proto 1 1; label3:; retsub", "proto 1 1; label3:; retsub; return", "", ""], "name": "label_proto_interleaved", "program_hex": "084200068a0000894200038a01018943"}
+{"class": "label-order", "details": ["", "b label1", "", "b label1; err; label1:", "b label1; err; label1:; return", "", ""], "name": "label_varint_forward", "program_hex": "0d42020043"}
+{"class": "label-order", "details": ["", "intc_0", "intc_0; b label1", "", "intc_0; b label1; return", "", ""], "name": "label_varint_backward", "program_hex": "0d22420143"}
+{"class": "label-order", "details": ["", "b label1", "", "b label1; b label1; label1:", "", "b label1; b label1; label1:; err", "b label1; label1:; err; return", "", ""], "name": "label_varint_two_labels_reversed", "program_hex": "0d420442000043"}
+{"class": "label-order", "details": ["", "b label1", "", "", "b label1; err; label1:", "b label1; err; label1:; err", "err; label1:; err; return", "", ""], "name": "label_varint_padded_offset", "program_hex": "0d428200000043"}
+{"class": "label-order", "details": ["", "callsub label1", "", "callsub label1; return; label1:", "callsub label1; return; label1:; proto 0 0", "", "", "return; label1:; proto 0 0; retsub", "", ""], "name": "label_callsub_varint", "program_hex": "0d8802438a000089"}
+{"class": "label-order", "details": ["", "switch label1 label2; label2:", "", "", "", "", "", "switch label1 label2; label2:; err; label1:", "switch label1 label2; label2:; err; label1:; return", "", ""], "name": "label_switch_v13", "program_hex": "0d8d02000100000043"}
+{"class": "label-order", "details": ["", "bnz label1", "", "bnz label1; err; label1:", "bnz label1; err; label1:; return", "", ""], "name": "label_v14_forward", "program_hex": "0e40020043"}
+{"class": "version", "details": ["", "", "", ""], "name": "version_unsupported_15", "program_hex": "0f43"}
+{"class": "version", "details": ["", "", "", "", ""], "name": "version_unsupported_255", "program_hex": "ff0143"}
+{"class": "version", "details": ["", "", "", "", ""], "name": "version_unsupported_varuint", "program_hex": "810143"}
+{"class": "version", "details": ["", "", "", "", "", "", "", "", "", "", "", "", "", ""], "name": "version_invalid_varint", "program_hex": "ffffffffffffffffffffffff"}
+{"class": "version", "details": ["", ""], "name": "version_empty", "program_hex": ""}
+{"class": "version", "details": ["", "", ""], "name": "version_only", "program_hex": "08"}
+{"class": "version", "details": ["", "", "", "", ""], "name": "version_zero_alias", "program_hex": "002243"}
+{"class": "version", "details": ["", "", "intc_0", "intc_0; return", "", ""], "name": "version_padded_varuint", "program_hex": "88002243"}
+{"class": "opcode-error", "details": ["", "", "", ""], "name": "opcode_illegal_byte", "program_hex": "08ff"}
+{"class": "opcode-error", "details": ["", "", "", "", ""], "name": "opcode_not_yet_in_version", "program_hex": "02224b"}
+{"class": "opcode-error", "details": ["", "", "", "", ""], "name": "opcode_pushint_in_v2", "program_hex": "028101"}
+{"class": "opcode-error", "details": ["", "", "", ""], "name": "opcode_prefix_missing_sub", "program_hex": "0dd4"}
+{"class": "opcode-error", "details": ["", "", "", "", ""], "name": "opcode_prefix_bad_sub", "program_hex": "0dd4ff"}
+{"class": "opcode-error", "details": ["", "", "", "", ""], "name": "opcode_prefix_before_v13", "program_hex": "0cd401"}
+{"class": "opcode-error", "details": ["", "app_box_create", "", "app_box_create; return", "", ""], "name": "opcode_prefix_ok", "program_hex": "0dd40143"}
+{"class": "opcode-error", "details": ["", "", "", "", "", ""], "name": "opcode_after_valid_text", "program_hex": "082243fe"}
+{"class": "immediate", "details": ["", "txn Sender", "", "txn Sender; return", "", ""], "name": "imm_txn_field", "program_hex": "08310043"}
+{"class": "immediate", "details": ["", "", "", "", ""], "name": "imm_txn_bad_field", "program_hex": "0831ff"}
+{"class": "immediate", "details": ["", "", "", ""], "name": "imm_txn_truncated", "program_hex": "0831"}
+{"class": "immediate", "details": ["", "", "", "", ""], "name": "imm_global_bad_field", "program_hex": "0832ff"}
+{"class": "immediate", "details": ["", "gtxn 0 Fee", "", "", "gtxn 0 Fee; return", "", ""], "name": "imm_gtxn_second_group", "program_hex": "0833000143"}
+{"class": "immediate", "details": ["", "", "", "", ""], "name": "imm_gtxn_truncated_second", "program_hex": "083300"}
+{"class": "immediate", "details": ["", "", "", "", "", ""], "name": "imm_gtxn_bad_field", "program_hex": "083300ff"}
+{"class": "field-group", "details": ["", "", "", "", ""], "name": "imm_txna_scalar_field_rejected", "program_hex": "083600"}
+{"class": "field-group", "details": ["", "txna Accounts 0", "", "", "txna Accounts 0; return", "", ""], "name": "imm_txna_array_field", "program_hex": "08361c0043"}
+{"class": "field-group", "details": ["", "", "", "", ""], "name": "imm_txna_truncated_index", "program_hex": "08361c"}
+{"class": "field-group", "details": ["", "", "", "", ""], "name": "imm_txn_array_field_rejected", "program_hex": "08311c"}
+{"class": "field-group", "details": ["", "txn RejectVersion", "", "txn RejectVersion; return", "", ""], "name": "imm_txn_last_field", "program_hex": "08314443"}
+{"class": "field-group", "details": ["", "", "", "", ""], "name": "imm_txn_past_last_field", "program_hex": "083145"}
+{"class": "field-group", "details": ["", "txnas Accounts", "", "txnas Accounts; return", "", ""], "name": "imm_txnas_array_field", "program_hex": "08c01c43"}
+{"class": "field-group", "details": ["", "", "", "", ""], "name": "imm_txnas_scalar_field_rejected", "program_hex": "08c000"}
+{"class": "field-group", "details": ["", "gtxns Sender", "", "gtxns Sender; return", "", ""], "name": "imm_gtxns_scalar_field", "program_hex": "08380043"}
+{"class": "field-group", "details": ["", "", "", "", "", ""], "name": "imm_gtxnsa_scalar_field_rejected", "program_hex": "08390000"}
+{"class": "field-group", "details": ["", "", "", "", ""], "name": "imm_itxn_array_field_rejected", "program_hex": "08b41c"}
+{"class": "field-group", "details": ["", "itxn_field Accounts", "", "itxn_field Accounts; return", "", ""], "name": "imm_itxn_field_accepts_array_field", "program_hex": "08b21c43"}
+{"class": "field-group", "details": ["", "gitxn 0 Accounts", "", "", "gitxn 0 Accounts; return", "", ""], "name": "imm_gitxn_accepts_array_field", "program_hex": "08b7001c43"}
+{"class": "field-group", "details": ["", "app_params_set AppForeignBoxReads", "", "app_params_set AppForeignBoxReads; return", "", ""], "name": "imm_app_params_set_box_field", "program_hex": "0d760b43"}
+{"class": "field-group", "details": ["", "", "", "", ""], "name": "imm_app_params_set_low_field_rejected", "program_hex": "0d7600"}
+{"class": "immediate", "details": ["", "gtxna 0 Accounts 2", "", "", "", "gtxna 0 Accounts 2; return", "", ""], "name": "imm_gtxna_three", "program_hex": "0837001c0243"}
+{"class": "immediate", "details": ["", "", "", "", "", ""], "name": "imm_gtxna_truncated_third", "program_hex": "0837001c"}
+{"class": "immediate", "details": ["", "", "", "", ""], "name": "imm_proto_truncated", "program_hex": "088a01"}
+{"class": "immediate", "details": ["", "frame_dig -1", "", "frame_dig -1; return", "", ""], "name": "imm_frame_dig_negative", "program_hex": "088bff43"}
+{"class": "immediate", "details": ["", "frame_bury -128", "", "frame_bury -128; return", "", ""], "name": "imm_frame_bury_int8", "program_hex": "088c8043"}
+{"class": "immediate", "details": ["", "", "", ""], "name": "imm_frame_dig_truncated", "program_hex": "088b"}
+{"class": "immediate", "details": ["", "pushbytes 0x // \"\"", "", "pushbytes 0x // \"\"; extract 0 2", "", "", "pushbytes 0x // \"\"; extract 0 2; return", "", ""], "name": "imm_extract_pair", "program_hex": "08800057000243"}
+{"class": "immediate", "details": ["", "", "", "", ""], "name": "imm_ecdsa_curve_bad", "program_hex": "0805ff"}
+{"class": "immediate", "details": ["", "pushint 1", "", "pushint 1; block BlkSeed", "", "pushint 1; block BlkSeed; return", "", ""], "name": "imm_block_field_ok", "program_hex": "088101d10043"}
+{"class": "immediate", "details": ["", "", "", "", "", "", ""], "name": "imm_block_field_bad", "program_hex": "088101d1ff"}
+{"class": "field-group", "details": ["", "pushint 1", "", "pushint 1; block BlkBranch512", "", "pushint 1; block BlkBranch512; return", "", ""], "name": "imm_block_field_v13_branch512", "program_hex": "0d8101d10a43"}
+{"class": "field-group", "details": ["", "pushint 1", "", "pushint 1; block BlkSha512_256TxnCommitment", "", "pushint 1; block BlkSha512_256TxnCommitment; return", "", ""], "name": "imm_block_field_v13_sha512_256_commitment", "program_hex": "0d8101d10b43"}
+{"class": "field-group", "details": ["", "pushint 1", "", "pushint 1; block BlkSha256TxnCommitment", "", "pushint 1; block BlkSha256TxnCommitment; return", "", ""], "name": "imm_block_field_v13_sha256_commitment", "program_hex": "0d8101d10c43"}
+{"class": "field-group", "details": ["", "pushint 1", "", "pushint 1; block BlkSha512TxnCommitment", "", "pushint 1; block BlkSha512TxnCommitment; return", "", ""], "name": "imm_block_field_v13_sha512_commitment", "program_hex": "0d8101d10d43"}
+{"class": "field-group", "details": ["", "", "", "", "", "", ""], "name": "imm_block_field_past_last", "program_hex": "0d8101d10e"}
+{"class": "immediate", "details": ["", "", "", "", ""], "name": "imm_mimc_bad", "program_hex": "0be6ff"}
+{"class": "immediate", "details": ["", "", "", "", ""], "name": "imm_vrf_verify_bad", "program_hex": "08d0ff"}
+{"class": "immediate", "details": ["", "", "", "", ""], "name": "imm_base64_decode_bad", "program_hex": "085eff"}
+{"class": "immediate", "details": ["", "", "", "", ""], "name": "imm_asset_params_bad", "program_hex": "0871ff"}
+{"class": "immediate", "details": ["", "intcblock 7 8", "", "", "", "intcblock 7 8; intc 1 // 8", "", "intcblock 7 8; intc 1 // 8; return", "", ""], "name": "imm_intc_with_block", "program_hex": "0820020708210143"}
+{"class": "immediate", "details": ["", "intcblock 7", "", "", "intcblock 7; intc 5", "", "intcblock 7; intc 5; intc_0 // 7", "intc 5; intc_0 // 7; intc_1", "intc_0 // 7; intc_1; return", "", ""], "name": "imm_intc_out_of_block", "program_hex": "082001072105222343"}
+{"class": "immediate", "details": ["", "bytecblock 0x6869 0xff", "", "", "", "", "", "", "bytecblock 0x6869 0xff; bytec 0 // \"hi\"", "", "bytecblock 0x6869 0xff; bytec 0 // \"hi\"; bytec_0 // \"hi\"", "bytec 0 // \"hi\"; bytec_0 // \"hi\"; bytec_1 // 0xff", "bytec_0 // \"hi\"; bytec_1 // 0xff; return", "", ""], "name": "imm_bytec_with_block", "program_hex": "08260202686901ff2700282943"}
+{"class": "immediate", "details": ["", "intcblock 7", "", "", "intcblock 7; intc_0 // 7", "intcblock 7; intc_0 // 7; intcblock 9", "", "", "intc_0 // 7; intcblock 9; intc_0 // 9", "intcblock 9; intc_0 // 9; return", "", ""], "name": "imm_second_intcblock_wins", "program_hex": "08200107222001092243"}
+{"class": "immediate", "details": ["", "bytecblock 0x61", "", "", "", "bytecblock 0x61; bytec_0 // \"a\"", "bytecblock 0x61; bytec_0 // \"a\"; bytecblock 0x62", "", "", "", "bytec_0 // \"a\"; bytecblock 0x62; bytec_0 // \"b\"", "bytecblock 0x62; bytec_0 // \"b\"; return", "", ""], "name": "imm_second_bytecblock_wins", "program_hex": "082601016128260101622843"}
+{"class": "constant", "details": ["", "intcblock ", "", "intcblock ; return", "", ""], "name": "const_intcblock_empty", "program_hex": "08200043"}
+{"class": "constant", "details": ["", "bytecblock ", "", "bytecblock ; return", "", ""], "name": "const_bytecblock_empty", "program_hex": "08260043"}
+{"class": "constant", "details": ["", "intcblock 18446744073709551615 0", "", "", "", "", "", "", "", "", "", "", "", "", "intcblock 18446744073709551615 0; return", "", ""], "name": "const_intcblock_large", "program_hex": "082002ffffffffffffffffff010043"}
+{"class": "constant", "details": ["", "pushint 0", "", "", "pushint 0; return", "", ""], "name": "const_pushint_padded_varuint", "program_hex": "0881800043"}
+{"class": "constant", "details": ["", "pushints 1 255", "", "", "", "", "pushints 1 255; return", "", ""], "name": "const_pushints", "program_hex": "08830201ff0143"}
+{"class": "constant", "details": ["", "pushints ", "", "pushints ; return", "", ""], "name": "const_pushints_empty", "program_hex": "08830043"}
+{"class": "constant", "details": ["", "pushbytess 0x6869 0x", "", "", "", "", "", "pushbytess 0x6869 0x; return", "", ""], "name": "const_pushbytess", "program_hex": "0882020268690043"}
+{"class": "constant", "details": ["", "pushbytess ", "", "pushbytess ; return", "", ""], "name": "const_pushbytess_empty", "program_hex": "08820043"}
+{"class": "constant", "details": ["", "pushbytes 0x6869 // \"hi\"", "", "", "", "pushbytes 0x6869 // \"hi\"; return", "", ""], "name": "const_pushbytes_ascii", "program_hex": "088002686943"}
+{"class": "constant", "details": ["", "pushbytes 0x // \"\"", "", "pushbytes 0x // \"\"; return", "", ""], "name": "const_pushbytes_empty", "program_hex": "08800043"}
+{"class": "constant", "details": ["", "pushbytes 0x225c27 // \"\\\"\\\\'\"", "", "", "", "", "pushbytes 0x225c27 // \"\\\"\\\\'\"; return", "", ""], "name": "const_pushbytes_quote_backslash", "program_hex": "088003225c2743"}
+{"class": "constant", "details": ["", "pushbytes 0x0a0d09 // 0x0a0d09", "", "", "", "", "pushbytes 0x0a0d09 // 0x0a0d09; return", "", ""], "name": "const_pushbytes_nonprintable", "program_hex": "0880030a0d0943"}
+{"class": "constant", "details": ["", "pushbytes 0xc3a9 // 0xc3a9", "", "", "", "pushbytes 0xc3a9 // 0xc3a9; return", "", ""], "name": "const_pushbytes_high_bit", "program_hex": "088002c3a943"}
+{"class": "constant", "details": ["", "pushbytes 0x7e7f // 0x7e7f", "", "", "", "pushbytes 0x7e7f // 0x7e7f; return", "", ""], "name": "const_pushbytes_del", "program_hex": "0880027e7f43"}
+{"class": "constant", "details": ["", "pushbytes 0x0000000000000000000000000000000000000000000000000000000000000000 // addr AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "pushbytes 0x0000000000000000000000000000000000000000000000000000000000000000 // addr AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ; return", "", ""], "name": "const_pushbytes_32_address", "program_hex": "088020000000000000000000000000000000000000000000000000000000000000000043"}
+{"class": "constant", "details": ["", "pushbytes 0x6161616161616161616161616161616161616161616161616161616161616161 // addr MFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQS3KHEHM", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "pushbytes 0x6161616161616161616161616161616161616161616161616161616161616161 // addr MFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQS3KHEHM; return", "", ""], "name": "const_pushbytes_32_printable", "program_hex": "088020616161616161616161616161616161616161616161616161616161616161616143"}
+{"class": "truncated", "details": ["", "", "", ""], "name": "trunc_intcblock_no_count", "program_hex": "0820"}
+{"class": "truncated", "details": ["", "", "", "", "", ""], "name": "trunc_intcblock_short", "program_hex": "08200301"}
+{"class": "truncated", "details": ["", "", "", "", "", ""], "name": "trunc_intcblock_item", "program_hex": "08200180"}
+{"class": "truncated", "details": ["", "", "", "", "", "", ""], "name": "trunc_intcblock_too_many", "program_hex": "0820ff0101"}
+{"class": "truncated", "details": ["", "", "", "", "", "", "", "", "", "", "", "", "", ""], "name": "trunc_intcblock_count_overflow", "program_hex": "0820ffffffffffffffffffff"}
+{"class": "truncated", "details": ["", "", "", ""], "name": "trunc_bytecblock_no_count", "program_hex": "0826"}
+{"class": "truncated", "details": ["", "", "", "", "", "", ""], "name": "trunc_bytecblock_short", "program_hex": "0826020161"}
+{"class": "truncated", "details": ["", "", "", "", ""], "name": "trunc_bytecblock_item_len", "program_hex": "082601"}
+{"class": "truncated", "details": ["", "", "", "", "", "", ""], "name": "trunc_bytecblock_item_data", "program_hex": "0826010561"}
+{"class": "truncated", "details": ["", "", "", "", "", "", ""], "name": "trunc_bytecblock_too_many", "program_hex": "0826ff0100"}
+{"class": "truncated", "details": ["", "bytecblock 0x", "", "", "", ""], "name": "trunc_bytecblock_trailing_empty", "program_hex": "08260100"}
+{"class": "truncated", "details": ["", "bytecblock 0x", "", "", "", ""], "name": "trunc_bytecblock_trailing_empty_v13", "program_hex": "0d260100"}
+{"class": "truncated", "details": ["", "", "", ""], "name": "trunc_pushint_no_value", "program_hex": "0881"}
+{"class": "truncated", "details": ["", "", "", "", ""], "name": "trunc_pushint_unterminated", "program_hex": "088180"}
+{"class": "truncated", "details": ["", "", "", "", "", "", "", "", "", "", "", "", "", "", ""], "name": "trunc_pushint_overflow", "program_hex": "0881ffffffffffffffffffff01"}
+{"class": "truncated", "details": ["", "", "", ""], "name": "trunc_pushbytes_no_len", "program_hex": "0880"}
+{"class": "truncated", "details": ["", "", "", "", "", "", ""], "name": "trunc_pushbytes_short", "program_hex": "0880056162"}
+{"class": "truncated", "details": ["", "", "", "", "", ""], "name": "trunc_pushints_short", "program_hex": "08830201"}
+{"class": "truncated", "details": ["", "", "", "", "", "", ""], "name": "trunc_pushbytess_short", "program_hex": "0882020161"}
+{"class": "truncated", "details": ["", "", "", ""], "name": "trunc_branch_no_offset", "program_hex": "0842"}
+{"class": "truncated", "details": ["", "", "", "", ""], "name": "trunc_branch_one_byte", "program_hex": "084200"}
+{"class": "truncated", "details": ["", "", "", ""], "name": "trunc_branch_varint_none", "program_hex": "0d42"}
+{"class": "truncated", "details": ["", "", "", "", ""], "name": "trunc_branch_varint_unterminated", "program_hex": "0d4280"}
+{"class": "truncated", "details": ["", "", "", "", "", "", "", "", "", "", "", "", "", "", ""], "name": "trunc_branch_varint_overflow", "program_hex": "0d42ffffffffffffffffffff01"}
+{"class": "truncated", "details": ["", "", "", ""], "name": "trunc_switch_no_count", "program_hex": "088d"}
+{"class": "truncated", "details": ["", "", "", "", "", "", ""], "name": "trunc_switch_short", "program_hex": "088d020000"}
+{"class": "truncated", "details": ["", "", "", ""], "name": "trunc_match_no_count", "program_hex": "088e"}
+{"class": "truncated", "details": ["", "", "", "", "", "", "", "", ""], "name": "trunc_match_short", "program_hex": "088e0300000000"}
+{"class": "truncated", "details": ["", "", "", "", "", "", ""], "name": "trunc_error_after_labels", "program_hex": "0842000081"}
+{"class": "shape", "details": ["", "intcblock 1 2", "", "", "", "intcblock 1 2; intc_0 // 1", "intcblock 1 2; intc_0 // 1; callsub label1", "", "", "intc_0 // 1; callsub label1; return; label2:", "callsub label1; return; label2:; proto 1 1", "", "", "return; label2:; proto 1 1; frame_dig -1; label1:", "", "proto 1 1; frame_dig -1; label1:; intc_1 // 2", "frame_dig -1; label1:; intc_1 // 2; +", "intc_1 // 2; +; dup", "+; dup; bnz label3", "", "", "dup; bnz label3; retsub", "", ""], "name": "shape_subroutine_loop", "program_hex": "082002010222880006438a01018bff23084940fff989"}
+{"class": "pcdetails-label-order", "details": ["", "pushint 1", "", "pushint 1; bnz label1", "", "", "pushint 1; bnz label1; err; label2:", "bnz label1; err; label2:; pushint 5", "", "err; label2:; pushint 5; pushint 0", "", "pushint 5; pushint 0; assert; label1:", "pushint 0; assert; label1:; pushint 1", "", "assert; label1:; pushint 1; bnz label2", "", "", "pushint 1; bnz label2; pushint 1", "", "", ""], "name": "pcd_labels_out_of_order", "program_hex": "088101400006008105810044810140fff68101"}
+{"class": "pcdetails-label-order", "details": ["", "pushint 1", "", "pushint 1; bnz label1", "", "", "pushint 1; bnz label1; err; label2:", "bnz label1; err; label2:; err; label1:", "err; label2:; err; label1:; pushint 1", "", "err; label1:; pushint 1; bnz label2", "", "", "pushint 1; bnz label2; pushint 1", "", "", ""], "name": "pcd_labels_in_window", "program_hex": "0881014000020000810140fffa8101"}
+{"class": "pcdetails-back-jump", "details": ["", "pushint 1", "", "pushint 1; bnz label1; label3:", "", "", "pushint 1; bnz label1; label3:; pushint 0", "", "bnz label1; label3:; pushint 0; assert", "pushint 0; assert; pushint 1", "", "assert; pushint 1; return; label1:", "pushint 1; return; label1:; pushint 2; label2:", "", "return; label1:; pushint 2; label2:; pushint 1", "", "pushint 2; label2:; pushint 1; -", "pushint 1; -; dup", "-; dup; bnz label2", "", "", "dup; bnz label2; pop", "bnz label2; pop; b label3", "", "", "", ""], "name": "pcd_back_jump_loop", "program_hex": "08810140000681004481014381028101094940fff94842ffed"}
+{"class": "pcdetails-proto", "details": ["", "b label1; label2:", "", "", "b label1; label2:; proto 0 0", "", "", "b label1; label2:; proto 0 0; retsub; label1:", "proto 0 0; retsub; label1:; pushint 3", "", "retsub; label1:; pushint 3; callsub label3", "", "", "pushint 3; callsub label3; callsub label4", "", "", "callsub label3; callsub label4; pushint 1", "", "callsub label4; pushint 1; return; label3:", "pushint 1; return; label3:; proto 1 1", "", "", "return; label3:; proto 1 1; frame_dig -1", "", "proto 1 1; frame_dig -1; pushint 1", "", "frame_dig -1; pushint 1; +", "pushint 1; +; retsub; label4:", "+; retsub; label4:; proto 1 0", "", "", "retsub; label4:; proto 1 0; frame_dig -1", "", "proto 1 0; frame_dig -1; pushint 0", "", "frame_dig -1; pushint 0; assert", "pushint 0; assert; retsub", "", ""], "name": "pcd_proto_labels", "program_hex": "084200048a000089810388000688000c8101438a01018bff810108898a01008bff81004489"}
+{"class": "pcdetails-label-order", "details": ["", "pushint 2", "", "pushint 2; switch label1 label2 label3", "", "", "", "", "", "", "", "pushint 2; switch label1 label2 label3; err; label3:", "switch label1 label2 label3; err; label3:; pushint 1", "", "err; label3:; pushint 1; return; label2:", "pushint 1; return; label2:; pushint 1", "", "return; label2:; pushint 1; return; label1:", "pushint 1; return; label1:; pushint 0", "", "return; label1:; pushint 0; assert", "", ""], "name": "pcd_switch_descending", "program_hex": "0881028d0300070004000100810143810143810044"}
+{"class": "pcdetails-varint", "details": ["", "pushint 1", "", "pushint 1; bnz label1", "", "pushint 1; bnz label1; err; label2:", "bnz label1; err; label2:; pushint 5", "", "err; label2:; pushint 5; pushint 0", "", "pushint 5; pushint 0; assert; label1:", "pushint 0; assert; label1:; pushint 1", "", "assert; label1:; pushint 1; bnz label2", "", "pushint 1; bnz label2; pushint 1", "", "", ""], "name": "pcd_varint_labels", "program_hex": "0d8101400c0081058100448101400d8101"}
+{"class": "pcdetails-constants", "details": ["", "intcblock 7 8", "", "", "", "intcblock 7 8; bytecblock 0x6869", "", "", "", "", "intcblock 7 8; bytecblock 0x6869; intc_0 // 7", "bytecblock 0x6869; intc_0 // 7; bytec_0 // \"hi\"", "intc_0 // 7; bytec_0 // \"hi\"; intc_1 // 8", "bytec_0 // \"hi\"; intc_1 // 8; assert", "", ""], "name": "pcd_constant_comments", "program_hex": "0820020708260102686922282344"}
+{"class": "pcdetails-go-test", "details": ["", "pushint 1", "", "pushint 1; pushint 2", "", "pushint 1; pushint 2; -", "", ""], "name": "pcd_go_test_sub", "program_hex": "0e8101810209"}
+{"class": "pcdetails-go-test", "details": ["", "pushint 1", "", "pushint 1; err", "", ""], "name": "pcd_go_test_err", "program_hex": "0e810100"}
+{"class": "pcdetails-go-test", "details": ["", "pushint 1", "", "pushint 1; dup", "pushint 1; dup; pushint 2", "", "dup; pushint 2; -", "pushint 2; -; +", "", ""], "name": "pcd_go_test_dup", "program_hex": "0e81014981020908"}
+{"class": "pcdetails-go-test", "details": ["", "b label1; label1:", "", "", ""], "name": "pcd_go_test_branch_to_end", "program_hex": "0e4200"}
+{"class": "pcdetails-autosalt-header", "details": ["", "pushint 0", "", "pushint 0; pushint 0", "", "pushint 0; pushint 0; assert", "", ""], "name": "pcd_autosalt_00", "program_hex": "0d8100810044"}

@@ -30,6 +30,9 @@ on:
       - "crates/core/algo-avm/src/opcode.rs"
       - "crates/core/algo-avm/tests/disassemble_go_parity.rs"
       - "crates/core/algo-avm/tests/fixtures/disasm_go_parity.jsonl"
+      - "crates/core/algo-avm/tests/pc_details_go_parity.rs"
+      - "crates/core/algo-avm/tests/fixtures/pcdetails_go_parity.jsonl"
+      - "crates/core/algo-avm/src/eval.rs"
       - "crates/core/algo-avm/src/sourcemap.rs"
       - "scripts/teal-corpus/**"
       - ".github/workflows/teal-corpus-drivers.yml"
@@ -52,6 +55,9 @@ on:
       - "crates/core/algo-avm/src/opcode.rs"
       - "crates/core/algo-avm/tests/disassemble_go_parity.rs"
       - "crates/core/algo-avm/tests/fixtures/disasm_go_parity.jsonl"
+      - "crates/core/algo-avm/tests/pc_details_go_parity.rs"
+      - "crates/core/algo-avm/tests/fixtures/pcdetails_go_parity.jsonl"
+      - "crates/core/algo-avm/src/eval.rs"
       - "crates/core/algo-avm/src/sourcemap.rs"
       - "scripts/teal-corpus/**"
       - ".github/workflows/teal-corpus-drivers.yml"
@@ -140,6 +146,13 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/teal-corpus/disasm_fixtures.py --check --go-driver "$RUNNER_TEMP/teal-corpus-go"
+
+      - name: pcDetails regression cases are not stale
+        run: |
+          set -euo pipefail
+          # pcDetails is unexported: the oracle is a test file run inside the
+          # sibling go-algorand checkout (libsodium already built above).
+          python3 scripts/teal-corpus/pcdetails_fixtures.py --check --go-algorand "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
 
       - name: Assembly regression cases are not stale
         run: |
