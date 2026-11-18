@@ -233,3 +233,50 @@ fn signed_txn_carrying_such_a_logicsig_is_rejected() {
     let _g = strict_unknown_fields(&stxn);
     assert!(algo_types::SignedTransaction::decode_from_bytes(&stxn).is_err());
 }
+
+/// A rejection carries go's `err.Error()`: msgp's error kind and the context
+/// path `msgp.WrapError` adds (issue #2404). The fixture of
+/// `goal-rust/tests/clerk_sign_lsig_e2e.rs` checks every record against go's
+/// own output; these pin the rules by name.
+#[test]
+fn rejections_carry_go_msgp_error_text() {
+    use algo_types::go_msgp::{MAX_LOGIC_SIG_ARG_SIZE, MAX_LOGIC_SIG_MAX_SIZE};
+    let by_name: std::collections::HashMap<_, _> = lsig_decode_cases().into_iter().collect();
+    let text = |name: &str| decode_logicsig_go(&by_name[name]).unwrap_err().text();
+    for (name, want) in [
+        // an `errWrapped` wraps again: one " at " per level
+        ("subsig unknown key", "Unknown field: zzz at Subsigs/0 at Msig"),
+        ("msig 256 subsigs", "msgp: length overflow: 256 > 255 at Subsigs at Msig"),
+        (
+            "subsig as array of three",
+            "Too many array fields when decoding into struct: 1 left at struct-from-array at Subsigs/0 at Msig",
+        ),
+        ("array form nil fields", "missing required field: v at struct-from-array/Msig"),
+        // a `TypeError` / `UintOverflow` prepends to its context
+        ("msig v 256", "msgp: 256 overflows uint8 at Msig/Version"),
+        (
+            "msig subsig as map",
+            "msgp: attempted to decode type \"str\" with method for \"array\" at Msig/Subsigs/0",
+        ),
+        // an `UintBelowZero` replaces it
+        ("msig v negative", "msgp: attempted to cast int -1 to unsigned at Msig"),
+        ("pqsig salt negative", "msgp: attempted to cast int -1 to unsigned at PQsig"),
+        // `ErrShortBytes` never gets one
+        ("l truncated", "msgp: too few bytes left to read object"),
+        ("reserved marker", "msgp: unrecognized type prefix 0xc1"),
+        ("pqsig pk 1794", "msgp: length overflow: 1794 > 1793 at PQsig"),
+    ] {
+        assert_eq!(String::from_utf8(text(name)).unwrap(), want, "{name}");
+    }
+    // The generated code returns the program and argument size overflows unwrapped.
+    assert_eq!(
+        String::from_utf8(text("l 16001 bytes")).unwrap(),
+        format!("msgp: length overflow: 16001 > {MAX_LOGIC_SIG_MAX_SIZE}")
+    );
+    assert_eq!(
+        String::from_utf8(text("arg element 4097")).unwrap(),
+        format!("msgp: length overflow: 4097 > {MAX_LOGIC_SIG_ARG_SIZE}")
+    );
+    // An unknown key is printed as its raw bytes.
+    assert_eq!(text("key l then nul"), b"Unknown field: l\0");
+}

@@ -20,7 +20,9 @@
 
 //! The wallet handle token cache and the password input of go's `goal`
 //! (`getWalletHandleMaybePassword`, `libgoal` `GetWalletHandleTokenCached`),
-//! issue #2391, seen through `goal clerk compile -s`.
+//! issue #2391, seen through `goal clerk compile -s`; the last rows are
+//! `goal clerk multisig signprogram -L` of LogicSig files go fails to decode
+//! (issue #2404).
 //!
 //! go keeps a wallet's handle token in `<datadir>/goal.cache/walletHandles.json`
 //! and reuses it without a password check, the password goal prompts for is only
@@ -49,6 +51,10 @@ use std::time::{Duration, Instant};
 
 mod common;
 use common::pty::{run, Ran, Stdin};
+
+#[path = "../../../core/algo-codec/tests/common/lsig_cases.rs"]
+mod lsig_cases;
+use lsig_cases::lsig_decode_cases;
 
 const GOAL_RUST_BIN: &str = env!("CARGO_BIN_EXE_goal-rust");
 
@@ -401,6 +407,36 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
     std::fs::remove_dir_all(dd.join("goal.cache")).unwrap();
     rows.push(row("cold success", &dd, &wid, &sign(&addr, typed("pw"))));
     rows.push(cache_row("cache after the cold success", &dd, &wid));
+
+    // `clerk multisig signprogram -L` of a file go's `protocol.Decode` rejects:
+    // `reportErrorf("%s: %s", logicSigFile, err)` (multisig.go:187-190) prints
+    // msgp's error text with its context path (issue #2404).
+    let cases: std::collections::HashMap<_, _> = lsig_decode_cases().into_iter().collect();
+    for name in [
+        "subsig unknown key",
+        "msig v 256",
+        "l truncated",
+        "key l then nul",
+    ] {
+        std::fs::write(dd.join("bad.lsig"), &cases[name]).unwrap();
+        let ran = run(
+            bin,
+            &dd,
+            &[
+                "clerk",
+                "multisig",
+                "signprogram",
+                "-L",
+                "bad.lsig",
+                "-a",
+                &addr,
+                "-w",
+                "w",
+            ],
+            typed("pw"),
+        );
+        rows.push(row(&format!("signprogram -L {name}"), &dd, &wid, &ran));
+    }
     rows
 }
 

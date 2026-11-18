@@ -136,6 +136,17 @@ fn multisig_decode_is_the_logicsig_members_decode() {
     }
 }
 
+/// A top-level `MultisigSig` failure has no `Msig` context: go's text for
+/// libgoal's `protocol.Decode(resp.Multisig, &msig)` (issue #2404).
+#[test]
+fn multisig_rejection_carries_go_msgp_error_text() {
+    let rec = |n: &str| records().into_iter().find(|r| r.0 == n).unwrap().1;
+    let text =
+        |n: &str| String::from_utf8(decode_multisig_go(&rec(n)).unwrap_err().text()).unwrap();
+    assert_eq!(text("v 256"), "msgp: 256 overflows uint8 at Version");
+    assert_eq!(text("unknown key"), "Unknown field: zzz");
+}
+
 #[test]
 fn serde_multisig_decode_is_not_go() {
     let unknown = records()

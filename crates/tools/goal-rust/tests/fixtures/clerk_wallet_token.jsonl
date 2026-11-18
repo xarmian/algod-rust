@@ -15,3 +15,7 @@
 {"cache":["<WALLET_ID>:<TOKEN>"],"mode":"600","name":"cache after the stale token","pretty":true}
 {"code":0,"name":"cold success","outfile":true,"stderr":"","stdout":"Please enter the password for wallet 'w': \n"}
 {"cache":["<WALLET_ID>:<TOKEN>"],"mode":"600","name":"cache after the cold success","pretty":true}
+{"code":1,"name":"signprogram -L subsig unknown key","outfile":false,"stderr":"bad.lsig: Unknown field: zzz at Subsigs/0 at Msig\n","stdout":"Please enter the password for wallet 'w': \n"}
+{"code":1,"name":"signprogram -L msig v 256","outfile":false,"stderr":"bad.lsig: msgp: 256 overflows uint8 at Msig/Version\n","stdout":"Please enter the password for wallet 'w': \n"}
+{"code":1,"name":"signprogram -L l truncated","outfile":false,"stderr":"bad.lsig: msgp: too few bytes left to read object\n","stdout":"Please enter the password for wallet 'w': \n"}
+{"code":1,"name":"signprogram -L key l then nul","outfile":false,"stderr":"One or more non-printable characters were omitted from the following error message:\nbad.lsig: Unknown field: l\n","stdout":"Please enter the password for wallet 'w': \n"}
