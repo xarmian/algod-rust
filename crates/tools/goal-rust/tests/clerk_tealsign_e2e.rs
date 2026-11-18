@@ -142,7 +142,11 @@ fn tealsign_set_lsig_arg_idx_rewrites_file_and_appends_signature() {
         .as_ref()
         .expect("args present");
     assert_eq!(args.len(), 1, "exactly one arg stored");
-    assert_eq!(args[0].len(), 64, "arg 0 is a 64-byte ed25519 signature");
+    assert_eq!(
+        args[0].as_ref().map(|a| a.len()),
+        Some(64),
+        "arg 0 is a 64-byte ed25519 signature"
+    );
 }
 
 /// Write a single payment SignedTxn carrying the `int 1` LogicSig (no
