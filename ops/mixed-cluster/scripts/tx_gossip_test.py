@@ -16,16 +16,40 @@ import tx_gossip as tg  # noqa: E402
 NODES = ("go-node-1", "go-node-2", "go-node-3", "rust-node-4")
 
 
+class FakeFuture:
+    """A request in flight on the fake clock: done once the clock reaches
+    `t_end`; its result is computed then (what the node answers at `t_end`)."""
+
+    def __init__(self, net, t_end, fn):
+        self.net, self.t_end, self.fn = net, t_end, fn
+        self.value, self.resolved = None, False
+
+    def done(self):
+        return self.net.t >= self.t_end
+
+    def result(self):
+        if not self.resolved:
+            self.value, self.resolved = self.fn(), True
+        return self.value, self.t_end
+
+
 class FakeNet:
     """A clock and four nodes. `delay[(source, target)]` is the seconds until a
     transaction submitted to `source` is in `target`'s pool (None: never), and
-    `commit_after` the seconds until it is confirmed everywhere."""
+    `commit_after` the seconds until it is confirmed everywhere (`commit_by_n`:
+    per submission number, 1-based). `pool_stall[node]` is how long the node's
+    bulk pool list takes to answer; the answer is the pool at the END of the
+    stall (a Go node's GET /v2/transactions/pending blocks behind its ledger's
+    slow DB commit, #2429)."""
 
     def __init__(self, delay=None, commit_after=2.7, round0=100, round_s=2.7,
-                 bulk=True, pending_stall=0.0, post_stall=0.0):
+                 bulk=True, pending_stall=0.0, post_stall=0.0, pool_stall=None,
+                 commit_by_n=None):
         self.bulk = bulk                    # False: the bulk pool list is unavailable
         self.pending_stall = pending_stall  # seconds each per-txid lookup takes
         self.post_stall = post_stall        # seconds each POST /v2/transactions takes
+        self.pool_stall = pool_stall or {}  # node -> seconds each bulk pool list takes
+        self.commit_by_n = commit_by_n or {}
         self.commit_nodes = []              # nodes committed_rounds was asked for
         self.pending_calls = 0
         self.t = 0.0
@@ -37,6 +61,7 @@ class FakeNet:
         self.n = 0
         self.posts = []
         self.raws = {}  # txid -> note
+        self.commit_of = {}  # txid -> seconds after submission it is committed
 
     def now(self):
         return self.t
@@ -47,32 +72,49 @@ class FakeNet:
     def round_of(self, node):
         return self.round0 + int(self.t / self.round_s)
 
-    def submit(self, node, raw):
+    def _register(self, node, raw, t):
         self.n += 1
         txid = "TX{:03d}".format(self.n)
-        self.t += self.post_stall   # the node answers, then gossips
-        self.submitted[txid] = (node, self.t)
+        self.submitted[txid] = (node, t)
+        self.commit_of[txid] = self.commit_by_n.get(self.n, self.commit_after)
         self.posts.append((node, raw))
         self.raws[txid] = raw.decode()
         return 200, '{"txId":"%s"}' % txid
 
+    def submit(self, node, raw):
+        self.t += self.post_stall   # the node answers, then gossips
+        return self._register(node, raw, self.t)
+
+    def submit_async(self, node, raw):
+        t_end = self.t + self.post_stall
+        return FakeFuture(self, t_end, lambda: self._register(node, raw, t_end))
+
     def note_of(self, raw):
         return raw.decode()
 
-    def pool_notes(self, node):
-        """The notes in `node`'s pool as the bulk list (fast, never stalls);
-        None when the bulk list is unavailable."""
-        if not self.bulk:
-            return None
+    def _pool_at(self, node, t):
         notes = set()
-        for n, (txid, (source, t0)) in enumerate(self.submitted.items()):
-            age = self.t - t0
-            if age >= self.commit_after:
+        for txid, (source, t0) in self.submitted.items():
+            age = t - t0
+            if age < 0 or age >= self.commit_of[txid]:
                 continue
             d = 0.0 if node == source else self.delay.get((source, node), 0.2)
             if d is not None and age >= d:
                 notes.add(self.raws[txid])
         return notes
+
+    def pool_notes(self, node):
+        """The notes in `node`'s pool as the bulk list (after `pool_stall`);
+        None when the bulk list is unavailable."""
+        if not self.bulk:
+            return None
+        self.t += self.pool_stall.get(node, 0.0)
+        return self._pool_at(node, self.t)
+
+    def pool_notes_async(self, node):
+        t_end = self.t + self.pool_stall.get(node, 0.0)
+        return FakeFuture(self, t_end,
+                          lambda: self._pool_at(node, t_end) if self.bulk else None)
 
     def committed_rounds(self, node, notes, from_round, wait_s):
         """note -> round it was committed in (what the blocks of `node` say)."""
@@ -82,8 +124,9 @@ class FakeNet:
         while len(out) < len(notes) and self.t < end:
             for txid, (source, t0) in self.submitted.items():
                 note = self.raws[txid]
-                if note in notes and self.t - t0 >= self.commit_after:
-                    out[note] = self.round0 + int((t0 + self.commit_after) / self.round_s)
+                c = self.commit_of[txid]
+                if note in notes and self.t - t0 >= c:
+                    out[note] = self.round0 + int((t0 + c) / self.round_s)
             if len(out) < len(notes):
                 self.t += 1.0
         return out
@@ -96,8 +139,9 @@ class FakeNet:
             return 404, 0
         source, t0 = self.submitted[txid]
         age = self.t - t0
-        if age >= self.commit_after:
-            return 200, self.round0 + int((t0 + self.commit_after) / self.round_s)
+        c = self.commit_of[txid]
+        if age >= c:
+            return 200, self.round0 + int((t0 + c) / self.round_s)
         d = 0.0 if node == source else self.delay.get((source, node), 0.2)
         if d is not None and age >= d:
             return 200, 0
@@ -162,7 +206,7 @@ class PerNodeTest(unittest.TestCase):
 
     def test_a_rejected_submission_aborts_with_the_node_response(self):
         class Rejecting(FakeNet):
-            def submit(self, node, raw):
+            def _register(self, node, raw, t):
                 return 400, "txn rejected"
 
         with self.assertRaises(tg.CheckError) as cm:
@@ -243,6 +287,62 @@ class LatencyBaselineTest(unittest.TestCase):
                            poll_s=0.05, commit_node="go-node-1")
         self.assertEqual(set(net.commit_nodes), {"go-node-1"})
         self.assertTrue(all(s["confirmed"] == 2 for s in res["sources"]), res["sources"])
+
+
+class StalledNodeTest(unittest.TestCase):
+    """Issue #2429. A Go node's REST answers (the bulk pool list, a POST) block
+    for 1.4 to 2.8 s behind its ledger's slow DB commit (`dbatomic: tx surpassed
+    expected deadline`, Docker Desktop I/O), and the answer is the pool at the
+    END of the stall. The check polled the targets one after the other and only
+    after every POST had been answered, so one stalled node delayed the
+    observation of every other node, and a txn gossiped and committed inside
+    that blind window read as `confirmed_first` and failed its pair."""
+
+    def test_a_stalled_target_does_not_blind_the_check_to_the_other_targets(self):
+        # The live run of #2429: go-node-3's pool list takes 2.8 s, each txn is
+        # in the pools for 2.5 s. rust-node-4 and go-node-2 must still be seen.
+        net = FakeNet(pool_stall={"go-node-3": 2.8}, commit_after=2.5)
+        res = run(net, sources=("go-node-1",))
+        by = {p["target"]: p for p in res["pairs"]}
+        for target in ("go-node-2", "rust-node-4"):
+            self.assertEqual(by[target]["in_pool_first"], 3, by[target])
+            self.assertTrue(by[target]["ok"], by[target])
+
+    def test_the_targets_are_watched_while_the_submissions_are_still_being_answered(self):
+        # Each POST takes 1.5 s; the first txn is committed 2 s after its POST
+        # was answered, before the last POST is answered (4.5 s).
+        net = FakeNet(post_stall=1.5, commit_after=2.0)
+        res = run(net, sources=("go-node-1",))
+        self.assertTrue(res["pass"], res)
+        for pair in res["pairs"]:
+            self.assertEqual(pair["in_pool_first"], 3, pair)
+            self.assertLessEqual(pair["max_latency_s"], 1.0, pair)
+
+    def test_a_txn_committed_inside_a_stalled_answer_is_not_a_failure(self):
+        # go-node-3 answers every 3 s; txn 1 is in its pool from 0.2 s to 1.0 s,
+        # entirely inside its first stalled request. The other two are seen in
+        # its pool, so the gossip path is proven: the pair passes and reports
+        # the commit-first txn.
+        net = FakeNet(pool_stall={"go-node-3": 3.0}, commit_after=30.0,
+                      commit_by_n={1: 1.0})
+        res = run(net, sources=("go-node-1",))
+        pair = [p for p in res["pairs"] if p["target"] == "go-node-3"][0]
+        self.assertEqual(pair["confirmed_first"], 1, pair)
+        self.assertEqual(pair["in_pool_first"], 2, pair)
+        self.assertEqual(pair["absent"], 0, pair)
+        self.assertTrue(pair["ok"], pair)
+        self.assertLessEqual(pair["max_latency_s"], 6.0, pair)
+        self.assertGreaterEqual(pair["max_poll_s"], 3.0, pair)
+        self.assertTrue(res["pass"], res)
+
+    def test_a_target_with_no_pool_sighting_at_all_still_fails(self):
+        # Every txn only ever confirmed on go-node-3: no evidence of gossip.
+        net = FakeNet(pool_stall={"go-node-3": 3.0}, commit_after=1.0)
+        res = run(net, sources=("go-node-1",))
+        pair = [p for p in res["pairs"] if p["target"] == "go-node-3"][0]
+        self.assertEqual(pair["in_pool_first"], 0, pair)
+        self.assertFalse(pair["ok"], pair)
+        self.assertFalse(res["pass"])
 
 
 class KmdPrepareTest(unittest.TestCase):

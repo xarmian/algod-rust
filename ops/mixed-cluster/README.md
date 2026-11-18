@@ -259,7 +259,7 @@ What it asserts:
 | `vote_step_coverage` | `analyze.py --rust-log` — the Rust node cast BOTH `soft` and `cert` votes |
 | `period_advancement_recovery` | a Go relay is paused for `PAUSE_SECONDS`, forcing period advancement; the cluster must return to lockstep |
 | `fork_free` | `algo-fork-detector` over every round |
-| `tx_gossip` | `tx_gossip.py` (issue #2154) — payments submitted to `go-node-1` appear in the other three nodes' pools (the Rust participation node included) and payments submitted to `rust-node-4` in every Go node's pool, within about two rounds; per-pair pool sightings, latencies and the commit round count are in `tx-gossip.json`. `TX_GOSSIP_CHECK=0` skips it. |
+| `tx_gossip` | `tx_gossip.py` (issue #2154) — payments submitted to `go-node-1` appear in the other three nodes' pools (the Rust participation node included) and payments submitted to `rust-node-4` in every Go node's pool, within about two rounds; per-pair pool sightings, latencies, the slowest REST answer of each target (`max_poll_s`) and the commit round count are in `tx-gossip.json`. Every target is watched by its own in-flight request from before the first submission (issue #2429: a Go node's REST answer can block for seconds behind its ledger's DB commit), and a txn seen only as committed (`confirmed_first`) fails its pair only when the pair has no pool sighting at all. `TX_GOSSIP_CHECK=0` skips it. |
 | `certs_authenticate_rust` | `algo-cert-crossverify` — Go-produced certs under Rust's verifier |
 | `certs_authenticate_go` | `tools/cert-authenticate` — the same certs under go-algorand's own `agreement.Certificate.Authenticate` |
 | `go_accepts_rust_votes` | Go's `VoteAccepted` telemetry with the Rust account as `Sender`, broken down per step |
