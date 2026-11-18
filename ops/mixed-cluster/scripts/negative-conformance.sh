@@ -36,6 +36,22 @@
 #                            Opt-in (CASES=unknown-field-proposal): the
 #                            honest copy is what the network commits, so the
 #                            evidence is that log line plus liveness.
+#   6 unknown-field-proposal-rust
+#                            the same payload injected into the ALGOD-RUST
+#                            node (issue #2398): captured off go-node-1, sent
+#                            to rust-node-4's inbound WS-gossip listener
+#                            (container 4162, published on 127.0.0.1:
+#                            PHASE6_RUST_GOSSIP_PORT). algod-rust's demux must
+#                            log "dropping proposal that failed to decode: ...
+#                            with key zzunk", keep the injector connected (go
+#                            does not disconnect either, #2431), commit the
+#                            same block as go at that round and keep making
+#                            rounds. Opt-in (CASES=unknown-field-proposal-rust).
+#
+# Both unknown-field cases also require algod-rust's own decoder to refuse the
+# bytes for the unknown key itself, not a msgp allocbound (#2427) or a repeated
+# key (#2424): the injector records that error in the report
+# (`rust_decode_error`), see unknown_field_proposal.sh.
 #
 # All three vote cases must make Go disconnect the injector with `BadData`
 # (agreement/player.go `voteMalformed` -> disconnectAction -> wsNetwork
@@ -48,7 +64,8 @@
 # but every injected vote is INVALID, so go-algorand discards it inside
 # `unauthenticatedVote.verify` before it can reach the vote tracker. It can
 # therefore never be recorded as an equivocating vote. No valid vote is ever
-# injected, and only go-node-1's gossip port is published to the host.
+# injected, and only go-node-1's gossip port is published to the host
+# (plus rust-node-4's, which only ever receives the unknown-field proposal).
 #
 # Usage:
 #   bash ops/mixed-cluster/scripts/negative-conformance.sh
@@ -62,6 +79,7 @@
 #   CAPTURE_SECS       seconds to wait for a proposal to capture    (60)
 #   HEALTH_ROUNDS      rounds the quorum must still advance after   (5)
 #   HEALTH_TIMEOUT     wall-clock cap on that, seconds              (90)
+#   PHASE6_RUST_GOSSIP_PORT  host port of rust-node-4's WS-gossip listener (4162)
 #   ALGOD_TOKEN        algod API token
 #   OUT_DIR            artifact directory
 #
@@ -73,6 +91,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=ports.sh
 source "$HERE/ports.sh"  # PHASE6_HOST_PORT_BASE -> PHASE6_*_PORT (issue #1956)
+# shellcheck source=unknown_field_proposal.sh
+source "$HERE/unknown_field_proposal.sh"  # ufp_* checks (issues #2394, #2398)
 ROOT="$(cd "$HERE/.." && pwd)"
 REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
 
@@ -92,6 +112,8 @@ SUMMARY_JSON="${SUMMARY_JSON:-$OUT_DIR/negative-summary.json}"
 TARGET_CONTAINER=phase6-go-node-1
 TARGET_REST="http://127.0.0.1:$PHASE6_GO1_PORT"
 TARGET_GOSSIP=127.0.0.1:4161
+RUST_CONTAINER=phase6-rust-node-4
+RUST_GOSSIP="127.0.0.1:${PHASE6_RUST_GOSSIP_PORT:-4162}"
 GO_PORTS=("$PHASE6_GO1_PORT" "$PHASE6_GO2_PORT" "$PHASE6_GO3_PORT")
 
 # Under Git Bash the shell hands out MSYS paths (/c/...) that neither the
@@ -135,6 +157,17 @@ try:
     print(int(v) if v is not None else 'unreachable')
 except Exception:
     print('unreachable')
+" | tr -d '\r'
+}
+
+block_hash() {  # block_hash <port> <round> -> base32 block hash or ""
+    curl -sf --max-time 5 -H "X-Algo-API-Token: $ALGOD_TOKEN" \
+        "http://127.0.0.1:$1/v2/blocks/$2/hash" 2>/dev/null | python3 -c "
+import json, sys
+try:
+    print(json.load(sys.stdin).get('blockHash') or '')
+except Exception:
+    print('')
 " | tr -d '\r'
 }
 
@@ -228,6 +261,7 @@ expected_go_error() {
         wrong-ots-domain)       echo "could not verify FS signature on vote" ;;
         malformed-proposal)     echo "" ;;
         unknown-field-proposal) echo "" ;;
+        unknown-field-proposal-rust) echo "" ;;
         *) echo "" ;;
     esac
 }
@@ -269,17 +303,25 @@ run_case() {  # run_case <case>
     local rc=0
     # unknown-field-proposal is the injector's malformed-proposal case with the
     # `unknown-field` fault (issue #2394)
-    local inject_case="$case" inject_extra=()
+    local inject_case="$case" inject_extra=() gossip="$TARGET_GOSSIP" container="$TARGET_CONTAINER"
     if [ "$case" = "unknown-field-proposal" ]; then
         inject_case="malformed-proposal"
         inject_extra=(--proposal-fault unknown-field)
+    elif [ "$case" = "unknown-field-proposal-rust" ]; then
+        # captured off go-node-1, injected into the Rust node's own listener
+        # (issue #2398)
+        inject_case="malformed-proposal"
+        inject_extra=(--proposal-fault unknown-field --capture-gossip "$TARGET_GOSSIP")
+        gossip="$RUST_GOSSIP"
+        container="$RUST_CONTAINER"
     fi
+    local rust_before; rust_before="$(node_round "$PHASE6_RUST_PORT")"
     "$FUZZ" \
         --case "$inject_case" \
         ${inject_extra[@]+"${inject_extra[@]}"} \
         --node "$TARGET_REST" \
         --token "$ALGOD_TOKEN" \
-        --gossip "$TARGET_GOSSIP" \
+        --gossip "$gossip" \
         --genesis-id "$GENESIS_ID" \
         --partkey "$PARTKEY_HOST" \
         --observe-secs "$OBSERVE_SECS" \
@@ -288,7 +330,7 @@ run_case() {  # run_case <case>
 
     # Give the node a moment to flush its log after the disconnect.
     sleep 3
-    docker logs --since "$since" "$TARGET_CONTAINER" > "$log" 2>&1 || true
+    docker logs --since "$since" "$container" > "$log" 2>&1 || true
 
     if [ "$raised" = "1" ]; then
         docker exec "$TARGET_CONTAINER" sh -c 'algocfg -d /algod/data set -p BaseLoggerDebugLevel -v 4' >/dev/null 2>&1 || true
@@ -348,22 +390,57 @@ run_case() {  # run_case <case>
         else
             record "$case" "bad-data" info "no 'disconnected: BadData' line (log level may hide it)"
         fi
-    elif [ "$case" = "unknown-field-proposal" ]; then
-        # go drops the payload at decode ("dropping proposal that failed to
-        # decode", agreement/demux.go) without a disconnect, at WARN level.
-        if grep -F "dropping proposal that failed to decode" "$log" | grep -qF "Unknown field: zzunk"; then
-            record "$case" "go-dropped-at-decode" pass \
-                "node logged 'dropping proposal that failed to decode: Unknown field: zzunk'"
+    elif [ "$case" = "unknown-field-proposal" ] || [ "$case" = "unknown-field-proposal-rust" ]; then
+        # The receiver drops the payload at decode ("dropping proposal that
+        # failed to decode": go agreement/demux.go, algod-rust demux.rs) at
+        # WARN level, without a disconnect.
+        if [ "$case" = "unknown-field-proposal" ]; then
+            if ufp_go_dropped "$log"; then
+                record "$case" "go-dropped-at-decode" pass \
+                    "node logged 'dropping proposal that failed to decode: Unknown field: zzunk'"
+            else
+                record "$case" "go-dropped-at-decode" fail \
+                    "node never dropped the payload at decode for key zzunk (see $log)"
+                FAILED=1
+            fi
+        elif ufp_rust_dropped "$log"; then
+            record "$case" "rust-dropped-at-decode" pass \
+                "algod-rust logged 'dropping proposal that failed to decode: ... with key zzunk'"
         else
-            record "$case" "go-dropped-at-decode" fail \
-                "node never dropped the payload at decode for key zzunk (see $log)"
+            record "$case" "rust-dropped-at-decode" fail \
+                "algod-rust never dropped the payload at decode for key zzunk (see $log)"
             FAILED=1
         fi
-        if grep -qF "algod-rust's own decoder accepted" "$OUT_DIR/$case.injector.log"; then
-            record "$case" "rust-decoder-rejects" fail "algod-rust's decoder accepted the payload with an unknown key"
-            FAILED=1
+        local rust_err; rust_err="$(report_field rust_decode_error)"
+        if ufp_rust_decoder_reason "$rust_err"; then
+            record "$case" "rust-decoder-rejects" pass "algod-rust's decoder refuses the bytes for the key: $rust_err"
         else
-            record "$case" "rust-decoder-rejects" pass "algod-rust's decoder rejected the same bytes before injection"
+            record "$case" "rust-decoder-rejects" fail "algod-rust's decoder did not refuse the bytes for the unknown key: $rust_err"
+            FAILED=1
+        fi
+        if ufp_not_disconnected "$disconnected"; then
+            record "$case" "no-disconnect" pass "the receiver kept the injector connected for ${OBSERVE_SECS}s"
+        else
+            record "$case" "no-disconnect" fail "the receiver disconnected the injector (disconnected=$disconnected)"
+            FAILED=1
+        fi
+        if [ "$case" = "unknown-field-proposal-rust" ]; then
+            # the Rust node commits the same block as go at the injected round
+            local round go_hash rust_hash=""
+            round="$(report_field round)"
+            go_hash="$(block_hash "$PHASE6_GO1_PORT" "$round")"
+            local wr=$(( $(date +%s) + HEALTH_TIMEOUT ))
+            while [ "$(date +%s)" -lt "$wr" ]; do
+                rust_hash="$(block_hash "$PHASE6_RUST_PORT" "$round")"
+                [ -n "$rust_hash" ] && break
+                sleep 2
+            done
+            if ufp_same_block_hash "$go_hash" "$rust_hash"; then
+                record "$case" "rust-same-block" pass "round $round: algod-rust and go-node-1 committed $rust_hash"
+            else
+                record "$case" "rust-same-block" fail "round $round: go-node-1 '$go_hash' vs algod-rust '$rust_hash'"
+                FAILED=1
+            fi
         fi
     else
         # A malformed payload is answered with ignoreAction, not a disconnect
@@ -413,6 +490,26 @@ run_case() {  # run_case <case>
     else
         record "$case" "liveness" fail "quorum did not advance $HEALTH_ROUNDS rounds within ${HEALTH_TIMEOUT}s"
         FAILED=1
+    fi
+    if [ "$case" = "unknown-field-proposal-rust" ]; then
+        # ...and so does the Rust node, which only learns blocks from its go
+        # peers: it kept them after dropping the payload.
+        local rust_after="" rok=0
+        d=$(( $(date +%s) + HEALTH_TIMEOUT ))
+        while [ "$(date +%s)" -lt "$d" ]; do
+            rust_after="$(node_round "$PHASE6_RUST_PORT")"
+            if [[ "$rust_before" =~ ^[0-9]+$ ]] && [[ "$rust_after" =~ ^[0-9]+$ ]] \
+                && [ "$rust_after" -ge $(( rust_before + HEALTH_ROUNDS )) ]; then
+                rok=1; break
+            fi
+            sleep 2
+        done
+        if [ "$rok" = "1" ]; then
+            record "$case" "rust-liveness" pass "algod-rust advanced $rust_before -> $rust_after"
+        else
+            record "$case" "rust-liveness" fail "algod-rust did not advance $HEALTH_ROUNDS rounds from $rust_before (now $rust_after)"
+            FAILED=1
+        fi
     fi
 
     if grep -Eqi 'panic:|fatal error:' "$log"; then

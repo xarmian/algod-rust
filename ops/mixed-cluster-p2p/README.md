@@ -155,6 +155,35 @@ semicolon-separated list of full multiaddrs (including a trailing
 seeds that node's DHT routing table and phonebook with exactly one
 directly-known peer.
 
+## Negative case: unknown-field proposal (issue #2398)
+
+`scripts/negative-conformance.sh` (issue #597, `make p2p-interop-negative`)
+also has the opt-in `unknown-field-proposal` case of the WS-gossip harness
+(issue #2394): a proposal payload captured off go-node-1 over
+`/algorand-ws/2.2.0`, block untouched, with one key `zzunk` added to its
+first transaction (top level for an empty payset), re-injected over the
+same stream. The checks (`../mixed-cluster/scripts/unknown_field_proposal.sh`):
+
+- `go-dropped-at-decode`: go-node-1 logs `dropping proposal that failed
+  to decode: Unknown field: zzunk` (`agreement/demux.go`, WARN level; the
+  agreement layer is transport-agnostic);
+- `rust-decoder-rejects`: algod-rust's own `decode_compound_message`
+  refuses the same bytes for that key (`no matching struct field found
+  ... with key zzunk`), not for a msgp allocbound (#2427) or a repeated key
+  (#2424);
+- `no-disconnect`: go does not reset the injector's stream;
+- `liveness` / `no-crash` as for every case.
+
+```bash
+CASES=unknown-field-proposal bash ops/mixed-cluster-p2p/scripts/negative-conformance.sh
+```
+
+Injection **into** the algod-rust node is done in the WS-gossip harness
+(`ops/mixed-cluster`, case `unknown-field-proposal-rust`): this harness's
+rust-node-4 is an outbound-only `P2pOnly` peer, and giving it a dialable
+listener would let the go nodes discover it over the DHT and change the
+topology this harness exists to prove.
+
 ## Cert verification on long soaks: `--cert-latest N` (issue #1913)
 
 Verifying the certificate of round `r` needs the online-account state at

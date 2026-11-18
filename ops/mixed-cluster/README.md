@@ -430,7 +430,19 @@ algo-agreement-fuzz --case bad-vrf-proof --dry-run ...
 | `wrong-committee-weight` | nothing on the wire — an entirely honest vote for a `(round, 0, propose)` where the account wins **zero** seats (**0 bytes** differ) | `malformed proposal for (r, 0): … UnauthenticatedCredential.Verify: credential has weight 0` + `BadData` |
 | `wrong-ots-domain` | the correct one-time key signs the correct body under the `"PL"` domain instead of `"VO"` | `malformed vote for (r, 0, 255): unauthenticatedVote.verify: could not verify FS signature on vote by …` + `BadData` |
 | `malformed-proposal` | a genuine `PP` captured off the wire with one block field corrupted | `rejected block for (r, 0): proposalStore: no accepting blockAssembler found on payloadPresent`, and the corrupted block is never committed |
-| `unknown-field-proposal` (opt-in, `CASES=unknown-field-proposal`; issue #2394) | a genuine `PP` captured off the wire, block untouched, with **one unknown key** added to its first transaction (top level when the payset is empty) | `dropping proposal that failed to decode: Unknown field: zzunk` (`agreement/demux.go`, `msgp.ErrNoField`; WARN level, no disconnect); algod-rust's own `decode_compound_message` must refuse the same bytes (checked before injecting) |
+| `unknown-field-proposal` (opt-in, `CASES=unknown-field-proposal`; issue #2394) | a genuine `PP` captured off the wire, block untouched, with **one unknown key** added to its first transaction (top level when the payset is empty) | `dropping proposal that failed to decode: Unknown field: zzunk` (`agreement/demux.go`, `msgp.ErrNoField`; WARN level); the injector stays connected for the whole observe window (`no-disconnect`); algod-rust's own `decode_compound_message` must refuse the same bytes **for that key** (checked before injecting and recorded as the report's `rust_decode_error`, so a msgp allocbound (#2427) or repeated-key (#2424) failure does not count) |
+| `unknown-field-proposal-rust` (opt-in, `CASES=unknown-field-proposal-rust`; issue #2398) | the same payload, captured off go-node-1 (`--capture-gossip 127.0.0.1:4161`) and injected **into the algod-rust node** through its inbound WS-gossip listener (container port 4162, published on `127.0.0.1:${PHASE6_RUST_GOSSIP_PORT:-4162}`; no go node is told that address, so the topology is unchanged) | algod-rust's `demux.rs`: `dropping proposal that failed to decode: … no matching struct field found when decoding stream map with key zzunk` (WARN, `rust-dropped-at-decode`); the injector is not disconnected (`no-disconnect`, go's behaviour since #2431); `rust-same-block`: algod-rust commits the same block hash as go-node-1 at the captured round; `rust-liveness`: algod-rust keeps advancing (it learns blocks only from its go peers, so it kept them) as well as the go quorum |
+
+Both unknown-field checks live in `scripts/unknown_field_proposal.sh`
+(shared with `ops/mixed-cluster-p2p/scripts/negative-conformance.sh`,
+which runs `unknown-field-proposal` against go over `/algorand-ws/2.2.0`)
+and are tested Docker-free by `scripts/unknown_field_proposal_shell_test.sh`
+(`make consensus-cluster-analyzer`, the Harness Shell Tests workflow):
+
+```bash
+PHASE6_HOST_PORT_BASE=5000 CASES="unknown-field-proposal unknown-field-proposal-rust" \
+    bash ops/mixed-cluster/scripts/negative-conformance.sh
+```
 
 Each vote case is answered with `disconnectAction`
 (`agreement/player.go`, `voteMalformed`) → `disconnectBadData`

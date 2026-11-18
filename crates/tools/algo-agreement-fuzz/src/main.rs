@@ -96,6 +96,14 @@ struct Cli {
     #[arg(long)]
     p2p_multiaddr: Option<String>,
 
+    /// `host:port` of a WS-gossip listener to capture the honest proposal
+    /// from (`malformed-proposal` only), when the injection target is not
+    /// one that relays proposals to a fresh observer. Defaults to the
+    /// injection transport itself. Issue #2398 captures off go-node-1 and
+    /// injects into the algod-rust node's listener.
+    #[arg(long)]
+    capture_gossip: Option<String>,
+
     /// Genesis ID of the network (e.g. `phase6net-v1`).
     #[arg(long)]
     genesis_id: String,
@@ -181,6 +189,10 @@ struct Report {
     /// `true` only if the network committed the corrupted block. Must be
     /// `false`; `true` would be a genuine consensus-safety finding.
     corrupted_block_adopted: Option<bool>,
+    /// algod-rust's own `decode_compound_message` error for the injected
+    /// bytes (`unknown-field` only). Checked before anything is sent: it must
+    /// name the unknown key, not another decode failure (issue #2398).
+    rust_decode_error: Option<String>,
     dry_run: bool,
 }
 
@@ -338,6 +350,15 @@ impl Transport {
                 observe,
                 ..cfg.clone()
             }),
+        }
+    }
+
+    /// The transport to capture an honest proposal over: `--capture-gossip`
+    /// when given, else this one.
+    fn capture_from(&self, cli: &Cli) -> Self {
+        match &cli.capture_gossip {
+            Some(addr) => Transport::WsGossip(InjectorConfig::new(addr, &cli.genesis_id)),
+            None => self.with_observe(cli.observe_secs),
         }
     }
 
@@ -675,6 +696,7 @@ async fn run_vote_case(
         injected_block_digest: None,
         committed_block_digest: None,
         corrupted_block_adopted: None,
+        rust_decode_error: None,
         dry_run: cli.dry_run,
     };
 
@@ -705,7 +727,7 @@ async fn run_malformed_proposal(cli: &Cli, algod: &Algod, transport: &Transport)
         return run_unknown_field_proposal(cli, algod, transport).await;
     }
     let fault = parse_proposal_fault(&cli.proposal_fault)?;
-    let capture_transport = transport.with_observe(cli.capture_secs);
+    let capture_transport = transport.capture_from(cli).with_observe(cli.capture_secs);
 
     let captured = capture_transport.capture_proposal().await?;
     tracing::debug!(
@@ -748,6 +770,7 @@ async fn run_malformed_proposal(cli: &Cli, algod: &Algod, transport: &Transport)
         injected_block_digest: Some(injected_cm.proposal.block_digest().to_string()),
         committed_block_digest: None,
         corrupted_block_adopted: None,
+        rust_decode_error: None,
         dry_run: cli.dry_run,
     };
     tracing::info!(
@@ -807,6 +830,7 @@ async fn run_unknown_field_proposal(
     use algo_agreement::codec;
 
     let captured = transport
+        .capture_from(cli)
         .with_observe(cli.capture_secs)
         .capture_proposal()
         .await?;
@@ -815,10 +839,10 @@ async fn run_unknown_field_proposal(
     let round = cm.proposal.round();
     let baseline_bytes = encode_compound_message(&cm);
     let (injected_bytes, site) = algo_agreement_fuzz::with_unknown_field(&baseline_bytes)?;
-    // algod-rust itself must refuse what it is about to inject (go does).
-    if codec::decode_compound_message(&injected_bytes).is_ok() {
-        bail!("algod-rust's own decoder accepted the payload with an unknown key");
-    }
+    // algod-rust itself must refuse what it is about to inject, for the
+    // unknown key and not for an allocbound or repeated key (go does).
+    let rust_decode_error = algo_agreement_fuzz::rust_rejects_for_unknown_key(&injected_bytes)?;
+    tracing::info!(%rust_decode_error, "algod-rust's decoder rejects the injected bytes");
     tracing::info!(
         round = round.0,
         ?site,
@@ -844,6 +868,7 @@ async fn run_unknown_field_proposal(
         injected_block_digest: Some(cm.proposal.block_digest().to_string()),
         committed_block_digest: None,
         corrupted_block_adopted: None,
+        rust_decode_error: Some(rust_decode_error),
         dry_run: cli.dry_run,
     };
     if cli.dry_run {
@@ -931,6 +956,43 @@ mod tests {
             VoteFault::WrongOtsDomain(OtsDomain::Payload)
         );
         assert!(parse_vote_fault("nope").is_err());
+    }
+
+    fn cli(extra: &[&str]) -> Cli {
+        let mut args = vec![
+            "algo-agreement-fuzz",
+            "--case",
+            "malformed-proposal",
+            "--token",
+            "t",
+            "--genesis-id",
+            "g",
+            "--partkey",
+            "k",
+            "--gossip",
+            "127.0.0.1:4162",
+        ];
+        args.extend_from_slice(extra);
+        Cli::try_parse_from(args).expect("valid cli")
+    }
+
+    fn gossip_addr(t: &Transport) -> &str {
+        match t {
+            Transport::WsGossip(c) => &c.peer_addr,
+            Transport::P2p(_) => panic!("expected ws-gossip"),
+        }
+    }
+
+    #[test]
+    fn capture_gossip_captures_elsewhere_and_injects_into_the_target() {
+        let c = cli(&["--capture-gossip", "127.0.0.1:4161"]);
+        let t = Transport::resolve(&c, c.observe_secs).unwrap();
+        assert_eq!(gossip_addr(&t), "127.0.0.1:4162");
+        assert_eq!(gossip_addr(&t.capture_from(&c)), "127.0.0.1:4161");
+
+        let c = cli(&[]);
+        let t = Transport::resolve(&c, c.observe_secs).unwrap();
+        assert_eq!(gossip_addr(&t.capture_from(&c)), "127.0.0.1:4162");
     }
 
     #[test]

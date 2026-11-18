@@ -679,6 +679,31 @@ pub fn with_unknown_field(encoded_pp: &[u8]) -> Result<(Vec<u8>, UnknownFieldSit
     Ok((out, site))
 }
 
+/// algod-rust's own verdict on a [`with_unknown_field`] payload (issue #2398).
+///
+/// `Ok(error text)` only when `decode_compound_message` refuses the bytes
+/// **because of** [`UNKNOWN_FIELD_KEY`]. Accepting them, or refusing them for
+/// another reason (a msgp allocbound from #2427, a repeated key from #2424, a
+/// truncated buffer), is an `Err`: the live case would then no longer prove
+/// that both implementations drop the payload for the same reason.
+pub fn rust_rejects_for_unknown_key(injected_pp: &[u8]) -> Result<String, FuzzError> {
+    match codec::decode_compound_message(injected_pp) {
+        Ok(_) => Err(FuzzError::PreconditionViolated(
+            "algod-rust's own decoder accepted the payload with an unknown key".to_string(),
+        )),
+        Err(e) => {
+            let text = e.to_string();
+            if text.contains(&format!("with key {UNKNOWN_FIELD_KEY}")) {
+                Ok(text)
+            } else {
+                Err(FuzzError::PreconditionViolated(format!(
+                    "algod-rust's own decoder rejected the payload for another reason: {text}"
+                )))
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Small helpers shared with the binary
 // ---------------------------------------------------------------------------
@@ -1392,6 +1417,57 @@ mod tests {
             assert!(!fault.expected_go_error().is_empty(), "{fault:?}");
             assert_ne!(fault.case_name(), "baseline", "{fault:?}");
         }
+    }
+
+    // ── Case 4b: unknown-field proposal (issues #2394, #2398) ──────────
+
+    fn honest_pp(with_txn: bool) -> Vec<u8> {
+        let mut p = sample_proposal();
+        if with_txn {
+            p.block.payset.push(algo_types::SignedTransaction {
+                sig: [7; 64],
+                txn: algo_types::Transaction {
+                    txn_type: algo_types::TxnType::from("pay".to_string()),
+                    sender: Address([9; 32]),
+                    fee: 1000,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+        let bytes = encode_compound_message(&build_compound_message(p, sample_vote()));
+        codec::decode_compound_message(&bytes).expect("the honest payload decodes");
+        bytes
+    }
+
+    #[test]
+    fn rust_rejects_the_unknown_key_at_both_sites() {
+        for (with_txn, want) in [
+            (false, UnknownFieldSite::TopLevel),
+            (true, UnknownFieldSite::SignedTxn),
+        ] {
+            let (bad, site) = with_unknown_field(&honest_pp(with_txn)).unwrap();
+            assert_eq!(site, want);
+            let reason = rust_rejects_for_unknown_key(&bad).expect("rejected for the key");
+            assert!(
+                reason.contains("no matching struct field found"),
+                "{site:?}: {reason}"
+            );
+            assert!(reason.contains("zzunk"), "{site:?}: {reason}");
+        }
+    }
+
+    #[test]
+    fn rust_verdict_is_an_error_when_accepted_or_rejected_for_another_reason() {
+        let honest = honest_pp(false);
+        let err = rust_rejects_for_unknown_key(&honest).unwrap_err();
+        assert!(err.to_string().contains("accepted"), "{err}");
+
+        // truncated before the key (it is appended last): rejected, but not
+        // because of the key
+        let (bad, _) = with_unknown_field(&honest).unwrap();
+        let err = rust_rejects_for_unknown_key(&bad[..bad.len() / 2]).unwrap_err();
+        assert!(err.to_string().contains("another reason"), "{err}");
     }
 
     // ── Misc helpers ───────────────────────────────────────────────────
