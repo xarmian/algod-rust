@@ -126,11 +126,19 @@ impl PQSig {
     /// Without this arm `pqsig` fell into `skip_value` and every PQ-account
     /// transaction submitted over REST looked unsigned (issue #1960).
     pub fn decode_from_reader(rd: &mut &[u8]) -> Result<Self, algo_error::AlgoError> {
-        let len = crate::rmp_decode::read_map_len(rd)?;
+        let _session = crate::rmp_decode::decode_session();
         let mut s = Self::default();
+        Self::decode_into(rd, &mut s)?;
+        Ok(s)
+    }
+
+    /// Decode into an already decoded value, as go's generated `UnmarshalMsg`
+    /// does (issue #2424): a repeated key decodes into the populated field.
+    pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> Result<(), algo_error::AlgoError> {
+        let len = crate::rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match crate::rmp_decode::read_key_bytes(rd)? {
-                b"sch" => s.scheme = crate::rmp_decode::read_fixed_bytes_go_compat::<2>(rd)?,
+                b"sch" => crate::rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.scheme)?,
                 b"slt" => s.salt = PQAddressSalt(crate::rmp_decode::read_u8_val(rd)?),
                 // go's `allocbound=crypto.MaxPQPublicKeySize` / `MaxPQSignatureSize`.
                 b"pk" => {
@@ -150,7 +158,7 @@ impl PQSig {
                 other => crate::rmp_decode::unknown_key(rd, other)?,
             }
         }
-        Ok(s)
+        Ok(())
     }
 
     /// Mirrors go's `PQSig.Address()`: the authorizer address derived from

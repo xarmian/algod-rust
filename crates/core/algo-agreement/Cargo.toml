@@ -31,6 +31,7 @@ criterion.workspace = true
 
 [dependencies]
 algo-codec.workspace = true
+algo-error.workspace = true
 algo-consensus-crypto.workspace = true
 algo-pool.workspace = true
 algo-types.workspace = true

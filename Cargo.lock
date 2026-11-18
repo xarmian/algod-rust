@@ -83,6 +83,7 @@ dependencies = [
  "algo-agreement",
  "algo-codec",
  "algo-consensus-crypto",
+ "algo-error",
  "algo-pool",
  "algo-types",
  "algo-validate",

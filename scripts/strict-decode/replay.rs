@@ -192,6 +192,10 @@ pub fn replay(
         })
         .collect();
     let mut mismatches = Vec::new();
+    let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
+    // `STRICT_MISMATCH_OUT`: every differing mutant as an oracle input row
+    // ({"name","kind","hex"}), to read go's decoded value when debugging
+    let mut dump = String::new();
     let mut accepted = 0usize;
     for c in &cases {
         let seed = &seeds[c["seed"].as_str().expect("seed")];
@@ -214,11 +218,15 @@ pub fn replay(
         let kind = c["kind"].as_str().expect("kind");
         let go_ok = c["go_ok"].as_bool().expect("go_ok");
         accepted += go_ok as usize;
+        let before = mismatches.len();
+        let mut rust_val = String::new();
+        let mut rust_err = String::new();
         for (path, rust) in verdicts(kind, &mutant) {
             if let (true, Ok(Some(enc))) = (go_ok, &rust) {
                 let got = hex::encode(&Sha256::digest(enc)[..8]);
                 let want = c["go_val"].as_str().expect("an accepted case has go_val");
                 if got != want {
+                    rust_val = hex::encode(enc);
                     mismatches.push(format!(
                         "{what} case {} ({kind}, seed {}, map {}, pos {}, key {}, val {}): {path} decodes another value than go (re-encoded, first 96 bytes: {})",
                         c["id"],
@@ -245,8 +253,25 @@ pub fn replay(
                     if rust.is_ok() { "accepts" } else { "rejects" },
                     rust.as_ref().err().map(|e| format!(" ({e})")).unwrap_or_default(),
                 ));
+                if let Err(e) = &rust {
+                    rust_err = e.clone();
+                }
             }
         }
+        if mismatches.len() > before {
+            *by_kind.entry(kind.to_string()).or_default() += 1;
+            let row = serde_json::json!({
+                "name": c["id"].to_string(),
+                "kind": kind,
+                "hex": hex::encode(&mutant),
+                "rust": rust_val,
+                "rust_err": rust_err,
+            });
+            dump.push_str(&format!("{row}\n"));
+        }
+    }
+    if let Ok(out) = std::env::var("STRICT_MISMATCH_OUT") {
+        std::fs::write(format!("{out}.{what}"), &dump).expect("write STRICT_MISMATCH_OUT");
     }
     assert!(accepted > 0 && accepted < cases.len(), "degenerate fixture");
     if !mismatches.is_empty() {
@@ -254,8 +279,8 @@ pub fn replay(
         mismatches.sort_by_key(|m| !m.contains("map -1"));
         let shown: Vec<_> = mismatches.iter().take(40).cloned().collect();
         panic!(
-            "{} of {} {what} cases differ from go:\n{}",
-            mismatches.len(),
+            "{} of {} {what} cases differ from go (by kind: {by_kind:?}):\n{}",
+            by_kind.values().sum::<usize>(),
             cases.len(),
             shown.join("\n")
         );
@@ -264,6 +289,7 @@ pub fn replay(
 
 /// The committed cases plus, when `STRICT_FUZZ_FILE` is set, the script's
 /// `--fuzz N OUT` output for this set (`OUT.<set>`).
+#[allow(dead_code)] // the consensus test replays its own way
 pub fn replay_committed_and_fuzz(
     manifest_dir: &str,
     set: &str,

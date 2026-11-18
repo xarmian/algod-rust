@@ -55,7 +55,7 @@ consensus-compatible. It exists for three readers:
 | DIV-001 | Falcon-1024 `det1024` implemented in pure Rust; vendored C kept as a runtime-selectable backend (`config.json` `FalconBackend`) | crypto / state proofs / PQ accounts / AVM `falcon_verify` | landed | 2026-10-14 | none (bit-identical keys, signatures, verify decisions, CT conversion) | `crates/core/algo-falcon/`, `crates/node/algo-config/src/lib.rs` (`FalconBackend`), `bin/algod-rust/src/commands/node.rs`, `crates/tools/algokey-rust` | `crypto/falconWrapper.go`, module `github.com/algorand/falcon` v0.1.0 (`falcon.go`, `deterministic.c`, Pornin's reference C) | Go-generated vector corpus diffed in CI, per-function differential tests vs the vendored C, fuzz target (epic #1926) |
 | DIV-002 | `goal node pendingtxns` prints each pending transaction in the REST API's JSON form instead of Go's `encoding/json` dump of its decoded `SignedTxn` structs | goal-rust CLI output | landed | 2026-10-17 | none (client-side formatting of data the node already serves) | `crates/tools/goal-rust/src/cmd/node.rs` (`format_pending_txns`) | `cmd/goal/node.go` (`pendingTxnsCmd`), `libgoal/libgoal.go` (`GetParsedPendingTransactions`) | unit test of the exact text for the empty and non-empty pool, mock-node end-to-end test |
 | DIV-003 | `algo-abi` rejects ABI types whose encoded head size overflows `usize` at parse time, and caps zero-size array element expansion in `decode` | ABI type parsing / decoding (REST `abi:` box names, goal CLI) | landed | 2026-10-24 | none (no such type can be encoded; valid ARC-4 vectors byte-identical) | `crates/core/algo-abi/src/lib.rs` (`check_static_size`, `MAX_ZERO_SIZE_ELEMS`) | `github.com/algorand/avm-abi` `abi/abi_type.go` (`TypeOf`, `GetEncodedSize`), `abi/abi_encode.go` | `algo-abi` unit tests (overflow/huge-array/zero-size cases) plus the unchanged ARC-4 vector suite (#2057) |
-| DIV-004 | Hand-written msgpack struct readers decode the map form only (go also decodes struct-from-array) and replace, rather than merge into, a struct/array on a duplicated key | wire decoding of non-canonical msgpack (blocks, transactions, heartbeat, state proof, PQ structs) | landed | 2026-10-24 | none for canonical encodings (go's encoder never emits the array form or duplicate keys; hashes are over the canonical re-encode); only non-canonical input go accepts is rejected or decoded differently | `crates/core/algo-types/src/rmp_decode.rs` (`read_map_len`), the `decode_from_reader` struct readers in `crates/core/algo-types/src/{transaction,block,header,pq}.rs` | `data/transactions/msgp_gen.go` (`SignedTxn.UnmarshalMsgWithState` struct-from-array branch and key loop), algorand/msgp `msgp/read_bytes.go` | `docs/BYTES_DECODE_PARITY.md` "Issue #2065: final disposition"; `go_msgp_nil_scalars_test.rs` pins the parts that were implemented (nil -> zero) |
+| DIV-004 | Hand-written msgpack struct readers decode the map form only (go also decodes a struct sent as an array, positionally) | wire decoding of non-canonical msgpack (blocks, transactions, votes, bundles, proposals, heartbeat, state proof, PQ structs) | landed | 2026-10-24 (narrowed 2026-11-18 by #2424: a repeated key now decodes into the populated field like go) | none for canonical encodings (go's encoder never emits the array form; hashes are over the canonical re-encode); only array-form input go accepts is rejected | `crates/core/algo-types/src/rmp_decode.rs` (`read_map_len`, `read_struct_map_len`), `crates/core/algo-agreement/src/codec.rs` (`struct_map_len`) | `data/transactions/msgp_gen.go` (`SignedTxn.UnmarshalMsgWithState` struct-from-array branch), algorand/msgp `msgp/read_bytes.go` | `docs/BYTES_DECODE_PARITY.md` "Issue #2065: final disposition" and "Issue #2424"; follow-up #2426 |
 | DIV-005 | `algokey keyreg` and the `--network` presets accept `voimain` (Voi mainnet) and `aramidmain` (Aramid mainnet), networks absent from go-algorand's `validNetworks` map | network presets / algokey genesis-hash table | landed | 2026-10-25 | none (additive preset; the four go networks resolve exactly as before) | `crates/core/algo-types/src/networks.rs`, `bin/algod-rust/src/commands/network_common.rs` | `cmd/algokey/keyreg.go` (`validNetworks`) | genesis-hash pin tests (`networks_parity`, `genesis_test::test_voimain_genesis_hash_matches_fixture`) against the live Voi `/genesis` and `/versions` (epic #2068, #2069, #2070) |
 | DIV-006 | A network preset's bundled `consensus.json` (aramidmain) contributes only protocol versions the binary does not already define; go loads every entry of a `consensus.json` wholesale | `--network aramidmain` consensus table | landed | 2026-10-25 | none (the aramidmain chain only ever uses `aramidmain-v1.0/1..3`, which are loaded exactly as go loads them; the file's stale copies of `future`/`v7`..`v12`/spec-URL protocols are never used by that chain) | `crates/core/algo-types/src/consensus.rs` (`preload_consensus_protocols_with_bundle`), `bin/algod-rust/src/commands/network_common.rs` | `config/config.go` (`PreloadConfigurableConsensusProtocols`), `config/consensus.go` (`ConsensusProtocols.Merge`) | `aramidmain_consensus_test.rs` (`custom_protocols_merge_like_go`, `bundle_adds_only_unknown_protocols`, `data_dir_file_overrides_bundle`) and the live aramidmain catchup + follow (#2070) |
 | DIV-007 | `simulate` serves a past `Request.Round` only from undo data held in memory for at most the last 320 rounds and at most a 16 MiB budget (whichever is fewer rounds), which starts empty at every node start; go serves back to its tracker `dbRound` (about `MaxAcctLookback` behind the latest round) at once after a restart | simulate (`POST /v2/transactions/simulate` with `round`) | landed | 2026-10-31 | none (affects only whether a simulate request with a past round is served; no block, state or consensus path) | `crates/core/algo-ledger/src/undo_journal.rs` (`UndoJournal`), `crates/core/algo-ledger/src/simulation/mod.rs` (`Simulator::rewind`), `crates/core/algo-ledger/src/sqlite.rs` (`undo_note_*`) | `ledger/simulation/simulator.go` (`Simulate`, `simulatorLedger.start`), `ledger/acctupdates.go` (`RoundOffsetError`) | `simulate_past_round_oracle_test.rs` (go oracle: rounds 1, 2 and the latest on a rewards-accruing chain), `simulate_past_round_test.rs` (state, window edge, header rewards state incl. a recalculation round), `undo_journal` unit tests, `simulation_gaps_test.rs` (store without undo data); the latest-round path stays proven by the #2118 go oracle (`simulation_rewards_oracle_test.rs`) |
@@ -210,55 +210,65 @@ unchanged and green; new unit tests cover the rejected cases and the boundary
 **How go-algorand could port it.** Use overflow-checked multiplication in the
 size computation and validate `len*minElemSize <= len(data)` before decoding.
 
-### DIV-004 — Map-form-only struct readers; no merge-into-existing on duplicate keys
+### DIV-004 — Map-form-only struct readers (no struct-from-array)
 
-**Status:** landed (#2065; audit chain #2046 -> #2063 -> #2065).
+**Status:** landed (#2065; audit chain #2046 -> #2063 -> #2065). Narrowed by
+#2424: the "replace instead of merge on a repeated key" half is gone, only the
+array form remains (follow-up #2426).
 
 **What go-algorand does.** Every generated `UnmarshalMsgWithState` first
 calls `msgp.ReadMapHeaderBytes`; on a `TypeError` it retries
 `ReadArrayHeaderBytes` and decodes the fields positionally in Go declaration
-order ("struct-from-array", `ErrTooManyArrayFields` on excess). In the map
-branch there is no duplicate-key detection: a repeated key decodes into the
-already-populated field, so a repeated nested struct merges and a repeated
-fixed-size byte value shorter than the array keeps the earlier tail.
+order ("struct-from-array", `ErrTooManyArrayFields` on excess).
 
-**What algod-rust does instead.** The hand-written `decode_from_reader`
-struct readers accept the map form (and nil, as go does, since #2065) but not
-the array form, and a repeated key replaces the field (nested struct /
-fixed-size array zero-filled) instead of merging; the transaction-sync
-response reads its transactions with the same `SignedTransaction` reader
-(since #2396). Making these readers merge is #2424. The non-consensus
-catchpoint, identity-handshake and peer-meta readers are not part of this
-entry: they decode a repeated key exactly as go does (#2421).
+**What algod-rust does instead.** The hand-written struct readers accept the
+map form (and nil, as go does, since #2065) but not the array form.
+
+Everything else about a struct decode is go's. Since #2424 every consensus
+reader (transactions, blocks, headers, the PQ and state-proof structs, the
+agreement codec's votes, bundles and proposal payloads), the raw `dt` / `spt`
+subtrees and the tx-sync response decode a **repeated key** exactly as go
+does: the field is decoded again INTO its current value (a nested struct
+merges and `nil` resets it; a slice is re-sliced within go's capacity, hidden
+elements coming back; a `[N]byte` keeps the bytes past a shorter value; a map
+gains entries), and the `required` checks run on the merged result. `dt` and
+`spt` are kept as go's canonical re-encode of what go decodes. The tx-sync
+response is decoded the way go's go-codec (`protocol.DecodeReflect`) decodes
+it: no `required` or `allocbound` checks, and a repeated `Reveals` entry is
+decoded into the existing, unaddressable map value. The non-consensus
+catchpoint, identity-handshake and peer-meta readers already did (#2421), and
+the catchpoint readers also read the array form.
+
 Since #2394 the catchup `decode_block_response` uses the hand-written reader too
 (`decode_block_response_serde` is the old path).
 Since #2319 `decode_block` (catchup, archive replay, apply, gossip block source)
 uses the hand-written reader too (behind the same depth pre-scan); its old
 serde path is `decode_block_serde`, the reference of
 `crates/core/algo-codec/tests/decode_block_differential_test.rs`. Over 88k
-mutated blocks the two differ only in six classes, and in each the hand reader
-is the side that matches go: a non-UTF-8 `str` key in `state_proof_tracking` is
-kept as a `str` (serde turned it into `bin`, which changes the header's
-canonical re-encode and so the block hash); an integer where a map key belongs
-is rejected (serde used it as a field index; go's `ReadMapKeyZC` rejects it); a
-nil integer, boolean or struct decodes to zero (serde errors; go decodes zero);
-a `[N]byte` of another length follows `ReadExactBytes` (serde is strict); a
-struct sent as an array and a transaction without `type` are rejected at decode
-(serde accepts; go decodes them, the latter failing later in `WellFormed`: both
-only for non-canonical input no node emits, and never for a block whose digest
-a certificate authenticates). Since #2421 a `bin` or uint8 array where a go
-`string` belongs is read as its bytes, as go's `ReadStringZC` does (serde
-rejects it).
+mutated blocks the two differ only in the classes listed there, and in each the
+hand reader is the side that matches go: a non-UTF-8 `str` key in
+`state_proof_tracking` is kept as a `str` (serde turned it into `bin`, which
+changes the header's canonical re-encode and so the block hash); an integer
+where a map key belongs is rejected (serde used it as a field index; go's
+`ReadMapKeyZC` rejects it); a nil integer, boolean or struct decodes to zero
+(serde errors; go decodes zero); a `[N]byte` of another length follows
+`ReadExactBytes` (serde is strict); a struct sent as an array and a
+transaction without `type` are rejected at decode (serde accepts; go decodes
+them, the latter failing later in `WellFormed`: both only for non-canonical
+input no node emits, and never for a block whose digest a certificate
+authenticates); a repeated key decodes into the populated field (serde: last
+wins). Since #2421 a `bin` or uint8 array where a go `string` belongs is read
+as its bytes, as go's `ReadStringZC` does (serde rejects it).
 
 **`LogicSig` (#2390).** The `LogicSig` / `MultisigSig` / `PQSig` readers
 carry go's allocation bounds (`l` at most 16000 bytes, `arg` at most 255
 elements of at most 4096 bytes, `subsig` at most 255, `pqsig` `pk`/`sig` at
 most 1793/1538 bytes) and a `nil` `msig`/`lmsig` fails the `required` checks
 as go's zero `MultisigSig` does; before, a `SignedTxn` go refuses at decode
-with one of these reached evaluation here. The array form and merge-on-repeat
-of this entry still apply to them: `algo_codec::decode_logicsig_go` is a
-faithful port of go's decode (array form, merging, every msgp leniency) for
-tools that must accept exactly what go does (`goal clerk compile -D`), and
+with one of these reached evaluation here. The array form of this entry still
+applies to them: `algo_codec::decode_logicsig_go` is a faithful port of go's
+decode (array form, merging, every msgp leniency) for tools that must accept
+exactly what go does (`goal clerk compile -D`), and
 `crates/core/algo-codec/tests/logicsig_go_decode_test.rs` pins, on the records
 of `tests/common/lsig_cases.rs` (also run through a real go `goal` in
 `crates/tools/goal-rust/tests/clerk_compile_e2e.rs`), that the consensus
@@ -268,33 +278,34 @@ reader never accepts a record the port rejects.
 decoders (and the reflection codec, `ErrorIfNoField = true`) fail with
 `msgp.ErrNoField` on a key the struct lacks, on every path that decodes a
 message: gossip proposal payloads / votes / bundles, catchup and REST blocks,
-block DB reads. Until #2394 the hand-written block, header, vote and bundle
-readers skipped such keys (only REST submit, gossip TX and simulate were
-strict), so a Rust node could vote for a proposal go nodes drop at decode. Every
-reader now rejects them at any nesting level, including the three subtrees
-kept as raw `rmpv::Value`s (`spt`, `dt`, the block response's `cert`; checked by
-`crates/core/algo-types/src/msgp_schema.rs`), proven by
+block DB reads. Every reader rejects them at any nesting level, including the
+raw `rmpv::Value` subtrees (`dt` and `spt` are decoded by
+`crates/core/algo-types/src/go_eval_delta.rs`, the block response's `cert` is
+checked by `crates/core/algo-types/src/msgp_schema.rs`), proven by
 `crates/core/algo-agreement/tests/strict_unknown_fields_go_parity.rs` against
 go's real decoders (`scripts/strict-decode/strict_decode_fixtures.py`).
 
 **What is identical.** All canonical input (go's encoder always writes a
-map with unique keys), nil -> zero for integers/bools/map headers, every
-byte-field form (`docs/BYTES_DECODE_PARITY.md`), a `bin` or uint8-array value
-for a go `string` field (#2421), unknown-key handling (since
-#2394), and every hash, ID and signature input (all are over the canonical re-encode of
-the decoded struct in both implementations).
+map), nil -> zero for integers/bools/map headers, every byte-field form
+(`docs/BYTES_DECODE_PARITY.md`), a `bin` or uint8-array value for a go
+`string` field (#2421), unknown-key handling (since #2394), every repeated key
+(since #2424, proven value for value by the strict-decode fixtures and a
+160k-case differential fuzz against go), and every hash, ID and signature
+input (all are over the canonical re-encode of the decoded struct in both
+implementations).
 
-**Why.** Positional decoding needs a per-struct field-order table for ~100
-readers and merge-on-duplicate needs decode-into-existing everywhere; the
-only inputs that benefit are hand-crafted non-canonical encodings that no
-node emits.
+**Why.** Positional decoding needs a per-struct field-order table (go's
+declaration order with embedded structs flattened, not the sorted wire-key
+order) in every reader; the only inputs that benefit are hand-crafted
+non-canonical encodings that no node emits. Tracked by #2426.
 
-**How parity is proven / impact.** No safety impact: a non-canonical wrapper
-cannot change a hash, so no fork. Worst case an adversary makes algod-rust
-drop one proposal payload or gossiped transaction, or one catchup peer, that
-go would decode (one-round liveness, repaired by catchup or another peer).
-Reasoning and the source citations are in `docs/BYTES_DECODE_PARITY.md`
-("Issue #2065: final disposition").
+**How parity is proven / impact.** No safety impact: go's encoder never emits
+the array form and a hash is over the canonical re-encode, so no fork. Worst
+case an adversary makes algod-rust drop one array-form proposal payload or
+gossiped transaction, or one catchup peer, that go would decode (one-round
+liveness, repaired by catchup or another peer). Reasoning and the source
+citations are in `docs/BYTES_DECODE_PARITY.md` ("Issue #2065: final
+disposition").
 
 **How to switch back.** No switch.
 

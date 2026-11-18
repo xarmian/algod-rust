@@ -321,118 +321,40 @@ impl Block {
     /// top-level keys are skipped (the caller reads them); any other unknown
     /// key, at any level, is `msgp.ErrNoField` as in go (issue #2394).
     pub fn decode_with_extra_keys(rd: &mut &[u8], extra_keys: &[&[u8]]) -> DecodeResult<Self> {
-        let len = rmp_decode::read_map_len(rd)?;
+        let _session = rmp_decode::decode_session();
         let mut b = Self::default();
+        Self::decode_into(rd, &mut b, extra_keys)?;
+        Ok(b)
+    }
+
+    /// Decode into an already decoded block, as go's generated `UnmarshalMsg`
+    /// does (issue #2424: a repeated key decodes into the populated field).
+    pub(crate) fn decode_into(
+        rd: &mut &[u8],
+        b: &mut Self,
+        extra_keys: &[&[u8]],
+    ) -> DecodeResult<()> {
+        let len = rmp_decode::read_struct_map_len(rd, b)?;
         for _ in 0..len {
             let key = rmp_decode::read_key_bytes(rd)?;
-            match (key.len(), key.first().copied().unwrap_or(0)) {
-                // ── 2-byte keys ──────────────────────────────────
-                (2, b'b') if key == b"bi" => b.bonus = rmp_decode::read_u64(rd)?,
-                (2, b'c') if key == b"ct" => b.congestion_tax = rmp_decode::read_u64(rd)?,
-                (2, b'f') if key == b"fc" => b.fees_collected = rmp_decode::read_u64(rd)?,
-                (2, b'g') if key == b"gh" => {
-                    b.genesis_hash = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
-                }
-                (2, b'l') if key == b"ld" => b.load = rmp_decode::read_u64(rd)?,
-                (2, b'p') if key == b"pp" => b.proposer_payout = rmp_decode::read_u64(rd)?,
-                (2, b't') => match key {
-                    b"tc" => b.txn_counter = rmp_decode::read_u64(rd)?,
-                    b"ts" => b.timestamp = rmp_decode::read_i64(rd)?,
-                    _ => rmp_decode::unknown_key(rd, key)?,
-                },
-                // ── 3-byte keys ──────────────────────────────────
-                (3, b'g') if key == b"gen" => b.genesis_id = rmp_decode::read_string(rd)?,
-                (3, b'p') if key == b"prp" => b.proposer = rmp_decode::read_address_go_compat(rd)?,
-                (3, b'r') => match key {
-                    // Canonically/omitempty-encoded blocks omit "rnd"
-                    // entirely at round 0 (e.g. the genesis block, since
-                    // #453) -- `b.round` is already `Round(0)` via
-                    // `Self::default()`, so there is no missing-field case
-                    // to reject here.
-                    b"rnd" => b.round = Round(rmp_decode::read_u64(rd)?),
-                    b"rwd" => b.rewards_pool = rmp_decode::read_address_go_compat(rd)?,
-                    _ => rmp_decode::unknown_key(rd, key)?,
-                },
-                (3, b's') if key == b"spt" => {
-                    b.state_proof_tracking = rmp_decode::read_checked_optional_rmpv(
-                        rd,
-                        &crate::msgp_schema::STATE_PROOF_TRACKING,
-                    )?
-                }
-                (3, b't') if key == b"txn" => {
-                    b.txn_commitment = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
-                }
-                // ── 4-byte keys ──────────────────────────────────
-                (4, b'e') if key == b"earn" => b.rewards_level = rmp_decode::read_u64(rd)?,
-                (4, b'f') => match key {
-                    b"fees" => b.fee_sink = rmp_decode::read_address_go_compat(rd)?,
-                    b"frac" => b.rewards_residue = rmp_decode::read_u64(rd)?,
-                    _ => rmp_decode::unknown_key(rd, key)?,
-                },
-                (4, b'p') if key == b"prev" => {
-                    b.branch = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
-                }
-                (4, b'r') if key == b"rate" => b.rewards_rate = rmp_decode::read_u64(rd)?,
-                (4, b's') if key == b"seed" => {
-                    b.seed = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
-                }
+            crate::header::header_key_match!(b, key, rd, {
+                // go's `Payset` (`[]SignedTxnInBlock`, `allocbound=-`)
                 (4, b't') if key == b"txns" => {
-                    b.payset = rmp_decode::read_vec(rd, SignedTransaction::decode_from_reader)?
+                    rmp_decode::read_slice_into(
+                        rd,
+                        &mut b.payset,
+                        usize::MAX,
+                        SignedTransaction::default,
+                        |rd, t| SignedTransaction::decode_into(rd, t, true),
+                    )?;
                 }
-                // ── 5-byte keys ──────────────────────────────────
-                (5, b'p') if key == b"proto" => b.current_protocol = rmp_decode::read_string(rd)?,
-                // ── 6-byte keys ──────────────────────────────────
-                (6, b'r') if key == b"rwcalr" => {
-                    b.rewards_recalculation_round = Round(rmp_decode::read_u64(rd)?)
-                }
-                (6, b't') => match key {
-                    b"txn256" => b.txn256 = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?,
-                    b"txn512" => b.txn512 = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?,
-                    _ => rmp_decode::unknown_key(rd, key)?,
-                },
-                // ── 7-byte keys ──────────────────────────────────
-                (7, b'n') => match key {
-                    b"nextyes" => b.next_protocol_approvals = rmp_decode::read_u64(rd)?,
-                    _ => rmp_decode::unknown_key(rd, key)?,
-                },
-                (7, b'p') if key == b"prev512" => {
-                    b.prev512 = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?
-                }
-                // ── 9-byte keys ──────────────────────────────────
-                (9, b'n') => match key {
-                    b"nextproto" => b.next_protocol = rmp_decode::read_string(rd)?,
-                    _ => rmp_decode::unknown_key(rd, key)?,
-                },
-                // ── 10-byte keys ─────────────────────────────────
-                (10, b'n') => match key {
-                    b"nextswitch" => b.next_protocol_switch_on = Round(rmp_decode::read_u64(rd)?),
-                    b"nextbefore" => b.next_protocol_vote_before = Round(rmp_decode::read_u64(rd)?),
-                    _ => rmp_decode::unknown_key(rd, key)?,
-                },
-                (10, b'p') => match key {
-                    b"partupdrmv" => {
-                        b.expired_participation_accounts =
-                            rmp_decode::read_optional_vec(rd, rmp_decode::read_address_go_compat)?
-                    }
-                    b"partupdabs" => {
-                        b.absent_participation_accounts =
-                            rmp_decode::read_optional_vec(rd, rmp_decode::read_address_go_compat)?
-                    }
-                    _ => rmp_decode::unknown_key(rd, key)?,
-                },
-                // ── upgrade* keys (10-12 bytes) ──────────────────
-                (_, b'u') => match key {
-                    b"upgradeprop" => b.upgrade_propose = rmp_decode::read_string(rd)?,
-                    b"upgradedelay" => b.upgrade_delay = rmp_decode::read_u64(rd)?,
-                    b"upgradeyes" => b.upgrade_approve = rmp_decode::read_bool(rd)?,
-                    _ => rmp_decode::unknown_key(rd, key)?,
-                },
+            }, {
                 // go's msgp decoder: msgp.ErrNoField (issue #2394)
                 _ if extra_keys.contains(&key) => rmp_decode::skip_value(rd)?,
                 _ => rmp_decode::unknown_key(rd, key)?,
-            }
+            });
         }
-        Ok(b)
+        Ok(())
     }
 
     /// Decode a Block from msgpack bytes.
@@ -443,40 +365,57 @@ impl Block {
 }
 
 impl BlockResponse {
-    /// Decode a BlockResponse from a msgpack map using raw rmp.
+    /// Decode a BlockResponse (go `rpcs.EncodedBlockCert`) from a msgpack
+    /// map using raw rmp.
     ///
-    /// The REST API wraps the block in a `{"block": ..., "cert": ...}` envelope.
-    /// The `cert` field is skipped (not parsed into rmpv::Value) since we don't
-    /// use certificate data in the fast decode path.
+    /// The REST API wraps the block in a `{"block": ..., "cert": ...}`
+    /// envelope. `block` is decoded into the populated block on a repeated
+    /// key like go's; `cert` is kept opaque, with every occurrence's raw
+    /// entries (see [`merge_raw_struct`]), for `decode_bundle` to read the
+    /// way go's `Certificate.UnmarshalMsg` does.
     pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let _session = rmp_decode::decode_session();
         let len = rmp_decode::read_map_len(rd)?;
-        let mut block = None;
+        let mut block = Block::default();
         let mut cert = None;
         for _ in 0..len {
             let key = rmp_decode::read_key_bytes(rd)?;
             match (key.len(), key.first().copied().unwrap_or(0)) {
-                (5, b'b') if key == b"block" => block = Some(Block::decode_from_reader(rd)?),
+                (5, b'b') if key == b"block" => Block::decode_into(rd, &mut block, &[])?,
                 (4, b'c') if key == b"cert" => {
-                    cert = rmp_decode::read_checked_optional_rmpv(
+                    let v = rmp_decode::read_checked_optional_rmpv(
                         rd,
                         &crate::msgp_schema::CERTIFICATE,
-                    )?
+                    )?;
+                    cert = merge_raw_struct(cert, v);
                 }
                 _ => rmp_decode::unknown_key(rd, key)?,
             }
         }
-        Ok(BlockResponse {
-            block: block.ok_or_else(|| algo_error::AlgoError::Codec {
-                source: "BlockResponse: missing 'block' field".into(),
-                context: "rmp_decode".into(),
-            })?,
-            cert,
-        })
+        // go's `EncodedBlockCert` has no required field: a response without
+        // `block` decodes to the zero block (which then fails every check of
+        // a fetched block, never the decode).
+        Ok(BlockResponse { block, cert })
     }
 
     /// Decode a BlockResponse from msgpack bytes.
     pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
         let mut rd = data;
         Self::decode_from_reader(&mut rd)
+    }
+}
+
+/// An opaque struct value decoded again under a repeated key: go decodes the
+/// second occurrence INTO the first, which (for a struct) is the same as
+/// decoding one map holding the first occurrence's entries followed by the
+/// second's. `nil` resets the struct (go `(*z) = T{}`), i.e. drops the
+/// earlier entries.
+fn merge_raw_struct(prev: Option<rmpv::Value>, next: Option<rmpv::Value>) -> Option<rmpv::Value> {
+    match (prev, next) {
+        (Some(rmpv::Value::Map(mut a)), Some(rmpv::Value::Map(b))) => {
+            a.extend(b);
+            Some(rmpv::Value::Map(a))
+        }
+        (_, next) => next,
     }
 }

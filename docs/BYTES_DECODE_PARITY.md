@@ -216,16 +216,12 @@ Go side verified in algorand/msgp v1.1.64 `read_bytes.go` and the generated
 
 go's generated decoder (see `SignedTxn` above) has **no duplicate-key
 detection**: it loops `for zb0001 > 0`, switches on the key, and decodes into
-the existing struct. Scalar repeats are last-wins (Rust identical). A
-repeated nested-struct key (`txn` twice) decodes *into* the already-populated
-struct (a merge), and a repeated fixed-size byte key with a shorter value
-keeps the earlier tail (`ReadExactBytes` copies `min(len, N)`); Rust replaces
-the nested struct / zero-fills. Not implemented: it needs merge-into-existing
-decoding in every struct reader, which is the same shape as the array-form
-change, and is observable only for inputs no encoder emits. Registered in
-`DIV-004` together with the array form (same impact argument: decoded-struct
-re-encode drives all hashes; go has no rejection either, so the divergence is
-only "which weird duplicate input decodes to which struct").
+the existing struct. Scalar repeats are last-wins. A repeated nested-struct
+key (`txn` twice) decodes *into* the already-populated struct (a merge), and a
+repeated fixed-size byte key with a shorter value keeps the earlier tail
+(`ReadExactBytes` copies `min(len, N)`). **Implemented** for every reader: the
+non-consensus ones by #2421, the consensus ones and tx-sync by #2424 (see
+"Issue #2424" below). Only the array form remains in `DIV-004`.
 
 ### 3. Local participation secrets
 
@@ -251,7 +247,7 @@ Production `rmp_serde` decodes and their reachability:
 | `algo-codec` `decode_block` / `decode_block_response`; used by `algo-rest-client` `gossip_block_source::decode_block_cert` and `client.rs get_block` | catchup blocks from peers (WS / REST) | yes, but cert-verified: block digest = hash of the canonical re-encode, cert covers it | **documented** (DIV-004): derived-serde `Deserialize` rejects nil-for-zero and accepts/misreads array form; a peer serving a non-canonical but go-acceptable encoding is dropped and another peer is used (per-peer liveness only, no safety) |
 | `algo-ledger` `apply.rs`, `heartbeat.rs`, `sqlite.rs`, `sync/mod.rs` `decode_block` | our own stored/canonical blobs (`blockdb`, catchpoint-written) | no (local DB; written by our canonical encoder) | none |
 | `algo-agreement` proposal / vote / bundle decode | gossip | yes | **hand-written** decoders (`codec.rs`, `Block::decode_from_bytes`), covered by #2062/#2063 and this issue's shared-reader change; not serde |
-| `algo-network` `tx_sync_client.rs` `Vec<SignedTransaction>` | peer txn-sync response | transaction gossip, not block/consensus input | same serde limitation, DIV-004; failure rejects one peer's response |
+| `algo-network` `tx_sync_client.rs` `Vec<SignedTransaction>` | peer txn-sync response | transaction gossip, not block/consensus input | hand-written reader in go-codec mode (`algo_types::go_codec_reflect`, #2424): go's `protocol.DecodeReflect` checks no `required` / `allocbound` and decodes a repeated map entry into the existing one; array form still DIV-004 |
 | `algo-network` `identity.rs`, `algo-p2p` `wsproto.rs` (`peerMetaHeaders`) | peer handshake | no (identity challenge / headers; go-encoded canonical; no consensus effect) | none |
 | `algo-rest-api` `handlers.rs` (txn submit), `simulate_strict.rs`, `format.rs` | local REST clients | no | none (go's REST `protocol.Decode` is the model; strict-unknown-field guard already present) |
 | `algo-ledger` `eval_delta.rs` inner-txn rebuild, `state_delta.rs`, `catchpoint/types.rs` | our own re-encoded values / go catchpoint files | no / file | none |
@@ -317,8 +313,8 @@ set and go accepts; the Rust reader replaced the participant and rejected
 check runs on the merged result, nil still zeroes it). Pinned as two
 always-present cases (`PINNED` in `strict_decode_fixtures.py`). This narrows,
 and does not widen, DIV-004's "replace instead of merge on a duplicated key"
-(other struct fields still replace; #2421's decoded-value oracle shows that is
-observable, tracked by #2424).
+(other struct fields still replaced then; #2421's decoded-value oracle showed
+that is observable, and #2424 made every reader merge).
 
 ## Issue #2421: a repeated key decodes into the populated field
 
@@ -357,8 +353,67 @@ case, 11 of 24 peer-meta cases; green after, plus 36k fuzz cases
 (`--fuzz 20000`, 26432 ledger / 9196 network / 630 p2p). Unit tests pin go's
 slice-capacity result (checked against go v5.0.5-stable) and each merge rule.
 
-**Consensus readers and tx-sync (not yet).** With the same oracle, 389 of 4748
-consensus cases decode differently from go (and some verdicts differ); the
-tx-sync response goes through the same `SignedTransaction` reader. Their
-repeated-key cases stay off (`repeat_kinds`) until #2424 makes those readers
-merge; DIV-004 keeps that half until then.
+**Consensus readers and tx-sync.** Done by #2424, below.
+
+## Issue #2424: the consensus readers and tx-sync decode a repeated key like go
+
+Every consensus reader now decodes a repeated key the way #2421 describes:
+`Transaction`, `SignedTransaction` (`SignedTxnInBlock` / `SignedTxnWithAD`),
+`LogicSig`, `MultisigSig`, the state-proof and heartbeat structs, `PQSig`
+(`crates/core/algo-types/src/{transaction,pq}.rs`), `Block` / `BlockHeader`
+(one shared field dispatch, `header_key_match!`), `BlockResponse` (a repeated
+`block` merges; a repeated `cert` keeps both occurrences' entries in order,
+which `decode_bundle` then reads exactly as go decodes the second into the
+first), and the agreement codec's votes, bundles and proposal payloads
+(`crates/core/algo-agreement/src/codec.rs`; a `[2]T` field takes at most two
+elements into the leading ones, a `nil` struct is its zero value). The
+building blocks are in `crates/core/algo-types/src/rmp_decode.rs`
+(`read_struct_map_len`, `read_struct_into_opt`, `read_pointer_into` for go's
+one pointer field `hb`, `read_fixed_into_opt`, `read_slice_into` with go's
+slice capacity, `read_u64_map_into`, `read_fixed_array_into`). A slice's
+hidden capacity (elements past a shorter repeat, which a longer one brings
+back) is kept per buffer for the rest of the top-level decode
+(`DecodeSession`).
+
+**`dt` and `spt`.** A transaction's eval delta and a header's state-proof
+tracking map were kept as the raw `rmpv::Value` and written back verbatim into
+the payset commitment and the block hash. They are now decoded with go's
+semantics into a typed mirror and kept as go's canonical re-encode
+(`crates/core/algo-types/src/go_eval_delta.rs`), including go's allocation
+bounds (`MaxStateDeltaKeys`, `MaxEvalDeltaAccounts`, `MaxLogCalls`,
+`MaxInnerTransactionsPerDelta`, `MaxAppBytesValueLen`, `NumStateProofTypes`,
+`MaxHashDigestSize`) and the `nil`-versus-empty distinctions go's encoder
+keeps (`ld: {5: nil}` re-encodes as `nil`). An inner transaction is re-encoded
+with the transaction encoder, which moved from `algo-codec` to
+`algo_types::canonical` for that (algo-codec re-exports it unchanged).
+
+**Encoders fixed on the way (go's `MarshalMsg` of the decoded value).** Each
+was only observable for a value no honest encoder produces, but each changed
+bytes go would have written: `lsig: {}` (a zero `LogicSig`) is omitted like
+go's `MsgIsZero`; `LogicSig.l` and `PQSig.pk`/`sig` are `[]byte` (length-only
+omitempty; an all-zero non-empty value was dropped); an equivocation-vote
+authenticator always writes its `sig` pair (go's struct is not omitempty).
+
+**tx-sync is go-codec, not msgp.** go reads a tx-sync response with
+`protocol.DecodeReflect` (reflection). Read with the oracle: it checks no
+`codec:",required"` field and no msgp `allocbound`, decodes a repeated key
+into the populated field like msgp, and decodes a repeated `map[uint64]Reveal`
+entry INTO the existing, unaddressable map value: integers are written, a
+`[]byte` is copied over the existing prefix (length unchanged), a nested
+slice cannot grow, and any `nil` or `[N]byte` fails the decode
+(`reflect.Value.Set using unaddressable value` / `slice of unaddressable
+array`); msgp decodes every map entry fresh. `decode_tx_sync_response` runs
+the readers in that mode (`algo_types::go_codec_reflect`).
+
+**Proof.** `strict_decode_fixtures.py` now generates repeated-key cases for
+every consensus kind and `txsync`, and
+`crates/core/algo-agreement/tests/strict_unknown_fields_go_parity.rs` compares
+every accepted case's decoded value (re-encoded with the node's go-canonical
+encoders) with go's, like the non-consensus tests. Red before the fix: 600 of
+4748 consensus cases (applydata 101, blockcert 94, block 54, bundle 46, cert
+43, evaldelta 110, header 20, payload 58, stxn 10, stxninblock 35, txn 13,
+vote 16) and 8 of 593 network (tx-sync) cases; green after, plus the
+`--fuzz 100000` run (159,664 consensus and 19,884 network cases, every
+verdict and decoded value equal to go's). The real-chain corpus tests, the
+88k-case block differential test and the canonical re-encode of every
+committed real block are unchanged.
