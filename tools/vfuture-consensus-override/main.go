@@ -20,7 +20,8 @@
 
 // vfuture-consensus-override: emit a go-algorand `consensus.json`
 // (config.ConfigurableConsensusProtocolsFilename) that overrides only
-// `MaxTxnBytesPerBlock` for the `vFuture`/"future" consensus version.
+// `MaxTxnBytesPerBlock` (and, opt-in, `UpgradeVoteRounds`) for the
+// `vFuture`/"future" consensus version.
 //
 // Why this exists (issue #548): the default `MaxTxnBytesPerBlock` for
 // "future" is 5 MiB (inherited from V41 — config/consensus.go), so
@@ -42,6 +43,10 @@
 // Usage:
 //
 //	go run . -out /path/to/consensus.json [-max-txn-bytes-per-block 4096]
+//	go run . -out /path/to/consensus.json -max-txn-bytes-per-block 0 -upgrade-vote-rounds 20
+//
+// The second form (issue #2400) keeps the block size and only shortens the
+// upgrade vote window, for ops/mixed-cluster/scripts/upgradeprop-nonutf8.sh.
 //
 // Regeneration: see docs/DEV_WORKFLOW.md → "vFuture Fixture Capture".
 package main
@@ -117,7 +122,9 @@ func checkPin(dir string, allowUnpinned bool) error {
 func main() {
 	out := flag.String("out", "vfuture-consensus.json", "output path for the consensus.json override")
 	maxTxnBytesPerBlock := flag.Int("max-txn-bytes-per-block", 4096,
-		"override value for the future protocol's MaxTxnBytesPerBlock")
+		"override value for the future protocol's MaxTxnBytesPerBlock (0 keeps the pinned value)")
+	upgradeVoteRounds := flag.Uint64("upgrade-vote-rounds", 0,
+		"override value for the future protocol's UpgradeVoteRounds (0 keeps the pinned value; issue #2400)")
 	allowUnpinned := flag.Bool("allow-unpinned", false,
 		"skip the go-algorand pin/dirty-tree check (for intentional regeneration against a different tag)")
 	flag.Parse()
@@ -143,7 +150,12 @@ func main() {
 	// field-by-field, so a partial override would zero every other
 	// field (MinTxnFee, ApprovedUpgrades, etc.) and break the network.
 	override := base
-	override.MaxTxnBytesPerBlock = *maxTxnBytesPerBlock
+	if *maxTxnBytesPerBlock > 0 {
+		override.MaxTxnBytesPerBlock = *maxTxnBytesPerBlock
+	}
+	if *upgradeVoteRounds > 0 {
+		override.UpgradeVoteRounds = *upgradeVoteRounds
+	}
 
 	payload := config.ConsensusProtocols{
 		protocol.ConsensusFuture: override,
@@ -164,6 +176,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("vfuture-consensus-override: wrote %s (future.MaxTxnBytesPerBlock=%d, pin=%s)\n",
-		*out, *maxTxnBytesPerBlock, expectedGoAlgorandPin)
+	fmt.Printf("vfuture-consensus-override: wrote %s (future.MaxTxnBytesPerBlock=%d, UpgradeVoteRounds=%d, pin=%s)\n",
+		*out, override.MaxTxnBytesPerBlock, override.UpgradeVoteRounds, expectedGoAlgorandPin)
 }

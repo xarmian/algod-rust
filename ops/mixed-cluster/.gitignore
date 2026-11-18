@@ -28,3 +28,6 @@ scripts/__pycache__/
 # Issue #471 restart/rejoin artifact directories (per-scenario node logs,
 # fork-detector JSONL, restart-summary.json). Same rationale as above.
 restart-*/
+
+# Issue #2400 upgradeprop-nonutf8.sh artifact directories.
+upgradeprop-run-*/
