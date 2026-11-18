@@ -1493,14 +1493,9 @@ pub fn read_slice_into<T: 'static>(
                 rd.len()
             )));
         }
-        if reflect_mode() {
-            // go-codec (`kSlice`) grows the slice by copying its elements (up
-            // to its length, not its capacity: the hidden ones are dropped)
-            // into the new one, then decodes each element INTO what is there
-            // (issue #2427, read with the strict-decode oracle)
-            v.reserve_exact(n - v.len());
-            v.resize_with(n, &zero);
-            drop(take_spare(v));
+        // (an empty slice grows alike in both decoders: the common case)
+        if !v.is_empty() && reflect_mode() {
+            grow_keeping_elements(v, n, &zero);
         } else {
             let mut fresh = Vec::with_capacity(n);
             fresh.extend((0..n).map(|_| zero()));
@@ -1517,6 +1512,19 @@ pub fn read_slice_into<T: 'static>(
         item(rd, e)?;
     }
     Ok(false)
+}
+
+/// go-codec (`kSlice`) grows a repeated slice past its capacity by copying its
+/// elements (up to its length, not its capacity: the hidden ones are dropped)
+/// into the new one, then decodes each element INTO what is there (issue
+/// #2427, read with the strict-decode oracle); msgp makes a fresh slice.
+#[cold]
+#[inline(never)]
+fn grow_keeping_elements<T: 'static>(v: &mut Vec<T>, n: usize, zero: &impl Fn() -> T) {
+    v.reserve_exact(n - v.len());
+    v.resize_with(n, zero);
+    // a stale record for a freed buffer at the same address
+    drop(take_spare(v));
 }
 
 /// [`read_slice_into`] for a slice kept as an `Option` (`None` is go's nil).
