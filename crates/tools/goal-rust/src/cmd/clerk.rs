@@ -118,7 +118,7 @@ pub fn run_send(
     match run_send_inner(args, wallet, cli_d, kmd_dir_flag) {
         Ok(code) => code,
         Err(msg) => {
-            eprintln!("{msg}");
+            report_lines(&msg, ERROR_NON_PRINTABLE_CHARACTERS);
             ExitCode::from(1)
         }
     }
@@ -655,7 +655,7 @@ pub fn run_sign(
     match run_sign_inner(args, wallet, cli_d, kmd_dir_flag) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
-            eprintln!("{msg}");
+            report_lines(&msg, ERROR_NON_PRINTABLE_CHARACTERS);
             ExitCode::from(1)
         }
     }
@@ -1715,7 +1715,7 @@ pub fn run_multisig_sign(
     match run_multisig_sign_inner(args, wallet, cli_d, kmd_dir_flag) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
-            eprintln!("{msg}");
+            report_lines(&msg, ERROR_NON_PRINTABLE_CHARACTERS);
             ExitCode::from(1)
         }
     }
@@ -1791,9 +1791,12 @@ fn run_multisig_sign_inner(
                 .block_on(kmd.multisig_sign_transaction(
                     &handle, &password, encoded, signer.0, partial, auth_addr,
                 ))
-                .map_err(|e| format!("Couldn't sign tx with kmd: {}", kmd_msg(&e)))?;
-            algo_codec::decode_multisig_go(&resp.multisig)
-                .map_err(|e| format!("kmd returned an undecodable multisig: {e}"))?
+                .map_err(|e| ERROR_SIGNING_TX.replacen("{}", &kmd_msg(&e), 1))?;
+            // libgoal's `protocol.Decode(resp.Multisig, &msig)` error reaches the
+            // same `reportErrorf(errorSigningTX, err)` (multisig.go:129-131).
+            algo_codec::decode_multisig_go(&resp.multisig).map_err(|e| {
+                ERROR_SIGNING_TX.replacen("{}", &algo_avm::raw_text::encode(&e.text()), 1)
+            })?
         };
 
         stxn.msig = Some(new_msig);
@@ -1832,7 +1835,7 @@ pub fn run_multisig_signprogram(
     match run_multisig_signprogram_inner(args, wallet, cli_d, kmd_dir_flag) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
-            eprintln!("{msg}");
+            report_lines(&msg, ERROR_NON_PRINTABLE_CHARACTERS);
             ExitCode::from(1)
         }
     }
@@ -1888,7 +1891,7 @@ fn run_multisig_signprogram_inner(
         let bytes = std::fs::read(file).map_err(|e| format!("{file}: {e}"))?;
         // go's `protocol.Decode(program, &lsig)` (multisig.go:187): strict, like `lsigFromArgs`.
         lsig = algo_codec::decode_logicsig_go(&bytes)
-            .map_err(|e| format!("{file}: {e}"))?
+            .map_err(|e| format!("{file}: {}", algo_avm::raw_text::encode(&e.text())))?
             .into_logicsig();
         program = lsig.logic.to_vec();
         if out_name.is_none() {
@@ -1975,9 +1978,10 @@ fn run_multisig_signprogram_inner(
             program,
             use_legacy_msig,
         ))
-        .map_err(|e| format!("Couldn't sign program with kmd: {}", kmd_msg(&e)))?;
+        .map_err(|e| ERROR_SIGNING_TX.replacen("{}", &kmd_msg(&e), 1))?;
+    // multisig.go:249-252: a kmd error and libgoal's decode error alike.
     let msig = algo_codec::decode_multisig_go(&resp.multisig)
-        .map_err(|e| format!("kmd returned an undecodable multisig: {e}"))?;
+        .map_err(|e| ERROR_SIGNING_TX.replacen("{}", &algo_avm::raw_text::encode(&e.text()), 1))?;
 
     if use_legacy_msig {
         lsig.msig = Some(msig);

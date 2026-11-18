@@ -24,7 +24,10 @@
 //! `fixtures/clerk_sign_lsig.jsonl` holds, for each record of the shared
 //! `lsig_cases.rs` (at most `FIXTURE_MAX_INPUT` bytes), what go
 //! v5.0.5-stable's `goal clerk sign -L` printed and wrote for a payment whose
-//! sender is the program's contract account. goal-rust must do the same (a
+//! sender is the program's contract account (a decode failure prints msgp's
+//! error text with its context path, issue #2404; `clerk send -L` decodes
+//! through the same `lsigFromArgs` and is checked against those rows too).
+//! goal-rust must do the same (a
 //! default test, no go needed); a `MIXED_CLUSTER=1` run re-checks the file
 //! against a real go `goal` (`GOAL_GO` names a prebuilt one), and
 //! `REGEN_SIGN_LSIG_FIXTURE=1` rewrites it from go:
@@ -193,18 +196,13 @@ fn row(name: &str, input: &[u8], run: &RunResult) -> serde_json::Value {
 ///
 /// * a record go decodes and then rejects in the sanity check is compared as
 ///   "decoded" only;
-/// * a record go fails to decode must fail to decode in goal-rust too, whose
-///   error text lacks msgp's context path (`... at Subsigs/0 at Msig`) and goal's
-///   "One or more non-printable characters" preamble (follow-up #2404);
-/// * everything else (go's success) must match exactly, the signed file included.
+/// * everything else must match exactly: go's success (the signed file
+///   included) and go's decode failure, whose stderr carries msgp's error text
+///   with its context path (`... at Subsigs/0 at Msig`) and goal's
+///   "One or more non-printable characters" preamble (issue #2404).
 fn same_outcome(want: &serde_json::Value, got: &serde_json::Value) -> bool {
     let werr = want["stderr"].as_str().unwrap_or("");
     let gerr = got["stderr"].as_str().unwrap_or("");
-    if werr.contains("l.lsig: decode failed, ") {
-        return got["code"] == want["code"]
-            && got["outfile_hex"].is_null()
-            && gerr.starts_with("l.lsig: decode failed, ");
-    }
     if werr.contains("t.txn: txn[0] error") {
         return !gerr.contains("decode failed");
     }
@@ -243,6 +241,90 @@ fn sign_lsig_fixture_matches_goal_rust() {
         "{} of {} records differ from go:\n{}",
         mismatches.len(),
         cases.len(),
+        mismatches.join("\n")
+    );
+}
+
+/// The zero address, a valid `--to`.
+const ZERO_ADDR: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ";
+
+/// `goal clerk send -L l.lsig` with a data dir holding only a genesis: go's
+/// `sendCmd` resolves the data dir and the accounts list (which locates the kmd
+/// directory from the genesis), then decodes the file with the same
+/// `lsigFromArgs` as `clerk sign` (clerk.go:375), before any node is contacted.
+fn run_send(bin: &Path, lsig: &[u8]) -> RunResult {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("l.lsig"), lsig).unwrap();
+    std::fs::create_dir(tmp.path().join("data")).unwrap();
+    std::fs::write(
+        tmp.path().join("data/genesis.json"),
+        r#"{"id":"v1","network":"testnet","proto":"future","alloc":[],"rwd":"FEESINKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANY3ZN3I","fees":"FEESINKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANY3ZN3I"}"#,
+    )
+    .unwrap();
+    let out = Command::new(bin)
+        .args([
+            "clerk", "send", "-L", "l.lsig", "-t", ZERO_ADDR, "-a", "1", "-d", "data",
+        ])
+        .current_dir(tmp.path())
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("run goal");
+    (out.status.code(), out.stdout, out.stderr, None)
+}
+
+/// Every fixture record go's `lsigFromArgs` fails to decode, run through
+/// `clerk send -L` with `bin`: its exit code and stderr must be the fixture's.
+fn send_decode_failure_mismatches(bin: &Path) -> (usize, Vec<String>) {
+    let fixture = read_fixture();
+    let mut checked = 0;
+    let mut mismatches = Vec::new();
+    for ((name, input), want) in cases().iter().zip(&fixture) {
+        assert_eq!(want["name"], *name, "{FIXTURE} is out of date");
+        if !want["stderr"]
+            .as_str()
+            .unwrap_or("")
+            .contains("l.lsig: decode failed, ")
+        {
+            continue;
+        }
+        checked += 1;
+        let got = row(name, input, &run_send(bin, input));
+        let differs = ["code", "stdout", "stderr", "stderr_hex"]
+            .iter()
+            .any(|k| got[k] != want[k]);
+        if differs {
+            mismatches.push(format!("{name}:\n  go sign: {want}\n  send:    {got}"));
+        }
+    }
+    (checked, mismatches)
+}
+
+#[test]
+fn send_lsig_decode_failures_match_go() {
+    let (checked, mismatches) = send_decode_failure_mismatches(Path::new(GOAL_RUST_BIN));
+    assert!(checked > 100, "only {checked} decode-failure records");
+    assert!(
+        mismatches.is_empty(),
+        "{} of {checked} records differ from go:\n{}",
+        mismatches.len(),
+        mismatches.join("\n")
+    );
+}
+
+#[test]
+fn send_lsig_decode_failures_match_go_goal() {
+    if !mixed_cluster_enabled() {
+        eprintln!("Go-parity SKIPPED: set MIXED_CLUSTER=1");
+        return;
+    }
+    let Some(go_goal) = try_ensure_go_goal() else {
+        return;
+    };
+    let (checked, mismatches) = send_decode_failure_mismatches(&go_goal);
+    assert!(
+        mismatches.is_empty(),
+        "go's `clerk send -L` differs from its `clerk sign -L` on {} of {checked} records:\n{}",
+        mismatches.len(),
         mismatches.join("\n")
     );
 }

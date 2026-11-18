@@ -132,10 +132,14 @@ pub fn lsig_from_args(
             let bytes = std::fs::read(file).map_err(|e| format!("{file}: read failed, {e}"))?;
             // go's `protocol.Decode`, the strict msgp-generated decoder (unknown
             // keys, the required `v`/`thr`/`subsig` of a multisig...), not serde.
-            // Only the outcome is go's; its error text carries msgp's context path
-            // (`... at Subsigs/0 at Msig`), which is not reproduced (#2404).
-            let go = algo_codec::decode_logicsig_go(&bytes)
-                .map_err(|e| format!("{file}: decode failed, {e}"))?;
+            // The error is go's text with msgp's context path (`... at Subsigs/0
+            // at Msig`), as raw bytes in `raw_text` form for `reportErrorf` (#2404).
+            let go = algo_codec::decode_logicsig_go(&bytes).map_err(|e| {
+                format!(
+                    "{file}: decode failed, {}",
+                    algo_avm::raw_text::encode(&e.text())
+                )
+            })?;
             // `lsig.Logic == nil` is "no LogicSig" to go's signCmd/sendCmd.
             if go.logic_nil {
                 return Ok(None);
