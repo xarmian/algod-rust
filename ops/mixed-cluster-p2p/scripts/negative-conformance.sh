@@ -35,6 +35,24 @@
 #   4 malformed-proposal     a genuine proposal payload captured off the wire
 #                            with exactly one block field corrupted.
 #                            Go: rejects the payload, does not adopt it.
+#   5 unknown-field-proposal a genuine proposal payload with ONE unknown key
+#                            (`zzunk`, in its first transaction, else the top
+#                            level), block untouched (issues #2394, #2398).
+#                            Go's msgp decoder fails with ErrNoField and
+#                            drops it without resetting the stream:
+#                            "dropping proposal that failed to decode:
+#                            Unknown field: zzunk". algod-rust's own decoder
+#                            must refuse the same bytes for that key (not a
+#                            msgp allocbound, #2427, or a repeated key,
+#                            #2424) before anything is sent. Opt-in
+#                            (CASES=unknown-field-proposal): the honest copy
+#                            is what the network commits, so the evidence is
+#                            the log line, no reset, and liveness. Injecting
+#                            into the Rust node is covered by the WS-gossip
+#                            harness's `unknown-field-proposal-rust`: this
+#                            harness's rust-node-4 is outbound-only P2pOnly
+#                            and making it dialable would change the DHT
+#                            topology the harness exists to prove.
 #
 # All three vote cases must make Go reject the injector's stream — in P2P
 # mode `network/p2pNetwork.go`'s `Disconnect`/`disconnect` both resets the
@@ -99,6 +117,8 @@ export MSYS_NO_PATHCONV=1
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
+# shellcheck source=../../mixed-cluster/scripts/unknown_field_proposal.sh
+source "$REPO_ROOT/ops/mixed-cluster/scripts/unknown_field_proposal.sh"  # ufp_* (#2398)
 
 CASES="${CASES:-bad-vrf-proof wrong-committee-weight wrong-ots-domain malformed-proposal}"
 SKIP_START="${SKIP_START:-0}"
@@ -267,6 +287,7 @@ expected_go_error() {
         wrong-committee-weight) echo "credential has weight 0" ;;
         wrong-ots-domain)       echo "could not verify FS signature on vote" ;;
         malformed-proposal)     echo "" ;;
+        unknown-field-proposal) echo "" ;;
         *) echo "" ;;
     esac
 }
@@ -287,8 +308,16 @@ run_case() {  # run_case <case>
     before="$(go_max_round)"
 
     local rc=0
+    # unknown-field-proposal is the injector's malformed-proposal case with the
+    # `unknown-field` fault (issues #2394, #2398)
+    local inject_case="$case" inject_extra=()
+    if [ "$case" = "unknown-field-proposal" ]; then
+        inject_case="malformed-proposal"
+        inject_extra=(--proposal-fault unknown-field)
+    fi
     "$FUZZ" \
-        --case "$case" \
+        --case "$inject_case" \
+        ${inject_extra[@]+"${inject_extra[@]}"} \
         --node "$TARGET_REST" \
         --token "$ALGOD_TOKEN" \
         --transport p2p \
@@ -360,6 +389,30 @@ run_case() {  # run_case <case>
             record "$case" "bad-data" pass "node logged 'disconnected: BadData'"
         else
             record "$case" "bad-data" info "no 'disconnected: BadData' line (P2P disconnect path does not log it; see this script's header)"
+        fi
+    elif [ "$case" = "unknown-field-proposal" ]; then
+        # go drops the payload at decode (agreement/demux.go, WARN level,
+        # transport-agnostic) and keeps the stream open.
+        if ufp_go_dropped "$log"; then
+            record "$case" "go-dropped-at-decode" pass \
+                "node logged 'dropping proposal that failed to decode: Unknown field: zzunk'"
+        else
+            record "$case" "go-dropped-at-decode" fail \
+                "node never dropped the payload at decode for key zzunk (see $log)"
+            FAILED=1
+        fi
+        local rust_err; rust_err="$(report_field rust_decode_error)"
+        if ufp_rust_decoder_reason "$rust_err"; then
+            record "$case" "rust-decoder-rejects" pass "algod-rust's decoder refuses the bytes for the key: $rust_err"
+        else
+            record "$case" "rust-decoder-rejects" fail "algod-rust's decoder did not refuse the bytes for the unknown key: $rust_err"
+            FAILED=1
+        fi
+        if ufp_not_disconnected "$disconnected"; then
+            record "$case" "no-disconnect" pass "go kept the injector's /algorand-ws/2.2.0 stream open for ${OBSERVE_SECS}s"
+        else
+            record "$case" "no-disconnect" fail "go reset the injector's stream after an undecodable proposal (disconnected=$disconnected)"
+            FAILED=1
         fi
     else
         # A malformed payload is answered with ignoreAction, not a

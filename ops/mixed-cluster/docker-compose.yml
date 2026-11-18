@@ -235,6 +235,11 @@ services:
       - --data-dir=/data
     ports:
       - "127.0.0.1:${PHASE6_RUST_PORT:-4004}:8080"
+      # The 4162 WS-gossip listener above, published (local-only) so the
+      # negative suite's opt-in `unknown-field-proposal-rust` case (issue
+      # #2398) can inject one undecodable proposal straight into this node.
+      # No go node is told this address, so the topology is unchanged.
+      - "127.0.0.1:${PHASE6_RUST_GOSSIP_PORT:-4162}:4162"
     volumes:
       - rust-node-4-data:/app
       - ./netroot:/netroot:ro
