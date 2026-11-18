@@ -1,0 +1,124 @@
+Copyright (C) 2019-2026 Algorand Foundation Ltd.
+Modifications Copyright (C) 2026 Algod DAO
+SPDX-License-Identifier: AGPL-3.0-or-later
+
+Issue #2400: TEST-ONLY patch on go-algorand v5.0.5-stable (applied by the
+Dockerfile next to it, never to the reference checkout). It lets the block
+proposer put the bytes of ALGOD_TEST_INJECT_UPGRADEPROP_HEX into upgradeprop
+for rounds in [ALGOD_TEST_INJECT_UPGRADEPROP_FROM, ..._UNTIL) when no upgrade
+is pending. Unset, the hook is inert. git apply ignores this preamble.
+
+diff --git a/data/bookkeeping/block.go b/data/bookkeeping/block.go
+index 3452fcb72..f129d029e 100644
+--- a/data/bookkeeping/block.go
++++ b/data/bookkeeping/block.go
+@@ -570,6 +570,10 @@ func ProcessUpgradeParams(prev BlockHeader) (uv UpgradeVote, us UpgradeState, er
+ 			upgradeVote.UpgradeApprove = true
+ 			break
+ 		}
++		// algod-rust #2400 test-only hook, inert unless its env is set.
++		if v, ok := injectedUpgradeVote(prev.Round+1, prevParams); ok {
++			upgradeVote = v
++		}
+ 	}
+ 
+ 	// If there is a proposal being voted on, see if we approve it
+diff --git a/data/bookkeeping/upgradeprop_inject.go b/data/bookkeeping/upgradeprop_inject.go
+new file mode 100644
+index 000000000..7cab4382b
+--- /dev/null
++++ b/data/bookkeeping/upgradeprop_inject.go
+@@ -0,0 +1,93 @@
++// Copyright (C) 2019-2026 Algorand Foundation Ltd.
++// Modifications Copyright (C) 2026 Algod DAO
++// This file is part of algod-rust, a modified work based on go-algorand
++// (https://github.com/algorand/go-algorand).
++//
++// algod-rust is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// algod-rust is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with algod-rust.  If not, see <https://www.gnu.org/licenses/>.
++//
++// SPDX-License-Identifier: AGPL-3.0-or-later
++
++// TEST-ONLY injection hook for algod-rust issue #2400 (ops/mixed-cluster
++// upgradeprop-nonutf8 case). This file is NOT part of go-algorand: it is added
++// by ops/mixed-cluster/upgradeprop-inject/inject.patch to a throwaway build of
++// v5.0.5-stable that only go-node-1 of the mixed cluster runs. With
++// ALGOD_TEST_INJECT_UPGRADEPROP_HEX unset it changes nothing.
++
++package bookkeeping
++
++import (
++	"encoding/hex"
++	"os"
++	"strconv"
++	"sync"
++
++	"github.com/algorand/go-algorand/config"
++	"github.com/algorand/go-algorand/data/basics"
++	"github.com/algorand/go-algorand/logging"
++	"github.com/algorand/go-algorand/protocol"
++)
++
++type upgradePropInjection struct {
++	propose     protocol.ConsensusVersion
++	from, until basics.Round // inject for rounds in [from, until)
++	enabled     bool
++}
++
++var (
++	upgradePropInjectionOnce sync.Once
++	upgradePropInjectionCfg  upgradePropInjection
++)
++
++func loadUpgradePropInjection() upgradePropInjection {
++	upgradePropInjectionOnce.Do(func() {
++		h := os.Getenv("ALGOD_TEST_INJECT_UPGRADEPROP_HEX")
++		if h == "" {
++			return
++		}
++		raw, err := hex.DecodeString(h)
++		if err != nil || len(raw) == 0 {
++			logging.Base().Errorf("upgradeprop-inject: bad ALGOD_TEST_INJECT_UPGRADEPROP_HEX %q: %v", h, err)
++			return
++		}
++		from, _ := strconv.ParseUint(os.Getenv("ALGOD_TEST_INJECT_UPGRADEPROP_FROM"), 10, 64)
++		until, err := strconv.ParseUint(os.Getenv("ALGOD_TEST_INJECT_UPGRADEPROP_UNTIL"), 10, 64)
++		if err != nil || until == 0 {
++			until = ^uint64(0)
++		}
++		upgradePropInjectionCfg = upgradePropInjection{
++			propose: protocol.ConsensusVersion(raw),
++			from:    basics.Round(from),
++			until:   basics.Round(until),
++			enabled: true,
++		}
++	})
++	return upgradePropInjectionCfg
++}
++
++// injectedUpgradeVote returns the test-injected proposal for round, if any.
++// It is consulted only where go itself would propose (no pending proposal),
++// so the resulting vote is one applyUpgradeVote accepts: any byte string of at
++// most MaxVersionStringLen bytes, with a delay inside the permitted range.
++func injectedUpgradeVote(round basics.Round, params config.ConsensusParams) (UpgradeVote, bool) {
++	cfg := loadUpgradePropInjection()
++	if !cfg.enabled || round < cfg.from || round >= cfg.until {
++		return UpgradeVote{}, false
++	}
++	logging.Base().Warnf("upgradeprop-inject: proposing upgradeprop %x for round %d", []byte(cfg.propose), round)
++	return UpgradeVote{
++		UpgradePropose: cfg.propose,
++		UpgradeDelay:   basics.Round(params.MinUpgradeWaitRounds),
++		UpgradeApprove: true,
++	}, true
++}

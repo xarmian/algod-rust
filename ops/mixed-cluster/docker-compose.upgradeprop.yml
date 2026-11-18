@@ -1,0 +1,22 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+# Issue #2400 overlay, used ONLY by scripts/upgradeprop-nonutf8.sh (through
+# COMPOSE_FILE=docker-compose.yml:docker-compose.upgradeprop.yml). go-node-1
+# runs the test-only injector build (upgradeprop-inject/Dockerfile) that
+# proposes a non-UTF-8 `upgradeprop` for rounds [FROM, UNTIL); go-node-2/3
+# stay stock algorand/algod:5.0.5-stable. rust-node-4's image is overridable
+# so the same case can run against an older algod-rust build (TDD: a pre-#2397
+# image must stall at the proposal block).
+
+services:
+  go-node-1:
+    image: ${PHASE6_UPGRADEPROP_GO_IMAGE:-algod-upgradeprop-inject:local}
+    environment:
+      - ALGOD_TEST_INJECT_UPGRADEPROP_HEX=${PHASE6_UPGRADEPROP_HEX:-}
+      - ALGOD_TEST_INJECT_UPGRADEPROP_FROM=${PHASE6_UPGRADEPROP_FROM:-0}
+      - ALGOD_TEST_INJECT_UPGRADEPROP_UNTIL=${PHASE6_UPGRADEPROP_UNTIL:-0}
+
+  rust-node-4:
+    image: ${PHASE6_RUST_IMAGE:-algod-rust-phase6:local}

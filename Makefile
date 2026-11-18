@@ -29,7 +29,7 @@ P2P_INTEROP_1V1_CLUSTER := ops/mixed-cluster-p2p-1v1
 .PHONY: relay-up relay-down relay-test
 .PHONY: mixed-cluster-up mixed-cluster-down mixed-cluster-smoke mixed-cluster-test mixed-cluster-conformance
 .PHONY: consensus-cluster-up consensus-cluster-down consensus-cluster-status consensus-cluster-smoke
-.PHONY: consensus-cluster-test consensus-cluster-restart consensus-cluster-negative
+.PHONY: consensus-cluster-test consensus-cluster-restart consensus-cluster-negative consensus-cluster-upgradeprop
 .PHONY: consensus-cluster-analyzer
 .PHONY: p2p-interop-up p2p-interop-down p2p-interop-test p2p-interop-status
 .PHONY: p2p-interop-consensus-test p2p-interop-soak p2p-interop-soak-test
@@ -739,6 +739,7 @@ mixed-cluster-conformance: mixed-cluster-up ## Run long-running conformance test
 ##   consensus-cluster-test      #470 positive conformance suite
 ##   consensus-cluster-restart   #471 restart/rejoin scenarios
 ##   consensus-cluster-negative  #472 negative conformance suite
+##   consensus-cluster-upgradeprop  #2400 live non-UTF-8 upgradeprop (opt-in, fresh cluster)
 ##   consensus-cluster-analyzer  soak-analyzer unit tests (no Docker)
 ##
 ## `phase6-cluster-*`, `consensus-analyzer-test` and
@@ -804,6 +805,9 @@ consensus-cluster-negative: ## Run the #472 negative conformance suite (up + inj
 	KEEP_CLUSTER=$(or $(KEEP_CLUSTER),0) \
 		$(PHASE6_CLUSTER)/scripts/negative-conformance.sh
 
+consensus-cluster-upgradeprop: ## Issue #2400: live non-UTF-8 upgradeprop through the vote deadline (fresh cluster, up + check + down)
+	bash $(PHASE6_CLUSTER)/scripts/upgradeprop-nonutf8.sh
+
 consensus-cluster-analyzer: ## Unit-test the #470 soak-analyzer logic (no Docker needed)
 	python3 $(PHASE6_CLUSTER)/scripts/analyze_test.py
 	python3 $(PHASE6_CLUSTER)/scripts/ports_test.py
@@ -812,6 +816,7 @@ consensus-cluster-analyzer: ## Unit-test the #470 soak-analyzer logic (no Docker
 	python3 $(PHASE6_CLUSTER)/scripts/workload_test.py
 	python3 $(PHASE6_CLUSTER)/scripts/pq_evidence_test.py
 	python3 $(PHASE6_CLUSTER)/scripts/unknown_field_parity_test.py
+	python3 $(PHASE6_CLUSTER)/scripts/upgradeprop_check_test.py
 	python3 $(PHASE6_CLUSTER)/scripts/simulate_parity_test.py
 	python3 $(PHASE6_CLUSTER)/scripts/sig_failure_parity_test.py
 	python3 $(PHASE6_CLUSTER)/scripts/tx_gossip_test.py
