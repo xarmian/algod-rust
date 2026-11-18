@@ -16,14 +16,16 @@ checks it on the mixed cluster, in both directions:
   * a set submitted to the Rust node (rust-node-4) must appear in every Go
     node's pool (Rust-originated transactions reach the Go side).
 
-For each (source, target) pair the transactions are looked up on the target with
-`GET /v2/transactions/pending/{txid}` in a tight loop: 200 without a confirmed
-round is a pool sighting, a confirmed round before any pool sighting means the
-txn was only seen as part of a block (not evidence of gossip), 404 means not
-there yet. A pair passes when every txn reached the target within the budget
-(`--within-s`, about two rounds) and at least one was seen in its pool. Also
-recorded: the round the set was submitted in and the rounds it took to commit
-(the "comparable commit round count" of the issue).
+For each (source, target) pair the transactions are looked for in the target's
+pool (the bulk `GET /v2/transactions/pending` list), every target with its own
+request in flight from before the first submission on (issue #2429: a Go
+node's REST answer can block for seconds behind its ledger's DB commit, which
+must not blind the check to the other nodes). A txn never seen in the pool
+but confirmed is reported as `confirmed_first` (seen only as part of a block,
+not evidence of gossip). A pair passes when no txn is absent, at least one was
+seen in its pool and every pool sighting is within the budget (`--within-s`,
+about two rounds). Also recorded: the round the set was submitted in and the
+rounds it took to commit (the "comparable commit round count" of the issue).
 
 Needs the cluster from start.sh, Docker on PATH and python3 (standard library
 only). Exit 0 when every pair passes.
@@ -115,66 +117,93 @@ def notes_of_block(doc):
 def run_check(net, *, nodes, sources, count, within_s, build, poll_s=0.1,
               settle_s=10.0, commit_wait_s=90.0, topology="default", commit_node=None):
     """Submit `count` transactions to each source node and watch every other
-    node. `net` provides now(), sleep(s), round_of(node), submit(node, raw) ->
-    (status, body), note_of(raw), pool_notes(node) (the notes in the node's pool
-    from the bulk list, None when unavailable), committed_rounds(node, notes,
-    from_round, wait_s) and pending(node, txid) -> (status, confirmed_round);
-    `build(source, i)` returns the raw signed transaction. Returns the result
-    document (see `pass`, `pairs`, `sources`).
+    node. `net` provides now(), sleep(s), round_of(node), submit_async(node,
+    raw) and pool_notes_async(node) (requests in flight: `.done()`, and
+    `.result()` -> (answer, when it was answered); the answers are those of
+    submit(node, raw) -> (status, body) and pool_notes(node), the notes in the
+    node's pool from the bulk list or None when unavailable), note_of(raw),
+    committed_rounds(node, notes, from_round, wait_s) and pending(node, txid)
+    -> (status, confirmed_round); `build(source, i)` returns the raw signed
+    transaction. Returns the result document (see `pass`, `pairs`, `sources`).
 
     A transaction is "seen" in a target's pool when its note is in the bulk
-    pending list (a few ms, never stalls): the per-txid
-    GET /v2/transactions/pending/{txid} of a Go node takes 0.1 to 2.5 s and
-    stalls (#2301). It is used only once, after the deadline, for what the list
-    did not show (to tell "confirmed first" from "absent"), and as the whole
-    method when the list is unavailable. The commit rounds come from the blocks."""
+    pending list. Every target has its own request in flight, from before the
+    first submission until the end: a Go node's REST answer (the list, a POST)
+    can block for 1.4 to 2.8 s behind its ledger's slow DB commit (#2429), and
+    one stalled node must not leave the others unwatched. The per-txid
+    GET /v2/transactions/pending/{txid} (0.1 to 2.5 s and stalls on Go, #2301)
+    is used only once, after the deadline, for what the list did not show (to
+    tell "confirmed first" from "absent"), and as the whole method when the
+    list is unavailable. The commit rounds come from the blocks.
+
+    A pair passes when no txn is absent, at least one was seen in the target's
+    pool (the gossip path is proven), and every pool sighting is within the
+    budget. A txn seen only as committed is reported (`confirmed_first`) but is
+    not a failure on its own: it can be gossiped and committed inside a single
+    stalled answer of the target."""
     pairs, source_rows = [], []
     for src in sources:
         raws = [build(src, i) for i in range(count)]
         # After the (slow, goal-in-docker) build: commit_rounds counts from the
         # moment the first payment is submitted.
         round_before = net.round_of(src)
-        t0 = net.now()
         notes = [net.note_of(raw) for raw in raws]
-        txids = []
-        answered = {}   # txid -> when the node answered its submission
-        max_post = 0.0
-        for raw in raws:
-            posted = net.now()
-            status, body = net.submit(src, raw)
-            if status != 200:
-                raise CheckError("{} rejected a submitted payment ({}): {}".format(
-                    src, status, body[:200]))
-            txid = parse_txid(body)
-            txids.append(txid)
-            answered[txid] = net.now()
-            max_post = max(max_post, answered[txid] - posted)
-        # Gossip latency counts from the moment the node has answered the LAST
-        # submission (the earlier ones had at least that long): a Go node's POST
-        # can itself take seconds while its pool lock is held.
-        submitted_at = max(answered.values())
         targets = [n for n in nodes if n != src]
-        seen = {}  # (target, txid) -> (state, latency)
-        deadline = t0 + within_s + settle_s
+        txid_of = {}    # note -> txid
+        answered = {}   # note -> when the node answered its submission
+        max_post = 0.0
+        seen = {}       # (target, note) -> (state, latency)
+        polls = {t: net.pool_notes_async(t) for t in targets}
+        max_poll = {t: 0.0 for t in targets}
+        poll_started = {t: net.now() for t in targets}
         bulk_ok = {t: True for t in targets}
+        queue = list(raws)
+        sub, sub_started = None, None
+        deadline = None
         while True:
+            # The submissions, one at a time and in order, while the targets
+            # are watched.
+            if sub is not None and sub.done():
+                (status, body), at = sub.result()
+                if status != 200:
+                    raise CheckError("{} rejected a submitted payment ({}): {}".format(
+                        src, status, body[:200]))
+                note = net.note_of(queue.pop(0))
+                txid_of[note] = parse_txid(body)
+                answered[note] = at
+                max_post = max(max_post, at - sub_started)
+                sub = None
+            if sub is None and queue:
+                sub, sub_started = net.submit_async(src, queue[0]), net.now()
+            if not queue and deadline is None:
+                # Gossip latency counts from each node's answer: a Go node's
+                # POST can itself take seconds while its pool lock is held.
+                deadline = max(answered.values()) + within_s + settle_s
             for target in targets:
-                if len(seen) == len(targets) * len(txids):
-                    break
-                pool = net.pool_notes(target) if bulk_ok[target] else None
-                if pool is None:
-                    bulk_ok[target] = False
-                    for txid in txids:
-                        if (target, txid) in seen:
-                            continue
-                        state = pending_state(*net.pending(target, txid))
-                        if state != "absent":
-                            seen[(target, txid)] = (state, max(0.0, net.now() - submitted_at))
+                if bulk_ok[target]:
+                    fut = polls[target]
+                    if not fut.done():
+                        continue
+                    pool, at = fut.result()
+                    max_poll[target] = max(max_poll[target], at - poll_started[target])
+                    if pool is None:
+                        bulk_ok[target] = False
+                        continue
+                    for note in notes:
+                        if (target, note) not in seen and note in pool:
+                            seen[(target, note)] = (
+                                "pool", max(0.0, at - answered.get(note, at)))
+                    polls[target] = net.pool_notes_async(target)
+                    poll_started[target] = net.now()
                     continue
-                for txid, note in zip(txids, notes):
-                    if (target, txid) not in seen and note in pool:
-                        seen[(target, txid)] = ("pool", max(0.0, net.now() - submitted_at))
-            if len(seen) == len(targets) * len(txids) or net.now() >= deadline:
+                for note, txid in txid_of.items():
+                    if (target, note) in seen:
+                        continue
+                    state = pending_state(*net.pending(target, txid))
+                    if state != "absent":
+                        seen[(target, note)] = (state, max(0.0, net.now() - answered[note]))
+            if deadline is not None and (len(seen) == len(targets) * len(notes)
+                                         or net.now() >= deadline):
                 break
             net.sleep(poll_s)
         # What the bulk list never showed: one per-txid lookup each, to tell
@@ -182,26 +211,27 @@ def run_check(net, *, nodes, sources, count, within_s, build, poll_s=0.1,
         for target in targets:
             if not bulk_ok[target]:
                 continue
-            for txid in txids:
-                if (target, txid) not in seen:
-                    state = pending_state(*net.pending(target, txid))
+            for note in notes:
+                if (target, note) not in seen:
+                    state = pending_state(*net.pending(target, txid_of[note]))
                     if state != "absent":
-                        seen[(target, txid)] = (state, max(0.0, net.now() - submitted_at))
+                        seen[(target, note)] = (state, max(0.0, net.now() - answered[note]))
         for target in targets:
-            states = [seen.get((target, x)) for x in txids]
+            states = [seen.get((target, n)) for n in notes]
             absent = sum(1 for s in states if s is None)
             in_pool = sum(1 for s in states if s and s[0] == "pool")
             confirmed_first = sum(1 for s in states if s and s[0] == "confirmed")
-            lat = [s[1] for s in states if s]
+            lat = [s[1] for s in states if s and s[0] == "pool"]
             max_latency = max(lat) if lat else None
             ok = (absent == 0 and in_pool >= 1
                   and max_latency is not None and max_latency <= within_s)
             pairs.append({
-                "source": src, "target": target, "txns": len(txids), "ok": ok,
+                "source": src, "target": target, "txns": len(notes), "ok": ok,
                 "in_pool_first": in_pool, "confirmed_first": confirmed_first,
                 "absent": absent,
                 "max_latency_s": None if max_latency is None else round(max_latency, 3),
                 "min_latency_s": round(min(lat), 3) if lat else None,
+                "max_poll_s": round(max_poll[target], 3),
             })
         # Commit rounds, read from the blocks of the source node.
         found = net.committed_rounds(commit_node or src, set(notes), round_before or 0,
@@ -209,7 +239,7 @@ def run_check(net, *, nodes, sources, count, within_s, build, poll_s=0.1,
         confirmed_rounds = {n: r for n, r in found.items() if n in notes}
         rounds = sorted(confirmed_rounds.values())
         source_rows.append({
-            "source": src, "submitted": len(txids), "confirmed": len(rounds),
+            "source": src, "submitted": len(txid_of), "confirmed": len(rounds),
             "max_post_s": round(max_post, 3),
             "block_scan": getattr(net, "last_scan", None),
             "round_before": round_before,
@@ -234,6 +264,7 @@ class ClusterNet:
         self.env = workload.Env()
         self.funder = None
         self.notes = {}  # raw signed payment -> its note
+        self._executor = None
 
     def now(self):
         return time.monotonic()
@@ -249,6 +280,24 @@ class ClusterNet:
 
     def submit(self, node, raw):
         return self.env.post_txn(node, raw)
+
+    def _in_flight(self, fn, *args):
+        """`fn(*args)` on a worker thread: a future whose result is
+        (answer, when it was answered), so a stalled node blocks only itself."""
+        if self._executor is None:
+            import concurrent.futures
+            self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+
+        def call():
+            answer = fn(*args)
+            return answer, self.now()
+        return self._executor.submit(call)
+
+    def submit_async(self, node, raw):
+        return self._in_flight(self.submit, node, raw)
+
+    def pool_notes_async(self, node):
+        return self._in_flight(self.pool_notes, node)
 
     def _get_json(self, node, path, timeout=10):
         import urllib.request
@@ -400,9 +449,9 @@ def main(argv=None):
         return 1
     for p in res["pairs"]:
         print("tx-gossip: {:>11} -> {:<11} pool={} confirmed_first={} absent={} "
-              "latency {}..{}s {}".format(
+              "latency {}..{}s max_poll {}s {}".format(
                   p["source"], p["target"], p["in_pool_first"], p["confirmed_first"],
-                  p["absent"], p["min_latency_s"], p["max_latency_s"],
+                  p["absent"], p["min_latency_s"], p["max_latency_s"], p["max_poll_s"],
                   "ok" if p["ok"] else "FAIL"))
     for s in res["sources"]:
         print("tx-gossip: {} submitted={} confirmed={} rounds {}..{} (commit_rounds={})".format(
