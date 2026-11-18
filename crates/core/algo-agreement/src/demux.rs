@@ -745,23 +745,22 @@ impl Demux {
                 // well-formedness (step > down rejected) is checked at
                 // decode time, as defense in depth ahead of `verify()`'s
                 // own check.
+                // Like every proposal decode failure it drops the proposal
+                // without disconnecting the peer (see the `Err` arm below).
                 if let Err(e) = compound.vote.well_formed() {
                     warn!(
                         len = msg.data.len(),
                         prefix = %hex_prefix(&msg.data, 96),
-                        "error decoding proposal message: {}",
+                        "dropping proposal that failed to decode: {}",
                         e
                     );
-                    if let Some(ref net) = self.network {
-                        net.disconnect(&msg.handle);
-                    }
                     return None;
                 }
                 // Group-level structural screen (Go: `agreement/message.go`'s
                 // `proposalCarriesInvalidTxn`, called from `demux.go`'s
                 // `tokenizeMessages`). A proposal whose payset fails this
                 // screen is silently dropped — logged, but the peer is NOT
-                // disconnected, unlike a raw decode failure below.
+                // disconnected, like a decode failure below.
                 if let Err(e) = algo_validate::check_payset(&compound.proposal.block.payset) {
                     warn!(
                         len = msg.data.len(),
@@ -817,16 +816,18 @@ impl Demux {
                 ))
             }
             Err(e) => {
+                // go's `tokenizeMessages` (agreement/demux.go, since
+                // v4.7.2-stable commit 2fd42e446 "transactions: updates for
+                // bound checks") drops a proposal that fails to decode
+                // WITHOUT disconnecting the peer, unlike a vote or a bundle:
+                // a payload over a msgp allocbound (issue #2427) is such a
+                // failure.
                 warn!(
                     len = msg.data.len(),
                     prefix = %hex_prefix(&msg.data, 96),
-                    "error decoding proposal message: {}",
+                    "dropping proposal that failed to decode: {}",
                     e
                 );
-                // Disconnect the peer that sent the malformed message.
-                if let Some(ref net) = self.network {
-                    net.disconnect(&msg.handle);
-                }
                 None
             }
         }
@@ -1927,9 +1928,11 @@ mod tests {
     }
 
     /// Port of go-algorand's `TestDecodeRejectsStepAboveDown` (proposal
-    /// case): the embedded `PriorVote`'s step bound is checked too.
+    /// case): the embedded `PriorVote`'s step bound is checked too. It is a
+    /// `decodeProposal` error, and go's demux drops a proposal that fails to
+    /// decode without disconnecting the peer (issue #2427).
     #[test]
-    fn demux_raw_proposal_with_prior_vote_step_above_down_is_dropped_and_disconnects() {
+    fn demux_raw_proposal_with_prior_vote_step_above_down_is_dropped_not_disconnected() {
         use crate::step::{Step, DOWN};
         use crate::stubs::StubNetwork;
 
@@ -1967,10 +1970,60 @@ mod tests {
             result.is_none(),
             "a proposal whose prior vote has an out-of-bound step must be dropped"
         );
-        assert_eq!(
-            stub.disconnected.lock().unwrap().len(),
-            1,
-            "an out-of-bound prior-vote step must disconnect the peer, like any other malformed decode"
+        assert!(
+            stub.disconnected.lock().unwrap().is_empty(),
+            "a proposal that fails to decode is dropped without disconnecting the peer"
+        );
+    }
+
+    /// A proposal payload over one of go's msgp allocbounds (a 4097-byte
+    /// `note`) fails to decode, as in go, and is dropped without disconnecting
+    /// the peer (go `tokenizeMessages`, issue #2427).
+    #[test]
+    fn demux_raw_proposal_over_an_allocbound_is_dropped_not_disconnected() {
+        use crate::stubs::StubNetwork;
+        use algo_types::{SignedTransaction, Transaction, TxnType};
+
+        let (mut demux, ..) = make_test_demux();
+        let stub = Arc::new(StubNetwork::new());
+        demux.set_network(stub.clone() as Arc<dyn AgreementNetwork + Send + Sync>);
+
+        let payload = |note_len: usize| {
+            let txn = SignedTransaction {
+                txn: Transaction {
+                    txn_type: TxnType::from("pay"),
+                    sender: Address([1u8; 32]),
+                    note: serde_bytes::ByteBuf::from(vec![7u8; note_len]),
+                    ..Transaction::default()
+                },
+                ..SignedTransaction::default()
+            };
+            codec::encode_compound_message(&CompoundMessage {
+                vote: UnauthenticatedVote::default(),
+                proposal: crate::proposal::UnauthenticatedProposal {
+                    block: algo_types::Block {
+                        round: Round(1),
+                        payset: vec![txn],
+                        ..algo_types::Block::default()
+                    },
+                    ..crate::proposal::UnauthenticatedProposal::default()
+                },
+            })
+        };
+        assert!(codec::decode_compound_message(&payload(4096)).is_ok());
+        assert!(codec::decode_compound_message(&payload(4097)).is_err());
+
+        let result = demux.handle_raw_proposal(
+            Message {
+                data: payload(4097),
+                handle: None,
+            },
+            &ConsensusVersionView::default(),
+        );
+        assert!(result.is_none(), "an over-bound proposal must be dropped");
+        assert!(
+            stub.disconnected.lock().unwrap().is_empty(),
+            "a proposal that fails to decode is dropped without disconnecting the peer"
         );
     }
 
