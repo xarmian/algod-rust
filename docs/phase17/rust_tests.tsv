@@ -1368,7 +1368,7 @@ crates/core/algo-agreement	demux_raw_proposal_with_valid_group_over_stripped_gen
 crates/core/algo-agreement	demux_raw_proposal_with_oversized_txn_group_is_dropped_not_disconnected	crates/core/algo-agreement/src/demux.rs	1797
 crates/core/algo-agreement	demux_raw_vote_with_step_above_down_is_dropped_and_disconnects	crates/core/algo-agreement/src/demux.rs	1867
 crates/core/algo-agreement	demux_raw_bundle_with_step_above_down_is_dropped_and_disconnects	crates/core/algo-agreement/src/demux.rs	1898
-crates/core/algo-agreement	demux_raw_proposal_with_prior_vote_step_above_down_is_dropped_and_disconnects	crates/core/algo-agreement/src/demux.rs	1932
+crates/core/algo-agreement	demux_raw_proposal_with_prior_vote_step_above_down_is_dropped_not_disconnected	crates/core/algo-agreement/src/demux.rs	1932
 crates/core/algo-agreement	demux_garbage_data_does_not_crash	crates/core/algo-agreement/src/demux.rs	1978
 crates/core/algo-agreement	demux_channel_close_does_not_crash	crates/core/algo-agreement/src/demux.rs	2000
 crates/core/algo-agreement	consensus_version_view_marshal_unmarshal_msgpack_roundtrip	crates/core/algo-agreement/src/events.rs	1508

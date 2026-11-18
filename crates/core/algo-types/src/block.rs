@@ -338,12 +338,12 @@ impl Block {
         for _ in 0..len {
             let key = rmp_decode::read_key_bytes(rd)?;
             crate::header::header_key_match!(b, key, rd, {
-                // go's `Payset` (`[]SignedTxnInBlock`, `allocbound=-`)
+                // go's `Payset` (`//msgp:allocbound Payset 100000`)
                 (4, b't') if key == b"txns" => {
                     rmp_decode::read_slice_into(
                         rd,
                         &mut b.payset,
-                        usize::MAX,
+                        rmp_decode::MAX_PAYSET_LEN,
                         SignedTransaction::default,
                         |rd, t| SignedTransaction::decode_into(rd, t, true),
                     )?;
@@ -417,5 +417,27 @@ fn merge_raw_struct(prev: Option<rmpv::Value>, next: Option<rmpv::Value>) -> Opt
             Some(rmpv::Value::Map(a))
         }
         (_, next) => next,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// go's `//msgp:allocbound Payset 100000` is checked on the array header,
+    /// before any element is read (issue #2427): a payset header claiming one
+    /// more is `msgp.ErrOverflow`, whatever follows it.
+    #[test]
+    fn payset_over_its_allocbound_fails_on_the_header() {
+        let block = |n: u32| {
+            let mut b = vec![0x81, 0xa4, b't', b'x', b'n', b's', 0xdd];
+            b.extend_from_slice(&n.to_be_bytes());
+            b
+        };
+        let over = Block::decode_from_bytes(&block(100_001)).unwrap_err();
+        assert!(format!("{over:?}").contains("allocation bound"), "{over:?}");
+        // at the bound the header passes and the (missing) elements fail
+        let at = Block::decode_from_bytes(&block(100_000)).unwrap_err();
+        assert!(!format!("{at:?}").contains("allocation bound"), "{at:?}");
     }
 }

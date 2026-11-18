@@ -328,7 +328,10 @@ macro_rules! header_key_match {
             (2, b't') if $key == b"tc" => $h.txn_counter = rmp_decode::read_u64($rd)?,
             (2, b't') if $key == b"ts" => $h.timestamp = rmp_decode::read_i64($rd)?,
             // ── 3-byte keys ──────────────────────────────────
-            (3, b'g') if $key == b"gen" => $h.genesis_id = rmp_decode::read_string($rd)?,
+            (3, b'g') if $key == b"gen" => {
+                $h.genesis_id =
+                    rmp_decode::read_bounded_string($rd, rmp_decode::MAX_GENESIS_ID_LEN)?
+            }
             (3, b'p') if $key == b"prp" => {
                 rmp_decode::read_fixed_bytes_into_go_compat($rd, &mut $h.proposer.0)?
             }
@@ -361,7 +364,8 @@ macro_rules! header_key_match {
             }
             // ── 5-byte keys ──────────────────────────────────
             (5, b'p') if $key == b"proto" => {
-                $h.current_protocol = rmp_decode::read_string($rd)?
+                $h.current_protocol =
+                    rmp_decode::read_bounded_string($rd, rmp_decode::MAX_CONSENSUS_VERSION_LEN)?
             }
             // ── 6-byte keys ──────────────────────────────────
             (6, b'r') if $key == b"rwcalr" => {
@@ -382,7 +386,8 @@ macro_rules! header_key_match {
             }
             // ── 9-byte keys ──────────────────────────────────
             (9, b'n') if $key == b"nextproto" => {
-                $h.next_protocol = rmp_decode::read_string($rd)?
+                $h.next_protocol =
+                    rmp_decode::read_bounded_string($rd, rmp_decode::MAX_CONSENSUS_VERSION_LEN)?
             }
             // ── 10-byte keys ─────────────────────────────────
             (10, b'n') if $key == b"nextswitch" => {
@@ -407,7 +412,8 @@ macro_rules! header_key_match {
             )?,
             // ── upgrade* keys ────────────────────────────────
             (11, b'u') if $key == b"upgradeprop" => {
-                $h.upgrade_propose = rmp_decode::read_string($rd)?
+                $h.upgrade_propose =
+                    rmp_decode::read_bounded_string($rd, rmp_decode::MAX_CONSENSUS_VERSION_LEN)?
             }
             (12, b'u') if $key == b"upgradedelay" => {
                 $h.upgrade_delay = rmp_decode::read_u64($rd)?

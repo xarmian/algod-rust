@@ -1585,6 +1585,7 @@ impl BoxRef {
             match rmp_decode::read_key_bytes(rd)? {
                 b"i" => s.index = rmp_decode::read_u64(rd)?,
                 b"n" => {
+                    rmp_decode::check_go_bytes_bound(rd, rmp_decode::MAX_BYTES_KEY_VALUE_LEN)?;
                     s.name =
                         rmp_decode::read_optional(rd, rmp_decode::read_bytes_as_bytebuf_go_compat)?
                 }
@@ -1608,9 +1609,19 @@ impl AssetParams {
                 // Issue #1608: raw bytes, not `read_string` -- go's
                 // `string`-typed unit_name/asset_name/url are not
                 // UTF-8-validated on the wire.
-                b"un" => s.unit_name = rmp_decode::read_str_bytes(rd)?,
-                b"an" => s.asset_name = rmp_decode::read_str_bytes(rd)?,
-                b"au" => s.url = rmp_decode::read_str_bytes(rd)?,
+                b"un" => {
+                    s.unit_name = rmp_decode::read_bounded_str_bytes(
+                        rd,
+                        rmp_decode::MAX_ASSET_UNIT_NAME_BYTES,
+                    )?
+                }
+                b"an" => {
+                    s.asset_name =
+                        rmp_decode::read_bounded_str_bytes(rd, rmp_decode::MAX_ASSET_NAME_BYTES)?
+                }
+                b"au" => {
+                    s.url = rmp_decode::read_bounded_str_bytes(rd, rmp_decode::MAX_ASSET_URL_BYTES)?
+                }
                 b"am" => rmp_decode::read_fixed_into_opt(rd, &mut s.metadata_hash)?,
                 b"m" => rmp_decode::read_address_into_opt(rd, &mut s.manager)?,
                 b"r" => rmp_decode::read_address_into_opt(rd, &mut s.reserve)?,
@@ -1828,6 +1839,16 @@ fn read_bytes_elem_into(rd: &mut &[u8], e: &mut Option<ByteBuf>) -> DecodeResult
     Ok(())
 }
 
+/// [`read_bytes_elem_into`] for a `crypto.GenericDigest` element (a proof's
+/// `pth`), bounded by `MaxHashDigestSize`.
+fn read_digest_elem_into(rd: &mut &[u8], e: &mut Option<ByteBuf>) -> DecodeResult<()> {
+    *e = Some(rmp_decode::read_bounded_bytebuf(
+        rd,
+        rmp_decode::MAX_HASH_DIGEST_SIZE,
+    )?);
+    Ok(())
+}
+
 /// go `crypto.FalconPublicKey` is `[FalconPublicKeySize]byte`
 /// (`crypto/falconWrapper.go`), read with `ReadExactBytes`: any encoded
 /// length is padded/truncated to this size, and an all-zero key is the zero
@@ -1859,9 +1880,9 @@ impl MerkleProof {
                 b"pth" => rmp_decode::read_slice_into_opt(
                     rd,
                     &mut s.path,
-                    usize::MAX,
+                    rmp_decode::MAX_PROOF_PATH_LEN,
                     || None,
-                    read_bytes_elem_into,
+                    read_digest_elem_into,
                 )?,
                 b"hsh" => rmp_decode::read_struct_into_opt(
                     rd,
@@ -1898,7 +1919,10 @@ impl MerkleSignature {
         let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"sig" => s.signature = rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?,
+                b"sig" => {
+                    s.signature =
+                        rmp_decode::read_bounded_bytebuf(rd, rmp_decode::FALCON_MAX_SIGNATURE_SIZE)?
+                }
                 b"idx" => s.vector_commitment_index = rmp_decode::read_u64(rd)?,
                 b"prf" => {
                     rmp_decode::read_struct_into_opt(rd, &mut s.proof, MerkleProof::decode_into)?
@@ -2028,7 +2052,10 @@ impl StateProofBody {
         let len = rmp_decode::read_struct_map_len(rd, s)?;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"c" => s.sig_commit = rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?,
+                b"c" => {
+                    s.sig_commit =
+                        rmp_decode::read_bounded_bytebuf(rd, rmp_decode::MAX_HASH_DIGEST_SIZE)?
+                }
                 b"w" => s.signed_weight = rmp_decode::read_u64(rd)?,
                 b"S" => rmp_decode::read_struct_into_opt(
                     rd,
@@ -2045,15 +2072,20 @@ impl StateProofBody {
                 // value fresh; go-codec decodes a repeated entry into the
                 // existing one (see `Reveal::decode_into_map_entry`)
                 b"r" if rmp_decode::reflect_mode() => read_reveals_reflect(rd, &mut s.reveals)?,
-                b"r" => rmp_decode::read_u64_map_into(rd, &mut s.reveals, |rd| {
-                    let mut r = Reveal::default();
-                    Reveal::decode_into(rd, &mut r)?;
-                    Ok(r)
-                })?,
+                b"r" => rmp_decode::read_u64_map_into(
+                    rd,
+                    &mut s.reveals,
+                    rmp_decode::MAX_REVEALS,
+                    |rd| {
+                        let mut r = Reveal::default();
+                        Reveal::decode_into(rd, &mut r)?;
+                        Ok(r)
+                    },
+                )?,
                 b"pr" => rmp_decode::read_slice_into_opt(
                     rd,
                     &mut s.positions_to_reveal,
-                    usize::MAX,
+                    rmp_decode::MAX_REVEALS,
                     || 0,
                     |rd, e| {
                         *e = rmp_decode::read_u64(rd)?;
@@ -2276,9 +2308,13 @@ impl StateProofMessage {
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
                 b"b" => {
-                    s.block_headers_commitment = rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?
+                    s.block_headers_commitment =
+                        rmp_decode::read_bounded_bytebuf(rd, rmp_decode::SHA256_SIZE)?
                 }
-                b"v" => s.voters_commitment = rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?,
+                b"v" => {
+                    s.voters_commitment =
+                        rmp_decode::read_bounded_bytebuf(rd, rmp_decode::SUMHASH_DIGEST_SIZE)?
+                }
                 b"P" => s.ln_proven_weight = rmp_decode::read_u64(rd)?,
                 b"f" => s.first_attested_round = rmp_decode::read_u64(rd)?,
                 b"l" => s.last_attested_round = rmp_decode::read_u64(rd)?,
@@ -2433,7 +2469,7 @@ impl Transaction {
                 (2, b'a') if key == b"al" => rmp_decode::read_slice_into_opt(
                     rd,
                     &mut t.access,
-                    usize::MAX,
+                    rmp_decode::MAX_APP_ACCESS,
                     ResourceRef::default,
                     ResourceRef::decode_into,
                 )?,
@@ -2459,7 +2495,10 @@ impl Transaction {
                 // ── 3-byte keys ──────────────────────────────────
                 (3, b'a') if key == b"amt" => t.amount = rmp_decode::read_u64(rd)?,
                 (3, b'f') if key == b"fee" => t.fee = rmp_decode::read_u64(rd)?,
-                (3, b'g') if key == b"gen" => t.genesis_id = rmp_decode::read_string(rd)?,
+                (3, b'g') if key == b"gen" => {
+                    t.genesis_id =
+                        rmp_decode::read_bounded_string(rd, rmp_decode::MAX_GENESIS_ID_LEN)?
+                }
                 (3, b'g') if key == b"grp" => {
                     rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut t.group)?
                 }
@@ -2476,12 +2515,16 @@ impl Transaction {
                     b"apaa" => rmp_decode::read_slice_into_opt(
                         rd,
                         &mut t.app_arguments,
-                        usize::MAX,
+                        rmp_decode::ENCODED_MAX_APPLICATION_ARGS,
                         || None,
                         read_bytes_elem_into,
                     )?,
                     b"apan" => t.on_completion = rmp_decode::read_u64(rd)?,
                     b"apap" => {
+                        rmp_decode::check_go_bytes_bound(
+                            rd,
+                            rmp_decode::MAX_AVAILABLE_APP_PROGRAM_LEN,
+                        )?;
                         t.approval_program = rmp_decode::read_optional(
                             rd,
                             rmp_decode::read_bytes_as_bytebuf_go_compat,
@@ -2495,21 +2538,21 @@ impl Transaction {
                     b"apas" => rmp_decode::read_slice_into_opt(
                         rd,
                         &mut t.foreign_assets,
-                        usize::MAX,
+                        rmp_decode::ENCODED_MAX_FOREIGN_ASSETS,
                         || 0,
                         read_u64_elem_into,
                     )?,
                     b"apat" => rmp_decode::read_slice_into_opt(
                         rd,
                         &mut t.accounts,
-                        usize::MAX,
+                        rmp_decode::ENCODED_MAX_ACCOUNTS,
                         Address::default,
                         read_address_elem_into,
                     )?,
                     b"apbx" => rmp_decode::read_slice_into_opt(
                         rd,
                         &mut t.boxes,
-                        usize::MAX,
+                        rmp_decode::ENCODED_MAX_BOXES,
                         BoxRef::default,
                         BoxRef::decode_into,
                     )?,
@@ -2517,7 +2560,7 @@ impl Transaction {
                     b"apfa" => rmp_decode::read_slice_into_opt(
                         rd,
                         &mut t.foreign_apps,
-                        usize::MAX,
+                        rmp_decode::ENCODED_MAX_FOREIGN_APPS,
                         || 0,
                         read_u64_elem_into,
                     )?,
@@ -2534,6 +2577,10 @@ impl Transaction {
                     )?,
                     b"aprv" => t.reject_version = rmp_decode::read_u64(rd)?,
                     b"apsu" => {
+                        rmp_decode::check_go_bytes_bound(
+                            rd,
+                            rmp_decode::MAX_AVAILABLE_APP_PROGRAM_LEN,
+                        )?;
                         t.clear_state_program = rmp_decode::read_optional(
                             rd,
                             rmp_decode::read_bytes_as_bytebuf_go_compat,
@@ -2549,10 +2596,13 @@ impl Transaction {
                 }
                 (4, b'f') if key == b"faid" => t.freeze_asset = rmp_decode::read_u64(rd)?,
                 (4, b'n') if key == b"note" => {
-                    t.note = rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?
+                    t.note = rmp_decode::read_bounded_bytebuf(rd, rmp_decode::MAX_TXN_NOTE_BYTES)?
                 }
                 (4, b't') if key == b"type" => {
-                    t.txn_type = TxnType::from(rmp_decode::read_string(rd)?)
+                    t.txn_type = TxnType::from(rmp_decode::read_bounded_string(
+                        rd,
+                        rmp_decode::TX_TYPE_MAX_LEN,
+                    )?)
                 }
                 (4, b'x') if key == b"xaid" => t.xaid = rmp_decode::read_u64(rd)?,
                 // ── 5-byte keys ──────────────────────────────────
