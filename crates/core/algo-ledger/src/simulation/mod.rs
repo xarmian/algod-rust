@@ -2242,7 +2242,7 @@ mod tests {
                 sig: [0u8; 64],
                 msig: None,
                 lmsig: None,
-                args: Some(vec![serde_bytes::ByteBuf::from(vec![1u8])]),
+                args: Some(vec![Some(serde_bytes::ByteBuf::from(vec![1u8]))]),
                 pqsig: None,
             }),
             ..Default::default()

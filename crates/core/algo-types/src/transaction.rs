@@ -626,9 +626,10 @@ pub struct LogicSig {
     #[serde(rename = "msig", default, skip_serializing_if = "Option::is_none")]
     pub msig: Option<MultisigSig>,
 
-    /// Arguments (optional, variable length).
+    /// Arguments (optional, variable length). A `None` element is go's nil
+    /// `[]byte` (encoded as msgpack `nil`, not `bin` 0; issue #2430).
     #[serde(rename = "arg", default, skip_serializing_if = "Option::is_none")]
-    pub args: Option<Vec<ByteBuf>>,
+    pub args: Option<Vec<Option<ByteBuf>>>,
 
     /// Delegated logic multisig (optional).
     #[serde(rename = "lmsig", default, skip_serializing_if = "Option::is_none")]
@@ -1703,11 +1704,10 @@ impl MultisigSig {
 }
 
 /// One `LogicSig.Args` element: go bounds it by `MaxLogicSigArgSize` before
-/// reading it.
-fn read_lsig_arg(rd: &mut &[u8], e: &mut ByteBuf) -> DecodeResult<()> {
+/// reading it, and keeps a `nil` element nil like [`read_bytes_elem_into`].
+fn read_lsig_arg(rd: &mut &[u8], e: &mut Option<ByteBuf>) -> DecodeResult<()> {
     rmp_decode::check_go_bytes_bound(rd, rmp_decode::MAX_LOGIC_SIG_ARG_SIZE)?;
-    *e = rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?;
-    Ok(())
+    read_bytes_elem_into(rd, e)
 }
 
 impl LogicSig {
@@ -1726,6 +1726,15 @@ impl LogicSig {
     /// Go: `LogicSig.HasProgram()` -- `len(Logic) != 0`.
     pub fn has_program(&self) -> bool {
         !self.logic.is_empty()
+    }
+
+    /// The arguments as go's program and size checks see them: a nil element
+    /// (`None`) is a zero-length `[]byte`.
+    pub fn arg_bytes(&self) -> impl Iterator<Item = &[u8]> {
+        self.args
+            .iter()
+            .flatten()
+            .map(|a| a.as_ref().map_or(&[][..], |a| a.as_slice()))
     }
 
     decode_via_into!();
@@ -1754,7 +1763,7 @@ impl LogicSig {
                     rd,
                     &mut s.args,
                     rmp_decode::EVAL_MAX_ARGS,
-                    ByteBuf::new,
+                    || None,
                     read_lsig_arg,
                 )?,
                 // As `msig`: a `nil` `lmsig` fails the required checks (#2390).
@@ -1831,21 +1840,31 @@ impl HashFactory {
 
 /// Element reader for go `[][]byte` / `[]GenericDigest` lists.
 ///
-/// go's `ReadBytesBytes` decodes a nil element as an empty slice, which
-/// re-encodes as `bin` len 0 -- NOT as nil. Returning `None` here would
-/// re-encode as nil and change TxIDs / group IDs / Merkle leaves (#2046).
+/// go's `msgp.ReadBytesBytes` keeps a `nil` element a nil slice (`None`),
+/// which `msgp.AppendBytes` re-encodes as `nil`; a `bin` / `str` of length 0
+/// is a non-nil empty slice, re-encoded as `bin` 0. The two encode
+/// differently, so mapping one to the other changes TxIDs / group IDs /
+/// payset commitments (issue #2430).
 fn read_bytes_elem_into(rd: &mut &[u8], e: &mut Option<ByteBuf>) -> DecodeResult<()> {
-    *e = Some(rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?);
+    *e = if rmp_decode::try_read_nil(rd) {
+        None
+    } else {
+        Some(rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?)
+    };
     Ok(())
 }
 
 /// [`read_bytes_elem_into`] for a `crypto.GenericDigest` element (a proof's
 /// `pth`), bounded by `MaxHashDigestSize`.
 fn read_digest_elem_into(rd: &mut &[u8], e: &mut Option<ByteBuf>) -> DecodeResult<()> {
-    *e = Some(rmp_decode::read_bounded_bytebuf(
-        rd,
-        rmp_decode::MAX_HASH_DIGEST_SIZE,
-    )?);
+    *e = if rmp_decode::try_read_nil(rd) {
+        None
+    } else {
+        Some(rmp_decode::read_bounded_bytebuf(
+            rd,
+            rmp_decode::MAX_HASH_DIGEST_SIZE,
+        )?)
+    };
     Ok(())
 }
 
@@ -3231,7 +3250,7 @@ mod logicsig_blank_tests {
                 ..Default::default()
             },
             LogicSig {
-                args: Some(vec![ByteBuf::new()]),
+                args: Some(vec![Some(ByteBuf::new())]),
                 ..Default::default()
             },
             LogicSig {
@@ -3334,7 +3353,7 @@ mod logicsig_blank_tests {
     #[test]
     fn logicsig_blank_and_has_program_args_alone_is_not_blank_no_program() {
         let lsig = LogicSig {
-            args: Some(vec![ByteBuf::new()]),
+            args: Some(vec![Some(ByteBuf::new())]),
             ..Default::default()
         };
         assert!(!logicsig_blank(&lsig));

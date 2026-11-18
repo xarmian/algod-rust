@@ -2030,7 +2030,7 @@ mod tests {
         let mut lsig = make_signed_txn(4000);
         lsig.lsig = Some(algo_types::LogicSig {
             logic: ByteBuf::from(vec![8, 0x81, 1]),
-            args: Some(vec![ByteBuf::from(vec![9, 9])]),
+            args: Some(vec![Some(ByteBuf::from(vec![9, 9]))]),
             ..Default::default()
         });
 

@@ -329,16 +329,11 @@ fn txna_application_args() {
 
 /// TestTxnaEmptyValues (eval_test.go), ApplicationArgs half: `btoi(txna
 /// ApplicationArgs 0) == 0` must hold for both an explicit empty-bytes arg
-/// and a nil arg -- go distinguishes `[]byte("")` from `nil`, but rust's
-/// `Vec<u8>` has no such distinction, so both cases collapse to the same
-/// representation and this test exercises that directly.
+/// and a nil arg (`None`: go's nil `[]byte`, which the encoding keeps
+/// distinct, issue #2430; the program sees zero bytes for both).
 #[test]
 fn txna_application_args_empty_bytes_is_zero() {
     let sender = [0xAA; 32];
-    let txn = make_appl_txn_with_args(sender, 42, vec![Vec::new()]);
-    let mut store = LedgerState::new();
-    let mut ctx = make_context(&mut store, vec![txn]);
-
     let code: &[u8] = &[
         0x36, 26, 0x00, // txna ApplicationArgs 0
         0x17, // btoi
@@ -346,8 +341,17 @@ fn txna_application_args_empty_bytes_is_zero() {
         0x12, // ==
         0x43, // return
     ];
-    let result = run_with_context(6, code, &mut ctx).unwrap();
-    assert!(result, "btoi of an empty ApplicationArgs[0] should equal 0");
+    for arg in [Some(ByteBuf::new()), None] {
+        let mut txn = make_appl_txn_with_args(sender, 42, vec![Vec::new()]);
+        txn.txn.app_arguments = Some(vec![arg.clone()]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        let result = run_with_context(6, code, &mut ctx).unwrap();
+        assert!(
+            result,
+            "btoi of ApplicationArgs[0] = {arg:?} should equal 0"
+        );
+    }
 }
 
 /// TestTxnaEmptyValues (eval_test.go), Accounts half: `txna Accounts 1 ==

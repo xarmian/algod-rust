@@ -11749,7 +11749,8 @@ mod tests {
             txn,
             lsig: Some(algo_types::LogicSig {
                 logic: serde_bytes::ByteBuf::from(program),
-                args: (arg_len > 0).then(|| vec![serde_bytes::ByteBuf::from(vec![7u8; arg_len])]),
+                args: (arg_len > 0)
+                    .then(|| vec![Some(serde_bytes::ByteBuf::from(vec![7u8; arg_len]))]),
                 ..Default::default()
             }),
             ..Default::default()

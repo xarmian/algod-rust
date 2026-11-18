@@ -20,7 +20,7 @@ reader, so the table below collapses to two classes.
 | go reader | accepts | length rule |
 |---|---|---|
 | `ReadExactBytes` (`[N]byte`) | `bin8/16/32`, `str` (fixstr/str8/16/32), `nil` (array zeroed), explicit array of uint8, (interleaved map) | **not enforced**: copies `min(encoded, N)` bytes, tail stays zero (the strict check is commented out in `read_bytes.go`) |
-| `ReadBytesBytes` (`[]byte`) | same set; `nil` gives an empty slice | any |
+| `ReadBytesBytes` (`[]byte`) | same set; `nil` gives a nil slice (`msgp.AppendBytes` re-encodes it as `nil`, an empty one as `bin` 0: visible only where nil and empty are both encoded, i.e. list elements, issue #2430) | any |
 | `ReadStringBytes` / `ReadStringZC` (`string`) | `str`, `nil` (empty string); **not** `bin` | any |
 
 ## Rust before / after
@@ -87,11 +87,24 @@ the rule is "reject nothing go accepts".
 ## List elements, arrays, duplicate keys (review follow-ups)
 
 * **nil elements of `[]byte` lists** (`apaa`, MerkleProof `pth`, LogicSig
-  `arg`): go's `ReadBytesBytes(nil)` yields an empty slice, which re-encodes
-  as `bin` len 0. Rust's `Option<ByteBuf>` list readers previously mapped a
-  nil element to `None` (re-encoded as nil: a different TxID / group ID /
-  Merkle leaf). Fixed: the element reader returns `Some(empty)`.
-  Tests: `go_msgp_bytes_compat_lists_test.rs`.
+  `arg`; at go v5.0.5-stable these are the only `[][]byte` /
+  `[]crypto.GenericDigest` reachable from a consensus message, besides
+  the local crash-recovery `agreement.diskState.Actions`, whose elements are
+  each decoded into an action, never re-encoded as a list): go's `ReadBytesBytes` keeps a `nil` element a nil slice and
+  `msgp.AppendBytes` re-encodes it as `nil` (`0xc0`); a `bin` / `str` of
+  length 0 is a non-nil empty slice, re-encoded as `bin` 0 (`c4 00`). The two
+  give different TxIDs / group IDs / payset commitments. Issue #2430 (which
+  corrected the earlier, opposite reading of #2046 / PR #2062): every element
+  is an `Option<ByteBuf>` (`LogicSig.args` included), `None` being go's nil,
+  decoded and re-encoded losslessly by the canonical, serde and go-codec
+  (tx-sync) paths; go-codec's JSON renders a nil element `null`, an empty one
+  `""`, and so does the REST JSON. What a program sees (`txna
+  ApplicationArgs i`, `arg i`) and the size checks treat a nil element as zero
+  bytes, like go. Tests: `go_msgp_bytes_compat_lists_test.rs`,
+  `algo-codec/tests/nil_byte_elements_go_txid_test.rs` (go's TxID and signed
+  transaction bytes), `pre_encoded_tx_info_json_test.rs`, and the
+  strict-decode oracle's nil-element cases (`go_val`, every consensus seed
+  kind and tx-sync).
 * **Explicit-array form**: elements are read like go `ReadUint8Bytes`
   (`ReadUint64Bytes` + `> 255` overflow check): fixint, uint8..64,
   non-negative int8..64 and nil (as 0); negative values and > 255 are

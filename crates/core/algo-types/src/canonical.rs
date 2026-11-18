@@ -921,7 +921,11 @@ pub fn canonical_encode_logicsig(lsig: &LogicSig) -> Vec<u8> {
             let mut buf = Vec::new();
             rmp::encode::write_array_len(&mut buf, args.len() as u32).unwrap();
             for arg in args {
-                rmp::encode::write_bin(&mut buf, arg).unwrap();
+                // go `msgp.AppendBytes`: a nil element is `nil` (issue #2430)
+                match arg {
+                    Some(arg) => rmp::encode::write_bin(&mut buf, arg).unwrap(),
+                    None => rmp::encode::write_nil(&mut buf).unwrap(),
+                }
             }
             m.push_encoded("arg", &buf);
         }

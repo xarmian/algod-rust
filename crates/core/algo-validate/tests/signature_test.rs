@@ -961,7 +961,7 @@ fn sig_plus_orphan_lsig_counts_one_category_like_go() {
         txn,
         sig,
         lsig: Some(LogicSig {
-            args: Some(vec![serde_bytes::ByteBuf::from(vec![7u8])]),
+            args: Some(vec![Some(serde_bytes::ByteBuf::from(vec![7u8]))]),
             ..Default::default()
         }),
         ..Default::default()
@@ -1040,7 +1040,7 @@ fn escrow_txn_with_arg(salt: u8, arg_len: usize) -> SignedTransaction {
     stx.txn.note = serde_bytes::ByteBuf::from(vec![salt]);
     if arg_len > 0 {
         stx.lsig.as_mut().unwrap().args =
-            Some(vec![serde_bytes::ByteBuf::from(vec![7u8; arg_len])]);
+            Some(vec![Some(serde_bytes::ByteBuf::from(vec![7u8; arg_len]))]);
     }
     stx
 }
@@ -1106,7 +1106,7 @@ fn cached_verify_pre_v42_pooled_size() {
 fn cached_verify_rejects_orphan_lsig_content_v42() {
     let err = verify_cached(
         &[orphan_lsig_txn(LogicSig {
-            args: Some(vec![serde_bytes::ByteBuf::from(vec![1u8])]),
+            args: Some(vec![Some(serde_bytes::ByteBuf::from(vec![1u8]))]),
             ..Default::default()
         })],
         &v42(),
