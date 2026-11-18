@@ -942,9 +942,9 @@ fn read_bool(cursor: &mut Cursor<&[u8]>) -> Result<bool, CodecError> {
 
 type GoResult<T> = algo_error::Result<T>;
 
-/// go's `bounds.MaxVoteThreshold`: most votes / equivocation votes of a
-/// bundle.
-const MAX_BUNDLE_ARRAY_LEN: usize = 10_000;
+/// go's `bounds.MaxVoteThreshold` (7750, issue #2427): the `allocbound` of a
+/// bundle's votes / equivocation votes.
+const MAX_BUNDLE_ARRAY_LEN: usize = go_msgp::MAX_VOTE_THRESHOLD;
 
 fn go_err(e: algo_error::AlgoError) -> CodecError {
     CodecError::Decode(e.to_string())
@@ -1743,7 +1743,7 @@ pub fn encode_authenticated_bundle(b: &AuthenticatedBundle) -> Vec<u8> {
 /// Decode an authenticated bundle from canonical wire-format msgpack bytes.
 pub fn decode_authenticated_bundle(bytes: &[u8]) -> Result<AuthenticatedBundle, CodecError> {
     // Same alloc bound as `decode_bundle`.
-    const MAX_BUNDLE_ARRAY_LEN: u32 = 10_000;
+    const MAX_BUNDLE_ARRAY_LEN: u32 = go_msgp::MAX_VOTE_THRESHOLD as u32;
 
     let mut cursor = Cursor::new(bytes);
     let map_len = rmp::decode::read_map_len(&mut cursor)

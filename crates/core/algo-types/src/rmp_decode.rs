@@ -118,6 +118,67 @@ pub const MAX_PQ_PUBLIC_KEY_SIZE: usize = 1793;
 /// `crypto.MaxPQSignatureSize` (`FalconMaxSignatureSize`, the CT signature).
 pub const MAX_PQ_SIGNATURE_SIZE: usize = 1538;
 
+// ── go's other msgp allocation bounds of consensus messages (issue #2427) ──
+//
+// Every field below carries an `allocbound` in go v5.0.5-stable: its generated
+// decoder reads the length header (`msgp.ReadBytesBytesHeader`,
+// `ReadArrayHeaderBytes`, `ReadMapHeaderBytes`) and fails with
+// `msgp.ErrOverflow` when it is larger, before reading the value. The
+// `bounds.*` values are what `config.checkSetAllocBounds` computes, the
+// maximum over every consensus version (vFuture included).
+
+/// `bounds.MaxGenesisIDLen`: `gen` of a transaction and a block header.
+pub const MAX_GENESIS_ID_LEN: usize = 128;
+/// `bounds.MaxConsensusVersionLen`: a `protocol.ConsensusVersion` (`proto`,
+/// `nextproto`, `upgradeprop`).
+pub const MAX_CONSENSUS_VERSION_LEN: usize = 128;
+/// `protocol.txTypeMaxLen`: a `protocol.TxType` (`type`).
+pub const TX_TYPE_MAX_LEN: usize = 7;
+/// `bounds.MaxTxnNoteBytes` (`MaxAbsoluteTxnNoteBytes`): `note`.
+pub const MAX_TXN_NOTE_BYTES: usize = 4096;
+/// `transactions.encodedMaxApplicationArgs`: elements of `apaa`.
+pub const ENCODED_MAX_APPLICATION_ARGS: usize = 32;
+/// `transactions.encodedMaxAccounts`: elements of `apat`.
+pub const ENCODED_MAX_ACCOUNTS: usize = 32;
+/// `transactions.encodedMaxForeignAssets`: elements of `apas`.
+pub const ENCODED_MAX_FOREIGN_ASSETS: usize = 32;
+/// `transactions.encodedMaxForeignApps`: elements of `apfa`.
+pub const ENCODED_MAX_FOREIGN_APPS: usize = 32;
+/// `transactions.encodedMaxBoxes`: elements of `apbx`.
+pub const ENCODED_MAX_BOXES: usize = 32;
+/// `bounds.MaxAppAccess`: elements of `al`.
+pub const MAX_APP_ACCESS: usize = 16;
+/// `bounds.MaxAvailableAppProgramLen` (`MaxAppProgramLen * (1 +
+/// MaxExtraAppProgramLen)`, 2048 * 8): `apap`, `apsu`.
+pub const MAX_AVAILABLE_APP_PROGRAM_LEN: usize = 16384;
+/// `bounds.MaxBytesKeyValueLen`: a box name (`BoxRef.n`).
+pub const MAX_BYTES_KEY_VALUE_LEN: usize = 128;
+/// `bounds.MaxAssetUnitNameBytes`: `AssetParams.un`.
+pub const MAX_ASSET_UNIT_NAME_BYTES: usize = 8;
+/// `bounds.MaxAssetNameBytes`: `AssetParams.an`.
+pub const MAX_ASSET_NAME_BYTES: usize = 32;
+/// `bounds.MaxAssetURLBytes`: `AssetParams.au`.
+pub const MAX_ASSET_URL_BYTES: usize = 96;
+/// `crypto.MaxHashDigestSize` (`SumhashDigestSize`): a `crypto.GenericDigest`.
+pub const MAX_HASH_DIGEST_SIZE: usize = 64;
+/// `crypto.Sha256Size`: `stateproofmsg.Message.BlockHeadersCommitment`.
+pub const SHA256_SIZE: usize = 32;
+/// `crypto.SumhashDigestSize`: `stateproofmsg.Message.VotersCommitment`.
+pub const SUMHASH_DIGEST_SIZE: usize = 64;
+/// `crypto.FalconMaxSignatureSize` (`cfalcon.CTSignatureSize`): a
+/// `crypto.FalconSignature`.
+pub const FALCON_MAX_SIGNATURE_SIZE: usize = 1538;
+/// `stateproof.MaxReveals`: entries of `Reveals`, elements of
+/// `PositionsToReveal`.
+pub const MAX_REVEALS: usize = 640;
+/// `merklearray.MaxNumLeavesOnEncodedTree / 2`: elements of a proof's `pth`.
+pub const MAX_PROOF_PATH_LEN: usize = (1 << 16) / 2;
+/// `//msgp:allocbound Payset 100000`: transactions of a block.
+pub const MAX_PAYSET_LEN: usize = 100_000;
+/// `bounds.MaxVoteThreshold` (the largest committee threshold, 7750):
+/// elements of a bundle's `vote` and `eqv`.
+pub const MAX_VOTE_THRESHOLD: usize = 7750;
+
 // ── Skip value ─────────────────────────────────────────────────
 
 /// Matches go-algorand v4.7.2-stable's `msgp.DefaultUnmarshalState.AllowableDepth`
@@ -247,10 +308,13 @@ pub fn strict_unknown_fields_scan(body: &[u8]) -> StrictUnknownFieldsGuard {
 /// - `codec:",required"` and the msgp `allocbound`s are msgp-only: go-codec
 ///   checks neither;
 /// - a repeated key of a `map[K]struct` decodes INTO the existing entry, an
-///   unaddressable map value: see `Reveal::decode_into_map_entry`.
+///   unaddressable map value: see `Reveal::decode_into_map_entry`;
+/// - a repeated slice longer than its capacity keeps its elements (go-codec
+///   copies them into the grown slice, msgp makes a fresh one, issue #2427):
+///   see [`read_slice_into`].
 ///
-/// Everything else (a repeated struct field merges, slices, `[N]byte`) the
-/// two decoders do alike.
+/// Everything else (a repeated struct field merges, a slice within its
+/// capacity, `[N]byte`) the two decoders do alike.
 pub fn go_codec_reflect(body: &[u8]) -> StrictUnknownFieldsGuard {
     let guard = strict_unknown_fields(body);
     SCAN_ONLY.with(|c| c.set(true));
@@ -1061,6 +1125,42 @@ pub fn check_go_bytes_bound(rd: &[u8], bound: usize) -> Result<()> {
     Ok(())
 }
 
+/// A go `string` field with an `allocbound` (issue #2427): the bound is
+/// checked on the length header ([`check_go_bytes_bound`]), then the value is
+/// read with [`read_string`].
+#[inline]
+pub fn read_bounded_string(rd: &mut &[u8], bound: usize) -> Result<String> {
+    check_go_bytes_bound(rd, bound)?;
+    read_string(rd)
+}
+
+/// [`read_bounded_string`] keeping the raw bytes ([`read_str_bytes`]).
+#[inline]
+pub fn read_bounded_str_bytes(rd: &mut &[u8], bound: usize) -> Result<Vec<u8>> {
+    check_go_bytes_bound(rd, bound)?;
+    read_str_bytes(rd)
+}
+
+/// A go `[]byte` field with an `allocbound` (issue #2427), checked on the
+/// length header before the value is read.
+#[inline]
+pub fn read_bounded_bytebuf(rd: &mut &[u8], bound: usize) -> Result<ByteBuf> {
+    check_go_bytes_bound(rd, bound)?;
+    read_bytes_as_bytebuf_go_compat(rd)
+}
+
+/// go's check of a map field's `allocbound` on the entry count of its header
+/// (`msgp.ErrOverflow`); none in [`go_codec_reflect`] mode.
+#[inline]
+pub fn check_go_map_bound(n: usize, bound: usize) -> Result<()> {
+    if n > bound && alloc_bounds_checked() {
+        return Err(codec_err(format!(
+            "read_map: {n} entries exceed the allocation bound {bound}"
+        )));
+    }
+    Ok(())
+}
+
 /// Read an rmpv::Value from the reader (for opaque passthrough fields like eval_delta).
 #[inline]
 pub fn read_rmpv_value(rd: &mut &[u8]) -> Result<rmpv::Value> {
@@ -1375,11 +1475,21 @@ pub fn read_slice_into<T: 'static>(
                 rd.len()
             )));
         }
-        let mut fresh = Vec::with_capacity(n);
-        fresh.extend((0..n).map(|_| zero()));
-        // a stale record for a freed buffer at the same address
-        drop(take_spare(&fresh));
-        *v = fresh;
+        if reflect_mode() {
+            // go-codec (`kSlice`) grows the slice by copying its elements (up
+            // to its length, not its capacity: the hidden ones are dropped)
+            // into the new one, then decodes each element INTO what is there
+            // (issue #2427, read with the strict-decode oracle)
+            v.reserve_exact(n - v.len());
+            v.resize_with(n, &zero);
+            drop(take_spare(v));
+        } else {
+            let mut fresh = Vec::with_capacity(n);
+            fresh.extend((0..n).map(|_| zero()));
+            // a stale record for a freed buffer at the same address
+            drop(take_spare(&fresh));
+            *v = fresh;
+        }
         spare = Vec::new();
     }
     if !spare.is_empty() {
@@ -1430,11 +1540,13 @@ pub fn read_fixed_array_into<T>(
 }
 
 /// A go `map[uint64]T` decoded into its populated value: `nil` makes it nil,
-/// anything else adds (or overwrites) entries, each value decoded fresh.
+/// anything else adds (or overwrites) entries, each value decoded fresh. More
+/// than `bound` entries is go's `msgp.ErrOverflow`.
 #[inline]
 pub fn read_u64_map_into<T>(
     rd: &mut &[u8],
     slot: &mut Option<std::collections::BTreeMap<u64, T>>,
+    bound: usize,
     decode_fn: impl Fn(&mut &[u8]) -> Result<T>,
 ) -> Result<()> {
     if try_read_nil(rd) {
@@ -1442,6 +1554,7 @@ pub fn read_u64_map_into<T>(
         return Ok(());
     }
     let len = read_map_len(rd)?;
+    check_go_map_bound(len as usize, bound)?;
     let map = slot.get_or_insert_with(std::collections::BTreeMap::new);
     for _ in 0..len {
         let key = read_u64(rd)?;

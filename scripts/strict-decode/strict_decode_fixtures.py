@@ -71,6 +71,12 @@ value, re-encoded. Repeated-key cases are generated for a set's
 `repeat_kinds`: every kind since issue #2424 (the consensus readers and the
 tx-sync reader merge a repeated key like go), and the consensus set's
 algo-agreement test compares decoded values too.
+
+Allocation-bound cases (issue #2427) come last: for every msgp `allocbound`
+reachable from a consensus message (BOUND_RULES), the field again at exactly
+its bound and at bound + 1 elements / bytes, in a set's `bound_kinds`. go
+rejects the second with `msgp.ErrOverflow` on the length header; the tx-sync
+response (go-codec) checks no allocbound and accepts both.
 """
 import argparse
 import hashlib
@@ -516,6 +522,244 @@ def make_repeat_cases(seeds, rng, cap):
     return cases[:cap]
 
 
+# ── allocation-bound boundary cases (issue #2427) ─────────────────────────
+#
+# go's generated msgp decoders read the length header of every field with an
+# `allocbound` (`msgp.ReadBytesBytesHeader` / `ReadArrayHeaderBytes` /
+# `ReadMapHeaderBytes`) and fail with `msgp.ErrOverflow` when it is larger,
+# before reading the value. Each rule below is one such bound reachable from a
+# consensus message (the `Transaction` / `BlockHeader` / `Payset` /
+# `StateProof` / `LogicSig` / `EvalDelta` / bundle decoders of go v5.0.5-stable;
+# the `bounds.*` values are the maxima `config.checkSetAllocBounds` computes
+# over every consensus version). Every rule gives two mutants of a map of that
+# struct: the field again, at the end of the map (so it is the value go keeps),
+# with exactly `bound` and with `bound + 1` elements / bytes. go-codec (the
+# tx-sync response) checks no allocbound, so there both are accepted.
+
+
+def enc_uint(n):
+    if n < 128:
+        return bytes([n])
+    if n < 256:
+        return b"\xcc" + bytes([n])
+    if n < 65536:
+        return b"\xcd" + n.to_bytes(2, "big")
+    return b"\xce" + n.to_bytes(4, "big")
+
+
+def enc_str_n(n):
+    raw = b"a" * n
+    if n < 32:
+        return bytes([0xA0 | n]) + raw
+    if n < 256:
+        return b"\xd9" + bytes([n]) + raw
+    return b"\xda" + n.to_bytes(2, "big") + raw
+
+
+def enc_bin_n(n):
+    raw = b"\x61" * n
+    if n < 256:
+        return b"\xc4" + bytes([n]) + raw
+    if n < 65536:
+        return b"\xc5" + n.to_bytes(2, "big") + raw
+    return b"\xc6" + n.to_bytes(4, "big") + raw
+
+
+def enc_array(n, elem):
+    if n < 16:
+        head = bytes([0x90 | n])
+    elif n < 65536:
+        head = b"\xdc" + n.to_bytes(2, "big")
+    else:
+        head = b"\xdd" + n.to_bytes(4, "big")
+    return head + elem * n
+
+
+def enc_map_u64(n, val):
+    return encode_map_len(n) + b"".join(enc_uint(k) + val for k in range(n))
+
+
+def enc_map_str(n, val):
+    return encode_map_len(n) + b"".join(str_key(f"k{k:05d}") + val for k in range(n))
+
+
+S = lambda n: enc_str_n(n)  # noqa: E731  a go `string`
+B = lambda n: enc_bin_n(n)  # noqa: E731  a go `[]byte`
+A = lambda elem: lambda n: enc_array(n, elem)  # noqa: E731  a slice of n `elem`
+MU = lambda val: lambda n: enc_map_u64(n, val)  # noqa: E731  a map[uint64]T
+MS = lambda val: lambda n: enc_map_str(n, val)  # noqa: E731  a map[string]T
+AE = lambda n: enc_array(1, enc_bin_n(n))  # noqa: E731  one element of n bytes
+
+NIL, EMPTY_MAP, EMPTY_BIN = b"\xc0", b"\x80", b"\xc4\x00"
+# the smallest `stateproof.Reveal` go accepts: its required `p` with a non-zero
+# verifier (`{"p": {"p": {"lf": 1}}}`)
+MIN_REVEAL = b"\x81\xa1p\x81\xa1p\x81\xa2lf\x01"
+# the smallest `SignedTxnWithAD` go accepts: its required `txn` with the
+# Transaction's required `snd` and `type`
+MIN_STXN = b"\x81\xa3txn\x82\xa3snd\xc4\x20" + b"\x01" * 32 + b"\xa4type\xa3pay"
+
+HEADER = {"$block", "block", "$header"}
+HEADER_SIB = {"rnd", "prev", "gh", "proto", "ts", "seed", "txn", "gen", "fees", "rwd"}
+TXN_SIB = {"snd", "type", "fv", "lv", "fee", "gh", "note"}
+# (parents, any sibling key the map must have or None, key, value builder, bound, go's bound)
+BOUND_RULES = [
+    # bookkeeping.BlockHeader (Block, unauthenticatedProposal, transmittedPayload)
+    (HEADER, HEADER_SIB, "gen", S, 128, "bounds.MaxGenesisIDLen"),
+    (HEADER, HEADER_SIB, "proto", S, 128, "bounds.MaxConsensusVersionLen"),
+    (HEADER, HEADER_SIB, "nextproto", S, 128, "bounds.MaxConsensusVersionLen"),
+    (HEADER, HEADER_SIB, "upgradeprop", S, 128, "bounds.MaxConsensusVersionLen"),
+    (HEADER, HEADER_SIB, "spt", MU(NIL), 1, "protocol.NumStateProofTypes"),
+    (HEADER, HEADER_SIB, "partupdrmv", A(NIL), 32, "bounds.MaxProposedExpiredOnlineAccounts"),
+    (HEADER, HEADER_SIB, "partupdabs", A(NIL), 32, "bounds.MaxMarkAbsent"),
+    ({"spt"}, {"v", "t", "n"}, "v", B, 64, "crypto.MaxHashDigestSize"),
+    # transactions.Payset (100000 valid elements would be 5 MB: at the bound go
+    # and algod-rust both reject the first element's missing required `txn`)
+    ({"$block", "block"}, HEADER_SIB, "txns", A(EMPTY_MAP), 100000, "Payset 100000"),
+    # transactions.Transaction
+    ({"txn"}, TXN_SIB, "note", B, 4096, "bounds.MaxTxnNoteBytes"),
+    ({"txn"}, TXN_SIB, "gen", S, 128, "bounds.MaxGenesisIDLen"),
+    ({"txn"}, TXN_SIB, "type", S, 7, "txTypeMaxLen"),
+    ({"txn"}, TXN_SIB, "apaa", A(EMPTY_BIN), 32, "encodedMaxApplicationArgs"),
+    ({"txn"}, TXN_SIB, "apat", A(NIL), 32, "encodedMaxAccounts"),
+    ({"txn"}, TXN_SIB, "apas", A(b"\x01"), 32, "encodedMaxForeignAssets"),
+    ({"txn"}, TXN_SIB, "apfa", A(b"\x01"), 32, "encodedMaxForeignApps"),
+    ({"txn"}, TXN_SIB, "al", A(EMPTY_MAP), 16, "bounds.MaxAppAccess"),
+    ({"txn"}, TXN_SIB, "apbx", A(EMPTY_MAP), 32, "encodedMaxBoxes"),
+    ({"txn"}, TXN_SIB, "apap", B, 16384, "bounds.MaxAvailableAppProgramLen"),
+    ({"txn"}, TXN_SIB, "apsu", B, 16384, "bounds.MaxAvailableAppProgramLen"),
+    ({"apbx", "b"}, {"i", "n"}, "n", B, 128, "bounds.MaxBytesKeyValueLen"),
+    ({"apar"}, {"t", "dc", "un", "an", "au", "m"}, "un", S, 8, "bounds.MaxAssetUnitNameBytes"),
+    ({"apar"}, {"t", "dc", "un", "an", "au", "m"}, "an", S, 32, "bounds.MaxAssetNameBytes"),
+    ({"apar"}, {"t", "dc", "un", "an", "au", "m"}, "au", S, 96, "bounds.MaxAssetURLBytes"),
+    # stateproof.StateProof, merklearray.Proof, merklesignature.Signature
+    ({"sp"}, {"c", "w", "S", "P", "r", "pr"}, "c", B, 64, "crypto.MaxHashDigestSize"),
+    ({"sp"}, {"c", "w", "S", "P", "r", "pr"}, "r", MU(MIN_REVEAL), 640, "stateproof.MaxReveals"),
+    ({"sp"}, {"c", "w", "S", "P", "r", "pr"}, "pr", A(b"\x01"), 640, "stateproof.MaxReveals"),
+    # (elements "": a nil element is go's nil digest, issue #2430)
+    ({"S", "P", "prf"}, {"pth", "hsh", "td"}, "pth", A(b"\xa0"), 32768, "MaxNumLeavesOnEncodedTree/2"),
+    ({"S", "P", "prf"}, {"pth", "hsh", "td"}, "pth", AE, 64, "crypto.MaxHashDigestSize"),
+    ({"s"}, {"sig", "idx", "prf", "vkey"}, "sig", B, 1538, "crypto.FalconMaxSignatureSize"),
+    ({"spmsg"}, None, "b", B, 32, "crypto.Sha256Size"),
+    ({"spmsg"}, None, "v", B, 64, "crypto.SumhashDigestSize"),
+    # transactions.LogicSig, crypto.MultisigSig, transactions.PQSig (#2390)
+    ({"lsig"}, None, "l", B, 16000, "bounds.MaxLogicSigMaxSize"),
+    ({"lsig"}, None, "arg", A(EMPTY_BIN), 255, "EvalMaxArgs"),
+    ({"lsig"}, None, "arg", AE, 4096, "MaxLogicSigArgSize"),
+    ({"msig", "lmsig"}, {"v", "thr", "subsig"}, "subsig", A(EMPTY_MAP), 255, "maxMultisig"),
+    ({"pqsig"}, None, "pk", B, 1793, "crypto.MaxPQPublicKeySize"),
+    ({"pqsig"}, None, "sig", B, 1538, "crypto.MaxPQSignatureSize"),
+    # transactions.EvalDelta, basics.StateDelta / ValueDelta (#2424)
+    ({"dt"}, None, "gd", MS(NIL), 2048, "bounds.MaxStateDeltaKeys"),
+    ({"dt"}, None, "ld", MU(NIL), 2048, "bounds.MaxEvalDeltaAccounts"),
+    ({"dt"}, None, "sa", A(NIL), 2048, "bounds.MaxEvalDeltaAccounts"),
+    ({"dt"}, None, "lg", A(b"\xa0"), 2048, "bounds.MaxLogCalls"),
+    ({"dt"}, None, "itx", A(MIN_STXN), 256, "bounds.MaxInnerTransactionsPerDelta"),
+    (None, {"at"}, "bs", S, 128, "bounds.MaxAppBytesValueLen"),
+    # agreement.unauthenticatedBundle / Certificate
+    ({"$bundle", "cert"}, {"rnd", "per", "step", "prop", "vote", "eqv"}, "vote", A(EMPTY_MAP), 7750,
+     "bounds.MaxVoteThreshold"),
+    ({"$bundle", "cert"}, {"rnd", "per", "step", "prop", "vote", "eqv"}, "eqv", A(EMPTY_MAP), 7750,
+     "bounds.MaxVoteThreshold"),
+]
+
+# the parent of a seed's top-level map(s)
+ROOT_PARENT = {
+    "payload": "$block",
+    "block": "$block",
+    "header": "$header",
+    "blockcert": "$blockcert",
+    "vote": "$vote",
+    "bundle": "$bundle",
+    "cert": "$bundle",
+    "stxn": "$stxn",
+    "stxninblock": "$stxn",
+    "applydata": "$stxn",
+    "txsync": "$stxn",
+    "txn": "txn",
+    "evaldelta": "dt",
+}
+
+
+def walk_maps_ctx(b, i, parent, out):
+    """walk_maps, also giving each map its parent: the nearest enclosing
+    string key (array elements and integer-keyed map values inherit it)."""
+    mh = map_header(b, i)
+    c = b[i]
+    if mh is not None:
+        n, hl = mh
+        slot = len(out)
+        out.append(None)
+        keys = set()
+        j = i + hl
+        for _ in range(n):
+            ks = j
+            vs = skip(b, ks)
+            walk_maps_ctx(b, ks, parent, out)
+            is_str = 0xA0 <= b[ks] <= 0xBF
+            key = b[ks + 1 : vs].decode("latin-1") if is_str else None
+            if key is not None:
+                keys.add(key)
+            walk_maps_ctx(b, vs, key if key is not None else parent, out)
+            j = skip(b, vs)
+        out[slot] = (parent, keys, n)
+        return out
+    if 0x90 <= c <= 0x9F or c in (0xDC, 0xDD):
+        if c <= 0x9F:
+            n, hl = c & 0x0F, 1
+        elif c == 0xDC:
+            n, hl = int.from_bytes(b[i + 1 : i + 3], "big"), 3
+        else:
+            n, hl = int.from_bytes(b[i + 1 : i + 5], "big"), 5
+        j = i + hl
+        for _ in range(n):
+            walk_maps_ctx(b, j, parent, out)
+            j = skip(b, j)
+    return out
+
+
+# seed kinds in the order bound cases pick them: the gossip messages first
+BOUND_KIND_ORDER = [
+    "payload",
+    "bundle",
+    "vote",
+    "stxn",
+    "block",
+    "blockcert",
+    "cert",
+    "header",
+    "stxninblock",
+    "txn",
+    "applydata",
+    "evaldelta",
+    "txsync",
+]
+
+
+def make_bound_cases(seeds, kinds):
+    """The boundary mutants of every rule: per (rule, seed kind) the first map
+    of a matching struct (real seeds first), at `bound` and `bound + 1`. A
+    value over 1 KiB is placed in the first two kinds of BOUND_KIND_ORDER that
+    have such a map, one over 8 KiB in the first one (fixture size)."""
+    real = [s for s in seeds if "_rand" not in s["name"]] + [s for s in seeds if "_rand" in s["name"]]
+    ordered = [s for k in BOUND_KIND_ORDER if k in kinds for s in real if s["kind"] == k]
+    walked = {s["name"]: walk_maps_ctx(bytes.fromhex(s["hex"]), 0, ROOT_PARENT[s["kind"]], []) for s in ordered}
+    cases = []
+    for parents, sib, key, build, bound, _go in BOUND_RULES:
+        size = len(build(bound))
+        max_kinds = 1 if size > 8192 else 2 if size > 1024 else len(kinds)
+        done = []
+        for s in ordered:
+            if s["kind"] in done or len(done) >= max_kinds:
+                continue
+            for m, (parent, keys, n) in enumerate(walked[s["name"]]):
+                if (parents is None or parent in parents) and (sib is None or keys & sib):
+                    for v in (bound, bound + 1):
+                        cases.append((s, m, n, str_key(key), build(v)))
+                    done.append(s["kind"])
+                    break
+    return cases
+
+
 def finish_cases(cases, first_id=0):
     out = []
     for n, (s, m, pos, key, val) in enumerate(cases):
@@ -689,6 +933,21 @@ SETS = {
             "applydata",
             "evaldelta",
         },
+        # issue #2427: go's msgp allocbounds
+        "bound_kinds": {
+            "payload",
+            "vote",
+            "bundle",
+            "cert",
+            "blockcert",
+            "block",
+            "header",
+            "stxn",
+            "stxninblock",
+            "txn",
+            "applydata",
+            "evaldelta",
+        },
     },
     "ledger": {
         "dir": fixture_dir("core", "algo-ledger"),
@@ -700,6 +959,7 @@ SETS = {
         "pinned": (),
         "fresh": True,
         "repeat_kinds": {"cpheader", "cpchunk", "cpspver"},
+        "bound_kinds": set(),
     },
     "network": {
         "dir": fixture_dir("node", "algo-network"),
@@ -711,6 +971,8 @@ SETS = {
         "pinned": (),
         "fresh": True,
         "repeat_kinds": {"idchal", "idresp", "idverify", "txsync"},
+        # go-codec: no allocbound is checked, both mutants are accepted
+        "bound_kinds": {"txsync"},
     },
     "p2p": {
         "dir": fixture_dir("node", "algo-p2p"),
@@ -722,6 +984,7 @@ SETS = {
         "pinned": (),
         "fresh": True,
         "repeat_kinds": {"peermeta"},
+        "bound_kinds": set(),
     },
 }
 
@@ -765,6 +1028,7 @@ def run_set(name, st, go, a):
                 break
             rep += make_repeat_cases(rep_seeds, rng, n - len(rep))
         cases += finish_cases(rep, first_id=len(cases))
+        cases += finish_cases(make_bound_cases(seeds, st["bound_kinds"]), first_id=len(cases))
         cases = attach_verdicts(go, cases)
         out = a.fuzz[1] if name == "consensus" else f"{a.fuzz[1]}.{name}"
         with open(out, "w", encoding="utf-8", newline="\n") as f:
@@ -778,6 +1042,7 @@ def run_set(name, st, go, a):
     rep_seeds = [s for s in seeds if s["kind"] in st["repeat_kinds"]]
     rep = make_repeat_cases(rep_seeds, random.Random(st["rng"] ^ 0x2421), a.repeat_cap)
     cases += finish_cases(rep, first_id=len(cases))
+    cases += finish_cases(make_bound_cases(seeds, st["bound_kinds"]), first_id=len(cases))
     cases = attach_verdicts(go, cases)
     text = dump(cases)
     path = cases_path(st)
