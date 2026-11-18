@@ -1091,7 +1091,25 @@ pub fn read_optional<T>(
 /// field's `allocbound` before reading the value (`msgp.ErrOverflow`). Peeks; the
 /// value is not consumed. The size is the encoded length of a `bin`/`str`, the
 /// element count of an array (a map counts twice its pairs) and 0 for `nil`.
+#[inline]
 pub fn check_go_bytes_bound(rd: &[u8], bound: usize) -> Result<()> {
+    // the shapes every encoder writes, within the bound: no further work
+    let size = match *rd {
+        [b @ 0xa0..=0xbf, ..] => (b & 0x1f) as usize,
+        [0xc0, ..] => 0,
+        [0xc4 | 0xd9, n, ..] => n as usize,
+        [0xc5 | 0xda, a, b, ..] => u16::from_be_bytes([a, b]) as usize,
+        _ => usize::MAX,
+    };
+    if size <= bound {
+        return Ok(());
+    }
+    check_go_bytes_bound_slow(rd, bound)
+}
+
+#[cold]
+#[inline(never)]
+fn check_go_bytes_bound_slow(rd: &[u8], bound: usize) -> Result<()> {
     if !alloc_bounds_checked() {
         return Ok(());
     }
