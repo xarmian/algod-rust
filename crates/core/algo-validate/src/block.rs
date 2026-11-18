@@ -1323,7 +1323,7 @@ mod tests {
     fn orphan_lsig_block(proto: &str) -> Block {
         let mut b = genesis_strict_block(proto);
         b.payset[0].lsig = Some(algo_types::LogicSig {
-            args: Some(vec![serde_bytes::ByteBuf::from(vec![7u8])]),
+            args: Some(vec![Some(serde_bytes::ByteBuf::from(vec![7u8]))]),
             ..Default::default()
         });
         b.txn_commitment = compute_payset_merkle_root(&b);

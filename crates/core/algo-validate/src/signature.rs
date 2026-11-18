@@ -739,10 +739,8 @@ pub fn verify_logicsig_with_tracer(
     // skipped and the total is checked at group level instead (see
     // `verify_group_logicsig_size`).
     let mut lsig_len: u64 = lsig.logic.len() as u64;
-    if let Some(ref args) = lsig.args {
-        for arg in args {
-            lsig_len += arg.len() as u64;
-        }
+    for arg in lsig.arg_bytes() {
+        lsig_len += arg.len() as u64;
     }
     if !consensus.enable_logicsig_size_pooling && lsig_len > consensus.logic_sig_max_size {
         return Err(AlgoError::Validation {
@@ -873,11 +871,7 @@ pub fn verify_logicsig_with_tracer(
 
     // ── TEAL program execution ──
     // Build LogicSig arguments from the lsig.args field.
-    let args: Vec<Vec<u8>> = lsig
-        .args
-        .as_ref()
-        .map(|a| a.iter().map(|b| b.to_vec()).collect())
-        .unwrap_or_default();
+    let args: Vec<Vec<u8>> = lsig.arg_bytes().map(<[u8]>::to_vec).collect();
 
     // Eval-time argument limits (Go: `EvalSignatureFull`,
     // `data/transactions/logic/eval.go`): checked at the same point go does
@@ -1316,10 +1310,8 @@ pub fn logicsig_group_size(group: &[SignedTransaction]) -> u64 {
     for stx in group {
         if let Some(lsig) = &stx.lsig {
             total += lsig.logic.len() as u64;
-            if let Some(ref args) = lsig.args {
-                for arg in args {
-                    total += arg.len() as u64;
-                }
+            for arg in lsig.arg_bytes() {
+                total += arg.len() as u64;
             }
         }
     }
@@ -1419,8 +1411,7 @@ pub fn logic_sig_group_size_check_indexed(
 
         let logic_len = lsig.map(|l| l.logic.len() as u64).unwrap_or(0);
         let args_len: u64 = lsig
-            .and_then(|l| l.args.as_ref())
-            .map(|args| args.iter().map(|a| a.len() as u64).sum())
+            .map(|l| l.arg_bytes().map(|a| a.len() as u64).sum())
             .unwrap_or(0);
 
         lsig_pooled_size += logic_len + args_len;
@@ -4519,7 +4510,7 @@ mod tests {
         let lsig = LogicSig {
             logic: ByteBuf::from(program),
             // go: `transactions.EvalMaxArgs + 1` empty args.
-            args: Some(vec![ByteBuf::from(Vec::new()); EVAL_MAX_ARGS + 1]),
+            args: Some(vec![Some(ByteBuf::from(Vec::new())); EVAL_MAX_ARGS + 1]),
             ..LogicSig::default()
         };
         let stx = SignedTransaction {
@@ -4546,7 +4537,10 @@ mod tests {
         let lsig = LogicSig {
             logic: ByteBuf::from(program),
             // go: a single arg of `transactions.MaxLogicSigArgSize + 1` bytes.
-            args: Some(vec![ByteBuf::from(vec![0u8; MAX_LOGIC_SIG_ARG_SIZE + 1])]),
+            args: Some(vec![Some(ByteBuf::from(vec![
+                0u8;
+                MAX_LOGIC_SIG_ARG_SIZE + 1
+            ]))]),
             ..LogicSig::default()
         };
         let stx = SignedTransaction {
@@ -4577,7 +4571,7 @@ mod tests {
         let lsig = LogicSig {
             logic: ByteBuf::from(program),
             args: Some(vec![
-                ByteBuf::from(vec![0u8; MAX_LOGIC_SIG_ARG_SIZE]);
+                Some(ByteBuf::from(vec![0u8; MAX_LOGIC_SIG_ARG_SIZE]));
                 EVAL_MAX_ARGS
             ]),
             ..LogicSig::default()

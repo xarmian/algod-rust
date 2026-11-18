@@ -112,7 +112,7 @@ pub fn lsig_from_args(
     let args_field = if args.is_empty() {
         None
     } else {
-        Some(args.into_iter().map(ByteBuf::from).collect())
+        Some(args.into_iter().map(|a| Some(ByteBuf::from(a))).collect())
     };
 
     match (program_source, logic_sig_file) {
@@ -248,12 +248,7 @@ pub fn logicsig_program_check(lsig: &LogicSig) -> Result<(), String> {
     // Go's size check counts the whole LogicSig: `LogicSig.Len()` =
     // len(Logic) + sum(len(Args)) against `LogicSigMaxSize`. Pass the pooled
     // length as `program_len`.
-    let lsig_len = program.len()
-        + lsig
-            .args
-            .as_ref()
-            .map(|a| a.iter().map(|arg| arg.len()).sum::<usize>())
-            .unwrap_or(0);
+    let lsig_len = program.len() + lsig.arg_bytes().map(<[u8]>::len).sum::<usize>();
     algo_avm::check_program(&parsed, algo_avm::Mode::LogicSig, lsig_len, 0)
         .map_err(|e| format!("{e}"))?;
     Ok(())
@@ -312,7 +307,7 @@ mod tests {
         assert!(!lsig.logic.is_empty(), "program assembled");
         let args = lsig.args.expect("args present");
         assert_eq!(args.len(), 1);
-        assert_eq!(args[0].as_ref(), &[1u8]);
+        assert_eq!(args[0].as_deref().map(Vec::as_slice), Some(&[1u8][..]));
     }
 
     #[test]
@@ -374,7 +369,7 @@ mod tests {
         // (1000 bytes for v1-3) must be rejected on the pooled-size check.
         let lsig = LogicSig {
             logic: ByteBuf::from(vec![0x02u8, 0x20, 0x01, 0x01, 0x22]),
-            args: Some(vec![ByteBuf::from(vec![0u8; 4096])]),
+            args: Some(vec![Some(ByteBuf::from(vec![0u8; 4096]))]),
             ..LogicSig::default()
         };
         let err = logicsig_program_check(&lsig).unwrap_err();

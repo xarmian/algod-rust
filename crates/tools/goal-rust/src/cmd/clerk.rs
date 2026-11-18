@@ -478,7 +478,11 @@ fn resolve_send_lsig(
             let args_field = if args.is_empty() {
                 None
             } else {
-                Some(args.into_iter().map(serde_bytes::ByteBuf::from).collect())
+                Some(
+                    args.into_iter()
+                        .map(|a| Some(serde_bytes::ByteBuf::from(a)))
+                        .collect(),
+                )
             };
             let escrow_address = clerk_sign::program_address(&program);
             Ok(Some(ResolvedSendLsig {
@@ -929,10 +933,12 @@ fn run_tealsign_inner(args: TealsignArgs) -> Result<(), String> {
         }
         let lsig = stxn.lsig.get_or_insert_with(algo_types::LogicSig::default);
         let mut existing = lsig.args.take().unwrap_or_default();
+        // go (`cmd/goal/tealsign.go`) pads with nil args, encoded as msgpack
+        // `nil` (issue #2430)
         while existing.len() < idx + 1 {
-            existing.push(serde_bytes::ByteBuf::new());
+            existing.push(None);
         }
-        existing[idx] = serde_bytes::ByteBuf::from(signature.to_vec());
+        existing[idx] = Some(serde_bytes::ByteBuf::from(signature.to_vec()));
         lsig.args = Some(existing);
 
         let path = args
@@ -3327,7 +3333,7 @@ mod tests {
         assert!(!resolved.lsig.logic.is_empty());
         let args = resolved.lsig.args.expect("args present");
         assert_eq!(args.len(), 1);
-        assert_eq!(args[0].as_ref(), &[1u8]);
+        assert_eq!(args[0].as_deref().map(Vec::as_slice), Some(&[1u8][..]));
         // Escrow address is HashProgram of the assembled bytes.
         assert_eq!(
             resolved.escrow_address,

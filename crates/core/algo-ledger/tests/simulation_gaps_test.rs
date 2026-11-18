@@ -2129,7 +2129,7 @@ fn optional_signatures_programless_logicsig_content() {
             sig: [0u8; 64],
             msig: None,
             lmsig: None,
-            args: Some(vec![serde_bytes::ByteBuf::from(vec![1u8])]),
+            args: Some(vec![Some(serde_bytes::ByteBuf::from(vec![1u8]))]),
             pqsig: None,
         }),
         ..Default::default()
@@ -2256,7 +2256,7 @@ fn exec_trace_enabled_orphan_logicsig_fails_cleanly() {
             ..Default::default()
         },
         lsig: Some(LogicSig {
-            args: Some(vec![vec![1u8].into()]),
+            args: Some(vec![Some(vec![1u8].into())]),
             ..Default::default()
         }),
         ..Default::default()
@@ -2373,7 +2373,7 @@ fn pre_v42_orphan_lsig_with_sig_succeeds_without_sig_fails_no_signature() {
         ..Default::default()
     };
     let orphan = LogicSig {
-        args: Some(vec![serde_bytes::ByteBuf::from(vec![1u8])]),
+        args: Some(vec![Some(serde_bytes::ByteBuf::from(vec![1u8]))]),
         ..Default::default()
     };
 
@@ -3613,7 +3613,7 @@ fn escrow_with_arg(state: &mut LedgerState, salt: u8, arg_len: usize) -> SignedT
             args: if arg_len == 0 {
                 None
             } else {
-                Some(vec![serde_bytes::ByteBuf::from(vec![7u8; arg_len])])
+                Some(vec![Some(serde_bytes::ByteBuf::from(vec![7u8; arg_len]))])
             },
             ..Default::default()
         }),
@@ -3694,7 +3694,7 @@ fn orphan_lsig_member(
             ..Default::default()
         },
         lsig: Some(LogicSig {
-            args: Some(vec![serde_bytes::ByteBuf::from(vec![1u8])]),
+            args: Some(vec![Some(serde_bytes::ByteBuf::from(vec![1u8]))]),
             ..Default::default()
         }),
         ..Default::default()

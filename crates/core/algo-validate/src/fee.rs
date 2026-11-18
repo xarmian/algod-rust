@@ -961,7 +961,7 @@ mod tests {
         let p = v42();
         let mut stx = make_stxn("pay", 1000);
         stx.lsig = Some(algo_types::LogicSig {
-            args: Some(vec![serde_bytes::ByteBuf::from(vec![9u8; 5000])]),
+            args: Some(vec![Some(serde_bytes::ByteBuf::from(vec![9u8; 5000]))]),
             pqsig: Some(algo_types::pq::PQSig {
                 scheme: algo_types::pq::PQ_SCHEME_FALCON1024,
                 ..Default::default()

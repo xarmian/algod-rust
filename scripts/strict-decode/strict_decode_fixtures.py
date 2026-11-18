@@ -77,6 +77,11 @@ reachable from a consensus message (BOUND_RULES), the field again at exactly
 its bound and at bound + 1 elements / bytes, in a set's `bound_kinds`. go
 rejects the second with `msgp.ErrOverflow` on the length header; the tx-sync
 response (go-codec) checks no allocbound and accepts both.
+
+Nil-element cases (issue #2430) come after them: `apaa`, a proof's `pth` and
+a LogicSig's `arg` again, as lists mixing `nil`, empty and one-byte elements,
+in a set's `nil_kinds`. go keeps a `nil` element nil and re-encodes it as
+`nil`, an empty `bin` / `str` as `bin` 0, so `go_val` pins the difference.
 """
 import argparse
 import hashlib
@@ -635,8 +640,7 @@ BOUND_RULES = [
     ({"sp"}, {"c", "w", "S", "P", "r", "pr"}, "c", B, 64, "crypto.MaxHashDigestSize"),
     ({"sp"}, {"c", "w", "S", "P", "r", "pr"}, "r", MU(MIN_REVEAL), 640, "stateproof.MaxReveals"),
     ({"sp"}, {"c", "w", "S", "P", "r", "pr"}, "pr", A(b"\x01"), 640, "stateproof.MaxReveals"),
-    # (elements "": a nil element is go's nil digest, issue #2430)
-    ({"S", "P", "prf"}, {"pth", "hsh", "td"}, "pth", A(b"\xa0"), 32768, "MaxNumLeavesOnEncodedTree/2"),
+    ({"S", "P", "prf"}, {"pth", "hsh", "td"}, "pth", A(NIL), 32768, "MaxNumLeavesOnEncodedTree/2"),
     ({"S", "P", "prf"}, {"pth", "hsh", "td"}, "pth", AE, 64, "crypto.MaxHashDigestSize"),
     ({"s"}, {"sig", "idx", "prf", "vkey"}, "sig", B, 1538, "crypto.FalconMaxSignatureSize"),
     ({"spmsg"}, None, "b", B, 32, "crypto.Sha256Size"),
@@ -756,6 +760,46 @@ def make_bound_cases(seeds, kinds):
                     for v in (bound, bound + 1):
                         cases.append((s, m, n, str_key(key), build(v)))
                     done.append(s["kind"])
+                    break
+    return cases
+
+
+# ── nil elements of `[]byte` lists (issue #2430) ──────────────────────────
+#
+# go reads every element of a `[][]byte` / `[]crypto.GenericDigest` with
+# `msgp.ReadBytesBytes`, which keeps a msgpack `nil` element as a nil slice,
+# and `msgp.AppendBytes` re-encodes a nil slice as `nil` (0xc0), a `bin` / `str`
+# of length 0 as `bin` 0. So `go_val` tells nil from empty elements. Each rule
+# gives the field again at the end of the first matching map per seed kind
+# (decoded into the populated field when the seed already has it), as lists of
+# nil, `bin` 0, `str` 0 and one-byte elements.
+NIL_ELEM_VALUES = [
+    enc_array(1, NIL),
+    b"\x94" + NIL + EMPTY_BIN + b"\xa0" + b"\xc4\x01a",
+    b"\x93" + b"\xc4\x01a" + NIL + NIL,
+]
+NIL_ELEM_RULES = [
+    ({"txn"}, TXN_SIB, "apaa"),  # transactions.ApplicationCallTxnFields.ApplicationArgs
+    ({"S", "P", "prf"}, {"pth", "hsh", "td"}, "pth"),  # merklearray.Proof.Path
+    ({"lsig"}, None, "arg"),  # transactions.LogicSig.Args
+]
+
+
+def make_nil_elem_cases(seeds, kinds):
+    real = [s for s in seeds if "_rand" not in s["name"]] + [s for s in seeds if "_rand" in s["name"]]
+    ordered = [s for k in BOUND_KIND_ORDER if k in kinds for s in real if s["kind"] == k]
+    walked = {s["name"]: walk_maps_ctx(bytes.fromhex(s["hex"]), 0, ROOT_PARENT[s["kind"]], []) for s in ordered}
+    cases = []
+    for parents, sib, key in NIL_ELEM_RULES:
+        done = set()
+        for s in ordered:
+            if s["kind"] in done:
+                continue
+            for m, (parent, keys, n) in enumerate(walked[s["name"]]):
+                if parent in parents and (sib is None or keys & sib):
+                    for v in NIL_ELEM_VALUES:
+                        cases.append((s, m, n, str_key(key), v))
+                    done.add(s["kind"])
                     break
     return cases
 
@@ -948,6 +992,8 @@ SETS = {
             "applydata",
             "evaldelta",
         },
+        # issue #2430: nil elements of []byte lists
+        "nil_kinds": {"stxn", "block", "payload", "stxninblock", "txn", "applydata", "evaldelta"},
     },
     "ledger": {
         "dir": fixture_dir("core", "algo-ledger"),
@@ -960,6 +1006,7 @@ SETS = {
         "fresh": True,
         "repeat_kinds": {"cpheader", "cpchunk", "cpspver"},
         "bound_kinds": set(),
+        "nil_kinds": set(),
     },
     "network": {
         "dir": fixture_dir("node", "algo-network"),
@@ -973,6 +1020,8 @@ SETS = {
         "repeat_kinds": {"idchal", "idresp", "idverify", "txsync"},
         # go-codec: no allocbound is checked, both mutants are accepted
         "bound_kinds": {"txsync"},
+        # issue #2430: nil elements of []byte lists (go-codec)
+        "nil_kinds": {"txsync"},
     },
     "p2p": {
         "dir": fixture_dir("node", "algo-p2p"),
@@ -985,6 +1034,7 @@ SETS = {
         "fresh": True,
         "repeat_kinds": {"peermeta"},
         "bound_kinds": set(),
+        "nil_kinds": set(),
     },
 }
 
@@ -1029,6 +1079,7 @@ def run_set(name, st, go, a):
             rep += make_repeat_cases(rep_seeds, rng, n - len(rep))
         cases += finish_cases(rep, first_id=len(cases))
         cases += finish_cases(make_bound_cases(seeds, st["bound_kinds"]), first_id=len(cases))
+        cases += finish_cases(make_nil_elem_cases(seeds, st["nil_kinds"]), first_id=len(cases))
         cases = attach_verdicts(go, cases)
         out = a.fuzz[1] if name == "consensus" else f"{a.fuzz[1]}.{name}"
         with open(out, "w", encoding="utf-8", newline="\n") as f:
@@ -1043,6 +1094,7 @@ def run_set(name, st, go, a):
     rep = make_repeat_cases(rep_seeds, random.Random(st["rng"] ^ 0x2421), a.repeat_cap)
     cases += finish_cases(rep, first_id=len(cases))
     cases += finish_cases(make_bound_cases(seeds, st["bound_kinds"]), first_id=len(cases))
+    cases += finish_cases(make_nil_elem_cases(seeds, st["nil_kinds"]), first_id=len(cases))
     cases = attach_verdicts(go, cases)
     text = dump(cases)
     path = cases_path(st)

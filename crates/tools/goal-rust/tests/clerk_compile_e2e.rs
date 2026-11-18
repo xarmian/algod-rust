@@ -486,7 +486,7 @@ fn lsig_files() -> Vec<(String, Vec<u8>)> {
     let args = |a: &[&[u8]]| {
         Some(
             a.iter()
-                .map(|x| serde_bytes::ByteBuf::from(x.to_vec()))
+                .map(|x| Some(serde_bytes::ByteBuf::from(x.to_vec())))
                 .collect::<Vec<_>>(),
         )
     };

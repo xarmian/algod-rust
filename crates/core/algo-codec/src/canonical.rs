@@ -2561,7 +2561,7 @@ mod tests {
         }
         let programless = [
             LogicSig {
-                args: Some(vec![serde_bytes::ByteBuf::from(vec![7u8])]),
+                args: Some(vec![Some(serde_bytes::ByteBuf::from(vec![7u8]))]),
                 ..LogicSig::default()
             },
             LogicSig {
@@ -2597,7 +2597,7 @@ mod tests {
         // A non-empty program is unchanged: `l` present on both encoders.
         let with_prog = LogicSig {
             logic: serde_bytes::ByteBuf::from(vec![0x06, 0x81, 0x01]),
-            args: Some(vec![serde_bytes::ByteBuf::from(vec![1u8])]),
+            args: Some(vec![Some(serde_bytes::ByteBuf::from(vec![1u8]))]),
             ..LogicSig::default()
         };
         let s = as_sorted_map(&rmp_serde::to_vec_named(&with_prog).unwrap());
@@ -3075,7 +3075,7 @@ mod tests {
                 let n = rng.random_range(1..=3);
                 Some(
                     (0..n)
-                        .map(|_| ByteBuf::from(gen_nonzero_bytes(rng, 1, 16)))
+                        .map(|_| Some(ByteBuf::from(gen_nonzero_bytes(rng, 1, 16))))
                         .collect(),
                 )
             } else {

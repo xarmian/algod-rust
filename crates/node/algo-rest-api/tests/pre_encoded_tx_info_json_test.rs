@@ -112,7 +112,7 @@ fn app_call_programs_args_boxes_and_lsig_render_as_base64() {
         txn: t,
         lsig: Some(LogicSig {
             logic: ByteBuf::from(vec![6, 1]),
-            args: Some(vec![ByteBuf::from(vec![0xff])]),
+            args: Some(vec![Some(ByteBuf::from(vec![0xff]))]),
             ..LogicSig::default()
         }),
         ..SignedTransaction::default()
@@ -129,6 +129,42 @@ fn app_call_programs_args_boxes_and_lsig_render_as_base64() {
     assert_eq!(txn["apbx"][0]["n"], b64(&[0xde, 0xad]));
     assert_eq!(v["txn"]["lsig"]["l"], b64(&[6, 1]));
     assert_eq!(v["txn"]["lsig"]["arg"], serde_json::json!([b64(&[0xff])]));
+}
+
+/// Issue #2430: go keeps a nil `[]byte` list element nil and go-codec's JSON
+/// renders it `null` (an empty one `""`), in `apaa` and LogicSig `arg` alike
+/// (go v5.0.5-stable `protocol.EncodeJSON` / `EncodeJSONStrict` of a
+/// `SignedTxn` with `{nil, {}, "a"}` args).
+#[test]
+fn nil_app_and_lsig_args_render_as_null_like_go() {
+    let mut t = base_txn(TxnType::Appl);
+    t.app_arguments = Some(vec![
+        None,
+        Some(ByteBuf::new()),
+        Some(ByteBuf::from(b"a".to_vec())),
+    ]);
+    let s = SignedTransaction {
+        txn: t,
+        lsig: Some(LogicSig {
+            logic: ByteBuf::from(vec![1, 32, 1, 1, 34]),
+            args: Some(vec![
+                None,
+                Some(ByteBuf::new()),
+                Some(ByteBuf::from(b"b".to_vec())),
+            ]),
+            ..LogicSig::default()
+        }),
+        ..SignedTransaction::default()
+    };
+    let v = json_of(&info(s));
+    assert_eq!(
+        v["txn"]["txn"]["apaa"],
+        serde_json::json!([null, "", "YQ=="])
+    );
+    assert_eq!(
+        v["txn"]["lsig"]["arg"],
+        serde_json::json!([null, "", "Yg=="])
+    );
 }
 
 #[test]

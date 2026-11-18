@@ -108,14 +108,15 @@ pub fn decode_multisig_go(bytes: &[u8]) -> Result<MultisigSig> {
 impl GoLogicSig {
     /// The value goal's signing and sending code works with: members go holds
     /// blank (`Blank()`: no sig, no msig, no pqsig, no args) are absent, so
-    /// re-encoding omits them like go's `omitempty`. A `nil` argument is an
-    /// empty one (go encodes a nil `[]byte` as an empty `bin`).
+    /// re-encoding omits them like go's `omitempty`. A `nil` argument stays
+    /// nil (go's `msgp.AppendBytes` encodes a nil `[]byte` as `nil`, an empty
+    /// one as `bin` 0; issue #2430).
     pub fn into_logicsig(self) -> LogicSig {
         let msig = |m: MultisigSig| Some(m).filter(|m| !m.blank());
         let args = (!self.args.is_empty()).then(|| {
             self.args
                 .into_iter()
-                .map(|a| ByteBuf::from(a.unwrap_or_default()))
+                .map(|a| a.map(ByteBuf::from))
                 .collect()
         });
         LogicSig {

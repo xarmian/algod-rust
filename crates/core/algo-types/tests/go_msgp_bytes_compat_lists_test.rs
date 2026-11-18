@@ -19,9 +19,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Issue #2046 review follow-ups (PR #2062): nil elements inside go
-//! `[][]byte` lists, str-form decode of the nested LogicSig / Msig /
-//! Heartbeat / StateProof / Falcon structs, and canonical re-encode equality.
-//! See `docs/BYTES_DECODE_PARITY.md`.
+//! `[][]byte` lists (corrected by issue #2430: go keeps them nil), str-form
+//! decode of the nested LogicSig / Msig / Heartbeat / StateProof / Falcon
+//! structs, and canonical re-encode equality. See `docs/BYTES_DECODE_PARITY.md`.
 
 use algo_types::{
     FalconVerifier, HeartbeatTxnFields, LogicSig, MerkleProof, MultisigSig, SignedTransaction,
@@ -78,9 +78,11 @@ fn reencode(s: &SignedTransaction) -> Vec<u8> {
 }
 
 #[test]
-fn nil_list_elements_decode_as_empty_and_reencode_as_bin0() {
-    // go ReadBytesBytes(nil) -> empty slice, re-encoded as bin len 0.
-    let canonical = dec(&appl(
+fn nil_list_elements_stay_nil_and_empty_ones_reencode_as_bin0() {
+    // go `msgp.ReadBytesBytes` keeps a nil element nil (`AppendBytes` writes
+    // `nil`); a `bin` / `str` of length 0 is a non-nil empty slice (`bin` 0).
+    // Issue #2430, read with the strict-decode oracle.
+    let empty_elem = dec(&appl(
         vec![("apaa", arr(vec![bin(b"x"), bin(b""), bin(b"y")]))],
         bin(&[1u8; 32]),
         bin(&[3u8; 64]),
@@ -90,21 +92,68 @@ fn nil_list_elements_decode_as_empty_and_reencode_as_bin0() {
         bin(&[1u8; 32]),
         bin(&[3u8; 64]),
     ));
-    assert_eq!(nil_elem, canonical);
-    let enc = reencode(&nil_elem);
-    assert_eq!(enc, reencode(&canonical));
-    assert!(enc.windows(2).any(|w| w == [0xc4, 0x00]), "bin0, not nil");
-    let args = nil_elem.txn.app_arguments.unwrap();
-    assert_eq!(args[1].as_ref().unwrap().len(), 0);
+    assert_ne!(nil_elem, empty_elem);
+    let args = nil_elem.txn.app_arguments.as_ref().unwrap();
+    assert_eq!(args[1], None);
+    let args = empty_elem.txn.app_arguments.as_ref().unwrap();
+    assert_eq!(args[1].as_ref().map(|a| a.len()), Some(0));
+    let nil_enc = algo_types::canonical::canonical_encode_transaction(&nil_elem.txn);
+    let empty_enc = algo_types::canonical::canonical_encode_transaction(&empty_elem.txn);
+    // a4 "apaa" 93 c4 01 'x' <elem> c4 01 'y'
+    let apaa = |elem: &[u8]| [&b"\xa4apaa\x93\xc4\x01x"[..], elem, b"\xc4\x01y"].concat();
+    let has = |enc: &[u8], want: &[u8]| enc.windows(want.len()).any(|w| w == want);
+    assert!(
+        has(&nil_enc, &apaa(&[0xc0])),
+        "nil element re-encodes as nil"
+    );
+    assert!(
+        has(&empty_enc, &apaa(&[0xc4, 0x00])),
+        "empty element as bin0"
+    );
+    // the derived serde encoder agrees
+    assert!(has(&reencode(&nil_elem), &[0x93, 0xc4, 0x01, b'x', 0xc0]));
 }
 
 #[test]
-fn merkle_proof_nil_path_element_is_empty_digest() {
-    let m = map(vec![("pth", arr(vec![bin(&[1u8; 32]), vec![0xc0]]))]);
+fn merkle_proof_nil_path_element_stays_nil() {
+    let m = map(vec![(
+        "pth",
+        arr(vec![bin(&[1u8; 32]), vec![0xc0], fixstr("")]),
+    )]);
     let p = MerkleProof::decode_from_reader(&mut &m[..]).unwrap();
     let path = p.path.unwrap();
-    assert_eq!(path.len(), 2);
-    assert_eq!(path[1].as_ref().unwrap().len(), 0);
+    assert_eq!(path.len(), 3);
+    assert_eq!(path[1], None);
+    assert_eq!(path[2].as_ref().map(|d| d.len()), Some(0));
+}
+
+#[test]
+fn logicsig_nil_arg_stays_nil_and_reencodes_as_nil() {
+    let m = map(vec![
+        ("arg", arr(vec![vec![0xc0], bin(b""), bin(b"b")])),
+        ("l", bin(&[1, 32, 1, 1, 34])),
+    ]);
+    let l = LogicSig::decode_from_bytes(&m).unwrap();
+    let args = l.args.as_ref().unwrap();
+    assert_eq!(args[0], None);
+    assert_eq!(args[1].as_ref().map(|a| a.len()), Some(0));
+    // go's `protocol.Encode` of the decoded LogicSig: `arg` [nil, bin0, "b"]
+    assert_eq!(
+        algo_types::canonical::canonical_encode_logicsig(&l),
+        hex_bytes("82a361726793c0c400c40162a16cc4050120010122")
+    );
+    // what a program sees (`arg 0`, size checks): a zero-length value
+    assert_eq!(
+        l.arg_bytes().collect::<Vec<_>>(),
+        vec![&b""[..], &b""[..], &b"b"[..]]
+    );
+}
+
+fn hex_bytes(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
 }
 
 #[test]

@@ -169,8 +169,9 @@ fn go_logicsig_converts_to_the_serde_value() {
     assert_eq!(l.msig.as_ref().unwrap().subsigs.len(), 1);
     let args = l.args.unwrap();
     assert_eq!(args.len(), 2);
-    assert_eq!(args[0].as_ref(), b"q");
-    assert!(args[1].is_empty());
+    assert_eq!(args[0].as_deref().map(Vec::as_slice), Some(&b"q"[..]));
+    // go keeps a nil element nil (issue #2430)
+    assert!(args[1].is_none());
     // Where both decoders accept, the values agree.
     let plain = mp::rec(&[
         ("l", mp::bin(&[8, 0x81, 1])),

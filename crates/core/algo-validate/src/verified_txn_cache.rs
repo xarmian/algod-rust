@@ -932,7 +932,7 @@ mod tests {
                 .collect();
             LogicSig {
                 logic: serde_bytes::ByteBuf::from(program.to_vec()),
-                args: Some(vec![serde_bytes::ByteBuf::from(arg.to_vec())]),
+                args: Some(vec![Some(serde_bytes::ByteBuf::from(arg.to_vec()))]),
                 msig: Some(MultisigSig {
                     version: 1,
                     threshold: 2,

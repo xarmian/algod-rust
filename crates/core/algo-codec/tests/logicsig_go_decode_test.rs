@@ -46,7 +46,12 @@ fn hand_strict(b: &[u8]) -> Option<LogicSig> {
 fn norm_hand(l: &LogicSig) -> String {
     let blank_msig = |m: &Option<algo_types::MultisigSig>| m.clone().filter(|m| !m.blank());
     let pq = l.pqsig.clone().filter(|p| !p.blank());
-    let args: Vec<Vec<u8>> = l.args.iter().flatten().map(|a| a.to_vec()).collect();
+    let args: Vec<Option<Vec<u8>>> = l
+        .args
+        .iter()
+        .flatten()
+        .map(|a| a.as_ref().map(|a| a.to_vec()))
+        .collect();
     format!(
         "{:?}",
         (
@@ -63,11 +68,7 @@ fn norm_hand(l: &LogicSig) -> String {
 fn norm_port(g: &GoLogicSig) -> String {
     let m = |m: &algo_types::MultisigSig| Some(m.clone()).filter(|m| !m.blank());
     let pq = Some(g.pqsig.clone()).filter(|p| !p.blank());
-    let args: Vec<Vec<u8>> = g
-        .args
-        .iter()
-        .map(|a| a.clone().unwrap_or_default())
-        .collect();
+    let args: Vec<Option<Vec<u8>>> = g.args.clone();
     format!(
         "{:?}",
         (
