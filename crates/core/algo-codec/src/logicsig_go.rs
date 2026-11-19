@@ -58,8 +58,8 @@
 //! `... at struct-from-array/Msig`).
 
 use algo_types::go_msgp::{
-    EVAL_MAX_ARGS, MAX_LOGIC_SIG_ARG_SIZE, MAX_LOGIC_SIG_MAX_SIZE, MAX_MULTISIG,
-    MAX_PQ_PUBLIC_KEY_SIZE, MAX_PQ_SIGNATURE_SIZE,
+    bounds, EVAL_MAX_ARGS, MAX_LOGIC_SIG_ARG_SIZE, MAX_MULTISIG, MAX_PQ_PUBLIC_KEY_SIZE,
+    MAX_PQ_SIGNATURE_SIZE,
 };
 use algo_types::{LogicSig, MultisigSig, MultisigSubsig, PQAddressSalt, PQSig};
 use serde_bytes::ByteBuf;
@@ -905,7 +905,7 @@ impl Default for LsigState {
 
 impl LsigState {
     fn decode_logic(&mut self, b: &mut &[u8], ctx: &str) -> R<()> {
-        let (v, nil) = read_bounded_bytes(b, MAX_LOGIC_SIG_MAX_SIZE, ctx)?;
+        let (v, nil) = read_bounded_bytes(b, bounds::MAX_LOGIC_SIG_MAX_SIZE.get(), ctx)?;
         self.logic = v;
         self.logic_nil = nil;
         Ok(())

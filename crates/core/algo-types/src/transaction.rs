@@ -1586,7 +1586,10 @@ impl BoxRef {
             match rmp_decode::read_key_bytes(rd)? {
                 b"i" => s.index = rmp_decode::read_u64(rd)?,
                 b"n" => {
-                    rmp_decode::check_go_bytes_bound(rd, rmp_decode::MAX_BYTES_KEY_VALUE_LEN)?;
+                    rmp_decode::check_go_bytes_bound(
+                        rd,
+                        rmp_decode::bounds::MAX_BYTES_KEY_VALUE_LEN.get(),
+                    )?;
                     s.name =
                         rmp_decode::read_optional(rd, rmp_decode::read_bytes_as_bytebuf_go_compat)?
                 }
@@ -1613,15 +1616,20 @@ impl AssetParams {
                 b"un" => {
                     s.unit_name = rmp_decode::read_bounded_str_bytes(
                         rd,
-                        rmp_decode::MAX_ASSET_UNIT_NAME_BYTES,
+                        rmp_decode::bounds::MAX_ASSET_UNIT_NAME_BYTES.get(),
                     )?
                 }
                 b"an" => {
-                    s.asset_name =
-                        rmp_decode::read_bounded_str_bytes(rd, rmp_decode::MAX_ASSET_NAME_BYTES)?
+                    s.asset_name = rmp_decode::read_bounded_str_bytes(
+                        rd,
+                        rmp_decode::bounds::MAX_ASSET_NAME_BYTES.get(),
+                    )?
                 }
                 b"au" => {
-                    s.url = rmp_decode::read_bounded_str_bytes(rd, rmp_decode::MAX_ASSET_URL_BYTES)?
+                    s.url = rmp_decode::read_bounded_str_bytes(
+                        rd,
+                        rmp_decode::bounds::MAX_ASSET_URL_BYTES.get(),
+                    )?
                 }
                 b"am" => rmp_decode::read_fixed_into_opt(rd, &mut s.metadata_hash)?,
                 b"m" => rmp_decode::read_address_into_opt(rd, &mut s.manager)?,
@@ -1750,7 +1758,10 @@ impl LogicSig {
                 // The allocation bounds are go's (`allocbound` tags of
                 // `transactions.LogicSig`): a record over one never decodes (#2390).
                 b"l" => {
-                    rmp_decode::check_go_bytes_bound(rd, rmp_decode::MAX_LOGIC_SIG_MAX_SIZE)?;
+                    rmp_decode::check_go_bytes_bound(
+                        rd,
+                        rmp_decode::bounds::MAX_LOGIC_SIG_MAX_SIZE.get(),
+                    )?;
                     s.logic = rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?;
                 }
                 b"sig" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.sig)?,
@@ -2488,7 +2499,7 @@ impl Transaction {
                 (2, b'a') if key == b"al" => rmp_decode::read_slice_into_opt(
                     rd,
                     &mut t.access,
-                    rmp_decode::MAX_APP_ACCESS,
+                    rmp_decode::bounds::MAX_APP_ACCESS.get(),
                     ResourceRef::default,
                     ResourceRef::decode_into,
                 )?,
@@ -2542,7 +2553,7 @@ impl Transaction {
                     b"apap" => {
                         rmp_decode::check_go_bytes_bound(
                             rd,
-                            rmp_decode::MAX_AVAILABLE_APP_PROGRAM_LEN,
+                            rmp_decode::bounds::MAX_AVAILABLE_APP_PROGRAM_LEN.get(),
                         )?;
                         t.approval_program = rmp_decode::read_optional(
                             rd,
@@ -2598,7 +2609,7 @@ impl Transaction {
                     b"apsu" => {
                         rmp_decode::check_go_bytes_bound(
                             rd,
-                            rmp_decode::MAX_AVAILABLE_APP_PROGRAM_LEN,
+                            rmp_decode::bounds::MAX_AVAILABLE_APP_PROGRAM_LEN.get(),
                         )?;
                         t.clear_state_program = rmp_decode::read_optional(
                             rd,
@@ -2615,7 +2626,10 @@ impl Transaction {
                 }
                 (4, b'f') if key == b"faid" => t.freeze_asset = rmp_decode::read_u64(rd)?,
                 (4, b'n') if key == b"note" => {
-                    t.note = rmp_decode::read_bounded_bytebuf(rd, rmp_decode::MAX_TXN_NOTE_BYTES)?
+                    t.note = rmp_decode::read_bounded_bytebuf(
+                        rd,
+                        rmp_decode::bounds::MAX_TXN_NOTE_BYTES.get(),
+                    )?
                 }
                 (4, b't') if key == b"type" => {
                     t.txn_type = TxnType::from(rmp_decode::read_bounded_string(

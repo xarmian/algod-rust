@@ -63,12 +63,12 @@ pub use rmp_decode::{check_msgpack_depth, msgpack_value_len};
 /// wire decoders in other crates (issue #2063); see `docs/BYTES_DECODE_PARITY.md`.
 pub mod go_msgp {
     pub use crate::rmp_decode::{
-        check_go_bytes_bound, decode_session, no_matching_field_error, read_address_go_compat,
-        read_bytes_go_compat, read_fixed_array_into, read_fixed_bytes_go_compat,
-        read_fixed_bytes_into_go_compat, read_go_array_header, read_key_bytes, read_map_len,
-        read_slice_into, read_str_bytes, read_string, read_u64, skip_value, DecodeSession,
-        EVAL_MAX_ARGS, MAX_LOGIC_SIG_ARG_SIZE, MAX_LOGIC_SIG_MAX_SIZE, MAX_MULTISIG,
-        MAX_PQ_PUBLIC_KEY_SIZE, MAX_PQ_SIGNATURE_SIZE, MAX_VOTE_THRESHOLD,
+        bounds, check_go_bytes_bound, decode_session, no_matching_field_error,
+        read_address_go_compat, read_bytes_go_compat, read_fixed_array_into,
+        read_fixed_bytes_go_compat, read_fixed_bytes_into_go_compat, read_go_array_header,
+        read_key_bytes, read_map_len, read_slice_into, read_str_bytes, read_string, read_u64,
+        skip_value, DecodeSession, EVAL_MAX_ARGS, MAX_LOGIC_SIG_ARG_SIZE, MAX_LOGIC_SIG_MAX_SIZE,
+        MAX_MULTISIG, MAX_PQ_PUBLIC_KEY_SIZE, MAX_PQ_SIGNATURE_SIZE, MAX_VOTE_THRESHOLD,
     };
 }
 pub use rmp_decode::{

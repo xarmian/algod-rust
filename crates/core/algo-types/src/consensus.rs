@@ -2471,7 +2471,70 @@ pub fn install_consensus_overrides(merged: &HashMap<String, ConsensusParams>) {
     }
 
     // Ignore the error (registry already installed): see write-once note above.
-    let _ = CONSENSUS_OVERRIDES.set(diff);
+    if CONSENSUS_OVERRIDES.set(diff).is_ok() {
+        // go's `SetConfigurableConsensusProtocols`: raise the msgp allocbounds
+        // over every loaded protocol (issue #2439).
+        for params in merged.values() {
+            check_set_alloc_bounds(params);
+        }
+    }
+}
+
+/// go's `config.checkSetAllocBounds` (`config/consensus.go`): raise the
+/// consensus-derived msgp allocbounds ([`crate::rmp_decode::bounds`]) to
+/// cover `p`. Bounds only grow, as in go.
+///
+/// `MaxTxnNoteBytes` is raised to the note cap this node's `WellFormed`
+/// enforces for `p` (`MaxAbsoluteTxnNoteBytes`, or `MaxTxnNoteBytes` when a
+/// `consensus.json` written for go before v5.0.0 leaves it unset, as
+/// `algo_validate::fee::effective_max_note_bytes` does): a transaction the
+/// node accepts as well-formed must also decode. Before v5.0.0 go raised this
+/// bound with `MaxTxnNoteBytes` itself (v4.7.3-stable `checkSetAllocBounds`),
+/// which is what the aramidmain network runs; for every built-in protocol the
+/// two are the same.
+pub fn check_set_alloc_bounds(p: &ConsensusParams) {
+    use crate::rmp_decode::bounds as b;
+    let to_usize = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
+    for t in [
+        p.soft_committee_threshold,
+        p.cert_committee_threshold,
+        p.next_committee_threshold,
+        p.late_committee_threshold,
+        p.redo_committee_threshold,
+        p.down_committee_threshold,
+    ] {
+        b::MAX_VOTE_THRESHOLD.raise(to_usize(t));
+    }
+    b::MAX_STATE_DELTA_KEYS.raise(p.max_app_program_len);
+    b::MAX_EVAL_DELTA_ACCOUNTS.raise(p.max_app_program_len);
+    b::MAX_APP_PROGRAM_LEN.raise(p.max_app_program_len);
+    b::MAX_LOGIC_SIG_MAX_SIZE
+        .raise(to_usize(p.logic_sig_max_size).saturating_mul(p.max_tx_group_size));
+    b::MAX_LOGIC_SIG_MAX_SIZE.raise(to_usize(p.max_absolute_logic_sig_program_size));
+    let note_cap = if p.max_absolute_txn_note_bytes > 0 {
+        p.max_absolute_txn_note_bytes
+    } else {
+        p.max_txn_note_bytes
+    };
+    b::MAX_TXN_NOTE_BYTES.raise(note_cap);
+    b::MAX_BYTES_KEY_VALUE_LEN.raise(p.max_app_key_len);
+    b::MAX_BYTES_KEY_VALUE_LEN.raise(p.max_app_bytes_value_len);
+    b::MAX_EXTRA_APP_PROGRAM_LEN.raise(p.max_absolute_extra_program_pages as usize);
+    b::MAX_AVAILABLE_APP_PROGRAM_LEN.set(
+        b::MAX_APP_PROGRAM_LEN
+            .get()
+            .saturating_mul(1 + b::MAX_EXTRA_APP_PROGRAM_LEN.get()),
+    );
+    b::MAX_LOG_CALLS.raise(p.max_app_program_len);
+    b::MAX_INNER_TRANSACTIONS_PER_DELTA
+        .raise(p.max_inner_transactions.saturating_mul(p.max_tx_group_size));
+    b::MAX_PROPOSED_EXPIRED_ONLINE_ACCOUNTS.raise(p.max_proposed_expired_online_accounts);
+    b::MAX_MARK_ABSENT.raise(p.payouts_max_mark_absent);
+    b::MAX_ASSET_NAME_BYTES.raise(p.max_asset_name_bytes);
+    b::MAX_ASSET_UNIT_NAME_BYTES.raise(p.max_asset_unit_name_bytes);
+    b::MAX_ASSET_URL_BYTES.raise(p.max_asset_url_bytes);
+    b::MAX_APP_BYTES_VALUE_LEN.raise(p.max_app_bytes_value_len);
+    b::MAX_APP_ACCESS.raise(p.max_app_access);
 }
 
 /// Merge configurable `consensus.json` overrides onto a base consensus
