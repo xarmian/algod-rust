@@ -272,10 +272,19 @@ const GENESIS_CASES: &[(&str, &str)] = &[
         "state ok",
         r#"{"alloc":[{"state":{"onl":1,"algo":"5","vote":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","sel":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=","stprf":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==","voteFst":1,"voteLst":1e3,"voteKD":10000}}]}"#,
     ),
-    ("state null fields", r#"{"alloc":[{"state":{"onl":null,"vote":null}}]}"#),
+    (
+        "state null fields",
+        r#"{"alloc":[{"state":{"onl":null,"vote":null}}]}"#,
+    ),
     ("state null", r#"{"alloc":[{"state":null}]}"#),
-    ("state unknown field", r#"{"alloc":[{"state":{"onl":1,"x":1}}]}"#),
-    ("state array", r#"{"alloc":[{"state":[1,2,"AAAA",null,[1,2],3,4,5]}]}"#),
+    (
+        "state unknown field",
+        r#"{"alloc":[{"state":{"onl":1,"x":1}}]}"#,
+    ),
+    (
+        "state array",
+        r#"{"alloc":[{"state":[1,2,"AAAA",null,[1,2],3,4,5]}]}"#,
+    ),
     (
         "state array past the fields",
         r#"{"alloc":[{"state":[1,2,null,null,null,3,4,5,6]}]}"#,
@@ -284,42 +293,105 @@ const GENESIS_CASES: &[(&str, &str)] = &[
     ("state onl max", r#"{"alloc":[{"state":{"onl":"255"}}]}"#),
     ("state onl string", r#"{"alloc":[{"state":{"onl":"abc"}}]}"#),
     ("state onl NaN", r#"{"alloc":[{"state":{"onl":"NaN"}}]}"#),
-    ("state onl hex float", r#"{"alloc":[{"state":{"onl":"0x1p4"}}]}"#),
-    ("state onl hex overflow", r#"{"alloc":[{"state":{"onl":"0x1p8"}}]}"#),
-    ("state onl underscores", r#"{"alloc":[{"state":{"onl":"1_0"}}]}"#),
+    (
+        "state onl hex float",
+        r#"{"alloc":[{"state":{"onl":"0x1p4"}}]}"#,
+    ),
+    (
+        "state onl hex overflow",
+        r#"{"alloc":[{"state":{"onl":"0x1p8"}}]}"#,
+    ),
+    (
+        "state onl underscores",
+        r#"{"alloc":[{"state":{"onl":"1_0"}}]}"#,
+    ),
     ("state onl bool", r#"{"alloc":[{"state":{"onl":true}}]}"#),
-    ("state algo negative", r#"{"alloc":[{"state":{"algo":-1}}]}"#),
+    (
+        "state algo negative",
+        r#"{"alloc":[{"state":{"algo":-1}}]}"#,
+    ),
     (
         "state algo overflow",
         r#"{"alloc":[{"state":{"algo":18446744073709551616}}]}"#,
     ),
-    ("state algo fraction", r#"{"alloc":[{"state":{"algo":1.5}}]}"#),
+    (
+        "state algo fraction",
+        r#"{"alloc":[{"state":{"algo":1.5}}]}"#,
+    ),
     ("state algo inf", r#"{"alloc":[{"state":{"algo":"Inf"}}]}"#),
-    ("state algo out of range", r#"{"alloc":[{"state":{"algo":"1e400"}}]}"#),
-    ("state voteFst float overflow", r#"{"alloc":[{"state":{"voteFst":1e20}}]}"#),
-    ("state voteLst 2^64", r#"{"alloc":[{"state":{"voteLst":1.8446744073709552e19}}]}"#),
-    ("state voteKD array", r#"{"alloc":[{"state":{"voteKD":[1]}}]}"#),
-    ("state vote bad base64", r#"{"alloc":[{"state":{"vote":"!!!!"}}]}"#),
-    ("state vote short base64", r#"{"alloc":[{"state":{"vote":"AAA"}}]}"#),
-    ("state vote bad padding", r#"{"alloc":[{"state":{"vote":"A==="}}]}"#),
-    ("state vote missing padding", r#"{"alloc":[{"state":{"vote":"AA="}}]}"#),
-    ("state vote trailing base64", r#"{"alloc":[{"state":{"vote":"AA==AA"}}]}"#),
-    ("state vote base64 newline", r#"{"alloc":[{"state":{"vote":"AA\nAA\r\n=="}}]}"#),
-    ("state vote short", r#"{"alloc":[{"state":{"vote":"AAAA"}}]}"#),
+    (
+        "state algo out of range",
+        r#"{"alloc":[{"state":{"algo":"1e400"}}]}"#,
+    ),
+    (
+        "state voteFst float overflow",
+        r#"{"alloc":[{"state":{"voteFst":1e20}}]}"#,
+    ),
+    (
+        "state voteLst 2^64",
+        r#"{"alloc":[{"state":{"voteLst":1.8446744073709552e19}}]}"#,
+    ),
+    (
+        "state voteKD array",
+        r#"{"alloc":[{"state":{"voteKD":[1]}}]}"#,
+    ),
+    (
+        "state vote bad base64",
+        r#"{"alloc":[{"state":{"vote":"!!!!"}}]}"#,
+    ),
+    (
+        "state vote short base64",
+        r#"{"alloc":[{"state":{"vote":"AAA"}}]}"#,
+    ),
+    (
+        "state vote bad padding",
+        r#"{"alloc":[{"state":{"vote":"A==="}}]}"#,
+    ),
+    (
+        "state vote missing padding",
+        r#"{"alloc":[{"state":{"vote":"AA="}}]}"#,
+    ),
+    (
+        "state vote trailing base64",
+        r#"{"alloc":[{"state":{"vote":"AA==AA"}}]}"#,
+    ),
+    (
+        "state vote base64 newline",
+        r#"{"alloc":[{"state":{"vote":"AA\nAA\r\n=="}}]}"#,
+    ),
+    (
+        "state vote short",
+        r#"{"alloc":[{"state":{"vote":"AAAA"}}]}"#,
+    ),
     (
         "state sel long",
         r#"{"alloc":[{"state":{"sel":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}]}"#,
     ),
-    ("state stprf bad base64", r#"{"alloc":[{"state":{"stprf":"AAAAAAAA*AAA"}}]}"#),
+    (
+        "state stprf bad base64",
+        r#"{"alloc":[{"state":{"stprf":"AAAAAAAA*AAA"}}]}"#,
+    ),
     ("state vote number", r#"{"alloc":[{"state":{"vote":1}}]}"#),
-    ("state vote empty string", r#"{"alloc":[{"state":{"vote":""}}]}"#),
-    ("state vote array", r#"{"alloc":[{"state":{"vote":[1,null,"3"]}}]}"#),
-    ("state vote array overflow", r#"{"alloc":[{"state":{"vote":[1,256]}}]}"#),
+    (
+        "state vote empty string",
+        r#"{"alloc":[{"state":{"vote":""}}]}"#,
+    ),
+    (
+        "state vote array",
+        r#"{"alloc":[{"state":{"vote":[1,null,"3"]}}]}"#,
+    ),
+    (
+        "state vote array overflow",
+        r#"{"alloc":[{"state":{"vote":[1,256]}}]}"#,
+    ),
     (
         "state vote array too long",
         r#"{"alloc":[{"state":{"vote":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,null]}}]}"#,
     ),
-    ("state vote map", r#"{"alloc":[{"state":{"vote":{"1":2,"3":4}}}]}"#),
+    (
+        "state vote map",
+        r#"{"alloc":[{"state":{"vote":{"1":2,"3":4}}}]}"#,
+    ),
     (
         "state vote map too long",
         r#"{"alloc":[{"state":{"vote":{"0":0,"1":1,"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,"10":10,"11":11,"12":12,"13":13,"14":14,"15":15,"16":16}}}]}"#,

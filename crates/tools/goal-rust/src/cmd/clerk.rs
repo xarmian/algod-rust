@@ -55,6 +55,7 @@ use base64::Engine;
 use crate::accounts_list::AccountsList;
 use crate::cmd::clerk_sign;
 use crate::data_dir;
+use crate::formatting::ERROR_NON_PRINTABLE_CHARACTERS;
 use crate::groups::clerk::{
     GroupArgs, InspectArgs, MultisigMergeArgs, MultisigSignArgs, MultisigSignProgramArgs,
     RawsendArgs, SendArgs, SignArgs, SimulateArgs, SplitArgs, TealsignArgs,
@@ -1149,10 +1150,6 @@ pub fn run_compile(
         }
     }
 }
-
-/// go's `errorNonPrintableCharacters` (cmd/goal/messages.go).
-const ERROR_NON_PRINTABLE_CHARACTERS: &str =
-    "One or more non-printable characters were omitted from the following error message:";
 
 /// go's `infoNonPrintableCharacters` (cmd/goal/messages.go).
 const INFO_NON_PRINTABLE_CHARACTERS: &str =

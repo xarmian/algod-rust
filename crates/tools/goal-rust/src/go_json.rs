@@ -26,17 +26,27 @@
 //!
 //! The decoder below is a port of the parts of that decoder the `Genesis`
 //! struct reaches (`json.go` `jsonDecDriver`, the bytes reader, `decode.go`
-//! `kStruct` / `kSlice` / `swallow`), so a malformed file fails with go's text
-//! (`EOF`, `json decode error [pos N]: ...`) and the inputs go accepts are
-//! accepted too: trailing bytes after the value, a struct written as an array,
-//! numbers and literals where a string field is expected, `null` fields.
+//! `kStruct` / `kSlice`), so a malformed file fails with go's text (`EOF`,
+//! `json decode error [pos N]: ...`) and the inputs go accepts are accepted
+//! too: trailing bytes after the value, a struct written as an array, numbers
+//! and literals where a string field is expected, `null` fields.
 //!
-//! Not ported: the field types inside an allocation's `state`
-//! (`GenesisAccountData`), which is only checked for being well formed
-//! (issue #2455).
+//! An allocation's `state` is decoded as go decodes a
+//! `bookkeeping.GenesisAccountData` (issue #2455): unknown fields fail,
+//! `onl` (`basics.Status`) is a `kUint8` with its overflow check, `algo`
+//! (`MicroAlgos`' `CodecDecodeSelf`), `voteFst` / `voteLst` and `voteKD`
+//! are `DecodeUint64`, and `vote` / `sel` (`[32]byte`) and `stprf`
+//! (`[64]byte`) are `kSlice` of an array: a string is base64 (`DecodeBytes`,
+//! go's `encoding/base64` errors, no length check), a JSON array or map holds
+//! the bytes (`kUint8` each, `ErrorIfNoArrayExpand` past the length).
 
 /// go-codec's `decDefMaxDepth`.
 const MAX_DEPTH: usize = 1024;
+
+/// `GenesisAccountData` fields in source order.
+const ACCOUNT_FIELDS: [&str; 8] = [
+    "onl", "algo", "vote", "stprf", "sel", "voteFst", "voteLst", "voteKD",
+];
 
 /// `Genesis` fields in source order (`kStruct` array form), by codec name.
 const GENESIS_FIELDS: [&str; 9] = [
@@ -106,6 +116,11 @@ fn is_num(b: u8) -> bool {
 /// go's `%c` of a byte: the rune with that code point.
 fn ch(b: u8) -> char {
     char::from(b)
+}
+
+/// go's `%s` of bytes, as goal prints it (each invalid byte one U+FFFD).
+fn lossy(b: &[u8]) -> String {
+    algo_types::raw_text::go_lossy(b)
 }
 
 impl<'a> Dec<'a> {
@@ -290,11 +305,7 @@ impl<'a> Dec<'a> {
         let bs = self.readx(rest.len())?;
         self.tok = 0;
         if bs != rest {
-            return Err(self.err(format!(
-                "expecting {}: got {}",
-                String::from_utf8_lossy(rest),
-                String::from_utf8_lossy(bs)
-            )));
+            return Err(self.err(format!("expecting {}: got {}", lossy(rest), lossy(bs))));
         }
         Ok(())
     }
@@ -359,18 +370,48 @@ impl<'a> Dec<'a> {
         if s.is_empty() {
             return Ok(0);
         }
-        let text = String::from_utf8_lossy(s);
-        let f = match text.parse::<f64>() {
-            Ok(f) if f.is_finite() => f,
-            _ => return Err(self.err(format!("invalid syntax for integer: {text}"))),
+        let text = lossy(s);
+        let Ok(f) = go_parse_float(s) else {
+            return Err(self.err(format!("invalid syntax for integer: {text}")));
         };
+        // `math.Modf`: `fract` of an infinity is NaN, like go's.
         let (fi, ff) = (f.trunc(), f.fract());
         if ff > 0.0 {
             return Err(self.err(format!("fractional part found parsing integer: {text}")));
         } else if fi > u64::MAX as f64 {
             return Err(self.err(format!("overflow parsing integer: {text}")));
         }
-        Ok(fi as u64)
+        Ok(go_f64_to_u64(fi))
+    }
+
+    /// `DecodeUint64`.
+    fn decode_uint64(&mut self) -> R<u64> {
+        let bs = self.dec_num_bytes()?;
+        if bs.is_empty() {
+            return Ok(0);
+        }
+        let (n, neg, bad, overflow) = parse_integer(bs);
+        if overflow {
+            Err(self.err(format!("overflow parsing unsigned integer: {}", lossy(bs))))
+        } else if neg {
+            Err(self.err(format!(
+                "minus found parsing unsigned integer: {}",
+                lossy(bs)
+            )))
+        } else if bad {
+            self.dec_u64_via_float(bs)
+        } else {
+            Ok(n)
+        }
+    }
+
+    /// `kUint8`: `DecodeUint64` and `chkOvf.UintV(v, 8)`.
+    fn decode_uint8(&mut self) -> R<()> {
+        let v = self.decode_uint64()?;
+        if v > u64::from(u8::MAX) {
+            return Err(self.err(format!("uint64 overflow: {v}")));
+        }
+        Ok(())
     }
 
     fn decode_int64(&mut self) -> R<i64> {
@@ -379,7 +420,7 @@ impl<'a> Dec<'a> {
         if bs.is_empty() {
             return Ok(0);
         }
-        let shown = String::from_utf8_lossy(bs).into_owned();
+        let shown = lossy(bs);
         let (mut n, neg, bad, overflow) = parse_integer(bs);
         if overflow {
             return Err(self.err(format!("overflow parsing integer: {shown}")));
@@ -514,73 +555,6 @@ impl<'a> Dec<'a> {
         Ok(char::from_u32(rr).unwrap_or(char::REPLACEMENT_CHARACTER))
     }
 
-    /// `DecodeNaked` of a scalar (the `default` branch of `swallow`).
-    fn decode_naked_scalar(&mut self) -> R<()> {
-        self.ensure_tok()?;
-        match self.tok {
-            b'n' => self.read_lit(b"ull"),
-            b'f' => self.read_lit(b"alse"),
-            b't' => self.read_lit(b"rue"),
-            b'{' | b'[' => Ok(()),
-            b'"' => self.decode_string().map(|_| ()),
-            _ => {
-                let bs = self.dec_num_bytes()?;
-                if bs.is_empty() {
-                    return Err(self.err("decode number from empty string"));
-                }
-                let (_, _, bad, overflow) = parse_integer(bs);
-                if bad || overflow {
-                    let text = String::from_utf8_lossy(bs);
-                    let why = match text.parse::<f64>() {
-                        Ok(f) if f.is_finite() => return Ok(()),
-                        Ok(_) => "value out of range",
-                        Err(_) => "invalid syntax",
-                    };
-                    return Err(self.err(format!(
-                        "decode number from {text}: strconv.ParseFloat: parsing {text:?}: {why}"
-                    )));
-                }
-                Ok(())
-            }
-        }
-    }
-
-    /// `Decoder.swallow`.
-    fn swallow(&mut self) -> R<()> {
-        if self.try_decode_as_nil()? {
-            return Ok(());
-        }
-        match self.container_type()? {
-            ValueType::Map => {
-                self.read_map_start()?;
-                self.depth_incr()?;
-                while !self.check_break()? {
-                    self.read_map_elem_key()?;
-                    self.swallow()?;
-                    self.read_map_elem_value()?;
-                    self.swallow()?;
-                }
-                self.read_map_end()?;
-                self.depth_decr();
-            }
-            ValueType::Array => {
-                self.read_array_start()?;
-                self.depth_incr()?;
-                while !self.check_break()? {
-                    self.read_array_elem()?;
-                    self.swallow()?;
-                }
-                self.read_array_end()?;
-                self.depth_decr();
-            }
-            ValueType::String => {
-                self.decode_string()?;
-            }
-            _ => self.decode_naked_scalar()?,
-        }
-        Ok(())
-    }
-
     /// `kStruct` for a struct whose fields are `fields`; `field` decodes the
     /// value of field `k` (the `TryDecodeAsNil` check is done here).
     fn decode_struct(
@@ -605,7 +579,7 @@ impl<'a> Dec<'a> {
                         None => {
                             return Err(self.err(format!(
                             "no matching struct field found when decoding stream map with key {}",
-                            String::from_utf8_lossy(&key)
+                            lossy(&key)
                         )))
                         }
                     }
@@ -645,14 +619,16 @@ impl<'a> Dec<'a> {
         Ok(())
     }
 
-    /// `kSlice` for `[]GenesisAllocation`.
-    fn decode_alloc(&mut self) -> R<()> {
-        let ctyp = self.container_type()?;
-        if ctyp == ValueType::String {
-            return Err(self.err(
-                "bytes/string in stream must decode into slice/array of bytes, not []bookkeeping.GenesisAllocation",
-            ));
-        }
+    /// The container part of `kSlice` (`decSliceHelperStart` on): a JSON
+    /// array or map (keys and values alternate, `ElemContainerState(j)`),
+    /// `elem` decoding element `j` once `TryDecodeAsNil` is false. A fixed
+    /// array of `len` elements fails past it (`ErrorIfNoArrayExpand`).
+    fn decode_seq(
+        &mut self,
+        ctyp: ValueType,
+        len: Option<usize>,
+        elem: &mut dyn FnMut(&mut Self) -> R<()>,
+    ) -> R<()> {
         let array = match ctyp {
             ValueType::Array => {
                 self.read_array_start()?;
@@ -670,23 +646,28 @@ impl<'a> Dec<'a> {
             }
         };
         self.depth_incr()?;
-        // A map's keys and values alternate (`ElemContainerState(j)`).
-        let mut at_key = true;
+        let mut j = 0usize;
         while !self.check_break()? {
             if array {
                 self.read_array_elem()?;
-            } else if at_key {
+            } else if j.is_multiple_of(2) {
                 self.read_map_elem_key()?;
             } else {
                 self.read_map_elem_value()?;
             }
-            if !self.try_decode_as_nil()? {
-                self.decode_struct(&ALLOC_FIELDS, &mut |d, k| match k {
-                    2 => d.decode_account_data(),
-                    _ => d.decode_string().map(|_| ()),
-                })?;
+            let nil = self.try_decode_as_nil()?;
+            if let Some(len) = len {
+                if j >= len {
+                    return Err(self.err(format!(
+                        "cannot expand array len during decode from {len} to {}",
+                        j + 1
+                    )));
+                }
             }
-            at_key = !at_key;
+            if !nil {
+                elem(self)?;
+            }
+            j += 1;
         }
         if array {
             self.read_array_end()?;
@@ -697,14 +678,367 @@ impl<'a> Dec<'a> {
         Ok(())
     }
 
-    /// `GenesisAccountData`: a struct, its fields only checked to be well
-    /// formed.
+    /// `kSlice` for `[]GenesisAllocation`.
+    fn decode_alloc(&mut self) -> R<()> {
+        let ctyp = self.container_type()?;
+        if ctyp == ValueType::String {
+            return Err(self.err(
+                "bytes/string in stream must decode into slice/array of bytes, not []bookkeeping.GenesisAllocation",
+            ));
+        }
+        self.decode_seq(ctyp, None, &mut |d| {
+            d.decode_struct(&ALLOC_FIELDS, &mut |d, k| match k {
+                2 => d.decode_account_data(),
+                _ => d.decode_string().map(|_| ()),
+            })
+        })
+    }
+
+    /// `kStruct` for `GenesisAccountData`.
     fn decode_account_data(&mut self) -> R<()> {
-        match self.container_type()? {
-            ValueType::Map | ValueType::Array => self.swallow(),
-            _ => Err(self.err("only encoded map or array can be decoded into a struct")),
+        self.decode_struct(&ACCOUNT_FIELDS, &mut |d, k| match k {
+            0 => d.decode_uint8(),
+            2 | 4 => d.decode_byte_array(32),
+            3 => d.decode_byte_array(64),
+            _ => d.decode_uint64().map(|_| ()),
+        })
+    }
+
+    /// `kSlice` for a `[len]byte` (the array's `codecFnInfo`, `seqTypeArray`):
+    /// a string is base64 (`DecodeBytes`; a short or long value is copied
+    /// as far as it goes, no error), an array or map holds `kUint8` elements.
+    fn decode_byte_array(&mut self, len: usize) -> R<()> {
+        let ctyp = self.container_type()?;
+        if ctyp == ValueType::String {
+            let bs = self.decode_string()?;
+            if !bs.is_empty() {
+                if let Err(at) = go_base64_check(&bs) {
+                    return Err(self.err(format!(
+                        "error decoding base64 binary '{}': illegal base64 data at input byte {at}",
+                        lossy(&bs)
+                    )));
+                }
+            }
+            return Ok(());
+        }
+        self.decode_seq(ctyp, Some(len), &mut |d| d.decode_uint8())
+    }
+}
+
+/// go's `base64.StdEncoding.Decode` of `src`, only for its error: the
+/// `CorruptInputError` offset. `\r` and `\n` are skipped; the fast paths of
+/// `Decode` only take whole valid quanta, so `decodeQuantum` alone decides.
+fn go_base64_check(src: &[u8]) -> Result<(), usize> {
+    let valid = |c: u8| c.is_ascii_alphanumeric() || c == b'+' || c == b'/';
+    let skip_nl = |mut si: usize| {
+        while si < src.len() && (src[si] == b'\n' || src[si] == b'\r') {
+            si += 1;
+        }
+        si
+    };
+    let mut si = 0;
+    while si < src.len() {
+        // `decodeQuantum`
+        let mut j = 0usize;
+        while j < 4 {
+            if si == src.len() {
+                if j == 0 {
+                    break;
+                }
+                return Err(si - j);
+            }
+            let c = src[si];
+            si += 1;
+            if valid(c) {
+                j += 1;
+                continue;
+            }
+            if c == b'\n' || c == b'\r' {
+                continue;
+            }
+            if c != b'=' {
+                return Err(si - 1);
+            }
+            match j {
+                0 | 1 => return Err(si - 1),
+                2 => {
+                    si = skip_nl(si);
+                    if si == src.len() {
+                        return Err(src.len());
+                    }
+                    if src[si] != b'=' {
+                        return Err(si - 1);
+                    }
+                    si += 1;
+                }
+                _ => {}
+            }
+            si = skip_nl(si);
+            if si < src.len() {
+                return Err(si);
+            }
+            break;
         }
     }
+    Ok(())
+}
+
+/// go's `uint64(f)` on amd64: below 2^63 `CVTTSD2SQ`, else `CVTTSD2SQ(f -
+/// 2^63) | 1<<63`; an out-of-range or NaN conversion gives `1<<63`.
+fn go_f64_to_u64(f: f64) -> u64 {
+    const TWO63: f64 = 9_223_372_036_854_775_808.0;
+    let cvtt = |x: f64| -> u64 {
+        if x.is_nan() || !(-TWO63..TWO63).contains(&x) {
+            1 << 63
+        } else {
+            x as i64 as u64
+        }
+    };
+    if f < TWO63 {
+        cvtt(f)
+    } else {
+        cvtt(f - TWO63) | (1 << 63)
+    }
+}
+
+/// go's `strconv.ParseFloat(s, 64)`: `Err` is `"invalid syntax"` or
+/// `"value out of range"`. Decimal and hex (`0x...p...`) forms, `_` digit
+/// separators (`underscoreOK`), `inf` / `infinity` with a sign and `nan`
+/// without one, in any case.
+fn go_parse_float(s: &[u8]) -> Result<f64, &'static str> {
+    if let Some((f, n)) = go_float_special(s) {
+        return if n == s.len() {
+            Ok(f)
+        } else {
+            Err("invalid syntax")
+        };
+    }
+    let Some(r) = go_read_float(s) else {
+        return Err("invalid syntax");
+    };
+    if r.n != s.len() {
+        return Err("invalid syntax");
+    }
+    let f = if r.hex {
+        // `atofHex`; a truncated mantissa (16 hex digits read) keeps a
+        // sticky low bit so the rounding to 53 bits is go's.
+        let mut m = r.mantissa;
+        if r.trunc {
+            m |= 1;
+        }
+        let mut f = m as f64;
+        let mut e = r.exp;
+        while e != 0 && f != 0.0 && f.is_finite() {
+            let step: i32 = e.clamp(-1000, 1000).try_into().unwrap_or(0);
+            f *= 2f64.powi(step);
+            e -= i64::from(step);
+        }
+        if r.neg {
+            -f
+        } else {
+            f
+        }
+    } else {
+        let text: String = s[..r.n]
+            .iter()
+            .filter(|&&c| c != b'_')
+            .map(|&c| char::from(c))
+            .collect();
+        text.parse::<f64>().map_err(|_| "invalid syntax")?
+    };
+    if f.is_infinite() {
+        return Err("value out of range");
+    }
+    Ok(f)
+}
+
+/// strconv's `special`: (value, bytes consumed).
+fn go_float_special(s: &[u8]) -> Option<(f64, usize)> {
+    let prefix = |s: &[u8], word: &[u8]| {
+        s.iter()
+            .zip(word)
+            .take_while(|(a, b)| a.to_ascii_lowercase() == **b)
+            .count()
+    };
+    let (sign, nsign, rest) = match s.first()? {
+        b'+' => (1.0, 1, &s[1..]),
+        b'-' => (-1.0, 1, &s[1..]),
+        b'i' | b'I' => (1.0, 0, s),
+        b'n' | b'N' => {
+            return (prefix(s, b"nan") == 3).then_some((f64::NAN, 3));
+        }
+        _ => return None,
+    };
+    let mut n = prefix(rest, b"infinity");
+    if 3 < n && n < 8 {
+        n = 3;
+    }
+    (n == 3 || n == 8).then_some((sign * f64::INFINITY, nsign + n))
+}
+
+/// What strconv's `readFloat` read.
+struct ReadFloat {
+    mantissa: u64,
+    exp: i64,
+    neg: bool,
+    trunc: bool,
+    hex: bool,
+    n: usize,
+}
+
+/// strconv's `readFloat`; `None` is its `ok == false`.
+fn go_read_float(s: &[u8]) -> Option<ReadFloat> {
+    let lower = |c: u8| c | 0x20;
+    let mut underscores = false;
+    let mut i = 0;
+    let mut neg = false;
+    match s.first()? {
+        b'+' => i += 1,
+        b'-' => {
+            i += 1;
+            neg = true;
+        }
+        _ => {}
+    }
+    let mut base: u64 = 10;
+    let mut max_mant_digits = 19;
+    let mut exp_char = b'e';
+    let mut hex = false;
+    if i + 2 < s.len() && s[i] == b'0' && lower(s[i + 1]) == b'x' {
+        base = 16;
+        max_mant_digits = 16;
+        i += 2;
+        exp_char = b'p';
+        hex = true;
+    }
+    let (mut sawdot, mut sawdigits) = (false, false);
+    let (mut nd, mut nd_mant, mut dp) = (0i64, 0i64, 0i64);
+    let mut mantissa: u64 = 0;
+    let mut trunc = false;
+    while i < s.len() {
+        let c = s[i];
+        if c == b'_' {
+            underscores = true;
+        } else if c == b'.' {
+            if sawdot {
+                break;
+            }
+            sawdot = true;
+            dp = nd;
+        } else if c.is_ascii_digit() {
+            sawdigits = true;
+            if c == b'0' && nd == 0 {
+                dp -= 1;
+            } else {
+                nd += 1;
+                if nd_mant < max_mant_digits {
+                    mantissa = mantissa * base + u64::from(c - b'0');
+                    nd_mant += 1;
+                } else if c != b'0' {
+                    trunc = true;
+                }
+            }
+        } else if base == 16 && (b'a'..=b'f').contains(&lower(c)) {
+            sawdigits = true;
+            nd += 1;
+            if nd_mant < max_mant_digits {
+                mantissa = mantissa * 16 + u64::from(lower(c) - b'a' + 10);
+                nd_mant += 1;
+            } else {
+                trunc = true;
+            }
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    if !sawdigits {
+        return None;
+    }
+    if !sawdot {
+        dp = nd;
+    }
+    if base == 16 {
+        dp *= 4;
+        nd_mant *= 4;
+    }
+    if i < s.len() && lower(s[i]) == exp_char {
+        i += 1;
+        if i >= s.len() {
+            return None;
+        }
+        let mut esign = 1;
+        match s[i] {
+            b'+' => i += 1,
+            b'-' => {
+                i += 1;
+                esign = -1;
+            }
+            _ => {}
+        }
+        if i >= s.len() || !s[i].is_ascii_digit() {
+            return None;
+        }
+        let mut e = 0i64;
+        while i < s.len() && (s[i].is_ascii_digit() || s[i] == b'_') {
+            if s[i] == b'_' {
+                underscores = true;
+            } else if e < 10000 {
+                e = e * 10 + i64::from(s[i] - b'0');
+            }
+            i += 1;
+        }
+        dp += e * esign;
+    } else if base == 16 {
+        return None;
+    }
+    let exp = if mantissa != 0 { dp - nd_mant } else { 0 };
+    if underscores && !go_underscore_ok(&s[..i]) {
+        return None;
+    }
+    Some(ReadFloat {
+        mantissa,
+        exp,
+        neg,
+        trunc,
+        hex,
+        n: i,
+    })
+}
+
+/// strconv's `underscoreOK`.
+fn go_underscore_ok(s: &[u8]) -> bool {
+    let lower = |c: u8| c | 0x20;
+    let mut s = s;
+    if let Some(b'-' | b'+') = s.first() {
+        s = &s[1..];
+    }
+    let mut saw = b'^';
+    let mut i = 0;
+    let mut hex = false;
+    if s.len() >= 2 && s[0] == b'0' && matches!(lower(s[1]), b'b' | b'o' | b'x') {
+        i = 2;
+        saw = b'0';
+        hex = lower(s[1]) == b'x';
+    }
+    while i < s.len() {
+        let c = s[i];
+        if c.is_ascii_digit() || hex && (b'a'..=b'f').contains(&lower(c)) {
+            saw = b'0';
+        } else if c == b'_' {
+            if saw != b'0' {
+                return false;
+            }
+            saw = b'_';
+        } else {
+            if saw == b'_' {
+                return false;
+            }
+            saw = b'!';
+        }
+        i += 1;
+    }
+    saw != b'_'
 }
 
 fn hex(c: u8) -> Option<u32> {
@@ -820,11 +1154,104 @@ mod tests {
         );
     }
 
+    /// `state` is a `GenesisAccountData`; texts and positions from go goal
+    /// v5.0.5-stable (`tests/fixtures/genesis_id_fail.jsonl`, issue #2455).
     #[test]
-    fn deep_nesting_is_bounded() {
-        let mut s = String::from(r#"{"alloc":[{"state":"#);
-        s.push_str(&"[".repeat(5000));
-        let err = gid(s.as_bytes()).unwrap_err();
-        assert!(err.ends_with("maximum decoding depth exceeded"), "{err}");
+    fn alloc_state_decodes_like_go() {
+        let state = |s: &str| gid(format!(r#"{{"alloc":[{{"state":{s}}}]}}"#).as_bytes());
+        let err = |pos: usize, m: &str| Err(format!("json decode error [pos {pos}]: {m}"));
+        for ok in [
+            r#"{"onl":"255","algo":"5","voteLst":1e3,"voteKD":10000}"#,
+            r#"{"onl":"0x1p4","voteFst":"1_0"}"#,
+            r#"{"voteLst":1.8446744073709552e19}"#,
+            r#"[1,2,"AAAA",null,[1,2],3,4,5]"#,
+            r#"{"vote":"AAAA","sel":"","stprf":{"1":2}}"#,
+            "null",
+        ] {
+            assert_eq!(state(ok), Ok("-".to_string()), "{ok}");
+        }
+        assert_eq!(
+            state(r#"{"onl":1,"x":1}"#),
+            err(
+                32,
+                "no matching struct field found when decoding stream map with key x"
+            )
+        );
+        assert_eq!(
+            state("[1,2,null,null,null,3,4,5,6]"),
+            err(
+                45,
+                "no matching struct field found when decoding stream array at index 8"
+            )
+        );
+        assert_eq!(state(r#"{"onl":256}"#), err(29, "uint64 overflow: 256"));
+        assert_eq!(
+            state(r#"{"onl":"NaN"}"#),
+            err(31, "uint64 overflow: 9223372036854775808")
+        );
+        assert_eq!(state(r#"{"onl":"0x1p8"}"#), err(33, "uint64 overflow: 256"));
+        assert_eq!(
+            state(r#"{"algo":-1}"#),
+            err(29, "minus found parsing unsigned integer: -1")
+        );
+        assert_eq!(
+            state(r#"{"algo":"1e400"}"#),
+            err(34, "invalid syntax for integer: 1e400")
+        );
+        assert_eq!(
+            state(r#"{"algo":"Inf"}"#),
+            err(32, "overflow parsing integer: Inf")
+        );
+        assert_eq!(
+            state(r#"{"vote":"AA==AA"}"#),
+            err(
+                35,
+                "error decoding base64 binary 'AA==AA': illegal base64 data at input byte 4"
+            )
+        );
+        assert_eq!(
+            state(r#"{"vote":1}"#),
+            err(
+                28,
+                "only encoded map or array can be decoded into a slice (0)"
+            )
+        );
+        let long = format!(r#"{{"vote":[{}null]}}"#, "0,".repeat(32));
+        assert_eq!(
+            state(&long),
+            err(96, "cannot expand array len during decode from 32 to 33")
+        );
+    }
+
+    #[test]
+    fn go_parse_float_matches_strconv() {
+        use super::go_parse_float as pf;
+        assert_eq!(pf(b"1_0"), Ok(10.0));
+        assert_eq!(pf(b"1_000.5"), Ok(1000.5));
+        assert_eq!(pf(b"0x_1p4"), Ok(16.0));
+        assert_eq!(pf(b"0x1.8p1"), Ok(3.0));
+        assert_eq!(pf(b"+Inf"), Ok(f64::INFINITY));
+        assert!(pf(b"nan").unwrap().is_nan());
+        for bad in [&b"0x1"[..], b"-nan", b"infin", b"1__0", b"_1", b"1_", b""] {
+            assert_eq!(pf(bad), Err("invalid syntax"), "{bad:?}");
+        }
+        assert_eq!(pf(b"1e400"), Err("value out of range"));
+        assert_eq!(pf(b"1e-400"), Ok(0.0));
+        assert_eq!(super::go_f64_to_u64(-5.0), 18446744073709551611);
+        assert_eq!(super::go_f64_to_u64(18446744073709551616.0), 1 << 63);
+        assert_eq!(super::go_f64_to_u64(f64::NAN), 1 << 63);
+    }
+
+    #[test]
+    fn base64_errors_are_gos_offsets() {
+        use super::go_base64_check as b;
+        assert_eq!(b(b"AAAA"), Ok(()));
+        assert_eq!(b(b"AAAA\r\nAA=\n="), Ok(()));
+        assert_eq!(b(b"!!!!"), Err(0));
+        assert_eq!(b(b"AAA"), Err(0));
+        assert_eq!(b(b"A==="), Err(1));
+        assert_eq!(b(b"AA="), Err(3));
+        assert_eq!(b(b"AA\nAA\r\n=="), Err(7));
+        assert_eq!(b(b"AAAAAAAA*AAA"), Err(8));
     }
 }

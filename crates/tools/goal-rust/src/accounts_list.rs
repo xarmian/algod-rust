@@ -309,8 +309,9 @@ pub enum AccountsListError {
     /// Couldn't read the genesis ID for the data dir (no
     /// `genesis.json`, malformed, etc.). Go's `errorGenesisIDFail`
     /// (`cmd/goal/messages.go`) with the `GenesisID()` error and the
-    /// data dir, as `accountListFileName` reports it.
-    #[error("Error determining kmd folder ({err}). Ensure the node is running in {}.", data_dir.display())]
+    /// data dir, as `accountListFileName` reports it (`reportErrorf`, so a
+    /// line with non-printable characters is go's, issue #2455).
+    #[error("{}", genesis_id_fail_text(.err, .data_dir))]
     GenesisIdFail { err: String, data_dir: PathBuf },
 
     /// go's `ensureGoalClient` failed before the genesis ID was read
@@ -337,6 +338,14 @@ pub enum AccountsListError {
     /// (accountsList.go:48-52).
     #[error("An Algorand address cannot be used as an account name.")]
     AddressAsName,
+}
+
+/// go's `errorGenesisIDFail` as `reportErrorf` prints it.
+fn genesis_id_fail_text(err: &str, data_dir: &Path) -> String {
+    crate::formatting::report_error_text(&format!(
+        "Error determining kmd folder ({err}). Ensure the node is running in {}.",
+        data_dir.display()
+    ))
 }
 
 #[cfg(test)]
