@@ -603,8 +603,18 @@ fn goal_client_fixture_matches_go_goal() {
         return;
     }
     let committed = std::fs::read_to_string(&path).expect("fixture file");
+    let stale: Vec<String> = committed
+        .lines()
+        .zip(text.lines())
+        .filter(|(c, g)| c != g)
+        .map(|(c, g)| format!("  fixture: {c}\n  go:      {g}"))
+        .collect();
     assert!(
         committed == text,
-        "{FIXTURE} differs from go's output: regenerate it with REGEN_GOAL_CLIENT_FIXTURE=1"
+        "{FIXTURE} differs from go's output ({} vs {} rows): regenerate it with \
+         REGEN_GOAL_CLIENT_FIXTURE=1\n{}",
+        committed.lines().count(),
+        text.lines().count(),
+        stale.join("\n")
     );
 }
