@@ -208,11 +208,18 @@ fn full_placeholder_pqsig_mismatched_authorizer_rejected() {
     };
 
     // The placeholder fails envelope validation, so `check()` leaves the
-    // transaction untouched; real group verification then rejects it as an
-    // invalid request (not a soft per-txn failure), matching go's
-    // `verify.TxnGroupWithTracer` behavior on an unresolved placeholder.
-    let result = simulate(&mut state, request);
-    assert!(result.is_err(), "mismatched placeholder must be rejected");
+    // transaction untouched; real group verification then rejects it. go's
+    // `stxnCoreChecks` attributes the failure to the transaction
+    // (`TxGroupError{GroupIndex: 0}`), so `Simulate` reports it as the group's
+    // failure, not a request error (issue #2438).
+    let result = simulate(&mut state, request).expect("a PQ failure is not a request error");
+    let group = &result.txn_groups[0];
+    assert_eq!(group.failed_at, Some(vec![0]));
+    let message = group.failure_message.as_deref().unwrap_or_default();
+    assert!(
+        message.starts_with("pq signature validation failed: pq signature authorizer mismatch: "),
+        "{message}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -291,8 +298,16 @@ fn delegated_placeholder_pqsig_mismatched_authorizer_rejected() {
         ..Default::default()
     };
 
-    let result = simulate(&mut state, request);
-    assert!(result.is_err(), "mismatched placeholder must be rejected");
+    let result = simulate(&mut state, request).expect("a PQ failure is not a request error");
+    let group = &result.txn_groups[0];
+    assert_eq!(group.failed_at, Some(vec![0]));
+    let message = group.failure_message.as_deref().unwrap_or_default();
+    assert!(
+        message.starts_with(
+            "pq delegated logic signature validation failed: pq signature authorizer mismatch: "
+        ),
+        "{message}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -330,10 +345,19 @@ fn non_placeholder_pqsig_with_wrong_authorizer_is_not_silently_proxy_signed() {
         ..Default::default()
     };
 
-    let result = simulate(&mut state, request);
-    assert!(
-        result.is_err(),
+    // Real verification rejects it, attributed to the transaction as in go
+    // (issue #2438).
+    let result = simulate(&mut state, request).expect("a PQ failure is not a request error");
+    let group = &result.txn_groups[0];
+    assert_eq!(
+        group.failed_at,
+        Some(vec![0]),
         "a non-placeholder (non-empty-signature) pqsig must not be silently proxy-signed"
+    );
+    let message = group.failure_message.as_deref().unwrap_or_default();
+    assert!(
+        message.starts_with("pq signature validation failed: pq signature authorizer mismatch: "),
+        "{message}"
     );
 }
 

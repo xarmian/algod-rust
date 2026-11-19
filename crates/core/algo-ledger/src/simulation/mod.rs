@@ -1717,6 +1717,14 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // the delta at 0.
             logicsig_budgets[i] = (budget_before - budget.remaining()).max(0) as u64;
             if let Err(e) = result {
+                if is_pq_signature_failure(&e) {
+                    return Ok(CheckOutcome::RecoverableFailure {
+                        index: i,
+                        message: go_error_text(&e),
+                        logicsig_traces,
+                        logicsig_budgets,
+                    });
+                }
                 let message = e.to_string();
                 // Signature-*format* failures (no signature at all, more
                 // than one signature category present) are per-transaction
@@ -1877,8 +1885,12 @@ fn validate_fixed_placeholder_pq_envelopes(
                 .as_ref()
                 .expect("is_placeholder_pqsig implies Some");
             if !pqsig.public_key.is_empty() {
-                validate_pqsig_envelope(pqsig, &authorizer, consensus)
-                    .map_err(|e| (i, format!("pq signature validation failed: {e}")))?;
+                validate_pqsig_envelope(pqsig, &authorizer, consensus).map_err(|e| {
+                    (
+                        i,
+                        format!("pq signature validation failed: {}", go_error_text(&e)),
+                    )
+                })?;
             }
         }
         if is_placeholder_delegated_pqsig(stx) {
@@ -1891,13 +1903,39 @@ fn validate_fixed_placeholder_pq_envelopes(
                 validate_pqsig_envelope(pqsig, &authorizer, consensus).map_err(|e| {
                     (
                         i,
-                        format!("pq delegated logic signature validation failed: {e}"),
+                        format!(
+                            "pq delegated logic signature validation failed: {}",
+                            go_error_text(&e)
+                        ),
                     )
                 })?;
             }
         }
     }
     Ok(())
+}
+
+/// go's text of a validation error: `AlgoError`'s `Display` prepends a
+/// `validation error: ` category prefix that go's errors do not carry.
+fn go_error_text(e: &AlgoError) -> String {
+    match e {
+        AlgoError::Validation { message } => message.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Whether a signature-verification error is a post-quantum envelope or
+/// signature failure. go attributes each to its transaction
+/// (`stxnCoreChecks`' `TxGroupError{GroupIndex: gi}` for the pre-activation
+/// gate and a top-level `PQsig`, `logicSigVerify`'s for a PQ-delegated
+/// LogicSig): PQ signatures are verified in place, never in the ed25519
+/// batch, so `Simulate` reports them as the group's `FailureMessage`, not as
+/// a request error (issue #2438).
+fn is_pq_signature_failure(e: &AlgoError) -> bool {
+    matches!(e, AlgoError::Validation { message }
+        if message == "pq signature not enabled"
+            || message.starts_with("pq signature validation failed: ")
+            || message.starts_with("pq delegated logic signature validation failed: "))
 }
 
 /// Validate a placeholder `PQSig` envelope, matching go-algorand's

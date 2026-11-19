@@ -34,11 +34,12 @@ use crate::{
     FALCON_DET1024_SIG_COMPRESSED_MAXSIZE, FALCON_DET1024_SIG_CT_SIZE,
 };
 
-/// `falcon_det1024_verify_compressed`. Sizes are pre-validated by the caller.
-pub(crate) fn verify(pubkey: &[u8], sig: &[u8], data: &[u8]) -> Result<bool, FalconError> {
+/// `falcon_det1024_verify_compressed`: `0` when the signature is valid, else
+/// its `FALCON_ERR_*` code. Sizes are pre-validated by the caller.
+pub(crate) fn verify(pubkey: &[u8], sig: &[u8], data: &[u8]) -> i32 {
     debug_assert_eq!(pubkey.len(), FALCON_DET1024_PUBKEY_SIZE);
     debug_assert!(sig.len() >= 2 && sig.len() <= FALCON_DET1024_SIG_COMPRESSED_MAXSIZE);
-    Ok(det1024::verify_compressed_det(sig, pubkey, data) == 0)
+    det1024::verify_compressed_det(sig, pubkey, data)
 }
 
 /// `shake256_init_prng_from_seed` + `falcon_det1024_keygen`.

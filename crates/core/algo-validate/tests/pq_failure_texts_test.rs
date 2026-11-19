@@ -61,7 +61,11 @@ fn pq_failure_texts_match_go_on_the_pool_path() {
     assert_eq!(cases.len(), 28, "fixture must carry every pool case");
     let mut mismatches = Vec::new();
     for case in &cases {
-        let name = format!("{} / {}", case["kind"].as_str().unwrap(), case["name"].as_str().unwrap());
+        let name = format!(
+            "{} / {}",
+            case["kind"].as_str().unwrap(),
+            case["name"].as_str().unwrap()
+        );
         let bytes = hex::decode(case["stxn"].as_str().unwrap()).unwrap();
         let group = algo_codec::decode_signed_txn_stream(&bytes).expect("go's SignedTxn decodes");
         assert_eq!(group.len(), 1, "{name}");

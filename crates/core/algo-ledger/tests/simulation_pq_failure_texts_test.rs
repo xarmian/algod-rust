@@ -81,7 +81,12 @@ fn pq_failure_texts_match_go_in_simulate() {
             case["fix_signers"]
         );
         let sender: Address = case["sender"].as_str().unwrap().parse().unwrap();
-        let scheme: [u8; 2] = case["scheme"].as_str().unwrap().as_bytes().try_into().unwrap();
+        let scheme: [u8; 2] = case["scheme"]
+            .as_str()
+            .unwrap()
+            .as_bytes()
+            .try_into()
+            .unwrap();
         let pqsig = PQSig {
             scheme,
             salt: PQAddressSalt(case["salt"].as_u64().unwrap() as u8),

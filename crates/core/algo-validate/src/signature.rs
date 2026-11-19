@@ -332,23 +332,19 @@ pub fn validate_pqsig_envelope(
 ) -> Result<(), AlgoError> {
     validate_pqsig_scheme(pqsig, consensus)?;
 
-    // Reject an oversized public key BEFORE hashing it for address
-    // derivation. `public_key` is attacker-controlled wire input (bounded
-    // upstream by overall txn/message size caps, but not by a per-field
-    // limit at decode time the way go's `allocbound=crypto.MaxPQPublicKeySize`
-    // msgp codegen bounds it) — without this check, a public key blob much
-    // larger than a real Falcon-1024 key would still get hashed in full by
-    // `pqsig.address()` below before any cheap size check could reject it.
-    // go's own `VerifyFalcon1024` performs the equivalent size check, just
-    // later (inside signature verification); doing it first here is strictly
-    // cheaper and avoids hashing attacker-controlled oversized input.
-    if pqsig.public_key.len() != algo_falcon::FALCON_DET1024_PUBKEY_SIZE {
+    // go derives the address from whatever key the envelope carries and
+    // leaves a wrong-size key to `VerifyFalcon1024`, after the authorizer
+    // check (issue #2438): a short key that derives the authorizer is a valid
+    // envelope (a simulate placeholder accepts it) and fails only signature
+    // verification. Hashing stays bounded because the public key is decoded
+    // under go's `allocbound=crypto.MaxPQPublicKeySize` (`PQSig::decode_into`,
+    // `algo-codec`'s LogicSig decoder). A longer key can only come from a
+    // caller-built value; it is refused unhashed with go's key-size text,
+    // which go never reaches since its decoder rejects such a key first.
+    if pqsig.public_key.len() > algo_consensus_crypto::MAX_PQ_PUBLIC_KEY_SIZE {
         return Err(AlgoError::Validation {
-            message: format!(
-                "pq public key size {} does not match falcon-1024 public key size {}",
-                pqsig.public_key.len(),
-                algo_falcon::FALCON_DET1024_PUBKEY_SIZE
-            ),
+            message: algo_consensus_crypto::PQVerifyError::PublicKeySize(pqsig.public_key.len())
+                .to_string(),
         });
     }
 
@@ -388,10 +384,12 @@ fn verify_pqsig_bytes(
             message: "pq signature scheme not supported".into(),
         }
     })?;
+    // go returns the scheme verifier's error as is (`VerifyFalcon1024`'s
+    // wrapped `ErrPQFalcon1024SigInvalid`, issue #2438).
     verifier
         .verify(message, &pqsig.public_key, &pqsig.signature)
         .map_err(|e| AlgoError::Validation {
-            message: format!("pq falcon signature verification failed: {e}"),
+            message: e.to_string(),
         })?;
 
     Ok(())
@@ -419,7 +417,10 @@ pub fn verify_pqsig(
         None => &stx.txn.sender,
     };
 
-    verify_pqsig_bytes(pqsig, &msg, authorizer, consensus)
+    // go: `TxGroupError{err: fmt.Errorf("pq signature validation failed: %w", err)}`.
+    verify_pqsig_bytes(pqsig, &msg, authorizer, consensus).map_err(|e| AlgoError::Validation {
+        message: format!("pq signature validation failed: {}", validation_text(e)),
+    })
 }
 
 /// Verify a PQ-delegated LogicSig's authorization proof, mirroring go's
@@ -3900,8 +3901,9 @@ mod tests {
                  the raw \"TX\" || canonical_encode(txn) message",
             );
         assert!(
-            err.to_string()
-                .contains("pq falcon signature verification failed"),
+            err.to_string().contains(
+                "pq signature validation failed: invalid falcon-1024 signature: error code "
+            ),
             "{err}"
         );
     }
@@ -3946,8 +3948,9 @@ mod tests {
         let err = verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus)
             .expect_err("a PQSig must not verify against a transaction it wasn't signed over");
         assert!(
-            err.to_string()
-                .contains("pq falcon signature verification failed"),
+            err.to_string().contains(
+                "pq signature validation failed: invalid falcon-1024 signature: error code "
+            ),
             "expected a signature-verification failure, got: {err}"
         );
     }
@@ -3991,8 +3994,9 @@ mod tests {
         let err = verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus)
             .expect_err("a tampered PQSig signature must not verify");
         assert!(
-            err.to_string()
-                .contains("pq falcon signature verification failed"),
+            err.to_string().contains(
+                "pq signature validation failed: invalid falcon-1024 signature: error code "
+            ),
             "expected a signature-verification failure, got: {err}"
         );
     }
@@ -4072,7 +4076,8 @@ mod tests {
         // A public key blob far larger than a real Falcon-1024 key (1793
         // bytes) must be rejected on a cheap length check, not hashed in
         // full for address derivation first — regression test for the
-        // pre-hash size guard in `verify_pqsig_bytes`.
+        // pre-hash guard on keys over `MAX_PQ_PUBLIC_KEY_SIZE` in
+        // `validate_pqsig_envelope` (go's decoder bounds them, issue #2438).
         let (_pk, sk, salt, addr) = falcon_identity(12);
         let txn = minimal_pay_txn(addr);
         let canonical = canonical_encode_transaction(&txn);
