@@ -119,12 +119,11 @@ impl Drop for KmdGuard {
 
 /// Build a fake algod data dir layout so `resolve_kmd_data_dir`
 /// resolves the kmd directory we control. No system.json ⇒ the data
-/// dir is "private", so kmd resides at `<data_dir>/kmd-v0.5`.
+/// dir is "private", so kmd resides at `<data_dir>/kmd-v0.5`. It has a
+/// `genesis.json`: like go's, goal-rust's `wallet new` stops on an
+/// unreadable genesis ID before contacting kmd (issue #2436).
 fn setup_data_dir() -> (tempfile::TempDir, PathBuf) {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let kmd = tmp.path().join("kmd-v0.5");
-    std::fs::create_dir_all(&kmd).unwrap();
-    write_kmd_config(&kmd);
+    let (tmp, _data_dir, kmd) = setup_data_dir_with_genesis();
     (tmp, kmd)
 }
 
