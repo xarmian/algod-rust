@@ -453,12 +453,9 @@ pub struct SignArgs {
     /// repeatable / comma-separated).
     #[arg(long = "argb64", value_delimiter = ',')]
     pub argb64: Vec<String>,
-    /// Consensus protocol version id string (Go `-P/--proto`). Accepted for
-    /// flag parity. NOTE: unlike Go (which loads the consensus-param table to
-    /// gate `LogicSigVersion`/`LogicSigMaxSize`), goal-rust does not load that
-    /// table client-side, so this value is not used to lower the LogicSig
-    /// version/size ceiling. The program is still checked against the Rust
-    /// AVM's structural limits, and the node re-verifies on submit.
+    /// Consensus protocol version id string (Go `-P/--proto`): the consensus
+    /// params the LogicSig sanity check runs under (go's `getProto`; default:
+    /// the data dir's node, else the current protocol).
     #[arg(short = 'P', long = "proto")]
     pub proto: Option<String>,
     /// Wallet password (skip the prompt). goal-rust convention shared with the

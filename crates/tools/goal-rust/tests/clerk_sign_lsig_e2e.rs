@@ -188,24 +188,13 @@ fn row(name: &str, input: &[u8], run: &RunResult) -> serde_json::Value {
     serde_json::Value::Object(row)
 }
 
-/// What issue #2393 is about is the decode: whether `lsigFromArgs` accepts the
-/// file. Past the decode, go's `LogicSigSanityCheck` runs (its message texts, its
-/// order of checks, the consensus params it uses, the PQ scheme gate) and
-/// goal-rust's `algo_validate` check words and orders some of it differently
-/// (follow-up #2405), so:
-///
-/// * a record go decodes and then rejects in the sanity check is compared as
-///   "decoded" only;
-/// * everything else must match exactly: go's success (the signed file
-///   included) and go's decode failure, whose stderr carries msgp's error text
-///   with its context path (`... at Subsigs/0 at Msig`) and goal's
-///   "One or more non-printable characters" preamble (issue #2404).
+/// Every record must match go exactly: go's success (the signed file
+/// included), go's decode failure, whose stderr carries msgp's error text with
+/// its context path (`... at Subsigs/0 at Msig`) and goal's "One or more
+/// non-printable characters" preamble (issue #2404), and go's
+/// `LogicSigSanityCheck` rejection (`t.txn: txn[0] error ...`: its texts, its
+/// order of checks, its consensus params, the PQ scheme gate; issue #2405).
 fn same_outcome(want: &serde_json::Value, got: &serde_json::Value) -> bool {
-    let werr = want["stderr"].as_str().unwrap_or("");
-    let gerr = got["stderr"].as_str().unwrap_or("");
-    if werr.contains("t.txn: txn[0] error") {
-        return !gerr.contains("decode failed");
-    }
     got == want
 }
 

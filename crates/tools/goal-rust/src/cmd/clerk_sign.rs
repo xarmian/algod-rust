@@ -230,34 +230,6 @@ pub fn tealsign_payload(program_hash: &[u8; 32], data: &[u8]) -> Vec<u8> {
     payload
 }
 
-/// Structural + size check for a LogicSig program, the consensus-independent
-/// part of `verify.LogicSigSanityCheck` (`data/transactions/verify/txn.go`):
-///
-/// - the program is non-empty and passes the structural [`check_program`]
-///   checks (AVM version, opcode mode, branch targets, stack depth);
-/// - the pooled LogicSig length `len(logic) + sum(len(args))` is within the
-///   LogicSig size limit (so an oversized `--argb64` is rejected, matching
-///   Go's `LogicSig.Len()` vs `LogicSigMaxSize`).
-///
-/// The delegation-signature verification (sig / msig / lmsig over
-/// `"Program" || logic`, or the contract-account `authorizer == HashProgram`
-/// check) is performed by [`algo_validate::logicsig_sanity_check`], which
-/// reuses the tested signature/multisig verification in `algo-validate`.
-pub fn logicsig_program_check(lsig: &LogicSig) -> Result<(), String> {
-    let program: Vec<u8> = lsig.logic.to_vec();
-    if program.is_empty() {
-        return Err("LogicSig.Logic empty".to_string());
-    }
-    let parsed = algo_avm::parse(&program).map_err(|e| format!("{e}"))?;
-    // Go's size check counts the whole LogicSig: `LogicSig.Len()` =
-    // len(Logic) + sum(len(Args)) against `LogicSigMaxSize`. Pass the pooled
-    // length as `program_len`.
-    let lsig_len = program.len() + lsig.arg_bytes().map(<[u8]>::len).sum::<usize>();
-    algo_avm::check_program(&parsed, algo_avm::Mode::LogicSig, lsig_len, 0)
-        .map_err(|e| format!("{e}"))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,35 +321,6 @@ mod tests {
         // Address must match the independent multisig_addr_gen computation.
         let expected = multisig_addr_gen(1, 2, &[[1u8; 32], [2u8; 32], [3u8; 32]]).unwrap();
         assert_eq!(pre.address, expected);
-    }
-
-    #[test]
-    fn logicsig_program_check_accepts_valid_program() {
-        // `int 1` (v2): 0x0220010122.
-        let lsig = LogicSig {
-            logic: ByteBuf::from(vec![0x02u8, 0x20, 0x01, 0x01, 0x22]),
-            ..LogicSig::default()
-        };
-        assert!(logicsig_program_check(&lsig).is_ok());
-    }
-
-    #[test]
-    fn logicsig_program_check_rejects_empty_program() {
-        let lsig = LogicSig::default();
-        assert!(logicsig_program_check(&lsig).unwrap_err().contains("empty"));
-    }
-
-    #[test]
-    fn logicsig_program_check_counts_args_toward_size() {
-        // A tiny program with a single arg larger than the LogicSig size limit
-        // (1000 bytes for v1-3) must be rejected on the pooled-size check.
-        let lsig = LogicSig {
-            logic: ByteBuf::from(vec![0x02u8, 0x20, 0x01, 0x01, 0x22]),
-            args: Some(vec![Some(ByteBuf::from(vec![0u8; 4096]))]),
-            ..LogicSig::default()
-        };
-        let err = logicsig_program_check(&lsig).unwrap_err();
-        assert!(err.contains("size"), "got: {err}");
     }
 
     #[test]

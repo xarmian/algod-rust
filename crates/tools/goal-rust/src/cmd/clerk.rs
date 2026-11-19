@@ -95,6 +95,51 @@ pub(crate) fn resolve_max_txn_life(
         })
 }
 
+/// go's `getProto` (clerk.go): the consensus params of `--proto`, else of the
+/// node of a single data dir (its suggested params; any failure keeps the
+/// default), else of the current protocol, looked up in the built-in table
+/// (`config.Consensus`).
+fn get_proto(
+    proto: Option<&str>,
+    cli_d: &[PathBuf],
+) -> Result<algo_types::consensus::ConsensusParams, String> {
+    let version = match proto.filter(|p| !p.is_empty()) {
+        Some(p) => p.to_string(),
+        None => node_consensus_version(cli_d)
+            .unwrap_or_else(|| algo_types::consensus::CONSENSUS_CURRENT_VERSION.to_string()),
+    };
+    algo_types::consensus::consensus_params_for_version(&version).ok_or_else(|| {
+        // go ranges over a map, in no fixed order.
+        let mut versions: Vec<String> = algo_types::consensus::built_in_consensus_protocols()
+            .into_keys()
+            .collect();
+        versions.sort();
+        let mut msg = "Invalid consensus version. Possible versions:".to_string();
+        for v in versions {
+            msg.push_str("\n\t");
+            msg.push_str(&v);
+        }
+        msg
+    })
+}
+
+/// go's `MaybeSingleDataDir` + `client.SuggestedParams().ConsensusVersion`:
+/// `None` without exactly one data dir or when the node does not answer.
+fn node_consensus_version(cli_d: &[PathBuf]) -> Option<String> {
+    if cli_d.len() > 1 {
+        return None;
+    }
+    let dir = data_dir::ensure_first_data_dir(cli_d).ok()?;
+    let algod = build_algod_client_for_dir(&dir).ok()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    rt.block_on(algod.suggested_transaction_params())
+        .ok()
+        .map(|p| p.consensus_version)
+}
+
 /// Mirrors Go's `Could not contact kmd; is it running?` error path.
 const ERROR_KMD_UNREACHABLE: &str = "Could not contact kmd; is it running?";
 
@@ -300,13 +345,22 @@ fn run_send_inner(
             // no sanity check here; the node verifies on submit.
             s.auth_addr = auth_addr;
         } else {
-            // Delegated LogicSig path: structural + delegation sanity check
-            // before broadcast (clerk.go:465-481, verify.LogicSigSanityCheck),
-            // split the same way `clerk sign` does (see run_sign_inner).
-            clerk_sign::logicsig_program_check(&resolved.lsig)
-                .map_err(|e| format!("{}: txn error {e}", out_label(args.out.as_deref())))?;
-            algo_validate::logicsig_sanity_check(&s, &resolved.lsig)
-                .map_err(|e| format!("{}: txn error {e}", out_label(args.out.as_deref())))?;
+            // Delegated LogicSig path: go's `verify.LogicSigSanityCheck` under
+            // the node's consensus version before broadcast (clerk.go:440-462;
+            // `PrepareGroupContext` fails with `protocol.Error` on a version
+            // missing from the built-in table).
+            let sanity = match algo_types::consensus::consensus_params_for_version(
+                &params.consensus_version,
+            ) {
+                Some(consensus) => {
+                    algo_validate::logicsig_sanity_check(&s, &resolved.lsig, &consensus)
+                }
+                None => Err(format!(
+                    "protocol not supported: {}",
+                    params.consensus_version
+                )),
+            };
+            sanity.map_err(|e| format!("{}: txn error {e}", out_label(args.out.as_deref())))?;
         }
         s
     } else if want_wallet_sign {
@@ -693,18 +747,13 @@ fn run_sign_inner(
 
     let out_data = if let Some(lsig) = lsig {
         // --- LogicSig path: attach lsig (+ AuthAddr) to every txn. ---
-        // Go runs verify.LogicSigSanityCheck per txn (it depends on the txn's
-        // authorizer). We mirror it in two steps that together match Go without
-        // needing the consensus-param table loaded client-side:
-        //   1. `clerk_sign::logicsig_program_check` — program structure +
-        //      pooled-size (len(logic) + sum(args)) check;
-        //   2. `algo_validate::logicsig_sanity_check` — the at-most-one-sig rule
-        //      and the actual delegation-signature verification (sig / msig /
-        //      lmsig over "Program"||logic, or the contract-account
-        //      authorizer == HashProgram check). This is the load-bearing
-        //      security check: it rejects an invalid/unsigned delegated lsig
-        //      before we write the file. The node re-runs the full check
-        //      (including TEAL execution) on submit.
+        // Go runs `verify.LogicSigSanityCheck` per txn (it depends on the
+        // txn's authorizer) under `getProto(--proto)`'s consensus params
+        // (clerk.go:833-868): the shared `algo_validate::logicsig_sanity_check`
+        // the node runs before evaluating a LogicSig, with go's texts. It
+        // rejects an invalid/unsigned delegated lsig before we write the file;
+        // the node re-runs the full check (including TEAL execution) on submit.
+        let consensus = get_proto(args.proto.as_deref(), &cli_d)?;
         let mut out = Vec::new();
         for (idx, stxn) in stxns.iter_mut().enumerate() {
             stxn.lsig = Some(lsig.clone());
@@ -722,9 +771,7 @@ fn run_sign_inner(
                 }
                 stxn.auth_addr = Some(signer);
             }
-            clerk_sign::logicsig_program_check(&lsig)
-                .map_err(|e| format!("{}: txn[{idx}] error {e}", args.infile.display()))?;
-            algo_validate::logicsig_sanity_check(stxn, &lsig)
+            algo_validate::logicsig_sanity_check(stxn, &lsig, &consensus)
                 .map_err(|e| format!("{}: txn[{idx}] error {e}", args.infile.display()))?;
             out.extend_from_slice(&canonical_encode_signed_transaction(stxn));
         }
