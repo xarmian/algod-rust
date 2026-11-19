@@ -125,6 +125,9 @@ fn cases() -> Vec<(&'static str, Vec<&'static str>)> {
             "clerk compile -s",
             vec!["clerk", "compile", "-s", "-a", ADDR, "p.teal"],
         ),
+        // go's `accountCmd` builds the list before it looks at `-f` (#2448).
+        ("account", vec!["account"]),
+        ("account -f", vec!["account", "-f", "a"]),
         ("account list", vec!["account", "list"]),
         ("account new", vec!["account", "new"]),
         ("account rename", vec!["account", "rename", "a", "b"]),
@@ -141,7 +144,13 @@ fn cases() -> Vec<(&'static str, Vec<&'static str>)> {
             "account multisig delete",
             vec!["account", "multisig", "delete", "-a", ADDR],
         ),
+        (
+            "account import -m",
+            vec!["account", "import", "-m", ZERO_MNEMONIC],
+        ),
         ("wallet new", vec!["wallet", "new", "w"]),
+        // go's `walletCmd` builds the list before it asks kmd (#2448).
+        ("wallet -f", vec!["wallet", "-f", "w"]),
     ]
 }
 
