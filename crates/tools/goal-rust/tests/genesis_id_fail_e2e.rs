@@ -29,7 +29,8 @@
 //! printed (exit code, stdout, stderr, the data dir masked) for the commands
 //! below, each run against a data dir without `genesis.json` and without a
 //! node: the ones that reach `makeAccountsList` before anything that needs a
-//! node, and one (`clerk compile` without `-s`) that never calls it. goal-rust must produce the same rows (a default test, no go needed);
+//! node (the `account -f`, `wallet -f` and `account import -m` rows since
+//! issue #2448), and one (`clerk compile` without `-s`) that never calls it. goal-rust must produce the same rows (a default test, no go needed);
 //! a `MIXED_CLUSTER=1` run re-checks the file against a real go `goal`
 //! (`GOAL_GO` names a prebuilt one), and `REGEN_GENESIS_ID_FIXTURE=1`
 //! rewrites it from go:
@@ -125,6 +126,9 @@ fn cases() -> Vec<(&'static str, Vec<&'static str>)> {
             "clerk compile -s",
             vec!["clerk", "compile", "-s", "-a", ADDR, "p.teal"],
         ),
+        // go's `accountCmd` builds the list before it looks at `-f` (#2448).
+        ("account", vec!["account"]),
+        ("account -f", vec!["account", "-f", "a"]),
         ("account list", vec!["account", "list"]),
         ("account new", vec!["account", "new"]),
         ("account rename", vec!["account", "rename", "a", "b"]),
@@ -141,7 +145,13 @@ fn cases() -> Vec<(&'static str, Vec<&'static str>)> {
             "account multisig delete",
             vec!["account", "multisig", "delete", "-a", ADDR],
         ),
+        (
+            "account import -m",
+            vec!["account", "import", "-m", ZERO_MNEMONIC],
+        ),
         ("wallet new", vec!["wallet", "new", "w"]),
+        // go's `walletCmd` builds the list before it asks kmd (#2448).
+        ("wallet -f", vec!["wallet", "-f", "w"]),
     ]
 }
 

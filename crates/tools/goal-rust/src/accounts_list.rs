@@ -67,7 +67,9 @@ use crate::data_dir;
 pub struct AccountsList {
     /// address → friendly name. Empty when no accounts have been
     /// named yet.
-    #[serde(rename = "Accounts", default)]
+    /// Written with the addresses sorted, as go's `encoding/json` writes a
+    /// map (issue #2448).
+    #[serde(rename = "Accounts", default, serialize_with = "serialize_sorted")]
     pub accounts: HashMap<String, String>,
 
     /// Address of the default account, or empty if unset.
@@ -87,6 +89,15 @@ pub struct AccountsList {
     /// `<data_dir>` that produced the file.
     #[serde(rename = "DataDir", default)]
     pub data_dir: PathBuf,
+}
+
+fn serialize_sorted<S: serde::Serializer>(
+    map: &HashMap<String, String>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    map.iter()
+        .collect::<std::collections::BTreeMap<_, _>>()
+        .serialize(s)
 }
 
 impl AccountsList {

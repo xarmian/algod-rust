@@ -104,6 +104,11 @@ pub struct Cli {
 pub enum RootCommand {
     /// Control and manage Algorand accounts.
     Account {
+        /// Set the account with this name to be the default account.
+        /// Mirrors Go's local `-f, --default` flag on `accountCmd`
+        /// (`account.go`); a leaf's own `-f` is a different flag.
+        #[arg(short = 'f', long = "default")]
+        default: Option<String>,
         #[command(subcommand)]
         cmd: Option<groups::account::AccountCmd>,
     },
@@ -187,6 +192,11 @@ pub enum RootCommand {
 
     /// Manage wallets: encrypted collections of Algorand account keys.
     Wallet {
+        /// Set the wallet with this name to be the default wallet.
+        /// Mirrors Go's local `-f, --default` flag on `walletCmd`
+        /// (`wallet.go`).
+        #[arg(short = 'f', long = "default")]
+        default: Option<String>,
         #[command(subcommand)]
         cmd: Option<groups::wallet::WalletCmd>,
     },
@@ -232,8 +242,10 @@ pub fn run() -> ExitCode {
         return ExitCode::SUCCESS;
     };
     match command {
-        RootCommand::Account { cmd: Some(c) } => groups::account::run(c),
-        RootCommand::Account { cmd: None } => print_group_help(&["account"]),
+        RootCommand::Account { cmd: Some(c), .. } => groups::account::run(c),
+        RootCommand::Account { cmd: None, default } => {
+            cmd::account::run_root(default, cli_state::datadirs())
+        }
         RootCommand::App {
             cmd: Some(c),
             wallet,
@@ -266,7 +278,9 @@ pub fn run() -> ExitCode {
         RootCommand::Protocols => unimplemented("", "protocols"),
         RootCommand::Report => unimplemented("", "report"),
         RootCommand::Version => unimplemented("", "version"),
-        RootCommand::Wallet { cmd: Some(c) } => groups::wallet::run(c),
-        RootCommand::Wallet { cmd: None } => print_group_help(&["wallet"]),
+        RootCommand::Wallet { cmd: Some(c), .. } => groups::wallet::run(c),
+        RootCommand::Wallet { cmd: None, default } => {
+            cmd::wallet::run_root(default, cli_state::datadirs(), cli_state::kmddir())
+        }
     }
 }

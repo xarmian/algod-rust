@@ -514,6 +514,91 @@ fn print_wallets(wallets: &[algo_kmd_api_types::common::APIV1Wallet], default_wa
     println!("{WALLET_SEPARATOR}");
 }
 
+/// Mirrors `messages.go:196` (`infoSetWalletToDefault`).
+const INFO_SET_WALLET_TO_DEFAULT: &str = "Set wallet '{}' to be the default wallet";
+/// Mirrors `messages.go:201` (`errWalletNameAmbiguous`).
+const ERR_WALLET_NAME_AMBIGUOUS: &str = "More than one wallet named '{}' exists. Please remove any wallets with the same name from the kmd wallet directory";
+/// Mirrors `messages.go:204` (`errWalletNotFound`).
+const ERR_WALLET_NOT_FOUND: &str = "Wallet '{}' not found";
+
+/// Port of `walletCmd`'s `Run` (`wallet.go`): `-f/--default <name>` builds
+/// the accounts list (stopping on an unreadable genesis ID), looks the
+/// wallet up in kmd (`FindWalletIDByName`) and records its ID as the
+/// default wallet; without it (or with an empty name) the group's help is
+/// printed and nothing else is touched.
+pub fn run_root(
+    default_name: Option<String>,
+    cli_d: Vec<PathBuf>,
+    kmd_dir_flag: Option<PathBuf>,
+) -> ExitCode {
+    let Some(name) = default_name.filter(|n| !n.is_empty()) else {
+        return crate::print_group_help(&["wallet"]);
+    };
+    let data_dir_path = match data_dir::ensure_single_data_dir(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut accounts = match AccountsList::load(&data_dir_path) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let client = match ensure_kmd_client_for_dir(
+        &data_dir_path,
+        kmd_dir_flag.as_deref(),
+        ERROR_COULDNT_FIND,
+    ) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("{}", format_message(ERROR_COULDNT_FIND, &[&name]));
+            return ExitCode::from(1);
+        }
+    };
+    // go's `FindWalletIDByName`: any kmd failure is `errFindingWallet` (the
+    // same text as `errorCouldntFindWallet`) with
+    // the wallet name (not the error); the last match wins, a second one
+    // marks a duplicate.
+    let wallets = match rt.block_on(client.list_wallets()) {
+        Ok(r) => r.wallets,
+        Err(_) => {
+            eprintln!("{}", format_message(ERROR_COULDNT_FIND, &[&name]));
+            return ExitCode::from(1);
+        }
+    };
+    let mut wid: Option<String> = None;
+    let mut duplicate = false;
+    for w in wallets.iter().filter(|w| w.name == name) {
+        duplicate |= wid.is_some();
+        wid = Some(w.id.clone());
+    }
+    if duplicate {
+        eprintln!("{}", format_message(ERR_WALLET_NAME_AMBIGUOUS, &[&name]));
+        return ExitCode::from(1);
+    }
+    let Some(wid) = wid.filter(|id| !id.is_empty()) else {
+        eprintln!("{}", format_message(ERR_WALLET_NOT_FOUND, &[&name]));
+        return ExitCode::from(1);
+    };
+    if let Err(e) = accounts.set_default_wallet_id(&wid) {
+        eprintln!("{e}");
+        return ExitCode::from(1);
+    }
+    println!("{}", format_message(INFO_SET_WALLET_TO_DEFAULT, &[&name]));
+    ExitCode::SUCCESS
+}
+
 /// Port of `renameWalletCmd` (`wallet.go:215-280`).
 pub fn run_rename(
     args: RenameArgs,
