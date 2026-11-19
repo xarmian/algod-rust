@@ -423,8 +423,9 @@ fn verify_transaction_signature_dispatches_to_logicsig() {
     );
 }
 
-/// LogicSig size pooling: a LogicSig exceeding 1000 bytes should be rejected
-/// without pooling but accepted with pooling when the group pool is large enough.
+/// LogicSig size pooling: a LogicSig exceeding 1000 bytes is rejected by the
+/// group check when the group's pool is too small and accepted when it is large
+/// enough.
 #[test]
 fn logicsig_size_pooling_allows_large_lsig_in_group() {
     use algo_validate::signature::verify_group_logicsig_size;
@@ -468,39 +469,32 @@ fn logicsig_size_pooling_allows_large_lsig_in_group() {
         consensus.logic_sig_max_size
     );
 
-    // Without pooling, the individual LogicSig should be rejected.
-    let no_pooling = ConsensusParams {
-        enable_logicsig_size_pooling: false,
-        ..ConsensusParams::default()
-    };
+    // go v5.0.5 has no per-LogicSig `LogicSigMaxSize` check, with or without
+    // `EnableLogicSigSizePooling` (go-algorand #6637 retired it, issue #2405):
+    // the LogicSig itself is fine, the group check rejects a group whose pool
+    // (one member: 1000 bytes) is too small for it.
     let stx = make_contract_account_txn(&program);
     let group = vec![stx.clone()];
-    let mut budget = GroupBudget::for_logicsig(1);
     let lsig = stx.lsig.as_ref().unwrap();
-    let result = verify_logicsig(&stx, lsig, &group, 0, &mut budget, &no_pooling);
+    for pooling in [false, true] {
+        let params = ConsensusParams {
+            enable_logicsig_size_pooling: pooling,
+            ..ConsensusParams::default()
+        };
+        let mut budget = GroupBudget::for_logicsig(1);
+        let result = verify_logicsig(&stx, lsig, &group, 0, &mut budget, &params);
+        assert!(
+            result.is_ok(),
+            "pooling {pooling}: no per-LogicSig size check: {:?}",
+            result.err()
+        );
+    }
+    let single = verify_group_logicsig_size(&group, &consensus).unwrap_err();
     assert!(
-        result.is_err(),
-        "should reject large LogicSig without size pooling"
-    );
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("LogicSig too long"),
-        "error should mention size"
-    );
-
-    // With pooling enabled, the per-txn check is skipped.
-    let pooling_consensus = ConsensusParams {
-        enable_logicsig_size_pooling: true,
-        ..ConsensusParams::default()
-    };
-    let mut budget2 = GroupBudget::for_logicsig(1);
-    let result2 = verify_logicsig(&stx, lsig, &group, 0, &mut budget2, &pooling_consensus);
-    assert!(
-        result2.is_ok(),
-        "should accept large LogicSig with size pooling (per-txn check skipped): {:?}",
-        result2.err()
+        single.to_string().contains(
+            "txgroup had 3387 bytes of LogicSigs, more than the available pool of 1000 bytes"
+        ),
+        "{single}"
     );
 
     // Group-level check with 8 members: pool = 8 * 1000 = 8000.
@@ -991,7 +985,7 @@ fn logicsig_sanity_check_ignores_blank_msig_and_lmsig() {
         lsig.lmsig = Some(blank);
     }
     let lsig = stx.lsig.clone().unwrap();
-    algo_validate::signature::logicsig_sanity_check(&stx, &lsig)
+    algo_validate::signature::logicsig_sanity_check(&stx, &lsig, &v42())
         .expect("blank msig/lmsig must not count as delegation signatures");
 }
 

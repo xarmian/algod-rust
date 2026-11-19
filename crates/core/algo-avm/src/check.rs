@@ -50,7 +50,7 @@ use crate::opcode::{self, ImmKind, Mode};
 
 /// Go's `binary.Uvarint`: `(value, bytes read)`; the count is `0` when the
 /// buffer ends first and negative on 64-bit overflow.
-fn uvarint(buf: &[u8]) -> (u64, isize) {
+pub fn uvarint(buf: &[u8]) -> (u64, isize) {
     let mut x: u64 = 0;
     let mut shift = 0u32;
     for (i, &b) in buf.iter().enumerate() {

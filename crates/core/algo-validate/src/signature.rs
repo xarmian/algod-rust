@@ -306,9 +306,10 @@ pub fn validate_pqsig_scheme(pqsig: &PQSig, consensus: &ConsensusParams) -> Resu
     // `LookupPQScheme` miss → `ErrPQSchemeNotSupported`) before checking
     // whether it's consensus-enabled -- an unregistered tag has no verifier
     // to dispatch to regardless of what the consensus params say.
+    // go's `crypto.ErrPQSchemeNotSupported`, which names no scheme.
     if algo_consensus_crypto::lookup_pq_scheme(pqsig.scheme).is_none() {
         return Err(AlgoError::Validation {
-            message: format!("pq signature scheme not supported: {:?}", pqsig.scheme),
+            message: "pq signature scheme not supported".into(),
         });
     }
     if !consensus.pq_scheme_enabled(pqsig.scheme) {
@@ -384,7 +385,7 @@ fn verify_pqsig_bytes(
     // go's `stxnCoreChecks`'s use of `LookupPQScheme` at the call site.
     let verifier = algo_consensus_crypto::lookup_pq_scheme(pqsig.scheme).ok_or_else(|| {
         AlgoError::Validation {
-            message: format!("pq signature scheme not supported: {:?}", pqsig.scheme),
+            message: "pq signature scheme not supported".into(),
         }
     })?;
     verifier
@@ -443,7 +444,10 @@ fn verify_pq_delegated_logicsig(
     };
     verify_pqsig_bytes(pqsig, &program.to_be_signed(), authorizer, consensus).map_err(|e| {
         AlgoError::Validation {
-            message: format!("pq delegated logic signature validation failed: {e}"),
+            message: format!(
+                "pq delegated logic signature validation failed: {}",
+                validation_text(e)
+            ),
         }
     })
 }
@@ -591,93 +595,173 @@ pub fn verify_multisig(stx: &SignedTransaction, msig: &MultisigSig) -> Result<()
     verify_multisig_subsigs(msig, &msg, "multisig")
 }
 
-/// Verify a multisig used in a logicsig delegation context.
-///
-/// Similar to `verify_multisig` but verifies against "Program" || logic instead of "TX" || txn.
-fn verify_logicsig_multisig(
-    stx: &SignedTransaction,
-    msig: &MultisigSig,
-    program_msg: &[u8],
-) -> Result<(), AlgoError> {
-    check_multisig_address(stx, msig, "logicsig delegated multisig")?;
-    verify_multisig_subsigs(msig, program_msg, "logicsig multisig")
+/// go's `crypto.MultisigBatchPrep` (`crypto/multisig.go`) of a LogicSig's
+/// delegation multisig: the structural checks, with go's texts and in go's
+/// order. The signatures themselves are go's batch: [`logicsig_sanity_check`]
+/// verifies them after every structural check passed.
+fn logic_multisig_prep(addr: &Address, msig: &MultisigSig) -> Result<(), &'static str> {
+    // go's `errInvalidNumberOfSignature` / `errUnknownVersion` /
+    // `errInvalidThreshold` / `errInvalidAddress` (`crypto/cryptoerror.go`).
+    const INVALID_NUMBER: &str = "Invalid number of signatures";
+    let first_is_empty = msig
+        .subsigs
+        .first()
+        .is_none_or(|s| s.public_key == [0u8; 32] && s.signature == [0u8; 64]);
+    if first_is_empty {
+        return Err(INVALID_NUMBER);
+    }
+    // `MultisigAddrGenWithSubsigs`.
+    if msig.version != 1 {
+        return Err("unknown version");
+    }
+    if msig.threshold == 0 || usize::from(msig.threshold) > msig.subsigs.len() {
+        return Err("Invalid threshold");
+    }
+    if compute_multisig_address(msig) != *addr {
+        return Err("Invalid address");
+    }
+    if msig.subsigs.len() > 255 {
+        return Err(INVALID_NUMBER);
+    }
+    let signatures = msig
+        .subsigs
+        .iter()
+        .filter(|s| s.signature != [0u8; 64])
+        .count();
+    if signatures < usize::from(msig.threshold) {
+        return Err(INVALID_NUMBER);
+    }
+    Ok(())
 }
 
-/// Signature-level sanity check for a LogicSig, mirroring go-algorand's
-/// `verify.LogicSigSanityCheck` (`data/transactions/verify/txn.go:360-444`)
-/// **without** executing the program.
+/// The text of a validation error, without the `validation error: ` category
+/// prefix `AlgoError`'s `Display` adds (go's errors carry none).
+fn validation_text(e: AlgoError) -> String {
+    match e {
+        AlgoError::Validation { message } => message,
+        other => other.to_string(),
+    }
+}
+
+/// go's `verify.LogicSigSanityCheck` (`data/transactions/verify/txn.go`
+/// `logicSigSanityCheckBatchPrep` followed by its batch's `Verify`): whether
+/// the LogicSig of `stx` is well formed and its delegation signature (or its
+/// contract account) authorizes `stx`, **without** executing the program.
+/// The error is go's text, and the checks run in go's order:
 ///
-/// Verifies the structural rules (empty program, at-most-one of
-/// sig/msig/lmsig) and the delegation signature itself:
-/// - **no sig/msig/lmsig**: contract account — the txn authorizer (auth_addr
-///   else sender) must equal `SHA512/256("Program" || logic)`;
-/// - **sig**: ed25519 over `"Program" || logic` against the authorizer;
-/// - **msig**: multisig over `"Program" || logic`;
-/// - **lmsig**: multisig over `"MsigProgram" || authorizer || logic`.
+/// 1. LogicSigs are enabled, the program is non-empty, within
+///    `MaxAbsoluteLogicSigProgramSize`, its version decodes and is at most
+///    `LogicSigVersion`;
+/// 2. go's static check of the program (`logic.CheckSignature`);
+/// 3. no delegation signature: the authorizer is the program's contract
+///    account; otherwise exactly one of sig / msig / lmsig / pqsig;
+/// 4. a PQ delegation verifies in place; a legacy `msig` / an `lmsig` needs
+///    `LogicSigMsig` / `LogicSigLMsig` and passes `MultisigBatchPrep`;
+/// 5. the ed25519 signatures verify (go's batch).
 ///
-/// This is what `goal clerk sign` runs before writing a LogicSig-signed file
-/// (the node re-runs the full check, including TEAL execution, on submit).
-pub fn logicsig_sanity_check(stx: &SignedTransaction, lsig: &LogicSig) -> Result<(), AlgoError> {
-    if lsig.logic.is_empty() {
-        return Err(AlgoError::Validation {
-            message: "LogicSig.Logic empty".into(),
-        });
+/// The size of the LogicSig's args and of the group's LogicSigs is a group
+/// check ([`logic_sig_group_size_check`], go's `logicSigGroupSizeCheck`).
+///
+/// [`verify_logicsig_with_tracer`] runs it before evaluating the program
+/// (go's `logicSigVerify`), and `goal clerk sign -L` / `goal clerk send -L`
+/// run it before writing or sending a delegated LogicSig.
+pub fn logicsig_sanity_check(
+    stx: &SignedTransaction,
+    lsig: &LogicSig,
+    consensus: &ConsensusParams,
+) -> Result<(), String> {
+    if consensus.logic_sig_version == 0 {
+        return Err("LogicSig not enabled".into());
+    }
+    if !lsig.has_program() {
+        return Err("LogicSig.Logic empty".into());
+    }
+    if lsig.logic.len() as u64 > consensus.max_absolute_logic_sig_program_size {
+        return Err(format!(
+            "LogicSig.Logic too long. max size is {} bytes",
+            consensus.max_absolute_logic_sig_program_size
+        ));
+    }
+    let (version, vlen) = algo_avm::check::uvarint(&lsig.logic);
+    if vlen <= 0 {
+        return Err("LogicSig.Logic bad version".into());
+    }
+    if version > consensus.logic_sig_version {
+        return Err("LogicSig.Logic version too new".into());
     }
 
+    // go's `logic.CheckSignature`: the static pass over the program, reported
+    // as `pc=%3d <err>` (issue #2225).
+    if let Some(message) = algo_avm::check::logicsig_static_check(&lsig.logic) {
+        return Err(message);
+    }
+
+    // go: `!Sig.Blank()` / `!Msig.Blank()` / `!LMsig.Blank()` /
+    // `!PQsig.Blank()` (a present-but-empty envelope is not a delegation
+    // signature; strict wire decode rejects an empty multisig, the serde/JSON
+    // path can produce one).
     let has_sig = lsig.sig != [0u8; 64];
-    // Go: `!Msig.Blank()` / `!LMsig.Blank()` (a present-but-empty envelope is
-    // not a delegation signature). Strict wire decode already rejects an
-    // empty multisig, but the serde/JSON path can produce one.
-    let has_msig = lsig.msig.as_ref().is_some_and(|m| !m.blank());
-    let has_lmsig = lsig.lmsig.as_ref().is_some_and(|m| !m.blank());
-    let num_sigs = has_sig as u8 + has_msig as u8 + has_lmsig as u8;
+    let msig = lsig.msig.as_ref().filter(|m| !m.blank());
+    let lmsig = lsig.lmsig.as_ref().filter(|m| !m.blank());
+    let pqsig = lsig.pqsig.as_ref().filter(|p| !p.blank());
+    let num_sigs =
+        has_sig as u8 + msig.is_some() as u8 + lmsig.is_some() as u8 + pqsig.is_some() as u8;
 
-    if num_sigs > 1 {
-        return Err(AlgoError::Validation {
-            message: "LogicSig should only have one of Sig, Msig, or LMsig but has more than one"
-                .into(),
-        });
-    }
-
-    let authorizer = match &stx.auth_addr {
-        Some(addr) => addr,
-        None => &stx.txn.sender,
-    };
+    let authorizer = stx.auth_addr.unwrap_or(stx.txn.sender);
+    let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + lsig.logic.len());
+    program_msg.extend_from_slice(PROGRAM_PREFIX);
+    program_msg.extend_from_slice(&lsig.logic);
 
     if num_sigs == 0 {
-        let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + lsig.logic.len());
-        program_msg.extend_from_slice(PROGRAM_PREFIX);
-        program_msg.extend_from_slice(&lsig.logic);
-        let hash = Sha512_256::digest(&program_msg);
-        let mut expected = [0u8; 32];
-        expected.copy_from_slice(&hash);
-        if *authorizer != Address(expected) {
-            return Err(AlgoError::Validation {
-                message: "logicsig contract account: sender does not match program hash".into(),
-            });
+        // A (potentially) valid operation on a contract-only account.
+        if authorizer.0[..] == Sha512_256::digest(&program_msg)[..] {
+            return Ok(());
         }
-    } else if has_sig {
-        let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + lsig.logic.len());
-        program_msg.extend_from_slice(PROGRAM_PREFIX);
-        program_msg.extend_from_slice(&lsig.logic);
-        if !ed25519_bv_compatible_verify(&authorizer.0, &program_msg, &lsig.sig) {
-            return Err(AlgoError::Validation {
-                message: algo_error::BATCH_HAS_FAILED_SIGS.into(),
-            });
-        }
-    } else if let Some(msig) = lsig.msig.as_ref().filter(|m| !m.blank()) {
-        let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + lsig.logic.len());
-        program_msg.extend_from_slice(PROGRAM_PREFIX);
-        program_msg.extend_from_slice(&lsig.logic);
-        verify_logicsig_multisig(stx, msig, &program_msg)?;
-    } else if let Some(lmsig) = lsig.lmsig.as_ref().filter(|m| !m.blank()) {
-        let mut lmsig_msg = Vec::with_capacity(MSIG_PROGRAM_PREFIX.len() + 32 + lsig.logic.len());
-        lmsig_msg.extend_from_slice(MSIG_PROGRAM_PREFIX);
-        lmsig_msg.extend_from_slice(&authorizer.0);
-        lmsig_msg.extend_from_slice(&lsig.logic);
-        verify_logicsig_multisig(stx, lmsig, &lmsig_msg)?;
+        return Err("LogicNot signed and not a Logic-only account".into());
+    }
+    if num_sigs > 1 {
+        return Err("LogicSig should have only one type of delegation signature".into());
+    }
+    if let Some(pqsig) = pqsig {
+        // PQ schemes have no batch verification: verified in place.
+        return verify_pq_delegated_logicsig(lsig, pqsig, &authorizer, consensus)
+            .map_err(validation_text);
     }
 
+    if has_sig {
+        if !ed25519_bv_compatible_verify(&authorizer.0, &program_msg, &lsig.sig) {
+            return Err(algo_error::BATCH_HAS_FAILED_SIGS.into());
+        }
+        return Ok(());
+    }
+
+    let (msg, msig) = if let Some(lmsig) = lmsig {
+        if !consensus.logic_sig_lmsig {
+            return Err("LogicSig LMsig field not supported in this consensus version".into());
+        }
+        // `MultisigProgram{Addr: authorizer, Program: logic}`.
+        let mut msg = Vec::with_capacity(MSIG_PROGRAM_PREFIX.len() + 32 + lsig.logic.len());
+        msg.extend_from_slice(MSIG_PROGRAM_PREFIX);
+        msg.extend_from_slice(&authorizer.0);
+        msg.extend_from_slice(&lsig.logic);
+        (msg, lmsig)
+    } else {
+        let msig = msig.expect("one delegation signature, none of sig / lmsig / pqsig");
+        if !consensus.logic_sig_msig {
+            return Err("LogicSig Msig field not supported in this consensus version".into());
+        }
+        (program_msg, msig)
+    };
+    logic_multisig_prep(&authorizer, msig)
+        .map_err(|e| format!("logic multisig validation failed: {e}"))?;
+    let all_verify = msig
+        .subsigs
+        .iter()
+        .filter(|s| s.signature != [0u8; 64])
+        .all(|s| ed25519_bv_compatible_verify(&s.public_key, &msg, &s.signature));
+    if !all_verify {
+        return Err(algo_error::BATCH_HAS_FAILED_SIGS.into());
+    }
     Ok(())
 }
 
@@ -726,148 +810,13 @@ pub fn verify_logicsig_with_tracer(
     tracer: Option<&mut dyn EvalTracer>,
     sig_ledger: Option<&dyn SigBlockSource>,
 ) -> Result<(), AlgoError> {
-    // ── Structural sanity checks (Go: logicSigSanityCheckBatchPrep) ──
-    // Empty program is always invalid.
-    if lsig.logic.is_empty() {
-        return Err(AlgoError::Validation {
-            message: "LogicSig.Logic empty".into(),
-        });
-    }
-
-    // Size check: len(logic) + sum(len(args[i])) must not exceed LogicSigMaxSize.
-    // When EnableLogicSigSizePooling is true (v40+), the per-txn check is
-    // skipped and the total is checked at group level instead (see
-    // `verify_group_logicsig_size`).
-    let mut lsig_len: u64 = lsig.logic.len() as u64;
-    for arg in lsig.arg_bytes() {
-        lsig_len += arg.len() as u64;
-    }
-    if !consensus.enable_logicsig_size_pooling && lsig_len > consensus.logic_sig_max_size {
-        return Err(AlgoError::Validation {
-            message: format!(
-                "LogicSig too long: {} bytes exceeds maximum {}",
-                lsig_len, consensus.logic_sig_max_size
-            ),
-        });
-    }
-
-    // Absolute per-LogicSig program cap (Go: `logicSigSanityCheckBatchPrep`,
-    // `data/transactions/verify/txn.go`, v5.0.0-stable): independent of group
-    // pooling, a single LogicSig program longer than
-    // `MaxAbsoluteLogicSigProgramSize` is never well-formed, no matter how
-    // much of the group's pooled allowance is unused. Zero means LogicSigs
-    // are not yet supported by this protocol version (pre-v18), in which case
-    // this check is a no-op and the version gate elsewhere is authoritative.
-    if consensus.max_absolute_logic_sig_program_size > 0
-        && lsig.logic.len() as u64 > consensus.max_absolute_logic_sig_program_size
-    {
-        return Err(AlgoError::Validation {
-            message: format!(
-                "LogicSig.Logic too long. max size is {} bytes",
-                consensus.max_absolute_logic_sig_program_size
-            ),
-        });
-    }
-
-    // Count how many of sig/msig/lmsig/pqsig are set — must be 0 or 1
-    // (matches Go's `logicSigSanityCheckBatchPrep`, which added `PQsig` to
-    // this same mutual-exclusivity count in commit `ef838f4e9`).
-    let has_sig = lsig.sig != [0u8; 64];
-    let has_msig = lsig.msig.as_ref().is_some_and(|m| !m.blank());
-    let has_lmsig = lsig.lmsig.as_ref().is_some_and(|m| !m.blank());
-    let has_pqsig = lsig.pqsig.as_ref().is_some_and(|p| !p.blank());
-    let num_sigs = has_sig as u8 + has_msig as u8 + has_lmsig as u8 + has_pqsig as u8;
-
-    if num_sigs > 1 {
-        return Err(AlgoError::Validation {
-            message: "LogicSig should have only one type of delegation signature".into(),
-        });
-    }
-
-    // The authorizer is auth_addr if set, otherwise sender.
-    let authorizer = match &stx.auth_addr {
-        Some(addr) => addr,
-        None => &stx.txn.sender,
-    };
-
-    // PQ-delegated LogicSig: verified in-place (never batched — Falcon is
-    // not ed25519-batchable), and short-circuits before the ed25519
-    // sig/msig/lmsig/contract-account dispatch below, matching go's
-    // `logicSigSanityCheckBatchPrep`'s early-return PQ branch.
-    if has_pqsig {
-        let pqsig = lsig.pqsig.as_ref().expect("has_pqsig implies Some");
-        verify_pq_delegated_logicsig(lsig, pqsig, authorizer, consensus)?;
-    } else if num_sigs == 0 {
-        // Mode 4: Contract account — authorizer should be SHA512/256("Program" || logic)
-        let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + lsig.logic.len());
-        program_msg.extend_from_slice(PROGRAM_PREFIX);
-        program_msg.extend_from_slice(&lsig.logic);
-        let hash = Sha512_256::digest(&program_msg);
-        let mut expected = [0u8; 32];
-        expected.copy_from_slice(&hash);
-        let expected_addr = Address(expected);
-
-        if *authorizer != expected_addr {
-            return Err(AlgoError::Validation {
-                message: "logicsig contract account: sender does not match program hash".into(),
-            });
-        }
-    } else if has_sig {
-        // Mode 1: Delegated single-sig — verify signature on "Program" || logic
-        let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + lsig.logic.len());
-        program_msg.extend_from_slice(PROGRAM_PREFIX);
-        program_msg.extend_from_slice(&lsig.logic);
-
-        let sig_bytes: [u8; 64] = lsig.sig[..].try_into().map_err(|_| AlgoError::Validation {
-            message: format!(
-                "invalid logicsig signature length: expected 64 bytes, got {}",
-                lsig.sig.len()
-            ),
-        })?;
-
-        if !ed25519_bv_compatible_verify(&authorizer.0, &program_msg, &sig_bytes) {
-            return Err(AlgoError::Validation {
-                message: algo_error::BATCH_HAS_FAILED_SIGS.into(),
-            });
-        }
-    } else if let Some(msig) = lsig.msig.as_ref().filter(|m| !m.blank()) {
-        // Mode 2: Delegated multisig — verify multisig on "Program" || logic.
-        // Gated on `LogicSigMsig` (Go: `data/transactions/verify/txn.go`'s
-        // `logicSigSanityCheckBatchPrep`, v18+, retired at v41 in favor of
-        // `LogicSigLMsig` -- see issue #752).
-        if !consensus.logic_sig_msig {
-            return Err(AlgoError::Validation {
-                message: "LogicSig Msig field not supported in this consensus version".into(),
-            });
-        }
-        let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + lsig.logic.len());
-        program_msg.extend_from_slice(PROGRAM_PREFIX);
-        program_msg.extend_from_slice(&lsig.logic);
-        verify_logicsig_multisig(stx, msig, &program_msg)?;
-    } else if let Some(lmsig) = lsig.lmsig.as_ref().filter(|m| !m.blank()) {
-        // Mode 3: Delegated logic-multisig (lmsig). Gated on `LogicSigLMsig`
-        // (Go: same function, v41+ -- see issue #752).
-        if !consensus.logic_sig_lmsig {
-            return Err(AlgoError::Validation {
-                message: "LogicSig LMsig field not supported in this consensus version".into(),
-            });
-        }
-        // Signed data: "MsigProgram" || authorizer_addr || program
-        // This matches Go's MultisigProgram{Addr: Digest(authorizer), Program: logic}.ToBeHashed()
-        let mut lmsig_msg = Vec::with_capacity(MSIG_PROGRAM_PREFIX.len() + 32 + lsig.logic.len());
-        lmsig_msg.extend_from_slice(MSIG_PROGRAM_PREFIX);
-        lmsig_msg.extend_from_slice(&authorizer.0);
-        lmsig_msg.extend_from_slice(&lsig.logic);
-        verify_logicsig_multisig(stx, lmsig, &lmsig_msg)?;
-    }
-
-    // go's `logic.CheckSignature` (`verify.logicSigSanityCheck`): the static
-    // pass over the program that precedes evaluation, so a malformed program is
-    // rejected with `pc=%3d <err>` and never reaches the runtime texts
-    // (issue #2225).
-    if let Some(message) = algo_avm::check::logicsig_static_check(&lsig.logic) {
-        return Err(AlgoError::Validation { message });
-    }
+    // go's `logicSigVerify`: `LogicSigSanityCheck` (the structure, the
+    // static check and the delegation signature), then the evaluation.
+    // go v5.0.5 has no per-LogicSig `LogicSigMaxSize` check (it was retired
+    // with `EnableLogicSigSizePooling`, go-algorand #6637): the LogicSig
+    // sizes are a group check, `logic_sig_group_size_check` (issue #2405).
+    logicsig_sanity_check(stx, lsig, consensus)
+        .map_err(|message| AlgoError::Validation { message })?;
 
     // ── TEAL program execution ──
     // Build LogicSig arguments from the lsig.args field.
@@ -1678,7 +1627,8 @@ mod tests {
             lsig: Some(lsig.clone()),
             ..Default::default()
         };
-        assert!(logicsig_sanity_check(&stx, &lsig).is_ok());
+        let current = current_consensus();
+        assert_eq!(logicsig_sanity_check(&stx, &lsig, &current), Ok(()));
 
         // authorizer != program hash, no delegated sig → rejected.
         let bad = SignedTransaction {
@@ -1686,7 +1636,17 @@ mod tests {
             lsig: Some(lsig.clone()),
             ..Default::default()
         };
-        assert!(logicsig_sanity_check(&bad, &lsig).is_err());
+        assert_eq!(
+            logicsig_sanity_check(&bad, &lsig, &current).unwrap_err(),
+            "LogicNot signed and not a Logic-only account"
+        );
+    }
+
+    fn current_consensus() -> ConsensusParams {
+        algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_CURRENT_VERSION,
+        )
+        .expect("the current protocol is built in")
     }
 
     /// Port of go-algorand's `TestLogicErrorDetails`
@@ -1796,7 +1756,8 @@ mod tests {
             lsig: Some(lsig.clone()),
             ..Default::default()
         };
-        assert!(logicsig_sanity_check(&stx, &lsig).is_ok());
+        let current = current_consensus();
+        assert_eq!(logicsig_sanity_check(&stx, &lsig, &current), Ok(()));
 
         // A garbage delegated sig must be rejected (the Codex round-3 fix:
         // `clerk sign -L bad.lsig` must not write an unverified delegation).
@@ -1810,7 +1771,133 @@ mod tests {
             lsig: Some(bad_lsig.clone()),
             ..Default::default()
         };
-        assert!(logicsig_sanity_check(&bad, &bad_lsig).is_err());
+        assert_eq!(
+            logicsig_sanity_check(&bad, &bad_lsig, &current).unwrap_err(),
+            algo_error::BATCH_HAS_FAILED_SIGS
+        );
+    }
+
+    /// go's `LogicSigSanityCheck` texts, in go's order, on the path a node
+    /// verifies a LogicSig with (`verify_logicsig`, go's `logicSigVerify`) and
+    /// in `logicsig_sanity_check` itself (issue #2405; the texts are those of
+    /// go v5.0.5 `goal clerk sign -L` in
+    /// `goal-rust/tests/fixtures/clerk_sign_lsig.jsonl`).
+    #[test]
+    fn logicsig_sanity_check_is_gos_text_and_order() {
+        let key = test_signing_key();
+        let signer = Address(key.verifying_key().to_bytes());
+        let program = int1_program();
+        let current = current_consensus();
+        let lsig_of = |logic: Vec<u8>| LogicSig {
+            logic: ByteBuf::from(logic),
+            ..LogicSig::default()
+        };
+        let check = |sender: Address, lsig: &LogicSig, params: &ConsensusParams| {
+            let stx = SignedTransaction {
+                txn: minimal_pay_txn(sender),
+                lsig: Some(lsig.clone()),
+                ..Default::default()
+            };
+            let sanity = logicsig_sanity_check(&stx, lsig, params).err();
+            let group = [stx.clone()];
+            let mut budget = GroupBudget::for_logicsig(1);
+            let verify = verify_logicsig(&stx, lsig, &group, 0, &mut budget, params).err();
+            assert_eq!(
+                sanity.as_ref().map(|m| format!("validation error: {m}")),
+                verify.as_ref().map(|e| e.to_string()),
+                "the node reports the sanity check's text"
+            );
+            sanity.unwrap_or_default()
+        };
+        let one_key_msig = |sign: bool| MultisigSig {
+            version: 1,
+            threshold: 1,
+            subsigs: vec![MultisigSubsig {
+                public_key: signer.0,
+                signature: if sign {
+                    sign_program(&key, &program)
+                } else {
+                    [0u8; 64]
+                },
+            }],
+        };
+
+        let mut disabled = current.clone();
+        disabled.logic_sig_version = 0;
+        assert_eq!(
+            check(signer, &lsig_of(vec![]), &disabled),
+            "LogicSig not enabled"
+        );
+        let mut short = current.clone();
+        short.max_absolute_logic_sig_program_size = 4;
+        assert_eq!(
+            check(signer, &lsig_of(program.clone()), &short),
+            "LogicSig.Logic too long. max size is 4 bytes"
+        );
+        assert_eq!(
+            check(signer, &lsig_of(vec![0x80]), &current),
+            "LogicSig.Logic bad version"
+        );
+        assert_eq!(
+            check(signer, &lsig_of(vec![99, 0x81, 1]), &current),
+            "LogicSig.Logic version too new"
+        );
+        // The static check runs before the delegation signature is looked at.
+        let mut itxnas = lsig_of(vec![8, 0xc5, 0]);
+        itxnas.sig = [0x11; 64];
+        itxnas.msig = Some(one_key_msig(true));
+        assert_eq!(
+            check(signer, &itxnas, &current),
+            "pc=  1 itxnas not allowed in current mode"
+        );
+        assert_eq!(
+            check(signer, &lsig_of(program.clone()), &current),
+            "LogicNot signed and not a Logic-only account"
+        );
+        let mut two = lsig_of(program.clone());
+        two.sig = sign_program(&key, &program);
+        two.lmsig = Some(one_key_msig(true));
+        assert_eq!(
+            check(signer, &two, &current),
+            "LogicSig should have only one type of delegation signature"
+        );
+        // A legacy `msig` is gated off at the current protocol before its
+        // address is looked at.
+        let mut legacy = lsig_of(program.clone());
+        legacy.msig = Some(one_key_msig(true));
+        assert_eq!(
+            check(Address([7; 32]), &legacy, &current),
+            "LogicSig Msig field not supported in this consensus version"
+        );
+        let mut lmsig = lsig_of(program.clone());
+        lmsig.lmsig = Some(one_key_msig(true));
+        assert_eq!(
+            check(Address([7; 32]), &lmsig, &current),
+            "logic multisig validation failed: Invalid address"
+        );
+        let mut unsigned = lsig_of(program.clone());
+        unsigned.lmsig = Some(one_key_msig(false));
+        let msig_addr = compute_multisig_address(&one_key_msig(false));
+        assert_eq!(
+            check(msig_addr, &unsigned, &current),
+            "logic multisig validation failed: Invalid number of signatures"
+        );
+        // `Program || logic` is not what an lmsig signs.
+        assert_eq!(
+            check(msig_addr, &lmsig, &current),
+            algo_error::BATCH_HAS_FAILED_SIGS
+        );
+        let mut pq = lsig_of(program.clone());
+        pq.pqsig = Some(PQSig {
+            scheme: *b"fn",
+            salt: PQAddressSalt(3),
+            public_key: ByteBuf::from((0..20).collect::<Vec<u8>>()),
+            signature: ByteBuf::from((0..30).collect::<Vec<u8>>()),
+        });
+        assert_eq!(
+            check(signer, &pq, &current),
+            "pq delegated logic signature validation failed: pq signature scheme not supported"
+        );
     }
 
     #[test]
@@ -2469,7 +2556,10 @@ mod tests {
         };
 
         let err = verify_lsig(&stx, stx.lsig.as_ref().unwrap()).unwrap_err();
-        assert!(err.to_string().contains("does not match program hash"));
+        assert_eq!(
+            err.to_string(),
+            "validation error: LogicNot signed and not a Logic-only account"
+        );
     }
 
     #[test]
@@ -4292,7 +4382,9 @@ mod tests {
         let sig = algo_falcon::falcon_sign(&sk, &dp.to_be_signed()).expect("falcon sign");
 
         let mut tampered_program = original_program;
-        tampered_program.push(0x81); // append an extra opcode byte
+        // Append a valid v2 instruction (`intc_0`): go's static check of the
+        // program runs before the PQ signature is verified.
+        tampered_program.push(0x22);
 
         let pqsig = PQSig {
             scheme: PQ_SCHEME_FALCON1024,
