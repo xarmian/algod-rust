@@ -2669,6 +2669,9 @@ fn is_valid_api_token(token: &str) -> bool {
 }
 
 fn build_algod_endpoint(data_dir_path: &Path) -> Option<(String, String)> {
+    // go builds a client here, whose `getGoalClient` creates the cache dir
+    // first (issue #2449).
+    crate::goal_client::prepare_or_exit(data_dir_path);
     let net = std::fs::read_to_string(data_dir_path.join("algod.net")).ok()?;
     let net = net.trim();
     if net.is_empty() {
@@ -2703,6 +2706,9 @@ pub(crate) fn build_kmd_client(
     data_dir_path: &Path,
     kmd_dir_flag: Option<&Path>,
 ) -> Result<KmdClient, String> {
+    // go builds a client here, whose `getGoalClient` creates the cache dir
+    // first (issue #2449).
+    crate::goal_client::prepare_or_exit(data_dir_path);
     let kmd_dir =
         data_dir::resolve_kmd_data_dir(kmd_dir_flag, data_dir_path).map_err(|e| e.to_string())?;
     let net = std::fs::read_to_string(kmd_dir.join("kmd.net"))

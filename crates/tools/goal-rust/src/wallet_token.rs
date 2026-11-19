@@ -67,7 +67,7 @@ pub(crate) fn ensure_cache_dir(data_dir: &Path) -> Result<PathBuf, String> {
         let cache_dir = data_dir.join(DEFAULT_CACHE_DIR);
         if let Err(e) = create_dir_0700(&cache_dir, false) {
             if e.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(format!("could not make cachedir: {e}"));
+                return Err(mkdir_error(&cache_dir, &e));
             }
         }
         return Ok(cache_dir);
@@ -77,8 +77,18 @@ pub(crate) fn ensure_cache_dir(data_dir: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| "config error $HOME is not defined".to_string())?;
     let escaped = data_dir.to_string_lossy().replace('/', "_");
     let cache_dir = root.join(escaped);
-    create_dir_0700(&cache_dir, true).map_err(|e| format!("could not make cachedir: {e}"))?;
+    create_dir_0700(&cache_dir, true).map_err(|e| mkdir_error(&cache_dir, &e))?;
     Ok(cache_dir)
+}
+
+/// go: `reportErrorf("could not make cachedir: %s", err)` of an
+/// `os.Mkdir` / `os.MkdirAll` `*PathError` (`mkdir <path>: <errno text>`).
+fn mkdir_error(path: &Path, e: &std::io::Error) -> String {
+    format!(
+        "could not make cachedir: mkdir {}: {}",
+        path.display(),
+        data_dir::go_os_error(e)
+    )
 }
 
 fn create_dir_0700(path: &Path, all: bool) -> std::io::Result<()> {

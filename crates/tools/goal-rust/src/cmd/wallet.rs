@@ -143,6 +143,9 @@ fn ensure_kmd_client_single(
             return Err(());
         }
     };
+    // go builds a client here, whose `getGoalClient` creates the cache dir
+    // first (issue #2449).
+    crate::goal_client::prepare_or_exit(&data_dir);
     let kmd_dir = match data_dir::resolve_kmd_data_dir(kmd_dir_flag, &data_dir) {
         Ok(d) => d,
         Err(e) => {
@@ -473,6 +476,9 @@ fn ensure_kmd_client_for_dir(
     kmd_dir_flag: Option<&Path>,
     client_error_tpl: &str,
 ) -> Result<KmdClient, ()> {
+    // go builds a client here, whose `getGoalClient` creates the cache dir
+    // first (issue #2449).
+    crate::goal_client::prepare_or_exit(data_dir_path);
     let kmd_dir = match data_dir::resolve_kmd_data_dir(kmd_dir_flag, data_dir_path) {
         Ok(d) => d,
         Err(e) => {

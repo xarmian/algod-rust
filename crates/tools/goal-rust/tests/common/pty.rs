@@ -70,7 +70,19 @@ fn open_pty() -> (OwnedFd, OwnedFd) {
 
 /// `bin -d <dd> <args>` in `dd`, `ALGORAND_DATA` unset.
 pub fn run(bin: &Path, dd: &Path, args: &[&str], stdin: Stdin<'_>) -> Ran {
+    run_env(bin, dd, args, stdin, &[])
+}
+
+/// [`run`] with `envs` set in the child's environment.
+pub fn run_env(
+    bin: &Path,
+    dd: &Path,
+    args: &[&str],
+    stdin: Stdin<'_>,
+    envs: &[(&str, &str)],
+) -> Ran {
     let mut cmd = Command::new(bin);
+    cmd.envs(envs.iter().copied());
     cmd.arg("-d")
         .arg(dd)
         .args(args)
