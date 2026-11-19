@@ -194,7 +194,7 @@ fn run_send_inner(
     }
 
     let data_dir_path = data_dir::ensure_single_data_dir(&cli_d).map_err(|e| e.to_string())?;
-    let accounts = AccountsList::load(&data_dir_path);
+    let accounts = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
 
     // Resolve the program/LogicSig source (clerk.go:370-396). Exactly one of
     // `-P/--from-program-bytes` (raw bytes), `-F/--from-program` (TEAL source),
@@ -375,7 +375,7 @@ fn run_send_inner(
         // account either fails (sender key not in the wallet) or emits a
         // signature by the *old* sender that won't verify against the AuthAddr.
         let kmd = pipeline.kmd().ok_or("no kmd client configured")?;
-        let mut accounts = AccountsList::load(&data_dir_path);
+        let mut accounts = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
         let (handle, _wallet_name, password) = resolve_wallet_and_init(
             &rt,
             kmd,
@@ -784,7 +784,7 @@ fn run_sign_inner(
             .enable_all()
             .build()
             .map_err(|e| format!("Error processing command: {e}"))?;
-        let mut accounts = AccountsList::load(&data_dir_path);
+        let mut accounts = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
         let (handle, _wallet_name, password) = resolve_wallet_and_init(
             &rt,
             &kmd,
@@ -1402,7 +1402,7 @@ fn sign_program_to_lsig(
     kmd_dir_flag: Option<&Path>,
 ) -> Result<Vec<u8>, String> {
     let data_dir_path = data_dir::ensure_single_data_dir(cli_d).map_err(|e| e.to_string())?;
-    let mut accounts = AccountsList::load(&data_dir_path);
+    let mut accounts = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
     let kmd = build_kmd_client(&data_dir_path, kmd_dir_flag)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1793,7 +1793,7 @@ fn run_multisig_sign_inner(
         .enable_all()
         .build()
         .map_err(|e| format!("Error processing command: {e}"))?;
-    let mut accounts = AccountsList::load(&data_dir_path);
+    let mut accounts = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
     let (handle, _wallet_name, password) = resolve_wallet_and_init(
         &rt,
         &kmd,
@@ -1902,7 +1902,7 @@ fn run_multisig_signprogram_inner(
         .enable_all()
         .build()
         .map_err(|e| format!("Error processing command: {e}"))?;
-    let mut accounts = AccountsList::load(&data_dir_path);
+    let mut accounts = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
     let (handle, _wallet_name, password) = resolve_wallet_and_init(
         &rt,
         &kmd,
@@ -2894,16 +2894,30 @@ mod tests {
         }
     }
 
+    /// A data dir with only a `genesis.json`: go's `clerk send` builds the
+    /// accounts list (which needs the genesis ID, issue #2436) before it
+    /// parses the addresses.
+    fn data_dir_with_genesis() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("genesis.json"),
+            r#"{"id":"v1","network":"testnet","proto":"future","alloc":[]}"#,
+        )
+        .unwrap();
+        tmp
+    }
+
     /// Parity with go-algorand's `TestClientRejectsBadFromAddressWhenSending`
     /// (`test/e2e-go/restAPI/restClient_test.go:141`): a malformed sender
     /// address must be rejected before any network/kmd contact is attempted
     /// -- `run_send_inner` parses `-f/--from` (clerk.go:388-403,
     /// `basics.UnmarshalChecksumAddress`) well before it builds an algod or
-    /// kmd client, so passing a bogus address with an otherwise-empty data
-    /// dir (no algod/kmd running) still exercises the real rejection path.
+    /// kmd client, so passing a bogus address with a data dir holding only
+    /// `genesis.json` (no algod/kmd running) still exercises the real
+    /// rejection path.
     #[test]
     fn run_send_rejects_bad_from_address() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = data_dir_with_genesis();
         let args = bare_send_args(
             Some("This is absolutely not a valid account address."),
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ",
@@ -2918,7 +2932,7 @@ mod tests {
     /// sender and before any network/kmd contact.
     #[test]
     fn run_send_rejects_bad_to_address() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = data_dir_with_genesis();
         let args = bare_send_args(
             Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ"),
             "This is absolutely not a valid account address.",
@@ -2960,7 +2974,7 @@ mod tests {
     /// `run_send_rejects_bad_from_address` already covers.
     #[test]
     fn run_send_rejects_mutated_from_address() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = data_dir_with_genesis();
         let valid = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ";
         // Sanity check: the unmutated literal really does parse (so the
         // rejection below is attributable to the mutation, not to the
@@ -2979,7 +2993,7 @@ mod tests {
     /// the receiver.
     #[test]
     fn run_send_rejects_mutated_to_address() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = data_dir_with_genesis();
         let valid = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ";
         assert!(Address::from_algorand_string(valid).is_ok());
         let mutated = mutate_at_index(valid, 0);

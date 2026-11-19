@@ -78,6 +78,13 @@ const ERROR_NO_WALLETS: &str =
 const ERROR_NO_DEFAULT_WALLET: &str =
     "More than one wallet exists; please specify which one to use with -w.";
 
+/// go's `makeAccountsList`: the data dir's accounts list, or go's
+/// `errorGenesisIDFail` on stderr when its genesis ID cannot be read
+/// (issue #2436); the caller exits 1.
+fn load_accounts(data_dir_path: &Path) -> Result<AccountsList, ()> {
+    AccountsList::load(data_dir_path).map_err(|e| eprintln!("{e}"))
+}
+
 // ---- account new ----------------------------------------------------------
 
 pub fn run_new(args: NewArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>) -> ExitCode {
@@ -88,6 +95,11 @@ pub fn run_new(args: NewArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>
             return ExitCode::from(1);
         }
     };
+    // go builds the accounts list first (account.go:332).
+    let mut accounts = match load_accounts(&data_dir_path) {
+        Ok(a) => a,
+        Err(()) => return ExitCode::from(1),
+    };
     let client = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
         Ok(c) => c,
         Err(()) => return ExitCode::from(1),
@@ -97,8 +109,6 @@ pub fn run_new(args: NewArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
     };
-
-    let mut accounts = AccountsList::load(&data_dir_path);
 
     // Pick the account name (positional or auto-generated).
     let account_name = match args.name {
@@ -171,6 +181,11 @@ pub fn run_list(args: ListArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBu
             return ExitCode::from(1);
         }
     };
+    // go builds the accounts list first (account.go:508).
+    let accounts = match load_accounts(&data_dir_path) {
+        Ok(a) => a,
+        Err(()) => return ExitCode::from(1),
+    };
     let client = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
         Ok(c) => c,
         Err(()) => return ExitCode::from(1),
@@ -179,7 +194,6 @@ pub fn run_list(args: ListArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBu
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
     };
-    let accounts = AccountsList::load(&data_dir_path);
 
     // Enumerate wallets (filtered by -w if given).
     let listed = match rt.block_on(client.list_wallets()) {
@@ -464,6 +478,11 @@ pub fn run_delete(
             return ExitCode::from(1);
         }
     };
+    // go builds the accounts list first (account.go:399).
+    let mut accounts = match load_accounts(&data_dir_path) {
+        Ok(a) => a,
+        Err(()) => return ExitCode::from(1),
+    };
     let client = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
         Ok(c) => c,
         Err(()) => return ExitCode::from(1),
@@ -474,7 +493,6 @@ pub fn run_delete(
         Err(()) => return ExitCode::from(1),
     };
 
-    let mut accounts = AccountsList::load(&data_dir_path);
     let (handle, _wallet_name, password) = match resolve_wallet_and_init(
         &rt,
         &client,
@@ -512,7 +530,10 @@ pub fn run_rename(args: RenameArgs, cli_d: Vec<PathBuf>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let mut accounts = AccountsList::load(&data_dir_path);
+    let mut accounts = match load_accounts(&data_dir_path) {
+        Ok(a) => a,
+        Err(()) => return ExitCode::from(1),
+    };
 
     // isValidName(newName) — Go checks the *new* name only.
     if algo_types::Address::from_algorand_string(&args.new_name).is_ok() {
@@ -815,6 +836,11 @@ pub fn run_import(
             return ExitCode::from(1);
         }
     };
+    // go builds the accounts list first (account.go:1389).
+    let mut accounts = match load_accounts(&data_dir_path) {
+        Ok(a) => a,
+        Err(()) => return ExitCode::from(1),
+    };
     let client = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
         Ok(c) => c,
         Err(()) => return ExitCode::from(1),
@@ -823,8 +849,6 @@ pub fn run_import(
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
     };
-
-    let mut accounts = AccountsList::load(&data_dir_path);
 
     // Account name selection (same isValidName / isTaken guards as
     // run_new — account.go:1289-1303).
@@ -937,7 +961,11 @@ pub fn run_export(
         Err(()) => return ExitCode::from(1),
     };
 
-    let mut accounts = AccountsList::load(&data_dir_path);
+    // go: `ensureWalletHandleMaybePassword` → `makeAccountsList`.
+    let mut accounts = match load_accounts(&data_dir_path) {
+        Ok(a) => a,
+        Err(()) => return ExitCode::from(1),
+    };
     let (handle, _wallet_name, password) = match resolve_wallet_and_init(
         &rt,
         &client,
@@ -1473,7 +1501,11 @@ pub fn run_changeonlinestatus(
     let go_online = !args.offline;
     let pipeline = algo_txn_pipeline::TxnPipeline::new(algod, Some(kmd));
 
-    let mut accounts = AccountsList::load(&data_dir_path);
+    // go: `ensureWalletHandleMaybePassword` → `makeAccountsList`.
+    let mut accounts = match load_accounts(&data_dir_path) {
+        Ok(a) => a,
+        Err(()) => return ExitCode::from(1),
+    };
     let (handle, _wallet_name, password) = match resolve_wallet_and_init(
         &rt,
         pipeline.kmd().expect("kmd configured above"),
@@ -1640,7 +1672,11 @@ pub fn run_marknonparticipating(
         args.address
     );
 
-    let mut accounts = AccountsList::load(&data_dir_path);
+    // go: `ensureWalletHandleMaybePassword` → `makeAccountsList`.
+    let mut accounts = match load_accounts(&data_dir_path) {
+        Ok(a) => a,
+        Err(()) => return ExitCode::from(1),
+    };
     let (handle, _wallet_name, password) = match resolve_wallet_and_init(
         &rt,
         pipeline.kmd().expect("kmd configured above"),
@@ -1754,7 +1790,11 @@ pub fn run_renewpartkey(
         Err(()) => return ExitCode::from(1),
     };
     let pipeline = algo_txn_pipeline::TxnPipeline::new(client, Some(kmd));
-    let mut accounts = AccountsList::load(&data_dir_path);
+    // go: `ensureWalletHandleMaybePassword` → `makeAccountsList`.
+    let mut accounts = match load_accounts(&data_dir_path) {
+        Ok(a) => a,
+        Err(()) => return ExitCode::from(1),
+    };
     let (handle, _wallet_name, password) = match resolve_wallet_and_init(
         &rt,
         pipeline.kmd().expect("kmd configured above"),
@@ -1971,6 +2011,11 @@ pub fn run_multisig_new(
             return ExitCode::from(1);
         }
     };
+    // go builds the accounts list first (account.go:420).
+    let mut accounts = match load_accounts(&data_dir_path) {
+        Ok(a) => a,
+        Err(()) => return ExitCode::from(1),
+    };
     if args.addresses.is_empty() {
         eprintln!("error: need at least one component address");
         return ExitCode::from(1);
@@ -2021,7 +2066,6 @@ pub fn run_multisig_new(
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
     };
-    let mut accounts = AccountsList::load(&data_dir_path);
     let (handle, _wallet_name, _pw) = match resolve_wallet_no_password(
         &rt,
         &client,
@@ -2073,6 +2117,11 @@ pub fn run_multisig_delete(
             return ExitCode::from(1);
         }
     };
+    // go builds the accounts list first (account.go:463).
+    let mut accounts = match load_accounts(&data_dir_path) {
+        Ok(a) => a,
+        Err(()) => return ExitCode::from(1),
+    };
     let client = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
         Ok(c) => c,
         Err(()) => return ExitCode::from(1),
@@ -2081,7 +2130,6 @@ pub fn run_multisig_delete(
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
     };
-    let mut accounts = AccountsList::load(&data_dir_path);
     let (handle, _wallet_name, password) = match resolve_wallet_and_init(
         &rt,
         &client,
@@ -2124,7 +2172,11 @@ pub fn run_multisig_info(
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
     };
-    let mut accounts = AccountsList::load(&data_dir_path);
+    // go: `ensureWalletHandleMaybePassword` → `makeAccountsList`.
+    let mut accounts = match load_accounts(&data_dir_path) {
+        Ok(a) => a,
+        Err(()) => return ExitCode::from(1),
+    };
     // Multisig info is structural metadata, but kmd still requires
     // a wallet handle which requires a password for encrypted
     // wallets. The earlier code forced empty password unconditionally,
@@ -2190,7 +2242,10 @@ pub fn run_importrootkey(
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
     };
-    let mut accounts = AccountsList::load(&data_dir_path);
+    // go builds no accounts list here: an unreadable genesis ID makes the
+    // command return silently just below, and `ensureWalletHandle` (which
+    // does build one) only runs once a key file is read.
+    let mut accounts = AccountsList::load_or_empty(&data_dir_path);
 
     // Go's `client.GenesisID()` returns the genesis id from algod's
     // GenesisJSON; we read it directly from disk via the data_dir

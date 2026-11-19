@@ -111,11 +111,19 @@ impl Drop for KmdGuard {
     }
 }
 
+/// A private data dir with a kmd dir and a `genesis.json`: go's
+/// `printWallets` builds the accounts list, which needs the genesis ID
+/// (issue #2436).
 fn setup_data_dir() -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let kmd = tmp.path().join("kmd-v0.5");
     std::fs::create_dir_all(&kmd).unwrap();
     write_kmd_config(&kmd);
+    std::fs::write(
+        tmp.path().join("genesis.json"),
+        r#"{"id":"v1","network":"testnet","proto":"future","alloc":[]}"#,
+    )
+    .unwrap();
     (tmp, kmd)
 }
 

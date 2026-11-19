@@ -169,6 +169,15 @@ pub fn run_new(args: NewArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>
             return ExitCode::from(1);
         }
     };
+    // go's `makeAccountsList` comes first (wallet.go:93-94), so a data dir
+    // whose genesis ID cannot be read stops here (issue #2436).
+    let mut accounts = match AccountsList::load(&data_dir_path) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
     let client = match ensure_kmd_client_for_dir(
         &data_dir_path,
         kmd_dir_flag.as_deref(),
@@ -251,7 +260,6 @@ pub fn run_new(args: NewArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>
     match rt.block_on(client.list_wallets()) {
         Ok(list) => {
             if list.wallets.len() == 1 {
-                let mut accounts = AccountsList::load(&data_dir_path);
                 if let Err(e) = accounts.set_default_wallet_id(&create_resp.wallet.id) {
                     // Persisting the default is non-fatal — Go's
                     // dumpList swallows write errors via log.Error +
@@ -430,7 +438,15 @@ pub fn run_list(cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>) -> ExitCode 
         };
         match rt.block_on(client.list_wallets()) {
             Ok(resp) => {
-                let accounts = AccountsList::load(d);
+                // go's `printWallets` starts with `makeAccountsList`
+                // (wallet.go:261-262), which exits on an unreadable genesis ID.
+                let accounts = match AccountsList::load(d) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::from(1);
+                    }
+                };
                 print_wallets(&resp.wallets, &accounts.default_wallet_id);
             }
             Err(e) => {
