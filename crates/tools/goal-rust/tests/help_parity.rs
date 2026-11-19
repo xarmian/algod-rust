@@ -202,8 +202,10 @@ fn group_without_leaf_falls_back_to_help_and_exits_zero() {
     // treats `goal app` (group, no leaf) as a help fallback — prints
     // group help on stdout and exits 0. Our scaffold previously
     // rejected with a clap parse error.
+    // Bare `account` is not here: go's `accountCmd` needs the data dir and
+    // its accounts list before the help (see
+    // `bare_account_needs_a_data_dir_like_go`).
     let cases: &[&[&str]] = &[
-        &["account"],
         &["app"],
         &["app", "box"],
         &["account", "multisig"],
@@ -242,6 +244,41 @@ fn group_without_leaf_falls_back_to_help_and_exits_zero() {
             "argv={argv:?} fallback help missing global --datadir flag; got {stdout:?}",
         );
     }
+}
+
+#[test]
+fn bare_account_needs_a_data_dir_like_go() {
+    // go's `accountCmd` Run calls `datadir.EnsureSingleDataDir()` and
+    // `makeAccountsList` before printing its help (issue #2448): without a
+    // data dir it exits 1 with go's message on stderr; with one whose genesis
+    // ID reads it prints the help and exits 0.
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("account")
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("run goal-rust account");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Data directory not specified.  Please use -d or set $ALGORAND_DATA in your environment. Exiting.\n"
+    );
+
+    let dd = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dd.path().join("genesis.json"),
+        r#"{"id":"v1","network":"testnet"}"#,
+    )
+    .unwrap();
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(dd.path())
+        .arg("account")
+        .output()
+        .expect("run goal-rust -d <dd> account");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Commands:"), "help expected: {stdout:?}");
 }
 
 #[test]

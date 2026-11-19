@@ -406,8 +406,8 @@ pub struct ImportArgs {
     pub password: Option<String>,
 
     /// 25-word mnemonic instead of reading from stdin. Mirrors Go's
-    /// `--mnemonic` flag.
-    #[arg(long = "mnemonic")]
+    /// `-m, --mnemonic` flag (`account.go` `importCmd`).
+    #[arg(short = 'm', long = "mnemonic")]
     pub mnemonic: Option<String>,
 
     /// Mark the imported account as default in accountList.json.

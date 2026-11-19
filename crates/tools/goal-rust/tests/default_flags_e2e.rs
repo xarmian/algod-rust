@@ -288,7 +288,15 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
         "account import -m",
         &masks,
         &go(
-            &["account", "import", "imported", "-m", ZERO_MNEMONIC, "-w", "w"],
+            &[
+                "account",
+                "import",
+                "imported",
+                "-m",
+                ZERO_MNEMONIC,
+                "-w",
+                "w",
+            ],
             Stdin::Pty {
                 prompt: PROMPT,
                 line: "pw",

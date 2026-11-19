@@ -29,7 +29,8 @@
 //! printed (exit code, stdout, stderr, the data dir masked) for the commands
 //! below, each run against a data dir without `genesis.json` and without a
 //! node: the ones that reach `makeAccountsList` before anything that needs a
-//! node, and one (`clerk compile` without `-s`) that never calls it. goal-rust must produce the same rows (a default test, no go needed);
+//! node (the `account -f`, `wallet -f` and `account import -m` rows since
+//! issue #2448), and one (`clerk compile` without `-s`) that never calls it. goal-rust must produce the same rows (a default test, no go needed);
 //! a `MIXED_CLUSTER=1` run re-checks the file against a real go `goal`
 //! (`GOAL_GO` names a prebuilt one), and `REGEN_GENESIS_ID_FIXTURE=1`
 //! rewrites it from go:

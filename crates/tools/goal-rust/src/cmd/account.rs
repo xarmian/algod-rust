@@ -85,6 +85,43 @@ fn load_accounts(data_dir_path: &Path) -> Result<AccountsList, ()> {
     AccountsList::load(data_dir_path).map_err(|e| eprintln!("{e}"))
 }
 
+/// Mirrors `messages.go:39` (`infoSetAccountToDefault`).
+const INFO_SET_ACCOUNT_TO_DEFAULT: &str = "Set account '{}' to be the default account";
+
+// ---- account (no subcommand) ----------------------------------------------
+
+/// Port of `accountCmd`'s `Run` (`account.go`): go builds the accounts
+/// list first (so a data dir without a readable genesis ID stops with
+/// `errorGenesisIDFail` even without `-f`), then `-f/--default <name>` marks
+/// that account the default one; without it (or with an empty name) the
+/// group's help is printed. kmd is not contacted.
+pub fn run_root(default_name: Option<String>, cli_d: Vec<PathBuf>) -> ExitCode {
+    let data_dir_path = match data_dir::ensure_single_data_dir(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut accounts = match load_accounts(&data_dir_path) {
+        Ok(a) => a,
+        Err(()) => return ExitCode::from(1),
+    };
+    let Some(name) = default_name.filter(|n| !n.is_empty()) else {
+        return crate::print_group_help(&["account"]);
+    };
+    if !accounts.is_taken(&name) {
+        eprintln!("{}", format_message(ERROR_NAME_DOESNT_EXIST, &[&name]));
+        return ExitCode::from(1);
+    }
+    if let Err(e) = accounts.set_default(&name) {
+        eprintln!("{e}");
+        return ExitCode::from(1);
+    }
+    println!("{}", format_message(INFO_SET_ACCOUNT_TO_DEFAULT, &[&name]));
+    ExitCode::SUCCESS
+}
+
 // ---- account new ----------------------------------------------------------
 
 pub fn run_new(args: NewArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>) -> ExitCode {
