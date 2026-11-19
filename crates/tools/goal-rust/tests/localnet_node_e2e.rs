@@ -989,7 +989,7 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
     //     unsigned spend FROM the msig address with `clerk sign -L`, and rawsend
     //     to confirm the node accepts the multisig-delegated logicsig
     //     (TASK-292, multisig.go:144 signProgramCmd). Exercises the msig-address-
-    //     derived kmd signing path.
+    //     derived kmd signing path and the `LMsig` delegation of v41+.
     let prog_teal = dd.join("msig-prog.teal");
     std::fs::write(&prog_teal, "#pragma version 2\nint 1\n").unwrap();
     let lsig_file = dd.join("msig-prog.lsig");
@@ -1011,9 +1011,11 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
                 &msig_addr,
                 "-o",
                 lsig_file.to_str().unwrap(),
-                // Use the legacy `Msig` delegation field (broadly enabled);
-                // exercises the msig-address-derived kmd signing path.
-                "--legacy-msig",
+                // No `--legacy-msig`: like go (multisig.go:209-213) the field
+                // follows the node's consensus params, `LMsig` on the dev
+                // genesis's v42. The legacy `Msig` field is retired at v41
+                // (`LogicSigMsig = false`), so go's `clerk sign -L` and the
+                // node reject it there (issue #2461).
                 "-w",
                 "w",
                 "--password",
@@ -1037,7 +1039,6 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
                 &bob,
                 "-o",
                 lsig_file.to_str().unwrap(),
-                "--legacy-msig",
                 "-w",
                 "w",
                 "--password",

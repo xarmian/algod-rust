@@ -37,6 +37,11 @@
 //!   --test clerk_sign_lsig_e2e sign_lsig_fixture_matches_go_goal
 //! ```
 //!
+//! `fixtures/clerk_sign_delegated_msig.jsonl` (issue #2461) holds go's
+//! verdict for a correctly signed delegated multisig LogicSig, in its `msig`
+//! and its `lmsig` form, under `-P` v40, v42 (the localnet's protocol) and
+//! v43; the same two variables check and regenerate it.
+//!
 //! CI runs the check in `.github/workflows/teal-corpus-drivers.yml`.
 
 use std::path::{Path, PathBuf};
@@ -315,6 +320,206 @@ fn send_lsig_decode_failures_match_go_goal() {
         "go's `clerk send -L` differs from its `clerk sign -L` on {} of {checked} records:\n{}",
         mismatches.len(),
         mismatches.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Delegated multisig LogicSigs (issue #2461)
+// ---------------------------------------------------------------------------
+
+/// go's verdict for `clerk sign -L` of a correctly signed 2-of-3 delegated
+/// multisig LogicSig, in its legacy `msig` form and its `lmsig` form, under
+/// `-P` v40 (`LogicSigMsig`), v42 (the localnet-rust dev genesis's protocol,
+/// `LogicSigLMsig` only) and v43 (current). Rows: `<form> <proto label>`.
+const DELEGATED_FIXTURE: &str = "tests/fixtures/clerk_sign_delegated_msig.jsonl";
+
+const DELEGATED_PROTOS: [(&str, &str); 3] = [
+    (
+        "v40",
+        "https://github.com/algorandfoundation/specs/tree/236dcc18c9c507d794813ab768e467ea42d1b4d9",
+    ),
+    (
+        "v42",
+        "https://github.com/algorandfoundation/specs/tree/268b63433a907455d439995bf916f6b296018f4f",
+    ),
+    (
+        "v43",
+        "https://github.com/algorandfoundation/specs/tree/73c43b4a9699390884c51e2a9598d49e28373d10",
+    ),
+];
+
+/// The delegated program, `#pragma version 8; pushint 1`.
+const DELEGATED_PROGRAM: [u8; 3] = [8, 0x81, 1];
+
+fn delegated_keys() -> Vec<ed25519_dalek::SigningKey> {
+    (1u8..=3)
+        .map(|i| ed25519_dalek::SigningKey::from_bytes(&[i; 32]))
+        .collect()
+}
+
+/// go's `crypto.MultisigAddrGen(1, 2, pks)`.
+fn delegated_msig_addr(keys: &[ed25519_dalek::SigningKey]) -> [u8; 32] {
+    let mut h = Sha512_256::new();
+    h.update(b"MultisigAddr");
+    h.update([1u8, 2u8]);
+    for k in keys {
+        h.update(k.verifying_key().to_bytes());
+    }
+    h.finalize().into()
+}
+
+/// msgpack of `{"l": program, <field>: {subsig, thr: 2, v: 1}}` signed by the
+/// first two keys: `msig` over `"Program" || program`, `lmsig` over
+/// `"MsigProgram" || msig address || program` (go's `MultisigProgram`).
+fn delegated_lsig(field: &str) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+    use rmp::encode::{write_array_len, write_bin, write_map_len, write_str, write_uint};
+    let keys = delegated_keys();
+    let addr = delegated_msig_addr(&keys);
+    let mut msg = Vec::new();
+    if field == "lmsig" {
+        msg.extend_from_slice(b"MsigProgram");
+        msg.extend_from_slice(&addr);
+    } else {
+        msg.extend_from_slice(b"Program");
+    }
+    msg.extend_from_slice(&DELEGATED_PROGRAM);
+
+    let mut b = Vec::new();
+    write_map_len(&mut b, 2).unwrap();
+    write_str(&mut b, "l").unwrap();
+    write_bin(&mut b, &DELEGATED_PROGRAM).unwrap();
+    write_str(&mut b, field).unwrap();
+    write_map_len(&mut b, 3).unwrap();
+    write_str(&mut b, "subsig").unwrap();
+    write_array_len(&mut b, 3).unwrap();
+    for (i, k) in keys.iter().enumerate() {
+        write_map_len(&mut b, if i < 2 { 2 } else { 1 }).unwrap();
+        write_str(&mut b, "pk").unwrap();
+        write_bin(&mut b, &k.verifying_key().to_bytes()).unwrap();
+        if i < 2 {
+            write_str(&mut b, "s").unwrap();
+            write_bin(&mut b, &k.sign(&msg).to_bytes()).unwrap();
+        }
+    }
+    write_str(&mut b, "thr").unwrap();
+    write_uint(&mut b, 2).unwrap();
+    write_str(&mut b, "v").unwrap();
+    write_uint(&mut b, 1).unwrap();
+    b
+}
+
+/// `goal clerk sign -L l.lsig -i t.txn -o o.stxn -P <proto>` for a payment
+/// from the multisig account the LogicSig is delegated by.
+fn run_sign_delegated(bin: &Path, lsig: &[u8], proto: &str) -> RunResult {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("l.lsig"), lsig).unwrap();
+    let sender = delegated_msig_addr(&delegated_keys());
+    std::fs::write(tmp.path().join("t.txn"), payment_from(sender)).unwrap();
+    let out = Command::new(bin)
+        .args([
+            "clerk", "sign", "-L", "l.lsig", "-i", "t.txn", "-o", "o.stxn", "-P", proto,
+        ])
+        .current_dir(tmp.path())
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("run goal");
+    (
+        out.status.code(),
+        out.stdout,
+        out.stderr,
+        std::fs::read(tmp.path().join("o.stxn")).ok(),
+    )
+}
+
+fn delegated_rows(bin: &Path) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    for field in ["msig", "lmsig"] {
+        let lsig = delegated_lsig(field);
+        for (label, proto) in DELEGATED_PROTOS {
+            let name = format!("{field} {label}");
+            rows.push(row(&name, &lsig, &run_sign_delegated(bin, &lsig, proto)));
+        }
+    }
+    rows
+}
+
+fn read_delegated_fixture() -> Vec<serde_json::Value> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(DELEGATED_FIXTURE);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("fixture row is JSON"))
+        .collect()
+}
+
+/// goal-rust gives go's verdict on every delegated multisig row: the legacy
+/// `msig` form is signed under v40 and rejected with go's
+/// `LogicSig Msig field not supported in this consensus version` under v42
+/// (the localnet's protocol) and v43, the `lmsig` form the other way round,
+/// and each accepted file is go's byte for byte.
+#[test]
+fn sign_delegated_msig_lsig_matches_go() {
+    let want = read_delegated_fixture();
+    let got = delegated_rows(Path::new(GOAL_RUST_BIN));
+    assert_eq!(
+        want.len(),
+        got.len(),
+        "{DELEGATED_FIXTURE} is out of date: regenerate it (see the module comment)"
+    );
+    let mismatches: Vec<String> = want
+        .iter()
+        .zip(&got)
+        .filter(|(w, g)| w != g)
+        .map(|(w, g)| format!("{}:\n  go:   {w}\n  rust: {g}", w["name"]))
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "{} of {} delegated multisig records differ from go:\n{}",
+        mismatches.len(),
+        want.len(),
+        mismatches.join("\n")
+    );
+    // The verdicts the localnet e2e relies on (issue #2461): on v42 go
+    // accepts only the `lmsig` form.
+    let code = |name: &str| {
+        want.iter()
+            .find(|r| r["name"] == name)
+            .unwrap_or_else(|| panic!("no {name} row"))["code"]
+            .as_i64()
+    };
+    assert_eq!(code("msig v40"), Some(0));
+    assert_eq!(code("lmsig v40"), Some(1));
+    assert_eq!(code("msig v42"), Some(1));
+    assert_eq!(code("lmsig v42"), Some(0));
+    assert_eq!(code("msig v43"), Some(1));
+    assert_eq!(code("lmsig v43"), Some(0));
+}
+
+/// `MIXED_CLUSTER=1`: the delegated fixture is go `goal`'s output
+/// (`REGEN_SIGN_LSIG_FIXTURE=1` rewrites it).
+#[test]
+fn sign_delegated_msig_lsig_fixture_matches_go_goal() {
+    if !mixed_cluster_enabled() {
+        eprintln!("Go-parity SKIPPED: set MIXED_CLUSTER=1");
+        return;
+    }
+    let Some(go_goal) = try_ensure_go_goal() else {
+        return;
+    };
+    let text: String = delegated_rows(&go_goal)
+        .iter()
+        .map(|r| format!("{r}\n"))
+        .collect();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(DELEGATED_FIXTURE);
+    if std::env::var("REGEN_SIGN_LSIG_FIXTURE").is_ok_and(|v| !v.is_empty() && v != "0") {
+        std::fs::write(&path, text).expect("write the fixture");
+        return;
+    }
+    let committed = std::fs::read_to_string(&path).expect("fixture file");
+    assert!(
+        committed == text,
+        "{DELEGATED_FIXTURE} differs from go's output: regenerate it with REGEN_SIGN_LSIG_FIXTURE=1"
     );
 }
 
