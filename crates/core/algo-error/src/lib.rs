@@ -88,6 +88,23 @@ pub enum AlgoError {
         got: u64,
     },
 
+    /// A peer's answer to a round-specific block fetch did not decode.
+    /// Mirrors go's `errCannotDecodeBlock` (`catchup/universalFetcher.go`),
+    /// raised by `processBlockBytes` when `protocol.Decode` fails: its text
+    /// names the round, the peer and the decoder's own message, which is
+    /// rendered here with its whole `source()` chain because
+    /// [`AlgoError::Codec`]'s `Display` shows only its context.
+    #[error("processBlockBytes: cannot decode block {round} from peer {peer}: {}", error_chain(.source.as_ref()))]
+    CannotDecodeBlock {
+        /// The round that was requested.
+        round: u64,
+        /// The address of the peer that served the undecodable bytes.
+        peer: String,
+        /// The decode error (go's `Unwrap()`).
+        #[source]
+        source: Box<AlgoError>,
+    },
+
     #[error("conformance error: {message}")]
     Conformance { message: String },
 
@@ -195,6 +212,19 @@ pub enum AlgoError {
 
     #[error("network error: {message}")]
     Network { message: String },
+}
+
+/// `err`'s text followed by each `source()` in turn, joined with `": "`, as
+/// go prints a `%w`-wrapped error.
+pub fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut cur = err.source();
+    while let Some(next) = cur {
+        out.push_str(": ");
+        out.push_str(&next.to_string());
+        cur = next.source();
+    }
+    out
 }
 
 /// go `ledgercore.MinBalanceError.Error`
@@ -564,7 +594,10 @@ mod tests {
             message: BATCH_HAS_FAILED_SIGS.to_string(),
         };
         assert!(e.is_batch_sig_failure());
-        assert_eq!(BATCH_HAS_FAILED_SIGS, "At least one signature didn't pass verification");
+        assert_eq!(
+            BATCH_HAS_FAILED_SIGS,
+            "At least one signature didn't pass verification"
+        );
         for other in [
             AlgoError::Validation {
                 message: "transaction has no signature".into(),
@@ -575,6 +608,30 @@ mod tests {
         ] {
             assert!(!other.is_batch_sig_failure(), "{other}");
         }
+    }
+
+    /// go's `errCannotDecodeBlock.Error()` shape, with the decoder detail
+    /// that `Codec`'s own `Display` leaves to its source (issue #2442).
+    #[test]
+    fn cannot_decode_block_text_carries_round_peer_and_source_chain() {
+        let e = AlgoError::CannotDecodeBlock {
+            round: 7,
+            peer: "relay:4160".into(),
+            source: Box::new(AlgoError::Codec {
+                source: "length 8535 exceeds the allocation bound 4096".into(),
+                context: "rmp_decode".into(),
+            }),
+        };
+        assert_eq!(
+            e.to_string(),
+            "processBlockBytes: cannot decode block 7 from peer relay:4160: \
+             codec error: rmp_decode: length 8535 exceeds the allocation bound 4096"
+        );
+        // go's `Unwrap()` returns the decode error.
+        assert_eq!(
+            std::error::Error::source(&e).map(|s| s.to_string()),
+            Some("codec error: rmp_decode".to_string())
+        );
     }
 
     /// go `MinBalanceError.Error` text, byte for byte, and its recognition.

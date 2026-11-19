@@ -343,7 +343,7 @@ impl GossipBlockSource {
         let response =
             decode_block_cert(&data.block_data, &data.cert_data, round).map_err(|error| {
                 PeerFetchFailure {
-                    error,
+                    error: cannot_decode_block(round, peer.get_address(), error),
                     answered: true,
                 }
             })?;
@@ -512,6 +512,23 @@ impl GossipBlockSource {
 // ---------------------------------------------------------------------------
 // Conversion helpers
 // ---------------------------------------------------------------------------
+
+/// Frame a [`decode_block_cert`] failure for `round` from `peer` as go's
+/// `processBlockBytes` does: a decode failure becomes
+/// [`AlgoError::CannotDecodeBlock`] (go's `errCannotDecodeBlock`, whose text
+/// keeps the decoder's detail); the wrong-round verdicts are go's own
+/// `errWrongBlockFromPeer` / `errWrongCertFromPeer` and are returned as they
+/// are.
+pub fn cannot_decode_block(round: Round, peer: &str, error: AlgoError) -> AlgoError {
+    match error {
+        e @ (AlgoError::WrongBlockFromPeer { .. } | AlgoError::WrongCertFromPeer { .. }) => e,
+        e => AlgoError::CannotDecodeBlock {
+            round: round.0,
+            peer: peer.to_string(),
+            source: Box::new(e),
+        },
+    }
+}
 
 /// Decode separate block and certificate msgpack blobs into a [`BlockResponse`],
 /// checking both against the round that was actually requested.
@@ -951,6 +968,54 @@ mod tests {
         let src = GossipBlockSource::new(vec![peer as Arc<dyn UnicastPeer>]);
         let resp = src.get_block(Round(5)).await.unwrap();
         assert_eq!(resp.block.round.0, 5);
+    }
+
+    /// Split a `{"block", "cert"}` response body into the raw `block` and
+    /// `cert` values, as a WS block service sends them in separate topics.
+    fn split_block_cert(body: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let value = rmpv::decode::read_value(&mut &body[..]).expect("response map");
+        let field = |name: &str| {
+            let (_, v) = value
+                .as_map()
+                .expect("response map")
+                .iter()
+                .find(|(k, _)| k.as_str() == Some(name))
+                .expect("response field");
+            let mut out = Vec::new();
+            rmpv::encode::write_value(&mut out, v).expect("re-encode");
+            out
+        };
+        (field("block"), field("cert"))
+    }
+
+    /// Issue #2442: a block that fails to decode (aramidmain round 23132701,
+    /// a payment note of 8535 bytes against the built-in `MaxTxnNoteBytes`
+    /// bound 4096) must be reported like go's `errCannotDecodeBlock`
+    /// (`catchup/universalFetcher.go`): `processBlockBytes: cannot decode
+    /// block <r> from peer <p>: <decoder error>`, not just `codec error:
+    /// rmp_decode`.
+    #[tokio::test]
+    async fn undecodable_block_error_names_round_peer_and_decoder_detail() {
+        const ROUND: u64 = 23_132_701;
+        let body = include_bytes!(
+            "../../../core/algo-codec/tests/fixtures/aramidmain/block_23132701.msgpack"
+        );
+        let (block_bytes, cert_bytes) = split_block_cert(body);
+        let peer: Arc<dyn UnicastPeer> =
+            Arc::new(MockPeer::new("relay-a:4160").with_success(ROUND, block_bytes, cert_bytes));
+        let src = GossipBlockSource::new(vec![peer]);
+
+        let err = src.get_block(Round(ROUND)).await.unwrap_err().to_string();
+        assert!(
+            err.starts_with(
+                "processBlockBytes: cannot decode block 23132701 from peer relay-a:4160: "
+            ),
+            "go's errCannotDecodeBlock shape: {err}"
+        );
+        assert!(
+            err.contains("length 8535 exceeds the allocation bound 4096"),
+            "the decoder's own detail is kept: {err}"
+        );
     }
 
     /// Direct port of go's `TestUGetBlockWs` (`catchup/universalFetcher_test.go`):
