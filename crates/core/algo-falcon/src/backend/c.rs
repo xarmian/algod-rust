@@ -100,11 +100,12 @@ fn ptr_or_null(data: &[u8]) -> *const c_void {
     }
 }
 
-/// `falcon_det1024_verify_compressed`. Sizes are pre-validated by the caller.
-pub(crate) fn verify(pubkey: &[u8], sig: &[u8], data: &[u8]) -> Result<bool, FalconError> {
+/// `falcon_det1024_verify_compressed`: `0` when the signature is valid, else
+/// its `FALCON_ERR_*` code. Sizes are pre-validated by the caller.
+pub(crate) fn verify(pubkey: &[u8], sig: &[u8], data: &[u8]) -> i32 {
     debug_assert_eq!(pubkey.len(), FALCON_DET1024_PUBKEY_SIZE);
     debug_assert!(sig.len() >= 2 && sig.len() <= FALCON_DET1024_SIG_COMPRESSED_MAXSIZE);
-    let rc = unsafe {
+    unsafe {
         falcon_det1024_verify_compressed(
             sig.as_ptr() as *const c_void,
             sig.len(),
@@ -112,8 +113,7 @@ pub(crate) fn verify(pubkey: &[u8], sig: &[u8], data: &[u8]) -> Result<bool, Fal
             ptr_or_null(data),
             data.len(),
         )
-    };
-    Ok(rc == 0)
+    }
 }
 
 /// `shake256_init_prng_from_seed` + `falcon_det1024_keygen`.

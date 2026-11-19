@@ -59,23 +59,45 @@ pub trait PQVerifier {
     ) -> Result<(), PQVerifyError>;
 }
 
+/// go's `crypto.ErrPQFalcon1024SigInvalid` (`crypto/falconWrapper.go`), which
+/// `VerifyFalcon1024` wraps for every failed Falcon-1024 verification.
+pub const ERR_PQ_FALCON1024_SIG_INVALID: &str = "invalid falcon-1024 signature";
+
 /// Errors from a [`PQVerifier`] (Go: the `error` returned by
-/// `PQVerifier.Verify`).
+/// `PQVerifier.Verify`). Each `Display`s as go's text.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PQVerifyError {
-    /// The signature did not verify against the given message/public key.
-    InvalidSignature,
-    /// The underlying scheme implementation rejected malformed input
-    /// (wrong-sized key/signature) before it could even attempt
-    /// verification.
-    MalformedInput(String),
+    /// The public key is not a Falcon-1024 key's size. go:
+    /// `fmt.Errorf("%w: public key size %d, want %d", ErrPQFalcon1024SigInvalid, ...)`.
+    PublicKeySize(usize),
+    /// An empty signature. go's `cfalcon` `PublicKey.Verify`:
+    /// `fmt.Errorf("empty signature: %w", ErrVerifyFail)`, wrapped.
+    EmptySignature,
+    /// The verifier rejected the signature with this `FALCON_ERR_*` code.
+    /// go's `cfalcon`: `fmt.Errorf("error code %d: %w", r, ErrVerifyFail)`,
+    /// wrapped as `fmt.Errorf("%w: %w", ErrPQFalcon1024SigInvalid, err)`.
+    VerifyFailed(i32),
+    /// Any other failure of the Falcon layer (not produced for inputs that
+    /// passed the size checks above).
+    Backend(String),
 }
 
 impl std::fmt::Display for PQVerifyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PQVerifyError::InvalidSignature => write!(f, "pq signature verification failed"),
-            PQVerifyError::MalformedInput(msg) => write!(f, "malformed pq input: {msg}"),
+            PQVerifyError::PublicKeySize(n) => write!(
+                f,
+                "{ERR_PQ_FALCON1024_SIG_INVALID}: public key size {n}, want {FALCON_DET1024_PUBKEY_SIZE}"
+            ),
+            PQVerifyError::EmptySignature => write!(
+                f,
+                "{ERR_PQ_FALCON1024_SIG_INVALID}: empty signature: falcon verify failed"
+            ),
+            PQVerifyError::VerifyFailed(rc) => write!(
+                f,
+                "{ERR_PQ_FALCON1024_SIG_INVALID}: error code {rc}: falcon verify failed"
+            ),
+            PQVerifyError::Backend(msg) => write!(f, "{ERR_PQ_FALCON1024_SIG_INVALID}: {msg}"),
         }
     }
 }
@@ -84,12 +106,15 @@ impl std::error::Error for PQVerifyError {}
 
 impl From<FalconError> for PQVerifyError {
     fn from(e: FalconError) -> Self {
-        PQVerifyError::MalformedInput(e.to_string())
+        match e {
+            FalconError::InvalidPubkeySize(n) => PQVerifyError::PublicKeySize(n),
+            other => PQVerifyError::Backend(other.to_string()),
+        }
     }
 }
 
 /// The Falcon-1024 (`"f1"`) scheme (Go: the unexported `falcon1024` type in
-/// `crypto/pq_scheme.go`).
+/// `crypto/pq_scheme.go`, which calls `crypto.VerifyFalcon1024`).
 struct Falcon1024;
 
 impl PQVerifier for Falcon1024 {
@@ -99,10 +124,17 @@ impl PQVerifier for Falcon1024 {
         public_key: &[u8],
         signature: &[u8],
     ) -> Result<(), PQVerifyError> {
-        if algo_falcon::falcon_verify(public_key, signature, message)? {
-            Ok(())
-        } else {
-            Err(PQVerifyError::InvalidSignature)
+        // go's `VerifyFalcon1024` order: the key size, then the C verifier,
+        // which rejects an empty signature before any work.
+        if public_key.len() != FALCON_DET1024_PUBKEY_SIZE {
+            return Err(PQVerifyError::PublicKeySize(public_key.len()));
+        }
+        if signature.is_empty() {
+            return Err(PQVerifyError::EmptySignature);
+        }
+        match algo_falcon::falcon_verify_code(public_key, signature, message)? {
+            0 => Ok(()),
+            rc => Err(PQVerifyError::VerifyFailed(rc)),
         }
     }
 }
@@ -166,5 +198,35 @@ mod tests {
 
         assert!(verifier.verify(msg, &pubkey, &sig).is_ok());
         assert!(verifier.verify(msg, &pubkey, &[]).is_err());
+    }
+
+    /// go's `VerifyFalcon1024` texts (`crypto/falconWrapper.go`, v5.0.5):
+    /// the key size first, then the wrapped `cfalcon` error (issue #2438).
+    #[test]
+    fn test_falcon1024_failure_texts_match_go() {
+        let verifier = lookup_pq_scheme(*b"f1").expect("f1 must be registered");
+        let seed = [3u8; algo_falcon::FALCON_SEED_SIZE];
+        let (pubkey, privkey) = algo_falcon::falcon_keygen(&seed).expect("keygen should succeed");
+        let sig = algo_falcon::falcon_sign(&privkey, b"m").expect("sign should succeed");
+        let text = |pk: &[u8], s: &[u8]| verifier.verify(b"m", pk, s).unwrap_err().to_string();
+
+        assert_eq!(
+            text(&pubkey[1..], &[]),
+            "invalid falcon-1024 signature: public key size 1792, want 1793"
+        );
+        assert_eq!(
+            text(&pubkey, &[]),
+            "invalid falcon-1024 signature: empty signature: falcon verify failed"
+        );
+        assert_eq!(
+            text(&pubkey, &sig[..1]),
+            "invalid falcon-1024 signature: error code -4: falcon verify failed"
+        );
+        let mut tampered = sig.clone();
+        tampered[0] ^= 1;
+        assert_eq!(
+            text(&pubkey, &tampered),
+            "invalid falcon-1024 signature: error code -4: falcon verify failed"
+        );
     }
 }

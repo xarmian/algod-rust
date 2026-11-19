@@ -247,6 +247,47 @@ pub fn falcon_verify_with(
 ) -> Result<bool, FalconError> {
     check_pubkey(pubkey)?;
     check_sig(sig)?;
+    Ok(verify_code_unchecked(backend, pubkey, sig, data) == 0)
+}
+
+/// `FALCON_ERR_BADSIG`: what `falcon_det1024_verify_compressed` answers for a
+/// signature shorter than 2 bytes or longer than the compressed maximum.
+pub const FALCON_ERR_BADSIG: i32 = -4;
+
+/// Verify a deterministic Falcon-1024 compressed-format signature with the
+/// process-wide backend and return the verifier's own result code: `0` when
+/// the signature is valid, otherwise its negative `FALCON_ERR_*` code.
+///
+/// go-algorand's `cfalcon` wrapper puts this code in its error text
+/// (`error code %d: falcon verify failed`, `github.com/algorand/falcon`
+/// `PublicKey.Verify`), which `crypto.VerifyFalcon1024` wraps for every
+/// failed post-quantum signature. Unlike [`falcon_verify`], a non-empty
+/// signature of any length is answered with a code, as the C verifier does
+/// (`FALCON_ERR_BADSIG` outside `2..=1423` bytes); only a wrong-size public
+/// key is an `Err`.
+pub fn falcon_verify_code(pubkey: &[u8], sig: &[u8], data: &[u8]) -> Result<i32, FalconError> {
+    falcon_verify_code_with(falcon_backend(), pubkey, sig, data)
+}
+
+/// [`falcon_verify_code`] with an explicit backend.
+pub fn falcon_verify_code_with(
+    backend: FalconBackend,
+    pubkey: &[u8],
+    sig: &[u8],
+    data: &[u8],
+) -> Result<i32, FalconError> {
+    check_pubkey(pubkey)?;
+    if check_sig(sig).is_err() {
+        // `falcon_det1024_verify_compressed` rejects these sizes itself
+        // (`sig_len < 2`, and a salted length over the maximum) before any
+        // decoding; answer for it without handing the C code an empty slice.
+        return Ok(FALCON_ERR_BADSIG);
+    }
+    Ok(verify_code_unchecked(backend, pubkey, sig, data))
+}
+
+/// Dispatch a size-checked verification to `backend`.
+fn verify_code_unchecked(backend: FalconBackend, pubkey: &[u8], sig: &[u8], data: &[u8]) -> i32 {
     match backend {
         FalconBackend::Rust => backend::rust::verify(pubkey, sig, data),
         #[cfg(feature = "c-backend")]
@@ -499,6 +540,52 @@ mod backend_tests {
                 ))
             );
         }
+    }
+
+    /// Every compiled backend answers a tampered signature with the same
+    /// `FALCON_ERR_*` code (go-algorand's PQ failure text carries it, issue
+    /// #2438), and out-of-range signature sizes with `FALCON_ERR_BADSIG`, as
+    /// the C verifier does.
+    #[test]
+    fn all_backends_agree_on_verify_codes() {
+        let seed = [0x26u8; FALCON_SEED_SIZE];
+        let msg = b"verify codes";
+        let (pk, sk) = falcon_keygen(&seed).unwrap();
+        let sig = falcon_sign(&sk, msg).unwrap();
+        let mut variants: Vec<(String, Vec<u8>, &[u8])> = vec![
+            ("valid".into(), sig.clone(), msg),
+            ("other message".into(), sig.clone(), b"other"),
+            ("one byte".into(), sig[..1].to_vec(), msg),
+            ("41 bytes".into(), sig[..41].to_vec(), msg),
+            (
+                "too long".into(),
+                vec![0xba; FALCON_DET1024_SIG_COMPRESSED_MAXSIZE + 1],
+                msg,
+            ),
+        ];
+        for i in [0, 1, 2, 40, sig.len() / 2, sig.len() - 1] {
+            let mut s = sig.clone();
+            s[i] ^= 0x55;
+            variants.push((format!("byte {i} flipped"), s, msg));
+        }
+        for (name, s, m) in &variants {
+            let codes: Vec<i32> = FalconBackend::all()
+                .iter()
+                .map(|&b| falcon_verify_code_with(b, &pk, s, m).unwrap())
+                .collect();
+            assert!(codes.windows(2).all(|w| w[0] == w[1]), "{name}: {codes:?}");
+            assert_eq!(codes[0] == 0, name == "valid", "{name}: {codes:?}");
+        }
+        assert_eq!(
+            falcon_verify_code(&pk, &sig[..1], msg),
+            Ok(FALCON_ERR_BADSIG)
+        );
+        assert_eq!(
+            falcon_verify_code(&pk[1..], &sig, msg),
+            Err(FalconError::InvalidPubkeySize(
+                FALCON_DET1024_PUBKEY_SIZE - 1
+            ))
+        );
     }
 
     #[test]
