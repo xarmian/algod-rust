@@ -31,7 +31,9 @@ mod types;
 
 pub use catchpoint_download::{CatchpointDownloadConfig, CatchpointDownloader, DownloadProgress};
 pub use client::{AlgodClient, ClientConfig};
-pub use gossip_block_source::{decode_block_cert, GossipBlockSource, GossipBlockSourceConfig};
+pub use gossip_block_source::{
+    cannot_decode_block, decode_block_cert, GossipBlockSource, GossipBlockSourceConfig,
+};
 pub use http_block_fetcher::{HttpBlockFetchError, HttpBlockFetcher, BLOCK_RESPONSE_CONTENT_TYPE};
 pub use http_over_stream::{
     build_get_request, build_head_request, read_http_response_head, write_request,

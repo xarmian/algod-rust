@@ -974,11 +974,10 @@ impl HttpBlockFetcherSource {
             preferred: std::sync::atomic::AtomicUsize::new(0),
         }
     }
-}
 
-#[async_trait::async_trait]
-impl BlockSource for HttpBlockFetcherSource {
-    async fn get_block_raw(&self, round: Round) -> algo_error::Result<Vec<u8>> {
+    /// Fetch the raw `{block, cert}` body for `round`, rotating across the
+    /// peers, and return it with the base URL of the peer that served it.
+    async fn fetch_raw_from_any(&self, round: Round) -> algo_error::Result<(Vec<u8>, &str)> {
         use std::sync::atomic::Ordering;
         let total = self.fetchers.len();
         let start = self.preferred.load(Ordering::Relaxed) % total;
@@ -989,7 +988,7 @@ impl BlockSource for HttpBlockFetcherSource {
             match self.fetchers[idx].fetch_block(round.0).await {
                 Ok(raw) => {
                     self.preferred.store(idx, Ordering::Relaxed);
-                    return Ok(raw);
+                    return Ok((raw, self.fetchers[idx].base_url()));
                 }
                 Err(e) => {
                     let err = match e {
@@ -1027,11 +1026,20 @@ impl BlockSource for HttpBlockFetcherSource {
             AlgoError::Network { message }
         })
     }
+}
 
+#[async_trait::async_trait]
+impl BlockSource for HttpBlockFetcherSource {
+    async fn get_block_raw(&self, round: Round) -> algo_error::Result<Vec<u8>> {
+        Ok(self.fetch_raw_from_any(round).await?.0)
+    }
+
+    /// A body that does not decode is reported like go's `processBlockBytes`
+    /// (`errCannotDecodeBlock`: round, peer and the decoder's detail).
     async fn get_block(&self, round: Round) -> algo_error::Result<algo_types::BlockResponse> {
-        let raw = self.get_block_raw(round).await?;
-        let br = decode_block_response(&raw)?;
-        Ok(br)
+        let (raw, peer) = self.fetch_raw_from_any(round).await?;
+        decode_block_response(&raw)
+            .map_err(|e| algo_rest_client::cannot_decode_block(round, peer, e))
     }
 
     async fn get_status(&self) -> algo_error::Result<algo_rest_client::NodeStatus> {
@@ -1229,9 +1237,7 @@ impl GossipSyncBackend {
 
     /// Fetch a block via HTTP, returning the decoded `Block`.
     async fn fetch_block_http(&self, round: u64) -> Result<Block, AlgoError> {
-        let raw = self.http.get_block_raw(Round(round)).await?;
-        let br = decode_block_response(&raw)?;
-        Ok(br.block)
+        Ok(self.http.get_block(Round(round)).await?.block)
     }
 
     /// Fetch a block using the configured source selection policy.
@@ -3193,6 +3199,54 @@ mod tests {
             b"catchpoint-file-bytes-0123456789"
         );
         let _ = std::fs::remove_dir_all(dest.parent().expect("parent"));
+    }
+
+    /// Issue #2442: an HTTP block body that does not decode (aramidmain round
+    /// 23132701, an 8535-byte note against the built-in 4096 bound) is
+    /// reported like go's `errCannotDecodeBlock`: round, serving peer and
+    /// the decoder's detail.
+    #[tokio::test]
+    async fn http_source_undecodable_block_names_round_peer_and_decoder_detail() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = include_bytes!(
+            "../../../../crates/core/algo-codec/tests/fixtures/aramidmain/block_23132701.msgpack"
+        );
+        Mock::given(method("GET"))
+            // The round is base-36 in the path (go's `strconv.FormatUint(r, 36)`).
+            .and(path_regex(r"^/v1/test-v1\.0/block/[0-9a-z]+$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "Content-Type",
+                        algo_rest_client::BLOCK_RESPONSE_CONTENT_TYPE,
+                    )
+                    .set_body_bytes(body.to_vec()),
+            )
+            .mount(&server)
+            .await;
+        let source = HttpBlockFetcherSource::new(
+            HttpBlockFetcher::new(server.uri(), "test-v1.0").expect("fetcher"),
+        );
+        let err = source
+            .get_block(Round(23_132_701))
+            .await
+            .expect_err("4096-byte note bound")
+            .to_string();
+        let prefix = format!(
+            "processBlockBytes: cannot decode block 23132701 from peer {}: ",
+            server.uri()
+        );
+        assert!(
+            err.starts_with(&prefix),
+            "go's errCannotDecodeBlock shape: {err}"
+        );
+        assert!(
+            err.contains("length 8535 exceeds the allocation bound 4096"),
+            "the decoder's own detail is kept: {err}"
+        );
     }
 
     /// The configured ledger-download retry budget reaches the gossip
