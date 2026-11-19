@@ -256,6 +256,8 @@ jobs:
           # #2448: go's `account -f/--default`, `wallet -f/--default` and
           # `account import -m` against a kmd-rust; fixtures/default_flags.jsonl
           # is go's output (a stale one fails default_flags_fixture_matches_go_goal).
+          # #2453: its rows also hold cobra's usage errors for extra arguments
+          # to `account` / `wallet` and a `-f` before one of their subcommands.
           MIXED_CLUSTER=1 cargo test -p goal-rust --test default_flags_e2e -- --nocapture
           # #2454: go's client setup (ensureKmdClient / ensureAlgodClient /
           # ensureFullClient / getGoalClient): kmd started next to goal (go's
