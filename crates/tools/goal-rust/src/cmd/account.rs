@@ -69,14 +69,11 @@ const ERROR_NAME_DOESNT_EXIST: &str = "An account named '{}' does not exist.";
 /// (`messages.go:46`).
 const ERROR_REQUEST_FAIL: &str = "Request failed: {}";
 
-/// Mirrors Go's `Could not contact kmd; is it running?` error path.
-const ERROR_KMD_UNREACHABLE: &str = "Could not contact kmd; is it running?";
-
-/// Mirrors Go's `errNoWallets` / `errNoDefaultWallet` flavor.
+/// go: `errNoWallets` / `errNoDefaultWallet` (`cmd/goal/messages.go`).
 const ERROR_NO_WALLETS: &str =
-    "Wallet not found. Create a wallet using `goal wallet new` and try again.";
-const ERROR_NO_DEFAULT_WALLET: &str =
-    "More than one wallet exists; please specify which one to use with -w.";
+    "No wallets found. Create a new wallet with `goal wallet new [wallet name]`";
+const ERROR_NO_DEFAULT_WALLET: &str = "No default wallet found. Specify a wallet by name with -w, \
+     or set a default with `goal wallet -f [wallet name]";
 
 /// go's `makeAccountsList`: the data dir's accounts list, or go's
 /// `errorGenesisIDFail` on stderr when its genesis ID cannot be read
@@ -137,7 +134,8 @@ pub fn run_new(args: NewArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>
         Ok(a) => a,
         Err(()) => return ExitCode::from(1),
     };
-    let client = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
+    let _ = kmd_dir_flag;
+    let client = match build_wallet_handle_kmd_client(&data_dir_path) {
         Ok(c) => c,
         Err(()) => return ExitCode::from(1),
     };
@@ -223,7 +221,8 @@ pub fn run_list(args: ListArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBu
         Ok(a) => a,
         Err(()) => return ExitCode::from(1),
     };
-    let client = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
+    let _ = kmd_dir_flag;
+    let client = match build_wallet_handle_kmd_client(&data_dir_path) {
         Ok(c) => c,
         Err(()) => return ExitCode::from(1),
     };
@@ -257,7 +256,12 @@ pub fn run_list(args: ListArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBu
         None => listed,
     };
     if wallets.is_empty() {
-        // No wallets at all — Go prints infoNoAccounts.
+        // go's `ensureWalletHandle` with no wallet at all: `errNoWallets`
+        // (`getWalletHandleMaybePassword`), exit 1 (issue #2454).
+        if accounts.default_wallet_id.is_empty() {
+            eprintln!("{ERROR_NO_WALLETS}");
+            return ExitCode::from(1);
+        }
         println!("{INFO_NO_ACCOUNTS}");
         return ExitCode::SUCCESS;
     }
@@ -615,23 +619,15 @@ pub fn run_dump(args: DumpArgs, cli_d: Vec<PathBuf>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    // Validate the address so a typo errors before we issue the HTTP
-    // call (Go does the same in account.go:838-841 via
-    // basics.UnmarshalChecksumAddress).
+    // go's dumpCmd: `ensureAlgodClient(dataDir)` (issue #2454), then the
+    // address (`basics.UnmarshalChecksumAddress`).
+    let Ok((base, token)) = ensure_algod_endpoint(&data_dir_path) else {
+        return ExitCode::from(1);
+    };
     if let Err(e) = algo_types::Address::from_algorand_string(&args.address) {
         eprintln!("Could not parse address: {e}");
         return ExitCode::from(1);
     }
-    // Route through build_algod_endpoint for the same admin-token-first
-    // resolution every other account command uses (Go's dumpCmd reaches
-    // NodeController.AlgodClient() too).
-    let (base, token) = match build_algod_endpoint(&data_dir_path) {
-        Some(e) => e,
-        None => {
-            eprintln!("Could not contact algod: algod.net/algod.token missing");
-            return ExitCode::from(1);
-        }
-    };
     let rt = match build_runtime() {
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
@@ -700,26 +696,19 @@ fn build_runtime() -> Result<tokio::runtime::Runtime, ()> {
         })
 }
 
-fn build_kmd_client(data_dir_path: &Path, kmd_dir_flag: Option<&Path>) -> Result<KmdClient, ()> {
-    // go builds a client here, whose `getGoalClient` creates the cache dir
-    // first (issue #2449).
-    crate::goal_client::prepare_or_exit(data_dir_path);
-    let kmd_dir = data_dir::resolve_kmd_data_dir(kmd_dir_flag, data_dir_path).map_err(|e| {
+/// go's `ensureKmdClient(dataDir)`, which starts kmd when it is not running
+/// (the `-k` flag is the one `goal_client` resolves; issue #2454).
+fn build_kmd_client(data_dir_path: &Path, _kmd_dir_flag: Option<&Path>) -> Result<KmdClient, ()> {
+    crate::goal_client::ensure_kmd_client(data_dir_path).map_err(|e| {
         eprintln!("{e}");
-    })?;
-    let net = std::fs::read_to_string(kmd_dir.join("kmd.net")).map_err(|_| {
-        eprintln!("{ERROR_KMD_UNREACHABLE}");
-    })?;
-    let tok = std::fs::read_to_string(kmd_dir.join("kmd.token")).map_err(|_| {
-        eprintln!("{ERROR_KMD_UNREACHABLE}");
-    })?;
-    let net = net.trim();
-    let tok = tok.trim();
-    if net.is_empty() || tok.is_empty() {
-        eprintln!("{ERROR_KMD_UNREACHABLE}");
-        return Err(());
-    }
-    KmdClient::new(net, tok).map_err(|e| {
+    })
+}
+
+/// The kmd client of go's `ensureWalletHandle(dataDir, walletName)` when no
+/// `ensureKmdClient` comes before it (`account new`, `account list`): its
+/// failure is `kmd client init error: <err>` (issue #2454).
+fn build_wallet_handle_kmd_client(data_dir_path: &Path) -> Result<KmdClient, ()> {
+    crate::goal_client::wallet_handle_kmd_client(data_dir_path).map_err(|e| {
         eprintln!("{e}");
     })
 }
@@ -1081,9 +1070,16 @@ pub fn run_addpartkey(args: AddpartkeyArgs, cli_d: Vec<PathBuf>) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    let client = match build_algod_client(&cli_d) {
-        Ok(c) => c,
-        Err(()) => return ExitCode::from(1),
+    // go: `ensureFullClient(dataDir)` (account.go:1088), which starts kmd.
+    let client = match data_dir::ensure_single_data_dir(&cli_d) {
+        Ok(dd) => match build_full_algod_client_for_dir(&dd) {
+            Ok(c) => c,
+            Err(()) => return ExitCode::from(1),
+        },
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
     };
     let rt = match build_runtime() {
         Ok(r) => r,
@@ -1195,9 +1191,28 @@ pub fn run_installpartkey(args: InstallpartkeyArgs, cli_d: Vec<PathBuf>) -> Exit
 /// (account.go:1220-1278). Columns + format match Go's hdrFormat /
 /// rowFormat (squeezed to 77 chars wide).
 pub fn run_listpartkeys(cli_d: Vec<PathBuf>) -> ExitCode {
-    let client = match build_algod_client(&cli_d) {
-        Ok(c) => c,
-        Err(()) => return ExitCode::from(1),
+    let dd = match data_dir::ensure_single_data_dir(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    // go: `ensureGoalClient(dataDir, DynamicClient)`; its
+    // `ListParticipationKeys` then needs the algod client, whose failure is
+    // `errorRequestFail` (account.go:1330-1333, issue #2454).
+    if let Err(e) =
+        crate::goal_client::ensure_goal_client(&dd, crate::goal_client::ClientType::Dynamic)
+    {
+        eprintln!("{e}");
+        return ExitCode::from(1);
+    }
+    let client = match crate::goal_client::algod_endpoint(&dd) {
+        Ok((base, token)) => algo_rest_client::AlgodClient::new(&base, &token),
+        Err(e) => {
+            eprintln!("Error processing command: {e}");
+            return ExitCode::from(1);
+        }
     };
     let rt = match build_runtime() {
         Ok(r) => r,
@@ -1374,15 +1389,26 @@ fn build_algod_client(cli_d: &[PathBuf]) -> Result<algo_rest_client::AlgodClient
     build_algod_client_for_dir(&dd)
 }
 
+/// go's `ensureAlgodClient(dataDir)` (issue #2454).
 fn build_algod_client_for_dir(dd: &Path) -> Result<algo_rest_client::AlgodClient, ()> {
-    let (base, token) = match build_algod_endpoint(dd) {
-        Some(e) => e,
-        None => {
-            eprintln!("Could not contact algod: algod.net/algod.token missing");
-            return Err(());
-        }
-    };
+    let (base, token) = ensure_algod_endpoint(dd)?;
     Ok(algo_rest_client::AlgodClient::new(&base, &token))
+}
+
+/// go's `ensureFullClient(dataDir)`: kmd started, then the algod client
+/// (issue #2454).
+fn build_full_algod_client_for_dir(dd: &Path) -> Result<algo_rest_client::AlgodClient, ()> {
+    let (base, token) =
+        crate::goal_client::ensure_algod_endpoint(dd, crate::goal_client::ClientType::Full)
+            .map_err(|e| eprintln!("{e}"))?;
+    Ok(algo_rest_client::AlgodClient::new(&base, &token))
+}
+
+/// go's `ensureAlgodClient(dataDir)`: the algod base URL and token, else go's
+/// `Cannot contact Algorand node: <err>` printed (issue #2454).
+fn ensure_algod_endpoint(dd: &Path) -> Result<(String, String), ()> {
+    crate::goal_client::ensure_algod_endpoint(dd, crate::goal_client::ClientType::Algod)
+        .map_err(|e| eprintln!("{e}"))
 }
 
 /// `roundOrNA(value)` — Go's helper for printing optional rounds
@@ -1528,11 +1554,14 @@ pub fn run_changeonlinestatus(
             return ExitCode::from(1);
         }
     };
-    let algod = match build_algod_client_for_dir(&data_dir_path) {
+    // go: `ensureFullClient(dataDir)`, which starts kmd; the wallet handle
+    // comes later (`ensureWalletHandleMaybePassword`).
+    let _ = kmd_dir_flag;
+    let algod = match build_full_algod_client_for_dir(&data_dir_path) {
         Ok(c) => c,
         Err(()) => return ExitCode::from(1),
     };
-    let kmd = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
+    let kmd = match build_wallet_handle_kmd_client(&data_dir_path) {
         Ok(c) => c,
         Err(()) => return ExitCode::from(1),
     };
@@ -1652,11 +1681,14 @@ pub fn run_marknonparticipating(
             return ExitCode::from(1);
         }
     };
-    let algod = match build_algod_client_for_dir(&data_dir_path) {
+    // go: `ensureFullClient(dataDir)`, which starts kmd; the wallet handle
+    // comes later (`ensureWalletHandleMaybePassword`).
+    let _ = kmd_dir_flag;
+    let algod = match build_full_algod_client_for_dir(&data_dir_path) {
         Ok(c) => c,
         Err(()) => return ExitCode::from(1),
     };
-    let kmd = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
+    let kmd = match build_wallet_handle_kmd_client(&data_dir_path) {
         Ok(c) => c,
         Err(()) => return ExitCode::from(1),
     };
@@ -2553,17 +2585,14 @@ pub fn run_assetdetails(args: AssetdetailsArgs, cli_d: Vec<PathBuf>) -> ExitCode
             return ExitCode::from(1);
         }
     };
+    // go: `ensureAlgodClient(dataDir)` first (issue #2454).
+    let Ok(endpoint) = ensure_algod_endpoint(&dd) else {
+        return ExitCode::from(1);
+    };
     if let Err(e) = algo_types::Address::from_algorand_string(&args.address) {
         eprintln!("Could not parse address: {e}");
         return ExitCode::from(1);
     }
-    let endpoint = match build_algod_endpoint(&dd) {
-        Some(e) => e,
-        None => {
-            eprintln!("Could not contact algod: algod.net/algod.token missing");
-            return ExitCode::from(1);
-        }
-    };
     let rt = match build_runtime() {
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
@@ -2711,17 +2740,12 @@ fn fetch_account_json(address: &str, cli_d: &[PathBuf]) -> Result<serde_json::Va
             return Err(());
         }
     };
+    // go: `ensureAlgodClient(dataDir)` first (issue #2454).
+    let endpoint = ensure_algod_endpoint(&dd)?;
     if let Err(e) = algo_types::Address::from_algorand_string(address) {
         eprintln!("Could not parse address: {e}");
         return Err(());
     }
-    let endpoint = match build_algod_endpoint(&dd) {
-        Some(e) => e,
-        None => {
-            eprintln!("Could not contact algod: algod.net/algod.token missing");
-            return Err(());
-        }
-    };
     let rt = build_runtime()?;
     let url = format!(
         "{}/v2/accounts/{}",

@@ -55,8 +55,8 @@ use base64::Engine;
 use crate::accounts_list::AccountsList;
 use crate::cmd::app_state_json::{encode_teal_state_json, heuristic_format_entries, TealEntry};
 use crate::cmd::clerk::{
-    build_algod_client_for_dir, build_kmd_client, compute_validity, kmd_msg, parse_lease,
-    parse_note, resolve_wallet_and_init, write_file_0600,
+    build_full_algod_client_for_dir, build_wallet_handle_kmd_client, compute_validity, kmd_msg,
+    parse_lease, parse_note, resolve_wallet_and_init, write_file_0600,
 };
 use crate::cmd::clerk_sign::{hash_program, program_address};
 use crate::data_dir;
@@ -536,7 +536,7 @@ fn submit_app_lifecycle_txn(
 
     let refs = build_ref_bundle_from_flags(refs_args)?;
 
-    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    let algod = build_full_algod_client_for_dir(&data_dir_path)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -650,7 +650,7 @@ fn run_create_inner(args: CreateArgs, wallet: Option<String>) -> Result<ExitCode
     }
     let refs = build_ref_bundle_from_flags(&args.refs)?;
 
-    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    let algod = build_full_algod_client_for_dir(&data_dir_path)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -748,7 +748,7 @@ fn run_update_inner(args: UpdateArgs, wallet: Option<String>) -> Result<ExitCode
     }
     let refs = build_ref_bundle_from_flags(&args.refs)?;
 
-    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    let algod = build_full_algod_client_for_dir(&data_dir_path)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -841,7 +841,7 @@ fn submit_single(
 ) -> Result<Option<algo_rest_client::PendingTxnInfo>, String> {
     let want_wallet_sign = txn_args.out.is_none() || txn_args.sign;
     let stx = if want_wallet_sign {
-        let kmd = build_kmd_client(data_dir_path, crate::cli_state::kmddir().as_deref())?;
+        let kmd = build_wallet_handle_kmd_client(data_dir_path)?;
         let mut accounts = AccountsList::load(data_dir_path).map_err(|e| e.to_string())?;
         let (handle, _name, password) = resolve_wallet_and_init(
             rt,
@@ -939,7 +939,7 @@ pub fn run_info(args: InfoArgs) -> ExitCode {
 fn run_info_inner(args: InfoArgs) -> Result<ExitCode, String> {
     let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
         .map_err(|e| e.to_string())?;
-    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    let algod = build_full_algod_client_for_dir(&data_dir_path)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1109,7 +1109,7 @@ fn run_read_inner(args: ReadArgs) -> Result<ExitCode, String> {
 
     let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
         .map_err(|e| e.to_string())?;
-    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    let algod = build_full_algod_client_for_dir(&data_dir_path)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1443,7 +1443,7 @@ fn run_method_inner(args: MethodArgs, wallet: Option<String>) -> Result<ExitCode
     let from_addr = Address::from_algorand_string(&from_resolved)
         .map_err(|e| format!("Could not parse from address {from_resolved}: {e}"))?;
 
-    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    let algod = build_full_algod_client_for_dir(&data_dir_path)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1528,10 +1528,7 @@ fn run_method_inner(args: MethodArgs, wallet: Option<String>) -> Result<ExitCode
     // kmd client/handle eagerly whenever `want_wallet_sign` is set.
     let want_wallet_sign = args.txn.out.is_none() || args.txn.sign;
     let kmd: Option<KmdClient> = if want_wallet_sign {
-        Some(build_kmd_client(
-            &data_dir_path,
-            crate::cli_state::kmddir().as_deref(),
-        )?)
+        Some(build_wallet_handle_kmd_client(&data_dir_path)?)
     } else {
         None
     };
@@ -1715,7 +1712,7 @@ fn run_box_info_inner(args: BoxInfoArgs) -> Result<ExitCode, String> {
 
     let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
         .map_err(|e| e.to_string())?;
-    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    let algod = build_full_algod_client_for_dir(&data_dir_path)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1783,7 +1780,7 @@ pub fn run_box_list(args: BoxListArgs) -> ExitCode {
 fn run_box_list_inner(args: BoxListArgs) -> Result<ExitCode, String> {
     let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
         .map_err(|e| e.to_string())?;
-    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    let algod = build_full_algod_client_for_dir(&data_dir_path)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

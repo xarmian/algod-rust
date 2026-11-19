@@ -173,13 +173,16 @@ fn wallet_new_creates_wallet_with_go_exact_output() {
 
 #[test]
 fn wallet_new_missing_kmd_produces_go_unreachable_error() {
-    // No kmd-rust spawn ⇒ kmd.net / kmd.token missing from kmd-v0.5.
+    // No kmd running and none next to the binary: go's `ensureKmdClient`
+    // cannot start one (#2454).
     let (data_dir, _kmd_dir) = setup_data_dir();
-    let out = Command::new(GOAL_RUST_BIN)
+    let (bin_dir, goal) = goal_rust_without_kmd();
+    let out = Command::new(&goal)
         .arg("-d")
         .arg(data_dir.path())
         .args(["wallet", "new", "any-name", "-w", "pw"])
         .env_remove("ALGORAND_DATA")
+        .env("PATH", "/usr/bin:/bin")
         .output()
         .expect("run goal-rust wallet new");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -188,10 +191,23 @@ fn wallet_new_missing_kmd_produces_go_unreachable_error() {
         "wallet new must fail without kmd; exit={:?} stderr={stderr:?}",
         out.status.code(),
     );
-    assert!(
-        stderr.contains("Could not contact kmd; is it running?"),
-        "stderr must carry Go's unreachable text; got {stderr:?}",
+    assert_eq!(
+        stderr,
+        format!(
+            "Cannot contact Algorand node: fork/exec {}/kmd: no such file or directory\n",
+            bin_dir.path().canonicalize().unwrap().display()
+        )
     );
+}
+
+/// goal-rust copied to a fresh directory without kmd (`PATH` without one
+/// either), so the kmd it starts, like go's `<binDir>/kmd`, is not there
+/// (#2454). Returns the directory guard and the copy.
+fn goal_rust_without_kmd() -> (tempfile::TempDir, PathBuf) {
+    let bin = tempfile::tempdir().expect("tempdir");
+    let copy = bin.path().canonicalize().unwrap().join("goal-rust");
+    std::fs::copy(GOAL_RUST_BIN, &copy).expect("copy goal-rust");
+    (bin, copy)
 }
 
 #[test]

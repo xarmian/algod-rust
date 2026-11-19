@@ -257,3 +257,13 @@ jobs:
           # `account import -m` against a kmd-rust; fixtures/default_flags.jsonl
           # is go's output (a stale one fails default_flags_fixture_matches_go_goal).
           MIXED_CLUSTER=1 cargo test -p goal-rust --test default_flags_e2e -- --nocapture
+          # #2454: go's client setup (ensureKmdClient / ensureAlgodClient /
+          # ensureFullClient / getGoalClient): kmd started next to goal (go's
+          # kmd, built from ../go-algorand/cmd/kmd, for go's goal), go's error
+          # texts without kmd or algod, and consensus.json decoded by go's
+          # encoding/json; fixtures/goal_client.jsonl is go's output (a stale
+          # one fails goal_client_fixture_matches_go_goal). GOTOOLCHAIN pins
+          # the toolchain of go-algorand v5.0.5-stable's go.mod for go's goal and kmd
+          # (go1.25.3, as released): a newer `stable` go changes
+          # encoding/json's error texts.
+          GOTOOLCHAIN=go1.25.3 MIXED_CLUSTER=1 cargo test -p goal-rust --test goal_client_e2e -- --nocapture

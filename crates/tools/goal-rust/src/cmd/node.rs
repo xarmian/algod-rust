@@ -735,6 +735,65 @@ pub fn run_pendingtxns(args: crate::groups::node::PendingTxnsArgs, cli_d: Vec<Pa
     ExitCode::SUCCESS
 }
 
+/// Port of `supplyCmd` (`ledger.go`): `ensureAlgodClient(dataDir)`, then
+/// `GET /v2/ledger/supply` (issue #2454).
+pub fn run_ledger_supply(cli_d: Vec<PathBuf>) -> ExitCode {
+    let dir = match crate::data_dir::ensure_single_data_dir(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let (url, token) = match client_endpoint(&dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("{}", node_status_error(&e));
+            return ExitCode::from(1);
+        }
+    };
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("tokio runtime: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let fetched = rt.block_on(async {
+        let resp = http()
+            .get(format!("{url}/v2/ledger/supply"))
+            .header("X-Algo-API-Token", &token)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(|e| e.to_string())?;
+        if !status.is_success() {
+            return Err(http_error_text(status, &body));
+        }
+        serde_json::from_str::<serde_json::Value>(&body).map_err(|e| e.to_string())
+    });
+    match fetched {
+        Ok(doc) => {
+            let field = |k: &str| doc.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+            println!(
+                "Round: {}\nTotal Money: {} microAlgos\nOnline Money: {} microAlgos",
+                field("current_round"),
+                field("total-money"),
+                field("online-money")
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("Error processing command: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 /// Port of `lastroundCmd` (`node.go:519-534`). Per-data-dir, calls
 /// `client.CurrentRound()` and prints `{round}\n`.
 pub fn run_lastround(cli_d: Vec<PathBuf>) -> ExitCode {
@@ -1074,8 +1133,15 @@ pub(crate) fn status_text(data_dir: &Path) -> Result<String, String> {
 /// whose `getGoalClient` first creates the cache dir (issue #2449); `goal
 /// network status` reads the endpoint without one.
 fn client_endpoint(data_dir: &Path) -> Result<(String, String), String> {
-    crate::goal_client::prepare_or_exit(data_dir);
-    endpoint(data_dir)
+    use crate::goal_client::{get_goal_client, ClientError, ClientType};
+    match get_goal_client(data_dir, ClientType::Algod) {
+        Ok(_) => crate::goal_client::algod_endpoint(data_dir),
+        Err(ClientError::Init(e)) => Err(e),
+        Err(ClientError::Fatal(e)) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn build_client(data_dir: &Path) -> Result<AlgodClient, ()> {

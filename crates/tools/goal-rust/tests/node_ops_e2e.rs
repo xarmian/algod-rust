@@ -82,7 +82,8 @@ fn data_dir(port: u16) -> tempfile::TempDir {
 
 fn write_net(dir: &Path, port: u16) {
     std::fs::write(dir.join("algod.net"), format!("127.0.0.1:{port}\n")).unwrap();
-    std::fs::write(dir.join("algod.token"), "tok\n").unwrap();
+    // go validates the token: 64 to 256 characters (#2454)
+    std::fs::write(dir.join("algod.token"), format!("{}\n", "t".repeat(64))).unwrap();
 }
 
 fn goal(dir: &Path, args: &[&str]) -> Output {

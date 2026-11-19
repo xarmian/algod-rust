@@ -35,9 +35,8 @@ pub enum LedgerCmd {
 }
 
 pub fn run(cmd: LedgerCmd) -> ExitCode {
-    let leaf = match cmd {
-        LedgerCmd::Block => "block",
-        LedgerCmd::Supply => "supply",
-    };
-    unimplemented("ledger", leaf)
+    match cmd {
+        LedgerCmd::Block => unimplemented("ledger", "block"),
+        LedgerCmd::Supply => crate::cmd::node::run_ledger_supply(crate::cli_state::datadirs()),
+    }
 }

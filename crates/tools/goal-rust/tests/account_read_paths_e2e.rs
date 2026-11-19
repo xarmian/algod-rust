@@ -472,6 +472,10 @@ fn account_info_only_show_asset_ids_skips_metadata_fetch() {
 #[test]
 fn account_balance_bad_address_errors() {
     let (_t, dd) = mk_data_dir();
+    // go's `ensureAlgodClient` comes first (#2454): it needs the token and
+    // address files, not a node.
+    std::fs::write(dd.join("algod.token"), "a".repeat(64)).unwrap();
+    std::fs::write(dd.join("algod.net"), "127.0.0.1:1\n").unwrap();
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)

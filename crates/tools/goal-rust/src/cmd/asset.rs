@@ -40,8 +40,8 @@ use base64::Engine;
 
 use crate::accounts_list::AccountsList;
 use crate::cmd::clerk::{
-    build_algod_client_for_dir, build_kmd_client, compute_validity, kmd_msg, parse_lease,
-    parse_note, resolve_max_txn_life, resolve_wallet_and_init,
+    build_algod_client_for_dir, build_wallet_handle_kmd_client, compute_validity, kmd_msg,
+    parse_lease, parse_note, resolve_max_txn_life, resolve_wallet_and_init,
 };
 use crate::data_dir;
 use crate::groups::asset::{
@@ -67,6 +67,7 @@ fn run_and_report(f: impl FnOnce() -> Result<ExitCode, String>) -> ExitCode {
 /// `Cannot contact Algorand node: ...` (issue #2449).
 fn ensure_full_client(data_dir_path: &Path) -> Result<(), String> {
     crate::goal_client::ensure_goal_client(data_dir_path, crate::goal_client::ClientType::Full)
+        .map(|_| ())
 }
 
 /// Resolve a possibly-empty account-name/address string through the
@@ -147,7 +148,7 @@ fn submit_single(
 ) -> Result<Option<algo_rest_client::PendingTxnInfo>, String> {
     let want_wallet_sign = txn_args.out.is_none() || txn_args.sign;
     let stx = if want_wallet_sign {
-        let kmd = build_kmd_client(data_dir_path, crate::cli_state::kmddir().as_deref())?;
+        let kmd = build_wallet_handle_kmd_client(data_dir_path)?;
         let mut accounts = AccountsList::load(data_dir_path).map_err(|e| e.to_string())?;
         let (handle, _name, password) = resolve_wallet_and_init(
             rt,
