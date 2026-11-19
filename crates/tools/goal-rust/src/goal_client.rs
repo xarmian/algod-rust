@@ -29,8 +29,12 @@
 //! data dir of nearly every go command, also when the command then fails
 //! (`accountListFileName` builds a `DynamicClient` before it reads the genesis
 //! ID). A `KmdClient` / `FullClient` then starts kmd when it is not running,
-//! an `AlgodClient` / `FullClient` reads the algod token and `algod.net`; a
-//! failure there is `Cannot contact Algorand node: <err>` (`errorNodeStatus`).
+//! an `AlgodClient` / `FullClient` reads the algod token and `algod.net`,
+//! and every client loads `<dd>/consensus.json`; a failure there is `Cannot
+//! contact Algorand node: <err>` (`errorNodeStatus`), or `kmd client init
+//! error: <err>` for the client `getWalletHandleMaybePassword` builds. Every
+//! go call site of `ensureKmdClient` / `ensureAlgodClient` /
+//! `ensureFullClient` / `getGoalClient` goes through here (issue #2454).
 
 use std::path::{Path, PathBuf};
 
@@ -73,23 +77,102 @@ pub fn prepare_or_exit(data_dir: &Path) {
     }
 }
 
-/// go's `ensureGoalClient(dataDir, clientType)` up to the client: `Err` is
-/// the full text go prints before it exits 1. Not ported: the consensus
-/// table every client loads (`nc.GetConsensus`, a `consensus.json` in the
-/// data dir); outside `asset` the kmd and algod client builders only
-/// [`prepare`] so far (issue #2454).
-pub fn ensure_goal_client(data_dir: &Path, client_type: ClientType) -> Result<(), String> {
-    let kmd_dir = prepare(data_dir)?;
-    let node_status = |e: String| format!("{ERROR_NODE_STATUS}{e}");
+/// Why go's `getGoalClient` failed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ClientError {
+    /// `resolveKmdDataDir` / `ensureCacheDir` failed: go reports this text
+    /// itself (`reportErrorf`) and exits 1, whatever the caller.
+    Fatal(String),
+    /// `libgoal.MakeClientFromConfig` failed with this error.
+    Init(String),
+}
+
+impl ClientError {
+    /// What go's `ensureGoalClient` prints: `Cannot contact Algorand node:
+    /// <err>` (`errorNodeStatus`).
+    pub fn node_status(self) -> String {
+        match self {
+            Self::Fatal(s) => s,
+            Self::Init(e) => format!("{ERROR_NODE_STATUS}{e}"),
+        }
+    }
+
+    /// What go's `getWalletHandleMaybePassword` prints when it cannot build
+    /// its own `KmdClient`: `kmd client init error: <err>`.
+    pub fn kmd_init(self) -> String {
+        match self {
+            Self::Fatal(s) => s,
+            Self::Init(e) => format!("kmd client init error: {e}"),
+        }
+    }
+}
+
+/// go's `getGoalClient(dataDir, clientType)`: [`prepare`], then
+/// `libgoal` `Client.init` -- start kmd for a `KmdClient` / `FullClient`
+/// (`getKMDClient`: `StartKMD`, then `KMDClient` reads the kmd token and
+/// address), read the algod token and address for an `AlgodClient` /
+/// `FullClient`, and load `<dd>/consensus.json` (`nc.GetConsensus`).
+/// Returns the kmd data dir.
+pub fn get_goal_client(data_dir: &Path, client_type: ClientType) -> Result<PathBuf, ClientError> {
+    let kmd_dir = prepare(data_dir).map_err(ClientError::Fatal)?;
     if matches!(client_type, ClientType::Kmd | ClientType::Full) {
         KmdController::new(&kmd_dir)
             .start(DEFAULT_KMD_TIMEOUT_SECS)
-            .map_err(node_status)?;
+            .map_err(ClientError::Init)?;
+        kmd_endpoint(&kmd_dir).map_err(ClientError::Init)?;
     }
     if matches!(client_type, ClientType::Algod | ClientType::Full) {
-        algod_endpoint(data_dir).map_err(node_status)?;
+        algod_endpoint(data_dir).map_err(ClientError::Init)?;
     }
-    Ok(())
+    crate::consensus_json::preload_configurable_consensus_protocols(data_dir)
+        .map_err(ClientError::Init)?;
+    Ok(kmd_dir)
+}
+
+/// go's `ensureGoalClient(dataDir, clientType)` up to the client: `Err` is
+/// the full text go prints before it exits 1. Returns the kmd data dir.
+pub fn ensure_goal_client(data_dir: &Path, client_type: ClientType) -> Result<PathBuf, String> {
+    get_goal_client(data_dir, client_type).map_err(ClientError::node_status)
+}
+
+/// go's `ensureKmdClient(dataDir)`: the client of a kmd started when it is
+/// not running. `Err` is the full text go prints before it exits 1.
+pub fn ensure_kmd_client(data_dir: &Path) -> Result<algo_kmd_client::KmdClient, String> {
+    let kmd_dir = ensure_goal_client(data_dir, ClientType::Kmd)?;
+    kmd_client(&kmd_dir).map_err(|e| format!("{ERROR_NODE_STATUS}{e}"))
+}
+
+/// The kmd client of the `KmdClient` go's `getWalletHandleMaybePassword`
+/// builds (`getGoalClient(dataDir, KmdClient)`): `Err` is `kmd client init
+/// error: <err>`.
+pub fn wallet_handle_kmd_client(data_dir: &Path) -> Result<algo_kmd_client::KmdClient, String> {
+    let kmd_dir = get_goal_client(data_dir, ClientType::Kmd).map_err(ClientError::kmd_init)?;
+    kmd_client(&kmd_dir).map_err(|e| ClientError::Init(e).kmd_init())
+}
+
+/// go: `KMDController.KMDClient` + `client.MakeKMDClient`.
+fn kmd_client(kmd_dir: &Path) -> Result<algo_kmd_client::KmdClient, String> {
+    let (net, token) = kmd_endpoint(kmd_dir)?;
+    algo_kmd_client::KmdClient::new(&net, &token).map_err(|e| e.to_string())
+}
+
+/// go's `ensureAlgodClient(dataDir)` / `ensureFullClient(dataDir)`: the
+/// algod base URL and token. `Err` is the full text go prints before it
+/// exits 1.
+pub fn ensure_algod_endpoint(
+    data_dir: &Path,
+    client_type: ClientType,
+) -> Result<(String, String), String> {
+    ensure_goal_client(data_dir, client_type)?;
+    algod_endpoint(data_dir).map_err(|e| format!("{ERROR_NODE_STATUS}{e}"))
+}
+
+/// go: `KMDController.KMDClient` -- the kmd token (validated), then the
+/// first line of `kmd.net`.
+fn kmd_endpoint(kmd_dir: &Path) -> Result<(String, String), String> {
+    let token = get_and_validate_api_token(kmd_dir, "kmd.token")?;
+    let net = first_line(&kmd_dir.join("kmd.net"))?;
+    Ok((net, token))
 }
 
 /// go: `tokens.GetAndValidateAPIToken`.

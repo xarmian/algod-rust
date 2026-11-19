@@ -168,8 +168,18 @@ fn node_status_prefers_admin_token_when_both_present() {
         format!("127.0.0.1:{port}\n"),
     )
     .unwrap();
-    std::fs::write(data_dir.path().join("algod.token"), "regular-tok\n").unwrap();
-    std::fs::write(data_dir.path().join("algod.admin.token"), "admin-tok\n").unwrap();
+    // go validates the tokens: 64 to 256 characters (#2454)
+    let admin = "a".repeat(64);
+    std::fs::write(
+        data_dir.path().join("algod.token"),
+        format!("{}\n", "r".repeat(64)),
+    )
+    .unwrap();
+    std::fs::write(
+        data_dir.path().join("algod.admin.token"),
+        format!("{admin}\n"),
+    )
+    .unwrap();
 
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
@@ -191,7 +201,7 @@ fn node_status_prefers_admin_token_when_both_present() {
     );
     for t in &seen {
         assert_eq!(
-            t, "admin-tok",
+            t, &admin,
             "admin token must be preferred over algod.token; got {seen:?}",
         );
     }
@@ -216,7 +226,7 @@ fn node_status_prints_go_format_text_for_synced_node() {
         "genesis_hash_b64": "SGVsbG8gV29ybGQAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
     }"#;
     let (port, _tokens, _server) = spawn_mock_algod(status_json, versions_json);
-    write_algod_files(data_dir.path(), port, "deadbeef");
+    write_algod_files(data_dir.path(), port, &"d".repeat(64));
 
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
@@ -256,7 +266,7 @@ fn node_lastround_prints_round_decimal_with_trailing_newline() {
     // responsive in case retry logic touches it.
     let versions_json = r#"{"versions": ["v2"], "genesis_id": "", "genesis_hash_b64": ""}"#;
     let (port, _tokens, _server) = spawn_mock_algod(status_json, versions_json);
-    write_algod_files(data_dir.path(), port, "deadbeef");
+    write_algod_files(data_dir.path(), port, &"d".repeat(64));
 
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")

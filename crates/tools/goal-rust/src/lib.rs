@@ -34,6 +34,7 @@ use clap::{Parser, Subcommand};
 pub mod accounts_list;
 pub mod cli_state;
 pub mod cmd;
+pub mod consensus_json;
 pub mod data_dir;
 pub mod formatting;
 pub mod go_json;

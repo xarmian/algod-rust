@@ -59,11 +59,6 @@ const ERROR_COULDNT_CREATE: &str = "Couldn't create wallet: {}";
 /// Mirrors `messages.go:186` (`errorPasswordConfirmation`).
 const ERROR_PW_CONFIRM: &str = "Password confirmation did not match";
 
-/// Mirrors Go's `Could not contact kmd; is it running?` error path
-/// (`commands.go` / `kmdControl.go` — when kmd.net or kmd.token is
-/// missing, the Go libgoal client surfaces this exact text).
-const ERROR_KMD_UNREACHABLE: &str = "Could not contact kmd; is it running?";
-
 /// Mirrors `messages.go:178` (`infoNoWallets`).
 const INFO_NO_WALLETS: &str = "No wallets found. You can create a wallet with `goal wallet new`";
 
@@ -143,23 +138,8 @@ fn ensure_kmd_client_single(
             return Err(());
         }
     };
-    // go builds a client here, whose `getGoalClient` creates the cache dir
-    // first (issue #2449).
-    crate::goal_client::prepare_or_exit(&data_dir);
-    let kmd_dir = match data_dir::resolve_kmd_data_dir(kmd_dir_flag, &data_dir) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("{e}");
-            return Err(());
-        }
-    };
-    let (kmd_addr, kmd_token) = read_kmd_endpoint(&kmd_dir)?;
-    KmdClient::new(&kmd_addr, &kmd_token).map_err(|e| {
-        eprintln!(
-            "{}",
-            format_message(ERROR_COULDNT_CREATE, &[&e.to_string()])
-        );
-    })
+    let _ = kmd_dir_flag;
+    ensure_kmd_client(&data_dir)
 }
 
 pub fn run_new(args: NewArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>) -> ExitCode {
@@ -473,22 +453,17 @@ pub fn run_list(cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>) -> ExitCode 
 /// "Couldn't create wallet" — Codex review TASK-227 round 2).
 fn ensure_kmd_client_for_dir(
     data_dir_path: &Path,
-    kmd_dir_flag: Option<&Path>,
-    client_error_tpl: &str,
+    _kmd_dir_flag: Option<&Path>,
+    _client_error_tpl: &str,
 ) -> Result<KmdClient, ()> {
-    // go builds a client here, whose `getGoalClient` creates the cache dir
-    // first (issue #2449).
-    crate::goal_client::prepare_or_exit(data_dir_path);
-    let kmd_dir = match data_dir::resolve_kmd_data_dir(kmd_dir_flag, data_dir_path) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("{e}");
-            return Err(());
-        }
-    };
-    let (kmd_addr, kmd_token) = read_kmd_endpoint(&kmd_dir)?;
-    KmdClient::new(&kmd_addr, &kmd_token).map_err(|e| {
-        eprintln!("{}", format_message(client_error_tpl, &[&e.to_string()]));
+    ensure_kmd_client(data_dir_path)
+}
+
+/// go's `ensureKmdClient(dataDir)`: kmd started when it is not running, else
+/// go's `Cannot contact Algorand node: <err>` printed (issue #2454).
+fn ensure_kmd_client(data_dir_path: &Path) -> Result<KmdClient, ()> {
+    crate::goal_client::ensure_kmd_client(data_dir_path).map_err(|e| {
+        eprintln!("{e}");
     })
 }
 
@@ -742,28 +717,6 @@ fn resolve_password_for_existing(args: &RenameArgs) -> Result<String, ()> {
         let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
         Ok(trimmed.to_string())
     }
-}
-
-fn read_kmd_endpoint(kmd_dir: &Path) -> Result<(String, String), ()> {
-    let net = match std::fs::read_to_string(kmd_dir.join("kmd.net")) {
-        Ok(s) => s.trim().to_string(),
-        Err(_) => {
-            eprintln!("{ERROR_KMD_UNREACHABLE}");
-            return Err(());
-        }
-    };
-    let token = match std::fs::read_to_string(kmd_dir.join("kmd.token")) {
-        Ok(s) => s.trim().to_string(),
-        Err(_) => {
-            eprintln!("{ERROR_KMD_UNREACHABLE}");
-            return Err(());
-        }
-    };
-    if net.is_empty() || token.is_empty() {
-        eprintln!("{ERROR_KMD_UNREACHABLE}");
-        return Err(());
-    }
-    Ok((net, token))
 }
 
 /// Resolve the wallet password:

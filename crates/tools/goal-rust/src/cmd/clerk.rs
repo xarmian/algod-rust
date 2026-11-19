@@ -131,7 +131,15 @@ fn node_consensus_version(cli_d: &[PathBuf]) -> Option<String> {
         return None;
     }
     let dir = data_dir::ensure_first_data_dir(cli_d).ok()?;
-    let algod = build_algod_client_for_dir(&dir).ok()?;
+    // go's `ensureAlgodClient` exits when there is no client (issue #2454);
+    // only the request's failure keeps the default.
+    let algod = match build_algod_client_for_dir(&dir) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -140,9 +148,6 @@ fn node_consensus_version(cli_d: &[PathBuf]) -> Option<String> {
         .ok()
         .map(|p| p.consensus_version)
 }
-
-/// Mirrors Go's `Could not contact kmd; is it running?` error path.
-const ERROR_KMD_UNREACHABLE: &str = "Could not contact kmd; is it running?";
 
 // ---- clerk send -----------------------------------------------------------
 
@@ -267,7 +272,8 @@ fn run_send_inner(
         }
     }
 
-    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    // go: `ensureFullClient(dataDir)` (clerk.go:403), which starts kmd.
+    let algod = build_full_algod_client_for_dir(&data_dir_path)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -724,12 +730,6 @@ fn run_sign_inner(
 ) -> Result<(), String> {
     let data = std::fs::read(&args.infile)
         .map_err(|e| format!("Cannot read file {}: {e}", args.infile.display()))?;
-    let mut stxns = decode_signed_txn_stream(&data).map_err(|e| {
-        format!(
-            "Cannot decode transactions from {}: {e}",
-            args.infile.display()
-        )
-    })?;
 
     // Build the LogicSig from --program/--logic-sig + --argb64, if any
     // (clerk.go:804-812). `None` ⇒ wallet-sign path.
@@ -738,6 +738,35 @@ fn run_sign_inner(
         args.logic_sig.as_deref(),
         &args.argb64,
     )?;
+
+    // go: the wallet path builds its client (`ensureKmdClient`, which starts
+    // kmd) and the wallet handle before the file is decoded (clerk.go:813-815).
+    let wallet_ctx = if lsig.is_none() {
+        let data_dir_path = data_dir::ensure_single_data_dir(&cli_d).map_err(|e| e.to_string())?;
+        let kmd = build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref())?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Error processing command: {e}"))?;
+        let mut accounts = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
+        let (handle, _wallet_name, password) = resolve_wallet_and_init(
+            &rt,
+            &kmd,
+            &mut accounts,
+            wallet.as_deref(),
+            args.password.as_deref(),
+        )?;
+        Some((kmd, rt, handle, password))
+    } else {
+        None
+    };
+
+    let mut stxns = decode_signed_txn_stream(&data).map_err(|e| {
+        format!(
+            "Cannot decode transactions from {}: {e}",
+            args.infile.display()
+        )
+    })?;
 
     // Resolve the optional --signer (AuthAddr) once (clerk.go:818-823).
     let signer_addr = args
@@ -779,20 +808,8 @@ fn run_sign_inner(
         out
     } else {
         // --- Wallet path: re-sign each txn body through kmd. ---
-        let data_dir_path = data_dir::ensure_single_data_dir(&cli_d).map_err(|e| e.to_string())?;
-        let kmd = build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref())?;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("Error processing command: {e}"))?;
-        let mut accounts = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
-        let (handle, _wallet_name, password) = resolve_wallet_and_init(
-            &rt,
-            &kmd,
-            &mut accounts,
-            wallet.as_deref(),
-            args.password.as_deref(),
-        )?;
+        let (kmd, rt, handle, password) =
+            wallet_ctx.expect("the wallet path built its client above");
 
         // `[0u8; 32]` ⇒ kmd infers the signer from the sender; a non-zero
         // signer pubkey selects a specific spending key (rekey case).
@@ -1631,7 +1648,8 @@ fn run_simulate_inner(args: SimulateArgs, cli_d: Vec<PathBuf>) -> Result<(), Str
     }
 
     let data_dir_path = data_dir::ensure_single_data_dir(&cli_d).map_err(|e| e.to_string())?;
-    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    // go: `ensureFullClient(dataDir)` (clerk.go:1194), which starts kmd.
+    let algod = build_full_algod_client_for_dir(&data_dir_path)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1773,8 +1791,6 @@ fn run_multisig_sign_inner(
 ) -> Result<(), String> {
     let data = std::fs::read(&args.tx)
         .map_err(|e| format!("Cannot read file {}: {e}", args.tx.display()))?;
-    let mut stxns = decode_signed_txn_stream(&data)
-        .map_err(|e| format!("Cannot decode transactions from {}: {e}", args.tx.display()))?;
 
     // --address and --no-sig are mutually exclusive; exactly one is required
     // (multisig.go:88-93, `addrNoSigError`).
@@ -1798,6 +1814,10 @@ fn run_multisig_sign_inner(
         wallet.as_deref(),
         args.password.as_deref(),
     )?;
+    // go decodes the file after the client and the wallet handle
+    // (multisig.go:98-104).
+    let mut stxns = decode_signed_txn_stream(&data)
+        .map_err(|e| format!("Cannot decode transactions from {}: {e}", args.tx.display()))?;
 
     let mut out_data = Vec::new();
     for stxn in stxns.iter_mut() {
@@ -2503,6 +2523,9 @@ fn run_rawsend_inner(args: RawsendArgs, cli_d: Vec<PathBuf>) -> Result<ExitCode,
 
     let data = std::fs::read(&args.filename)
         .map_err(|e| format!("Cannot read file {}: {e}", args.filename.display()))?;
+    // go: `ensureAlgodClient` before the file is decoded (clerk.go:569).
+    let data_dir_path = data_dir::ensure_single_data_dir(&cli_d).map_err(|e| e.to_string())?;
+    let algod = build_algod_client_for_dir(&data_dir_path)?;
     let txns = decode_signed_txn_stream(&data).map_err(|e| {
         format!(
             "Cannot decode transactions from {}: {e}",
@@ -2522,8 +2545,6 @@ fn run_rawsend_inner(args: RawsendArgs, cli_d: Vec<PathBuf>) -> Result<ExitCode,
         }
     }
 
-    let data_dir_path = data_dir::ensure_single_data_dir(&cli_d).map_err(|e| e.to_string())?;
-    let algod = build_algod_client_for_dir(&data_dir_path)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2661,63 +2682,41 @@ fn write_new_file(path: &Path, data: &[u8]) -> Result<(), String> {
 
 // ---- shared client + wallet helpers (mirrors crate::cmd::account) ---------
 
-fn is_valid_api_token(token: &str) -> bool {
-    (64..=256).contains(&token.len())
-}
-
-fn build_algod_endpoint(data_dir_path: &Path) -> Option<(String, String)> {
-    // go builds a client here, whose `getGoalClient` creates the cache dir
-    // first (issue #2449).
-    crate::goal_client::prepare_or_exit(data_dir_path);
-    let net = std::fs::read_to_string(data_dir_path.join("algod.net")).ok()?;
-    let net = net.trim();
-    if net.is_empty() {
-        return None;
-    }
-    let admin = data_dir::read_algod_admin_token(data_dir_path)
-        .ok()
-        .filter(|t| is_valid_api_token(t));
-    let tok = match admin {
-        Some(t) => t,
-        None => data_dir::read_algod_token(data_dir_path)
-            .ok()
-            .filter(|t| is_valid_api_token(t))?,
-    };
-    let base = if net.starts_with("http://") || net.starts_with("https://") {
-        net.to_string()
-    } else {
-        format!("http://{net}")
-    };
-    Some((base, tok))
-}
-
+/// go's `ensureAlgodClient(dataDir)`: `Err` is go's `Cannot contact
+/// Algorand node: <err>` (issue #2454).
 pub(crate) fn build_algod_client_for_dir(
     dd: &Path,
 ) -> Result<algo_rest_client::AlgodClient, String> {
-    let (base, token) = build_algod_endpoint(dd)
-        .ok_or_else(|| "Could not contact algod: algod.net/algod.token missing".to_string())?;
+    let (base, token) = crate::goal_client::ensure_algod_endpoint(
+        dd,
+        crate::goal_client::ClientType::Algod,
+    )?;
     Ok(algo_rest_client::AlgodClient::new(&base, &token))
 }
 
+/// go's `ensureFullClient(dataDir)`: kmd started, then the algod client.
+pub(crate) fn build_full_algod_client_for_dir(
+    dd: &Path,
+) -> Result<algo_rest_client::AlgodClient, String> {
+    let (base, token) =
+        crate::goal_client::ensure_algod_endpoint(dd, crate::goal_client::ClientType::Full)?;
+    Ok(algo_rest_client::AlgodClient::new(&base, &token))
+}
+
+/// go's `ensureKmdClient(dataDir)`, which starts kmd when it is not running
+/// (the `-k` flag is the one `goal_client` resolves; issue #2454).
 pub(crate) fn build_kmd_client(
     data_dir_path: &Path,
-    kmd_dir_flag: Option<&Path>,
+    _kmd_dir_flag: Option<&Path>,
 ) -> Result<KmdClient, String> {
-    // go builds a client here, whose `getGoalClient` creates the cache dir
-    // first (issue #2449).
-    crate::goal_client::prepare_or_exit(data_dir_path);
-    let kmd_dir =
-        data_dir::resolve_kmd_data_dir(kmd_dir_flag, data_dir_path).map_err(|e| e.to_string())?;
-    let net = std::fs::read_to_string(kmd_dir.join("kmd.net"))
-        .map_err(|_| ERROR_KMD_UNREACHABLE.to_string())?;
-    let tok = std::fs::read_to_string(kmd_dir.join("kmd.token"))
-        .map_err(|_| ERROR_KMD_UNREACHABLE.to_string())?;
-    let net = net.trim();
-    let tok = tok.trim();
-    if net.is_empty() || tok.is_empty() {
-        return Err(ERROR_KMD_UNREACHABLE.to_string());
-    }
-    KmdClient::new(net, tok).map_err(|e| e.to_string())
+    crate::goal_client::ensure_kmd_client(data_dir_path)
+}
+
+/// The kmd client of go's `ensureWalletHandleMaybePassword` when no
+/// `ensureKmdClient` comes before it (`createSignedTransaction`):
+/// `kmd client init error: <err>` (issue #2454).
+pub(crate) fn build_wallet_handle_kmd_client(data_dir_path: &Path) -> Result<KmdClient, String> {
+    crate::goal_client::wallet_handle_kmd_client(data_dir_path)
 }
 
 /// Mirrors `getWalletHandleMaybePassword(true)` (commands.go:342-410); a port
@@ -2759,20 +2758,21 @@ pub(crate) fn resolve_wallet_and_init(
                         .block_on(client.list_wallets())
                         .map_err(|e| format!("Request failed: {}", kmd_msg(&e)))?;
                     match listed.wallets.len() {
-                        0 => return Err(
-                            "Wallet not found. Create a wallet using `goal wallet new` and try \
-                             again."
-                                .to_string(),
-                        ),
+                        0 => {
+                            return Err("No wallets found. Create a new wallet with `goal wallet \
+                                 new [wallet name]`"
+                                .to_string())
+                        }
                         1 => {
                             wallet_id = listed.wallets[0].id.clone();
                             wallet_name = listed.wallets[0].name.clone();
                             let _ = accounts.set_default_wallet_id(&wallet_id);
                         }
-                        _ => return Err(
-                            "More than one wallet exists; please specify which one to use with -w."
-                                .to_string(),
-                        ),
+                        _ => {
+                            return Err("No default wallet found. Specify a wallet by name with \
+                                 -w, or set a default with `goal wallet -f [wallet name]"
+                                .to_string())
+                        }
                     }
                 }
                 if wallet_name.is_empty() {

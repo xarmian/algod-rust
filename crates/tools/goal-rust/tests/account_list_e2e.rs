@@ -313,10 +313,11 @@ fn account_list_renders_status_address_name_balance_and_default_marker() {
 }
 
 #[test]
-fn account_list_empty_kmd_prints_info_no_accounts() {
+fn account_list_empty_kmd_fails_with_go_no_wallets() {
     let (_t, dd, kmd_dir) = setup_data_dir();
     let _g = spawn_kmd(&kmd_dir);
-    // No wallets — kmd starts empty.
+    // No wallets — kmd starts empty: go's `ensureWalletHandle` fails with
+    // `errNoWallets` (#2454).
 
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
@@ -325,11 +326,11 @@ fn account_list_empty_kmd_prints_info_no_accounts() {
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("list");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "list must succeed on empty kmd");
-    assert!(
-        stdout.contains("Did not find any account. Please import or create a new one."),
-        "stdout must carry infoNoAccounts; got {stdout:?}",
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "list must fail on empty kmd");
+    assert_eq!(
+        stderr,
+        "No wallets found. Create a new wallet with `goal wallet new [wallet name]`\n"
     );
 }
 
@@ -359,21 +360,38 @@ fn account_list_empty_wallet_prints_info_no_accounts() {
 #[test]
 fn account_list_unreachable_kmd_surfaces_go_text() {
     let (_t, dd, _kmd_dir) = setup_data_dir();
-    // No kmd spawn — kmd.net / kmd.token absent.
-    let out = Command::new(GOAL_RUST_BIN)
+    // No kmd running and none next to the binary: go's wallet handle client
+    // cannot start one (#2454).
+    let (bin_dir, goal) = goal_rust_without_kmd();
+    let out = Command::new(&goal)
         .arg("-d")
         .arg(&dd)
         .args(["account", "list"])
         .env_remove("ALGORAND_DATA")
+        .env("PATH", "/usr/bin:/bin")
         .output()
         .expect("list");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "list must fail without kmd");
-    assert!(
-        stderr.contains("Could not contact kmd; is it running?"),
-        "stderr must carry Go's unreachable text; got {stderr:?}",
+    assert_eq!(out.status.code(), Some(1), "list must fail without kmd");
+    assert_eq!(
+        stderr,
+        format!(
+            "kmd client init error: fork/exec {}/kmd: no such file or directory\n",
+            bin_dir.path().canonicalize().unwrap().display()
+        )
     );
 }
+
+/// goal-rust copied to a fresh directory without kmd (`PATH` without one
+/// either), so the kmd it starts, like go's `<binDir>/kmd`, is not there
+/// (#2454). Returns the directory guard and the copy.
+fn goal_rust_without_kmd() -> (tempfile::TempDir, PathBuf) {
+    let bin = tempfile::tempdir().expect("tempdir");
+    let copy = bin.path().canonicalize().unwrap().join("goal-rust");
+    std::fs::copy(GOAL_RUST_BIN, &copy).expect("copy goal-rust");
+    (bin, copy)
+}
+
 
 #[test]
 fn account_list_renders_notparticipating_as_excluded() {

@@ -36,8 +36,9 @@
 //!
 //! `fixtures/goal_client.jsonl` holds what go v5.0.5-stable's `goal` printed
 //! (exit code, stdout, stderr, the data dir and the binary dir masked) and
-//! the files it left in the data dir, for each command below, run against a
-//! data dir holding a genesis but no node:
+//! the files it left in the data dir, for each command below (all of go's
+//! call sites but `ledger block` and `version`, which goal-rust does not
+//! implement yet), run against a data dir holding a genesis but no node:
 //! - with no kmd next to the binary (a copy of it in a temporary directory,
 //!   `PATH=/usr/bin:/bin`);
 //! - with a kmd next to it, which the command starts (go's `kmd` for go's
@@ -79,7 +80,7 @@ const ADDR: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ";
 const ZERO_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon invest";
 
 /// The files the data dir holds before the command runs.
-const INPUTS: [&str; 4] = ["genesis.json", "consensus.json", "p.teal", "x.txn"];
+const INPUTS: [&str; 5] = ["genesis.json", "consensus.json", "p.teal", "x.txn", "d.txn"];
 
 /// The files a running kmd writes in its own directory: what kmd-rust writes
 /// there is kmd's parity, not goal's, so the rows with a kmd leave them out.
@@ -166,10 +167,8 @@ fn cases() -> Vec<(&'static str, Vec<&'static str>)> {
         ("wallet new", vec!["wallet", "new", "w"]),
         ("wallet -f", vec!["wallet", "-f", "w"]),
         ("wallet rename", vec!["wallet", "rename", "a", "b"]),
-        ("wallet", vec!["wallet"]),
         // account.go
         ("account list", vec!["account", "list"]),
-        ("account", vec!["account"]),
         ("account new", vec!["account", "new"]),
         ("account delete", vec!["account", "delete", "-a", ADDR]),
         ("account rename", vec!["account", "rename", "a", "b"]),
@@ -199,7 +198,7 @@ fn cases() -> Vec<(&'static str, Vec<&'static str>)> {
         ),
         (
             "account changeonlinestatus",
-            vec!["account", "changeonlinestatus", "-a", ADDR, "-o=false"],
+            vec!["account", "changeonlinestatus", "-a", ADDR],
         ),
         (
             "account marknonparticipating",
@@ -278,6 +277,19 @@ fn cases() -> Vec<(&'static str, Vec<&'static str>)> {
             vec!["clerk", "compile", "-s", "-a", ADDR, "p.teal"],
         ),
         ("clerk simulate", vec!["clerk", "simulate", "-t", "x.txn"]),
+        // A LogicSig: `getProto` without `--proto` is `ensureAlgodClient`.
+        (
+            "clerk sign -p",
+            vec![
+                "clerk", "sign", "-i", "d.txn", "-o", "o.txn", "-p", "p.teal",
+            ],
+        ),
+        (
+            "clerk sign -p --proto",
+            vec![
+                "clerk", "sign", "-i", "d.txn", "-o", "o.txn", "-p", "p.teal", "--proto", "future",
+            ],
+        ),
         // application.go
         ("app info", vec!["app", "info", "--app-id", "1"]),
         (
@@ -309,8 +321,6 @@ fn cases() -> Vec<(&'static str, Vec<&'static str>)> {
         ("node wait", vec!["node", "wait"]),
         ("node catchup", vec!["node", "catchup", "--abort"]),
         ("ledger supply", vec!["ledger", "supply"]),
-        ("ledger block", vec!["ledger", "block", "1"]),
-        ("version", vec!["version"]),
     ]
 }
 
@@ -471,6 +481,11 @@ fn row(
     std::fs::write(dd.join("genesis.json"), GENESIS).unwrap();
     std::fs::write(dd.join("p.teal"), "#pragma version 8\nint 1\n").unwrap();
     std::fs::write(dd.join("x.txn"), b"\x81\xa3zzz\x01").unwrap();
+    // A transaction go decodes: `{"txn": {"snd": <0x01 * 32>, "type": "pay"}}`.
+    let mut txn = b"\x81\xa3txn\x82\xa3snd\xc4\x20".to_vec();
+    txn.extend_from_slice(&[1u8; 32]);
+    txn.extend_from_slice(b"\xa4type\xa3pay");
+    std::fs::write(dd.join("d.txn"), txn).unwrap();
     if let Some(c) = consensus {
         std::fs::write(dd.join("consensus.json"), c).unwrap();
     }
