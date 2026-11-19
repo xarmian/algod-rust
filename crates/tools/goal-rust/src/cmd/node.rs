@@ -525,7 +525,7 @@ pub fn run_catchup(args: crate::groups::node::CatchupArgs, cli_d: Vec<PathBuf>) 
         if multi {
             println!("{}{}]", crate::data_dir::INFO_DATA_DIR_FMT, dir.display());
         }
-        let (url, token) = match endpoint(dir) {
+        let (url, token) = match client_endpoint(dir) {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("{}", node_status_error(&e));
@@ -696,7 +696,7 @@ pub fn run_pendingtxns(args: crate::groups::node::PendingTxnsArgs, cli_d: Vec<Pa
         if multi {
             println!("{}{}]", crate::data_dir::INFO_DATA_DIR_FMT, dir.display());
         }
-        let (url, token) = match endpoint(dir) {
+        let (url, token) = match client_endpoint(dir) {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("{}", node_status_error(&e));
@@ -811,6 +811,9 @@ pub fn run_generate_token(cli_d: Vec<PathBuf>) -> ExitCode {
         if multi {
             println!("[Data Directory: {}]", dir.display());
         }
+        // go's `generateTokenCmd` builds its client config with
+        // `ensureCacheDir` first (issue #2449).
+        crate::goal_client::prepare_or_exit(dir);
         if rt.block_on(algod_is_running(dir)) {
             eprintln!("{ERROR_NODE_RUNNING}");
             exit = ExitCode::from(1);
@@ -1067,8 +1070,16 @@ pub(crate) fn status_text(data_dir: &Path) -> Result<String, String> {
     Ok(make_status_string(&stat))
 }
 
+/// [`endpoint`] for a command that builds go's client (`ensureAlgodClient`),
+/// whose `getGoalClient` first creates the cache dir (issue #2449); `goal
+/// network status` reads the endpoint without one.
+fn client_endpoint(data_dir: &Path) -> Result<(String, String), String> {
+    crate::goal_client::prepare_or_exit(data_dir);
+    endpoint(data_dir)
+}
+
 fn build_client(data_dir: &Path) -> Result<AlgodClient, ()> {
-    match endpoint(data_dir) {
+    match client_endpoint(data_dir) {
         Ok((url, token)) => Ok(AlgodClient::new(url, token)),
         Err(e) => {
             eprintln!("{}", format_message(ERROR_NODE_STATUS, &[&e]));

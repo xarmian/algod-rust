@@ -36,6 +36,8 @@ pub mod cli_state;
 pub mod cmd;
 pub mod data_dir;
 pub mod formatting;
+pub mod go_json;
+pub mod goal_client;
 pub mod groups;
 pub mod kmdcontrol;
 pub mod nodecontrol;

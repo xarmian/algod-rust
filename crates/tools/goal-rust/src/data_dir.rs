@@ -94,13 +94,14 @@ pub enum DataDirError {
     OnlyOneDataDirSupported,
     /// I/O error reading a data-dir-relative file.
     Io { path: PathBuf, source: io::Error },
-    /// Genesis file present but its JSON could not be parsed.
+    /// Genesis file present but go's decoder rejects it; `message` is go's
+    /// error text (`EOF`, `json decode error [pos N]: ...`).
     GenesisParse { path: PathBuf, message: String },
 }
 
 /// How go's `os` package words an I/O error: lower-case, without Rust's
 /// `(os error N)` suffix (`open /x/algod.net: no such file or directory`).
-fn go_os_error(e: &io::Error) -> String {
+pub(crate) fn go_os_error(e: &io::Error) -> String {
     let text = e.to_string();
     let text = text.split(" (os error").next().unwrap_or(&text);
     let mut chars = text.chars();
@@ -118,9 +119,7 @@ impl std::fmt::Display for DataDirError {
             Self::Io { path, source } => {
                 write!(f, "open {}: {}", path.display(), go_os_error(source))
             }
-            Self::GenesisParse { path, message } => {
-                write!(f, "{}: invalid genesis.json: {}", path.display(), message)
-            }
+            Self::GenesisParse { message, .. } => f.write_str(message),
         }
     }
 }
@@ -325,28 +324,17 @@ pub fn is_algorand_data_private(data_dir: &Path) -> bool {
 }
 
 /// Read `<data_dir>/genesis.json` and return the effective Genesis ID
-/// (`"<network>-<schema_id>"`), per
-/// `../go-algorand/data/bookkeeping/genesis.go:101-103`. The codec tag
-/// in Go is `network`/`id`, and the file is JSON; we read those two
-/// fields with `serde_json` and stay tolerant of unknown fields.
+/// (`"<network>-<schema_id>"`, `../go-algorand/data/bookkeeping/genesis.go`
+/// `ID`), decoding the file as go's `protocol.DecodeJSON` does
+/// ([`crate::go_json`]), so a malformed file fails with go's text (#2449).
 pub fn read_genesis_id(data_dir: &Path) -> Result<String, DataDirError> {
     let path = data_dir.join(GENESIS_JSON_FILE);
-    let text = fs::read_to_string(&path).map_err(|source| DataDirError::Io {
+    let text = fs::read(&path).map_err(|source| DataDirError::Io {
         path: path.clone(),
         source,
     })?;
-    #[derive(serde::Deserialize)]
-    struct Genesis {
-        #[serde(default)]
-        network: String,
-        #[serde(default)]
-        id: String,
-    }
-    let g: Genesis = serde_json::from_str(&text).map_err(|e| DataDirError::GenesisParse {
-        path: path.clone(),
-        message: e.to_string(),
-    })?;
-    Ok(format!("{}-{}", g.network, g.id))
+    crate::go_json::decode_genesis_id(&text)
+        .map_err(|message| DataDirError::GenesisParse { path, message })
 }
 
 /// Port of `cmd/goal/commands.go:resolveKmdDataDir`. Precedence:

@@ -123,7 +123,17 @@ impl AccountsList {
     /// (issue #2436), so every command that builds the list in go must
     /// stop on this error ([`AccountsListError::GenesisIdFail`]'s text
     /// is go's).
+    ///
+    /// Before that go builds a client (`ensureGoalClient(dataDir,
+    /// DynamicClient)`), which creates `<dd>/goal.cache` (issue #2449).
     pub fn load(data_dir: &Path) -> Result<Self, AccountsListError> {
+        crate::goal_client::ensure_goal_client(data_dir, crate::goal_client::ClientType::Dynamic)
+            .map_err(AccountsListError::Client)?;
+        Self::read(data_dir)
+    }
+
+    /// [`Self::load`] without go's client side effects.
+    fn read(data_dir: &Path) -> Result<Self, AccountsListError> {
         let mut list = Self::new_empty(data_dir);
         let path = list.account_list_filename()?;
         let Ok(raw) = fs::read(&path) else {
@@ -150,7 +160,7 @@ impl AccountsList {
     /// failure, the unreadable genesis ID included, gives an empty list,
     /// so those commands go on as go does.
     pub fn load_or_empty(data_dir: &Path) -> Self {
-        Self::load(data_dir).unwrap_or_else(|_| Self::new_empty(data_dir))
+        Self::read(data_dir).unwrap_or_else(|_| Self::new_empty(data_dir))
     }
 
     /// Resolve the on-disk path for this list. Equivalent to Go's
@@ -302,6 +312,11 @@ pub enum AccountsListError {
     /// data dir, as `accountListFileName` reports it.
     #[error("Error determining kmd folder ({err}). Ensure the node is running in {}.", data_dir.display())]
     GenesisIdFail { err: String, data_dir: PathBuf },
+
+    /// go's `ensureGoalClient` failed before the genesis ID was read
+    /// (`could not make cachedir: ...`, ...); the text is go's.
+    #[error("{0}")]
+    Client(String),
 
     /// Shared/server layout was selected but `$HOME` is unset so
     /// `~/.algorand` couldn't be resolved.

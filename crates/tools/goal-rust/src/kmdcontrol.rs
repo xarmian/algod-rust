@@ -59,7 +59,8 @@ pub struct KmdController {
 
 /// Locate kmd next to `goal` (go: `binDir/kmd`), preferring a real `kmd`, then
 /// the multi-command `kmd-rust` (whose daemon mode is `kmd-rust serve`), then
-/// `PATH`.
+/// `PATH`. With none of them, go's own choice `binDir/kmd`, so starting it
+/// fails as go's does (`fork/exec <binDir>/kmd: no such file or directory`).
 pub fn resolve_kmd(exe_dir: Option<&Path>) -> (PathBuf, Vec<String>) {
     let ext = if cfg!(windows) { ".exe" } else { "" };
     if let Some(dir) = exe_dir {
@@ -75,7 +76,13 @@ pub fn resolve_kmd(exe_dir: Option<&Path>) -> (PathBuf, Vec<String>) {
     if find_on_path(&format!("kmd{ext}")).is_some() {
         return (PathBuf::from("kmd"), Vec::new());
     }
-    (PathBuf::from("kmd-rust"), vec!["serve".into()])
+    if find_on_path(&format!("kmd-rust{ext}")).is_some() {
+        return (PathBuf::from("kmd-rust"), vec!["serve".into()]);
+    }
+    match exe_dir {
+        Some(dir) => (dir.join(format!("kmd{ext}")), Vec::new()),
+        None => (PathBuf::from("kmd-rust"), vec!["serve".into()]),
+    }
 }
 
 /// go: `GetKMDPID` -- the first line of `kmd.pid`, a positive pid.
@@ -198,9 +205,13 @@ impl KmdController {
             use std::os::unix::process::CommandExt as _;
             cmd.process_group(0);
         }
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("{}: {e}", self.program.display()))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            format!(
+                "fork/exec {}: {}",
+                self.program.display(),
+                crate::data_dir::go_os_error(&e)
+            )
+        })?;
         let deadline = Instant::now() + self.start_wait;
 
         loop {
@@ -284,8 +295,16 @@ pub fn ensure_kmd_running(kmd_dir: &Path) -> Result<(), String> {
         .map(|_| ())
 }
 
+/// go: `os.OpenFile(name, O_WRONLY|O_CREATE|O_APPEND, 0600)`.
 fn open_log_append(path: &Path) -> Option<File> {
-    match fs::OpenOptions::new().create(true).append(true).open(path) {
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    match options.open(path) {
         Ok(f) => Some(f),
         Err(e) => {
             eprintln!(
@@ -355,6 +374,28 @@ mod tests {
         let (p, args) = resolve_kmd(Some(tmp.path()));
         assert!(p.ends_with(format!("kmd{ext}")));
         assert!(args.is_empty());
+    }
+
+    /// A kmd that cannot be started fails with go's text (issue #2449).
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_kmd_fails_like_gos_fork_exec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kmd_dir = tmp.path().join("kmd-v0.5");
+        let program = tmp.path().join("bin/kmd");
+        let nc = KmdController::with_program(&kmd_dir, program.clone(), Vec::new());
+        assert_eq!(
+            nc.start(1),
+            Err(format!(
+                "fork/exec {}: no such file or directory",
+                program.display()
+            ))
+        );
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&kmd_dir), 0o700);
+        assert_eq!(mode(&kmd_dir.join("kmd-err.log")), 0o600);
+        assert_eq!(mode(&kmd_dir.join("kmd-out.log")), 0o600);
     }
 
     #[test]
