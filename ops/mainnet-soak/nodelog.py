@@ -248,6 +248,69 @@ def parse_phase_file(path: str) -> dict:
         return parse_phase_log([])
 
 
+# --- fast-catchup outcome (issue #2444) ---------------------------------
+
+# A live catchpoint catchup (or one of its sync attempts) failing.
+CATCHUP_FAILED_MARKERS = ("live catchpoint catchup failed",)
+# The catchpoint was applied: `completed`, or `stopped short` (issue #1725,
+# the catchpoint itself was applied and normal catchup closes the gap).
+CATCHUP_DONE_MARKERS = ("live catchpoint catchup completed", "live catchpoint catchup stopped short")
+
+
+def parse_catchup_outcome(lines) -> dict:
+    """How the node's fast catchup ended, from node.log lines. Never raises.
+
+    `state` is the last event seen: "none" (no catchup in the log),
+    "in_progress" (an attempt started and has not ended), "failed" (the
+    last attempt failed and no new one started) or "completed".
+    `failures` counts failure lines (live-catchup failures and sync
+    `to=Failed:` transitions); `failure_line` is the most recent one,
+    sanitized (the live-catchup line, which names the label and the error,
+    follows its sync transition, so it wins when both are present)."""
+    state = "none"
+    failures = 0
+    failure_line = None
+    for raw in lines:
+        if "catchpoint catchup" not in raw and "sync state transition" not in raw:
+            continue
+        p = parse_line(raw)
+        if p is None:
+            continue
+        msg = p[2]
+        line = strip_ansi(raw).strip()
+        m = TRANSITION_RE.search(msg) if "sync state transition" in msg else None
+        if m:
+            to = m.group(2)
+            if to == S_DOWNLOAD:
+                state = "in_progress"
+            elif to.startswith("Failed"):
+                state = "failed"
+                failures += 1
+                failure_line = line
+            elif to == S_DONE:
+                state = "completed"
+        elif any(k in msg for k in CATCHUP_FAILED_MARKERS):
+            state = "failed"
+            failures += 1
+            failure_line = line
+        elif any(k in msg for k in CATCHUP_DONE_MARKERS):
+            state = "completed"
+    return {
+        "state": state,
+        "failures": failures,
+        "failure_line": None if failure_line is None else sanitize_text(failure_line, 600),
+    }
+
+
+def parse_catchup_file(path: str) -> dict:
+    """`parse_catchup_outcome` over a file; an unreadable file is "none"."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return parse_catchup_outcome(f)
+    except OSError:
+        return parse_catchup_outcome([])
+
+
 # --- broken-state scan --------------------------------------------------
 
 # Log sources that emit routine mainnet gossip rejections (user transactions

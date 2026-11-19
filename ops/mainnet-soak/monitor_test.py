@@ -1617,5 +1617,217 @@ class StallTextEscapingTest(unittest.TestCase):
         self.assertIn("no observable progress", stuck["halt_intro"])
 
 
+# --- Issue #2444: a failed / never-completed fast catchup is not "ok" --------
+
+CP_LABEL = "23155000#L7ARTGXHXEFMPZ6WZKDDN2WUFN6Z5LASCJ34FIEE7OF4AG5KGTOA"
+CP_MISMATCH = (
+    "ledger error: catchpoint hash mismatch; expected " + CP_LABEL
+    + ", file label 23155000#TNJ2AKLK5GCNV2BLZO36LQL6UP6W34RPWMDOBWBQR2P4ADWIZRZA"
+)
+
+# The node.log lines of aramidmain run 44513047958: the download completes,
+# the file's label mismatches, the live catchup fails and the node goes on
+# syncing from genesis.
+FAILED_CATCHUP_LOG = [
+    L("11:21:17.825478", "INFO", f'algo_ledger::sync: starting catchpoint sync catchpoint=Some("{CP_LABEL}") db=/x/ledger'),
+    L("11:21:17.825957", "INFO", "algo_ledger::sync: sync state transition from=Idle to=Downloading ledger snapshot", True),
+    L("11:21:18.937175", "INFO", "algo_rest_client::catchpoint_download: catchpoint download complete round=23155000 path=/x/catchpoint-23155000.tar.gz"),
+    L("11:21:18.937377", "INFO", f"algo_ledger::sync: sync state transition from=Downloading ledger snapshot to=Failed: {CP_MISMATCH}"),
+    L("11:21:18.937537", "WARN", f"algod_rust::live_catchup: live catchpoint catchup failed catchpoint={CP_LABEL} error={CP_MISMATCH}", True),
+    L("11:21:18.938769", "INFO", "algod_rust::commands::participate: reloaded ledger from disk after live catchpoint catchup round=134"),
+]
+
+# The node.log lines of the green aramidmain run 44130904945.
+COMPLETED_CATCHUP_LOG = [
+    L("16:58:50.391347", "INFO", "algo_ledger::sync: sync state transition from=Idle to=Downloading ledger snapshot"),
+    L("16:58:51.606383", "INFO", "algo_ledger::sync: sync state transition from=Downloading ledger snapshot to=Importing ledger into database"),
+    L("16:58:51.614306", "INFO", "algo_ledger::sync: sync state transition from=Importing ledger into database to=Verifying ledger integrity"),
+    L("16:58:51.618011", "INFO", "algo_ledger::sync: sync state transition from=Verifying ledger integrity to=Downloading lookback blocks"),
+    L("17:03:52.555003", "INFO", "algo_ledger::sync: sync state transition from=Downloading lookback blocks to=Replaying blocks"),
+    L("17:03:53.234311", "INFO", "algo_ledger::sync: sync state transition from=Replaying blocks to=Sync complete"),
+    L("17:03:53.234817", "INFO", f"algod_rust::live_catchup: live catchpoint catchup completed catchpoint={CP_LABEL}"),
+]
+
+
+def cp_sample(ts, label=CP_LABEL):
+    s = node_catchup(ts)
+    s["node"]["catchpoint"] = label
+    s["peer"]["last_round"] = 23158000
+    return s
+
+
+def failed_run_samples():
+    """run 44513047958's shape: one catchup sample, then the node follows
+    from genesis (advancing, so never `stuck`) far below the peer."""
+    samples = [cp_sample(1000.0)]
+    samples += [node_follow(1010.0 + i * 10, 135 + i * 600, 23158000 + i) for i in range(60)]
+    return samples
+
+
+def healthy_run_samples(at_tip=True):
+    """run 44130904945's shape: catchup, then follow from the catchpoint round."""
+    samples = [cp_sample(1000.0 + i * 10) for i in range(30)]
+    for i in range(60):
+        r = 23155000 + 100 + i
+        samples.append(node_follow(1300.0 + i * 10, r, r if at_tip else r + 500))
+    return samples
+
+
+def _write_log(d, lines):
+    path = os.path.join(d, "node.log")
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    return path
+
+
+class CatchupOutcomeLogTest(unittest.TestCase):
+    def test_failed_live_catchup_is_unrecovered_and_quotes_the_line(self):
+        o = nodelog.parse_catchup_outcome(FAILED_CATCHUP_LOG)
+        self.assertEqual(o["state"], "failed")
+        self.assertEqual(o["failures"], 2)
+        self.assertIn("live catchpoint catchup failed", o["failure_line"])
+        self.assertIn("catchpoint hash mismatch", o["failure_line"])
+        self.assertNotIn("\x1b", o["failure_line"])
+
+    def test_completed_catchup(self):
+        o = nodelog.parse_catchup_outcome(COMPLETED_CATCHUP_LOG)
+        self.assertEqual(o["state"], "completed")
+        self.assertEqual(o["failures"], 0)
+        self.assertIsNone(o["failure_line"])
+
+    def test_failure_then_retry_that_completes_is_completed(self):
+        o = nodelog.parse_catchup_outcome(FAILED_CATCHUP_LOG + COMPLETED_CATCHUP_LOG)
+        self.assertEqual(o["state"], "completed")
+        self.assertEqual(o["failures"], 2)
+
+    def test_failure_then_a_new_attempt_still_running_is_in_progress(self):
+        o = nodelog.parse_catchup_outcome(FAILED_CATCHUP_LOG + COMPLETED_CATCHUP_LOG[:2])
+        self.assertEqual(o["state"], "in_progress")
+
+    def test_no_catchup_lines(self):
+        self.assertEqual(nodelog.parse_catchup_outcome([])["state"], "none")
+        self.assertEqual(nodelog.parse_catchup_file("/no/such/node.log")["state"], "none")
+
+
+class CatchupFailedVerdictTest(unittest.TestCase):
+    """Issue #2444: aramidmain run 44513047958 was green although its fast
+    catchup failed and the node never reached the tip."""
+
+    def test_failed_catchup_in_the_log_fails_the_run(self):
+        samples = failed_run_samples()
+        self.assertEqual(monitor.classify(samples).status, "ok")  # no stall: the old verdict
+        outcome = nodelog.parse_catchup_outcome(FAILED_CATCHUP_LOG)
+        v = monitor.finalize_verdict(samples, monitor.classify(samples), outcome)
+        self.assertEqual(v.status, "catchup_failed")
+        self.assertEqual(monitor.exit_code_for(v), 1)
+        self.assertEqual(v.phase, "catchup")
+        self.assertEqual(v.round, 23155000)
+        self.assertIn("catchpoint hash mismatch", v.message)
+        self.assertIn("never reached the tip", v.message)
+
+    def test_failed_catchup_without_a_log_is_caught_from_the_samples(self):
+        # The catchpoint field cleared but the node is below the catchpoint
+        # round: the catchpoint was never applied.
+        samples = failed_run_samples()
+        v = monitor.finalize_verdict(samples, monitor.classify(samples), None)
+        self.assertEqual(v.status, "catchup_failed")
+        self.assertEqual(monitor.exit_code_for(v), 1)
+        self.assertIn("below the catchpoint round 23155000", v.message)
+
+    def test_failed_catchup_fails_even_if_genesis_sync_reached_the_tip(self):
+        samples = [cp_sample(1000.0), node_follow(1010.0, 23158000, 23158000)]
+        outcome = nodelog.parse_catchup_outcome(FAILED_CATCHUP_LOG)
+        v = monitor.finalize_verdict(samples, monitor.classify(samples), outcome)
+        self.assertEqual(v.status, "catchup_failed")
+        self.assertNotIn("never reached the tip", v.message)
+
+    def test_healthy_run_that_follows_the_tip_stays_ok(self):
+        samples = healthy_run_samples()
+        outcome = nodelog.parse_catchup_outcome(COMPLETED_CATCHUP_LOG)
+        v = monitor.finalize_verdict(samples, monitor.classify(samples), outcome)
+        self.assertEqual(v.status, "ok")
+        self.assertEqual(monitor.exit_code_for(v), 0)
+
+    def test_completed_catchup_still_following_behind_the_tip_stays_ok(self):
+        samples = healthy_run_samples(at_tip=False)
+        outcome = nodelog.parse_catchup_outcome(COMPLETED_CATCHUP_LOG)
+        v = monitor.finalize_verdict(samples, monitor.classify(samples), outcome)
+        self.assertEqual(v.status, "ok")
+
+    def test_slow_but_progressing_catchup_at_the_budget_end_stays_ok(self):
+        samples = [cp_sample(1000.0 + i * 10) for i in range(40)]
+        for i, s in enumerate(samples):
+            s["node"]["catchpoint_acquired_blocks"] = i
+        outcome = nodelog.parse_catchup_outcome(COMPLETED_CATCHUP_LOG[:2])
+        v = monitor.finalize_verdict(samples, monitor.classify(samples), outcome)
+        self.assertEqual(v.status, "ok")
+
+    def test_failure_then_successful_retry_stays_ok(self):
+        samples = healthy_run_samples()
+        outcome = nodelog.parse_catchup_outcome(FAILED_CATCHUP_LOG + COMPLETED_CATCHUP_LOG)
+        self.assertEqual(monitor.finalize_verdict(samples, monitor.classify(samples), outcome).status, "ok")
+
+    def test_halt_verdicts_keep_priority(self):
+        stuck = monitor.Verdict("stuck", "follow", 5, "x", 400.0)
+        outcome = nodelog.parse_catchup_outcome(FAILED_CATCHUP_LOG)
+        self.assertIs(monitor.finalize_verdict(failed_run_samples(), stuck, outcome), stuck)
+
+    def test_unparseable_label_without_log_evidence_stays_ok(self):
+        samples = [cp_sample(1000.0, label="x#y"), node_follow(1010.0, 100, 100)]
+        self.assertEqual(monitor.finalize_verdict(samples, monitor.classify(samples), None).status, "ok")
+
+    def test_analyze_cli_exits_1_and_reports_the_failure_line(self):
+        import contextlib
+        import io
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            jsonl = os.path.join(d, "status.jsonl")
+            with open(jsonl, "w", encoding="utf-8") as f:
+                for s in failed_run_samples():
+                    f.write(json.dumps(s) + "\n")
+            log = _write_log(d, FAILED_CATCHUP_LOG)
+            out = os.path.join(d, "summary.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = monitor.main(["analyze", jsonl, "--node-log", log, "--json-out", out])
+            with open(out, encoding="utf-8") as f:
+                r = json.load(f)
+        self.assertEqual(rc, 1)
+        self.assertEqual(r["status"], "catchup_failed")
+        self.assertFalse(r["reached_tip"])
+        self.assertEqual(r["catchup_outcome"]["state"], "failed")
+        self.assertIn("catchpoint hash mismatch", r["catchup_outcome"]["failure_line"])
+        lines = monitor.render_step_summary_lines(r, network="aramidmain")
+        verdict_line = [l for l in lines if l.startswith("**Verdict:**")][0]
+        self.assertIn("catchup_failed", verdict_line)
+        row = [l for l in lines if l.startswith("| Fast-catchup failure")]
+        self.assertEqual(len(row), 1)
+        self.assertIn("catchpoint hash mismatch", row[0])
+        self.assertEqual(row[0].count("|"), 3)
+
+    def test_analyze_cli_keeps_a_healthy_run_ok(self):
+        import contextlib
+        import io
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            jsonl = os.path.join(d, "status.jsonl")
+            with open(jsonl, "w", encoding="utf-8") as f:
+                for s in healthy_run_samples():
+                    f.write(json.dumps(s) + "\n")
+            log = _write_log(d, COMPLETED_CATCHUP_LOG)
+            out = os.path.join(d, "summary.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = monitor.main(["analyze", jsonl, "--node-log", log, "--json-out", out])
+            with open(out, encoding="utf-8") as f:
+                r = json.load(f)
+        self.assertEqual(rc, 0)
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(r["catchup_outcome"]["state"], "completed")
+        self.assertFalse([l for l in monitor.render_step_summary_lines(r) if l.startswith("| Fast-catchup failure")])
+
+
 if __name__ == "__main__":
     unittest.main()

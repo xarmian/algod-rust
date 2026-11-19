@@ -9,9 +9,11 @@
 # the same round before ever creating a new one, exactly the same
 # discipline `algod-issue-create` requires of a human filing one by hand.
 #
-# Only called for a `stuck`, `node_failure` or `invalid_block_stall` verdict
-# (`monitor.py`'s exit code 1) -- `source_outage` (exit 2) and `ok` (exit 0) never reach this
-# script; see `monitor.py`'s module doc comment for why.
+# Only called for a `stuck`, `node_failure`, `invalid_block_stall` or
+# `catchup_failed` verdict (`monitor.py`'s exit code 1) -- `source_outage`
+# (exit 2) and `ok` (exit 0) never reach this script; see `monitor.py`'s
+# module doc comment for why. A `catchup_failed` issue (issue #2444) quotes
+# the node.log failure line and dedups on `<network>-soak:catchup_failed`.
 #
 # `--dry-run` prints the exact title/labels/body this would file (or the
 # exact comment it would post, if a dedup match is found) instead of
@@ -33,7 +35,10 @@ from string import Formatter
 
 import nodelog
 
-FILED_STATUSES = ("stuck", "node_failure", "invalid_block_stall")
+FILED_STATUSES = ("stuck", "node_failure", "invalid_block_stall", "catchup_failed")
+# Issue #2444: a failed fast catchup dedups on its kind, not on the
+# catchpoint round, which is a new one every night.
+CATCHUP_FAILED = "catchup_failed"
 
 DEFAULT_NETWORK = "mainnet"
 DEDUP_LABEL = "mainnet-soak"
@@ -78,7 +83,16 @@ def build_fields(
     stalled_s = verdict.get("stalled_since_s")
     catchpoint_label = verdict.get("catchpoint_label")
     stall = verdict.get("invalid_block_stall")
-    if stall:
+    catchup_failed = verdict.get("status") == CATCHUP_FAILED
+    failure_line = ((verdict.get("catchup_outcome") or {}).get("failure_line")) or ""
+    if catchup_failed:
+        halt_intro = (
+            "**failed its fast catchup**: the catchpoint was never applied, so the node fell back "
+            "to syncing block by block instead of following the tip (failure line below; "
+            "a `catchpoint hash mismatch` can also mean the serving relay's file is inconsistent "
+            "with the label the catchup peer announced, see issue #2444)."
+        )
+    elif stall:
         halt_intro = (
             f"reported **`stalled-on-invalid-block`** during `{phase}`: it is stuck on a "
             "block that deterministically fails to apply, while the catchup peer's own "
@@ -93,6 +107,12 @@ def build_fields(
     return {
         "network": network,
         "soak_name": dedup_label(network),
+        "dedup_marker": dedup_marker(round_, network, verdict.get("status")),
+        "catchup_failure_line": (
+            "\n- Fast-catchup failure (node.log): `" + nodelog.sanitize_text(failure_line, 600) + "`"
+            if catchup_failed and failure_line
+            else ""
+        ),
         "soak_workflow": f"{network}-node-soak.yml",
         "halt_intro": halt_intro,
         "invalid_block_stall_line": (
@@ -119,19 +139,32 @@ def build_fields(
     }
 
 
-def issue_title(round_, network: str = DEFAULT_NETWORK) -> str:
+def dedup_marker(round_, network: str = DEFAULT_NETWORK, status=None) -> str:
+    """The body marker an open issue for the same failure carries:
+    `<network>-soak:round=<round>` for a halt, `<network>-soak:catchup_failed`
+    for a failed fast catchup (issue #2444)."""
+    if status == CATCHUP_FAILED:
+        return f"{dedup_label(network)}:{CATCHUP_FAILED}"
+    return f"{dedup_label(network)}:round={round_ if round_ is not None else 'unknown'}"
+
+
+def issue_title(round_, network: str = DEFAULT_NETWORK, status=None) -> str:
     r = round_ if round_ is not None else "unknown"
     from datetime import date
 
+    if status == CATCHUP_FAILED:
+        return f"sync: {network} fast catchup failed for catchpoint round {r} — nightly {network} soak {date.today().isoformat()}"
     return f"sync: {network} participation node halted at round {r} — nightly {network} soak {date.today().isoformat()}"
 
 
-def find_existing_issue(repo: str, round_, network: str = DEFAULT_NETWORK) -> dict | None:
+def find_existing_issue(repo: str, round_, network: str = DEFAULT_NETWORK, marker=None) -> dict | None:
     """Search open issues labelled `<network>-soak` for the dedup marker for
-    this round. Returns the matching issue's {"number", "url"} or None."""
-    if round_ is None:
-        return None
-    marker = f"{dedup_label(network)}:round={round_}"
+    this round (or the explicit `marker`). Returns the matching issue's
+    {"number", "url"} or None."""
+    if marker is None:
+        if round_ is None:
+            return None
+        marker = f"{dedup_label(network)}:round={round_}"
     result = subprocess.run(
         [
             "gh",
@@ -185,16 +218,28 @@ def file_or_comment(
     round_ = verdict.get("round")
     fields = build_fields(verdict, run_url, artifacts_url, log_excerpt, peer_url, network)
     body = render_template(template_path, fields)
-    title = issue_title(round_, network)
+    status = verdict.get("status")
+    title = issue_title(round_, network, status)
 
-    existing = find_existing_issue(repo, round_, network)
-    comment_body = (
-        f"Another nightly {network} soak run hit the same halt.\n\n"
-        f"- Run: {run_url}\n"
-        f"- Artifacts: {artifacts_url}\n"
-        f"- Phase: {verdict.get('phase')}, stalled for "
-        f"{fields['stalled_minutes']} minutes\n"
-    )
+    marker = fields["dedup_marker"] if status == CATCHUP_FAILED else None
+    existing = find_existing_issue(repo, round_, network, marker)
+    if status == CATCHUP_FAILED:
+        comment_body = (
+            f"Another nightly {network} soak run's fast catchup failed (catchpoint "
+            f"`{fields['catchpoint_label']}`).\n\n"
+            f"- Run: {run_url}\n"
+            f"- Artifacts: {artifacts_url}\n"
+            f"- Verdict: {nodelog.sanitize_text(verdict.get('message') or '', 900)}\n"
+            f"{fields['catchup_failure_line'].lstrip()}\n"
+        )
+    else:
+        comment_body = (
+            f"Another nightly {network} soak run hit the same halt.\n\n"
+            f"- Run: {run_url}\n"
+            f"- Artifacts: {artifacts_url}\n"
+            f"- Phase: {verdict.get('phase')}, stalled for "
+            f"{fields['stalled_minutes']} minutes\n"
+        )
 
     if existing:
         if dry_run:

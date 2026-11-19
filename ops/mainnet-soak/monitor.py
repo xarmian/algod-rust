@@ -64,11 +64,24 @@
 #   3. STUCK -- the node's signature is frozen for `halt_minutes` while the
 #      peer's `last-round` kept advancing (proving the network was alive
 #      and the node fell behind). Exit 1 (issue-worthy).
-#   4. OK -- no stall observed. Exit 0. Includes a node that is still
+#   4. CATCHUP_FAILED (issue #2444) -- judged once, at the end of the run,
+#      by `finalize_verdict()` and only when 1-3 did not fire: the fast
+#      catchup failed or ended without applying the catchpoint. Evidence is
+#      node.log's catchup outcome (`nodelog.parse_catchup_outcome`: the last
+#      attempt failed, e.g. `live catchpoint catchup failed ... catchpoint
+#      hash mismatch`, and no later attempt completed or is running) or, with
+#      no log, the samples (the `catchpoint` field cleared while the node's
+#      `last-round` is still below the catchpoint round). Exit 1
+#      (issue-worthy); round = the catchpoint round, the failure line is
+#      quoted in the message. A node that syncs from genesis after such a
+#      failure keeps advancing, so it is never "stuck", and was reported ok
+#      before this rule (aramidmain run 44513047958).
+#   5. OK -- no stall observed. Exit 0. Includes a node that is still
 #      catching up when the run's time budget runs out, as long as it was
 #      making progress the whole time -- "didn't finish in the budget" is
 #      not the same claim as "got stuck," and conflating them would turn a
-#      slow-but-working run into a false-positive issue.
+#      slow-but-working run into a false-positive issue. Also a node whose
+#      catchup completed and that is still following behind the tip.
 #
 # Follow window (`--follow-minutes`): once the node is first seen at the tip,
 # `collect()` keeps polling for that many more minutes and then ends "ok";
@@ -148,7 +161,7 @@ TIP_SLACK_ROUNDS = 2
 Verdict = namedtuple(
     "Verdict",
     [
-        "status",  # "ok" | "stuck" | "source_outage" | "node_failure" | "invalid_block_stall"
+        "status",  # "ok" | "stuck" | "source_outage" | "node_failure" | "invalid_block_stall" | "catchup_failed"
         "phase",  # "catchup" | "follow" | None (node_failure with no samples)
         "round",  # int | None -- the round to report/dedup on
         "message",  # human-readable one-liner
@@ -477,12 +490,68 @@ def verdict_context(samples: list, verdict: Verdict) -> dict:
     }
 
 
+def label_round(label):
+    """The round of a `ROUND#HASH` catchpoint label, or None."""
+    head = (label or "").partition("#")[0].strip()
+    return int(head) if head.isdigit() else None
+
+
+def finalize_verdict(samples: list, verdict: Verdict, catchup_outcome: "dict | None") -> Verdict:
+    """End-of-run check (issue #2444): turn an "ok" verdict into
+    "catchup_failed" when the fast catchup failed or ended without applying
+    the catchpoint. `catchup_outcome` is `nodelog.parse_catchup_outcome`'s
+    result, or None without a node.log. Halt verdicts are returned as is.
+    A catchup still running at the end (the last sample shows `catchpoint`)
+    or one that completed is left "ok"."""
+    if verdict.status != "ok":
+        return verdict
+    ctx = verdict_context(samples, verdict)
+    label = ctx["catchpoint_label"]
+    cp_round = label_round(label)
+    node_round, peer_round = ctx["node_last_round"], ctx["peer_last_round"]
+    reached_tip = any(at_tip(s) for s in samples)
+    tail = (
+        f" Node last-round {node_round}, peer last-round {peer_round}"
+        + ("" if reached_tip else "; the node never reached the tip")
+        + "."
+    )
+    outcome = catchup_outcome or {}
+    if outcome.get("state") == "failed":
+        line = outcome.get("failure_line") or "(no failure line)"
+        return Verdict(
+            "catchup_failed",
+            "catchup",
+            cp_round,
+            f"fast catchup failed (catchpoint {label or 'unknown'}): {line}.{tail}",
+            None,
+        )
+    last = next((s for s in reversed(samples) if (s.get("node") or {}).get("ok")), None)
+    if (
+        last is not None
+        and not (last["node"].get("catchpoint") or "")
+        and cp_round is not None
+        and isinstance(last["node"].get("last_round"), int)
+        and last["node"]["last_round"] < cp_round
+        and outcome.get("state") != "completed"
+    ):
+        return Verdict(
+            "catchup_failed",
+            "catchup",
+            cp_round,
+            f"fast catchup ended without applying catchpoint {label}: the node is at round "
+            f"{last['node']['last_round']}, below the catchpoint round {cp_round}.{tail}",
+            None,
+        )
+    return verdict
+
+
 def exit_code_for(verdict: Verdict) -> int:
     return {
         "ok": 0,
         "stuck": 1,
         "node_failure": 1,
         "invalid_block_stall": 1,
+        "catchup_failed": 1,
         "source_outage": 2,
     }[verdict.status]
 
@@ -1174,6 +1243,11 @@ def render_step_summary_lines(r: dict, network: str = "mainnet") -> list:
     if window:
         lines.append(lag_row("Lag before stall (rounds)", lag_before))
         lines.append(f"| Stall window | {window.get('seconds')} s from ts {window.get('start_ts')} |")
+    outcome = r.get("catchup_outcome") or {}
+    if outcome.get("state") == "failed":
+        lines.append(
+            f"| Fast-catchup failure | {nodelog.sanitize_text(outcome.get('failure_line') or '', 600, table=True)} |"
+        )
     stall = r.get("invalid_block_stall")
     if stall:
         lines.append(f"| stalled-on-invalid-block | {nodelog.format_stall(stall, table=True)} |")
@@ -1262,13 +1336,24 @@ def _emit(result: dict, json_out: str | None):
             json.dump(result, f, indent=2)
 
 
+def _finish(samples: list, verdict: Verdict, follow_minutes: float, node_log, json_out) -> int:
+    """Shared tail of `analyze` and `collect`: the end-of-run catchup check
+    (issue #2444), the result JSON and the exit code."""
+    outcome = nodelog.parse_catchup_file(node_log) if node_log else None
+    verdict = finalize_verdict(samples, verdict, outcome)
+    result = build_result(samples, verdict, follow_minutes, node_log)
+    if outcome is not None:
+        result["catchup_outcome"] = outcome
+    _emit(result, json_out)
+    return exit_code_for(verdict)
+
+
 def _cmd_analyze(args):
     samples = _load_jsonl(args.jsonl)
     verdict = classify(
         samples, args.halt_minutes, args.verify_halt_minutes, args.post_verify_halt_minutes
     )
-    _emit(build_result(samples, verdict, 0.0, args.node_log), args.json_out)
-    return exit_code_for(verdict)
+    return _finish(samples, verdict, 0.0, args.node_log, args.json_out)
 
 
 def _cmd_collect(args):
@@ -1287,8 +1372,7 @@ def _cmd_collect(args):
         follow_s=args.follow_minutes * 60.0,
     )
     samples = _load_jsonl(args.out)
-    _emit(build_result(samples, verdict, args.follow_minutes, args.node_log), args.json_out)
-    return exit_code_for(verdict)
+    return _finish(samples, verdict, args.follow_minutes, args.node_log, args.json_out)
 
 
 def _cmd_scan_log(args):

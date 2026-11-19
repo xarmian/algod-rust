@@ -273,10 +273,35 @@ non-numeric or 0 means 1). The workflow passes every dispatch input to the
 run-parameters script through `env:` rather than interpolating it into the
 shell text.
 
+## Failed fast catchup (`catchup_failed`, issue #2444)
+
+A node whose fast catchup fails falls back to syncing block by block from
+genesis. Its `last-round` keeps advancing, so it is never "stuck", and
+before issue #2444 such a run ended `ok` with `reached_tip: false`
+(aramidmain run 44513047958: `catchpoint hash mismatch; expected
+23155000#L7AR..., file label 23155000#TNJ2...`). At the end of the run,
+`monitor.py`'s `finalize_verdict()` therefore turns an `ok` verdict into
+`catchup_failed` (exit 1, issue-worthy) when:
+
+- node.log's catchup outcome (`nodelog.parse_catchup_outcome`) is
+  `failed`: the last attempt logged `live catchpoint catchup failed` or a
+  sync `to=Failed:` transition, and no later attempt completed or started;
+  or
+- without that log evidence, the samples show the `catchpoint` field
+  cleared while the node's `last-round` is still below the catchpoint
+  round (the catchpoint was never applied).
+
+The verdict's round is the catchpoint round and its message quotes the
+failure line, which the step summary (`Fast-catchup failure` row) and the
+issue body repeat; the issue dedups on `<network>-soak:catchup_failed`, since
+the catchpoint round changes every night. A catchup that is still running
+when the budget ends, and one that completed and is still following behind
+the tip, stay `ok`. A failure followed by a retry that completes stays `ok`.
+
 ## Auto-filed issues
 
-Only a `stuck` or `node_failure` verdict files anything
-(`ops/mainnet-soak/file_issue.py`). It first searches open issues labelled
+Only a `stuck`, `node_failure`, `invalid_block_stall` or `catchup_failed`
+verdict files anything (`ops/mainnet-soak/file_issue.py`). It first searches open issues labelled
 `mainnet-soak` for a `<!-- mainnet-soak:round=N -->` marker matching the
 halted round; if found, it comments with the new run's link instead of
 opening a duplicate. Otherwise it creates one from
