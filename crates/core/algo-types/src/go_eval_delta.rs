@@ -45,22 +45,11 @@ use std::collections::BTreeMap;
 use algo_error::{AlgoError, Result};
 
 use crate::rmp_decode::{
-    self, read_bytes_go_compat, read_fixed_bytes_into_go_compat, read_key_bytes, read_slice_into,
-    read_struct_map_len, read_u64, unknown_key,
+    self, bounds, read_bytes_go_compat, read_fixed_bytes_into_go_compat, read_key_bytes,
+    read_slice_into, read_struct_map_len, read_u64, unknown_key,
 };
 use crate::{Address, SignedTransaction};
 
-/// `bounds.MaxStateDeltaKeys` (`MaxAppProgramLen`, 2048 since v28).
-const MAX_STATE_DELTA_KEYS: usize = 2048;
-/// `bounds.MaxEvalDeltaAccounts` (`MaxAppProgramLen`).
-const MAX_EVAL_DELTA_ACCOUNTS: usize = 2048;
-/// `bounds.MaxLogCalls` (`MaxAppProgramLen`).
-const MAX_LOG_CALLS: usize = 2048;
-/// `bounds.MaxInnerTransactionsPerDelta` (`MaxInnerTransactions *
-/// MaxTxGroupSize`, 16 * 16).
-const MAX_INNER_TRANSACTIONS_PER_DELTA: usize = 256;
-/// `bounds.MaxAppBytesValueLen` (128 since v28).
-const MAX_APP_BYTES_VALUE_LEN: usize = 128;
 /// `protocol.NumStateProofTypes`.
 const NUM_STATE_PROOF_TYPES: usize = 1;
 /// `crypto.MaxHashDigestSize` (`SumhashDigestSize`).
@@ -136,7 +125,7 @@ impl ValueDelta {
         for _ in 0..n {
             match read_key_bytes(rd)? {
                 b"at" => v.action = read_u64(rd)?,
-                b"bs" => v.bytes = read_bounded_string(rd, MAX_APP_BYTES_VALUE_LEN)?,
+                b"bs" => v.bytes = read_bounded_string(rd, bounds::MAX_APP_BYTES_VALUE_LEN.get())?,
                 b"ui" => v.uint = read_u64(rd)?,
                 other => unknown_key(rd, other)?,
             }
@@ -171,8 +160,12 @@ type StateDelta = Option<BTreeMap<Vec<u8>, ValueDelta>>;
 /// entries are added, each value fresh.
 fn state_delta_decode_into(rd: &mut &[u8], sd: &mut StateDelta) -> Result<()> {
     let (n, nil) = read_map_header(rd)?;
-    if n > MAX_STATE_DELTA_KEYS {
-        return Err(overflow("StateDelta", n, MAX_STATE_DELTA_KEYS));
+    if n > bounds::MAX_STATE_DELTA_KEYS.get() {
+        return Err(overflow(
+            "StateDelta",
+            n,
+            bounds::MAX_STATE_DELTA_KEYS.get(),
+        ));
     }
     if nil {
         *sd = None;
@@ -226,8 +219,12 @@ impl EvalDelta {
                 b"gd" => state_delta_decode_into(rd, &mut d.global)?,
                 b"ld" => {
                     let (n, nil) = read_map_header(rd)?;
-                    if n > MAX_EVAL_DELTA_ACCOUNTS {
-                        return Err(overflow("LocalDeltas", n, MAX_EVAL_DELTA_ACCOUNTS));
+                    if n > bounds::MAX_EVAL_DELTA_ACCOUNTS.get() {
+                        return Err(overflow(
+                            "LocalDeltas",
+                            n,
+                            bounds::MAX_EVAL_DELTA_ACCOUNTS.get(),
+                        ));
                     }
                     if nil {
                         d.local = None;
@@ -245,22 +242,28 @@ impl EvalDelta {
                     read_slice_into(
                         rd,
                         &mut d.shared_accts,
-                        MAX_EVAL_DELTA_ACCOUNTS,
+                        bounds::MAX_EVAL_DELTA_ACCOUNTS.get(),
                         Address::default,
                         |rd, a| read_fixed_bytes_into_go_compat(rd, &mut a.0),
                     )?;
                 }
                 b"lg" => {
-                    read_slice_into(rd, &mut d.logs, MAX_LOG_CALLS, Vec::new, |rd, l| {
-                        *l = read_go_string(rd)?;
-                        Ok(())
-                    })?;
+                    read_slice_into(
+                        rd,
+                        &mut d.logs,
+                        bounds::MAX_LOG_CALLS.get(),
+                        Vec::new,
+                        |rd, l| {
+                            *l = read_go_string(rd)?;
+                            Ok(())
+                        },
+                    )?;
                 }
                 b"itx" => {
                     read_slice_into(
                         rd,
                         &mut d.inner,
-                        MAX_INNER_TRANSACTIONS_PER_DELTA,
+                        bounds::MAX_INNER_TRANSACTIONS_PER_DELTA.get(),
                         SignedTransaction::default,
                         |rd, t| SignedTransaction::decode_into(rd, t, false),
                     )?;
@@ -519,10 +522,7 @@ pub(crate) fn read_state_proof_tracking_into(
 /// without building it. Anything else, including any input go would reject,
 /// returns `None` and takes the decoding path, which also gives go's verdict.
 mod canonical {
-    use super::{
-        MAX_APP_BYTES_VALUE_LEN, MAX_EVAL_DELTA_ACCOUNTS, MAX_INNER_TRANSACTIONS_PER_DELTA,
-        MAX_LOG_CALLS, MAX_STATE_DELTA_KEYS,
-    };
+    use crate::rmp_decode::bounds;
     use crate::SignedTransaction;
 
     fn be(b: &[u8], i: usize, n: usize) -> Option<usize> {
@@ -618,7 +618,7 @@ mod canonical {
             let (k, j) = key(b, i, &["at", "bs", "ui"], &mut after)?;
             i = if k == 1 {
                 let (r, j) = string(b, j)?;
-                (!r.is_empty() && r.len() <= MAX_APP_BYTES_VALUE_LEN).then_some(j)?
+                (!r.is_empty() && r.len() <= bounds::MAX_APP_BYTES_VALUE_LEN.get()).then_some(j)?
             } else {
                 uint(b, j)?.1
             };
@@ -630,7 +630,7 @@ mod canonical {
     /// only where go writes an empty map (`ld` values; `gd` is omitted then).
     fn state_delta(b: &[u8], i: usize, non_empty: bool) -> Option<usize> {
         let (n, mut i) = map(b, i)?;
-        if (non_empty && n == 0) || n > MAX_STATE_DELTA_KEYS {
+        if (non_empty && n == 0) || n > bounds::MAX_STATE_DELTA_KEYS.get() {
             return None;
         }
         let mut prev: Option<std::ops::Range<usize>> = None;
@@ -656,7 +656,7 @@ mod canonical {
                 0 => state_delta(b, j, true)?,
                 1 => {
                     let (m, mut j) = array(b, j)?;
-                    if m == 0 || m > MAX_INNER_TRANSACTIONS_PER_DELTA {
+                    if m == 0 || m > bounds::MAX_INNER_TRANSACTIONS_PER_DELTA.get() {
                         return None;
                     }
                     for _ in 0..m {
@@ -673,7 +673,7 @@ mod canonical {
                 }
                 2 => {
                     let (m, mut j) = map(b, j)?;
-                    if m == 0 || m > MAX_EVAL_DELTA_ACCOUNTS {
+                    if m == 0 || m > bounds::MAX_EVAL_DELTA_ACCOUNTS.get() {
                         return None;
                     }
                     let mut prev = None;
@@ -697,7 +697,7 @@ mod canonical {
                 }
                 3 => {
                     let (m, mut j) = array(b, j)?;
-                    if m == 0 || m > MAX_LOG_CALLS {
+                    if m == 0 || m > bounds::MAX_LOG_CALLS.get() {
                         return None;
                     }
                     for _ in 0..m {
@@ -707,7 +707,7 @@ mod canonical {
                 }
                 _ => {
                     let (m, mut j) = array(b, j)?;
-                    if m == 0 || m > MAX_EVAL_DELTA_ACCOUNTS {
+                    if m == 0 || m > bounds::MAX_EVAL_DELTA_ACCOUNTS.get() {
                         return None;
                     }
                     for _ in 0..m {

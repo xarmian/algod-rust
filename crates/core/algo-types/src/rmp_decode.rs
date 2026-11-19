@@ -125,7 +125,9 @@ pub const MAX_PQ_SIGNATURE_SIZE: usize = 1538;
 // `ReadArrayHeaderBytes`, `ReadMapHeaderBytes`) and fails with
 // `msgp.ErrOverflow` when it is larger, before reading the value. The
 // `bounds.*` values are what `config.checkSetAllocBounds` computes, the
-// maximum over every consensus version (vFuture included).
+// maximum over every built-in consensus version (vFuture included); the
+// consensus-derived ones are checked through their live copy in [`bounds`],
+// which a loaded `consensus.json` can raise (issue #2439).
 
 /// `bounds.MaxGenesisIDLen`: `gen` of a transaction and a block header.
 pub const MAX_GENESIS_ID_LEN: usize = 128;
@@ -178,6 +180,122 @@ pub const MAX_PAYSET_LEN: usize = 100_000;
 /// `bounds.MaxVoteThreshold` (the largest committee threshold, 7750):
 /// elements of a bundle's `vote` and `eqv`.
 pub const MAX_VOTE_THRESHOLD: usize = 7750;
+
+/// go's consensus-derived msgp allocation bounds (`config/bounds`), live.
+///
+/// go's `bounds.*` are package variables, not constants: `config.init` sets
+/// each to the maximum over the built-in consensus table, and
+/// `SetConfigurableConsensusProtocols` (a `<data_dir>/consensus.json`) raises
+/// them again over every loaded protocol (`checkSetAllocBounds`, only ever
+/// upwards). A network whose custom protocol allows more than any built-in
+/// one (aramidmain: 131072-byte notes, issue #2439) is decoded with the larger
+/// bound. Each static here starts at its built-in-table value (the `MAX_*`
+/// constant of the same name above) and is raised by
+/// [`crate::consensus::check_set_alloc_bounds`]. The bounds below are the
+/// ones algod-rust's readers check; the other `bounds.*` (`MaxTxGroupSize`,
+/// `MaxAppTotalArgLen`, ...) only size go's `MaxSize` functions.
+pub mod bounds {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// One go `bounds.*` variable.
+    #[derive(Debug)]
+    pub struct AllocBound(AtomicUsize);
+
+    impl AllocBound {
+        const fn new(v: usize) -> Self {
+            Self(AtomicUsize::new(v))
+        }
+
+        /// The current bound.
+        #[inline]
+        pub fn get(&self) -> usize {
+            self.0.load(Ordering::Relaxed)
+        }
+
+        /// go's `checkSetMax(value, &bound)`.
+        pub(crate) fn raise(&self, v: usize) {
+            self.0.fetch_max(v, Ordering::Relaxed);
+        }
+
+        /// go's plain assignment (`bounds.MaxAvailableAppProgramLen = ...`).
+        pub(crate) fn set(&self, v: usize) {
+            self.0.store(v, Ordering::Relaxed);
+        }
+    }
+
+    /// `bounds.MaxVoteThreshold`.
+    pub static MAX_VOTE_THRESHOLD: AllocBound = AllocBound::new(super::MAX_VOTE_THRESHOLD);
+    /// `bounds.MaxStateDeltaKeys` (`MaxAppProgramLen`).
+    pub static MAX_STATE_DELTA_KEYS: AllocBound = AllocBound::new(2048);
+    /// `bounds.MaxEvalDeltaAccounts` (`MaxAppProgramLen`).
+    pub static MAX_EVAL_DELTA_ACCOUNTS: AllocBound = AllocBound::new(2048);
+    /// `bounds.MaxAppProgramLen`.
+    pub static MAX_APP_PROGRAM_LEN: AllocBound = AllocBound::new(2048);
+    /// `bounds.MaxLogicSigMaxSize`.
+    pub static MAX_LOGIC_SIG_MAX_SIZE: AllocBound = AllocBound::new(super::MAX_LOGIC_SIG_MAX_SIZE);
+    /// `bounds.MaxTxnNoteBytes`.
+    pub static MAX_TXN_NOTE_BYTES: AllocBound = AllocBound::new(super::MAX_TXN_NOTE_BYTES);
+    /// `bounds.MaxBytesKeyValueLen`.
+    pub static MAX_BYTES_KEY_VALUE_LEN: AllocBound =
+        AllocBound::new(super::MAX_BYTES_KEY_VALUE_LEN);
+    /// `bounds.MaxExtraAppProgramLen` (`MaxAbsoluteExtraProgramPages`).
+    pub static MAX_EXTRA_APP_PROGRAM_LEN: AllocBound = AllocBound::new(7);
+    /// `bounds.MaxAvailableAppProgramLen`.
+    pub static MAX_AVAILABLE_APP_PROGRAM_LEN: AllocBound =
+        AllocBound::new(super::MAX_AVAILABLE_APP_PROGRAM_LEN);
+    /// `bounds.MaxLogCalls` (`MaxAppProgramLen`).
+    pub static MAX_LOG_CALLS: AllocBound = AllocBound::new(2048);
+    /// `bounds.MaxInnerTransactionsPerDelta`.
+    pub static MAX_INNER_TRANSACTIONS_PER_DELTA: AllocBound = AllocBound::new(256);
+    /// `bounds.MaxProposedExpiredOnlineAccounts`.
+    pub static MAX_PROPOSED_EXPIRED_ONLINE_ACCOUNTS: AllocBound = AllocBound::new(32);
+    /// `bounds.MaxMarkAbsent`.
+    pub static MAX_MARK_ABSENT: AllocBound = AllocBound::new(32);
+    /// `bounds.MaxAssetNameBytes`.
+    pub static MAX_ASSET_NAME_BYTES: AllocBound = AllocBound::new(super::MAX_ASSET_NAME_BYTES);
+    /// `bounds.MaxAssetUnitNameBytes`.
+    pub static MAX_ASSET_UNIT_NAME_BYTES: AllocBound =
+        AllocBound::new(super::MAX_ASSET_UNIT_NAME_BYTES);
+    /// `bounds.MaxAssetURLBytes`.
+    pub static MAX_ASSET_URL_BYTES: AllocBound = AllocBound::new(super::MAX_ASSET_URL_BYTES);
+    /// `bounds.MaxAppBytesValueLen`.
+    pub static MAX_APP_BYTES_VALUE_LEN: AllocBound = AllocBound::new(128);
+    /// `bounds.MaxAppAccess`.
+    pub static MAX_APP_ACCESS: AllocBound = AllocBound::new(super::MAX_APP_ACCESS);
+
+    /// Every bound, by its go name (tests and diagnostics).
+    pub fn snapshot() -> Vec<(&'static str, usize)> {
+        vec![
+            ("MaxVoteThreshold", MAX_VOTE_THRESHOLD.get()),
+            ("MaxStateDeltaKeys", MAX_STATE_DELTA_KEYS.get()),
+            ("MaxEvalDeltaAccounts", MAX_EVAL_DELTA_ACCOUNTS.get()),
+            ("MaxAppProgramLen", MAX_APP_PROGRAM_LEN.get()),
+            ("MaxLogicSigMaxSize", MAX_LOGIC_SIG_MAX_SIZE.get()),
+            ("MaxTxnNoteBytes", MAX_TXN_NOTE_BYTES.get()),
+            ("MaxBytesKeyValueLen", MAX_BYTES_KEY_VALUE_LEN.get()),
+            ("MaxExtraAppProgramLen", MAX_EXTRA_APP_PROGRAM_LEN.get()),
+            (
+                "MaxAvailableAppProgramLen",
+                MAX_AVAILABLE_APP_PROGRAM_LEN.get(),
+            ),
+            ("MaxLogCalls", MAX_LOG_CALLS.get()),
+            (
+                "MaxInnerTransactionsPerDelta",
+                MAX_INNER_TRANSACTIONS_PER_DELTA.get(),
+            ),
+            (
+                "MaxProposedExpiredOnlineAccounts",
+                MAX_PROPOSED_EXPIRED_ONLINE_ACCOUNTS.get(),
+            ),
+            ("MaxMarkAbsent", MAX_MARK_ABSENT.get()),
+            ("MaxAssetNameBytes", MAX_ASSET_NAME_BYTES.get()),
+            ("MaxAssetUnitNameBytes", MAX_ASSET_UNIT_NAME_BYTES.get()),
+            ("MaxAssetURLBytes", MAX_ASSET_URL_BYTES.get()),
+            ("MaxAppBytesValueLen", MAX_APP_BYTES_VALUE_LEN.get()),
+            ("MaxAppAccess", MAX_APP_ACCESS.get()),
+        ]
+    }
+}
 
 // ── Skip value ─────────────────────────────────────────────────
 

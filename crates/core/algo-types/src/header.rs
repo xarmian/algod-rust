@@ -295,12 +295,6 @@ impl Default for BlockHeader {
 /// Type alias for decoder methods to avoid shadowing serde's Result usage.
 type DecodeResult<T> = algo_error::Result<T>;
 
-/// `bounds.MaxProposedExpiredOnlineAccounts` (32 since v31): go's
-/// `allocbound` of `partupdrmv`.
-pub(crate) const MAX_PROPOSED_EXPIRED_ONLINE_ACCOUNTS: usize = 32;
-/// `bounds.MaxMarkAbsent` (`Payouts.MaxMarkAbsent`, 32): `partupdabs`.
-pub(crate) const MAX_MARK_ABSENT: usize = 32;
-
 /// A `basics.Address` slice element, read with `ReadExactBytes` into the
 /// element already there.
 pub(crate) fn read_address_elem_into(rd: &mut &[u8], e: &mut Address) -> DecodeResult<()> {
@@ -399,14 +393,14 @@ macro_rules! header_key_match {
             (10, b'p') if $key == b"partupdrmv" => rmp_decode::read_slice_into_opt(
                 $rd,
                 &mut $h.expired_participation_accounts,
-                $crate::header::MAX_PROPOSED_EXPIRED_ONLINE_ACCOUNTS,
+                $crate::rmp_decode::bounds::MAX_PROPOSED_EXPIRED_ONLINE_ACCOUNTS.get(),
                 Address::default,
                 $crate::header::read_address_elem_into,
             )?,
             (10, b'p') if $key == b"partupdabs" => rmp_decode::read_slice_into_opt(
                 $rd,
                 &mut $h.absent_participation_accounts,
-                $crate::header::MAX_MARK_ABSENT,
+                $crate::rmp_decode::bounds::MAX_MARK_ABSENT.get(),
                 Address::default,
                 $crate::header::read_address_elem_into,
             )?,

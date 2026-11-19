@@ -33,9 +33,10 @@
 
 use algo_error::{AlgoError, Result};
 
+use crate::rmp_decode::bounds::{self, AllocBound};
 use crate::rmp_decode::{
     alloc_bounds_checked, no_matching_field_error, read_fixed_bytes_go_compat,
-    read_go_array_header, read_key_bytes, read_map_len, read_u64, MAX_VOTE_THRESHOLD,
+    read_go_array_header, read_key_bytes, read_map_len, read_u64,
 };
 
 /// go's struct layout of a msgp value.
@@ -50,7 +51,7 @@ pub(crate) enum Sch {
     /// A struct: exactly these keys.
     Struct(&'static [(&'static str, Sch)]),
     /// A slice of at most this many elements (its `allocbound`, issue #2427).
-    Arr(usize, &'static Sch),
+    Arr(&'static AllocBound, &'static Sch),
     /// Another schema, by reference (statics cannot embed each other by value).
     Ref(&'static Sch),
 }
@@ -94,9 +95,10 @@ pub(crate) fn validate(rd: &mut &[u8], sch: &Sch) -> Result<()> {
             Ok(())
         }
         Sch::Arr(bound, v) => {
+            let bound = bound.get();
             let (n, _) = read_go_array_header(rd)?;
             // go's `msgp.ErrOverflow`, before reading an element
-            if n > *bound && alloc_bounds_checked() {
+            if n > bound && alloc_bounds_checked() {
                 return Err(err(&format!(
                     "array of {n} exceeds the allocation bound {bound}"
                 )));
@@ -143,6 +145,6 @@ pub(crate) static CERTIFICATE: Sch = Sch::Struct(&[
     ("per", Sch::Uint),
     ("step", Sch::Uint),
     ("prop", Sch::Ref(&PROPOSAL_VALUE)),
-    ("vote", Sch::Arr(MAX_VOTE_THRESHOLD, &VOTE_AUTH)),
-    ("eqv", Sch::Arr(MAX_VOTE_THRESHOLD, &EQV_AUTH)),
+    ("vote", Sch::Arr(&bounds::MAX_VOTE_THRESHOLD, &VOTE_AUTH)),
+    ("eqv", Sch::Arr(&bounds::MAX_VOTE_THRESHOLD, &EQV_AUTH)),
 ]);

@@ -942,9 +942,12 @@ fn read_bool(cursor: &mut Cursor<&[u8]>) -> Result<bool, CodecError> {
 
 type GoResult<T> = algo_error::Result<T>;
 
-/// go's `bounds.MaxVoteThreshold` (7750, issue #2427): the `allocbound` of a
+/// go's `bounds.MaxVoteThreshold` (7750 for the built-in protocols, issue
+/// #2427; raised by a loaded `consensus.json`, #2439): the `allocbound` of a
 /// bundle's votes / equivocation votes.
-const MAX_BUNDLE_ARRAY_LEN: usize = go_msgp::MAX_VOTE_THRESHOLD;
+fn max_bundle_array_len() -> usize {
+    go_msgp::bounds::MAX_VOTE_THRESHOLD.get()
+}
 
 fn go_err(e: algo_error::AlgoError) -> CodecError {
     CodecError::Decode(e.to_string())
@@ -1144,7 +1147,7 @@ fn bundle_into(rd: &mut &[u8], bundle: &mut UnauthenticatedBundle) -> GoResult<(
                 go_msgp::read_slice_into(
                     rd,
                     &mut bundle.equivocation_votes,
-                    MAX_BUNDLE_ARRAY_LEN,
+                    max_bundle_array_len(),
                     zero_equivocation_vote_authenticator,
                     equivocation_vote_authenticator_into,
                 )?;
@@ -1157,7 +1160,7 @@ fn bundle_into(rd: &mut &[u8], bundle: &mut UnauthenticatedBundle) -> GoResult<(
                 go_msgp::read_slice_into(
                     rd,
                     &mut bundle.votes,
-                    MAX_BUNDLE_ARRAY_LEN,
+                    max_bundle_array_len(),
                     zero_vote_authenticator,
                     vote_authenticator_into,
                 )?;
@@ -1743,7 +1746,7 @@ pub fn encode_authenticated_bundle(b: &AuthenticatedBundle) -> Vec<u8> {
 /// Decode an authenticated bundle from canonical wire-format msgpack bytes.
 pub fn decode_authenticated_bundle(bytes: &[u8]) -> Result<AuthenticatedBundle, CodecError> {
     // Same alloc bound as `decode_bundle`.
-    const MAX_BUNDLE_ARRAY_LEN: u32 = go_msgp::MAX_VOTE_THRESHOLD as u32;
+    let max_bundle_array_len = max_bundle_array_len();
 
     let mut cursor = Cursor::new(bytes);
     let map_len = rmp::decode::read_map_len(&mut cursor)
@@ -1757,10 +1760,10 @@ pub fn decode_authenticated_bundle(bytes: &[u8]) -> Result<AuthenticatedBundle, 
             "eqv" => {
                 let arr_len = rmp::decode::read_array_len(&mut cursor)
                     .map_err(|e| CodecError::Decode(format!("eqv array: {e}")))?;
-                if arr_len > MAX_BUNDLE_ARRAY_LEN {
+                if arr_len as usize > max_bundle_array_len {
                     return Err(CodecError::Format(format!(
                         "eqv array length {} exceeds maximum {}",
-                        arr_len, MAX_BUNDLE_ARRAY_LEN
+                        arr_len, max_bundle_array_len
                     )));
                 }
                 let mut evs = Vec::with_capacity(arr_len as usize);
@@ -1777,10 +1780,10 @@ pub fn decode_authenticated_bundle(bytes: &[u8]) -> Result<AuthenticatedBundle, 
             "vote" => {
                 let arr_len = rmp::decode::read_array_len(&mut cursor)
                     .map_err(|e| CodecError::Decode(format!("vote array: {e}")))?;
-                if arr_len > MAX_BUNDLE_ARRAY_LEN {
+                if arr_len as usize > max_bundle_array_len {
                     return Err(CodecError::Format(format!(
                         "vote array length {} exceeds maximum {}",
-                        arr_len, MAX_BUNDLE_ARRAY_LEN
+                        arr_len, max_bundle_array_len
                     )));
                 }
                 let mut vs = Vec::with_capacity(arr_len as usize);
