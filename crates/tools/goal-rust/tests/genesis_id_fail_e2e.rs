@@ -39,6 +39,10 @@
 //!   `json decode error [pos N]: ...`), while the odd inputs go accepts get
 //!   past the genesis ID.
 //!
+//! Issue #2455 adds an allocation's `state`, which go decodes strictly as a
+//! `bookkeeping.GenesisAccountData` (unknown fields, integer kinds and their
+//! overflow, base64 byte arrays and JSON arrays/maps of bytes).
+//!
 //! `fixtures/genesis_id_fail.jsonl` holds what go v5.0.5-stable's `goal`
 //! printed (exit code, stdout, stderr, the data dir and the binary dir
 //! masked) and the files it created, for the commands below, each run against
@@ -261,6 +265,66 @@ const GENESIS_CASES: &[(&str, &str)] = &[
         r#"{"id":"v1","network":"t","alloc":[{"addr":"A","state":{"algo":1}}]}"#,
     ),
     ("null", "null"),
+    // An allocation's `state` is a `bookkeeping.GenesisAccountData` (#2455):
+    // `onl` uint8, `algo` / `voteFst` / `voteLst` / `voteKD` uint64, `vote` /
+    // `sel` [32]byte, `stprf` [64]byte.
+    (
+        "state ok",
+        r#"{"alloc":[{"state":{"onl":1,"algo":"5","vote":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","sel":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=","stprf":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==","voteFst":1,"voteLst":1e3,"voteKD":10000}}]}"#,
+    ),
+    ("state null fields", r#"{"alloc":[{"state":{"onl":null,"vote":null}}]}"#),
+    ("state null", r#"{"alloc":[{"state":null}]}"#),
+    ("state unknown field", r#"{"alloc":[{"state":{"onl":1,"x":1}}]}"#),
+    ("state array", r#"{"alloc":[{"state":[1,2,"AAAA",null,[1,2],3,4,5]}]}"#),
+    (
+        "state array past the fields",
+        r#"{"alloc":[{"state":[1,2,null,null,null,3,4,5,6]}]}"#,
+    ),
+    ("state onl overflow", r#"{"alloc":[{"state":{"onl":256}}]}"#),
+    ("state onl max", r#"{"alloc":[{"state":{"onl":"255"}}]}"#),
+    ("state onl string", r#"{"alloc":[{"state":{"onl":"abc"}}]}"#),
+    ("state onl NaN", r#"{"alloc":[{"state":{"onl":"NaN"}}]}"#),
+    ("state onl hex float", r#"{"alloc":[{"state":{"onl":"0x1p4"}}]}"#),
+    ("state onl hex overflow", r#"{"alloc":[{"state":{"onl":"0x1p8"}}]}"#),
+    ("state onl underscores", r#"{"alloc":[{"state":{"onl":"1_0"}}]}"#),
+    ("state onl bool", r#"{"alloc":[{"state":{"onl":true}}]}"#),
+    ("state algo negative", r#"{"alloc":[{"state":{"algo":-1}}]}"#),
+    (
+        "state algo overflow",
+        r#"{"alloc":[{"state":{"algo":18446744073709551616}}]}"#,
+    ),
+    ("state algo fraction", r#"{"alloc":[{"state":{"algo":1.5}}]}"#),
+    ("state algo inf", r#"{"alloc":[{"state":{"algo":"Inf"}}]}"#),
+    ("state algo out of range", r#"{"alloc":[{"state":{"algo":"1e400"}}]}"#),
+    ("state voteFst float overflow", r#"{"alloc":[{"state":{"voteFst":1e20}}]}"#),
+    ("state voteLst 2^64", r#"{"alloc":[{"state":{"voteLst":1.8446744073709552e19}}]}"#),
+    ("state voteKD array", r#"{"alloc":[{"state":{"voteKD":[1]}}]}"#),
+    ("state vote bad base64", r#"{"alloc":[{"state":{"vote":"!!!!"}}]}"#),
+    ("state vote short base64", r#"{"alloc":[{"state":{"vote":"AAA"}}]}"#),
+    ("state vote bad padding", r#"{"alloc":[{"state":{"vote":"A==="}}]}"#),
+    ("state vote missing padding", r#"{"alloc":[{"state":{"vote":"AA="}}]}"#),
+    ("state vote trailing base64", r#"{"alloc":[{"state":{"vote":"AA==AA"}}]}"#),
+    ("state vote base64 newline", r#"{"alloc":[{"state":{"vote":"AA\nAA\r\n=="}}]}"#),
+    ("state vote short", r#"{"alloc":[{"state":{"vote":"AAAA"}}]}"#),
+    (
+        "state sel long",
+        r#"{"alloc":[{"state":{"sel":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}]}"#,
+    ),
+    ("state stprf bad base64", r#"{"alloc":[{"state":{"stprf":"AAAAAAAA*AAA"}}]}"#),
+    ("state vote number", r#"{"alloc":[{"state":{"vote":1}}]}"#),
+    ("state vote empty string", r#"{"alloc":[{"state":{"vote":""}}]}"#),
+    ("state vote array", r#"{"alloc":[{"state":{"vote":[1,null,"3"]}}]}"#),
+    ("state vote array overflow", r#"{"alloc":[{"state":{"vote":[1,256]}}]}"#),
+    (
+        "state vote array too long",
+        r#"{"alloc":[{"state":{"vote":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,null]}}]}"#,
+    ),
+    ("state vote map", r#"{"alloc":[{"state":{"vote":{"1":2,"3":4}}}]}"#),
+    (
+        "state vote map too long",
+        r#"{"alloc":[{"state":{"vote":{"0":0,"1":1,"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,"10":10,"11":11,"12":12,"13":13,"14":14,"15":15,"16":16}}}]}"#,
+    ),
+    ("timestamp double minus", r#"{"timestamp":"--5"}"#),
 ];
 
 /// Every file and directory under `dd` but the inputs, as
