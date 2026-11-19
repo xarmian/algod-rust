@@ -1,4 +1,4 @@
-<!-- {soak_name}:round={round} -->
+<!-- {dedup_marker} -->
 <!--
 Copyright (c) 2026 Algod DAO
 SPDX-License-Identifier: MIT
@@ -10,7 +10,7 @@ See the LICENSE-MIT file in the repository root for the full license text.
   issue #1598) ran a single `algod-rust participate --network {network}`
   process against real {network}, bootstrapped with fast catchup from
   `{peer_url}`, and it {halt_intro}
-- Round: **{round}**{catchpoint_line}{invalid_block_stall_line}
+- Round: **{round}**{catchpoint_line}{invalid_block_stall_line}{catchup_failure_line}
 - Node `/v2/status` just before the halt: `last-round={node_last_round}`,
   `time-since-last-round={node_time_since_last_round}`
 - Peer `/v2/status` just before the halt: `last-round={peer_last_round}`

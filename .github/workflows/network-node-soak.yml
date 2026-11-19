@@ -27,8 +27,10 @@ name: Network Node Soak (reusable)
 #      own `/v2/status` `last-catchpoint`) and `POST /v2/catchup/{label}`.
 #   5. Poll node + peer `/v2/status` via `monitor.py collect`.
 #   6. Tear down, summarise, upload artifacts, and on a halt verdict
-#      (`stuck`/`node_failure`/`invalid_block_stall`) file or comment on a
-#      network-scoped GitHub issue via `file_issue.py`.
+#      (`stuck`/`node_failure`/`invalid_block_stall`) or a failed fast
+#      catchup (`catchup_failed`, issue #2444: judged from node.log and the
+#      samples at the end of the run) file or comment on a network-scoped
+#      GitHub issue via `file_issue.py`.
 #
 # `source_outage` (the catchup peer itself unreachable / not advancing) is a
 # warning only and never files an issue -- see `monitor.py`'s doc comment.

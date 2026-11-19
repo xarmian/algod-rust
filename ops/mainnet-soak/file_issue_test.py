@@ -411,5 +411,85 @@ class MainFilesInvalidBlockStallTest(unittest.TestCase):
         self.assertIn("round: 65668288", out.getvalue().replace(",", ""))
 
 
+CATCHUP_FAILED_VERDICT = {
+    "status": "catchup_failed",
+    "phase": "catchup",
+    "round": 23_155_000,
+    "message": "fast catchup failed (catchpoint 23155000#L7AR): ...",
+    "stalled_since_s": None,
+    "node_last_round": 594_714,
+    "peer_last_round": 23_158_875,
+    "catchpoint_label": "23155000#L7AR",
+    "catchup_outcome": {
+        "state": "failed",
+        "failures": 2,
+        "failure_line": "2026-11-19T11:21:18Z WARN algod_rust::live_catchup: live catchpoint catchup failed "
+        "error=ledger error: catchpoint hash mismatch; expected 23155000#L7AR, file label 23155000#TNJ2",
+    },
+}
+
+
+class CatchupFailedFilingTest(unittest.TestCase):
+    """Issue #2444: a failed fast catchup files an issue that quotes the
+    failure line and dedups on the failure kind, not on a catchpoint round
+    that changes every night."""
+
+    def _main(self, verdict, gh_list_stdout="[]"):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            verdict_path = os.path.join(d, "verdict.json")
+            with open(verdict_path, "w") as f:
+                json.dump(verdict, f)
+            out = io.StringIO()
+            with patch("file_issue.subprocess.run") as run, contextlib.redirect_stdout(out):
+                run.return_value = MagicMock(returncode=0, stdout=gh_list_stdout, stderr="")
+                rc = file_issue.main(
+                    [
+                        "--repo", "owner/repo",
+                        "--verdict-json", verdict_path,
+                        "--template", TEMPLATE_PATH,
+                        "--run-url", "https://run",
+                        "--artifacts-url", "https://artifacts",
+                        "--network", "aramidmain",
+                        "--dry-run",
+                    ]
+                )
+            return rc, out.getvalue(), run
+
+    def test_catchup_failed_files_and_quotes_the_failure_line(self):
+        rc, out, run = self._main(CATCHUP_FAILED_VERDICT)
+        self.assertEqual(rc, 0)
+        self.assertIn("would CREATE issue", out)
+        self.assertIn("fast catchup failed", out)
+        self.assertIn("catchpoint hash mismatch; expected 23155000#L7AR, file label 23155000#TNJ2", out)
+        self.assertIn("<!-- aramidmain-soak:catchup_failed -->", out)
+        self.assertNotIn("no observable progress", out)
+        self.assertNotIn("{catchup_failure_line}", out)
+        # dedup searched for the kind marker
+        self.assertIn("aramidmain-soak:catchup_failed", run.call_args_list[0].args[0])
+
+    def test_catchup_failed_comments_on_the_open_issue(self):
+        existing = json.dumps(
+            [{"number": 9, "url": "https://i/9", "title": "t", "body": "<!-- aramidmain-soak:catchup_failed -->"}]
+        )
+        rc, out, _run = self._main(CATCHUP_FAILED_VERDICT, existing)
+        self.assertEqual(rc, 0)
+        self.assertIn("would COMMENT on #9", out)
+        self.assertIn("catchpoint hash mismatch", out)
+
+    def test_title_names_the_catchup_failure(self):
+        title = file_issue.issue_title(23_155_000, "aramidmain", status="catchup_failed")
+        self.assertIn("fast catchup failed", title)
+        self.assertIn("23155000", title)
+        self.assertIn("halted at round", file_issue.issue_title(5, "aramidmain"))
+
+    def test_halt_marker_is_unchanged(self):
+        fields = file_issue.build_fields(STUCK_VERDICT, "r", "a", "", "p")
+        self.assertEqual(fields["dedup_marker"], "mainnet-soak:round=50123456")
+        self.assertEqual(fields["catchup_failure_line"], "")
+
+
 if __name__ == "__main__":
     unittest.main()
