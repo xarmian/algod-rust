@@ -53,6 +53,30 @@ pub fn unicode_printable(s: &str) -> (bool, String) {
     (is_printable, printable_string)
 }
 
+/// go's `errorNonPrintableCharacters` (`cmd/goal/messages.go`).
+pub const ERROR_NON_PRINTABLE_CHARACTERS: &str =
+    "One or more non-printable characters were omitted from the following error message:";
+
+/// The text go's `reportErrorln` / `reportErrorf` (`cmd/goal/commands.go`)
+/// prints for `msg`, without the final newline: each line through
+/// [`unicode_printable`], a line that lost anything preceded by
+/// [`ERROR_NON_PRINTABLE_CHARACTERS`].
+pub fn report_error_text(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    for (i, line) in msg.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let (printable, printable_line) = unicode_printable(line);
+        if !printable {
+            out.push_str(ERROR_NON_PRINTABLE_CHARACTERS);
+            out.push('\n');
+        }
+        out.push_str(&printable_line);
+    }
+    out
+}
+
 /// Mirrors Go's `unicode.IsPrint` (letters, marks, numbers, punctuation,
 /// symbols and the ASCII space; not controls, format characters, private use,
 /// unassigned code points or non-ASCII spaces): the assembler's port, which
