@@ -248,3 +248,8 @@ jobs:
           # password typed into a pty; fixtures/clerk_wallet_token.jsonl is go's
           # output (a stale one fails wallet_token_fixture_matches_go_goal).
           MIXED_CLUSTER=1 cargo test -p goal-rust --test clerk_wallet_token_e2e -- --nocapture
+          # #2436: a data dir whose genesis ID cannot be read stops every
+          # command that builds go's accounts list (errorGenesisIDFail);
+          # fixtures/genesis_id_fail.jsonl is go's output (a stale one fails
+          # genesis_id_fail_fixture_matches_go_goal).
+          MIXED_CLUSTER=1 cargo test -p goal-rust --test genesis_id_fail_e2e -- --nocapture

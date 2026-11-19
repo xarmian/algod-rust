@@ -1,0 +1,13 @@
+{"code":1,"name":"clerk send","stderr":"Error determining kmd folder (open <DD>/genesis.json: no such file or directory). Ensure the node is running in <DD>.\n","stdout":""}
+{"code":1,"name":"clerk send -L","stderr":"Error determining kmd folder (open <DD>/genesis.json: no such file or directory). Ensure the node is running in <DD>.\n","stdout":""}
+{"code":1,"name":"clerk send -f -o","stderr":"Error determining kmd folder (open <DD>/genesis.json: no such file or directory). Ensure the node is running in <DD>.\n","stdout":""}
+{"code":0,"name":"clerk compile","stderr":"","stdout":"p.teal: PQOFFIOE4JA726ULBV4EQ23PNP3VGUP7KUB2UPK4CA6LWQ2RBMOX7PQRJM\n"}
+{"code":1,"name":"clerk compile -s","stderr":"Error determining kmd folder (open <DD>/genesis.json: no such file or directory). Ensure the node is running in <DD>.\n","stdout":""}
+{"code":1,"name":"account list","stderr":"Error determining kmd folder (open <DD>/genesis.json: no such file or directory). Ensure the node is running in <DD>.\n","stdout":""}
+{"code":1,"name":"account new","stderr":"Error determining kmd folder (open <DD>/genesis.json: no such file or directory). Ensure the node is running in <DD>.\n","stdout":""}
+{"code":1,"name":"account rename","stderr":"Error determining kmd folder (open <DD>/genesis.json: no such file or directory). Ensure the node is running in <DD>.\n","stdout":""}
+{"code":1,"name":"account delete","stderr":"Error determining kmd folder (open <DD>/genesis.json: no such file or directory). Ensure the node is running in <DD>.\n","stdout":""}
+{"code":1,"name":"account import","stderr":"Error determining kmd folder (open <DD>/genesis.json: no such file or directory). Ensure the node is running in <DD>.\n","stdout":""}
+{"code":1,"name":"account multisig new","stderr":"Error determining kmd folder (open <DD>/genesis.json: no such file or directory). Ensure the node is running in <DD>.\n","stdout":""}
+{"code":1,"name":"account multisig delete","stderr":"Error determining kmd folder (open <DD>/genesis.json: no such file or directory). Ensure the node is running in <DD>.\n","stdout":""}
+{"code":1,"name":"wallet new","stderr":"Error determining kmd folder (open <DD>/genesis.json: no such file or directory). Ensure the node is running in <DD>.\n","stdout":""}

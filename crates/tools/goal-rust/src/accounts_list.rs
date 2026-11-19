@@ -101,19 +101,22 @@ impl AccountsList {
         }
     }
 
-    /// Load from disk, falling back to an in-memory empty list when
-    /// the file doesn't exist or is unreadable. Mirrors Go's
-    /// `loadList` (accountsList.go:194-204) — Go uses
-    /// `json.Unmarshal` and ignores the error; we do the same so a
-    /// corrupted file doesn't block `wallet new`. Caller can call
-    /// `account_list_filename` explicitly to inspect the path.
-    pub fn load(data_dir: &Path) -> Self {
+    /// Go's `makeAccountsList` (accountsList.go:40-47): resolve the file
+    /// path, then load it, falling back to an in-memory empty list when
+    /// the file doesn't exist or is unreadable. Like Go's `loadList`
+    /// (accountsList.go:194-204), which `json.Unmarshal`s and ignores
+    /// the error, a corrupted file doesn't block `wallet new`.
+    ///
+    /// The path needs the data dir's genesis ID: when it cannot be read
+    /// go's `accountListFileName` exits 1 with `errorGenesisIDFail`
+    /// (issue #2436), so every command that builds the list in go must
+    /// stop on this error ([`AccountsListError::GenesisIdFail`]'s text
+    /// is go's).
+    pub fn load(data_dir: &Path) -> Result<Self, AccountsListError> {
         let mut list = Self::new_empty(data_dir);
-        let Ok(path) = list.account_list_filename() else {
-            return list;
-        };
+        let path = list.account_list_filename()?;
         let Ok(raw) = fs::read(&path) else {
-            return list;
+            return Ok(list);
         };
         if let Ok(parsed) = serde_json::from_slice::<AccountsList>(&raw) {
             list.accounts = parsed.accounts;
@@ -128,7 +131,15 @@ impl AccountsList {
             // the same dir). To keep this robust against a relocated
             // data dir we re-pin from the live argument.
         }
-        list
+        Ok(list)
+    }
+
+    /// [`Self::load`] for goal-rust's own name lookups on commands where
+    /// go never builds the list (e.g. `app` resolving `--from`): any
+    /// failure, the unreadable genesis ID included, gives an empty list,
+    /// so those commands go on as go does.
+    pub fn load_or_empty(data_dir: &Path) -> Self {
+        Self::load(data_dir).unwrap_or_else(|_| Self::new_empty(data_dir))
     }
 
     /// Resolve the on-disk path for this list. Equivalent to Go's
@@ -136,8 +147,12 @@ impl AccountsList {
     /// dirs land beside the data dir, shared/server layouts land
     /// under `~/.algorand/<genesis_id>/`.
     pub fn account_list_filename(&self) -> Result<PathBuf, AccountsListError> {
-        let genesis_id = data_dir::read_genesis_id(&self.data_dir)
-            .map_err(|e| AccountsListError::GenesisIdFail(e.to_string()))?;
+        let genesis_id = data_dir::read_genesis_id(&self.data_dir).map_err(|e| {
+            AccountsListError::GenesisIdFail {
+                err: e.to_string(),
+                data_dir: self.data_dir.clone(),
+            }
+        })?;
         let base = if data_dir::is_algorand_data_private(&self.data_dir) {
             self.data_dir.clone()
         } else {
@@ -271,11 +286,11 @@ impl AccountsList {
 #[derive(Debug, thiserror::Error)]
 pub enum AccountsListError {
     /// Couldn't read the genesis ID for the data dir (no
-    /// `genesis.json`, malformed, etc.). Carries the underlying error
-    /// text rendered verbatim — operators grep for kmd/algod's
-    /// existing wording.
-    #[error("Cannot retrieve genesis id from data directory: {0}")]
-    GenesisIdFail(String),
+    /// `genesis.json`, malformed, etc.). Go's `errorGenesisIDFail`
+    /// (`cmd/goal/messages.go`) with the `GenesisID()` error and the
+    /// data dir, as `accountListFileName` reports it.
+    #[error("Error determining kmd folder ({err}). Ensure the node is running in {}.", data_dir.display())]
+    GenesisIdFail { err: String, data_dir: PathBuf },
 
     /// Shared/server layout was selected but `$HOME` is unset so
     /// `~/.algorand` couldn't be resolved.
@@ -351,7 +366,7 @@ mod tests {
         );
         assert!(path.ends_with("accountList.json"));
 
-        let reloaded = AccountsList::load(&data_dir);
+        let reloaded = AccountsList::load(&data_dir).expect("load");
         assert_eq!(reloaded.default_wallet_id, "wallet-id-xyz");
         assert_eq!(reloaded.accounts.len(), 2);
         assert_eq!(
@@ -365,10 +380,34 @@ mod tests {
     #[test]
     fn load_missing_file_returns_empty_in_memory() {
         let (_tmp, data_dir) = fake_private_data_dir("net2");
-        let list = AccountsList::load(&data_dir);
+        let list = AccountsList::load(&data_dir).expect("load");
         assert!(list.accounts.is_empty());
         assert!(list.default_wallet_id.is_empty());
         assert!(list.default_account.is_empty());
+    }
+
+    /// go's `accountListFileName` exits with `errorGenesisIDFail` when
+    /// `genesis.json` is missing (issue #2436); `load_or_empty` is the
+    /// lenient lookup for paths where go never builds the list.
+    #[test]
+    fn load_without_genesis_fails_with_gos_text() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dd = tmp.path();
+        let err = AccountsList::load(dd).unwrap_err();
+        let genesis = dd.join("genesis.json");
+        let os_err = fs::read(&genesis).unwrap_err();
+        let os_text = os_err.to_string();
+        let os_text = os_text.split(" (os error").next().unwrap();
+        let os_text = os_text[..1].to_lowercase() + &os_text[1..];
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Error determining kmd folder (open {}: {os_text}). Ensure the node is running in {}.",
+                genesis.display(),
+                dd.display()
+            )
+        );
+        assert!(AccountsList::load_or_empty(dd).accounts.is_empty());
     }
 
     #[test]
@@ -430,7 +469,7 @@ mod tests {
         )
         .expect("add");
         list.rename("old", "new").expect("rename");
-        let reloaded = AccountsList::load(&data_dir);
+        let reloaded = AccountsList::load(&data_dir).expect("load");
         assert_eq!(
             reloaded.name_for("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY"),
             "new"

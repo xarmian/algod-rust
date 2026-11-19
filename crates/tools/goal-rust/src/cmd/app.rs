@@ -521,7 +521,7 @@ fn submit_app_lifecycle_txn(
 ) -> Result<ExitCode, String> {
     let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
         .map_err(|e| e.to_string())?;
-    let accounts = AccountsList::load(&data_dir_path);
+    let accounts = AccountsList::load_or_empty(&data_dir_path);
     let from_resolved = accounts.address_for(from);
     let from_addr = Address::from_algorand_string(&from_resolved)
         .map_err(|e| format!("Could not parse from address {from_resolved}: {e}"))?;
@@ -636,7 +636,7 @@ fn run_create_inner(args: CreateArgs, wallet: Option<String>) -> Result<ExitCode
 
     let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
         .map_err(|e| e.to_string())?;
-    let accounts = AccountsList::load(&data_dir_path);
+    let accounts = AccountsList::load_or_empty(&data_dir_path);
     let creator_resolved = accounts.address_for(&args.creator);
     let creator_addr = Address::from_algorand_string(&creator_resolved)
         .map_err(|e| format!("Could not parse creator address {creator_resolved}: {e}"))?;
@@ -734,7 +734,7 @@ fn run_update_inner(args: UpdateArgs, wallet: Option<String>) -> Result<ExitCode
 
     let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
         .map_err(|e| e.to_string())?;
-    let accounts = AccountsList::load(&data_dir_path);
+    let accounts = AccountsList::load_or_empty(&data_dir_path);
     let from_resolved = accounts.address_for(&args.from);
     let from_addr = Address::from_algorand_string(&from_resolved)
         .map_err(|e| format!("Could not parse from address {from_resolved}: {e}"))?;
@@ -842,7 +842,7 @@ fn submit_single(
     let want_wallet_sign = txn_args.out.is_none() || txn_args.sign;
     let stx = if want_wallet_sign {
         let kmd = build_kmd_client(data_dir_path, crate::cli_state::kmddir().as_deref())?;
-        let mut accounts = AccountsList::load(data_dir_path);
+        let mut accounts = AccountsList::load(data_dir_path).map_err(|e| e.to_string())?;
         let (handle, _name, password) = resolve_wallet_and_init(
             rt,
             &kmd,
@@ -1116,7 +1116,7 @@ fn run_read_inner(args: ReadArgs) -> Result<ExitCode, String> {
         .map_err(|e| format!("Error processing command: {e}"))?;
 
     let state = if args.local {
-        let accounts = AccountsList::load(&data_dir_path);
+        let accounts = AccountsList::load_or_empty(&data_dir_path);
         let resolved = accounts.address_for(&from);
         // Go's `--local` path treats a 404 specially (`errors.As(err,
         // &httpError) && httpError.StatusCode == http.StatusNotFound`) as
@@ -1438,7 +1438,7 @@ fn run_method_inner(args: MethodArgs, wallet: Option<String>) -> Result<ExitCode
 
     let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
         .map_err(|e| e.to_string())?;
-    let accounts = AccountsList::load(&data_dir_path);
+    let accounts = AccountsList::load_or_empty(&data_dir_path);
     let from_resolved = accounts.address_for(&args.from);
     let from_addr = Address::from_algorand_string(&from_resolved)
         .map_err(|e| format!("Could not parse from address {from_resolved}: {e}"))?;
@@ -1536,7 +1536,7 @@ fn run_method_inner(args: MethodArgs, wallet: Option<String>) -> Result<ExitCode
         None
     };
     let wallet_session = if let Some(kmd) = kmd.as_ref() {
-        let mut acc = AccountsList::load(&data_dir_path);
+        let mut acc = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
         Some(resolve_wallet_and_init(
             &rt,
             kmd,

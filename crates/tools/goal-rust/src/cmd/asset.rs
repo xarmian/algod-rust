@@ -141,7 +141,7 @@ fn submit_single(
     let want_wallet_sign = txn_args.out.is_none() || txn_args.sign;
     let stx = if want_wallet_sign {
         let kmd = build_kmd_client(data_dir_path, crate::cli_state::kmddir().as_deref())?;
-        let mut accounts = AccountsList::load(data_dir_path);
+        let mut accounts = AccountsList::load(data_dir_path).map_err(|e| e.to_string())?;
         let (handle, _name, password) = resolve_wallet_and_init(
             rt,
             &kmd,
@@ -320,7 +320,7 @@ fn run_create_inner(args: CreateArgs, wallet: Option<String>) -> Result<ExitCode
 
     let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
         .map_err(|e| e.to_string())?;
-    let accounts = AccountsList::load(&data_dir_path);
+    let accounts = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
     let creator_resolved = accounts.address_for(&args.creator);
     let creator_addr = parse_addr(&creator_resolved)?;
 
@@ -467,7 +467,7 @@ pub fn run_destroy(args: DestroyArgs, wallet: Option<String>) -> ExitCode {
 fn run_destroy_inner(args: DestroyArgs, wallet: Option<String>) -> Result<ExitCode, String> {
     let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
         .map_err(|e| e.to_string())?;
-    let accounts = AccountsList::load(&data_dir_path);
+    let accounts = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
 
     if args.manager.is_empty() && args.creator.is_empty() {
         return Err("Missing required parameter [--manager] or [--creator]".to_string());
@@ -546,7 +546,7 @@ pub fn run_config(args: ConfigArgs, wallet: Option<String>) -> ExitCode {
 fn run_config_inner(args: ConfigArgs, wallet: Option<String>) -> Result<ExitCode, String> {
     let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
         .map_err(|e| e.to_string())?;
-    let accounts = AccountsList::load(&data_dir_path);
+    let accounts = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
 
     let creator_name = if args.creator.is_empty() {
         args.manager.clone()
@@ -782,7 +782,7 @@ pub fn run_send(args: SendArgs, wallet: Option<String>) -> ExitCode {
 fn run_send_inner(args: SendArgs, wallet: Option<String>) -> Result<ExitCode, String> {
     let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
         .map_err(|e| e.to_string())?;
-    let accounts = AccountsList::load(&data_dir_path);
+    let accounts = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
 
     let from_name = if args.from.is_empty() {
         accounts.default_account.clone()
@@ -847,7 +847,7 @@ pub fn run_optin(args: OptinArgs, wallet: Option<String>) -> ExitCode {
 fn run_optin_inner(args: OptinArgs, wallet: Option<String>) -> Result<ExitCode, String> {
     let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
         .map_err(|e| e.to_string())?;
-    let accounts = AccountsList::load(&data_dir_path);
+    let accounts = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
     let creator_resolved = resolve_name(&accounts, &args.creator);
 
     let algod = build_algod_client_for_dir(&data_dir_path)?;
@@ -896,7 +896,7 @@ pub fn run_freeze(args: FreezeArgs, wallet: Option<String>) -> ExitCode {
 fn run_freeze_inner(args: FreezeArgs, wallet: Option<String>) -> Result<ExitCode, String> {
     let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
         .map_err(|e| e.to_string())?;
-    let accounts = AccountsList::load(&data_dir_path);
+    let accounts = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
     let freezer_resolved = resolve_name(&accounts, &args.freezer);
     let freezer_addr = parse_addr(&freezer_resolved)?;
     let creator_resolved = resolve_name(&accounts, &args.creator);
@@ -983,7 +983,7 @@ pub fn run_info(args: InfoArgs) -> ExitCode {
 fn run_info_inner(args: InfoArgs) -> Result<ExitCode, String> {
     let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
         .map_err(|e| e.to_string())?;
-    let accounts = AccountsList::load(&data_dir_path);
+    let accounts = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
     let creator_resolved = resolve_name(&accounts, &args.creator);
 
     let algod = build_algod_client_for_dir(&data_dir_path)?;
