@@ -95,37 +95,25 @@ pub(crate) enum Outcome {
     Fail { msg: String, usage_path: String },
 }
 
-/// The flags one command knows while cobra looks for a subcommand: the
-/// ones taking a value and the bool ones, short and long names alike.
-struct Level {
-    value: &'static [&'static str],
-    boolean: &'static [&'static str],
-}
+/// The flags one command knows while cobra looks for a subcommand, short
+/// and long names alike; all of them take a value. (cobra adds the help
+/// flag only to the command it finds, and a help flag is left to clap.)
+type Level = &'static [&'static str];
 
-/// The root: `-d/--datadir`, `-k/--kmddir` (persistent) and `-v/--version`.
-const ROOT: Level = Level {
-    value: &["d", "datadir", "k", "kmddir"],
-    boolean: &["v", "version"],
-};
+/// The root's persistent `-d/--datadir` and `-k/--kmddir`. Its local
+/// `-v/--version` is not one of `account`'s flags, so a call with it is left
+/// to clap.
+const ROOT: Level = &["d", "datadir", "k", "kmddir"];
 
 /// `account`: its local `-f/--default`, its persistent `-w/--wallet` and the
 /// root's persistent flags.
-const ACCOUNT: Level = Level {
-    value: &["d", "datadir", "k", "kmddir", "w", "wallet", "f", "default"],
-    boolean: &[],
-};
+const ACCOUNT: Level = &["d", "datadir", "k", "kmddir", "w", "wallet", "f", "default"];
 
 /// `wallet`: its local `-f/--default` and the root's persistent flags.
-const WALLET: Level = Level {
-    value: &["d", "datadir", "k", "kmddir", "f", "default"],
-    boolean: &[],
-};
+const WALLET: Level = &["d", "datadir", "k", "kmddir", "f", "default"];
 
 /// `account multisig`: the persistent flags it inherits.
-const MULTISIG: Level = Level {
-    value: &["d", "datadir", "k", "kmddir", "w", "wallet"],
-    boolean: &[],
-};
+const MULTISIG: Level = &["d", "datadir", "k", "kmddir", "w", "wallet"];
 
 const ACCOUNT_SUBCOMMANDS: &[&str] = &[
     "addpartkey",
@@ -185,7 +173,7 @@ enum Token {
     Other,
 }
 
-fn token(s: &str, level: &Level) -> Token {
+fn token(s: &str, level: Level) -> Token {
     if s == "--" {
         return Token::End;
     }
@@ -194,15 +182,10 @@ fn token(s: &str, level: &Level) -> Token {
             Some((n, _)) => (n, true),
             None => (long, false),
         };
-        return if level.value.contains(&name) {
+        return if level.contains(&name) {
             Token::Known {
                 takes_next: !has_value,
                 default: name == "default",
-            }
-        } else if level.boolean.contains(&name) && !has_value {
-            Token::Known {
-                takes_next: false,
-                default: false,
             }
         } else {
             Token::Other
@@ -215,17 +198,11 @@ fn token(s: &str, level: &Level) -> Token {
     let Some(c) = chars.next() else {
         return Token::Other;
     };
-    let name = c.to_string();
-    let attached = !chars.as_str().is_empty();
-    if level.value.contains(&name.as_str()) {
+    if level.contains(&c.to_string().as_str()) {
+        // `-fx` and `-f=x` carry their value.
         Token::Known {
-            takes_next: !attached,
+            takes_next: chars.as_str().is_empty(),
             default: c == 'f',
-        }
-    } else if level.boolean.contains(&name.as_str()) && !attached {
-        Token::Known {
-            takes_next: false,
-            default: false,
         }
     } else {
         Token::Other
@@ -281,15 +258,15 @@ pub(crate) fn decide(args: &[String]) -> Outcome {
         let Some(s) = args.get(i) else {
             return Outcome::Unchanged;
         };
-        match token(s, &ROOT) {
+        match token(s, ROOT) {
             Token::Positional => break i,
             Token::Known { takes_next, .. } => i += if takes_next { 2 } else { 1 },
             Token::End | Token::Other => return Outcome::Unchanged,
         }
     };
     let (level, subcommands) = match args[group].as_str() {
-        "account" => (&ACCOUNT, ACCOUNT_SUBCOMMANDS),
-        "wallet" => (&WALLET, WALLET_SUBCOMMANDS),
+        "account" => (ACCOUNT, ACCOUNT_SUBCOMMANDS),
+        "wallet" => (WALLET, WALLET_SUBCOMMANDS),
         _ => return Outcome::Unchanged,
     };
     let group_name = args[group].as_str();
@@ -360,7 +337,7 @@ pub(crate) fn decide(args: &[String]) -> Outcome {
     if group_name == "account" && args[first] == "multisig" {
         let mut j = first + 1;
         while let Some(s) = args.get(j) {
-            match token(s, &MULTISIG) {
+            match token(s, MULTISIG) {
                 Token::Positional => {
                     if MULTISIG_SUBCOMMANDS.contains(&s.as_str()) {
                         names.push(j);
@@ -471,6 +448,7 @@ mod tests {
         assert_eq!(d(&["account", "-f", "x"]), Outcome::Unchanged);
         assert_eq!(d(&["account", "list", "-f", "x"]), Outcome::Unchanged);
         assert_eq!(d(&["clerk", "extra"]), Outcome::Unchanged);
+        assert_eq!(d(&["-v", "account", "extra"]), Outcome::Unchanged);
         assert_eq!(d(&[]), Outcome::Unchanged);
     }
 
