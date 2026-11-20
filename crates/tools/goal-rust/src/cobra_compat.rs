@@ -449,7 +449,7 @@ fn child(parent: &Cmd, name: &str) -> Option<&'static Cmd> {
 /// of the same name); `with_help` adds cobra's help flag, then `extras`
 /// whose names go's flags do not use.
 fn flags_of<'a>(cmd: &Cmd, with_help: bool, extras: &[Flag<'a>]) -> Vec<Flag<'a>> {
-    let mut out: Vec<Flag<'a>> = cmd.local.iter().copied().collect();
+    let mut out: Vec<Flag<'a>> = cmd.local.to_vec();
     let mut path = Some(cmd.path);
     while let Some(p) = path {
         let c = command(p).expect("a parent of a known command is known");
@@ -736,7 +736,7 @@ fn underscore_ok(s: &[u8]) -> bool {
     if s.len() >= 2 && s[0] == b'0' && matches!(s[1].to_ascii_lowercase(), b'b' | b'o' | b'x') {
         i = 2;
         saw = b'0';
-        hex = s[1].to_ascii_lowercase() == b'x';
+        hex = s[1].eq_ignore_ascii_case(&b'x');
     }
     while i < s.len() {
         let c = s[i];
