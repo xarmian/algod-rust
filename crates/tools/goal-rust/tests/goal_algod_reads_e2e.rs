@@ -29,7 +29,14 @@
 //!   the one wallet `ensureWalletHandle` picks, with their status, balance,
 //!   multisig threshold, created assets/apps and opted-in apps, and `--info`;
 //! - go's `errorRequestFail` (`Error processing command: %s`) for a failing
-//!   `/v2/accounts` request (`account balance` / `rewards` / `info`).
+//!   `/v2/accounts` request (`account balance` / `rewards` / `info`);
+//! - go's request errors (`restClient.submitForm`, issue #2466) for every
+//!   command above plus `node status` and `ledger supply`: a refused
+//!   connection (`Get "<url>": dial tcp <addr>: connect: connection
+//!   refused`, `algod.net` naming a closed port), an answer-less close
+//!   (`Get "<url>": EOF`), a 401 (`Unauthorized request to ...`), and
+//!   go-codec's decode of malformed JSON answers (`json decode error [pos
+//!   N]: ...`, or what go-codec accepts that JSON does not).
 //!
 //! `fixtures/goal_algod_reads.jsonl` holds what go v5.0.5-stable's `goal`
 //! printed (exit code, stdout, stderr, the data dir masked; a stdout longer
@@ -498,6 +505,10 @@ fn spawn_mock(mock: Mock) -> u16 {
                 let _ = reader.read_exact(&mut body);
                 let path = first.split_whitespace().nth(1).unwrap_or("/");
                 let (code, ctype, body) = route(path, &mock);
+                if code == 0 {
+                    // close the connection without an answer
+                    return;
+                }
                 let head = format!(
                     "HTTP/1.1 {code} {}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     reason(code),
@@ -631,6 +642,19 @@ fn request_error_cases() -> Vec<Case> {
             prefix: "",
             status: 401,
             body: br#"{"message":"Invalid API Token"}"#.to_vec(),
+        }];
+        v.push(c);
+    }
+    for (name, args) in [
+        ("account balance closed", &["account", "balance", "-a", "<A1>"][..]),
+        ("version closed", &["version"]),
+        ("node status closed", &["node", "status"]),
+    ] {
+        let mut c = case(name, args);
+        c.answers = vec![Answer {
+            prefix: "",
+            status: 0,
+            body: Vec::new(),
         }];
         v.push(c);
     }
