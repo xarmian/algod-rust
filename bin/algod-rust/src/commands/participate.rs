@@ -16332,8 +16332,7 @@ mod tests {
                 Round(8),
                 Duration::from_secs(2),
             ))
-            .err()
-            .expect("the peer has no such block");
+            .expect_err("the peer has no such block");
         assert!(
             matches!(err, FetchError::NoBlockForRound { round } if round == Round(8)),
             "got {err:?}"

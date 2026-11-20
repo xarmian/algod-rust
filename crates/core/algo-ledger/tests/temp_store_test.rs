@@ -25,7 +25,10 @@
 //! SAVEPOINT (go-algorand's per-group rollback points here) spill to a file
 //! once they pass 64 KiB. With `temp_store=MEMORY` they stay in memory.
 
-use algo_ledger::{LedgerStore as _, SqliteLedger};
+#[cfg(target_os = "linux")]
+use algo_ledger::LedgerStore as _;
+use algo_ledger::SqliteLedger;
+#[cfg(target_os = "linux")]
 use algo_types::{AccountData, Address, Round};
 
 #[test]
