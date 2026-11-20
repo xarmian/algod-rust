@@ -24,7 +24,9 @@
 //! `cmd/goal/wallet.go` `walletCmd`), and `goal account import` takes `-m`
 //! for `--mnemonic` (issue #2448). Extra arguments to `account` / `wallet`
 //! and a `-f` placed before a subcommand fail with cobra's error and usage
-//! text (issue #2453).
+//! text (issue #2453), and so do the other flag, argument and required-flag
+//! errors of the `account` / `wallet` trees, whose `--help` is go's
+//! (issue #2464).
 //!
 //! `fixtures/default_flags.jsonl` holds what go v5.0.5-stable's `goal`
 //! printed (exit code, stdout, stderr) and the `accountList.json` it left, for
@@ -60,6 +62,41 @@ const ZERO_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon aba
 const GENESIS: &str = r#"{"id":"v1","network":"testnet","proto":"future","alloc":[],"rwd":"FEESINKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANY3ZN3I","fees":"FEESINKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANY3ZN3I"}"#;
 
 const PROMPT: &str = "Please enter the password for wallet 'w': ";
+
+/// Every command of the `account` and `wallet` trees, for the help rows.
+const HELP_PATHS: &[&str] = &[
+    "account",
+    "account addpartkey",
+    "account applicationdetails",
+    "account assetdetails",
+    "account balance",
+    "account changeonlinestatus",
+    "account delete",
+    "account deletepartkey",
+    "account dump",
+    "account export",
+    "account import",
+    "account importrootkey",
+    "account info",
+    "account installpartkey",
+    "account list",
+    "account listpartkeys",
+    "account marknonparticipating",
+    "account multisig",
+    "account multisig delete",
+    "account multisig info",
+    "account multisig new",
+    "account new",
+    "account partkeyinfo",
+    "account rename",
+    "account renewallpartkeys",
+    "account renewpartkey",
+    "account rewards",
+    "wallet",
+    "wallet list",
+    "wallet new",
+    "wallet rename",
+];
 
 fn mixed_cluster_enabled() -> bool {
     matches!(std::env::var("MIXED_CLUSTER").as_deref(), Ok(v) if !v.is_empty() && v != "0")
@@ -372,6 +409,85 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
         &masks,
         &go(&["account", "-f", "first", "new"], Stdin::Null),
     ));
+    // #2464: the rest of cobra's flag parsing for the `account` / `wallet`
+    // trees. The command cobra finds parses its arguments left to right
+    // (pflag): the first unknown flag, missing value or bad value is the
+    // error, with that command's usage; then `-h/--help` prints its help on
+    // stdout (exit 0); then its `Args` rule; then its required flags.
+    for path in HELP_PATHS {
+        let mut args: Vec<&str> = path.split(' ').collect();
+        args.push("--help");
+        rows.push(row(&args.join(" "), &masks, &go(&args, Stdin::Null)));
+    }
+    for args in [
+        // Help.
+        &["account", "-h"][..],
+        &["wallet", "-h"],
+        &["account", "multisig", "-h"],
+        &["account", "-h", "list"],
+        &["account", "--help", "list"],
+        &["account", "-f", "x", "-h"],
+        &["-d", "x", "wallet", "list", "-h"],
+        &["account", "list", "-h", "-z"],
+        &["account", "list", "-h=x"],
+        &["account", "info", "-a", "A", "-h", "extra"],
+        // A missing flag value.
+        &["account", "-f"],
+        &["account", "--default"],
+        &["wallet", "-f"],
+        &["account", "-w"],
+        &["account", "list", "-w"],
+        &["account", "balance", "-a"],
+        &["account", "changeonlinestatus", "--fee"],
+        &["wallet", "-h", "-f"],
+        // An unknown flag.
+        &["account", "list", "-f", "x"],
+        &["account", "list", "--default", "x"],
+        &["wallet", "list", "-f", "x"],
+        &["wallet", "new", "w9", "-f", "x"],
+        &["account", "multisig", "info", "-z"],
+        &["account", "multisig", "-z"],
+        &["account", "list", "--nosuch"],
+        &["account", "-z", "list"],
+        &["-v", "account", "list"],
+        &["account", "changeonlinestatus", "-Nz"],
+        &["account", "list", "---x"],
+        &["account", "list", "-é"],
+        // A bad flag value: the first error from the left wins.
+        &["account", "changeonlinestatus", "-f", "x", "-z"],
+        &["account", "changeonlinestatus", "-z", "-f", "x"],
+        &["account", "changeonlinestatus", "--online=x"],
+        &["account", "changeonlinestatus", "-ofalse"],
+        &["account", "renewallpartkeys", "--roundLastValid=-1"],
+        &["account", "renewpartkey", "-f", "18446744073709551616"],
+        &["account", "multisig", "new", "-T", "300"],
+        &["account", "multisig", "new", "-T", "0x"],
+        &["account", "multisig", "new", "-T", "1__0"],
+        &["account", "marknonparticipating", "--fee", ""],
+        // The positional arguments.
+        &["account", "list", "extra"],
+        &["account", "list", "--", "x"],
+        &["wallet", "new"],
+        &["wallet", "rename", "a"],
+        &["wallet", "list", "a", "b"],
+        &["account", "new", "a", "b"],
+        &["account", "rename", "x"],
+        &["account", "multisig", "new"],
+        &["account", "multisig", "info", "x"],
+        // The required flags, after the arguments.
+        &["account", "balance"],
+        &["account", "addpartkey"],
+        &["account", "addpartkey", "--roundLastValid", "5"],
+        &["account", "renewallpartkeys", "-f", "0x_1F"],
+        &["account", "assetdetails", "-l", "1_000"],
+        &["account", "multisig", "info"],
+        &["account", "multisig", "new", "A"],
+        &["account", "installpartkey", "--delete-input"],
+        &["account", "export", "extra"],
+        &["account", "balance", "extra"],
+    ] {
+        rows.push(row(&args.join(" "), &masks, &go(args, Stdin::Null)));
+    }
     rows.push(list_row("accountList after the cobra errors", &dd, &masks));
     // kmd gone: the default account needs no kmd. (go's `wallet -f` would
     // then try to start a kmd, which is not compared here.)
