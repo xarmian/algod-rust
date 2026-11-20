@@ -413,7 +413,6 @@ Every row where Go is faster with non-overlapping ranges, and who owns it
 | `micro avm/app-state-box` | 1.26x | [#2320](https://github.com/xarmian/algod-rust/issues/2320): per-call setup costs (bytecode parse, machine construction, allocation) |
 | `micro agreement/sortition-select-f128` | 1.22x | [#2321](https://github.com/xarmian/algod-rust/issues/2321): software f128; measured, division is not the lever (PERF_PHASE23.md row 9) |
 | `rest account_hot` p50 | 1.03x | [#2340](https://github.com/xarmian/algod-rust/issues/2340) |
-| `teal-corpus assemble-disassembled/all` wall, MB/s; `assemble-sources/all`, `assemble-disassembled/all` p50, p99 | 1.05x; p50 1.11x to 1.13x, p99 1.09x to 1.14x | [#2410](https://github.com/xarmian/algod-rust/issues/2410): per-call fixed cost on the typical small program (the 20 largest sources are now Rust 1.05x, `assemble-sources/all` wall is inconclusive); profile first. The #2411 driver fix below removed about 0.18 s of dispatch overhead from these rows (2026-11-17, `RUNS=10`) |
 | `localnet` `fixed` p95/p99, `ladder-50` p50/p95/p99 latency | 1.23x, 1.05x to 1.07x | round-quantised noise (see Headline), no node cost |
 
 The first baseline's findings are closed: #2145 (certificate authentication on
@@ -444,19 +443,22 @@ transactions in `txn-result`) is not covered and still differs
 The `teal-corpus` tier (`make bench-compare TIERS=teal-corpus`) times go-algorand's
 and algod-rust's TEAL disassembler and assembler, single-threaded, over the
 3,692 programs / 3,687 sources of the ARC56Registry (`e75e509c`), gated on
-byte-identical outputs. Run on 2026-11-17 on the same machine as above (go
-`v5.0.5-stable`, algod-rust `73317092` = #2411, `RUNS=10`, gate green, zero
-mismatches; the first run, `8af88af3`, in brackets).
+byte-identical outputs. Run on 2026-11-20 on the same machine as above (i7-13700,
+WSL2 Ubuntu-22.04, go `v5.0.5-stable`, algod-rust `b3195d75` = #2410, `RUNS=10`,
+gate green on every run, zero mismatches); the earlier state in brackets
+(2026-11-17: `73317092` = #2411, and the first run `8af88af3`).
 Full report, stats, history and reproduction: [TEAL_CORPUS_PARITY.md](TEAL_CORPUS_PARITY.md).
 
 | Workload | Metric | Go | Rust | Faster |
 |---|---|---|---|---|
-| `disassemble/all` | wall | 0.470 s | 0.108 s | Rust 4.34x (was Go 1.08x, [#2411](https://github.com/xarmian/algod-rust/issues/2411)) |
-| `disassemble/all` | p50 / p99 per program | 43.7 / 1,048 us | 10.1 / 283 us | Rust 4.33x / Rust 3.70x |
-| `assemble-disassembled/all` | wall | 1.025 s | 1.079 s | Go 1.05x (was 1.26x, [#2410](https://github.com/xarmian/algod-rust/issues/2410)) |
-| `assemble-sources/all` | wall | 1.074 s | 1.123 s | inconclusive (was Go 1.24x, [#2410](https://github.com/xarmian/algod-rust/issues/2410)) |
-| `disassemble/top20` | wall | 42.7 ms | 13.2 ms | Rust 3.24x (was 1.12x) |
-| `assemble-sources/top20` | wall | 86.8 ms | 82.4 ms | Rust 1.05x (was inconclusive) |
+| `disassemble/all` | wall | 0.464 s | 0.108 s | Rust 4.30x (was Go 1.08x before [#2411](https://github.com/xarmian/algod-rust/issues/2411)) |
+| `disassemble/all` | p50 / p99 per program | 42.7 / 1,047 us | 10.0 / 281 us | Rust 4.27x / Rust 3.72x |
+| `assemble-disassembled/all` | wall | 1.027 s | 0.359 s | Rust 2.86x (was Go 1.05x; Go 1.26x before #2411, [#2410](https://github.com/xarmian/algod-rust/issues/2410)) |
+| `assemble-disassembled/all` | p50 / p99 per program | 103.3 / 2,351 us | 41.1 / 848 us | Rust 2.52x / Rust 2.77x (was Go 1.11x / Go 1.14x) |
+| `assemble-sources/all` | wall | 1.072 s | 0.404 s | Rust 2.65x (was inconclusive; Go 1.24x before #2411, [#2410](https://github.com/xarmian/algod-rust/issues/2410)) |
+| `assemble-sources/all` | p50 / p99 per program | 108.0 / 2,599 us | 46.3 / 954 us | Rust 2.33x / Rust 2.73x (was Go 1.13x / Go 1.09x) |
+| `disassemble/top20` | wall | 40.4 ms | 12.5 ms | Rust 3.24x (was 3.24x) |
+| `assemble-sources/top20` | wall | 79.5 ms | 28.2 ms | Rust 2.82x (was 1.05x) |
 
 Where the #2411 change came from (profile and split measurement on the issue):
 the batch wall clock of `disassemble/all` was 0.47 s on both sides, but of
@@ -472,6 +474,23 @@ instruction, no `format!` per hex byte, labels as numbers in a pc-indexed table
 instead of a `HashMap<i64, String>`): 359 to 121 ms on its own. Together: 469 ms
 to 104 ms against go's 451 ms, rows byte-identical with go's on every run. The
 assembler rows gained from the driver change alone (same dispatch path).
+
+Where the #2410 change came from (profile on the issue): the assembler had no
+throughput hot spot, only per-instruction fixed costs. About 25% of
+`assemble-sources/all` was opcode-name lookup (a linear scan of the opcode table
+in `opcode::lookup_by_name` and a `str::cmp` binary search of the type table,
+each run several times per instruction), about 20% allocator churn (a `String`
+per token, a `Spec` of three `String`s and two `Vec`s per instruction, a
+`String` per pc in the source map) and about 10% the SipHash `offset_to_source`
+map, inserted per instruction, rebuilt from scratch for every constant the v4+
+optimizer rewrites and every varint branch it shrinks, and probed once per pc
+for the source map. Now both tables are read through a name index built once
+(FNV-hashed static keys), the spec and the tokens borrow the tables and the
+source text, the offsets are a position-ordered vector shifted in place and
+handed out as a `BTreeMap`, and the source map is written into one buffer.
+`assemble-sources/all` wall 1.079 s to 0.404 s against go's 1.07 s (main
+`040826a9` measured the same day on the same host: Rust 1.079 s, go 1.029 s,
+`RUNS=10`); corpus outputs, every source map included, byte-identical with go's.
 
 ## Regression detection and CI
 

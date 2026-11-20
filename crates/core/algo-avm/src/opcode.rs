@@ -759,27 +759,57 @@ fn resolve_in<'a>(
     }
 }
 
-/// Look up an opcode spec by mnemonic name. Linear scan — use for debugging/
-/// assembler use. Also searches inside any registered `sub_ops` family (e.g.
-/// `app_box_create`), so the assembler can resolve a sub-opcode's own
-/// two-byte-header spec by its distinct mnemonic, not just the shared prefix
-/// byte's synthetic entry.
+/// Look up an opcode spec by mnemonic name. Also resolves the mnemonics inside
+/// any registered `sub_ops` family (e.g. `app_box_create`), so the assembler
+/// can resolve a sub-opcode's own two-byte-header spec by its distinct
+/// mnemonic, not just the shared prefix byte's synthetic entry.
+///
+/// The assembler calls this for every instruction, so it reads a name index
+/// built once; a name that occurs twice resolves to the first one in opcode
+/// byte order (a prefix entry before its own sub-opcodes), like a scan would.
 pub fn lookup_by_name(name: &str) -> Option<&'static OpSpec> {
-    for entry in OPCODE_TABLE.iter().filter_map(|o| o.as_ref()) {
-        if entry.name == name {
-            return Some(entry);
-        }
-        if let Some(sub_ops) = entry.sub_ops {
-            if let Some(sub) = sub_ops
-                .iter()
-                .filter_map(|o| o.as_ref())
-                .find(|s| s.name == name)
-            {
-                return Some(sub);
+    static INDEX: std::sync::OnceLock<NameMap<&'static OpSpec>> = std::sync::OnceLock::new();
+    INDEX
+        .get_or_init(|| {
+            let mut index = NameMap::default();
+            for entry in OPCODE_TABLE.iter().filter_map(|o| o.as_ref()) {
+                index.entry(entry.name).or_insert(entry);
+                for sub in entry.sub_ops.into_iter().flatten().flatten() {
+                    index.entry(sub.name).or_insert(sub);
+                }
             }
+            index
+        })
+        .get(name)
+        .copied()
+}
+
+/// A map keyed by a static opcode or field name. The keys are fixed tables
+/// compiled into the binary (never caller input), so a cheap FNV-1a hash
+/// replaces the default SipHash, which costs more than the lookup it guards.
+pub(crate) type NameMap<V> =
+    std::collections::HashMap<&'static str, V, std::hash::BuildHasherDefault<NameHasher>>;
+
+/// FNV-1a, for [`NameMap`].
+pub(crate) struct NameHasher(u64);
+
+impl Default for NameHasher {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl std::hash::Hasher for NameHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
-    None
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
 }
 
 /// Return all defined opcodes as `(byte, name)` pairs, sorted by byte value.
@@ -892,6 +922,45 @@ mod tests {
         let spec = lookup_by_name("sha256").unwrap();
         assert_eq!(spec.opcode, 0x01);
         assert!(lookup_by_name("nonexistent").is_none());
+    }
+
+    /// The name index answers exactly what the former linear scan of the
+    /// table (each entry, then its sub-opcodes, first match wins) answered,
+    /// for every mnemonic in the table and for names that are not in it.
+    #[test]
+    fn lookup_by_name_index_matches_a_table_scan() {
+        fn scan(name: &str) -> Option<&'static OpSpec> {
+            for entry in OPCODE_TABLE.iter().filter_map(|o| o.as_ref()) {
+                if entry.name == name {
+                    return Some(entry);
+                }
+                if let Some(sub) = entry
+                    .sub_ops
+                    .and_then(|s| s.iter().filter_map(|o| o.as_ref()).find(|s| s.name == name))
+                {
+                    return Some(sub);
+                }
+            }
+            None
+        }
+        let mut names: Vec<&str> = vec!["", "nonexistent", "int", "byte", "txn ", "SHA256"];
+        for entry in OPCODE_TABLE.iter().filter_map(|o| o.as_ref()) {
+            names.push(entry.name);
+            names.extend(
+                entry
+                    .sub_ops
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|s| s.name),
+            );
+        }
+        assert!(names.len() > 200);
+        for name in names {
+            let got = lookup_by_name(name).map(|s| s as *const OpSpec);
+            let want = scan(name).map(|s| s as *const OpSpec);
+            assert_eq!(got, want, "{name:?}");
+        }
     }
 
     #[test]
