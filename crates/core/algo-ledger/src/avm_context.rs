@@ -4612,12 +4612,12 @@ fn execute_inner_appl<L: LedgerStore>(
     // ── ClearState: reject a caller trying to shortchange the shared budget ──
     // go-algorand (`data/transactions/logic/eval.go:1244-1247`,
     // `IsolateClearState`): even though ClearState always runs with its own
-    // isolated `MaxAppProgramCost` budget (it never draws from the shared
-    // pool -- see below), invoking one still requires the shared pooled
-    // budget to hold at least `MaxAppProgramCost` at the moment of the call
-    // (after `itxn_submit` credited the whole inner group, this call
-    // included). This is a plain `fmt.Errorf`, not a `logic.EvalError`, so unlike an
-    // ordinary ClearState program rejection it is NOT swallowed by
+    // isolated `MaxAppProgramCost` budget (its cost is still charged to the
+    // shared pool -- see below), invoking one still requires the shared
+    // pooled budget to hold at least `MaxAppProgramCost` at the moment of the
+    // call (after `itxn_submit` credited the whole inner group, this call
+    // included). This is a plain `fmt.Errorf`, not a `logic.EvalError`, so
+    // unlike an ordinary ClearState program rejection it is NOT swallowed by
     // `ledger/apply/application.go` -- it fails the entire outer transaction.
     // A caller that burns down the shared budget before invoking an inner
     // ClearState (mirrors go's TestInnerClearStateBadCaller) must not be
