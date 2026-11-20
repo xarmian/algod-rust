@@ -61,7 +61,7 @@ pub struct Answer {
 /// encoded sorted by key); `body` the raw request body of a
 /// `rawRequestPaths` POST.
 pub fn submit(
-    rt: &tokio::runtime::Runtime,
+    _rt: &tokio::runtime::Runtime,
     (base, token): &Endpoint,
     method: &str,
     path: &str,
@@ -80,11 +80,7 @@ pub fn submit(
     } else {
         vec![(AUTH_HEADER, token.as_str())]
     };
-    let resp = if url.scheme == "https" {
-        tls_request(rt, method, &url, &headers, body)?
-    } else {
-        go_http::request(method, &url, &headers, body)?
-    };
+    let resp = go_http::request(method, &url, &headers, body)?;
     if resp.status_code != 200 && resp.status_code != 201 {
         let message = error_message(&String::from_utf8_lossy(&resp.body));
         if resp.status_code == 401 {
@@ -247,66 +243,6 @@ pub fn eprint_raw(text: &str) {
     use std::io::Write as _;
     let mut err = std::io::stderr().lock();
     let _ = err.write_all(&algo_types::raw_text::decode(text));
-}
-
-/// An `https:` algod: the request through reqwest's TLS client.
-fn tls_request(
-    rt: &tokio::runtime::Runtime,
-    method: &str,
-    url: &GoUrl,
-    headers: &[(&str, &str)],
-    body: Option<&[u8]>,
-) -> Result<go_http::Response, String> {
-    let op = {
-        let mut c = method.chars();
-        match c.next() {
-            Some(f) => format!("{f}{}", c.as_str().to_ascii_lowercase()),
-            None => String::new(),
-        }
-    };
-    let text = url.to_string();
-    let wrap = |e: &reqwest::Error| format!("{op} \"{text}\": {}", transport_error(e));
-    rt.block_on(async {
-        let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
-        let mut req = reqwest::Client::new().request(method, text.as_str());
-        for (k, v) in headers {
-            req = req.header(*k, *v);
-        }
-        if let Some(b) = body {
-            req = req.body(b.to_vec());
-        }
-        let resp = req.send().await.map_err(|e| wrap(&e))?;
-        let status = resp.status();
-        let final_url = GoUrl::parse(resp.url().as_str());
-        let content_length = resp.content_length().map_or(-1, |n| n as i64);
-        let (body, body_err) = match resp.bytes().await {
-            Ok(b) => (b.to_vec(), None),
-            Err(e) => (Vec::new(), Some(transport_error(&e))),
-        };
-        Ok(go_http::Response {
-            status_code: status.as_u16(),
-            status: status.to_string(),
-            content_length,
-            body,
-            body_err,
-            url: final_url,
-        })
-    })
-}
-
-/// The error text of a request reqwest sent that got no answer.
-fn transport_error(e: &reqwest::Error) -> String {
-    use std::error::Error as _;
-    let mut source = e.source();
-    while let Some(s) = source {
-        if let Some(h) = s.downcast_ref::<hyper::Error>() {
-            if h.is_incomplete_message() {
-                return "EOF".to_string();
-            }
-        }
-        source = s.source();
-    }
-    e.to_string()
 }
 
 /// go's `extractError` message: the body decoded as a `model.ErrorResponse`

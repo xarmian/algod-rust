@@ -54,7 +54,12 @@
 //!   list`, `app read` (the account's application resource as msgpack),
 //!   `account deletepartkey` (a DELETE that expects no content) and
 //!   `installpartkey` (the key's POST, then its listing), and the reads of
-//!   `account renewpartkey` / `renewallpartkeys`.
+//!   `account renewpartkey` / `renewallpartkeys`;
+//! - issue #2489 (last slice): `node pendingtxns` (`format=msgpack`, go-codec's
+//!   msgpack decode), the msgp decode errors of `app read`'s account
+//!   resource, and an `https:` algod (a plain HTTP server, a server that
+//!   speaks neither HTTP nor TLS, one that closes, a self-signed certificate,
+//!   a refused port).
 //!
 //! `fixtures/goal_algod_reads.jsonl` holds what go v5.0.5-stable's `goal`
 //! printed (exit code, stdout, stderr, the data dir masked; a stdout longer
@@ -833,9 +838,7 @@ fn route_2489_reads(method: &str, path: &str, query: &str) -> Option<(u16, &'sta
     };
     match (method, path) {
         ("GET", "/v2/applications/7/box") => {
-            if has("name=str%3Ak") || has("name=b64%3Aaw%3D%3D") {
-                ok(serde_json::json!({"name": "aw==", "round": 5, "value": "dmFs"}))
-            } else if has("name=str%3Aother") {
+            if has("name=str%3Ak") || has("name=b64%3Aaw%3D%3D") || has("name=str%3Aother") {
                 ok(serde_json::json!({"name": "aw==", "round": 5, "value": "dmFs"}))
             } else {
                 not_found("box not found")
@@ -1036,6 +1039,83 @@ struct Case {
     net: Option<&'static str>,
     /// Files written into the data dir before the command runs.
     inputs: Vec<(&'static str, Vec<u8>)>,
+    /// `algod.net` names `https://` and this server instead of the mock.
+    tls: Option<TlsServer>,
+}
+
+/// What the `https://` algod of a row does on a connection.
+#[derive(Clone, Copy)]
+enum TlsServer {
+    /// Answers in plain HTTP at once.
+    PlainHttp,
+    /// Writes bytes that are neither HTTP nor TLS.
+    Garbage,
+    /// Closes the connection.
+    Close,
+    /// A TLS server with a self-signed certificate for 127.0.0.1.
+    SelfSigned,
+}
+
+/// A self-signed, non-CA (`CA:FALSE`, `serverAuth`) P-256 certificate for
+/// `IP:127.0.0.1` (DER, base64) and its PKCS#8 key: a test fixture no root
+/// vouches for.
+const TEST_CERT: &str = "MIIBsDCCAVegAwIBAgIUZfCH5XhSfpqsbyc3BV9ae8h4yDYwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJMTI3LjAuMC4xMCAXDTI2MTEyMDIzMDczNVoYDzIxMjYxMDI3MjMwNzM1WjAUMRIwEAYDVQQDDAkxMjcuMC4wLjEwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQ+68OezEpRQjpCKcx5UslFmJ4vceOvOtkI7qw6+dlBbGyTJcSNzEmmODWQmHFsK8kZ0B7P77P4JHzaf1uwVkM4o4GEMIGBMB0GA1UdDgQWBBQs6oia0kB+u3pzTpYhmQS40b2ABTAfBgNVHSMEGDAWgBQs6oia0kB+u3pzTpYhmQS40b2ABTAPBgNVHREECDAGhwR/AAABMAwGA1UdEwEB/wQCMAAwCwYDVR0PBAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMAoGCCqGSM49BAMCA0cAMEQCIA94ncOcNCUNIYXfey2BfXBn9VGWprdTOOx6ztrFsyZYAiAO+mUYj+SdpwoeS2F6h4A7kKy7Uojbyjpw7PuNGkIarg==";
+const TEST_KEY: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg0CEbjDURhPZrYmFYXJCqSO8tK6HgqNucopCOs2pMQM2hRANCAAQ+68OezEpRQjpCKcx5UslFmJ4vceOvOtkI7qw6+dlBbGyTJcSNzEmmODWQmHFsK8kZ0B7P77P4JHzaf1uwVkM4";
+
+/// Serve `kind` on a fresh port until the test process exits.
+fn spawn_tls_server(kind: TlsServer) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let config = match kind {
+        TlsServer::SelfSigned => {
+            let cert = rustls::pki_types::CertificateDer::from(
+                data_encoding::BASE64.decode(TEST_CERT.as_bytes()).unwrap(),
+            );
+            let key = rustls::pki_types::PrivateKeyDer::try_from(
+                data_encoding::BASE64.decode(TEST_KEY.as_bytes()).unwrap(),
+            )
+            .unwrap();
+            Some(Arc::new(
+                rustls::ServerConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::aws_lc_rs::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .unwrap(),
+            ))
+        }
+        _ => None,
+    };
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let config = config.clone();
+            std::thread::spawn(move || match kind {
+                TlsServer::PlainHttp => {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                TlsServer::Garbage => {
+                    let _ = stream.write_all(b"garbage!garbage!\n");
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                TlsServer::Close => {}
+                TlsServer::SelfSigned => {
+                    let mut conn = rustls::ServerConnection::new(config.unwrap()).unwrap();
+                    while conn.is_handshaking() {
+                        if conn.complete_io(&mut stream).is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    port
 }
 
 fn case(name: &str, args: &[&str]) -> Case {
@@ -1050,6 +1130,7 @@ fn case(name: &str, args: &[&str]) -> Case {
         consensus_json: false,
         net: None,
         inputs: Vec::new(),
+        tls: None,
     }
 }
 
@@ -1437,6 +1518,157 @@ fn cases() -> Vec<Case> {
     v.extend(transport_cases());
     v.extend(txn_cases());
     v.extend(read_cases_2489());
+    v.extend(final_cases_2489());
+    v
+}
+
+/// Issue #2489, last slice: `node pendingtxns`, the msgp decode of `app
+/// read`'s account resource and an `https:` algod.
+fn final_cases_2489() -> Vec<Case> {
+    let answer = |prefix: &'static str, status: u16, body: &[u8]| Answer {
+        prefix,
+        status,
+        body: body.to_vec(),
+    };
+    let mut v = Vec::new();
+    // `node pendingtxns`: the transactions themselves print differently
+    // (DIV-002), so only an empty pool and the failures
+    let empty_pool = mp_obj(&[
+        ("top-transactions", mp_arr(&[])),
+        ("total-transactions", mp_u(3)),
+    ]);
+    let pending: Vec<(&str, Vec<&str>, Vec<Answer>, bool)> = vec![
+        (
+            "node pendingtxns empty pool",
+            vec!["node", "pendingtxns", "-m", "5"],
+            vec![answer("/v2/transactions/pending", 200, &empty_pool)],
+            false,
+        ),
+        (
+            "node pendingtxns refused",
+            vec!["node", "pendingtxns"],
+            vec![],
+            true,
+        ),
+        (
+            "node pendingtxns 401",
+            vec!["node", "pendingtxns"],
+            vec![answer(
+                "/v2/transactions/pending",
+                401,
+                br#"{"message":"Invalid API Token"}"#,
+            )],
+            false,
+        ),
+        (
+            "node pendingtxns 500",
+            vec!["node", "pendingtxns"],
+            vec![answer(
+                "/v2/transactions/pending",
+                500,
+                br#"{"message":"pool is down"}"#,
+            )],
+            false,
+        ),
+        (
+            "node pendingtxns json body",
+            vec!["node", "pendingtxns"],
+            vec![answer(
+                "/v2/transactions/pending",
+                200,
+                br#"{"top-transactions":[]}"#,
+            )],
+            false,
+        ),
+        (
+            "node pendingtxns unknown field",
+            vec!["node", "pendingtxns"],
+            vec![answer(
+                "/v2/transactions/pending",
+                200,
+                &mp_obj(&[("foo", mp_u(1))]),
+            )],
+            false,
+        ),
+        (
+            "node pendingtxns truncated",
+            vec!["node", "pendingtxns"],
+            vec![answer(
+                "/v2/transactions/pending",
+                200,
+                &empty_pool[..empty_pool.len() - 1],
+            )],
+            false,
+        ),
+        (
+            "node pendingtxns bad transaction",
+            vec!["node", "pendingtxns"],
+            vec![answer(
+                "/v2/transactions/pending",
+                200,
+                &mp_obj(&[
+                    ("top-transactions", mp_arr(&[mp_obj(&[("txn", mp_u(5))])])),
+                    ("total-transactions", mp_u(1)),
+                ]),
+            )],
+            false,
+        ),
+    ];
+    for (name, args, answers, refused) in pending {
+        let mut c = case(name, &args);
+        c.answers = answers;
+        c.refused = refused;
+        v.push(c);
+    }
+    // `app read`'s account resource through go's msgp-generated decoder
+    let resources: Vec<(&str, Vec<u8>)> = vec![
+        ("unknown field", mp_obj(&[("foo", mp_u(1))])),
+        (
+            "local state not a map",
+            mp_obj(&[("app-local-state", mp_u(7))]),
+        ),
+        (
+            "key value wrong type",
+            mp_obj(&[(
+                "app-local-state",
+                mp_obj(&[("tkv", mp_obj(&[("k", mp_obj(&[("tt", s("x"))]))]))]),
+            )]),
+        ),
+        (
+            "truncated",
+            mp_obj(&[("app-local-state", mp_map(&[]))])[..3].to_vec(),
+        ),
+        (
+            "array form",
+            mp_arr(&[mp_obj(&[("tkv", mp_map(&[]))]), vec![0xc0], mp_u(1)]),
+        ),
+    ];
+    for (what, body) in resources {
+        let mut c = case(
+            &format!("app read --local msgp {what}"),
+            &["app", "read", "--app-id", "7", "--local", "--from", "<A1>"],
+        );
+        c.answers = vec![Answer {
+            prefix: "/v2/accounts/",
+            status: 200,
+            body,
+        }];
+        v.push(c);
+    }
+    // an `https:` algod
+    for (what, server) in [
+        ("plain HTTP", TlsServer::PlainHttp),
+        ("garbage", TlsServer::Garbage),
+        ("closes", TlsServer::Close),
+        ("self-signed", TlsServer::SelfSigned),
+    ] {
+        let mut c = case(&format!("node status https {what}"), &["node", "status"]);
+        c.tls = Some(server);
+        v.push(c);
+    }
+    let mut c = case("node status https refused", &["node", "status"]);
+    c.net = Some("https://127.0.0.1:1");
+    v.push(c);
     v
 }
 
@@ -1599,19 +1831,18 @@ fn read_cases_2489() -> Vec<Case> {
             refused.refused = true;
             v.push(refused);
         }
-        // the msgpack answer of `RawAccountApplicationInformation` is decoded
-        // by the msgp-generated decoder, not go-codec's JSON one: only its
-        // request errors here
-        let msgpack = *prefix == "/v2/accounts/";
         for (what, answers) in fails(prefix) {
-            if msgpack && (what == "malformed" || what == "unknown field") {
-                continue;
-            }
             v.push(mk(what, answers));
         }
     }
     // the rest of each command's own cases
-    let extra: Vec<(&str, Vec<&str>, Vec<Answer>, Vec<(&'static str, Vec<u8>)>)> = vec![
+    type Extra<'a> = (
+        &'a str,
+        Vec<&'a str>,
+        Vec<Answer>,
+        Vec<(&'static str, Vec<u8>)>,
+    );
+    let extra: Vec<Extra> = vec![
         (
             "app box info no such box",
             vec!["app", "box", "info", "--app-id", "7", "-n", "str:nope"],
@@ -2778,7 +3009,10 @@ fn row(goal: &Path, c: &Case) -> serde_json::Value {
         let doc = serde_json::json!({"v7": {"MinBalance": 123}, "extra": {"MinBalance": 5}});
         std::fs::write(dd.join("consensus.json"), doc.to_string()).unwrap();
     }
-    let net = if let Some(n) = c.net {
+    let tls_port = c.tls.map(spawn_tls_server);
+    let net = if let Some(p) = tls_port {
+        format!("https://127.0.0.1:{p}")
+    } else if let Some(n) = c.net {
         n.to_string()
     } else if c.refused {
         CLOSED_ALGOD.to_string()
@@ -2820,6 +3054,10 @@ fn row(goal: &Path, c: &Case) -> serde_json::Value {
         }
         let t = t.replace(&format!("127.0.0.1:{port}"), "<ALGOD>");
         let t = t.replace(MOCK_TXID, "<TXID>");
+        let t = match tls_port {
+            Some(p) => t.replace(&format!("127.0.0.1:{p}"), "<TLS>"),
+            None => t,
+        };
         // the host's DNS server, which go's resolver names
         let t = mask_dns_server(&t);
         if std::str::from_utf8(b).is_ok() {

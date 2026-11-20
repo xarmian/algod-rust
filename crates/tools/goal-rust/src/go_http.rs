@@ -35,7 +35,13 @@
 //!   1xx answers skipped, the body by `Content-Length`, chunked or up to
 //!   the close;
 //! - `Client.Do`'s redirects (301, 302, 303, 307, 308; `stopped after 10
-//!   redirects`).
+//!   redirects`);
+//! - for an `https://` algod (issue #2489), the TLS handshake's failures as
+//!   go's transport reports them: a server that answers in plain HTTP
+//!   (`http: server gave HTTP response to HTTPS client`), one that answers
+//!   neither HTTP nor TLS (`tls: first record does not look like a TLS
+//!   handshake`), a certificate no root vouches for (`tls: failed to verify
+//!   certificate: x509: certificate signed by unknown authority`).
 //!
 //! Every error is `<Op> "<url>": <err>` (`*url.Error`). Texts are in the
 //! lossless form of [`algo_types::raw_text`]: a reason phrase that is not
@@ -318,13 +324,15 @@ fn round_trip(
     headers: &[(&str, &str)],
     body: Option<&[u8]>,
 ) -> Result<RoundTrip, String> {
-    if url.scheme != "http" {
+    let https = url.scheme == "https";
+    if url.scheme != "http" && !https {
         return Err(format!("unsupported protocol scheme {:?}", url.scheme));
     }
     let host = url.host().to_string();
-    let proxy = proxy_for(&host);
+    let proxy = if https { None } else { proxy_for(&host) };
     let mut stream = match &proxy {
         Some(p) => dial(p).map_err(|e| format!("proxyconnect tcp: {e}"))?,
+        None if https && !has_port(&host) => dial(&format!("{host}:443"))?,
         None => dial(&host)?,
     };
     let target = match proxy {
@@ -347,10 +355,123 @@ fn round_trip(
     if let Some(b) = body {
         bytes.extend_from_slice(b);
     }
+    let local = stream.local_addr().ok();
+    let peer = stream.peer_addr().ok();
+    if https {
+        let mut tls = tls_connect(stream, &host)?;
+        let _ = tls.write_all(&bytes);
+        let _ = tls.flush();
+        return read_response(tls, local, peer, method, url);
+    }
     // A failed write shows as the read error below, as in go's transport.
     let _ = stream.write_all(&bytes);
     let _ = stream.flush();
-    read_response(stream, method, url)
+    read_response(stream, local, peer, method, url)
+}
+
+/// Whether a `host[:port]` names its port.
+fn has_port(hostport: &str) -> bool {
+    match hostport.strip_prefix('[') {
+        Some(rest) => rest
+            .split_once(']')
+            .is_some_and(|(_, a)| a.starts_with(':')),
+        None => hostport
+            .rsplit_once(':')
+            .is_some_and(|(h, _)| !h.contains(':')),
+    }
+}
+
+/// A connection that keeps the first bytes the server sent: what go's
+/// `tls.RecordHeaderError` holds of a record that is not TLS.
+struct Recording {
+    inner: TcpStream,
+    first: Vec<u8>,
+}
+
+impl Read for Recording {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        let keep = (5 - self.first.len().min(5)).min(n);
+        self.first.extend_from_slice(&buf[..keep]);
+        Ok(n)
+    }
+}
+
+impl Write for Recording {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// go's `tls.Client(conn, cfg).Handshake()` as the transport runs it (the
+/// system roots, the URL's host as the server name): the TLS stream, or
+/// go's error text.
+fn tls_connect(
+    stream: TcpStream,
+    host: &str,
+) -> Result<rustls::StreamOwned<rustls::ClientConnection, Recording>, String> {
+    let local = stream.local_addr().ok();
+    let peer = stream.peer_addr().ok();
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let verifier = rustls_platform_verifier::Verifier::new(provider.clone())
+        .map_err(|e| format!("tls: {e}"))?;
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("tls: {e}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
+        .with_no_client_auth();
+    let (name, _) = split_host_port(host);
+    let server_name = rustls::pki_types::ServerName::try_from(name.clone())
+        .map_err(|_| format!("tls: invalid server name {name:?}"))?;
+    let mut conn = rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
+        .map_err(|e| format!("tls: {e}"))?;
+    let mut sock = Recording {
+        inner: stream,
+        first: Vec::new(),
+    };
+    while conn.is_handshaking() {
+        if let Err(e) = conn.complete_io(&mut sock) {
+            return Err(tls_error(&e, &sock.first, local, peer));
+        }
+    }
+    Ok(rustls::StreamOwned::new(conn, sock))
+}
+
+/// go's text of a failed TLS handshake.
+fn tls_error(
+    e: &std::io::Error,
+    first: &[u8],
+    local: Option<SocketAddr>,
+    peer: Option<SocketAddr>,
+) -> String {
+    use rustls::{CertificateError, Error as TlsError};
+    let tls = e.get_ref().and_then(|i| i.downcast_ref::<TlsError>());
+    match tls {
+        Some(TlsError::InvalidCertificate(CertificateError::UnknownIssuer)) => {
+            "tls: failed to verify certificate: x509: certificate signed by unknown authority"
+                .to_string()
+        }
+        Some(TlsError::InvalidCertificate(c)) => {
+            format!("tls: failed to verify certificate: {c:?}")
+        }
+        // go's transport: a `RecordHeaderError` whose bytes read like HTTP
+        Some(_) if first.starts_with(b"HTTP/") => {
+            "http: server gave HTTP response to HTTPS client".to_string()
+        }
+        Some(TlsError::InvalidMessage(_)) if !first.is_empty() => {
+            "tls: first record does not look like a TLS handshake".to_string()
+        }
+        Some(other) => format!("tls: {other}"),
+        None if e.kind() == std::io::ErrorKind::UnexpectedEof => "EOF".to_string(),
+        None => match (local, peer) {
+            (Some(l), Some(p)) => format!("read tcp {l}->{p}: read: {}", errno_text(e)),
+            _ => errno_text(e),
+        },
+    }
 }
 
 /// go: `net/http: HTTP/1.x transport connection broken: <err>`.
@@ -358,9 +479,13 @@ fn broken(e: impl std::fmt::Display) -> String {
     format!("net/http: HTTP/1.x transport connection broken: {e}")
 }
 
-fn read_response(stream: TcpStream, method: &str, url: &GoUrl) -> Result<RoundTrip, String> {
-    let local = stream.local_addr().ok();
-    let peer = stream.peer_addr().ok();
+fn read_response(
+    stream: impl Read,
+    local: Option<SocketAddr>,
+    peer: Option<SocketAddr>,
+    method: &str,
+    url: &GoUrl,
+) -> Result<RoundTrip, String> {
     let read_err = |e: &std::io::Error| match (local, peer) {
         (Some(l), Some(p)) => format!("read tcp {l}->{p}: read: {}", errno_text(e)),
         _ => errno_text(e),

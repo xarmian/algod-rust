@@ -677,27 +677,18 @@ pub fn run_pendingtxns(args: crate::groups::node::PendingTxnsArgs, cli_d: Vec<Pa
                 return ExitCode::from(1);
             }
         };
-        let fetched = rt.block_on(async {
-            let resp = http()
-                .get(format!(
-                    "{url}/v2/transactions/pending?max={}&format=json",
-                    args.max
-                ))
-                .header("X-Algo-API-Token", &token)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(http_error_text(status, &body));
-            }
-            let doc = serde_json::from_str::<serde_json::Value>(&body).map_err(|e| e.to_string())?;
-            if doc.get("total-transactions").is_none() {
-                return Err("unexpected pending transactions response".to_string());
-            }
-            Ok(doc)
-        });
+        // go: `client.GetParsedPendingTransactions(max)`, i.e. `getRaw` of
+        // `/v2/transactions/pending?format=msgpack&max=N` through go's REST
+        // client, then `protocol.DecodeReflect` (go-codec's msgpack decode)
+        // into a `libgoal.PendingTransactions`
+        let max = args.max.to_string();
+        let fetched = crate::algod_rest::get(
+            &rt,
+            &(url.clone(), token.clone()),
+            "/v2/transactions/pending",
+            &[("format", "msgpack"), ("max", &max)],
+        )
+        .and_then(|body| pending_transactions_doc(&body));
         match fetched {
             Ok(doc) => print!("{}", format_pending_txns(&doc, args.max)),
             Err(e) => {
@@ -707,6 +698,38 @@ pub fn run_pendingtxns(args: crate::groups::node::PendingTxnsArgs, cli_d: Vec<Pa
         }
     }
     ExitCode::SUCCESS
+}
+
+/// go's `protocol.DecodeReflect(resp, &libgoal.PendingTransactions{})`, the
+/// decoded transactions in the REST API's JSON form (DIV-002) as the
+/// `{"top-transactions", "total-transactions"}` document
+/// [`format_pending_txns`] prints, or go-codec's error text.
+fn pending_transactions_doc(body: &[u8]) -> Result<serde_json::Value, String> {
+    use algo_codec::go_codec_msgpack::{encode, Decoder, GoVal};
+    use algo_rest_api::simulate_request_schema::TRANSACTIONS_SIGNEDTXN;
+    let decoded = Decoder::new(body)
+        .decode(&crate::go_codec_json::PENDING_TRANSACTIONS)
+        .map_err(|e| algo_types::raw_text::encode(&e.to_bytes()).into_owned())?;
+    let GoVal::Struct(fields) = decoded else {
+        return Err("unexpected pending transactions value".to_string());
+    };
+    let (top, total) = match (fields.first(), fields.get(1)) {
+        (Some(GoVal::Slice(top)), Some(GoVal::Uint(total))) => (top.elems(), *total),
+        _ => return Err("unexpected pending transactions value".to_string()),
+    };
+    let mut txns = Vec::with_capacity(top.len());
+    for stxn in top {
+        let mut bytes = Vec::new();
+        encode(stxn, &TRANSACTIONS_SIGNEDTXN, &mut bytes);
+        let tree = rmpv::decode::read_value(&mut &bytes[..]).map_err(|e| e.to_string())?;
+        // DIVERGENCE DIV-002: the REST API's JSON form of the transaction,
+        // not go's `encoding/json` of its `SignedTxn` struct.
+        txns.push(algo_rest_api::block_json::signed_txn_tree_to_json(&tree));
+    }
+    Ok(serde_json::json!({
+        "top-transactions": txns,
+        "total-transactions": total,
+    }))
 }
 
 /// Port of `supplyCmd` (`ledger.go`): `ensureAlgodClient(dataDir)`, then
