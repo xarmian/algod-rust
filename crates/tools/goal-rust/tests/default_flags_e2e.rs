@@ -50,7 +50,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod common;
-use common::pty::{run, Ran, Stdin};
+use common::pty::{run, wallet_new, Ran, Stdin};
 
 const GOAL_RUST_BIN: &str = env!("CARGO_BIN_EXE_goal-rust");
 
@@ -256,12 +256,7 @@ fn setup() -> (tempfile::TempDir, KmdGuard, Masks) {
     poll_ready(&kmd_dir).expect("ready");
     let goal = Path::new(GOAL_RUST_BIN);
     for w in ["w", "w2"] {
-        let out = run(
-            goal,
-            &dd,
-            &["wallet", "new", w, "-w", "pw", "--no-display-seed"],
-            Stdin::Null,
-        );
+        let out = wallet_new(goal, &dd, w, "pw");
         assert_eq!(out.code, Some(0), "wallet new {w}: {}", text(&out.stderr));
     }
     // A fixed key, so the account order in the file is the same every run.
@@ -277,10 +272,11 @@ fn setup() -> (tempfile::TempDir, KmdGuard, Masks) {
             &first,
             "-w",
             "w",
-            "--password",
-            "pw",
         ],
-        Stdin::Null,
+        Stdin::Pty {
+            prompt: PROMPT,
+            line: "pw",
+        },
     );
     assert_eq!(out.code, Some(0), "account import: {}", text(&out.stderr));
     let mut masks = vec![(dd.to_str().unwrap().to_string(), "<DD>")];

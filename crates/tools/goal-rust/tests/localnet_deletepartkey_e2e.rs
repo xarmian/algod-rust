@@ -279,23 +279,17 @@ fn localnet_dev_node_deletepartkey_removes_key() {
     );
 
     assert_cli_ok(
-        &goal_rust(dd, &["wallet", "new", "w", "-w", "pw", "--no-display-seed"]),
+        &goal_rust(
+            dd,
+            &["wallet", "new", "w", "--unencrypted", "--no-display-seed"],
+        ),
         "wallet new",
         &node,
     );
     assert_cli_ok(
         &goal_rust(
             dd,
-            &[
-                "account",
-                "import",
-                "-w",
-                "w",
-                "--password",
-                "pw",
-                "--mnemonic",
-                DEV_MNEMONIC,
-            ],
+            &["account", "import", "-w", "w", "--mnemonic", DEV_MNEMONIC],
         ),
         "account import",
         &node,

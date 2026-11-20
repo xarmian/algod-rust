@@ -446,10 +446,9 @@ fn child(parent: &Cmd, name: &str) -> Option<&'static Cmd> {
 
 /// The flags of `cmd` after `mergePersistentFlags`: its own, then the
 /// persistent ones of it and its parents (a parent's flag never shadows one
-/// of the same name); `with_help` adds cobra's help flag, then `extras`
-/// whose names go's flags do not use.
-fn flags_of<'a>(cmd: &Cmd, with_help: bool, extras: &[Flag<'a>]) -> Vec<Flag<'a>> {
-    let mut out: Vec<Flag<'a>> = cmd.local.to_vec();
+/// of the same name); `with_help` adds cobra's help flag.
+fn flags_of(cmd: &Cmd, with_help: bool) -> Vec<Flag<'static>> {
+    let mut out: Vec<Flag<'static>> = cmd.local.to_vec();
     let mut path = Some(cmd.path);
     while let Some(p) = path {
         let c = command(p).expect("a parent of a known command is known");
@@ -467,48 +466,7 @@ fn flags_of<'a>(cmd: &Cmd, with_help: bool, extras: &[Flag<'a>]) -> Vec<Flag<'a>
     if with_help {
         out.push(HELP);
     }
-    for e in extras {
-        if !e.long.is_empty() && out.iter().any(|o| o.long == e.long) {
-            continue;
-        }
-        let mut e = *e;
-        if out.iter().any(|o| o.short != 0 && o.short == e.short) {
-            e.short = 0;
-        }
-        if !e.long.is_empty() || e.short != 0 {
-            out.push(e);
-        }
-    }
     out
-}
-
-/// goal-rust's clap definition of the command `path`.
-fn clap_command(path: &str) -> Option<clap::Command> {
-    let mut c = <crate::Cli as clap::CommandFactory>::command();
-    for name in path.split(' ') {
-        c = c.find_subcommand(name)?.clone();
-    }
-    Some(c)
-}
-
-/// The flags goal-rust's clap command declares beyond go's (`--password`
-/// and the like, which goal-rust already accepted before this parsing was
-/// ported): known to the parse, so a command line using them still reaches
-/// clap.
-fn clap_extras(c: &clap::Command) -> Vec<Flag<'_>> {
-    c.get_arguments()
-        .filter(|a| !a.is_positional())
-        .map(|a| Flag {
-            long: a.get_long().unwrap_or(""),
-            short: a.get_short().filter(char::is_ascii).map_or(0, |c| c as u8),
-            kind: if a.get_action().takes_values() {
-                Kind::Str
-            } else {
-                Kind::Bool
-            },
-            required: false,
-        })
-        .collect()
 }
 
 fn by_long<'f, 'a>(flags: &'f [Flag<'a>], name: &str) -> Option<&'f Flag<'a>> {
@@ -931,7 +889,7 @@ pub(crate) fn decide(args: &[String]) -> Outcome {
     let mut idx: Vec<usize> = (1..args.len()).collect();
     let mut names = Vec::new();
     loop {
-        let flags = flags_of(cmd, false, &[]);
+        let flags = flags_of(cmd, false);
         let Some(&next) = strip_flags(args, &idx, &flags).first() else {
             break;
         };
@@ -947,9 +905,7 @@ pub(crate) fn decide(args: &[String]) -> Outcome {
     }
 
     // execute: flags, help, `Args`, required flags.
-    let clap_cmd = clap_command(cmd.path);
-    let extras = clap_cmd.as_ref().map(clap_extras).unwrap_or_default();
-    let flags = flags_of(cmd, true, &extras);
+    let flags = flags_of(cmd, true);
     let rest: Vec<&str> = idx.iter().map(|&k| args[k].as_str()).collect();
     let fail = |msg: String| Outcome::Fail {
         msg,
@@ -1252,20 +1208,54 @@ mod tests {
     }
 
     #[test]
-    fn goal_rusts_own_extra_flags_still_reach_clap() {
+    fn flags_go_does_not_define_are_cobras_unknown_flag() {
+        // goal-rust once had its own `--password`, `wallet new -w/--driver`,
+        // `changeonlinestatus --offline` and `renew*partkey(s) --register`
+        // (issue #2407): go's goal knows none of them.
         assert_eq!(
             d(&["wallet", "new", "w", "-w", "pw", "--no-display-seed"]),
-            Outcome::Unchanged
+            fail("unknown shorthand flag: 'w' in -w", "wallet new")
         );
         assert_eq!(
             d(&["account", "import", "x", "-m", "m", "--password", "pw"]),
-            Outcome::Unchanged
+            fail("unknown flag: --password", "account import")
         );
-        // go's flags keep their kinds and errors.
+        assert_eq!(
+            d(&["account", "changeonlinestatus", "-a", "A", "--offline"]),
+            fail("unknown flag: --offline", "account changeonlinestatus")
+        );
         assert_eq!(
             d(&["wallet", "new", "w", "-f", "x"]),
             fail("unknown shorthand flag: 'f' in -f", "wallet new")
         );
+    }
+
+    /// Every flag goal-rust's clap command declares is one of go's: nothing
+    /// cobra rejects as unknown is ever needed by goal-rust.
+    #[test]
+    fn clap_declares_no_flag_beyond_gos() {
+        for cmd in COMMANDS.iter().filter(|c| !c.path.is_empty()) {
+            let mut c = <crate::Cli as clap::CommandFactory>::command();
+            let mut found = true;
+            for name in cmd.path.split(' ') {
+                match c.find_subcommand(name) {
+                    Some(sub) => c = sub.clone(),
+                    None => found = false,
+                }
+            }
+            if !found {
+                continue;
+            }
+            let go = flags_of(cmd, true);
+            for a in c.get_arguments().filter(|a| !a.is_positional()) {
+                let long = a.get_long().unwrap_or("");
+                assert!(
+                    go.iter().any(|f| f.long == long),
+                    "goal {}: --{long} is not one of go's flags",
+                    cmd.path
+                );
+            }
+        }
     }
 
     #[test]
@@ -1350,7 +1340,7 @@ mod tests {
                     char::from(short.max(b' '))
                 ));
             }
-            let mut got: Vec<String> = flags_of(cmd, true, &[])
+            let mut got: Vec<String> = flags_of(cmd, true)
                 .iter()
                 .map(|f| {
                     format!(

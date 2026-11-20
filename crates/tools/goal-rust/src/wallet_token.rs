@@ -249,7 +249,7 @@ fn get_wallet_handle_token_cached(
 }
 
 /// `WalletIsUnencrypted`: whether the wallet initialises with a blank password.
-fn wallet_is_unencrypted(
+pub(crate) fn wallet_is_unencrypted(
     rt: &tokio::runtime::Runtime,
     client: &KmdClient,
     wallet_id: &str,
@@ -263,11 +263,16 @@ fn wallet_is_unencrypted(
     }
 }
 
-/// `ensurePasswordForWallet` + `ensurePassword`: the prompt, then
-/// `terminal.ReadPassword(os.Stdin.Fd())` and a newline. `Err` is go's
-/// `reportErrorf(errorFailedToReadPassword, err)` text.
+/// `ensurePasswordForWallet`: go's `infoPasswordPrompt`, then
+/// [`ensure_password`].
 pub(crate) fn read_password_for(wallet_name: &str) -> Result<String, String> {
     print!("Please enter the password for wallet '{wallet_name}': ");
+    ensure_password()
+}
+
+/// `ensurePassword`: `terminal.ReadPassword(os.Stdin.Fd())`, then a newline.
+/// `Err` is go's `reportErrorf(errorFailedToReadPassword, err)` text.
+pub(crate) fn ensure_password() -> Result<String, String> {
     let _ = std::io::stdout().flush();
     if !std::io::stdin().is_terminal() {
         // `ReadPassword` on a non-terminal fd: the failed terminal-state ioctl.
@@ -318,32 +323,27 @@ fn read_password_from_stdin() -> Result<String, String> {
 }
 
 /// The tail of `getWalletHandleMaybePassword(dataDir, walletName, true)` once
-/// the wallet is resolved: the (cached) handle token and the password. A
-/// `password_flag` stands for the prompt's answer; `get_password` is go's
-/// `getPassword` (false: the prompt only when no token could be had without it).
+/// the wallet is resolved: the (cached) handle token and the password;
+/// `get_password` is go's `getPassword` (false: the prompt only when no token
+/// could be had without it).
 pub(crate) fn wallet_handle_and_password(
     rt: &tokio::runtime::Runtime,
     client: &KmdClient,
     data_dir: &Path,
     wallet_id: &str,
     wallet_name: &str,
-    password_flag: Option<&str>,
     get_password: bool,
 ) -> Result<(String, String), String> {
     let cache_dir = ensure_cache_dir(data_dir)?;
-    let ensure_password = || match password_flag {
-        Some(p) => Ok(p.to_string()),
-        None => read_password_for(wallet_name),
-    };
     // A cached token, authing with a blank password if required.
     if let Ok(token) = get_wallet_handle_token_cached(rt, client, &cache_dir, wallet_id, "") {
         if get_password && !wallet_is_unencrypted(rt, client, wallet_id) {
-            return Ok((token, ensure_password()?));
+            return Ok((token, read_password_for(wallet_name)?));
         }
         return Ok((token, String::new()));
     }
     // Assume any errors were "wrong password" errors.
-    let pw = ensure_password()?;
+    let pw = read_password_for(wallet_name)?;
     let token =
         get_wallet_handle_token_cached(rt, client, &cache_dir, wallet_id, &pw).map_err(|e| {
             format!("Couldn't get token for wallet '{wallet_name}' (ID: {wallet_id}): {e}")

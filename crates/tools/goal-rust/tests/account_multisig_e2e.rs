@@ -132,7 +132,7 @@ fn create_default_wallet(dd: &Path) {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(dd)
-        .args(["wallet", "new", "w", "-w", "pw", "--no-display-seed"])
+        .args(["wallet", "new", "w", "--unencrypted", "--no-display-seed"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("wallet new");
@@ -147,7 +147,7 @@ fn create_account(dd: &Path, name: &str) -> String {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(dd)
-        .args(["account", "new", name, "--password", "pw"])
+        .args(["account", "new", name])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("account new");
@@ -179,18 +179,7 @@ fn multisig_new_delete_info_round_trip() {
     let new = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args([
-            "account",
-            "multisig",
-            "new",
-            "-T",
-            "2",
-            &a,
-            &b,
-            &c,
-            "--password",
-            "pw",
-        ])
+        .args(["account", "multisig", "new", "-T", "2", &a, &b, &c])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("multisig new");
@@ -211,15 +200,7 @@ fn multisig_new_delete_info_round_trip() {
     let info = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args([
-            "account",
-            "multisig",
-            "info",
-            "-a",
-            &msig_addr,
-            "--password",
-            "pw",
-        ])
+        .args(["account", "multisig", "info", "-a", &msig_addr])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("multisig info");
@@ -249,15 +230,7 @@ fn multisig_new_delete_info_round_trip() {
     let del = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args([
-            "account",
-            "multisig",
-            "delete",
-            "-a",
-            &msig_addr,
-            "--password",
-            "pw",
-        ])
+        .args(["account", "multisig", "delete", "-a", &msig_addr])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("multisig delete");
@@ -271,15 +244,7 @@ fn multisig_new_delete_info_round_trip() {
     let info2 = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args([
-            "account",
-            "multisig",
-            "info",
-            "-a",
-            &msig_addr,
-            "--password",
-            "pw",
-        ])
+        .args(["account", "multisig", "info", "-a", &msig_addr])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("multisig info after delete");
@@ -296,16 +261,7 @@ fn multisig_new_threshold_zero_is_rejected_before_kmd() {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args([
-            "account",
-            "multisig",
-            "new",
-            "-T",
-            "0",
-            &a,
-            "--password",
-            "pw",
-        ])
+        .args(["account", "multisig", "new", "-T", "0", &a])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("multisig new");
@@ -328,17 +284,7 @@ fn multisig_new_threshold_exceeds_addresses_is_rejected() {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args([
-            "account",
-            "multisig",
-            "new",
-            "-T",
-            "5",
-            &a,
-            &b,
-            "--password",
-            "pw",
-        ])
+        .args(["account", "multisig", "new", "-T", "5", &a, &b])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("multisig new");
@@ -360,17 +306,7 @@ fn multisig_new_bad_component_address_is_rejected_before_kmd() {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args([
-            "account",
-            "multisig",
-            "new",
-            "-T",
-            "1",
-            &a,
-            "BADADDRESS",
-            "--password",
-            "pw",
-        ])
+        .args(["account", "multisig", "new", "-T", "1", &a, "BADADDRESS"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("multisig new");

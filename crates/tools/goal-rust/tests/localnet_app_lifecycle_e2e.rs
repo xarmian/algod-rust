@@ -320,23 +320,17 @@ fn setup_node_and_dev_wallet() -> (tempfile::TempDir, DaemonGuard, DaemonGuard) 
     );
 
     assert_cli_ok(
-        &goal_rust(dd, &["wallet", "new", "w", "-w", "pw", "--no-display-seed"]),
+        &goal_rust(
+            dd,
+            &["wallet", "new", "w", "--unencrypted", "--no-display-seed"],
+        ),
         "wallet new",
         &node,
     );
     let imported = assert_cli_ok(
         &goal_rust(
             dd,
-            &[
-                "account",
-                "import",
-                "-w",
-                "w",
-                "--password",
-                "pw",
-                "--mnemonic",
-                DEV_MNEMONIC,
-            ],
+            &["account", "import", "-w", "w", "--mnemonic", DEV_MNEMONIC],
         ),
         "account import",
         &node,
@@ -408,8 +402,6 @@ fn localnet_app_create_logs_confirmed_txn() {
                 clear_teal.to_str().unwrap(),
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "app create (logging counter)",
@@ -493,7 +485,7 @@ fn localnet_app_lifecycle_global_local_counter_state() {
     // A second, freshly-generated wallet account, funded from the dev
     // account -- mirrors go's `client.GenerateAddress` + funding payment.
     let user_new = assert_cli_ok(
-        &goal_rust(dd, &["account", "new", "user", "--password", "pw"]),
+        &goal_rust(dd, &["account", "new", "user"]),
         "account new (user)",
         &node,
     );
@@ -517,8 +509,6 @@ fn localnet_app_lifecycle_global_local_counter_state() {
                 &user_addr,
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "fund user account",
@@ -584,8 +574,6 @@ fn localnet_app_lifecycle_global_local_counter_state() {
                 clear_teal.to_str().unwrap(),
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "app create (counter, OptIn)",
@@ -629,16 +617,7 @@ fn localnet_app_lifecycle_global_local_counter_state() {
         &goal_rust(
             dd,
             &[
-                "app",
-                "optin",
-                "-f",
-                &user_addr,
-                "--app-id",
-                &app_id_s,
-                "-w",
-                "w",
-                "--password",
-                "pw",
+                "app", "optin", "-f", &user_addr, "--app-id", &app_id_s, "-w", "w",
             ],
         ),
         "app optin (user)",
@@ -695,16 +674,7 @@ fn localnet_app_lifecycle_global_local_counter_state() {
         &goal_rust(
             dd,
             &[
-                "app",
-                "call",
-                "-f",
-                &user_addr,
-                "--app-id",
-                &app_id_s,
-                "-w",
-                "w",
-                "--password",
-                "pw",
+                "app", "call", "-f", &user_addr, "--app-id", &app_id_s, "-w", "w",
             ],
         ),
         "app call (noop, user)",
@@ -825,8 +795,6 @@ fn localnet_app_extra_program_pages_accounting() {
                 small_teal.to_str().unwrap(),
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "app create (app1, 1 extra page)",
@@ -861,8 +829,6 @@ fn localnet_app_extra_program_pages_accounting() {
                 small_teal.to_str().unwrap(),
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "app update (app1, big program)",
@@ -901,8 +867,6 @@ fn localnet_app_extra_program_pages_accounting() {
                 small_teal.to_str().unwrap(),
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "app create (app2, 2 extra pages)",
@@ -924,16 +888,7 @@ fn localnet_app_extra_program_pages_accounting() {
         &goal_rust(
             dd,
             &[
-                "app",
-                "delete",
-                "-f",
-                DEV_ADDR,
-                "--app-id",
-                &app1_id,
-                "-w",
-                "w",
-                "--password",
-                "pw",
+                "app", "delete", "-f", DEV_ADDR, "--app-id", &app1_id, "-w", "w",
             ],
         ),
         "app delete (app1)",
@@ -954,16 +909,7 @@ fn localnet_app_extra_program_pages_accounting() {
         &goal_rust(
             dd,
             &[
-                "app",
-                "delete",
-                "-f",
-                DEV_ADDR,
-                "--app-id",
-                &app2_id,
-                "-w",
-                "w",
-                "--password",
-                "pw",
+                "app", "delete", "-f", DEV_ADDR, "--app-id", &app2_id, "-w", "w",
             ],
         ),
         "app delete (app2)",

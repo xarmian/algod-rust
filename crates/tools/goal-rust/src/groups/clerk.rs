@@ -79,7 +79,7 @@ pub enum MultisigCmd {
     Signprogram(MultisigSignProgramArgs),
 }
 
-/// `clerk multisig sign -t <txfile> [-a addr | -n] [-w wallet] [--password]`.
+/// `clerk multisig sign -t <txfile> [-a addr | -n] [-w wallet]`.
 ///
 /// Mirrors Go's `addSigCmd` (multisig.go:75): start or extend a multisig on
 /// every transaction in `--tx`, rewriting the file in place. With `-a/--address`
@@ -102,14 +102,10 @@ pub struct MultisigSignArgs {
     /// with `--address`.
     #[arg(short = 'n', long = "no-sig")]
     pub no_sig: bool,
-    /// Wallet password (skip the prompt). goal-rust convention shared with the
-    /// other clerk leaves.
-    #[arg(long = "password")]
-    pub password: Option<String>,
 }
 
 /// `clerk multisig signprogram -a <addr> [-p prog | -P progbytes | -L lsig]
-/// [-A msig-addr] [-o lsig-out] [--legacy-msig] [-w wallet] [--password]`.
+/// [-A msig-addr] [-o lsig-out] [--legacy-msig] [-w wallet]`.
 ///
 /// Mirrors Go's `signProgramCmd` (multisig.go:144): start or extend a multisig
 /// on a LogicSig program and write the (partial) LogicSig blob. The program
@@ -156,10 +152,6 @@ pub struct MultisigSignProgramArgs {
     /// (required on protocols before v41's `LogicSigLMsig` activation).
     #[arg(long = "legacy-msig")]
     pub legacy_msig: bool,
-    /// Wallet password (skip the prompt). goal-rust convention shared with the
-    /// other clerk leaves.
-    #[arg(long = "password")]
-    pub password: Option<String>,
 }
 
 /// `clerk multisig merge -o <out> <file1> <file2> ...`.
@@ -273,10 +265,6 @@ pub struct SendArgs {
     /// goal `send` also honors the global no-wait behavior).
     #[arg(short = 'N', long = "no-wait")]
     pub no_wait: bool,
-    /// Wallet password (skip the prompt). goal-rust convention shared with the
-    /// account leaves.
-    #[arg(long = "password")]
-    pub password: Option<String>,
     // NOTE: `-w/--wallet` is declared on the `clerk` group (see
     // `RootCommand::Clerk`) as a `global = true` flag so both Go orderings
     // parse: `clerk -w w send ...` and `clerk send -w w ...`. It is threaded
@@ -418,7 +406,7 @@ pub struct SimulateArgs {
 }
 
 /// `clerk sign -i <in> -o <out> [-S signer] [-p prog | -L lsig] [--argb64 ...]
-/// [-P proto] [-w wallet] [--password]` — sign every transaction in a file.
+/// [-P proto] [-w wallet]` — sign every transaction in a file.
 ///
 /// Mirrors Go's `signCmd` (clerk.go:787-911). Two modes, keyed on whether a
 /// program/logicsig source is given:
@@ -458,10 +446,6 @@ pub struct SignArgs {
     /// the data dir's node, else the current protocol).
     #[arg(short = 'P', long = "proto")]
     pub proto: Option<String>,
-    /// Wallet password (skip the prompt). goal-rust convention shared with the
-    /// other clerk leaves.
-    #[arg(long = "password")]
-    pub password: Option<String>,
 }
 
 /// `clerk tealsign` — sign data to be verified inside a TEAL program by the

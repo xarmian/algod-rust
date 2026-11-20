@@ -50,7 +50,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod common;
-use common::pty::{run, Ran, Stdin};
+use common::pty::{run, wallet_new, Ran, Stdin};
 
 #[path = "../../../core/algo-codec/tests/common/lsig_cases.rs"]
 mod lsig_cases;
@@ -194,12 +194,7 @@ fn setup() -> (tempfile::TempDir, KmdGuard, String) {
     let guard = KmdGuard(child);
     poll_ready(&kmd_dir).expect("ready");
     let goal = Path::new(GOAL_RUST_BIN);
-    let out = run(
-        goal,
-        &dd,
-        &["wallet", "new", "w", "-w", "pw", "--no-display-seed"],
-        Stdin::Null,
-    );
+    let out = wallet_new(goal, &dd, "w", "pw");
     assert_eq!(out.code, Some(0), "wallet new: {}", text(&out.stderr));
     let out = run(
         goal,
@@ -210,12 +205,13 @@ fn setup() -> (tempfile::TempDir, KmdGuard, String) {
             "imported",
             "--mnemonic",
             ZERO_MNEMONIC,
-            "--password",
-            "pw",
             "-w",
             "w",
         ],
-        Stdin::Null,
+        Stdin::Pty {
+            prompt: PROMPT,
+            line: "pw",
+        },
     );
     assert_eq!(out.code, Some(0), "import: {}", text(&out.stderr));
     let addr = text(&out.stdout)

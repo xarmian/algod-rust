@@ -173,7 +173,7 @@ fn import_root_keys(network: &algo_netdeploy::create::Network) -> Result<(), Str
             .start(crate::kmdcontrol::DEFAULT_KMD_TIMEOUT_SECS)
             .map_err(|e| format!("failed to start kmd for node {name}: {e}"))?;
         let code = crate::cmd::account::run_importrootkey(
-            ImportRootKeyArgs { unencrypted: true, wallet: None, password: None },
+            ImportRootKeyArgs { unencrypted: true, wallet: None },
             vec![node_dir],
             Some(kmd_dir),
         );

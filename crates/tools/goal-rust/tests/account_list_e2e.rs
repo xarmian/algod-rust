@@ -140,7 +140,7 @@ fn create_default_wallet(data_dir: &Path) {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(data_dir)
-        .args(["wallet", "new", "w", "-w", "pw", "--no-display-seed"])
+        .args(["wallet", "new", "w", "--unencrypted", "--no-display-seed"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("wallet new");
@@ -155,7 +155,7 @@ fn create_account(data_dir: &Path, name: &str) -> String {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(data_dir)
-        .args(["account", "new", name, "--password", "pw"])
+        .args(["account", "new", name])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("account new");
@@ -256,7 +256,7 @@ fn account_list_renders_status_address_name_balance_and_default_marker() {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args(["account", "list", "--password", "pw"])
+        .args(["account", "list"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("account list");
@@ -346,7 +346,7 @@ fn account_list_empty_wallet_prints_info_no_accounts() {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args(["account", "list", "--password", "pw"])
+        .args(["account", "list"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("list");
@@ -414,7 +414,7 @@ fn account_list_renders_notparticipating_as_excluded() {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args(["account", "list", "--password", "pw"])
+        .args(["account", "list"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("list");
@@ -464,7 +464,7 @@ fn account_list_falls_back_to_na_when_algod_missing() {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args(["account", "list", "--password", "pw"])
+        .args(["account", "list"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("list");

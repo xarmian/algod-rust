@@ -145,12 +145,8 @@ fn setup() -> (tempfile::TempDir, KmdGuard) {
         .expect("spawn kmd-rust");
     let guard = KmdGuard(child);
     poll_ready(&kmd_dir).expect("ready");
-    let out = goal(
-        &dd,
-        &["wallet", "new", "w", "-w", "pw", "--no-display-seed"],
-        "",
-    );
-    assert!(out.status.success(), "wallet new: {}", text(&out.stderr));
+    let out = common::pty::wallet_new(Path::new(GOAL_RUST_BIN), &dd, "w", "pw");
+    assert_eq!(out.code, Some(0), "wallet new: {}", text(&out.stderr));
     (tmp, guard)
 }
 
@@ -188,12 +184,10 @@ fn import_zero_key(dd: &Path) -> String {
             "imported",
             "--mnemonic",
             ZERO_MNEMONIC,
-            "--password",
-            "pw",
             "-w",
             "w",
         ],
-        "",
+        "pw",
     );
     assert!(out.status.success(), "import: {}", text(&out.stderr));
     text(&out.stdout)

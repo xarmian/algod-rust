@@ -55,7 +55,7 @@
 //!   3. `account info` → assets/apps sections + a nonzero Minimum Balance
 //!      (Phase C2 read path).
 //!   4. `account balance` → the genesis-funded amount.
-//!   5. `account changeonlinestatus --offline` → keyreg submit, dev-mode block,
+//!   5. `account changeonlinestatus --online=false` → keyreg submit, dev-mode block,
 //!      confirmed; `account list` flips to `[offline]` (Phase C1, needs a
 //!      funded signer).
 //!   6. `clerk send` → a real payment, signed via `kmd-rust`, submitted to the
@@ -390,23 +390,17 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
 
     // 1. Encrypted wallet + import the funded dev account.
     assert_cli_ok(
-        &goal_rust(dd, &["wallet", "new", "w", "-w", "pw", "--no-display-seed"]),
+        &goal_rust(
+            dd,
+            &["wallet", "new", "w", "--unencrypted", "--no-display-seed"],
+        ),
         "wallet new",
         &node,
     );
     let imported = assert_cli_ok(
         &goal_rust(
             dd,
-            &[
-                "account",
-                "import",
-                "-w",
-                "w",
-                "--password",
-                "pw",
-                "--mnemonic",
-                DEV_MNEMONIC,
-            ],
+            &["account", "import", "-w", "w", "--mnemonic", DEV_MNEMONIC],
         ),
         "account import",
         &node,
@@ -418,11 +412,7 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
 
     // 2. account list → the imported account is online (genesis allocates it
     //    `onl: 1`) with its funded balance.
-    let list_out = assert_cli_ok(
-        &goal_rust(dd, &["account", "list", "--password", "pw"]),
-        "account list",
-        &node,
-    );
+    let list_out = assert_cli_ok(&goal_rust(dd, &["account", "list"]), "account list", &node);
     assert_eq!(
         account_list_status(&list_out, DEV_ADDR).as_deref(),
         Some("online"),
@@ -456,7 +446,7 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
         "dev account balance {balance} unexpectedly small; got:\n{bal_out}"
     );
 
-    // 5. changeonlinestatus --offline → keyreg submit + dev-mode block; status
+    // 5. changeonlinestatus --online=false → keyreg submit + dev-mode block; status
     //    flips to offline (C1: needs the funded signer we just imported).
     let offline_out = assert_cli_ok(
         &goal_rust(
@@ -466,14 +456,12 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
                 "changeonlinestatus",
                 "-a",
                 DEV_ADDR,
-                "--offline",
+                "--online=false",
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
-        "changeonlinestatus --offline",
+        "changeonlinestatus --online=false",
         &node,
     );
     assert!(
@@ -481,7 +469,7 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
         "offline keyreg should confirm in a dev-mode round; got:\n{offline_out}"
     );
     let list_off = assert_cli_ok(
-        &goal_rust(dd, &["account", "list", "--password", "pw"]),
+        &goal_rust(dd, &["account", "list"]),
         "account list (after offline)",
         &node,
     );
@@ -517,8 +505,6 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
                 FEE_SINK,
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "clerk send",
@@ -576,8 +562,6 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
                 "-s",
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "clerk send -o (write signed txn)",
@@ -655,8 +639,6 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
                 ws_signed.to_str().unwrap(),
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "clerk sign (wallet)",
@@ -710,8 +692,6 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
                 ESCROW_ADDR,
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "fund escrow",
@@ -839,7 +819,7 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
     //     multisig.go:75 addSigCmd). The recipient balance grows by the spend.
     let mk_acct = |name: &str| -> String {
         let out = assert_cli_ok(
-            &goal_rust(dd, &["account", "new", name, "--password", "pw"]),
+            &goal_rust(dd, &["account", "new", name]),
             "account new",
             &node,
         );
@@ -858,16 +838,7 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
         &goal_rust(
             dd,
             &[
-                "account",
-                "multisig",
-                "new",
-                "-T",
-                "2",
-                &alice,
-                &bob,
-                &carol,
-                "--password",
-                "pw",
+                "account", "multisig", "new", "-T", "2", &alice, &bob, &carol,
             ],
         ),
         "account multisig new",
@@ -885,18 +856,7 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
         &goal_rust(
             dd,
             &[
-                "clerk",
-                "send",
-                "-a",
-                "5000000",
-                "-f",
-                DEV_ADDR,
-                "-t",
-                &msig_addr,
-                "-w",
-                "w",
-                "--password",
-                "pw",
+                "clerk", "send", "-a", "5000000", "-f", DEV_ADDR, "-t", &msig_addr, "-w", "w",
             ],
         ),
         "fund multisig account",
@@ -953,8 +913,6 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
                     signer,
                     "-w",
                     "w",
-                    "--password",
-                    "pw",
                 ],
             ),
             "clerk multisig sign",
@@ -1018,8 +976,6 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
                 // node reject it there (issue #2461).
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "clerk multisig signprogram (alice)",
@@ -1041,8 +997,6 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
                 lsig_file.to_str().unwrap(),
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "clerk multisig signprogram (bob)",
@@ -1132,18 +1086,7 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
         &goal_rust(
             dd,
             &[
-                "clerk",
-                "send",
-                "-a",
-                "3000000",
-                "-f",
-                DEV_ADDR,
-                "-t",
-                &rekeyed,
-                "-w",
-                "w",
-                "--password",
-                "pw",
+                "clerk", "send", "-a", "3000000", "-f", DEV_ADDR, "-t", &rekeyed, "-w", "w",
             ],
         ),
         "fund rekey-to-msig sender",
@@ -1171,8 +1114,6 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
                 &msig_addr,
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "rekey sender to multisig",
@@ -1230,8 +1171,6 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
                     signer,
                     "-w",
                     "w",
-                    "--password",
-                    "pw",
                 ],
             ),
             "clerk multisig sign (msig-params spend)",
@@ -1283,8 +1222,6 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
                 &rk2_sender,
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "fund rekey-to-key sender",
@@ -1311,8 +1248,6 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
                 &rk2_signer,
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "rekey sender to signer key",
@@ -1346,8 +1281,6 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
                 &rk2_signer,
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "clerk send -S (rekeyed sender, signer key)",
@@ -1412,8 +1345,6 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
                 "--online",
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "changeonlinestatus --online",
@@ -1424,7 +1355,7 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
         "online keyreg should confirm in a dev-mode round; got:\n{online_out}"
     );
     let list_on = assert_cli_ok(
-        &goal_rust(dd, &["account", "list", "--password", "pw"]),
+        &goal_rust(dd, &["account", "list"]),
         "account list (after online)",
         &node,
     );
@@ -1577,23 +1508,17 @@ fn localnet_dev_node_note_roundtrips_through_pending_transaction_info() {
     );
 
     assert_cli_ok(
-        &goal_rust(dd, &["wallet", "new", "w", "-w", "pw", "--no-display-seed"]),
+        &goal_rust(
+            dd,
+            &["wallet", "new", "w", "--unencrypted", "--no-display-seed"],
+        ),
         "wallet new",
         &node,
     );
     assert_cli_ok(
         &goal_rust(
             dd,
-            &[
-                "account",
-                "import",
-                "-w",
-                "w",
-                "--password",
-                "pw",
-                "--mnemonic",
-                DEV_MNEMONIC,
-            ],
+            &["account", "import", "-w", "w", "--mnemonic", DEV_MNEMONIC],
         ),
         "account import",
         &node,
@@ -1625,8 +1550,6 @@ fn localnet_dev_node_note_roundtrips_through_pending_transaction_info() {
                 &note_b64,
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "clerk send --noteb64 (max-size note)",

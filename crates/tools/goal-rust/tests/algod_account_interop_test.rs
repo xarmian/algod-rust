@@ -309,8 +309,7 @@ fn goal_rust_account_group_against_go_algod_and_kmd() {
                 "wallet",
                 "new",
                 "test-wallet",
-                "-w",
-                "pw",
+                "--unencrypted",
                 "--no-display-seed",
             ],
         ),
@@ -319,10 +318,7 @@ fn goal_rust_account_group_against_go_algod_and_kmd() {
 
     // 2. account new → capture the address.
     let new_out = assert_ok(
-        &goal(
-            dd,
-            &["account", "new", "-w", "test-wallet", "--password", "pw"],
-        ),
+        &goal(dd, &["account", "new", "-w", "test-wallet"]),
         "account new",
     );
     let addr = new_out
@@ -331,12 +327,9 @@ fn goal_rust_account_group_against_go_algod_and_kmd() {
         .expect("address in account-new output")
         .to_string();
 
-    // 3. account list → the new address is rendered. `account list` opens each
-    // wallet via kmd, so it needs the password.
-    let list_out = assert_ok(
-        &goal(dd, &["account", "list", "--password", "pw"]),
-        "account list",
-    );
+    // 3. account list → the new address is rendered. `account list` opens the
+    // (unencrypted) wallet via kmd.
+    let list_out = assert_ok(&goal(dd, &["account", "list"]), "account list");
     assert!(
         list_out.contains(&addr),
         "account list missing the new address {addr}; got:\n{list_out}"
