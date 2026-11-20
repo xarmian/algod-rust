@@ -222,6 +222,12 @@ pub enum RootCommand {
 /// cobra's no-`Run` fallback for command groups (e.g. `goal app` ⇒
 /// help). `path` is the slice walked from the root, e.g. `["app", "box"]`.
 pub fn print_group_help(path: &[&str]) -> ExitCode {
+    // go's own help text where it is captured (`account`, `wallet`,
+    // `account multisig`; issue #2464).
+    if let Some(help) = cobra_usage::help(&path.join(" ")) {
+        print!("{help}");
+        return ExitCode::SUCCESS;
+    }
     let mut argv: Vec<String> = vec!["goal-rust".to_string()];
     argv.extend(path.iter().map(|s| (*s).to_string()));
     argv.push("--help".to_string());
