@@ -285,6 +285,29 @@ pub const TRANSACTION_PARAMETERS: Ty = Ty::Struct(&[
     Field("min-fee", Ty::U64),
 ]);
 
+/// `model.BoxResponse` (`GET /v2/applications/{application-id}/box`).
+pub const BOX: Ty = Ty::Struct(&[
+    Field("name", Ty::Bytes),
+    Field("round", ROUND),
+    Field("value", Ty::Bytes),
+]);
+
+/// `model.BoxesResponse` (`GET /v2/applications/{application-id}/boxes`).
+pub const BOXES: Ty = Ty::Struct(&[
+    Field(
+        "boxes",
+        Ty::Slice(
+            &Ty::Struct(&[
+                Field("name", Ty::Bytes),
+                Field("value", Ty::Ptr(&Ty::Bytes)),
+            ]),
+            "[]model.BoxDescriptor",
+        ),
+    ),
+    Field("next-token", Ty::Ptr(&Ty::Str)),
+    Field("round", Ty::Ptr(&ROUND)),
+]);
+
 /// `model.PostTransactionsResponse` (`POST /v2/transactions`).
 pub const POST_TRANSACTIONS: Ty = Ty::Struct(&[Field("txId", Ty::Str)]);
 

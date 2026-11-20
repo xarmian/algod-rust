@@ -46,7 +46,6 @@ use algo_codec::{
     canonical_encode_signed_transaction, canonical_encode_transaction, compute_group_id,
     compute_txn_id, decode_raw, decode_signed_txn_stream,
 };
-use algo_error::AlgoError;
 use algo_kmd_client::KmdClient;
 use algo_rest_client::AlgodClient;
 use algo_types::{Address, SignedTransaction, StateSchema, TealValue, Transaction};
@@ -1108,9 +1107,9 @@ fn run_read_inner(args: ReadArgs) -> Result<ExitCode, String> {
         // &httpError) && httpError.StatusCode == http.StatusNotFound`) as
         // "not opted in"; any other transport error is generic
         // (`application.go:1013-1020`).
-        let raw = match rt.block_on(algod.get_account_application_raw(&resolved, args.app_id)) {
+        let raw = match raw_account_application(&rt, &algod, &resolved, args.app_id) {
             Ok(b) => b,
-            Err(AlgoError::NotFound(_)) => {
+            Err(e) if crate::algod_rest::http_error_status(&e) == Some(404) => {
                 return Err(format!(
                     "{from} has not opted in to application {}",
                     args.app_id
@@ -1135,11 +1134,16 @@ fn run_read_inner(args: ReadArgs) -> Result<ExitCode, String> {
         // reusing the same message and the -- likely always empty --
         // `account`/`--from` value even though this is the global-state
         // path, a literal Go quirk we replicate for byte-exact CLI output).
-        let meta = rt
-            .block_on(algod.get_application(args.app_id))
-            .map_err(|e| format!("Error processing command: {e}"))?;
-        let raw = rt
-            .block_on(algod.get_account_application_raw(&meta.params.creator, args.app_id))
+        let meta = crate::algod_rest::get_json(
+            &rt,
+            &endpoint(&algod),
+            &format!("/v2/applications/{}", args.app_id),
+            &[],
+            &crate::go_codec_json::APPLICATION,
+        )
+        .map_err(|e| format!("Error processing command: {e}"))?;
+        let creator = meta["params"]["creator"].as_str().unwrap_or("").to_string();
+        let raw = raw_account_application(&rt, &algod, &creator, args.app_id)
             .map_err(|e| format!("Error processing command: {e}"))?;
         match extract_app_resource_state(&raw, "app-params", "gs")? {
             AppResourceState::NotPresent => {
@@ -1163,6 +1167,35 @@ fn run_read_inner(args: ReadArgs) -> Result<ExitCode, String> {
         .write_all(&json)
         .map_err(|e| format!("Error processing command: {e}"))?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// The `(base URL, token)` of `algod` for [`crate::algod_rest`].
+fn endpoint(algod: &AlgodClient) -> crate::algod_rest::Endpoint {
+    (algod.base_url().to_string(), algod.token().to_string())
+}
+
+/// A `[]byte` field of a go-codec decoded answer (base64; `null` is empty).
+fn json_bytes(v: &serde_json::Value) -> Vec<u8> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(v.as_str().unwrap_or(""))
+        .unwrap_or_default()
+}
+
+/// go's `RestClient.RawAccountApplicationInformation`: the msgpack of the
+/// account's resource of the application (`format=msgpack`).
+fn raw_account_application(
+    rt: &tokio::runtime::Runtime,
+    algod: &AlgodClient,
+    address: &str,
+    app_id: u64,
+) -> Result<Vec<u8>, String> {
+    crate::algod_rest::get(
+        rt,
+        &endpoint(algod),
+        &format!("/v2/accounts/{address}/applications/{app_id}"),
+        &[("format", "msgpack")],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1612,8 +1645,7 @@ fn run_method_inner(args: MethodArgs, wallet: Option<String>) -> Result<ExitCode
         return Ok(ExitCode::SUCCESS);
     }
 
-    let info =
-        crate::algod_txn::wait_for_commit_info(&rt, &algod, &app_call_txid.0, last_valid)?;
+    let info = crate::algod_txn::wait_for_commit_info(&rt, &algod, &app_call_txid.0, last_valid)?;
 
     if args.create {
         if let Some(app_idx) = info.application_index.filter(|i| *i != 0) {
@@ -1693,9 +1725,17 @@ fn run_box_info_inner(args: BoxInfoArgs) -> Result<ExitCode, String> {
         .build()
         .map_err(|e| format!("Error processing command: {e}"))?;
 
-    let box_resp = match rt.block_on(algod.get_application_box_by_name(args.app_id, &args.name)) {
+    // go: `client.GetApplicationBoxByName` through go's REST client; a
+    // `box not found` anywhere in its error is go's own message
+    let box_resp = match crate::algod_rest::get_json(
+        &rt,
+        &endpoint(&algod),
+        &format!("/v2/applications/{}/box", args.app_id),
+        &[("name", &args.name)],
+        &crate::go_codec_json::BOX,
+    ) {
         Ok(b) => b,
-        Err(AlgoError::NotFound(msg)) if msg.contains("box not found") => {
+        Err(e) if e.contains("box not found") => {
             return Err(format!(
                 "No box found for appid {} with name {}",
                 args.app_id, args.name
@@ -1707,10 +1747,13 @@ fn run_box_info_inner(args: BoxInfoArgs) -> Result<ExitCode, String> {
     // Cross-check the returned box name against what was requested, mirroring
     // Go's belt-and-suspenders comparison (box.go:84-92) — reduces confusion
     // if the server ever resolved a different box representation.
-    verify_box_name(&args.name, &box_resp.name)?;
+    verify_box_name(&args.name, &json_bytes(&box_resp["name"]))?;
 
     println!("Name:  {}", args.name);
-    println!("Value: {}", encode_bytes_as_app_call_bytes(&box_resp.value));
+    println!(
+        "Value: {}",
+        encode_bytes_as_app_call_bytes(&json_bytes(&box_resp["value"]))
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1768,38 +1811,59 @@ fn run_box_list_inner(args: BoxListArgs) -> Result<ExitCode, String> {
     let prefix = args.prefix.as_deref().unwrap_or("");
 
     loop {
-        let resp = rt
-            .block_on(algod.get_application_boxes_page(
-                args.app_id,
-                limit,
-                &next,
-                prefix,
-                args.values,
-                round,
-            ))
-            .map_err(|e| format!("Error processing command: {e}"))?;
+        // go: `client.ApplicationBoxesPage`, its `applicationBoxesParams`
+        // (`omitempty`) through go's REST client
+        let (limit_s, round_s) = (limit.to_string(), round.to_string());
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if args.values {
+            query.push(("include", "values"));
+        }
+        if limit != 0 {
+            query.push(("limit", &limit_s));
+        }
+        if !next.is_empty() {
+            query.push(("next", &next));
+        }
+        if !prefix.is_empty() {
+            query.push(("prefix", prefix));
+        }
+        if round != 0 {
+            query.push(("round", &round_s));
+        }
+        let resp = crate::algod_rest::get_json(
+            &rt,
+            &endpoint(&algod),
+            &format!("/v2/applications/{}/boxes", args.app_id),
+            &query,
+            &crate::go_codec_json::BOXES,
+        )
+        .map_err(|e| format!("Error processing command: {e}"))?;
+        let boxes = resp["boxes"].as_array().cloned().unwrap_or_default();
 
         if round == 0 {
             // Auto-pin round from the first page for consistent pagination.
-            round = resp
-                .round
+            round = resp["round"]
+                .as_u64()
                 .ok_or("algod did not return a round for a paginated box listing")?;
-            if resp.boxes.is_empty() {
+            if boxes.is_empty() {
                 return Err("No matching boxes found".to_string());
             }
         }
 
-        for descriptor in &resp.boxes {
-            let encoded_name = encode_bytes_as_app_call_bytes(&descriptor.name);
-            match (&args.values, &descriptor.value) {
+        for descriptor in &boxes {
+            let encoded_name = encode_bytes_as_app_call_bytes(&json_bytes(&descriptor["name"]));
+            match (args.values, descriptor.get("value")) {
                 (true, Some(value)) => {
-                    println!("{encoded_name} : {}", encode_bytes_as_app_call_bytes(value));
+                    println!(
+                        "{encoded_name} : {}",
+                        encode_bytes_as_app_call_bytes(&json_bytes(value))
+                    );
                 }
                 _ => println!("{encoded_name}"),
             }
         }
 
-        next = resp.next_token.unwrap_or_default();
+        next = resp["next-token"].as_str().unwrap_or("").to_string();
         if next.is_empty() {
             break;
         }

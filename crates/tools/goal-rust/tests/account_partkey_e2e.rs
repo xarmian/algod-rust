@@ -112,7 +112,12 @@ fn spawn_mock_algod(
                             // For unknown DELETE/POST, return 200 ""
                             // so callers can assert successful path
                             // by recording the request.
-                            if method == "DELETE" || method == "POST" {
+                            // algod answers a DELETE with no content, which
+                            // go's `RemoveParticipationKeyByID` requires
+                            // (`expectNoContent`, issue #2489).
+                            if method == "DELETE" {
+                                (200, "OK", Vec::new())
+                            } else if method == "POST" {
                                 (200, "OK", b"{}".to_vec())
                             } else {
                                 (404, "Not Found", Vec::new())
