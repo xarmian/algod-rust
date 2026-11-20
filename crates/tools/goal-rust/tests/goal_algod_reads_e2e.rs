@@ -36,7 +36,14 @@
 //!   refused`, `algod.net` naming a closed port), an answer-less close
 //!   (`Get "<url>": EOF`), a 401 (`Unauthorized request to ...`), and
 //!   go-codec's decode of malformed JSON answers (`json decode error [pos
-//!   N]: ...`, or what go-codec accepts that JSON does not).
+//!   N]: ...`, or what go-codec accepts that JSON does not);
+//! - issue #2476: the same for `account assetdetails`, `account info`'s held
+//!   assets, `asset info`, `app info`, `account listpartkeys` /
+//!   `partkeyinfo` and the POST / DELETE of `node catchup`; and what go's
+//!   `net/http` client makes of answers that are not well-formed HTTP, of the
+//!   server's own reason phrase (`resp.Status`, raw bytes), of redirects and
+//!   of hosts that do not resolve (`dial tcp: lookup <host> on <DNS>: no
+//!   such host`, the host's DNS server masked).
 //!
 //! `fixtures/goal_algod_reads.jsonl` holds what go v5.0.5-stable's `goal`
 //! printed (exit code, stdout, stderr, the data dir masked; a stdout longer
@@ -218,12 +225,32 @@ fn account_json(addr: &str) -> Option<(u16, String)> {
                 "address": a3, "amount": 42, "amount-without-pending-rewards": 42,
                 "min-balance": 100_000u64, "pending-rewards": 0, "rewards": 3, "round": 5,
                 "status": "Not Participating", "total-apps-opted-in": 0,
-                "total-assets-opted-in": 0, "total-created-apps": 0, "total-created-assets": 0
+                "total-assets-opted-in": 0, "total-created-apps": 0, "total-created-assets": 0,
+                "participation": {"selection-participation-key": "BAUG",
+                    "vote-participation-key": "AQID", "vote-first-valid": 1,
+                    "vote-last-valid": 3000000, "vote-key-dilution": 10000}
             })
             .to_string(),
         ))
     } else if addr == key(4).1 {
         Some((500, "boom <b>\n".to_string()))
+    } else if addr == key(6).1 {
+        // held assets: found, found through `name-b64`, unknown, failing
+        Some((
+            200,
+            serde_json::json!({
+                "address": key(6).1, "amount": 1, "min-balance": 100_000u64, "round": 5,
+                "status": "Offline",
+                "assets": [
+                    {"asset-id": 13, "amount": 1},
+                    {"asset-id": 99, "amount": 2},
+                    {"asset-id": 9, "amount": 15},
+                    {"asset-id": 12, "amount": 1234, "is-frozen": true}
+                ],
+                "created-assets": [{"index": 12, "params": asset_params(12)}]
+            })
+            .to_string(),
+        ))
     } else {
         None
     }
@@ -572,6 +599,7 @@ fn versions_body(v: Versions) -> (u16, String) {
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
         500 => "Internal Server Error",
@@ -599,15 +627,163 @@ const STATUS_JSON: &str = r#"{"catchup-time":0,"last-round":5,"last-version":"fu
 
 const SUPPLY_JSON: &str = r#"{"current_round":5,"online-money":1000000,"total-money":3000042}"#;
 
-/// `(status, content type, body)` for a request path.
-fn route(path: &str, mock: &Mock) -> (u16, &'static str, Vec<u8>) {
+/// The asset params of the asset rows (`model.AssetParams`).
+fn asset_params(id: u64) -> Option<serde_json::Value> {
+    let (a1, a2) = (key(1).1, key(2).1);
+    match id {
+        12 => Some(serde_json::json!({
+            "creator": a2, "decimals": 2, "total": 12345, "unit-name": "T<K>",
+            "name": "Tok\u{1}x", "url": "https://x\u{7f}", "default-frozen": true,
+            "manager": a1, "reserve": a1, "freeze": a2, "clawback": a2
+        })),
+        9 => Some(serde_json::json!({
+            "creator": a1, "decimals": 1, "total": 100, "name": "ignored",
+            "name-b64": "Tv9t", "unit-name": "u", "url-b64": ""
+        })),
+        _ => None,
+    }
+}
+
+/// What the mock algod answers for the asset, application, participation
+/// and catchup paths (issue #2476).
+fn route_2476(method: &str, path: &str, query: &str) -> Option<(u16, String)> {
+    let (a1, a2, a3) = (key(1).1, key(2).1, key(3).1);
+    let not_found = || (404, r#"{"message":"not found"}"#.to_string());
+    if let Some(rest) = path.strip_prefix("/v2/assets/") {
+        return Some(match (rest.parse::<u64>().ok(), rest) {
+            (Some(13), _) => (500, r#"{"message":"asset store is down"}"#.to_string()),
+            (Some(id), _) => match asset_params(id) {
+                Some(p) => (
+                    200,
+                    serde_json::json!({"index": id, "params": p}).to_string(),
+                ),
+                None => not_found(),
+            },
+            _ => not_found(),
+        });
+    }
+    if let Some(rest) = path.strip_prefix("/v2/accounts/") {
+        let (addr, tail) = rest.split_once('/')?;
+        if tail == "assets" {
+            let page2 = query.split('&').any(|kv| kv == "next=tok2");
+            return Some(if addr == a1 && page2 {
+                (
+                    200,
+                    serde_json::json!({"round": 5, "asset-holdings": [
+                        {"asset-holding": {"amount": 1, "asset-id": 9},
+                         "asset-params": {"total": 5}}
+                    ]})
+                    .to_string(),
+                )
+            } else if addr == a1 {
+                (
+                    200,
+                    serde_json::json!({"round": 5, "next-token": "tok2", "asset-holdings": [
+                        {"asset-holding": {"amount": 12345, "asset-id": 12, "is-frozen": true},
+                         "asset-params": asset_params(12)},
+                        {"asset-holding": {"amount": 7, "asset-id": 10}}
+                    ]})
+                    .to_string(),
+                )
+            } else if addr == a2 {
+                (200, r#"{"round":5,"asset-holdings":[]}"#.to_string())
+            } else {
+                not_found()
+            });
+        }
+        if let Some(id) = tail.strip_prefix("assets/") {
+            return Some(if addr == a1 && id == "12" {
+                (
+                    200,
+                    r#"{"round":5,"asset-holding":{"amount":345,"asset-id":12}}"#.to_string(),
+                )
+            } else {
+                not_found()
+            });
+        }
+        return None;
+    }
+    if let Some(id) = path.strip_prefix("/v2/applications/") {
+        return Some(match id {
+            "7" => (
+                200,
+                serde_json::json!({"id": 7, "params": {
+                    "approval-program": "BoEB", "clear-state-program": "BoEB",
+                    "creator": a1, "extra-program-pages": 1, "family-box-access": true,
+                    "foreign-box-reads": true, "global-state-schema": {"num-byte-slice": 1, "num-uint": 2},
+                    "local-state-schema": {"num-uint": 3}, "size-sponsor": a2, "version": 12
+                }})
+                .to_string(),
+            ),
+            "5" => (
+                200,
+                r#"{"id":5,"params":{"approval-program":"","clear-state-program":"Ag=="}}"#
+                    .to_string(),
+            ),
+            _ => not_found(),
+        });
+    }
+    if path == "/v2/participation" {
+        let part = |addr: &str, id: &str, sel: &str, extra: serde_json::Value| {
+            let mut p = serde_json::json!({
+                "address": addr, "id": id,
+                "key": {"selection-participation-key": sel, "vote-participation-key": "AQID",
+                        "vote-first-valid": 1, "vote-last-valid": 3000000, "vote-key-dilution": 10000}
+            });
+            p.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            p
+        };
+        return Some((
+            200,
+            serde_json::json!([
+                part(
+                    &a3,
+                    "PARTKEYIDTHREE",
+                    "BAUG",
+                    serde_json::json!({
+                        "effective-first-valid": 2, "effective-last-valid": 3000000,
+                        "last-vote": 9, "last-block-proposal": 11, "last-state-proof": 10
+                    })
+                ),
+                part(&a2, "PARTKEYIDTWO", "BwgJ", serde_json::json!({})),
+                part(&key(5).1, "PARTKEYIDFIVE", "", serde_json::json!({})),
+            ])
+            .to_string(),
+        ));
+    }
+    if let Some(label) = path.strip_prefix("/v2/catchup/") {
+        let label = label.replace("%23", "#");
+        let message = match (method, query) {
+            ("DELETE", _) => "aborted".to_string(),
+            (_, "") => label,
+            _ => format!("catching up to {label}\u{7}"),
+        };
+        return Some((
+            200,
+            serde_json::json!({"catchup-message": message}).to_string(),
+        ));
+    }
+    None
+}
+
+/// `(status, content type, body)` for a request path (status 1: `body` is
+/// the whole raw reply).
+fn route(method: &str, path: &str, mock: &Mock) -> (u16, &'static str, Vec<u8>) {
     let msgpack = path
         .split_once('?')
         .is_some_and(|(_, q)| q.split('&').any(|kv| kv == "format=msgpack"));
+    let query = path.split_once('?').map_or("", |(_, q)| q);
     let path = path.split('?').next().unwrap_or("");
     let json = "application/json";
     if let Some(a) = mock.answers.iter().find(|a| path.starts_with(a.prefix)) {
         return (a.status, json, a.body.clone());
+    }
+    // where the redirect rows send go
+    let path = path.strip_prefix("/moved").unwrap_or(path);
+    if let Some((code, body)) = route_2476(method, path, query) {
+        return (code, json, body.into_bytes());
     }
     let versions = mock.versions;
     if path == "/v2/status" {
@@ -673,10 +849,15 @@ fn spawn_mock(mock: Mock) -> u16 {
                 }
                 let mut body = vec![0u8; len];
                 let _ = reader.read_exact(&mut body);
+                let method = first.split_whitespace().next().unwrap_or("GET");
                 let path = first.split_whitespace().nth(1).unwrap_or("/");
-                let (code, ctype, body) = route(path, &mock);
+                let (code, ctype, body) = route(method, path, &mock);
                 if code == 0 {
                     // close the connection without an answer
+                    return;
+                }
+                if code == 1 {
+                    let _ = stream.write_all(&body);
                     return;
                 }
                 let head = format!(
@@ -706,6 +887,8 @@ struct Case {
     no_genesis: bool,
     /// The data dir holds a `consensus.json`.
     consensus_json: bool,
+    /// `algod.net` holds this instead of the mock's address.
+    net: Option<&'static str>,
 }
 
 fn case(name: &str, args: &[&str]) -> Case {
@@ -718,6 +901,7 @@ fn case(name: &str, args: &[&str]) -> Case {
         refused: false,
         no_genesis: false,
         consensus_json: false,
+        net: None,
     }
 }
 
@@ -1101,6 +1285,380 @@ fn cases() -> Vec<Case> {
     v.extend(request_error_cases());
     v.extend(info_cases());
     v.extend(followup_cases());
+    v.extend(remaining_reader_cases());
+    v.extend(transport_cases());
+    v
+}
+
+/// Issue #2476: the remaining commands that read from algod, through go's
+/// REST client: `account assetdetails`, `account info`'s held assets,
+/// `asset info`, `app info`, `account listpartkeys` / `partkeyinfo` and the
+/// POST / DELETE of `node catchup`.
+fn remaining_reader_cases() -> Vec<Case> {
+    const LABEL: &str = "5#AB";
+    let readers: Vec<(&str, Vec<&str>, bool)> = vec![
+        (
+            "account assetdetails",
+            vec!["account", "assetdetails", "-a", "<A1>"],
+            false,
+        ),
+        (
+            "asset info",
+            vec!["asset", "info", "--assetid", "12"],
+            false,
+        ),
+        ("app info", vec!["app", "info", "--app-id", "7"], false),
+        (
+            "account listpartkeys",
+            vec!["account", "listpartkeys"],
+            false,
+        ),
+        ("account partkeyinfo", vec!["account", "partkeyinfo"], false),
+        ("node catchup", vec!["node", "catchup", LABEL], false),
+    ];
+    let mut v = Vec::new();
+    for (name, args, accounts) in &readers {
+        v.push(case(name, args));
+        let mut c = case(&format!("{name} refused"), args);
+        c.accounts = *accounts;
+        c.refused = true;
+        v.push(c);
+        let mut c = case(&format!("{name} 401"), args);
+        c.answers = vec![Answer {
+            prefix: "",
+            status: 401,
+            body: br#"{"message":"Invalid API Token"}"#.to_vec(),
+        }];
+        v.push(c);
+    }
+    for (name, args) in [
+        (
+            "account assetdetails -l",
+            &["account", "assetdetails", "-a", "<A1>", "-l", "2"][..],
+        ),
+        (
+            "account assetdetails -n",
+            &["account", "assetdetails", "-a", "<A1>", "-n", "tok2"],
+        ),
+        (
+            "account assetdetails empty",
+            &["account", "assetdetails", "-a", "<A2>"],
+        ),
+        (
+            "account assetdetails not found",
+            &["account", "assetdetails", "-a", "<A5>"],
+        ),
+        (
+            "account info held assets",
+            &["account", "info", "-a", "<A6>"],
+        ),
+        (
+            "account info held assets ids",
+            &["account", "info", "-a", "<A6>", "--onlyShowAssetIDs"],
+        ),
+        ("asset info b64 name", &["asset", "info", "--assetid", "9"]),
+        (
+            "asset info not found",
+            &["asset", "info", "--assetid", "99"],
+        ),
+        ("asset info 500", &["asset", "info", "--assetid", "13"]),
+        (
+            "asset info by unit name",
+            &["asset", "info", "--unitname", "T<K>", "--creator", "<A1>"],
+        ),
+        (
+            "asset info by empty unit name",
+            &["asset", "info", "--unitname", "", "--creator", "<A1>"],
+        ),
+        (
+            "asset info unit name of unknown creator",
+            &["asset", "info", "--unitname", "x", "--creator", "<A5>"],
+        ),
+        ("app info minimal", &["app", "info", "--app-id", "5"]),
+        ("app info not found", &["app", "info", "--app-id", "8"]),
+        (
+            "node catchup --min",
+            &["node", "catchup", LABEL, "--min", "7"],
+        ),
+        (
+            "node catchup two data dirs",
+            &["node", "catchup", LABEL, "-d", "<DD>"],
+        ),
+        ("node catchup --abort idle", &["node", "catchup", "--abort"]),
+    ] {
+        v.push(case(name, args));
+    }
+    // `node catchup --abort` while a catchup runs: the DELETE
+    let catching_up = br#"{"catchpoint":"5#AB","last-round":3}"#;
+    let mut c = case("node catchup --abort", &["node", "catchup", "--abort"]);
+    c.answers = vec![Answer {
+        prefix: "/v2/status",
+        status: 200,
+        body: catching_up.to_vec(),
+    }];
+    v.push(c);
+    let mut c = case(
+        "node catchup --abort failing",
+        &["node", "catchup", "--abort"],
+    );
+    c.answers = vec![
+        Answer {
+            prefix: "/v2/status",
+            status: 200,
+            body: catching_up.to_vec(),
+        },
+        Answer {
+            prefix: "/v2/catchup/",
+            status: 400,
+            body: br#"{"message":"no catchup in progress"}"#.to_vec(),
+        },
+    ];
+    v.push(c);
+    // malformed answers, decoded by go-codec
+    for (name, prefix, body, args) in [
+        (
+            "account assetdetails unknown field",
+            "/v2/accounts/",
+            &br#"{"round":1,"x":2}"#[..],
+            &["account", "assetdetails", "-a", "<A1>"][..],
+        ),
+        (
+            "account assetdetails bad holding",
+            "/v2/accounts/",
+            br#"{"asset-holdings":[{"asset-holding":{"amount":"x"}}]}"#,
+            &["account", "assetdetails", "-a", "<A1>"],
+        ),
+        (
+            "asset info truncated",
+            "/v2/assets/",
+            br#"{"index":12,"params":{"total":5"#,
+            &["asset", "info", "--assetid", "12"],
+        ),
+        (
+            "app info bad program",
+            "/v2/applications/",
+            br#"{"id":7,"params":{"approval-program":"!!"}}"#,
+            &["app", "info", "--app-id", "7"],
+        ),
+        (
+            "account partkeyinfo not an array",
+            "/v2/participation",
+            br#"{"address":"x"}"#,
+            &["account", "partkeyinfo"],
+        ),
+        (
+            "account partkeyinfo null",
+            "/v2/participation",
+            b"null",
+            &["account", "partkeyinfo"],
+        ),
+        (
+            "account listpartkeys bad key",
+            "/v2/participation",
+            br#"[{"key":{"vote-first-valid":true}}]"#,
+            &["account", "listpartkeys"],
+        ),
+        (
+            "node catchup unknown field",
+            "/v2/catchup/",
+            br#"{"catchup-message":"5#AB","more":1}"#,
+            &["node", "catchup", LABEL],
+        ),
+        (
+            "node catchup message number",
+            "/v2/catchup/",
+            br#"{"catchup-message":42}"#,
+            &["node", "catchup", LABEL],
+        ),
+    ] {
+        let mut c = case(&format!("malformed: {name}"), args);
+        c.answers = vec![Answer {
+            prefix,
+            status: 200,
+            body: body.to_vec(),
+        }];
+        v.push(c);
+    }
+    // `account dump`'s JSON of strings that are not UTF-8
+    let mut c = case(
+        "account dump invalid utf-8 name",
+        &["account", "dump", "-a", "<A1>"],
+    );
+    c.answers = vec![Answer {
+        prefix: "/v2/accounts/",
+        status: 200,
+        body: mp_obj(&[(
+            "apar",
+            mp_imap(&[(
+                1,
+                mp_obj(&[("an", mp_str(b"a\xffb")), ("un", mp_str(b"\xe2\x82"))]),
+            )]),
+        )]),
+    }];
+    v.push(c);
+    v
+}
+
+/// Issue #2476: what go's `net/http` client makes of answers that are not
+/// well-formed HTTP, of a reason phrase of the server's own, of redirects
+/// and of hosts that do not resolve; for `version` (go prints the error
+/// unfiltered to stdout), `account balance` (`reportErrorf`) and `ledger
+/// block` (a raw answer).
+fn transport_cases() -> Vec<Case> {
+    let version = &["version"][..];
+    let balance = &["account", "balance", "-a", "<A1>"][..];
+    let block = &["ledger", "block", "1"][..];
+    let raw: Vec<(&str, &[u8], &[&str])> = vec![
+        ("garbage", b"garbage\r\n\r\n", version),
+        ("tls answer", b"\x15\x03\x01\x00\x02\x02P", version),
+        ("short status code", b"HTTP/1.1 20 OK\r\n\r\n", version),
+        ("bad status code", b"HTTP/1.1 2x0 OK\r\n\r\n", balance),
+        ("bad version", b"HTTX/1.1 200 OK\r\n\r\n", version),
+        (
+            "header without colon",
+            b"HTTP/1.1 200 OK\r\nbad header\r\n\r\n",
+            version,
+        ),
+        (
+            "header starting with a space",
+            b"HTTP/1.1 200 OK\r\n X: 1\r\n\r\n",
+            version,
+        ),
+        (
+            "bad content length",
+            b"HTTP/1.1 200 OK\r\nContent-Length: x\r\n\r\n",
+            version,
+        ),
+        (
+            "two content lengths",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+            version,
+        ),
+        (
+            "unsupported transfer encoding",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n",
+            version,
+        ),
+        (
+            "headers cut",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n",
+            version,
+        ),
+        ("status line cut", b"HTTP/1.1 200 OK", version),
+        (
+            "own reason phrase",
+            b"HTTP/1.1 500 Boom Town\r\nContent-Length: 2\r\n\r\n{}",
+            version,
+        ),
+        (
+            "own reason phrase reportErrorf",
+            b"HTTP/1.1 503 Boom Town\r\nContent-Length: 0\r\n\r\n",
+            balance,
+        ),
+        (
+            "no reason phrase",
+            b"HTTP/1.1 599\r\nContent-Length: 0\r\n\r\n",
+            version,
+        ),
+        (
+            "reason phrase not utf-8",
+            b"HTTP/1.1 500 B\xffad\r\nContent-Length: 0\r\n\r\n",
+            version,
+        ),
+        (
+            "reason phrase not utf-8 reportErrorf",
+            b"HTTP/1.1 500 B\xffad\x01\r\nContent-Length: 0\r\n\r\n",
+            balance,
+        ),
+        (
+            "chunked answer",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n{\"ve\r\nf\r\nrsions\":[\"v9\"]}\r\n0\r\n\r\n",
+            version,
+        ),
+        (
+            "100 continue first",
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 18\r\n\r\n{\"versions\":[\"7\"]}",
+            version,
+        ),
+        (
+            "body cut json",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\n{\"versions\":[\"v1\"",
+            version,
+        ),
+        (
+            "body cut after json",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\n{\"versions\":[\"v1\"]}",
+            version,
+        ),
+        (
+            "body cut raw",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\n\x81\xa3rnd\x05",
+            block,
+        ),
+        (
+            "body until close",
+            b"HTTP/1.1 200 OK\r\n\r\n{\"versions\":[\"v3\"]}",
+            version,
+        ),
+        (
+            "redirect",
+            b"HTTP/1.1 302 Found\r\nLocation: /moved/versions\r\nContent-Length: 0\r\n\r\n",
+            version,
+        ),
+        (
+            "redirect loop",
+            b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /versions\r\nContent-Length: 0\r\n\r\n",
+            version,
+        ),
+        (
+            "redirect without location",
+            b"HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\n\r\n",
+            version,
+        ),
+    ];
+    let mut v = Vec::new();
+    for (name, reply, args) in raw {
+        let mut c = case(&format!("transport: {name}"), args);
+        c.answers = vec![Answer {
+            prefix: if args == block {
+                "/v2/blocks/"
+            } else if args == version {
+                // `/moved/versions` answers as `/versions` does
+                "/versions"
+            } else {
+                ""
+            },
+            status: 1,
+            body: reply.to_vec(),
+        }];
+        v.push(c);
+    }
+    // a 401 after a redirect names the URL go was sent to
+    let mut c = case("transport: 401 after redirect", version);
+    c.answers = vec![
+        Answer {
+            prefix: "/moved/",
+            status: 401,
+            body: br#"{"message":"Invalid API Token"}"#.to_vec(),
+        },
+        Answer {
+            prefix: "/versions",
+            status: 1,
+            body: b"HTTP/1.1 308 Permanent Redirect\r\nLocation: /moved/versions\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        },
+    ];
+    v.push(c);
+    for (name, net, args) in [
+        ("unknown host", "algod.invalid:8080", version),
+        ("unknown host reportErrorf", "algod.invalid:8080", balance),
+        ("not a domain name", "256.1.1.1:80", version),
+        ("localhost refused", "localhost:1", version),
+        ("bad port", "127.0.0.1:99999", version),
+    ] {
+        let mut c = case(&format!("transport: {name}"), args);
+        c.net = Some(net);
+        v.push(c);
+    }
     v
 }
 
@@ -1441,7 +1999,7 @@ fn uname() -> String {
 /// Replace the `<DD>` / `<An>` placeholders of an argument.
 fn expand(arg: &str, dd: &Path) -> String {
     let mut a = arg.replace("<DD>", dd.to_str().unwrap());
-    for i in 1..=5u8 {
+    for i in 1..=6u8 {
         a = a.replace(&format!("<A{i}>"), &key(i).1);
     }
     a
@@ -1550,6 +2108,29 @@ fn stop_kmd(dd: &Path) {
     let _ = Command::new("kill").args(["-KILL", pid]).status();
 }
 
+/// `lookup <host> on <server>: ...` with the server as `<DNS>`.
+fn mask_dns_server(t: &str) -> String {
+    let mut out = String::new();
+    let mut rest = t;
+    while let Some(i) = rest.find("lookup ") {
+        let (head, tail) = rest.split_at(i);
+        out.push_str(head);
+        let line_end = tail.find('\n').unwrap_or(tail.len());
+        let line = &tail[..line_end];
+        match (line.find(" on "), line.rfind(": ")) {
+            (Some(on), Some(colon)) if on < colon => {
+                out.push_str(&line[..on + 4]);
+                out.push_str("<DNS>");
+                out.push_str(&line[colon..]);
+            }
+            _ => out.push_str(line),
+        }
+        rest = &tail[line_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn row(goal: &Path, c: &Case) -> serde_json::Value {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dd = tmp.path().canonicalize().unwrap();
@@ -1564,7 +2145,9 @@ fn row(goal: &Path, c: &Case) -> serde_json::Value {
         let doc = serde_json::json!({"v7": {"MinBalance": 123}, "extra": {"MinBalance": 5}});
         std::fs::write(dd.join("consensus.json"), doc.to_string()).unwrap();
     }
-    let net = if c.refused {
+    let net = if let Some(n) = c.net {
+        n.to_string()
+    } else if c.refused {
         CLOSED_ALGOD.to_string()
     } else {
         format!("127.0.0.1:{port}")
@@ -1596,10 +2179,12 @@ fn row(goal: &Path, c: &Case) -> serde_json::Value {
             );
         }
         let mut t = t.replace(dd.to_str().unwrap(), "<DD>");
-        for i in 1..=5u8 {
+        for i in 1..=6u8 {
             t = t.replace(&key(i).1, &format!("<A{i}>"));
         }
         let t = t.replace(&format!("127.0.0.1:{port}"), "<ALGOD>");
+        // the host's DNS server, which go's resolver names
+        let t = mask_dns_server(&t);
         if std::str::from_utf8(b).is_ok() {
             t
         } else {
