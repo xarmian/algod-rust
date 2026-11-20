@@ -978,58 +978,69 @@ fn expand_seed_to_sk(seed: &[u8; 32]) -> [u8; 64] {
 
 // ---- account partkey leaves (TASK-242 / B10) ------------------------------
 
-/// `account addpartkey -a <addr> --roundFirstValid <r> --roundLastValid <r>
-/// [--keyDilution <n>]`. Mirrors `addParticipationKeyCmd`
-/// (account.go:973-1011). See [`AddpartkeyArgs`] for the documented
-/// divergence from Go (REST server-side generation vs client-side).
-pub fn run_addpartkey(args: AddpartkeyArgs, cli_d: Vec<PathBuf>) -> ExitCode {
-    if let Err(e) = algo_types::Address::from_algorand_string(&args.address) {
-        eprintln!("Could not parse address: {e}");
-        return ExitCode::from(1);
-    }
-    // Inclusive range — `algokey-rust part generate` accepts
-    // last==first (a one-round participation key) and only rejects
-    // last < first. Codex round-1 finding.
-    if args.round_last_valid < args.round_first_valid {
-        eprintln!(
-            "--roundLastValid ({}) must be >= --roundFirstValid ({})",
-            args.round_last_valid, args.round_first_valid
-        );
-        return ExitCode::from(1);
-    }
+/// go's `errorDirectoryNotExist` (`cmd/goal/messages.go`).
+const ERROR_DIRECTORY_NOT_EXIST: &str = "Specified directory '{}' does not exist.";
 
-    // go: `ensureFullClient(dataDir)` (account.go:1088), which starts kmd.
-    let client = match data_dir::ensure_single_data_dir(&cli_d) {
-        Ok(dd) => match build_full_algod_client_for_dir(&dd) {
-            Ok(c) => c,
-            Err(()) => return ExitCode::from(1),
-        },
+/// `account addpartkey -a <addr> --roundFirstValid <r> --roundLastValid <r>
+/// [-o <dir>] [--keyDilution <n>]`: go's `addParticipationKeyCmd`
+/// (cmd/goal/account.go). The key is generated locally
+/// (`participation.GenParticipationKeysTo`) into `--outdir`, or into
+/// `$TMPDIR` and installed with `POST /v2/participation`.
+pub fn run_addpartkey(args: AddpartkeyArgs, cli_d: Vec<PathBuf>) -> ExitCode {
+    let dd = match data_dir::ensure_single_data_dir(&cli_d) {
+        Ok(d) => d,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::from(1);
         }
     };
-    let rt = match build_runtime() {
-        Ok(r) => r,
-        Err(()) => return ExitCode::from(1),
+    let out_dir = args.outdir.as_deref().filter(|d| !d.is_empty());
+    if let Some(d) = out_dir {
+        if !Path::new(d).is_dir() {
+            eprintln!("{}", format_message(ERROR_DIRECTORY_NOT_EXIST, &[d]));
+            return ExitCode::from(1);
+        }
+    }
+    // go: `ensureFullClient(dataDir)`, which starts kmd.
+    let endpoint = match crate::goal_client::ensure_algod_endpoint(
+        &dd,
+        crate::goal_client::ClientType::Full,
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let Ok(rt) = build_runtime() else {
+        return ExitCode::from(1);
     };
 
     println!("Please stand by while generating keys. This might take a few minutes...");
-    if let Err(e) = rt.block_on(client.generate_participation_keys(
-        &args.address,
-        args.round_first_valid,
-        args.round_last_valid,
-        args.key_dilution,
-    )) {
-        eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
-        return ExitCode::from(1);
-    }
-    // Go prints the new ParticipationID; the REST generate endpoint
-    // currently returns just "{}" (handlers.go:300 — future
-    // enrichment), so we surface a generic success message instead.
+    let generated = run_with_spinning_cursor(|| {
+        gen_participation_keys(
+            &rt,
+            &endpoint,
+            &args.address,
+            args.round_first_valid,
+            args.round_last_valid,
+            args.key_dilution.unwrap_or(0),
+            out_dir.map(Path::new),
+        )
+    });
+    let part_id = match generated {
+        Ok((id, _)) => id,
+        Err(e) => {
+            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e]));
+            return ExitCode::from(1);
+        }
+    };
+    // go's `reportInfof("...%s\n")`: every line of the text, the empty one
+    // after its trailing newline too.
+    println!("Participation key generation successful. Participation ID: {part_id}\n");
     println!(
-        "Participation key generation requested for {}.",
-        args.address
+        "\nGenerated with goal v{}",
+        crate::cmd::info::current_version_string()
     );
     ExitCode::SUCCESS
 }
@@ -1438,21 +1449,28 @@ fn compute_validity(
 }
 
 /// Pick the participation key for `address` valid at `round` that expires
-/// farthest in the future. Mirrors go-algorand's `Client.chooseParticipation`
-/// (libgoal/participation.go:30).
+/// farthest in the future, the first listed of those expiring together.
+/// Mirrors go-algorand's `Client.chooseParticipation`
+/// (libgoal/participation.go:30), whose `VoteLastValid > expiry` (expiry
+/// starting at 0) keeps the first maximum.
 fn choose_participation<'a>(
     parts: &'a [algo_rest_client::ParticipationKey],
     address: &str,
     round: u64,
 ) -> Option<&'a algo_rest_client::ParticipationKey> {
-    parts
-        .iter()
-        .filter(|p| {
-            p.address == address
-                && p.key.vote_first_valid <= round
-                && round <= p.key.vote_last_valid
-        })
-        .max_by_key(|p| p.key.vote_last_valid)
+    let mut chosen = None;
+    let mut expiry = 0;
+    for p in parts {
+        if p.key.vote_first_valid <= round
+            && round <= p.key.vote_last_valid
+            && p.address == address
+            && p.key.vote_last_valid > expiry
+        {
+            chosen = Some(p);
+            expiry = p.key.vote_last_valid;
+        }
+    }
+    chosen
 }
 
 /// Sign (via kmd), broadcast, and optionally wait for a status-change keyreg.
@@ -1518,70 +1536,79 @@ pub fn run_changeonlinestatus(
         }
     };
     // go: `ensureFullClient(dataDir)`, which starts kmd; the wallet handle
-    // comes later (`ensureWalletHandleMaybePassword`).
+    // comes after the keyreg is built (`changeAccountOnlineStatus`).
     let _ = kmd_dir_flag;
-    let algod = match build_full_algod_client_for_dir(&data_dir_path) {
-        Ok(c) => c,
-        Err(()) => return ExitCode::from(1),
+    let endpoint = match crate::goal_client::ensure_algod_endpoint(
+        &data_dir_path,
+        crate::goal_client::ClientType::Full,
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
     };
-    let kmd = match build_wallet_handle_kmd_client(&data_dir_path) {
-        Ok(c) => c,
-        Err(()) => return ExitCode::from(1),
-    };
+    let algod = algo_rest_client::AlgodClient::new(&endpoint.0, &endpoint.1);
     let rt = match build_runtime() {
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
     };
 
-    let go_online = args.online;
-    let pipeline = algo_txn_pipeline::TxnPipeline::new(algod, Some(kmd));
+    // go's `MakeUnsignedGoOnlineTx` (the node's participation key chosen by
+    // `chooseParticipation`) or `MakeUnsignedGoOfflineTx` (a bare keyreg
+    // clearing the account's voting keys).
+    let built = if args.online {
+        build_online_keyreg(
+            &rt,
+            &endpoint,
+            &algod,
+            &data_dir_path,
+            sender,
+            args.fee,
+            args.first_valid,
+            args.last_valid,
+        )
+    } else {
+        rt.block_on(build_offline_keyreg(
+            &algod,
+            &data_dir_path,
+            sender,
+            args.fee,
+            args.first_valid,
+            args.last_valid,
+        ))
+    };
+    let txn = match built {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
 
     // go: `ensureWalletHandleMaybePassword` → `makeAccountsList`.
+    let kmd = match build_wallet_handle_kmd_client(&data_dir_path) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
     let mut accounts = match load_accounts(&data_dir_path) {
         Ok(a) => a,
         Err(()) => return ExitCode::from(1),
     };
-    let (handle, _wallet_name, password) = match resolve_wallet_and_init(
-        &rt,
-        pipeline.kmd().expect("kmd configured above"),
-        &mut accounts,
-        args.wallet.as_deref(),
-    ) {
-        Ok(v) => v,
-        Err(()) => return ExitCode::from(1),
-    };
-
-    let result = if go_online {
-        // Online: pull participation material from /v2/participation (Go's
-        // chooseParticipation) and register it.
-        rt.block_on(register_online_keyreg(
-            &pipeline,
-            &data_dir_path,
-            sender,
-            &args.address,
-            args.fee,
-            args.first_valid,
-            args.last_valid,
-            &handle,
-            &password,
-            args.no_wait,
-        ))
-    } else {
-        // Offline: a bare keyreg clears the account's voting keys.
-        rt.block_on(submit_offline_keyreg(
-            &pipeline,
-            &data_dir_path,
-            sender,
-            args.fee,
-            args.first_valid,
-            args.last_valid,
-            &handle,
-            &password,
-            args.no_wait,
-        ))
-    };
-
-    match result {
+    let (handle, _wallet_name, password) =
+        match resolve_wallet_and_init(&rt, &kmd, &mut accounts, args.wallet.as_deref()) {
+            Ok(v) => v,
+            Err(()) => return ExitCode::from(1),
+        };
+    let pipeline = algo_txn_pipeline::TxnPipeline::new(algod, Some(kmd));
+    match rt.block_on(sign_submit_confirm(
+        &pipeline,
+        &txn,
+        &handle,
+        &password,
+        args.no_wait,
+        "status change",
+    )) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e}");
@@ -1590,23 +1617,20 @@ pub fn run_changeonlinestatus(
     }
 }
 
-/// Build → sign → submit a go-offline keyreg (clears the account's voting keys).
-#[allow(clippy::too_many_arguments)]
-async fn submit_offline_keyreg(
-    pipeline: &algo_txn_pipeline::TxnPipeline,
+/// go's `MakeUnsignedGoOfflineTx`: a go-offline keyreg (clears the account's
+/// voting keys).
+async fn build_offline_keyreg(
+    algod: &algo_rest_client::AlgodClient,
     data_dir: &Path,
     sender: algo_types::Address,
     fee: Option<u64>,
     first_valid: Option<u64>,
     last_valid: Option<u64>,
-    handle: &str,
-    password: &str,
-    no_wait: bool,
-) -> Result<(), String> {
-    let params = pipeline
-        .suggested_params()
+) -> Result<algo_types::Transaction, String> {
+    let params = algod
+        .suggested_transaction_params()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| algo_txn_pipeline::PipelineError::from(e).to_string())?;
     let max_txn_life =
         crate::cmd::clerk::resolve_max_txn_life(data_dir, &params.consensus_version)?;
     let (first, last) = compute_validity(first_valid, last_valid, params.last_round, max_txn_life)?;
@@ -1619,7 +1643,7 @@ async fn submit_offline_keyreg(
     if fee.is_none() {
         txn.fee = algo_txn_pipeline::estimate_fee(&txn, params.fee, params.min_fee);
     }
-    sign_submit_confirm(pipeline, &txn, handle, password, no_wait, "status change").await
+    Ok(txn)
 }
 
 /// `account marknonparticipating -a <addr> ...`. Mirrors Go's
@@ -1734,62 +1758,32 @@ pub fn run_marknonparticipating(
     }
 }
 
-/// Build → sign → submit a go-online keyreg for `address`, selecting the
-/// node's participation key via `/v2/participation` (Go's `chooseParticipation`
-/// + `changeAccountOnlineStatus(goOnline=true)`) for `changeonlinestatus
-/// --online`.
-#[allow(clippy::too_many_arguments)]
-async fn register_online_keyreg(
-    pipeline: &algo_txn_pipeline::TxnPipeline,
-    data_dir: &Path,
-    sender: algo_types::Address,
-    address: &str,
-    fee: Option<u64>,
-    first_valid: Option<u64>,
-    last_valid: Option<u64>,
-    handle: &str,
-    password: &str,
-    no_wait: bool,
-) -> Result<(), String> {
-    let txn = build_online_keyreg(
-        pipeline.algod(),
-        data_dir,
-        sender,
-        address,
-        fee,
-        first_valid,
-        last_valid,
-    )
-    .await?;
-    sign_submit_confirm(pipeline, &txn, handle, password, no_wait, "status change").await
-}
-
-/// go's `MakeUnsignedGoOnlineTx`: the go-online keyreg of `address` with the
+/// go's `MakeUnsignedGoOnlineTx`: the go-online keyreg of `sender` with the
 /// node's participation key valid at its first round (`chooseParticipation`).
-async fn build_online_keyreg(
+#[allow(clippy::too_many_arguments)]
+fn build_online_keyreg(
+    rt: &tokio::runtime::Runtime,
+    endpoint: &(String, String),
     algod: &algo_rest_client::AlgodClient,
     data_dir: &Path,
     sender: algo_types::Address,
-    address: &str,
     fee: Option<u64>,
     first_valid: Option<u64>,
     last_valid: Option<u64>,
 ) -> Result<algo_types::Transaction, String> {
-    let params = algod
-        .suggested_transaction_params()
-        .await
+    let params = rt
+        .block_on(algod.suggested_transaction_params())
         .map_err(|e| e.to_string())?;
     let max_txn_life =
         crate::cmd::clerk::resolve_max_txn_life(data_dir, &params.consensus_version)?;
     let (first, last) = compute_validity(first_valid, last_valid, params.last_round, max_txn_life)?;
-    let parts = algod
-        .list_participation_keys()
-        .await
-        .map_err(|e| e.to_string())?;
-    let part = choose_participation(&parts, address, first).ok_or_else(|| {
+    // go's `ListParticipationKeys` error is returned as is.
+    let parts = list_part_keys_raw(rt, endpoint)?;
+    let address = sender.to_string();
+    let part = choose_participation(&parts, &address, first).ok_or_else(|| {
         format!(
-            "couldn't find a participation key for address {address} valid at round {first} \
-             in the participation registry"
+            "couldn't find a participation key database for address {address} valid at round \
+             {first} in participation registry"
         )
     })?;
     let mut txn = algo_txn_pipeline::KeyregBuilder::online(sender, &part.key)
@@ -1847,14 +1841,22 @@ fn renew_rounds(
     })
 }
 
-/// go's `client.ListParticipationKeys()`.
+/// go's `client.ListParticipationKeys()`, a failure reported as go's
+/// `errorRequestFail`.
 fn list_part_keys(
     rt: &tokio::runtime::Runtime,
     endpoint: &(String, String),
 ) -> Result<Vec<algo_rest_client::ParticipationKey>, String> {
-    let fail = |e: String| format_message(ERROR_REQUEST_FAIL, &[&e]);
-    let body = crate::algod_rest::get(rt, endpoint, "/v2/participation", &[]).map_err(fail)?;
-    serde_json::from_slice(&body).map_err(|e| fail(e.to_string()))
+    list_part_keys_raw(rt, endpoint).map_err(|e| format_message(ERROR_REQUEST_FAIL, &[&e]))
+}
+
+/// go's `client.ListParticipationKeys()`, its error as is.
+fn list_part_keys_raw(
+    rt: &tokio::runtime::Runtime,
+    endpoint: &(String, String),
+) -> Result<Vec<algo_rest_client::ParticipationKey>, String> {
+    let body = crate::algod_rest::get(rt, endpoint, "/v2/participation", &[])?;
+    serde_json::from_slice(&body).map_err(|e| e.to_string())
 }
 
 /// go's `util.RunFuncWithSpinningCursor`: `f` runs while one of `/-\|` and a
@@ -1893,8 +1895,9 @@ impl Drop for RemoveOnDrop<'_> {
 }
 
 /// go's `participation.GenParticipationKeysTo(address, first, last, dilution,
-/// "", installFunc)` as `client.GenParticipationKeys` calls it: the key is
-/// generated into `os.TempDir()/<address>.<first>.<last>.partkey`, posted to
+/// out_dir, installFunc)`: the key is generated into
+/// `<out_dir>/<address>.<first>.<last>.partkey`; without `out_dir` (as
+/// `client.GenParticipationKeys` calls it) into `os.TempDir()`, posted to
 /// algod (`AddParticipationKey`) and the file removed. Returns the key's
 /// `ParticipationID` and the file's path.
 fn gen_participation_keys(
@@ -1904,11 +1907,14 @@ fn gen_participation_keys(
     first: u64,
     last: u64,
     dilution: u64,
+    out_dir: Option<&Path>,
 ) -> Result<(String, PathBuf), String> {
     let parsed = algo_avm::assembler::unmarshal_checksum_address(address)?;
     let mut pk = [0u8; 32];
     pk.copy_from_slice(&parsed);
-    let path = std::env::temp_dir().join(format!("{address}.{first}.{last}.partkey"));
+    let install = out_dir.is_none();
+    let dir = out_dir.map_or_else(std::env::temp_dir, Path::to_path_buf);
+    let path = dir.join(format!("{address}.{first}.{last}.partkey"));
     match std::fs::metadata(&path) {
         Ok(_) => {
             return Err(format!(
@@ -1923,7 +1929,7 @@ fn gen_participation_keys(
             ))
         }
     }
-    let _remove = RemoveOnDrop(&path);
+    let _remove = install.then(|| RemoveOnDrop(&path));
     let dilution = if dilution == 0 {
         algo_ledger::participation::default_key_dilution(
             algo_types::Round(first),
@@ -1944,15 +1950,17 @@ fn gen_participation_keys(
         )
         .map_err(|e| e.to_string())?
     };
-    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-    crate::algod_rest::post_json(
-        rt,
-        endpoint,
-        "/v2/participation",
-        &[],
-        Some(&bytes),
-        &crate::go_codec_json::POST_PARTICIPATION,
-    )?;
+    if install {
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        crate::algod_rest::post_json(
+            rt,
+            endpoint,
+            "/v2/participation",
+            &[],
+            Some(&bytes),
+            &crate::go_codec_json::POST_PARTICIPATION,
+        )?;
+    }
     Ok((part.id().to_string(), path.clone()))
 }
 
@@ -1991,6 +1999,7 @@ fn generate_and_register_part_key(
             current_round,
             key_last_valid,
             flags.dilution,
+            None,
         )
         .map_err(|e| format_message(ERROR_REQUEST_FAIL, &[&e]));
         // go prints this whether or not the generation failed.
@@ -2036,15 +2045,16 @@ fn register_renewed_key(
 ) -> Result<(), String> {
     let sender = algo_types::Address::from_algorand_string(address).map_err(|e| e.to_string())?;
     let algod = algo_rest_client::AlgodClient::new(&endpoint.0, &endpoint.1);
-    let mut txn = rt.block_on(build_online_keyreg(
+    let mut txn = build_online_keyreg(
+        rt,
+        endpoint,
         &algod,
         dd,
         sender,
-        address,
         Some(flags.fee).filter(|f| *f != 0),
         Some(first),
         Some(last),
-    ))?;
+    )?;
     match crate::cmd::clerk::parse_rekey(flags.rekey_to) {
         Ok(a) if a != algo_types::Address::default() => txn.rekey_to = Some(a),
         Ok(_) => {}
@@ -3316,6 +3326,12 @@ mod tests {
         assert!(choose_participation(&parts, "CCC", 100).is_none());
         // No key valid at a round beyond every key's window.
         assert!(choose_participation(&parts, "AAA", 100_000).is_none());
+        // Of keys expiring together go keeps the first listed (issue #2488).
+        let mut tied = vec![mk("AAA", 1, 5000), mk("AAA", 1, 5000)];
+        tied[0].id = "first".into();
+        tied[1].id = "second".into();
+        let chosen = choose_participation(&tied, "AAA", 100).expect("a valid key for AAA");
+        assert_eq!(chosen.id, "first");
     }
 
     #[test]

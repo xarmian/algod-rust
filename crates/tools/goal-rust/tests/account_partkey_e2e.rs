@@ -160,8 +160,13 @@ fn sample_partkey_list() -> serde_json::Value {
 }
 
 #[test]
-fn addpartkey_invokes_generate_endpoint_with_query_params() {
-    let (_t, dd) = mk_data_dir();
+fn addpartkey_generates_locally_and_installs() {
+    // go's `addParticipationKeyCmd`: the key is generated into $TMPDIR by
+    // `GenParticipationKeysTo`, posted to `/v2/participation` and removed
+    // (issue #2488).
+    let (t, dd) = mk_data_dir();
+    let tmpdir = t.path().join("tmp");
+    std::fs::create_dir_all(&tmpdir).unwrap();
     let addr = algo_types::Address([0x11; 32]).to_algorand_string();
     let (state, stop, jh, port) = spawn_mock_algod(MockState::default());
     wire_algod(&dd, port);
@@ -182,6 +187,7 @@ fn addpartkey_invokes_generate_endpoint_with_query_params() {
             "55",
         ])
         .env_remove("ALGORAND_DATA")
+        .env("TMPDIR", &tmpdir)
         .output()
         .expect("addpartkey");
     stop.store(true, Ordering::Relaxed);
@@ -192,19 +198,30 @@ fn addpartkey_invokes_generate_endpoint_with_query_params() {
         out.status.success(),
         "addpartkey: stdout={stdout:?}, stderr={stderr:?}"
     );
+    assert!(
+        stdout.contains("Participation key generation successful. Participation ID: "),
+        "got {stdout:?}"
+    );
 
     let s = state.lock().unwrap();
-    let got = s
-        .requests
-        .iter()
-        .find(|(m, p)| m == "POST" && p.starts_with(&format!("/v2/participation/generate/{addr}")));
-    let (_, path) = got.expect("addpartkey must POST generate");
     assert!(
-        path.contains("first=1000"),
-        "must carry first=…; got {path}"
+        s.requests
+            .iter()
+            .any(|(m, p)| m == "POST" && p == "/v2/participation"),
+        "addpartkey must POST the key file; saw {:?}",
+        s.requests
     );
-    assert!(path.contains("last=2000"));
-    assert!(path.contains("dilution=55"));
+    assert!(
+        !s.requests
+            .iter()
+            .any(|(_, p)| p.starts_with("/v2/participation/generate")),
+        "addpartkey must not ask algod to generate the key"
+    );
+    assert_eq!(
+        std::fs::read_dir(&tmpdir).unwrap().count(),
+        0,
+        "the installed key file is removed"
+    );
 }
 
 #[test]
@@ -233,7 +250,11 @@ fn addpartkey_bad_address_errors_before_any_request() {
     let _ = jh.join();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "bad address must fail");
-    assert!(stderr.contains("Could not parse address"), "got {stderr:?}");
+    // go: `reportErrorf(errorRequestFail, err)` of `GenParticipationKeysTo`.
+    assert!(
+        stderr.starts_with("Error processing command: "),
+        "got {stderr:?}"
+    );
     assert!(
         state.lock().unwrap().requests.is_empty(),
         "no requests should have been issued",
@@ -474,7 +495,7 @@ fn partkeyinfo_iterates_every_data_dir() {
 #[test]
 fn addpartkey_accepts_one_round_range() {
     // Codex round-1 finding: last==first must be allowed.
-    let (_t, dd) = mk_data_dir();
+    let (t, dd) = mk_data_dir();
     let addr = algo_types::Address([0x22; 32]).to_algorand_string();
     let (_state, stop, jh, port) = spawn_mock_algod(MockState::default());
     wire_algod(&dd, port);
@@ -493,6 +514,7 @@ fn addpartkey_accepts_one_round_range() {
             "1000",
         ])
         .env_remove("ALGORAND_DATA")
+        .env("TMPDIR", t.path())
         .output()
         .expect("addpartkey");
     stop.store(true, Ordering::Relaxed);
