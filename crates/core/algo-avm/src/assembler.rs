@@ -3489,7 +3489,7 @@ pub(crate) fn go_quote(s: &str) -> String {
 }
 
 /// `strconv.Quote` of a byte string: invalid UTF-8 bytes become `\xNN`.
-pub(crate) fn go_quote_bytes(bytes: &[u8]) -> String {
+pub fn go_quote_bytes(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() + 2);
     out.push('"');
     for chunk in bytes.utf8_chunks() {

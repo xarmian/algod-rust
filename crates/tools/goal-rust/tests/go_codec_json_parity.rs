@@ -41,7 +41,10 @@
 //! scratch buffer; random token soups.
 
 use base64::Engine as _;
-use goal_rust::go_codec_json::{decode, Ty, ACCOUNT, NODE_STATUS, SUPPLY, VERSION};
+use goal_rust::go_codec_json::{
+    decode, Ty, ACCOUNT, ACCOUNT_ASSET, ACCOUNT_ASSETS_INFORMATION, APPLICATION, ASSET,
+    CATCHPOINT_RESPONSE, NODE_STATUS, PARTICIPATION_KEYS, POST_PARTICIPATION, SUPPLY, VERSION,
+};
 
 const FIXTURE: &str = include_str!("fixtures/go_codec_json_decode.jsonl");
 
@@ -51,6 +54,13 @@ fn ty(name: &str) -> &'static Ty {
         "version" => &VERSION,
         "status" => &NODE_STATUS,
         "supply" => &SUPPLY,
+        "asset" => &ASSET,
+        "application" => &APPLICATION,
+        "account-assets" => &ACCOUNT_ASSETS_INFORMATION,
+        "account-asset" => &ACCOUNT_ASSET,
+        "participation-keys" => &PARTICIPATION_KEYS,
+        "post-participation" => &POST_PARTICIPATION,
+        "catchpoint" => &CATCHPOINT_RESPONSE,
         other => panic!("unknown type {other}"),
     }
 }

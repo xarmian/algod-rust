@@ -67,12 +67,35 @@ pub fn report_error_text(msg: &str) -> String {
         if i > 0 {
             out.push('\n');
         }
-        let (printable, printable_line) = unicode_printable(line);
+        // a raw byte of the lossless form is go's RuneError, printable
+        let line = algo_types::raw_text::go_lossy(&algo_types::raw_text::decode(line));
+        let (printable, printable_line) = unicode_printable(&line);
         if !printable {
             out.push_str(ERROR_NON_PRINTABLE_CHARACTERS);
             out.push('\n');
         }
         out.push_str(&printable_line);
+    }
+    out
+}
+
+/// go's `infoNonPrintableCharacters` (`cmd/goal/messages.go`).
+pub const INFO_NON_PRINTABLE_CHARACTERS: &str =
+    "One or more non-printable characters were omitted from the subsequent line:";
+
+/// What go's `reportInfoln` / `reportInfof` prints for `msg` (to stdout):
+/// each line through [`unicode_printable`] and a newline, a line that lost
+/// anything preceded by [`INFO_NON_PRINTABLE_CHARACTERS`].
+pub fn report_info_text(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len() + 1);
+    for line in msg.split('\n') {
+        let (printable, printable_line) = unicode_printable(line);
+        if !printable {
+            out.push_str(INFO_NON_PRINTABLE_CHARACTERS);
+            out.push('\n');
+        }
+        out.push_str(&printable_line);
+        out.push('\n');
     }
     out
 }
@@ -112,10 +135,47 @@ pub fn encode_bytes_as_app_call_bytes(value: &[u8]) -> String {
     )
 }
 
+/// go's `assetDecimalsFmt` (`cmd/goal/asset.go`): `amount` with `decimals`
+/// digits after the point (go's `pow` wraps like any `uint64`).
+pub fn asset_decimals_fmt(amount: u64, decimals: u64) -> String {
+    if decimals == 0 {
+        return amount.to_string();
+    }
+    let mut pow = 1u64;
+    for _ in 0..decimals.min(64) {
+        pow = pow.wrapping_mul(10);
+    }
+    if pow == 0 {
+        // go: an integer divide by zero; no asset has 64 decimals
+        return amount.to_string();
+    }
+    format!(
+        "{}.{:0width$}",
+        amount / pow,
+        amount % pow,
+        width = usize::try_from(decimals).unwrap_or(usize::MAX)
+    )
+}
+
+/// go's `unicodePrintable(s)`'s printable string.
+pub fn printable(s: &str) -> String {
+    unicode_printable(s).1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use base64::Engine;
+
+    #[test]
+    fn asset_decimals_fmt_matches_go() {
+        assert_eq!(asset_decimals_fmt(12345, 0), "12345");
+        assert_eq!(asset_decimals_fmt(12345, 3), "12.345");
+        assert_eq!(asset_decimals_fmt(1, 3), "0.001");
+        assert_eq!(asset_decimals_fmt(u64::MAX, 19), "1.8446744073709551615");
+        // go's pow wraps: 10^20 mod 2^64
+        assert_eq!(asset_decimals_fmt(u64::MAX, 20), "2.02914184810805067775");
+    }
 
     /// Direct port of go's `TestUnicodePrintable`
     /// (`cmd/goal/formatting_test.go:28-48`).

@@ -25,7 +25,9 @@
 // with response an `any` holding a pointer to the answer type) and prints
 // what that made of each.
 //
-// Input: JSON lines {"ty": "account"|"version"|"status"|"supply",
+// Input: JSON lines {"ty": "account"|"version"|"status"|"supply"|
+// "asset"|"application"|"account-assets"|"account-asset"|
+// "participation-keys"|"post-participation"|"catchpoint" (issue #2476),
 // "body": <base64>}. Output: the same lines plus "err" (go-codec's error
 // text, or null) and "value" (the decoded struct as encoding/json prints
 // it, or null on an error). It writes
@@ -91,6 +93,21 @@ func main() {
 			target = &model.NodeStatusResponse{}
 		case "supply":
 			target = &model.SupplyResponse{}
+		case "asset":
+			target = &model.Asset{}
+		case "application":
+			target = &model.Application{}
+		case "account-assets":
+			target = &model.AccountAssetsInformationResponse{}
+		case "account-asset":
+			target = &model.AccountAssetResponse{}
+		case "participation-keys":
+			// a nil slice, as the client's `var response` holds
+			target = new(model.ParticipationKeysResponse)
+		case "post-participation":
+			target = &model.PostParticipationResponse{}
+		case "catchpoint":
+			target = &model.CatchpointStartResponse{}
 		default:
 			panic(in.Ty)
 		}

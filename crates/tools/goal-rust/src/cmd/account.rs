@@ -293,8 +293,8 @@ pub fn run_list(args: ListArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBu
         }
         if args.info {
             let held = held_asset_params(&rt, algod.as_ref(), &info, false);
-            let (report, errors, has_error) = format_info(&info, &held, false);
-            eprint!("{errors}");
+            let (report, errors, has_error) = format_info(&addr, &info, &held, false);
+            crate::algod_rest::eprint_raw(&errors);
             print!("{report}");
             account_info_error |= has_error;
         }
@@ -1115,9 +1115,29 @@ pub fn run_installpartkey(args: InstallpartkeyArgs, cli_d: Vec<PathBuf>) -> Exit
     ExitCode::SUCCESS
 }
 
-/// `account listpartkeys`. Mirrors `listParticipationKeysCmd`
-/// (account.go:1220-1278). Columns + format match Go's hdrFormat /
-/// rowFormat (squeezed to 77 chars wide).
+/// go: `client.ListParticipationKeys()`: `GET /v2/participation` into a
+/// `model.ParticipationKeysResponse`.
+fn participation_keys(
+    rt: &tokio::runtime::Runtime,
+    endpoint: &(String, String),
+) -> Result<Vec<serde_json::Value>, String> {
+    let v = crate::algod_rest::get_json(
+        rt,
+        endpoint,
+        "/v2/participation",
+        &[],
+        &crate::go_codec_json::PARTICIPATION_KEYS,
+    )?;
+    Ok(v.as_array().cloned().unwrap_or_default())
+}
+
+/// go: `roundOrNA` of a `*basics.Round` field.
+fn json_round_or_na(v: &serde_json::Value) -> String {
+    round_or_na(v.as_u64())
+}
+
+/// `account listpartkeys`: go's `listParticipationKeysCmd`. A key whose
+/// account cannot be read is left out, like go.
 pub fn run_listpartkeys(cli_d: Vec<PathBuf>) -> ExitCode {
     let dd = match data_dir::ensure_single_data_dir(&cli_d) {
         Ok(d) => d,
@@ -1128,86 +1148,76 @@ pub fn run_listpartkeys(cli_d: Vec<PathBuf>) -> ExitCode {
     };
     // go: `ensureGoalClient(dataDir, DynamicClient)`; its
     // `ListParticipationKeys` then needs the algod client, whose failure is
-    // `errorRequestFail` (account.go:1330-1333, issue #2454).
+    // `errorRequestFail` (issue #2454).
     if let Err(e) =
         crate::goal_client::ensure_goal_client(&dd, crate::goal_client::ClientType::Dynamic)
     {
         eprintln!("{e}");
         return ExitCode::from(1);
     }
-    let client = match crate::goal_client::algod_endpoint(&dd) {
-        Ok((base, token)) => algo_rest_client::AlgodClient::new(&base, &token),
-        Err(e) => {
-            eprintln!("Error processing command: {e}");
-            return ExitCode::from(1);
-        }
+    let report = |e: &str| {
+        eprintln!(
+            "{}",
+            crate::formatting::report_error_text(&format_message(ERROR_REQUEST_FAIL, &[e]))
+        );
+        ExitCode::from(1)
+    };
+    let endpoint = match crate::goal_client::algod_endpoint(&dd) {
+        Ok(ep) => ep,
+        Err(e) => return report(&e),
     };
     let rt = match build_runtime() {
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
     };
-    let parts = match rt.block_on(client.list_participation_keys()) {
+    let parts = match participation_keys(&rt, &endpoint) {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
-            return ExitCode::from(1);
-        }
+        Err(e) => return report(&e),
     };
-    // Mirror Go's `%-10s  %-11s  %-15s  %10s  %11s  %10s\n` header
-    // (account.go:1235-1237).
     println!(
         "{:<10}  {:<11}  {:<15}  {:>10}  {:>11}  {:>10}",
         "Registered", "Account", "ParticipationID", "Last Used", "First round", "Last round"
     );
     for part in &parts {
-        // Online / registered determination requires AccountInformation
-        // — we don't compute it (would require a per-row REST call and
-        // doesn't change the table shape). Show `?` instead.
-        let online = "?";
-        let addr_short = if part.address.len() >= 8 {
-            format!(
-                "{}...{}",
-                &part.address[..4],
-                &part.address[part.address.len() - 4..]
-            )
-        } else {
-            part.address.clone()
+        let address = part["address"].as_str().unwrap_or("");
+        let Ok(account) = get_account(&rt, &endpoint, address, false) else {
+            continue;
         };
-        let id_short = if part.id.len() >= 8 {
-            format!("{}...", &part.id[..8])
-        } else {
-            part.id.clone()
-        };
-        let last_used = part
-            .last_vote
-            .max(part.last_block_proposal)
-            .max(part.last_state_proof)
+        let key = &part["key"];
+        let online = &account["participation"];
+        // go compares the `[]byte` keys as strings: nil and empty are equal
+        let bytes_eq = |f: &str| online[f].as_str().unwrap_or("") == key[f].as_str().unwrap_or("");
+        let registered = online.is_object()
+            && bytes_eq("vote-participation-key")
+            && bytes_eq("selection-participation-key")
+            && online["vote-first-valid"] == key["vote-first-valid"]
+            && online["vote-last-valid"] == key["vote-last-valid"]
+            && online["vote-key-dilution"] == key["vote-key-dilution"];
+        let last_used = ["last-vote", "last-block-proposal", "last-state-proof"]
+            .iter()
+            .filter_map(|f| part[*f].as_u64())
+            .max()
             .unwrap_or(0);
-        let last_used_str = if last_used == 0 {
-            "N/A".to_string()
-        } else {
-            last_used.to_string()
-        };
+        let id = part["id"].as_str().unwrap_or("");
+        // go slices `Address[:4]` / `Id[:8]` (byte offsets)
+        let head = |s: &str, n: usize| s.get(..n).unwrap_or(s).to_string();
+        let tail = |s: &str, n: usize| s.get(s.len().saturating_sub(n)..).unwrap_or(s).to_string();
         println!(
             "{:<10}  {:<11}  {:<15}  {:>10}  {:>11}  {:>10}",
-            online,
-            addr_short,
-            id_short,
-            last_used_str,
-            part.key.vote_first_valid,
-            part.key.vote_last_valid,
+            if registered { "yes" } else { "no" },
+            format!("{}...{}", head(address, 4), tail(address, 4)),
+            format!("{}...", head(id, 8)),
+            round_or_na(Some(last_used)),
+            key["vote-first-valid"].as_u64().unwrap_or(0),
+            key["vote-last-valid"].as_u64().unwrap_or(0),
         );
     }
     ExitCode::SUCCESS
 }
 
-/// `account partkeyinfo`. Mirrors `partkeyInfoCmd`
-/// (account.go:1464-1502).
+/// `account partkeyinfo`: go's `partkeyInfoCmd`, every data dir in turn;
+/// the first failure ends the command (`reportErrorf`).
 pub fn run_partkeyinfo(cli_d: Vec<PathBuf>) -> ExitCode {
-    // Go's partkeyInfoCmd uses datadir.OnDataDirs (account.go:1470)
-    // which iterates every -d data dir, printing a block per dir.
-    // Codex round-1 finding: the single-dir ensure_single_data_dir
-    // call rejected multi -d invocations.
     let dirs = match data_dir::resolve_data_dirs(&cli_d) {
         Ok(d) => d,
         Err(e) => {
@@ -1219,70 +1229,95 @@ pub fn run_partkeyinfo(cli_d: Vec<PathBuf>) -> ExitCode {
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
     };
-    use base64::Engine;
-    let mut had_error = false;
+    use std::io::Write as _;
     for data_dir_path in &dirs {
         println!(
             "Dumping participation key info from {}...",
             data_dir_path.display()
         );
-        let client = match build_algod_client_for_dir(data_dir_path) {
-            Ok(c) => c,
-            Err(()) => {
-                had_error = true;
-                continue;
-            }
+        let _ = std::io::stdout().flush();
+        let Ok(endpoint) = ensure_algod_endpoint(data_dir_path) else {
+            return ExitCode::from(1);
         };
-        let parts = match rt.block_on(client.list_participation_keys()) {
+        let parts = match participation_keys(&rt, &endpoint) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
-                had_error = true;
-                continue;
+                eprintln!(
+                    "{}",
+                    crate::formatting::report_error_text(&format_message(
+                        ERROR_REQUEST_FAIL,
+                        &[&e]
+                    ))
+                );
+                return ExitCode::from(1);
             }
         };
+        let mut out = String::new();
         for part in &parts {
-            println!();
-            println!("Participation ID:          {}", part.id);
-            println!("Parent address:            {}", part.address);
-            println!("Last vote round:           {}", round_or_na(part.last_vote));
-            println!(
+            use std::fmt::Write as _;
+            let key = &part["key"];
+            let s = |v: &serde_json::Value| v.as_str().unwrap_or("").to_string();
+            let u = |v: &serde_json::Value| v.as_u64().unwrap_or(0);
+            // `[]byte` fields are base64 in the decoded value already
+            let _ = writeln!(out);
+            let _ = writeln!(out, "Participation ID:          {}", s(&part["id"]));
+            let _ = writeln!(out, "Parent address:            {}", s(&part["address"]));
+            let _ = writeln!(
+                out,
+                "Last vote round:           {}",
+                json_round_or_na(&part["last-vote"])
+            );
+            let _ = writeln!(
+                out,
                 "Last block proposal round: {}",
-                round_or_na(part.last_block_proposal)
+                json_round_or_na(&part["last-block-proposal"])
             );
-            println!(
+            let _ = writeln!(
+                out,
                 "Effective first round:     {}",
-                round_or_na(part.effective_first_valid)
+                json_round_or_na(&part["effective-first-valid"])
             );
-            println!(
+            let _ = writeln!(
+                out,
                 "Effective last round:      {}",
-                round_or_na(part.effective_last_valid)
+                json_round_or_na(&part["effective-last-valid"])
             );
-            println!("First round:               {}", part.key.vote_first_valid);
-            println!("Last round:                {}", part.key.vote_last_valid);
-            println!("Key dilution:              {}", part.key.vote_key_dilution);
-            println!(
+            let _ = writeln!(
+                out,
+                "First round:               {}",
+                u(&key["vote-first-valid"])
+            );
+            let _ = writeln!(
+                out,
+                "Last round:                {}",
+                u(&key["vote-last-valid"])
+            );
+            let _ = writeln!(
+                out,
+                "Key dilution:              {}",
+                u(&key["vote-key-dilution"])
+            );
+            let _ = writeln!(
+                out,
                 "Selection key:             {}",
-                base64::engine::general_purpose::STANDARD
-                    .encode(&part.key.selection_participation_key)
+                s(&key["selection-participation-key"])
             );
-            println!(
+            let _ = writeln!(
+                out,
                 "Voting key:                {}",
-                base64::engine::general_purpose::STANDARD.encode(&part.key.vote_participation_key)
+                s(&key["vote-participation-key"])
             );
-            if let Some(spk) = &part.key.state_proof_key {
-                println!(
+            if key["state-proof-key"].is_string() {
+                let _ = writeln!(
+                    out,
                     "State proof key:           {}",
-                    base64::engine::general_purpose::STANDARD.encode(spk)
+                    s(&key["state-proof-key"])
                 );
             }
         }
+        print!("{out}");
     }
-    if had_error {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
-    }
+    ExitCode::SUCCESS
 }
 
 /// `account deletepartkey --partkeyid <id>`. Mirrors
@@ -1910,12 +1945,13 @@ fn gen_participation_keys(
         .map_err(|e| e.to_string())?
     };
     let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-    crate::algod_rest::post(
+    crate::algod_rest::post_json(
         rt,
         endpoint,
         "/v2/participation",
-        "application/msgpack",
-        bytes,
+        &[],
+        Some(&bytes),
+        &crate::go_codec_json::POST_PARTICIPATION,
     )?;
     Ok((part.id().to_string(), path.clone()))
 }
@@ -2701,13 +2737,10 @@ pub fn run_rewards(args: AddressArgs, cli_d: Vec<PathBuf>) -> ExitCode {
     }
 }
 
-/// `account assetdetails -a <addr> [-l <n>] [-n <token>]` — print
-/// the per-asset detail block. Mirrors `printAccountAssetsInformation`
-/// (`account.go:797+`). Routes through the paginated
-/// `/v2/accounts/{addr}/assets` endpoint so `--limit` / `--next` round-
-/// trip with Go's `goal account assetdetails` semantics (Codex round-1
-/// finding — the prior implementation incorrectly walked the unpaged
-/// `/v2/accounts/{addr}` shape and ignored both flags).
+/// `account assetdetails -a <addr> [-l <n>] [-n <token>]`: go's
+/// `assetDetailsCmd`: the pages of `GET /v2/accounts/<addr>/assets`
+/// (`AccountAssetsInformation`) printed by `printAccountAssetsInformation`,
+/// one page only when `--limit` or `--next` is given.
 pub fn run_assetdetails(args: AssetdetailsArgs, cli_d: Vec<PathBuf>) -> ExitCode {
     let dd = match data_dir::ensure_single_data_dir(&cli_d) {
         Ok(d) => d,
@@ -2716,83 +2749,123 @@ pub fn run_assetdetails(args: AssetdetailsArgs, cli_d: Vec<PathBuf>) -> ExitCode
             return ExitCode::from(1);
         }
     };
-    // go: `ensureAlgodClient(dataDir)` first (issue #2454).
     let Ok(endpoint) = ensure_algod_endpoint(&dd) else {
         return ExitCode::from(1);
     };
-    if let Err(e) = algo_types::Address::from_algorand_string(&args.address) {
-        eprintln!("Could not parse address: {e}");
-        return ExitCode::from(1);
-    }
     let rt = match build_runtime() {
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
     };
-
-    // Build the paginated assets URL.
-    let mut url = format!(
-        "{}/v2/accounts/{}/assets",
-        endpoint.0.trim_end_matches('/'),
-        args.address
-    );
-    let mut qs: Vec<String> = Vec::new();
-    if let Some(l) = args.limit {
-        qs.push(format!("limit={l}"));
-    }
-    if let Some(n) = args.next.as_deref().filter(|s| !s.is_empty()) {
-        qs.push(format!("next={n}"));
-    }
-    if !qs.is_empty() {
-        url.push('?');
-        url.push_str(&qs.join("&"));
-    }
-
-    let resp_json = rt.block_on(async {
-        let http = reqwest::Client::new();
-        let r = http
-            .get(&url)
-            .header("X-Algo-API-Token", &endpoint.1)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let status = r.status();
-        let bytes = r.bytes().await.map_err(|e| e.to_string())?;
-        if !status.is_success() {
-            return Err(format!("HTTP {}", status.as_u16()));
-        }
-        serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| e.to_string())
-    });
-    let resp = match resp_json {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e]));
-            return ExitCode::from(1);
-        }
+    let limit = args.limit.unwrap_or(0);
+    let next = args.next.clone().unwrap_or_default();
+    let mut token = next.clone();
+    let mut out = format!("Account: {}\nAssets:\n", args.address);
+    let flush = |out: &mut String| {
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(out.as_bytes());
+        let _ = stdout.flush();
+        out.clear();
     };
-
-    let round = resp.get("round").and_then(|r| r.as_u64()).unwrap_or(0);
-    let next_token = resp
-        .get("next-token")
-        .and_then(|n| n.as_str())
-        .map(|s| s.to_string());
-    let mut assets: Vec<(serde_json::Value, Option<serde_json::Value>)> = Vec::new();
-    if let Some(arr) = resp.get("asset-holdings").and_then(|a| a.as_array()) {
-        for entry in arr {
-            // The paginated endpoint nests holding + optional params
-            // under each `asset-holdings[i]` entry as:
-            //   { "asset-holding": {...}, "asset-params": {...?} }
-            let holding = entry
-                .get("asset-holding")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let params = entry.get("asset-params").cloned();
-            assets.push((holding, params));
+    loop {
+        let limit_text = limit.to_string();
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if !token.is_empty() {
+            query.push(("next", &token));
+        }
+        if limit > 0 {
+            query.push(("limit", &limit_text));
+        }
+        let response = match crate::algod_rest::get_json(
+            &rt,
+            &endpoint,
+            &format!("/v2/accounts/{}/assets", args.address),
+            &query,
+            &crate::go_codec_json::ACCOUNT_ASSETS_INFORMATION,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                flush(&mut out);
+                eprintln!(
+                    "{}",
+                    crate::formatting::report_error_text(&format_message(
+                        ERROR_REQUEST_FAIL,
+                        &[&e]
+                    ))
+                );
+                return ExitCode::from(1);
+            }
+        };
+        out.push_str(&format_account_assets_information(&response));
+        token = response["next-token"].as_str().unwrap_or("").to_string();
+        if token.is_empty() {
+            break;
+        }
+        if limit > 0 || !next.is_empty() {
+            // go: `reportInfof("NextToken: %s", token)`
+            out.push_str(&crate::formatting::report_info_text(&format!(
+                "NextToken: {token}"
+            )));
+            break;
         }
     }
-
-    let s = format_assetdetails(&args.address, round, next_token.as_deref(), &assets);
-    print!("{s}");
+    flush(&mut out);
     ExitCode::SUCCESS
+}
+
+/// go's `printAccountAssetsInformation`.
+fn format_account_assets_information(response: &serde_json::Value) -> String {
+    use crate::formatting::{asset_decimals_fmt, printable};
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let holdings = response["asset-holdings"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let u = |v: &serde_json::Value| v.as_u64().unwrap_or(0);
+    let s = |v: &serde_json::Value| v.as_str().unwrap_or("").to_string();
+    for asset in holdings {
+        let holding = &asset["asset-holding"];
+        let _ = writeln!(out, "  Asset ID: {}", u(&holding["asset-id"]));
+        let params = &asset["asset-params"];
+        if params.is_object() {
+            let decimals = u(&params["decimals"]);
+            let amount = asset_decimals_fmt(u(&holding["amount"]), decimals);
+            let _ = writeln!(out, "    Amount: {amount}");
+            let _ = writeln!(out, "    IsFrozen: {}", holding["is-frozen"] == true);
+            let _ = writeln!(out, "  Asset Params:");
+            let _ = writeln!(out, "    Creator: {}", s(&params["creator"]));
+            let name = params["name"]
+                .as_str()
+                .map_or_else(|| "<unnamed>".to_string(), printable);
+            let _ = writeln!(out, "    Asset name: {name}");
+            let units = params["unit-name"]
+                .as_str()
+                .map_or_else(|| "units".to_string(), printable);
+            let _ = writeln!(out, "    Unit name: {units}");
+            let _ = writeln!(out, "    Total: {}", u(&params["total"]));
+            let _ = writeln!(out, "    Decimals: {decimals}");
+            let _ = writeln!(
+                out,
+                "    Default frozen:   {}",
+                params["default-frozen"] == true
+            );
+            let url = params["url"].as_str().map(printable).unwrap_or_default();
+            let _ = writeln!(out, "    URL: {url}");
+            let _ = writeln!(out, "    Manager address:  {}", s(&params["manager"]));
+            let _ = writeln!(out, "    Reserve address:  {}", s(&params["reserve"]));
+            let _ = writeln!(out, "    Freeze address:   {}", s(&params["freeze"]));
+            let _ = writeln!(out, "    Clawback address: {}", s(&params["clawback"]));
+        } else {
+            let _ = writeln!(
+                out,
+                "    Amount (without formatting): {}",
+                u(&holding["amount"])
+            );
+            let _ = writeln!(out, "    IsFrozen: {}", holding["is-frozen"] == true);
+        }
+    }
+    out
 }
 
 /// The account's `assets` array; an absent key and `[]` are the same
@@ -2824,10 +2897,9 @@ pub fn run_info(args: InfoArgs, cli_d: Vec<PathBuf>) -> ExitCode {
     // an AssetInformation call.
     let held_params = held_asset_params(&rt, endpoint.as_ref(), &v, args.only_show_asset_ids);
 
-    let (report, errors, has_error) = format_info(&v, &held_params, args.only_show_asset_ids);
-    if !errors.is_empty() {
-        eprint!("{errors}");
-    }
+    let (report, errors, has_error) =
+        format_info(&args.address, &v, &held_params, args.only_show_asset_ids);
+    crate::algod_rest::eprint_raw(&errors);
     print!("{report}");
     if has_error {
         ExitCode::from(1)
@@ -2857,13 +2929,14 @@ fn held_asset_params(
     for h in held_asset_entries(v) {
         let aid = h.get("asset-id").and_then(|x| x.as_u64()).unwrap_or(0);
         let fetched = match endpoint {
-            Some(ep) => match fetch_asset_params_with_status(rt, ep, aid) {
-                Ok((404, _)) => AssetFetch::Missing,
-                Ok((_, Some(p))) => AssetFetch::Found(p),
-                Ok((_, None)) => AssetFetch::Error,
-                Err(_) => AssetFetch::Error,
+            Some(ep) => match crate::algod_rest::asset_information(rt, ep, aid) {
+                Ok(a) => AssetFetch::Found(a["params"].clone()),
+                Err(e) if crate::algod_rest::http_error_status(&e) == Some(404) => {
+                    AssetFetch::Missing
+                }
+                Err(e) => AssetFetch::Error(e),
             },
-            None => AssetFetch::Error,
+            None => AssetFetch::Error(String::new()),
         };
         held_params.insert(aid, fetched);
     }
@@ -2902,39 +2975,6 @@ fn fetch_account_json(
     })
 }
 
-/// `(status_code, asset_params)` from `GET /v2/assets/{aid}`. Returns
-/// Ok((status, None)) when the response is non-2xx or parse fails (the
-/// status lets the caller distinguish 404 "deleted/unknown" from other
-/// failures). Async fetch wrapped in a sync helper.
-fn fetch_asset_params_with_status(
-    rt: &tokio::runtime::Runtime,
-    endpoint: &(String, String),
-    asset_id: u64,
-) -> Result<(u16, Option<serde_json::Value>), String> {
-    let url = format!(
-        "{}/v2/assets/{}",
-        endpoint.0.trim_end_matches('/'),
-        asset_id
-    );
-    rt.block_on(async {
-        let http = reqwest::Client::new();
-        let resp = http
-            .get(&url)
-            .header("X-Algo-API-Token", &endpoint.1)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let status = resp.status();
-        let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-        if !status.is_success() {
-            return Ok((status.as_u16(), None));
-        }
-        let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        let params = v.get("params").cloned();
-        Ok((status.as_u16(), params))
-    })
-}
-
 // `fetch_asset_params` (single-shot, non-status-aware) was used by the
 // earlier non-paginated assetdetails path. The paginated endpoint
 // surfaces asset-params inline, so the helper has been removed.
@@ -2943,7 +2983,8 @@ fn fetch_asset_params_with_status(
 enum AssetFetch {
     Found(serde_json::Value),
     Missing, // 404 → `<deleted/unknown asset>`
-    Error,   // anything else → `error` + non-zero exit
+    /// anything else → `error` + non-zero exit: go's error text
+    Error(String),
 }
 
 // ---- formatters (pure for unit-testability) ------------------------------
@@ -2951,10 +2992,12 @@ enum AssetFetch {
 /// Render `account info` output. Returns `(report, errors, has_error)`
 /// — `report` to stdout, `errors` to stderr, `has_error` ⇒ exit 1.
 fn format_info(
+    address: &str,
     v: &serde_json::Value,
     held_params: &std::collections::HashMap<u64, AssetFetch>,
     only_show_asset_ids: bool,
 ) -> (String, String, bool) {
+    use crate::formatting::asset_decimals_fmt;
     use std::fmt::Write as _;
     let mut report = String::new();
     let mut errors = String::new();
@@ -2999,11 +3042,11 @@ fn format_info(
         let name = params
             .and_then(|p| p.get("name"))
             .and_then(|n| n.as_str())
-            .unwrap_or("<unnamed>");
+            .map_or_else(|| "<unnamed>".to_string(), crate::formatting::printable);
         let units = params
             .and_then(|p| p.get("unit-name"))
             .and_then(|n| n.as_str())
-            .unwrap_or("units");
+            .map_or_else(|| "units".to_string(), crate::formatting::printable);
         let total = params
             .and_then(|p| p.get("total"))
             .and_then(|n| n.as_u64())
@@ -3011,13 +3054,12 @@ fn format_info(
         let decimals = params
             .and_then(|p| p.get("decimals"))
             .and_then(|n| n.as_u64())
-            .unwrap_or(0) as u32;
+            .unwrap_or(0);
         let total_fmt = asset_decimals_fmt(total, decimals);
         let url = params
             .and_then(|p| p.get("url"))
             .and_then(|n| n.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| format!(", {s}"))
+            .map(|s| format!(", {}", crate::formatting::printable(s)))
             .unwrap_or_default();
         let _ = writeln!(report, "\tID {id}, {name}, supply {total_fmt} {units}{url}");
     }
@@ -3036,17 +3078,17 @@ fn format_info(
         }
         match held_params.get(&aid) {
             Some(AssetFetch::Found(params)) => {
-                let decimals = params.get("decimals").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
+                let decimals = params.get("decimals").and_then(|n| n.as_u64()).unwrap_or(0);
                 let amount = h.get("amount").and_then(|n| n.as_u64()).unwrap_or(0);
                 let amount_fmt = asset_decimals_fmt(amount, decimals);
                 let name = params
                     .get("name")
                     .and_then(|n| n.as_str())
-                    .unwrap_or("<unnamed>");
+                    .map_or_else(|| "<unnamed>".to_string(), crate::formatting::printable);
                 let unit = params
                     .get("unit-name")
                     .and_then(|n| n.as_str())
-                    .unwrap_or("units");
+                    .map_or_else(|| "units".to_string(), crate::formatting::printable);
                 let frozen = if h
                     .get("is-frozen")
                     .and_then(|b| b.as_bool())
@@ -3064,11 +3106,15 @@ fn format_info(
             Some(AssetFetch::Missing) => {
                 let _ = writeln!(report, "\tID {aid}, <deleted/unknown asset>");
             }
-            Some(AssetFetch::Error) | None => {
+            Some(AssetFetch::Error(e)) => {
                 let _ = writeln!(
                     errors,
-                    "Error: Unable to retrieve asset information for asset {aid}"
+                    "Error: Unable to retrieve asset information for asset {aid} referred to by account {address}: {e}"
                 );
+                let _ = writeln!(report, "\tID {aid}, error");
+                has_error = true;
+            }
+            None => {
                 let _ = writeln!(report, "\tID {aid}, error");
                 has_error = true;
             }
@@ -3163,90 +3209,10 @@ fn count_kv_types(kv: Option<&serde_json::Value>) -> (u64, u64) {
     (uints, bytes)
 }
 
-/// `assetDecimalsFmt(value, decimals)` — Go's `basics.AssetAmount.Fmt`
-/// at account.go:413-?. Renders `12345` with decimals=3 as `12.345`.
-fn asset_decimals_fmt(value: u64, decimals: u32) -> String {
-    if decimals == 0 {
-        return value.to_string();
-    }
-    let s = format!("{value:0>width$}", width = (decimals as usize) + 1);
-    let split = s.len() - decimals as usize;
-    let (whole, frac) = s.split_at(split);
-    format!("{whole}.{frac}")
-}
-
-/// `printAccountAssetsInformation` (account.go:797+). Pure, returns
-/// the rendered string. Each `(holding, params_opt)` pair is one
-/// asset block. `next_token` is rendered between `Round:` and
-/// `Assets:` when non-empty (Go's
-/// `NextToken (to retrieve more account assets): <token>` line).
-fn format_assetdetails(
-    address: &str,
-    round: u64,
-    next_token: Option<&str>,
-    assets: &[(serde_json::Value, Option<serde_json::Value>)],
-) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    let _ = writeln!(out, "Account: {address}");
-    let _ = writeln!(out, "Round: {round}");
-    if let Some(t) = next_token.filter(|s| !s.is_empty()) {
-        let _ = writeln!(out, "NextToken (to retrieve more account assets): {t}");
-    }
-    let _ = writeln!(out, "Assets:");
-    for (holding, params) in assets {
-        let aid = holding
-            .get("asset-id")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0);
-        let _ = writeln!(out, "  Asset ID: {aid}");
-        match params {
-            Some(p) => {
-                let amount = holding.get("amount").and_then(|x| x.as_u64()).unwrap_or(0);
-                let decimals = p.get("decimals").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-                let amount_fmt = asset_decimals_fmt(amount, decimals);
-                let _ = writeln!(out, "    Amount: {amount_fmt}");
-                let frozen = holding
-                    .get("is-frozen")
-                    .and_then(|b| b.as_bool())
-                    .unwrap_or(false);
-                let _ = writeln!(out, "    IsFrozen: {frozen}");
-                let _ = writeln!(out, "  Asset Params:");
-                let creator = p.get("creator").and_then(|x| x.as_str()).unwrap_or("");
-                let _ = writeln!(out, "    Creator: {creator}");
-                let name = p
-                    .get("name")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("<unnamed>");
-                let _ = writeln!(out, "    Name: {name}");
-                let unit_name = p
-                    .get("unit-name")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("units");
-                let _ = writeln!(out, "    Units: {unit_name}");
-                let total = p.get("total").and_then(|x| x.as_u64()).unwrap_or(0);
-                let _ = writeln!(out, "    Total: {total}");
-                let _ = writeln!(out, "    Decimals: {decimals}");
-                let url = p.get("url").and_then(|x| x.as_str()).unwrap_or("");
-                let _ = writeln!(out, "    URL: {url}");
-            }
-            None => {
-                let amount = holding.get("amount").and_then(|x| x.as_u64()).unwrap_or(0);
-                let _ = writeln!(out, "    Amount (without formatting): {amount}");
-                let frozen = holding
-                    .get("is-frozen")
-                    .and_then(|b| b.as_bool())
-                    .unwrap_or(false);
-                let _ = writeln!(out, "    IsFrozen: {frozen}");
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formatting::asset_decimals_fmt;
 
     #[test]
     fn build_algod_endpoint_prefers_admin_token() {
@@ -3420,7 +3386,8 @@ mod tests {
             "round": 1,
             "status": "Offline",
         });
-        let (report, errors, has_error) = format_info(&v, &std::collections::HashMap::new(), false);
+        let (report, errors, has_error) =
+            format_info("A", &v, &std::collections::HashMap::new(), false);
         assert_eq!(errors, "");
         assert!(!has_error);
         // Every section header present with the <none> placeholder.
@@ -3456,8 +3423,8 @@ mod tests {
             "reward-base": 0,
         });
         let none = std::collections::HashMap::new();
-        let want = format_info(&absent, &none, false);
-        let got = format_info(&empty, &none, false);
+        let want = format_info("A", &absent, &none, false);
+        let got = format_info("A", &empty, &none, false);
         assert_eq!(got, want);
         assert!(
             got.0.contains(
@@ -3524,7 +3491,7 @@ mod tests {
                 "decimals": 2, "name": "ACME", "unit-name": "AC",
             })),
         );
-        let (report, errors, has_error) = format_info(&v, &held, false);
+        let (report, errors, has_error) = format_info("A", &v, &held, false);
         assert_eq!(errors, "");
         assert!(!has_error);
         assert!(
@@ -3556,7 +3523,7 @@ mod tests {
         });
         let mut held = std::collections::HashMap::new();
         held.insert(99u64, AssetFetch::Missing);
-        let (report, _errors, has_error) = format_info(&v, &held, false);
+        let (report, _errors, has_error) = format_info("A", &v, &held, false);
         assert!(!has_error, "404 must not flag has_error");
         assert!(report.contains("\tID 99, <deleted/unknown asset>\n"));
     }
@@ -3568,38 +3535,11 @@ mod tests {
             "assets": [{"asset-id": 99, "amount": 0, "is-frozen": false}],
         });
         let mut held = std::collections::HashMap::new();
-        held.insert(99u64, AssetFetch::Error);
-        let (report, errors, has_error) = format_info(&v, &held, false);
+        held.insert(99u64, AssetFetch::Error("boom".to_string()));
+        let (report, errors, has_error) = format_info("A", &v, &held, false);
         assert!(has_error, "non-404 fetch error must set has_error");
         assert!(report.contains("\tID 99, error\n"));
         assert!(errors.contains("Error: Unable to retrieve asset information for asset 99"));
-    }
-
-    #[test]
-    fn format_assetdetails_renders_one_asset_block() {
-        let holding = serde_json::json!({"asset-id": 42, "amount": 250, "is-frozen": false});
-        let params = serde_json::json!({
-            "creator": "CREATOR", "name": "ACME", "unit-name": "AC",
-            "total": 1000, "decimals": 2, "url": "https://acme",
-        });
-        let s = format_assetdetails("ADDR", 99, None, &[(holding, Some(params))]);
-        // Pin every header + value Go emits, in order.
-        let expected = "\
-Account: ADDR
-Round: 99
-Assets:
-  Asset ID: 42
-    Amount: 2.50
-    IsFrozen: false
-  Asset Params:
-    Creator: CREATOR
-    Name: ACME
-    Units: AC
-    Total: 1000
-    Decimals: 2
-    URL: https://acme
-";
-        assert_eq!(s, expected, "assetdetails block diverges from Go format");
     }
 
     // ---- TASK-239 (B7) unit tests --------------------------------------
@@ -3644,16 +3584,5 @@ Assets:
         rmp::encode::write_bin(&mut buf, &[0u8; 32]).unwrap();
         let err = parse_signature_secrets_blob(&buf).unwrap_err();
         assert!(err.contains("SK has wrong length"), "got {err}");
-    }
-
-    #[test]
-    fn format_assetdetails_without_params_uses_unformatted_amount() {
-        let holding = serde_json::json!({"asset-id": 5, "amount": 17, "is-frozen": true});
-        let s = format_assetdetails("ADDR", 1, None, &[(holding, None)]);
-        assert!(
-            s.contains("    Amount (without formatting): 17\n"),
-            "no-params branch must render `Amount (without formatting):`; got {s}",
-        );
-        assert!(s.contains("    IsFrozen: true\n"));
     }
 }

@@ -201,15 +201,14 @@ fn account_assetdetails_prints_per_asset_block() {
     assert!(out.status.success(), "assetdetails: {stdout:?}");
     for line in [
         &format!("Account: {addr}"),
-        "Round: 5",
         "Assets:",
         "  Asset ID: 100",
         "    Amount: 2.50",
         "    IsFrozen: false",
         "  Asset Params:",
         "    Creator: CR",
-        "    Name: ACME",
-        "    Units: AC",
+        "    Asset name: ACME",
+        "    Unit name: AC",
         "    Total: 1000",
         "    Decimals: 2",
         "    URL: https://acme",
@@ -422,9 +421,9 @@ fn account_assetdetails_paginates_with_limit_and_next() {
     let _ = jh.join();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "paginated assetdetails: {stdout:?}");
-    assert!(stdout.contains("Round: 9"));
+    // go: `reportInfof("NextToken: %s", token)` after the one page
     assert!(
-        stdout.contains("NextToken (to retrieve more account assets): tok3"),
+        stdout.ends_with("NextToken: tok3\n"),
         "stdout must surface the next-token line; got {stdout:?}",
     );
 }

@@ -33,7 +33,6 @@ use std::process::ExitCode;
 use algo_codec::{
     canonical_encode_signed_transaction, canonical_encode_transaction, decode_signed_txn_stream,
 };
-use algo_error::AlgoError;
 use algo_rest_client::AlgodClient;
 use algo_types::{Address, AssetParams, Round, SignedTransaction, Transaction, TxnType};
 use base64::Engine;
@@ -217,6 +216,89 @@ fn submit_single(
         Ok(Some(info))
     })?;
     Ok(info)
+}
+
+/// go's `lookupAssetID` through go's REST client (issue #2476): the
+/// asset id of `--assetid`, else the creator's created asset whose unit
+/// name is `--unitname` (`client.AccountInformation(creator, true)`).
+fn lookup_asset_id_rest(
+    endpoint: &crate::algod_rest::Endpoint,
+    rt: &tokio::runtime::Runtime,
+    creator_resolved: &str,
+    lookup: &AssetLookupArgs,
+) -> Result<u64, String> {
+    let unit_specified = lookup.unit_name.is_some();
+    if lookup.asset_id != 0 && unit_specified {
+        return Err(
+            "Only one of [--assetid] or [--unitname and --creator] should be specified".to_string(),
+        );
+    }
+    if lookup.asset_id != 0 {
+        return Ok(lookup.asset_id);
+    }
+    if !unit_specified {
+        return Err(
+            "Missing required parameter [--assetid] or [--unitname and --creator] must \
+                     be specified"
+                .to_string(),
+        );
+    }
+    if creator_resolved.is_empty() {
+        return Err(
+            "Asset creator must be specified if finding asset by name. Use the asset's \
+                     integer identifier [--assetid] if the creator account is unknown."
+                .to_string(),
+        );
+    }
+    let unit_name = lookup.unit_name.as_deref().unwrap_or("");
+    let info = crate::algod_rest::get_json(
+        rt,
+        endpoint,
+        &format!("/v2/accounts/{creator_resolved}"),
+        &[("exclude", "none"), ("format", "json")],
+        &crate::go_codec_json::ACCOUNT,
+    )
+    .map_err(|e| crate::formatting::report_error_text(&format!("Error processing command: {e}")))?;
+    let created = info["created-assets"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut asset_id = 0;
+    let mut nmatch = 0;
+    for asset in created {
+        match asset["params"]["unit-name"].as_str() {
+            None if unit_name.is_empty() => {}
+            Some(u) if u == unit_name => {}
+            _ => continue,
+        }
+        asset_id = asset["index"].as_u64().unwrap_or(0);
+        nmatch += 1;
+    }
+    if nmatch == 0 {
+        // go prints `*response.CreatedAssets` with `%v`: `{<index>
+        // <params pointer>}` each, the pointer an address only go knows
+        let assets: Vec<String> = created
+            .iter()
+            .map(|a| {
+                let ptr = if a["params"].is_object() {
+                    "0xc000000000"
+                } else {
+                    "<nil>"
+                };
+                format!("{{{} {ptr}}}", a["index"].as_u64().unwrap_or(0))
+            })
+            .collect();
+        let assets = format!("[{}]", assets.join(" "));
+        return Err(crate::formatting::report_error_text(&format!(
+            "No matches for asset unit name {unit_name} in creator {creator_resolved}; assets {assets}"
+        )));
+    }
+    if nmatch > 1 {
+        return Err(crate::formatting::report_error_text(&format!(
+            "Multiple matches for asset unit name {unit_name} in creator {creator_resolved}"
+        )));
+    }
+    Ok(asset_id)
 }
 
 /// Resolve `--assetid`/`--unitname`+`--creator` into an asset id. Mirrors
@@ -953,20 +1035,6 @@ fn run_freeze_inner(args: FreezeArgs, wallet: Option<String>) -> Result<ExitCode
 // asset info
 // ---------------------------------------------------------------------------
 
-/// `assetDecimalsFmt`: format `amount` with `decimals` digits after the
-/// decimal point (Go's `asset.go:668-677`).
-fn asset_decimals_fmt(amount: u64, decimals: u64) -> String {
-    if decimals == 0 {
-        return amount.to_string();
-    }
-    let pow = 10u64.pow(decimals as u32);
-    format!(
-        "{}.{:0width$}",
-        amount / pow,
-        amount % pow,
-        width = decimals as usize
-    )
-}
 
 /// `asset info [--assetid id | --unitname s] [--creator addr]`.
 ///
@@ -982,93 +1050,105 @@ fn run_info_inner(args: InfoArgs) -> Result<ExitCode, String> {
     let accounts = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
     let creator_resolved = resolve_name(&accounts, &args.creator);
 
-    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    let endpoint = crate::goal_client::ensure_algod_endpoint(
+        &data_dir_path,
+        crate::goal_client::ClientType::Algod,
+    )?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("Error processing command: {e}"))?;
-    let asset_id = lookup_asset_id(&algod, &rt, &creator_resolved, &args.lookup)?;
+    let asset_id = lookup_asset_id_rest(&endpoint, &rt, &creator_resolved, &args.lookup)?;
+    let request_fail =
+        |e: String| crate::formatting::report_error_text(&format!("Error processing command: {e}"));
 
-    let asset = rt
-        .block_on(algod.get_asset(asset_id))
-        .map_err(|e| format!("Error processing command: {e}"))?;
-
-    let (reserve_empty, reserve_addr) = match &asset.params.reserve {
-        Some(r) if !r.is_empty() => (false, r.clone()),
-        _ => (true, asset.params.creator.clone()),
+    // go: `client.AssetInformation(assetID)`
+    let asset =
+        crate::algod_rest::asset_information(&rt, &endpoint, asset_id).map_err(request_fail)?;
+    let params = &asset["params"];
+    let s = |v: &serde_json::Value| v.as_str().unwrap_or("").to_string();
+    let creator = s(&params["creator"]);
+    let reserve_empty = s(&params["reserve"]).is_empty();
+    let reserve = if reserve_empty {
+        creator.clone()
+    } else {
+        s(&params["reserve"])
     };
 
+    // The reserve may not hold the asset: a 404 is a zero balance.
     let mut reserve_amount = 0u64;
-    match rt.block_on(algod.get_account_asset(&reserve_addr, asset_id)) {
-        Ok(holding) => {
-            if let Some(h) = holding.asset_holding {
-                reserve_amount = h.amount;
-            }
-        }
-        Err(AlgoError::NotFound(_)) => {}
-        Err(e) => return Err(format!("Error processing command: {e}")),
+    match crate::algod_rest::get_json(
+        &rt,
+        &endpoint,
+        &format!("/v2/accounts/{reserve}/assets/{asset_id}"),
+        &[],
+        &crate::go_codec_json::ACCOUNT_ASSET,
+    ) {
+        Ok(r) => reserve_amount = r["asset-holding"]["amount"].as_u64().unwrap_or(0),
+        Err(e) if crate::algod_rest::http_error_status(&e) == Some(404) => {}
+        Err(e) => return Err(request_fail(e)),
     }
 
-    println!("Asset ID:         {asset_id}");
-    println!("Creator:          {}", asset.params.creator);
-    println!(
-        "Asset name: {}",
-        asset.params.name.as_deref().unwrap_or("<unnamed>")
-    );
-    let units = asset
-        .params
-        .unit_name
-        .clone()
-        .unwrap_or_else(|| "units".to_string());
-    println!("Unit name:        {units}");
-    println!(
+    use crate::formatting::{asset_decimals_fmt, printable};
+    use std::fmt::Write as _;
+    let total = params["total"].as_u64().unwrap_or(0);
+    let decimals = params["decimals"].as_u64().unwrap_or(0);
+    let name = params["name"]
+        .as_str()
+        .map_or_else(|| "<unnamed>".to_string(), printable);
+    let units = params["unit-name"]
+        .as_str()
+        .map_or_else(|| "units".to_string(), printable);
+    let mut out = String::new();
+    let _ = writeln!(out, "Asset ID:         {asset_id}");
+    let _ = writeln!(out, "Creator:          {creator}");
+    let _ = writeln!(out, "Asset name: {name}");
+    // go: `reportInfof("Unit name:        %s", units)`
+    out.push_str(&crate::formatting::report_info_text(&format!(
+        "Unit name:        {units}"
+    )));
+    let _ = writeln!(
+        out,
         "Maximum issue:    {} {units}",
-        asset_decimals_fmt(asset.params.total, asset.params.decimals)
+        asset_decimals_fmt(total, decimals)
     );
-    println!(
+    let _ = writeln!(
+        out,
         "Reserve amount:   {} {units}",
-        asset_decimals_fmt(reserve_amount, asset.params.decimals)
+        asset_decimals_fmt(reserve_amount, decimals)
     );
-    println!(
+    let _ = writeln!(
+        out,
         "Issued:           {} {units}",
-        asset_decimals_fmt(
-            asset.params.total.saturating_sub(reserve_amount),
-            asset.params.decimals
-        )
+        asset_decimals_fmt(total.wrapping_sub(reserve_amount), decimals)
     );
-    println!("Decimals:         {}", asset.params.decimals);
-    println!("Default frozen:   {}", asset.params.default_frozen);
-    println!("URL: {}", asset.params.url.clone().unwrap_or_default());
-    println!(
-        "Manager address:  {}",
-        asset.params.manager.clone().unwrap_or_default()
+    let _ = writeln!(out, "Decimals:         {decimals}");
+    let _ = writeln!(
+        out,
+        "Default frozen:   {}",
+        params["default-frozen"] == true
     );
+    let url = params["url"].as_str().map(printable).unwrap_or_default();
+    let _ = writeln!(out, "URL: {url}");
+    let _ = writeln!(out, "Manager address:  {}", s(&params["manager"]));
     if reserve_empty {
-        println!(
-            "Reserve address:  {} (Empty. Defaulting to creator)",
-            asset.params.reserve.clone().unwrap_or_default()
+        let _ = writeln!(
+            out,
+            "Reserve address:  {reserve} (Empty. Defaulting to creator)"
         );
     } else {
-        println!(
-            "Reserve address:  {}",
-            asset.params.reserve.clone().unwrap_or_default()
-        );
+        let _ = writeln!(out, "Reserve address:  {reserve}");
     }
-    println!(
-        "Freeze address:   {}",
-        asset.params.freeze.clone().unwrap_or_default()
-    );
-    println!(
-        "Clawback address: {}",
-        asset.params.clawback.clone().unwrap_or_default()
-    );
-
+    let _ = writeln!(out, "Freeze address:   {}", s(&params["freeze"]));
+    let _ = writeln!(out, "Clawback address: {}", s(&params["clawback"]));
+    print!("{out}");
     Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formatting::asset_decimals_fmt;
     use crate::groups::asset::AssetLookupArgs;
 
     // ---- asset_decimals_fmt -------------------------------------------
