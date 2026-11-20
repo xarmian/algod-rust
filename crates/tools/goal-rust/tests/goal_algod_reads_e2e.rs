@@ -40,7 +40,8 @@
 //!
 //! `fixtures/goal_algod_reads.jsonl` holds what go v5.0.5-stable's `goal`
 //! printed (exit code, stdout, stderr, the data dir masked; a stdout longer
-//! than 8 KiB as its SHA-256) and the files it left in the data dir. Each row
+//! than 8 KiB as its SHA-256, an output that is not valid UTF-8 as
+//! `base64:<bytes>`) and the files it left in the data dir. Each row
 //! runs in a fresh data dir with its own mock algod; the account rows first
 //! create two unencrypted wallets and import keys with the same `goal` (and
 //! the `kmd` next to it, go's for go's goal, `kmd-rust` for goal-rust).
@@ -1099,6 +1100,59 @@ fn cases() -> Vec<Case> {
     }
     v.extend(request_error_cases());
     v.extend(info_cases());
+    v.extend(followup_cases());
+    v
+}
+
+/// Issue #2485: `node status` stops at the first failing data dir (go's
+/// `getStatus` → `reportErrorf`), and msgp's `Unknown field` names a key
+/// that is not valid UTF-8 as go prints it.
+fn followup_cases() -> Vec<Case> {
+    let mut v = vec![case(
+        "node status two data dirs",
+        &["node", "status", "-d", "<DD>"],
+    )];
+    for (name, prefix) in [
+        ("node status failing two data dirs", "/v2/status"),
+        ("node status failing versions two data dirs", "/versions"),
+    ] {
+        let mut c = case(name, &["node", "status", "-d", "<DD>"]);
+        c.answers = vec![Answer {
+            prefix,
+            status: 500,
+            body: br#"{"message":"status is down"}"#.to_vec(),
+        }];
+        v.push(c);
+    }
+    let mut c = case(
+        "node status refused two data dirs",
+        &["node", "status", "-d", "<DD>"],
+    );
+    c.refused = true;
+    v.push(c);
+    for (name, body) in [
+        // a truncated 4-byte sequence: go's `range` reads 3 runes of it
+        (
+            "account dump unknown field truncated utf-8",
+            vec![0x81, 0xa3, 0xf0, 0x9f, 0x98, 0x01],
+        ),
+        (
+            "account dump unknown field invalid utf-8 bin key",
+            vec![0x81, 0xc4, 0x04, b'a', 0xe2, 0x82, b'b', 0x01],
+        ),
+        (
+            "account dump unknown field invalid utf-8 byte",
+            vec![0x81, 0xa2, 0xff, b'z', 0x01],
+        ),
+    ] {
+        let mut c = case(name, &["account", "dump", "-a", "<A1>"]);
+        c.answers = vec![Answer {
+            prefix: "/v2/accounts/",
+            status: 200,
+            body,
+        }];
+        v.push(c);
+    }
     v
 }
 
@@ -1528,8 +1582,13 @@ fn row(goal: &Path, c: &Case) -> serde_json::Value {
     let files = files(&dd);
     stop_kmd(&dd);
     let uname = uname();
+    // An output that is not valid UTF-8 is kept byte for byte: masked through
+    // the lossless `raw_text` form, then written as `base64:<bytes>`.
     let mask = |b: &[u8]| {
-        let mut t = text(b);
+        let mut t = match std::str::from_utf8(b) {
+            Ok(s) => s.to_string(),
+            Err(_) => algo_types::raw_text::encode(b).into_owned(),
+        };
         if !uname.is_empty() {
             t = t.replace(
                 &uname, "<UNAME>
@@ -1540,7 +1599,13 @@ fn row(goal: &Path, c: &Case) -> serde_json::Value {
         for i in 1..=5u8 {
             t = t.replace(&key(i).1, &format!("<A{i}>"));
         }
-        t.replace(&format!("127.0.0.1:{port}"), "<ALGOD>")
+        let t = t.replace(&format!("127.0.0.1:{port}"), "<ALGOD>");
+        if std::str::from_utf8(b).is_ok() {
+            t
+        } else {
+            let bytes = algo_types::raw_text::decode(&t);
+            format!("base64:{}", data_encoding::BASE64.encode(&bytes))
+        }
     };
     let stdout = if ran.stdout.len() > MAX_INLINE {
         format!(
