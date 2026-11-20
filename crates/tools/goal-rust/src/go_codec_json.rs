@@ -308,6 +308,19 @@ pub const BOXES: Ty = Ty::Struct(&[
     Field("round", Ty::Ptr(&ROUND)),
 ]);
 
+/// `libgoal.PendingTransactions` (`GET /v2/transactions/pending?format=msgpack`,
+/// go-codec's msgpack decode: its `json` tags name the keys).
+pub const PENDING_TRANSACTIONS: Ty = Ty::Struct(&[
+    Field(
+        "top-transactions",
+        Ty::Slice(
+            &algo_rest_api::simulate_request_schema::TRANSACTIONS_SIGNEDTXN,
+            "[]transactions.SignedTxn",
+        ),
+    ),
+    Field("total-transactions", Ty::U64),
+]);
+
 /// `model.PostTransactionsResponse` (`POST /v2/transactions`).
 pub const POST_TRANSACTIONS: Ty = Ty::Struct(&[Field("txId", Ty::Str)]);
 

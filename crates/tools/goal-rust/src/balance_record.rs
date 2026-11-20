@@ -1123,6 +1123,49 @@ fn decode_account_data(msgpack: &[u8]) -> Result<AccountData, String> {
     Ok(z)
 }
 
+/// `v2.AccountApplicationModel` (`daemon/algod/api/spec/v2`): the account's
+/// resource of one application, as `RawAccountApplicationInformation`
+/// answers it.
+#[derive(Clone, Default)]
+struct AccountApplicationModel {
+    app_local_state: Option<AppLocalState>,
+    app_params: Option<AppParams>,
+}
+
+/// A `*T` field of a generated decoder: `nil` (`IsNil` + `ReadNilBytes`)
+/// clears it, anything else is decoded by `T`'s own `UnmarshalMsgWithState`
+/// into the value already there.
+fn ptr_field<T: Default>(
+    r: &mut Rd<'_>,
+    slot: &mut Option<T>,
+    ctx: &[String],
+    de: fn(&mut Rd<'_>, &mut T, &[String]) -> R<()>,
+) -> R<()> {
+    if r.0.first() == Some(&0xc0) {
+        r.0 = &r.0[1..];
+        *slot = None;
+        return Ok(());
+    }
+    de(r, slot.get_or_insert_with(T::default), ctx)
+}
+
+const ACCOUNT_APPLICATION_MODEL: &[Field<AccountApplicationModel>] = &[
+    ("app-local-state", "AppLocalState", |r, z, c| {
+        ptr_field(r, &mut z.app_local_state, c, method_app_local_state)
+    }),
+    ("app-params", "AppParams", |r, z, c| {
+        ptr_field(r, &mut z.app_params, c, method_app_params)
+    }),
+];
+
+/// go: `protocol.Decode(resp, &v2.AccountApplicationModel{})` (libgoal's
+/// `RawAccountApplicationInformation`, issue #2489): `Err` is msgp's error
+/// text.
+pub fn check_account_application_model(msgpack: &[u8]) -> Result<(), String> {
+    let mut z = AccountApplicationModel::default();
+    de_struct(&mut Rd(msgpack), &mut z, &[], ACCOUNT_APPLICATION_MODEL).map_err(|e| e.to_string())
+}
+
 // ---- the encoders ---------------------------------------------------------------
 
 /// A field of an `omitempty` struct: its codec name and value, `None` when

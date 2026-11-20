@@ -1182,20 +1182,24 @@ fn json_bytes(v: &serde_json::Value) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-/// go's `RestClient.RawAccountApplicationInformation`: the msgpack of the
-/// account's resource of the application (`format=msgpack`).
+/// go's libgoal `RawAccountApplicationInformation`: the msgpack of the
+/// account's resource of the application (`format=msgpack`), which go
+/// decodes into a `v2.AccountApplicationModel` (`protocol.Decode`: its
+/// msgp-generated decoder, whose error is returned as is).
 fn raw_account_application(
     rt: &tokio::runtime::Runtime,
     algod: &AlgodClient,
     address: &str,
     app_id: u64,
 ) -> Result<Vec<u8>, String> {
-    crate::algod_rest::get(
+    let raw = crate::algod_rest::get(
         rt,
         &endpoint(algod),
         &format!("/v2/accounts/{address}/applications/{app_id}"),
         &[("format", "msgpack")],
-    )
+    )?;
+    crate::balance_record::check_account_application_model(&raw)?;
+    Ok(raw)
 }
 
 // ---------------------------------------------------------------------------

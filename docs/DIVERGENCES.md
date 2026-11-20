@@ -151,8 +151,10 @@ so `encoding/json` falls back to the Go field names (`Sig`, `Msig`, `Txn`,
 each type's `MarshalText` / array rules. The shape is an accident of the Go
 struct layout rather than a documented format.
 
-**What algod-rust does instead.** It fetches `format=json` and prints each
-entry of `top-transactions` exactly as the REST API serves it (lowercase
+**What algod-rust does instead.** It fetches and decodes the answer as go
+does (`format=msgpack&max=N`, go-codec's msgpack decode into
+`PendingTransactions`, issue #2489), then prints each entry of
+`top-transactions` in the REST API's JSON form (`format=json`: lowercase
 canonical keys such as `txn`, `sig`, `type`), indented with the same four
 spaces. The header line (`Pending Transactions (Truncated max=N, Total in
 pool=M): `) and the `None` line for an empty pool are byte-identical to go.
@@ -168,8 +170,9 @@ stable JSON form that other tooling (the SDKs, `goal clerk inspect`) uses.
 
 **How parity is proven.** Not applicable to the transaction bodies (that is
 the divergence); `format_pending_txns` has unit tests for the header, the
-empty-pool text and the indentation, and `node_ops_e2e.rs` runs the command
-against a mock node.
+empty-pool text and the indentation, `node_ops_e2e.rs` runs the command
+against a mock node, and `goal_algod_reads_e2e.rs` holds go's output for an
+empty pool and every failure of the request and of the decode.
 
 **How to switch back.** There is no switch; the command line is unchanged.
 

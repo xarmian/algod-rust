@@ -14,6 +14,9 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 algo-rest-client = { workspace = true }
+algo-rest-api = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
+rustls-platform-verifier = "0.7"
 algo-kmd-client = { workspace = true }
 algo-kmd-api-types = { workspace = true }
 algo-txn-pipeline = { workspace = true }

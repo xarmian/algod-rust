@@ -63,11 +63,18 @@ where
             let (code, body) = route(&line, n);
             n += 1;
             let reason = if code == 200 { "OK" } else { "Error" };
-            let resp = format!(
-                "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            // a body `hex:<bytes>` is sent as those bytes (msgpack)
+            let body = match body.strip_prefix("hex:") {
+                Some(h) => hex::decode(h).expect("hex body"),
+                None => body.into_bytes(),
+            };
+            let mut resp = format!(
+                "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
-            );
-            let _ = stream.write_all(resp.as_bytes());
+            )
+            .into_bytes();
+            resp.extend_from_slice(&body);
+            let _ = stream.write_all(&resp);
             let _ = stream.flush();
         }
     });
@@ -179,10 +186,15 @@ fn catchup_reports_an_unreachable_node_like_go() {
 }
 
 #[test]
-fn pendingtxns_asks_for_json_with_the_cap_and_prints_go_s_header() {
-    let (port, seen) = mock(|_, _| {
-        (200, r#"{"top-transactions": [], "total-transactions": 0}"#.to_string())
-    });
+fn pendingtxns_asks_for_msgpack_with_the_cap_and_prints_go_s_header() {
+    // `{"top-transactions": [], "total-transactions": 0}` in msgpack
+    let mut pool = vec![0x82, 0xb0];
+    pool.extend_from_slice(b"top-transactions");
+    pool.extend_from_slice(&[0x90, 0xb2]);
+    pool.extend_from_slice(b"total-transactions");
+    pool.push(0x00);
+    let body = format!("hex:{}", hex::encode(pool));
+    let (port, seen) = mock(move |_, _| (200, body.clone()));
     let dir = data_dir(port);
     let out = goal(dir.path(), &["pendingtxns", "-m", "3"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -192,7 +204,7 @@ fn pendingtxns_asks_for_json_with_the_cap_and_prints_go_s_header() {
     );
     assert_eq!(
         seen.lock().unwrap().clone(),
-        vec!["GET /v2/transactions/pending?max=3&format=json HTTP/1.1".to_string()]
+        vec!["GET /v2/transactions/pending?format=msgpack&max=3 HTTP/1.1".to_string()]
     );
 }
 

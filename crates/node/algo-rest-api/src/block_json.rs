@@ -418,7 +418,9 @@ fn to_json_value(
 
 /// Render a msgpack `SignedTxn` tree as go's JSON form of `transactions.SignedTxn`:
 /// only `SignedTxn`'s own keys are kept, bytes are rendered by [`to_json_value`].
-fn signed_txn_tree_to_json(tree: &rmpv::Value) -> serde_json::Value {
+/// Public for `goal-rust node pendingtxns`, which prints each pending
+/// transaction in this form (DIV-002).
+pub fn signed_txn_tree_to_json(tree: &rmpv::Value) -> serde_json::Value {
     match tree {
         rmpv::Value::Map(entries) => {
             let kept: Vec<(rmpv::Value, rmpv::Value)> = entries
