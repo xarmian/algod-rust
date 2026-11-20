@@ -441,9 +441,8 @@ impl InnerTxnBuilder {
             // Note
             5 => {
                 if let TealValue::Bytes(b) = value {
-                    // Uses the "effective" helper for the same reason as
-                    // ApplicationArgs above: `max_absolute_txn_note_bytes`
-                    // is left 0 ("unset") pre-v42 (issue #1299).
+                    // The "effective" helper, as for ApplicationArgs below
+                    // (issue #1299).
                     let max = algo_validate::fee::effective_max_note_bytes(consensus);
                     if b.len() > max {
                         return Err(AlgoError::Avm {
@@ -495,13 +494,10 @@ impl InnerTxnBuilder {
                 };
                 let existing = self.array_fields.get(&26).map(Vec::as_slice).unwrap_or(&[]);
                 let total = array_bytes_len(existing) + b.len();
-                // `max_absolute_total_arg_len` is left 0 ("unset") for
-                // protocol versions at/before v41 -- use the "effective"
-                // helper (falls back to the soft cap `max_app_total_arg_len`
-                // in that case), matching go's `checkSetMax` clamp at
-                // config-load time (`config/consensus.go`). Using the raw
-                // field directly would reject every non-empty
-                // ApplicationArgs value pre-v42 (issue #1299).
+                // The "effective" helper: `max_absolute_total_arg_len`, or
+                // the soft cap `max_app_total_arg_len` when it is 0 (before
+                // v24, or a `consensus.json` entry leaving it out; issue
+                // #1299).
                 if total > algo_validate::fee::effective_max_total_arg_len(consensus) {
                     return Err(AlgoError::Avm {
                         message: "total application args length too long".to_string(),

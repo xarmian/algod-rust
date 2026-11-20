@@ -3429,7 +3429,7 @@ fn parse_string_literal(input: &str) -> Result<Vec<u8>, String> {
 /// go's `basics.UnmarshalChecksumAddress` (data/basics/address.go:54): a
 /// base32 (unpadded) address with a 4 byte checksum, which must also be the
 /// canonical rendering.
-fn unmarshal_checksum_address(address: &str) -> Result<Vec<u8>, String> {
+pub fn unmarshal_checksum_address(address: &str) -> Result<Vec<u8>, String> {
     use sha2::{Digest, Sha512_256};
     let decoded = go_base32_decode(&raw_text::decode(address), None)
         .map_err(|_| format!("failed to decode address {address} from base 32"))?;

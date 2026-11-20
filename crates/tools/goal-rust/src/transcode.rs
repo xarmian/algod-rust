@@ -261,7 +261,7 @@ impl Decoder<'_> {
 
 /// A value after go's `toJSON`: what go-codec's JSON encoder sees.
 #[derive(Debug)]
-enum Json {
+pub(crate) enum Json {
     Nil,
     Bool(bool),
     Uint(u64),
@@ -273,6 +273,9 @@ enum Json {
     Time(i128),
     Arr(Vec<Json>),
     Map(Vec<(Json, Json)>),
+    /// A struct, or a map go-codec has already put in canonical order: the
+    /// entries in the order given (issue #2467).
+    Ordered(Vec<(Json, Json)>),
 }
 
 impl Json {
@@ -492,8 +495,9 @@ const ZERO_TIME: i128 = -62_135_596_800 * NANOS_PER_SEC;
 
 // ---- the JSON encoder -------------------------------------------------------------
 
-/// go-codec's `quoteStr` with `HTMLCharsAsIs` unset.
-fn quote(out: &mut Vec<u8>, s: &[u8]) {
+/// go-codec's `quoteStr`; `<`, `>` and `&` are escaped unless
+/// `HTMLCharsAsIs` (`html_as_is`).
+fn quote(out: &mut Vec<u8>, s: &[u8], html_as_is: bool) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     out.push(b'"');
     let mut i = 0;
@@ -507,6 +511,7 @@ fn quote(out: &mut Vec<u8>, s: &[u8]) {
                 0x08 => out.extend_from_slice(b"\\b"),
                 0x0c => out.extend_from_slice(b"\\f"),
                 b'\t' => out.extend_from_slice(b"\\t"),
+                b'<' | b'>' | b'&' if html_as_is => out.push(b),
                 b'<' | b'>' | b'&' | 0x00..=0x1f => {
                     out.extend_from_slice(b"\\u00");
                     out.push(HEX[usize::from(b >> 4)]);
@@ -549,23 +554,23 @@ fn indent(out: &mut Vec<u8>, level: usize) {
     out.resize(out.len() + 2 * level, b' ');
 }
 
-/// go-codec's JSON encoding of `v` (`Canonical`, `Indent: 2`) at nesting
-/// `level`.
-fn encode(out: &mut Vec<u8>, v: &Json, level: usize) {
+/// go-codec's JSON encoding of `v` (`Canonical`, `Indent: 2`, and
+/// `HTMLCharsAsIs` when `html`) at nesting `level`.
+fn encode(out: &mut Vec<u8>, v: &Json, level: usize, html: bool) {
     match v {
         Json::Nil => out.extend_from_slice(b"null"),
         Json::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
         Json::Uint(u) => out.extend_from_slice(u.to_string().as_bytes()),
         Json::Int(i) => out.extend_from_slice(i.to_string().as_bytes()),
         Json::Float(f) => out.extend_from_slice(json_float(*f).as_bytes()),
-        Json::Str(s) => quote(out, s),
+        Json::Str(s) => quote(out, s, html),
         Json::Bytes(b) => {
             out.push(b'"');
             out.extend_from_slice(data_encoding::BASE64.encode(b).as_bytes());
             out.push(b'"');
         }
         Json::Time(t) if *t == ZERO_TIME => out.extend_from_slice(b"null"),
-        Json::Time(t) => quote(out, rfc3339_nano(*t).as_bytes()),
+        Json::Time(t) => quote(out, rfc3339_nano(*t).as_bytes(), html),
         Json::Arr(a) => {
             out.push(b'[');
             for (i, e) in a.iter().enumerate() {
@@ -573,7 +578,7 @@ fn encode(out: &mut Vec<u8>, v: &Json, level: usize) {
                     out.push(b',');
                 }
                 indent(out, level + 1);
-                encode(out, e, level + 1);
+                encode(out, e, level + 1, html);
             }
             if !a.is_empty() {
                 indent(out, level);
@@ -586,27 +591,52 @@ fn encode(out: &mut Vec<u8>, v: &Json, level: usize) {
                 .iter()
                 .map(|(k, e)| {
                     let mut kb = Vec::new();
-                    encode(&mut kb, k, 0);
+                    encode(&mut kb, k, 0, html);
                     (kb, e)
                 })
                 .collect();
             keyed.sort_by(|a, b| a.0.cmp(&b.0));
-            out.push(b'{');
-            for (i, (k, e)) in keyed.iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
-                }
-                indent(out, level + 1);
-                out.extend_from_slice(k);
-                out.extend_from_slice(b": ");
-                encode(out, e, level + 1);
-            }
-            if !keyed.is_empty() {
-                indent(out, level);
-            }
-            out.push(b'}');
+            encode_entries(out, &keyed, level, html);
+        }
+        Json::Ordered(m) => {
+            let keyed: Vec<(Vec<u8>, &Json)> = m
+                .iter()
+                .map(|(k, e)| {
+                    let mut kb = Vec::new();
+                    encode(&mut kb, k, 0, html);
+                    (kb, e)
+                })
+                .collect();
+            encode_entries(out, &keyed, level, html);
         }
     }
+}
+
+/// The `{...}` of a map or struct whose keys are already encoded, in order.
+fn encode_entries(out: &mut Vec<u8>, keyed: &[(Vec<u8>, &Json)], level: usize, html: bool) {
+    out.push(b'{');
+    for (i, (k, e)) in keyed.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        indent(out, level + 1);
+        out.extend_from_slice(k);
+        out.extend_from_slice(b": ");
+        encode(out, e, level + 1, html);
+    }
+    if !keyed.is_empty() {
+        indent(out, level);
+    }
+    out.push(b'}');
+}
+
+/// go's `protocol.EncodeJSON` / `EncodeJSONStrict` of a value already in
+/// go-codec's shape: `protocol.JSONHandle` (`Canonical`, `Indent: 2`,
+/// `HTMLCharsAsIs`), no trailing newline.
+pub(crate) fn encode_protocol_json(v: &Json) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode(&mut out, v, 0, true);
+    out
 }
 
 /// go's `transcode.Transcode(true, base32Encoding, strictJSON, in, out)`:
@@ -642,7 +672,7 @@ fn transcode(input: &[u8], base32: bool, strict: bool) -> Result<Vec<u8>, String
             Err(Stop::Eof) => break,
             Err(Stop::Err(e)) => return Err(e),
         };
-        encode(&mut out, &to_json(v, base32, strict), 0);
+        encode(&mut out, &to_json(v, base32, strict), 0, false);
         out.push(b'\n');
     }
     Ok(out)

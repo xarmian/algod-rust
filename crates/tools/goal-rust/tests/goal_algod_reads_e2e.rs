@@ -228,6 +228,166 @@ fn account_json(addr: &str) -> Option<(u16, String)> {
     }
 }
 
+/// A msgpack unsigned integer in its shortest form.
+fn mp_u(n: u64) -> Vec<u8> {
+    match n {
+        0..=0x7f => vec![n as u8],
+        0x80..=0xff => vec![0xcc, n as u8],
+        0x100..=0xffff => [vec![0xcd], (n as u16).to_be_bytes().to_vec()].concat(),
+        0x1_0000..=0xffff_ffff => [vec![0xce], (n as u32).to_be_bytes().to_vec()].concat(),
+        _ => [vec![0xcf], n.to_be_bytes().to_vec()].concat(),
+    }
+}
+
+fn mp_map_head(n: usize) -> Vec<u8> {
+    if n < 16 {
+        vec![0x80 | n as u8]
+    } else {
+        [vec![0xde], (n as u16).to_be_bytes().to_vec()].concat()
+    }
+}
+
+/// A canonical msgpack map with string keys, sorted like go's msgp.
+fn mp_obj(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let mut sorted: Vec<&(&str, Vec<u8>)> = entries.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    let mut v = mp_map_head(entries.len());
+    for (k, e) in sorted {
+        v.extend_from_slice(&s(k));
+        v.extend_from_slice(e);
+    }
+    v
+}
+
+/// A msgpack map with integer keys.
+fn mp_imap(entries: &[(u64, Vec<u8>)]) -> Vec<u8> {
+    let mut v = mp_map_head(entries.len());
+    for (k, e) in entries {
+        v.extend_from_slice(&mp_u(*k));
+        v.extend_from_slice(e);
+    }
+    v
+}
+
+fn addr_bytes(i: u8) -> Vec<u8> {
+    algo_types::Address::from_algorand_string(&key(i).1)
+        .expect("address")
+        .0
+        .to_vec()
+}
+
+/// The all-zero address.
+const ZERO_ADDRESS: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ";
+
+/// What the mock algod answers for `GET /v2/accounts/<addr>?format=msgpack`:
+/// go's `basics.AccountData`, as algod encodes it (`protocol.CodecHandle`).
+fn account_msgpack(addr: &str) -> Option<(u16, Vec<u8>)> {
+    if addr == key(1).1 {
+        let tv_bytes = |b: &[u8]| mp_obj(&[("tb", mp_str(b)), ("tt", mp_u(1))]);
+        let tv_uint = |u: u64| mp_obj(&[("tt", mp_u(2)), ("ui", mp_u(u))]);
+        Some((
+            200,
+            mp_obj(&[
+                ("onl", mp_u(1)),
+                ("algo", mp_u(1_000_000)),
+                ("ebase", mp_u(3)),
+                ("ern", mp_u(7)),
+                ("vote", mp_bin(&[0x11; 32])),
+                ("sel", mp_bin(&[0x22; 32])),
+                ("stprf", mp_bin(&[0x33; 64])),
+                ("voteFst", mp_u(1)),
+                ("voteLst", mp_u(3_000_000)),
+                ("voteKD", mp_u(10_000)),
+                ("lpr", mp_u(4)),
+                ("lhb", mp_u(5)),
+                (
+                    "apar",
+                    mp_imap(&[
+                        (
+                            12,
+                            mp_obj(&[
+                                ("am", mp_bin(&[0x44; 32])),
+                                ("an", s("Tok<&>")),
+                                ("au", s("https://x")),
+                                ("c", mp_bin(&addr_bytes(2))),
+                                ("dc", mp_u(2)),
+                                ("df", vec![0xc3]),
+                                ("f", mp_bin(&addr_bytes(2))),
+                                ("m", mp_bin(&addr_bytes(1))),
+                                ("r", mp_bin(&addr_bytes(1))),
+                                ("t", mp_u(12345)),
+                                ("un", s("T\u{2028}K")),
+                            ]),
+                        ),
+                        (9, mp_obj(&[("t", mp_u(5))])),
+                    ]),
+                ),
+                (
+                    "asset",
+                    mp_imap(&[
+                        (10, mp_obj(&[("a", mp_u(1))])),
+                        (12, mp_obj(&[("a", mp_u(100)), ("f", vec![0xc3])])),
+                        (9, mp_obj(&[])),
+                    ]),
+                ),
+                ("spend", mp_bin(&addr_bytes(3))),
+                ("ie", vec![0xc3]),
+                (
+                    "appl",
+                    mp_imap(&[(
+                        9,
+                        mp_obj(&[
+                            ("hsch", mp_obj(&[("nbs", mp_u(1)), ("nui", mp_u(1))])),
+                            (
+                                "tkv",
+                                mp_obj(&[("k<", tv_bytes(b"v&\xff\n")), ("n", tv_uint(5))]),
+                            ),
+                        ]),
+                    )]),
+                ),
+                (
+                    "appp",
+                    mp_imap(&[
+                        (
+                            7,
+                            mp_obj(&[
+                                ("approv", mp_bin(&[6, 0x81, 1])),
+                                ("clearp", mp_bin(&[6, 0x81, 1])),
+                                ("epp", mp_u(1)),
+                                ("fba", vec![0xc3]),
+                                ("fbr", vec![0xc3]),
+                                ("gs", mp_obj(&[("g", tv_uint(1)), ("", tv_bytes(b""))])),
+                                ("gsch", mp_obj(&[("nbs", mp_u(1)), ("nui", mp_u(2))])),
+                                ("lsch", mp_obj(&[("nui", mp_u(1))])),
+                                ("ss", mp_bin(&addr_bytes(2))),
+                                ("v", mp_u(3)),
+                            ]),
+                        ),
+                        (
+                            5,
+                            mp_obj(&[("approv", mp_bin(&[2])), ("clearp", mp_bin(&[2]))]),
+                        ),
+                    ]),
+                ),
+                ("tsch", mp_obj(&[("nbs", mp_u(2)), ("nui", mp_u(3))])),
+                ("teap", mp_u(1)),
+                ("tbx", mp_u(2)),
+                ("tbxb", mp_u(64)),
+            ]),
+        ))
+    } else if addr == key(2).1 {
+        Some((200, mp_obj(&[])))
+    } else if addr == ZERO_ADDRESS {
+        Some((200, mp_obj(&[("algo", mp_u(5))])))
+    } else if addr == key(3).1 {
+        Some((200, mp_obj(&[("algo", mp_u(42)), ("onl", mp_u(2))])))
+    } else if addr == key(4).1 {
+        Some((500, b"boom <b>\n".to_vec()))
+    } else {
+        None
+    }
+}
+
 // ---- the blocks -------------------------------------------------------------
 
 fn mp_str(s: &[u8]) -> Vec<u8> {
@@ -440,6 +600,9 @@ const SUPPLY_JSON: &str = r#"{"current_round":5,"online-money":1000000,"total-mo
 
 /// `(status, content type, body)` for a request path.
 fn route(path: &str, mock: &Mock) -> (u16, &'static str, Vec<u8>) {
+    let msgpack = path
+        .split_once('?')
+        .is_some_and(|(_, q)| q.split('&').any(|kv| kv == "format=msgpack"));
     let path = path.split('?').next().unwrap_or("");
     let json = "application/json";
     if let Some(a) = mock.answers.iter().find(|a| path.starts_with(a.prefix)) {
@@ -464,6 +627,13 @@ fn route(path: &str, mock: &Mock) -> (u16, &'static str, Vec<u8>) {
                 json,
                 br#"{"message":"failed to retrieve information from the ledger"}"#.to_vec(),
             ),
+        };
+    }
+    if let Some(a) = path.strip_prefix("/v2/accounts/").filter(|_| msgpack) {
+        return match account_msgpack(a) {
+            Some((200, body)) => (200, "application/msgpack", body),
+            Some((code, body)) => (code, json, body),
+            None => (404, json, br#"{"message":"no such account"}"#.to_vec()),
         };
     }
     if let Some(a) = path.strip_prefix("/v2/accounts/") {
@@ -531,6 +701,10 @@ struct Case {
     answers: Vec<Answer>,
     /// `algod.net` names a closed port instead of the mock.
     refused: bool,
+    /// The data dir holds no `genesis.json`.
+    no_genesis: bool,
+    /// The data dir holds a `consensus.json`.
+    consensus_json: bool,
 }
 
 fn case(name: &str, args: &[&str]) -> Case {
@@ -541,6 +715,8 @@ fn case(name: &str, args: &[&str]) -> Case {
         accounts: false,
         answers: Vec::new(),
         refused: false,
+        no_genesis: false,
+        consensus_json: false,
     }
 }
 
@@ -922,7 +1098,290 @@ fn cases() -> Vec<Case> {
         v.push(c);
     }
     v.extend(request_error_cases());
+    v.extend(info_cases());
     v
+}
+
+/// `goal -v`, `license`, `protocols`, `report` (`cmd/goal/commands.go`) and
+/// `account dump` (`cmd/goal/account.go` `dumpCmd`), issue #2467.
+fn info_cases() -> Vec<Case> {
+    let mut v = vec![
+        case("-v", &["-v"]),
+        case("--version", &["--version"]),
+        case("license", &["license"]),
+        case("protocols", &["protocols"]),
+        case("report", &["report"]),
+        case("report two data dirs", &["report", "-d", "<DD>"]),
+        case("account dump", &["account", "dump", "-a", "<A1>"]),
+        case("account dump empty", &["account", "dump", "-a", "<A2>"]),
+        case(
+            "account dump offline",
+            &["account", "dump", "--address", "<A3>"],
+        ),
+        case(
+            "account dump -o",
+            &["account", "dump", "-a", "<A1>", "-o", "out.mp"],
+        ),
+        case(
+            "account dump -o empty",
+            &["account", "dump", "-a", "<A2>", "-o", "out.mp"],
+        ),
+        case(
+            "account dump -o missing dir",
+            &["account", "dump", "-a", "<A1>", "-o", "nodir/x"],
+        ),
+        case("account dump 500", &["account", "dump", "-a", "<A4>"]),
+        case("account dump not found", &["account", "dump", "-a", "<A5>"]),
+        case(
+            "account dump bad address",
+            &["account", "dump", "-a", "XYZ"],
+        ),
+        case("account dump no address", &["account", "dump"]),
+    ];
+    v.push(case(
+        "account dump zero address",
+        &["account", "dump", "-a", ZERO_ADDRESS],
+    ));
+    let mut c = case("protocols with consensus.json", &["protocols"]);
+    c.consensus_json = true;
+    v.push(c);
+    let mut c = case("report failing", &["report"]);
+    c.versions = Versions::Fail;
+    v.push(c);
+    let mut c = case("report refused", &["report"]);
+    c.refused = true;
+    v.push(c);
+    let mut c = case("report without genesis", &["report"]);
+    c.no_genesis = true;
+    v.push(c);
+    for (name, args) in [
+        (
+            "account dump refused",
+            &["account", "dump", "-a", "<A1>"][..],
+        ),
+        ("report 401", &["report"]),
+    ] {
+        let mut c = case(name, args);
+        if name.ends_with("refused") {
+            c.refused = true;
+        } else {
+            c.answers = vec![Answer {
+                prefix: "",
+                status: 401,
+                body: br#"{"message":"Invalid API Token"}"#.to_vec(),
+            }];
+        }
+        v.push(c);
+    }
+    let mut c = case("account dump 401", &["account", "dump", "-a", "<A1>"]);
+    c.answers = vec![Answer {
+        prefix: "",
+        status: 401,
+        body: br#"{"message":"Invalid API Token"}"#.to_vec(),
+    }];
+    v.push(c);
+    let mut answers: Vec<(&str, Vec<u8>)> = vec![
+        ("account dump json answer", br#"{"amount":5}"#.to_vec()),
+        (
+            "account dump unknown field",
+            vec![0x81, 0xa3, b'f', b'o', b'o', 0x01],
+        ),
+        (
+            "account dump truncated",
+            vec![0x82, 0xa3, b'o', b'n', b'l', 0x01],
+        ),
+        ("account dump empty answer", Vec::new()),
+    ];
+    answers.extend(malformed_account_data());
+    for (name, body) in answers {
+        let mut c = case(name, &["account", "dump", "-a", "<A1>"]);
+        c.answers = vec![Answer {
+            prefix: "/v2/accounts/",
+            status: 200,
+            body,
+        }];
+        v.push(c);
+    }
+    v
+}
+
+/// msgpack `basics.AccountData` answers go's msgp decoder accepts or fails
+/// in its own ways: the array form of a struct, nil, short and long fixed
+/// byte arrays, bin keys, type errors at each nesting, unknown fields in a
+/// struct decoded inline or by its own method, bounds.
+fn malformed_account_data() -> Vec<(&'static str, Vec<u8>)> {
+    let one = |k: &str, v: Vec<u8>| mp_obj(&[(k, v)]);
+    let imap1 = |v: Vec<u8>| mp_imap(&[(1, v)]);
+    let arr = |items: &[Vec<u8>]| {
+        let mut v = vec![0xdc];
+        v.extend_from_slice(&(items.len() as u16).to_be_bytes());
+        for i in items {
+            v.extend_from_slice(i);
+        }
+        v
+    };
+    let nils = |n: usize| arr(&vec![vec![0xc0]; n]);
+    let mut nested = vec![vec![0xc0]; 13];
+    // the 14th field, `Assets`: asset 3 holding `[7, true]`
+    nested.push(mp_imap(&[(3, vec![0x92, 0x07, 0xc3])]));
+    vec![
+        ("account dump string status", one("onl", s("x"))),
+        ("account dump array form", vec![0x92, 0x01, 0x05]),
+        ("account dump too many array fields", nils(23)),
+        ("account dump array form nested", arr(&nested)),
+        ("account dump nil", vec![0xc0]),
+        (
+            "account dump trailing bytes",
+            [one("algo", mp_u(9)), vec![0xc1, 0xc1]].concat(),
+        ),
+        ("account dump negative", one("algo", vec![0xff])),
+        (
+            "account dump negative int16",
+            one("ebase", vec![0xd1, 0xff, 0x00]),
+        ),
+        ("account dump status overflow", one("onl", mp_u(300))),
+        ("account dump invalid prefix", one("onl", vec![0xc1])),
+        ("account dump short vote", one("vote", mp_bin(&[1, 2, 3]))),
+        ("account dump long vote", one("vote", mp_bin(&[9; 40]))),
+        (
+            "account dump vote as array",
+            one("vote", vec![0x92, 0x01, 0x02]),
+        ),
+        ("account dump vote as string", one("vote", s("abc"))),
+        ("account dump vote as int", one("vote", mp_u(5))),
+        (
+            "account dump bin key",
+            [vec![0x81], mp_bin(b"algo"), mp_u(7)].concat(),
+        ),
+        ("account dump int key", vec![0x81, 0x01, 0x02]),
+        (
+            "account dump nested unknown field",
+            one("apar", imap1(one("zz", mp_u(1)))),
+        ),
+        (
+            "account dump inline unknown field",
+            one("asset", imap1(one("zz", mp_u(1)))),
+        ),
+        (
+            "account dump schema unknown field",
+            one("appp", imap1(one("lsch", one("zz", mp_u(1))))),
+        ),
+        (
+            "account dump total schema unknown field",
+            one("tsch", one("zz", mp_u(1))),
+        ),
+        (
+            "account dump teal value unknown field",
+            one("appl", imap1(one("tkv", one("k", one("zz", mp_u(1)))))),
+        ),
+        (
+            "account dump teal key not a string",
+            one("appl", imap1(one("tkv", mp_imap(&[(5, mp_obj(&[]))])))),
+        ),
+        (
+            "account dump teal type",
+            one("appp", imap1(one("gs", one("k", one("tt", s("x")))))),
+        ),
+        (
+            "account dump asset key",
+            one("apar", mp_obj(&[("x", mp_obj(&[]))])),
+        ),
+        ("account dump asset map", one("apar", mp_u(1))),
+        ("account dump bool", one("ie", mp_u(1))),
+        (
+            "account dump decimals overflow",
+            one("apar", imap1(one("dc", mp_u(1 << 33)))),
+        ),
+        (
+            "account dump long unit name",
+            one("apar", imap1(one("un", s("123456789")))),
+        ),
+        (
+            "account dump unit name int",
+            one("apar", imap1(one("un", mp_u(5)))),
+        ),
+        (
+            "account dump unit name bin",
+            one("apar", imap1(one("un", mp_bin(b"U<")))),
+        ),
+        (
+            "account dump manager short",
+            one("apar", imap1(one("m", vec![0xc4, 0x05, 0x01]))),
+        ),
+        (
+            "account dump program as array",
+            one("appp", imap1(one("approv", vec![0x92, 0x06, 0x81]))),
+        ),
+        (
+            "account dump program bad byte",
+            one("appp", imap1(one("approv", vec![0x91, 0xcd, 0x01, 0x00]))),
+        ),
+        (
+            "account dump holding array form",
+            one("asset", imap1(vec![0x92, 0x05, 0xc3])),
+        ),
+        (
+            "account dump holding too many fields",
+            one("asset", imap1(vec![0x93, 0x05, 0xc3, 0xc0])),
+        ),
+        (
+            "account dump holding array bad",
+            one("asset", imap1(vec![0x92, 0x05, 0x05])),
+        ),
+        (
+            "account dump app array form",
+            one(
+                "appp",
+                imap1(arr(&[
+                    mp_bin(&[1]),
+                    vec![0xc0],
+                    one("g", mp_obj(&[("ui", mp_u(4))])),
+                ])),
+            ),
+        ),
+        (
+            "account dump nil fields",
+            mp_obj(&[
+                ("algo", vec![0xc0]),
+                ("apar", vec![0xc0]),
+                ("ie", vec![0xc0]),
+                ("vote", vec![0xc0]),
+            ]),
+        ),
+        (
+            "account dump duplicate fields",
+            [
+                vec![0x84],
+                s("tsch"),
+                one("nui", mp_u(1)),
+                s("tsch"),
+                one("nbs", mp_u(2)),
+                s("vote"),
+                mp_bin(&[5; 32]),
+                s("vote"),
+                mp_bin(&[6; 2]),
+            ]
+            .concat(),
+        ),
+        (
+            "account dump truncated nested",
+            one("apar", vec![0x81, 0x01, 0x81, 0xa1, b't']),
+        ),
+        (
+            "account dump map32",
+            [vec![0xdf, 0, 0, 0, 1], s("algo"), mp_u(3)].concat(),
+        ),
+        ("account dump short map16", vec![0xde, 0x00]),
+    ]
+}
+
+/// What `uname -a` prints on this host: `goal report` prints it.
+fn uname() -> String {
+    Command::new("uname")
+        .arg("-a")
+        .output()
+        .map(|o| text(&o.stdout))
+        .unwrap_or_default()
 }
 
 /// Replace the `<DD>` / `<An>` placeholders of an argument.
@@ -1044,7 +1503,13 @@ fn row(goal: &Path, c: &Case) -> serde_json::Value {
         versions: c.versions,
         answers: c.answers.clone(),
     });
-    std::fs::write(dd.join("genesis.json"), GENESIS).unwrap();
+    if !c.no_genesis {
+        std::fs::write(dd.join("genesis.json"), GENESIS).unwrap();
+    }
+    if c.consensus_json {
+        let doc = serde_json::json!({"v7": {"MinBalance": 123}, "extra": {"MinBalance": 5}});
+        std::fs::write(dd.join("consensus.json"), doc.to_string()).unwrap();
+    }
     let net = if c.refused {
         CLOSED_ALGOD.to_string()
     } else {
@@ -1062,8 +1527,16 @@ fn row(goal: &Path, c: &Case) -> serde_json::Value {
     let ran = run_env(goal, &dd, &args, Stdin::Null, &[("PATH", "/usr/bin:/bin")]);
     let files = files(&dd);
     stop_kmd(&dd);
+    let uname = uname();
     let mask = |b: &[u8]| {
-        let mut t = text(b).replace(dd.to_str().unwrap(), "<DD>");
+        let mut t = text(b);
+        if !uname.is_empty() {
+            t = t.replace(
+                &uname, "<UNAME>
+",
+            );
+        }
+        let mut t = t.replace(dd.to_str().unwrap(), "<DD>");
         for i in 1..=5u8 {
             t = t.replace(&key(i).1, &format!("<A{i}>"));
         }
