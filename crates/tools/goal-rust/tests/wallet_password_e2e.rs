@@ -35,7 +35,10 @@
 //! that sign) from a pipe, `/dev/null` and a pty, and go's
 //! `account renewpartkey` (`generateAndRegisterPartKey`: the key generated
 //! into `$TMPDIR`, installed, then registered with `-w`'s wallet) and
-//! `renewallpartkeys` (`renewPartKeysInDir`). The last row holds the SHA-256
+//! `renewallpartkeys` (`renewPartKeysInDir`), then (issue #2488) go's
+//! `account addpartkey` (the key generated locally into `--outdir`, or into
+//! `$TMPDIR` and installed) and `changeonlinestatus` failing to choose a
+//! participation key before any password is read. The last row holds the SHA-256
 //! of every transaction the commands broadcast or wrote. Masked as
 //! nondeterministic: the IDs of the new participation keys (`<PART_ID>`) and
 //! go's spinning cursor (`/-\|` + backspace, one per 100 ms).
@@ -208,12 +211,17 @@ fn b64(b: &[u8]) -> String {
 /// A `/v2/participation` entry of `address` valid for `first..=last`, its
 /// keys fixed.
 fn part_entry(address: &str, first: u64, last: u64) -> serde_json::Value {
+    part_entry_voting(address, first, last, 0x11)
+}
+
+/// [`part_entry`] with a vote key of 32 bytes of `vote`.
+fn part_entry_voting(address: &str, first: u64, last: u64, vote: u8) -> serde_json::Value {
     serde_json::json!({
         "id": "PARTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         "address": address,
         "key": {
             "selection-participation-key": b64(&[0x22; 32]),
-            "vote-participation-key": b64(&[0x11; 32]),
+            "vote-participation-key": b64(&[vote; 32]),
             "state-proof-key": b64(&[0x33; 64]),
             "vote-first-valid": first,
             "vote-last-valid": last,
@@ -961,6 +969,147 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
             "1100",
         ],
         Stdin::Null,
+    );
+
+    // `account addpartkey` (issue #2488): go generates the key locally, into
+    // `--outdir` or into $TMPDIR and installed (`GenParticipationKeysTo`).
+    // Each `--outdir` row is followed by what the generation left behind:
+    // the files in $TMPDIR and `--outdir`, and how many keys were installed.
+    let left_behind = |name: &str| {
+        let names = |dir: &Path| {
+            let mut v: Vec<String> = std::fs::read_dir(dir)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            v.sort_unstable();
+            v.join(" ")
+        };
+        let text = format!(
+            "tmp: {}\npartkeys: {}\ninstalled: {}\n",
+            names(&tmpdir),
+            names(&dd.join("partkeys")),
+            algod.lock().unwrap().parts.len()
+        );
+        step_ran(
+            &format!("{name}: files left behind"),
+            &Ran {
+                code: Some(0),
+                stdout: text.into_bytes(),
+                stderr: Vec::new(),
+            },
+        );
+    };
+    std::fs::create_dir_all(dd.join("partkeys")).unwrap();
+    let add = [
+        "account",
+        "addpartkey",
+        "-a",
+        &a1,
+        "--roundFirstValid",
+        "5",
+        "--roundLastValid",
+        "1100",
+    ];
+    let add_o: Vec<&str> = add.iter().copied().chain(["-o", "partkeys"]).collect();
+    fresh_renew(1100);
+    step_env("account addpartkey installed", &add, Stdin::Null);
+    left_behind("account addpartkey installed");
+    fresh_renew(1100);
+    step_env("account addpartkey --outdir", &add_o, Stdin::Null);
+    left_behind("account addpartkey --outdir");
+    step_env(
+        "account addpartkey --outdir key file exists",
+        &add_o,
+        Stdin::Null,
+    );
+    let add_missing: Vec<&str> = add.iter().copied().chain(["--outdir", "nosuch"]).collect();
+    step_env(
+        "account addpartkey --outdir does not exist",
+        &add_missing,
+        Stdin::Null,
+    );
+    fresh_renew(1100);
+    algod.lock().unwrap().fail = vec![(
+        "POST",
+        "/v2/participation",
+        400,
+        r#"{"message":"install failed"}"#,
+    )];
+    step_env("account addpartkey install fails", &add, Stdin::Null);
+    left_behind("account addpartkey install fails");
+    fresh_renew(1100);
+    for (name, a, first, last) in [
+        ("unparsable address", "NOTANADDRESS", "5", "1100"),
+        ("roundFirstValid after roundLastValid", a1.as_str(), "1100", "5"),
+        ("validity period too large", a1.as_str(), "5", "20000000"),
+    ] {
+        step_env(
+            &format!("account addpartkey {name}"),
+            &[
+                "account",
+                "addpartkey",
+                "-a",
+                a,
+                "--roundFirstValid",
+                first,
+                "--roundLastValid",
+                last,
+            ],
+            Stdin::Null,
+        );
+    }
+    left_behind("account addpartkey failures");
+
+    // `account changeonlinestatus` builds the keyreg (`MakeUnsignedGoOnlineTx`
+    // → `chooseParticipation`) before it reads the password.
+    let online = [
+        "account",
+        "changeonlinestatus",
+        "-a",
+        &a1,
+        "-w",
+        "sig",
+        "-N",
+    ];
+    for (name, parts) in [
+        ("no participation key", vec![]),
+        ("key not valid yet", vec![part_entry(&a1, 900, 2000)]),
+        ("key expired", vec![part_entry(&a1, 1, 3)]),
+        ("key of another account", vec![part_entry(&a2, 1, 2000)]),
+    ] {
+        fresh_renew(1100);
+        algod.lock().unwrap().parts = parts;
+        step_env(
+            &format!("account changeonlinestatus {name}"),
+            &online,
+            Stdin::Null,
+        );
+    }
+    fresh_renew(1100);
+    algod.lock().unwrap().fail = vec![("GET", "/v2/participation", 500, r#"{"message":"boom"}"#)];
+    step_env(
+        "account changeonlinestatus listing fails",
+        &online,
+        Stdin::Null,
+    );
+    // Of two keys expiring together go registers the first one listed: the
+    // broadcast's SHA-256 in the last row tells which.
+    fresh_renew(1100);
+    algod.lock().unwrap().parts = vec![
+        part_entry_voting(&a1, 1, 2000, 0x44),
+        part_entry_voting(&a1, 1, 1500, 0x55),
+        part_entry_voting(&a1, 1, 2000, 0x66),
+    ];
+    step_env(
+        "account changeonlinestatus two keys expire together pty",
+        &online,
+        Stdin::Pty {
+            prompt: &e_sig,
+            line: "spw",
+        },
     );
 
     // The other commands that sign with a wallet.
