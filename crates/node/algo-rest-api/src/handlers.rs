@@ -2621,43 +2621,41 @@ pub struct RawTransactionParams {
 }
 
 /// Decode a request body of concatenated msgpack `SignedTxn` objects the way
-/// go's `decodeTxGroup` does (`daemon/algod/api/server/v2/handlers.go:1172`):
-/// with `protocol.NewDecoder`, whose `ErrorIfNoField = true` turns a key the
-/// target struct lacks -- at any nesting level, and including the block-only
-/// `hgi`/`hgh`/ApplyData keys -- into a 400 reading
-/// `msgpack decode error [pos N]: no matching struct field found when
-/// decoding stream map with key K` (N counts from the start of the body).
-/// Synchronous on purpose: the strict mode is thread-local and must not be
-/// held across an `.await` (issues #1727, #1962).
+/// go's `decodeTxGroup` does (`daemon/algod/api/server/v2/handlers.go:1172`,
+/// issue #2492): go-codec's reflection decoder (`protocol.NewDecoder`) reads
+/// one `SignedTxn` after another until `io.EOF` -- which it also returns for
+/// a body that breaks off inside a transaction, ending the group there --
+/// and answers any other failure with its own text, `msgpack decode error
+/// [pos N]: ...` (N counting from the start of the body). Each decoded value
+/// becomes a [`algo_types::SignedTransaction`] through go-codec's rules
+/// ([`crate::simulate_strict::decode_signed_txn`]).
 #[allow(clippy::result_large_err)]
 fn decode_tx_group(
     body: &[u8],
     max_group_size: usize,
 ) -> Result<Vec<algo_types::SignedTransaction>, Response> {
-    let _strict = algo_types::strict_unknown_fields(body);
+    use crate::simulate_request_schema::TRANSACTIONS_SIGNEDTXN;
+    use algo_codec::go_codec_msgpack::{encode, Decoder, Error};
+
+    let mut dec = Decoder::new(body);
     let mut txgroup: Vec<algo_types::SignedTransaction> = Vec::new();
-    let mut cursor = body;
-    while !cursor.is_empty() {
-        match algo_types::SignedTransaction::decode_from_reader(&mut cursor) {
-            Ok(stxn) => {
-                txgroup.push(stxn);
-                if txgroup.len() > max_group_size {
-                    return Err(error::bad_request(format!(
-                        "max group size is {}",
-                        max_group_size
-                    )));
-                }
-            }
-            Err(algo_error::AlgoError::Codec { source, .. })
-                if source.is::<algo_types::UnknownFieldError>() =>
-            {
-                return Err(error::bad_request(source.to_string()));
-            }
-            Err(e) => {
-                return Err(error::bad_request(format!(
-                    "could not decode transaction: {e}"
-                )));
-            }
+    loop {
+        let value = match dec.decode(&TRANSACTIONS_SIGNEDTXN) {
+            Ok(v) => v,
+            Err(Error::Eof) => break,
+            Err(e) => return Err(error::bad_request_bytes(&e.to_bytes())),
+        };
+        let mut bytes = Vec::new();
+        encode(&value, &TRANSACTIONS_SIGNEDTXN, &mut bytes);
+        let stxn = crate::simulate_strict::decode_signed_txn(&bytes).map_err(|e| {
+            // go-codec's value always fits the type: not reached
+            error::internal_error(format!("could not rebuild the decoded transaction: {e}"))
+        })?;
+        txgroup.push(stxn);
+        if txgroup.len() > max_group_size {
+            return Err(error::bad_request(format!(
+                "max group size is {max_group_size}"
+            )));
         }
     }
     if txgroup.is_empty() {
