@@ -28,6 +28,7 @@
 // Input: JSON lines {"ty": "account"|"version"|"status"|"supply"|
 // "asset"|"application"|"account-assets"|"account-asset"|
 // "participation-keys"|"post-participation"|"catchpoint" (issue #2476),
+// "params"|"post-transactions"|"pending" (issue #2489),
 // "body": <base64>}. Output: the same lines plus "err" (go-codec's error
 // text, or null) and "value" (the decoded struct as encoding/json prints
 // it, or null on an error). It writes
@@ -53,6 +54,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -108,6 +110,12 @@ func main() {
 			target = &model.PostParticipationResponse{}
 		case "catchpoint":
 			target = &model.CatchpointStartResponse{}
+		case "params":
+			target = &model.TransactionParametersResponse{}
+		case "post-transactions":
+			target = &model.PostTransactionsResponse{}
+		case "pending":
+			target = &model.PendingTransactionResponse{}
 		default:
 			panic(in.Ty)
 		}
@@ -120,11 +128,47 @@ func main() {
 			s := err.Error()
 			out.Err = &s
 		} else {
+			if p, ok := target.(*model.PendingTransactionResponse); ok {
+				stringKeys(p)
+			}
 			out.Value, _ = json.Marshal(target)
 		}
 		b, _ := json.Marshal(out)
 		w.Write(b)
 		w.WriteByte('\n')
 		w.Flush()
+	}
+}
+
+// stringKeys makes a decoded PendingTransactionResponse printable by
+// encoding/json: go-codec decodes the nested objects of its `txn`
+// (`map[string]interface{}`) as `map[interface{}]interface{}`, which
+// encoding/json refuses; their keys are printed as fmt.Sprint does.
+func stringKeys(p *model.PendingTransactionResponse) {
+	for k, v := range p.Txn {
+		p.Txn[k] = nakedValue(v)
+	}
+	if p.InnerTxns != nil {
+		for i := range *p.InnerTxns {
+			stringKeys(&(*p.InnerTxns)[i])
+		}
+	}
+}
+
+func nakedValue(v any) any {
+	switch x := v.(type) {
+	case map[interface{}]interface{}:
+		m := make(map[string]any, len(x))
+		for k, e := range x {
+			m[fmt.Sprint(k)] = nakedValue(e)
+		}
+		return m
+	case []interface{}:
+		for i := range x {
+			x[i] = nakedValue(x[i])
+		}
+		return x
+	default:
+		return v
 	}
 }

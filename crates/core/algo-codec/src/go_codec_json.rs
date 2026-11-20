@@ -84,6 +84,11 @@ pub enum Ty {
     Slice(&'static Ty, &'static str),
     /// A struct.
     Struct(&'static [Field]),
+    /// `interface{}` (go-codec's `DecodeNaked`): any value; a JSON object
+    /// as a `map[string]interface{}`, an array as `[]interface{}`, a number
+    /// as a `float64` (or the integer it holds), printed as decoded. Only the
+    /// JSON decoder reads it.
+    Any,
 }
 
 /// A struct field: its JSON name and type, in go's declaration order.
@@ -173,7 +178,7 @@ fn zero(ty: &'static Ty) -> Value {
             Value::String(base64::engine::general_purpose::STANDARD.encode(vec![0u8; *n]))
         }
         Ty::Address => Value::String(algo_types::Address([0u8; 32]).to_string()),
-        Ty::Ptr(_) => Value::Null, // left out of a struct
+        Ty::Ptr(_) | Ty::Any => Value::Null, // a pointer is left out of a struct
         Ty::Struct(fields) => {
             let mut m = Map::new();
             for Field(name, t) in fields.iter() {
@@ -898,8 +903,85 @@ impl<'a> Dec<'a> {
             Ty::Address => *v = Value::String(self.decode_address()?),
             Ty::FastSlice(elem) => self.decode_fast_slice(elem, v)?,
             Ty::Map(key, val) => self.decode_map(key, val, v)?,
+            Ty::Any => *v = self.decode_naked()?,
         }
         Ok(())
+    }
+
+    /// go-codec's `DecodeNaked` of a JSON value into an `interface{}`.
+    fn decode_naked(&mut self) -> Result<Value, Error> {
+        self.ensure_tok()?;
+        match self.tok {
+            b'n' => {
+                self.read_lit("ull")?;
+                Ok(Value::Null)
+            }
+            b'f' | b't' => Ok(Value::Bool(self.decode_bool()?)),
+            b'"' => Ok(Value::String(self.decode_string()?)),
+            b'{' => {
+                self.read_map_start()?;
+                let mut m = Map::new();
+                let mut seen = None;
+                while self.more(&mut seen)? {
+                    // a `map[interface{}]interface{}`: the key is naked too
+                    self.read_map_elem_key()?;
+                    let k = match self.decode_naked()? {
+                        Value::String(k) => k,
+                        other => other.to_string(),
+                    };
+                    self.read_map_elem_value()?;
+                    let val = self.decode_naked()?;
+                    m.insert(k, val);
+                }
+                self.read_map_end()?;
+                Ok(Value::Object(m))
+            }
+            b'[' => {
+                self.read_array_start()?;
+                let mut items = Vec::new();
+                let mut seen = None;
+                while self.more(&mut seen)? {
+                    self.read_array_elem()?;
+                    items.push(self.decode_naked()?);
+                }
+                self.read_array_end()?;
+                Ok(Value::Array(items))
+            }
+            _ => {
+                // `decNumBytes`, then `nakedNum`: an integer as a `uint64` /
+                // `int64`, anything else through `strconv.ParseFloat`.
+                let bs = self.dec_num_bytes()?;
+                if bs.is_empty() {
+                    return self.err("decode number from empty string");
+                }
+                let p = parse_integer(&bs);
+                if !p.bad_syntax && !p.overflow && !(p.neg && p.n > 1 << 63) {
+                    return Ok(if p.neg {
+                        Value::from((p.n as i64).wrapping_neg())
+                    } else {
+                        Value::from(p.n)
+                    });
+                }
+                match go_parse_float(&bs) {
+                    Some(f) => Ok(go_marshaled_float(f)),
+                    None => {
+                        let why = if read_float(&bs).is_some() {
+                            "value out of range"
+                        } else {
+                            "invalid syntax"
+                        };
+                        self.err(cat(&[
+                            b"decode number from ",
+                            &bs,
+                            b": strconv.ParseFloat: parsing \"",
+                            &bs,
+                            b"\": ",
+                            why.as_bytes(),
+                        ]))
+                    }
+                }
+            }
+        }
     }
 
     /// `kUint8` / `kUint16` / `kUint32`: `chkOvf.UintV(DecodeUint64(), bits)`.
@@ -1448,6 +1530,20 @@ fn read_float(s: &[u8]) -> Option<ReadFloat> {
         .map(|&c| char::from(c))
         .collect();
     Some(ReadFloat::Dec(clean))
+}
+
+/// A `float64` as go's `encoding/json` prints it, read back as JSON: an
+/// integral value below 1e21 is printed without a fraction or exponent.
+fn go_marshaled_float(f: f64) -> Value {
+    if f.fract() == 0.0 && f.abs() < 1e21 {
+        if (0.0..18_446_744_073_709_551_616.0).contains(&f) {
+            return Value::from(f as u64);
+        }
+        if f < 0.0 && f >= i64::MIN as f64 {
+            return Value::from(f as i64);
+        }
+    }
+    serde_json::Number::from_f64(f).map_or(Value::Null, Value::Number)
 }
 
 /// Go's `strconv.ParseFloat(s, 64)`, `None` on an error (bad syntax or out

@@ -660,6 +660,8 @@ fn go_value_to_msgpack(
         Ty::Strings => list(v, &Ty::Str)?,
         Ty::FastSlice(elem) | Ty::Slice(elem, _) => list(v, elem)?,
         Ty::Ptr(t) => go_value_to_msgpack(v, t)?,
+        // no request type holds an `interface{}`
+        Ty::Any => return None,
         Ty::Map(key, val) => match v {
             J::Null => Value::Nil,
             J::Object(m) => {

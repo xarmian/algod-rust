@@ -43,7 +43,13 @@
 //!   `net/http` client makes of answers that are not well-formed HTTP, of the
 //!   server's own reason phrase (`resp.Status`, raw bytes), of redirects and
 //!   of hosts that do not resolve (`dial tcp: lookup <host> on <DNS>: no
-//!   such host`, the host's DNS server masked).
+//!   such host`, the host's DNS server masked);
+//! - issue #2489: the suggested parameters, broadcast and wait
+//!   (`waitForCommit`) of `clerk send`, `clerk rawsend` and the commands
+//!   that build a transaction (`asset`, `app`, `account
+//!   changeonlinestatus` / `marknonparticipating`) through go's REST client:
+//!   a refused connection, a 401, an error answer and a malformed answer of
+//!   each request.
 //!
 //! `fixtures/goal_algod_reads.jsonl` holds what go v5.0.5-stable's `goal`
 //! printed (exit code, stdout, stderr, the data dir masked; a stdout longer
@@ -608,7 +614,7 @@ fn reason(status: u16) -> &'static str {
 }
 
 /// A canned answer replacing `route`'s for the request paths starting with
-/// `prefix` (`""`: every path).
+/// `prefix` (`""`: every path; a trailing `$`: that path only).
 #[derive(Clone)]
 struct Answer {
     prefix: &'static str,
@@ -768,6 +774,35 @@ fn route_2476(method: &str, path: &str, query: &str) -> Option<(u16, String)> {
     None
 }
 
+/// The txid the mock algod answers a broadcast with.
+const MOCK_TXID: &str = "TXIDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+/// What the mock algod answers for the transaction paths (issue #2489): the
+/// suggested parameters, a broadcast and a pending transaction committed in
+/// round 6.
+fn route_2489(method: &str, path: &str) -> Option<(u16, String)> {
+    let genesis_hash = data_encoding::BASE64.encode(&[7u8; 32]);
+    match (method, path) {
+        ("GET", "/v2/transactions/params") => Some((
+            200,
+            serde_json::json!({
+                "consensus-version": "future", "fee": 0, "genesis-hash": genesis_hash,
+                "genesis-id": "v1", "last-round": 5, "min-fee": 1000
+            })
+            .to_string(),
+        )),
+        ("POST", "/v2/transactions") => {
+            Some((200, serde_json::json!({ "txId": MOCK_TXID }).to_string()))
+        }
+        ("GET", p) if p.starts_with("/v2/transactions/pending/") => Some((
+            200,
+            r#"{"confirmed-round":6,"pool-error":"","txn":{"sig":"AA==","txn":{"type":"pay"}}}"#
+                .to_string(),
+        )),
+        _ => None,
+    }
+}
+
 /// `(status, content type, body)` for a request path (status 1: `body` is
 /// the whole raw reply).
 fn route(method: &str, path: &str, mock: &Mock) -> (u16, &'static str, Vec<u8>) {
@@ -777,7 +812,14 @@ fn route(method: &str, path: &str, mock: &Mock) -> (u16, &'static str, Vec<u8>) 
     let query = path.split_once('?').map_or("", |(_, q)| q);
     let path = path.split('?').next().unwrap_or("");
     let json = "application/json";
-    if let Some(a) = mock.answers.iter().find(|a| path.starts_with(a.prefix)) {
+    if let Some(a) = mock
+        .answers
+        .iter()
+        .find(|a| match a.prefix.strip_suffix('$') {
+            Some(exact) => path == exact,
+            None => path.starts_with(a.prefix),
+        })
+    {
         return (a.status, json, a.body.clone());
     }
     // where the redirect rows send go
@@ -786,6 +828,9 @@ fn route(method: &str, path: &str, mock: &Mock) -> (u16, &'static str, Vec<u8>) 
         return (code, json, body.into_bytes());
     }
     let versions = mock.versions;
+    if let Some((code, body)) = route_2489(method, path) {
+        return (code, json, body.into_bytes());
+    }
     if path == "/v2/status" {
         return (200, json, STATUS_JSON.as_bytes().to_vec());
     }
@@ -889,6 +934,8 @@ struct Case {
     consensus_json: bool,
     /// `algod.net` holds this instead of the mock's address.
     net: Option<&'static str>,
+    /// Files written into the data dir before the command runs.
+    inputs: Vec<(&'static str, Vec<u8>)>,
 }
 
 fn case(name: &str, args: &[&str]) -> Case {
@@ -902,6 +949,7 @@ fn case(name: &str, args: &[&str]) -> Case {
         no_genesis: false,
         consensus_json: false,
         net: None,
+        inputs: Vec::new(),
     }
 }
 
@@ -1287,6 +1335,231 @@ fn cases() -> Vec<Case> {
     v.extend(followup_cases());
     v.extend(remaining_reader_cases());
     v.extend(transport_cases());
+    v.extend(txn_cases());
+    v
+}
+
+/// The files the transaction rows read: a TEAL program and a signed
+/// payment for `clerk rawsend`.
+const TXN_INPUTS: [&str; 2] = ["a.teal", "raw.stx"];
+
+/// A signed payment of 5 from key 1 to key 2 (the mock does not check it).
+fn raw_signed_payment() -> Vec<u8> {
+    let addr = |i: u8| algo_types::Address::from_algorand_string(&key(i).1).expect("address");
+    let stx = algo_types::SignedTransaction {
+        txn: algo_types::Transaction {
+            txn_type: algo_types::TxnType::Pay,
+            sender: addr(1),
+            receiver: addr(2),
+            amount: 5,
+            fee: 1000,
+            first_valid: algo_types::Round(5),
+            last_valid: algo_types::Round(1005),
+            genesis_id: "v1".into(),
+            genesis_hash: [7; 32],
+            ..Default::default()
+        },
+        sig: [1; 64],
+        ..Default::default()
+    };
+    algo_codec::canonical_encode_signed_transaction(&stx)
+}
+
+/// Issue #2489: the suggested parameters, the broadcast and the wait
+/// (`waitForCommit`) of the commands that build or send a transaction, each
+/// request failing in each of go's ways.
+fn txn_cases() -> Vec<Case> {
+    let send: &[&str] = &[
+        "clerk", "send", "-a", "5", "-f", "<A1>", "-t", "<A2>", "--note", "n", "-w", "a",
+    ];
+    let commands: Vec<(&str, Vec<&str>)> = vec![
+        ("clerk send", send.to_vec()),
+        ("clerk rawsend", vec!["clerk", "rawsend", "-f", "raw.stx"]),
+        (
+            "asset send",
+            vec![
+                "asset",
+                "send",
+                "--assetid",
+                "12",
+                "-f",
+                "<A1>",
+                "-t",
+                "<A2>",
+                "-a",
+                "1",
+                "--note",
+                "n",
+                "-w",
+                "a",
+            ],
+        ),
+        (
+            "asset create",
+            vec![
+                "asset",
+                "create",
+                "--creator",
+                "<A1>",
+                "--total",
+                "10",
+                "--note",
+                "n",
+                "-w",
+                "a",
+            ],
+        ),
+        (
+            "app call",
+            vec![
+                "app", "call", "--app-id", "7", "-f", "<A1>", "--note", "n", "-w", "a",
+            ],
+        ),
+        (
+            "app create",
+            vec![
+                "app",
+                "create",
+                "--creator",
+                "<A1>",
+                "--approval-prog",
+                "a.teal",
+                "--clear-prog",
+                "a.teal",
+                "--note",
+                "n",
+                "-w",
+                "a",
+            ],
+        ),
+        (
+            "account changeonlinestatus offline",
+            vec![
+                "account",
+                "changeonlinestatus",
+                "-a",
+                "<A1>",
+                "-o=false",
+                "-w",
+                "a",
+            ],
+        ),
+        (
+            "account marknonparticipating",
+            vec!["account", "marknonparticipating", "-a", "<A1>", "-w", "a"],
+        ),
+    ];
+    let inputs = || {
+        vec![
+            ("a.teal", b"#pragma version 2\nint 1\n".to_vec()),
+            ("raw.stx", raw_signed_payment()),
+        ]
+    };
+    let answer = |prefix: &'static str, status: u16, body: &str| Answer {
+        prefix,
+        status,
+        body: body.as_bytes().to_vec(),
+    };
+    let mut v = Vec::new();
+    for (name, args) in &commands {
+        let with_n: Vec<&str> = args.iter().copied().chain(["-N"]).collect();
+        let mk = |suffix: &str, args: &[&str], answers: Vec<Answer>| {
+            let mut c = case(&format!("{name} {suffix}"), args);
+            c.accounts = true;
+            c.inputs = inputs();
+            c.answers = answers;
+            c
+        };
+        v.push(mk("no wait", &with_n, vec![]));
+        v.push(mk("waits for the commit", args, vec![]));
+        let mut refused = mk("refused", &with_n, vec![]);
+        refused.refused = true;
+        v.push(refused);
+        for (what, prefix) in [
+            ("params", "/v2/transactions/params"),
+            ("broadcast", "/v2/transactions$"),
+        ] {
+            v.push(mk(
+                &format!("{what} 401"),
+                &with_n,
+                vec![answer(prefix, 401, r#"{"message":"Invalid API Token"}"#)],
+            ));
+            v.push(mk(
+                &format!("{what} 400"),
+                &with_n,
+                vec![answer(prefix, 400, r#"{"message":"bad \u0001 thing"}"#)],
+            ));
+            v.push(mk(
+                &format!("{what} malformed"),
+                &with_n,
+                vec![answer(prefix, 200, r#"{"fee":"x","txId":7}"#)],
+            ));
+            v.push(mk(
+                &format!("{what} unknown field"),
+                &with_n,
+                vec![answer(prefix, 200, r#"{"foo":1}"#)],
+            ));
+        }
+        // `clerk rawsend` warns about a failing pending read and keeps
+        // waiting for the next round, forever
+        let pending_rows: &[(&str, u16, &str)] = if *name == "clerk rawsend" {
+            &[]
+        } else {
+            &[
+                ("fails", 500, r#"{"message":"pending is down"}"#),
+                ("pool error", 200, r#"{"pool-error":"overspend","txn":{}}"#),
+                ("malformed", 200, r#"{"confirmed-round":"six"}"#),
+            ]
+        };
+        for &(what, status, body) in pending_rows {
+            v.push(mk(
+                &format!("pending {what}"),
+                args,
+                vec![answer("/v2/transactions/pending/", status, body)],
+            ));
+        }
+        v.push(mk(
+            "status fails while waiting",
+            args,
+            vec![
+                answer("/v2/status", 500, r#"{"message":"status is down"}"#),
+                answer(
+                    "/v2/transactions/pending/",
+                    200,
+                    r#"{"pool-error":"","txn":{}}"#,
+                ),
+            ],
+        ));
+    }
+    // a transaction whose last valid round has passed
+    let mut c = case(
+        "clerk send expired",
+        &[
+            "clerk",
+            "send",
+            "-a",
+            "5",
+            "-f",
+            "<A1>",
+            "-t",
+            "<A2>",
+            "--note",
+            "n",
+            "-w",
+            "a",
+            "--firstvalid",
+            "1",
+            "--lastvalid",
+            "5",
+        ],
+    );
+    c.accounts = true;
+    c.answers = vec![answer(
+        "/v2/transactions/pending/",
+        200,
+        r#"{"pool-error":"","txn":{}}"#,
+    )];
+    v.push(c);
     v
 }
 
@@ -2061,7 +2334,7 @@ fn files(dd: &Path) -> Vec<String> {
         for e in std::fs::read_dir(dir).expect("read_dir").flatten() {
             let p = e.path();
             let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
-            if INPUTS.contains(&rel.as_str()) {
+            if INPUTS.contains(&rel.as_str()) || TXN_INPUTS.contains(&rel.as_str()) {
                 continue;
             }
             let meta = std::fs::symlink_metadata(&p).expect("metadata");
@@ -2158,6 +2431,9 @@ fn row(goal: &Path, c: &Case) -> serde_json::Value {
     if c.accounts {
         setup_accounts(goal, &dd);
     }
+    for (name, bytes) in &c.inputs {
+        std::fs::write(dd.join(name), bytes).unwrap();
+    }
     let args: Vec<String> = c.args.iter().map(|a| expand(a, &dd)).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let ran = run_env(goal, &dd, &args, Stdin::Null, &[("PATH", "/usr/bin:/bin")]);
@@ -2182,6 +2458,7 @@ fn row(goal: &Path, c: &Case) -> serde_json::Value {
             t = t.replace(&key(i).1, &format!("<A{i}>"));
         }
         let t = t.replace(&format!("127.0.0.1:{port}"), "<ALGOD>");
+        let t = t.replace(MOCK_TXID, "<TXID>");
         // the host's DNS server, which go's resolver names
         let t = mask_dns_server(&t);
         if std::str::from_utf8(b).is_ok() {

@@ -115,6 +115,16 @@ impl AlgodClient {
         }
     }
 
+    /// The algod base URL (without a trailing `/`).
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// The algod API token.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
     /// Worst-case wall time of one request through this client, from the
     /// config it was actually built with (see
     /// [`ClientConfig::worst_case_request_time`]).

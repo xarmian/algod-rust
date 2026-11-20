@@ -519,9 +519,8 @@ fn submit_app_lifecycle_txn(
         .enable_all()
         .build()
         .map_err(|e| format!("Error processing command: {e}"))?;
-    let params = rt
-        .block_on(algod.suggested_transaction_params())
-        .map_err(|e| e.to_string())?;
+    let params = crate::algod_txn::suggested_params(&rt, &algod)
+        .map_err(|e| format!("Cannot determine last valid round: {e}"))?;
     let header = resolve_txn_header(txn_args, &data_dir_path, &params)?;
 
     let signer_addr = txn_args
@@ -640,9 +639,8 @@ fn run_create_inner(args: CreateArgs, wallet: Option<String>) -> Result<ExitCode
         args.programs.clear_prog_raw.as_deref(),
     )?;
 
-    let params = rt
-        .block_on(algod.suggested_transaction_params())
-        .map_err(|e| e.to_string())?;
+    let params = crate::algod_txn::suggested_params(&rt, &algod)
+        .map_err(|e| format!("Cannot determine last valid round: {e}"))?;
     let header = resolve_txn_header(&args.txn, &data_dir_path, &params)?;
 
     let signer_addr = args
@@ -736,9 +734,8 @@ fn run_update_inner(args: UpdateArgs, wallet: Option<String>) -> Result<ExitCode
         args.programs.clear_prog_raw.as_deref(),
     )?;
 
-    let params = rt
-        .block_on(algod.suggested_transaction_params())
-        .map_err(|e| e.to_string())?;
+    let params = crate::algod_txn::suggested_params(&rt, &algod)
+        .map_err(|e| format!("Cannot determine last valid round: {e}"))?;
     let header = resolve_txn_header(&args.txn, &data_dir_path, &params)?;
 
     let signer_addr = args
@@ -858,34 +855,21 @@ fn submit_single(
 
     let last_valid = txn.last_valid.0;
     let encoded_stx = canonical_encode_signed_transaction(&stx);
-    let pipeline = algo_txn_pipeline::TxnPipeline::new(algod, None);
-    let info = rt.block_on(async {
-        let txid = pipeline
-            .submit(&encoded_stx)
-            .await
-            .map_err(|e| format!("Couldn't broadcast tx with algod: {e}"))?;
-        if let Some(line) = &extra_info_line {
-            println!("{line}");
-        }
-        println!(
-            "Issued transaction from account {}, txid {} (fee {})",
-            txn.sender.to_algorand_string(),
-            txid,
-            txn.fee
-        );
-        if txn_args.no_wait {
-            return Ok::<Option<algo_rest_client::PendingTxnInfo>, String>(None);
-        }
-        let info = pipeline
-            .wait_for_confirmation(&txid, last_valid)
-            .await
-            .map_err(|e| e.to_string())?;
-        if let Some(round) = info.confirmed_round {
-            println!("Transaction {txid} committed in round {round}");
-        }
-        Ok(Some(info))
-    })?;
-    Ok(info)
+    let txid = crate::algod_txn::broadcast(rt, &algod, &encoded_stx)
+        .map_err(|e| format!("Couldn't broadcast tx with algod: {e}"))?;
+    if let Some(line) = &extra_info_line {
+        println!("{line}");
+    }
+    println!(
+        "Issued transaction from account {}, txid {} (fee {})",
+        txn.sender.to_algorand_string(),
+        txid,
+        txn.fee
+    );
+    if txn_args.no_wait {
+        return Ok(None);
+    }
+    crate::algod_txn::wait_for_commit_info(rt, &algod, &txid, last_valid).map(Some)
 }
 
 // ---------------------------------------------------------------------------
@@ -1464,9 +1448,8 @@ fn run_method_inner(args: MethodArgs, wallet: Option<String>) -> Result<ExitCode
             (None, None)
         };
 
-    let params = rt
-        .block_on(algod.suggested_transaction_params())
-        .map_err(|e| e.to_string())?;
+    let params = crate::algod_txn::suggested_params(&rt, &algod)
+        .map_err(|e| format!("Cannot determine last valid round: {e}"))?;
     let header = resolve_txn_header(&args.txn, &data_dir_path, &params)?;
 
     let mut builder =
@@ -1607,37 +1590,30 @@ fn run_method_inner(args: MethodArgs, wallet: Option<String>) -> Result<ExitCode
     for s in &signed_group {
         raw.extend_from_slice(&canonical_encode_signed_transaction(s));
     }
-    let pipeline = algo_txn_pipeline::TxnPipeline::new(algod, None);
     let last_valid = app_call_txn.last_valid.0;
     // Compute the app-call txid client-side (mirrors Go's `stxn.Txn.ID()`)
     // rather than trusting the broadcast response, which only names the
     // first transaction in the group.
     let app_call_txid: algo_rest_client::TxId = compute_txn_id(&app_call_txn).to_string().into();
 
-    rt.block_on(async {
-        pipeline
-            .submit(&raw)
-            .await
-            .map_err(|e| format!("Couldn't broadcast tx with algod: {e}"))?;
-        println!("Issued {} transaction(s):", signed_group.len());
-        for s in &signed_group {
-            println!(
-                "Issued transaction from account {}, txid {} (fee {})",
-                s.txn.sender.to_algorand_string(),
-                compute_txn_id(&s.txn),
-                s.txn.fee
-            );
-        }
-        Ok::<(), String>(())
-    })?;
+    crate::algod_txn::broadcast(&rt, &algod, &raw)
+        .map_err(|e| format!("Couldn't broadcast tx with algod: {e}"))?;
+    println!("Issued {} transaction(s):", signed_group.len());
+    for s in &signed_group {
+        println!(
+            "Issued transaction from account {}, txid {} (fee {})",
+            s.txn.sender.to_algorand_string(),
+            compute_txn_id(&s.txn),
+            s.txn.fee
+        );
+    }
 
     if args.txn.no_wait {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let info = rt
-        .block_on(pipeline.wait_for_confirmation(&app_call_txid, last_valid))
-        .map_err(|e| e.to_string())?;
+    let info =
+        crate::algod_txn::wait_for_commit_info(&rt, &algod, &app_call_txid.0, last_valid)?;
 
     if args.create {
         if let Some(app_idx) = info.application_index.filter(|i| *i != 0) {

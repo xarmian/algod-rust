@@ -134,7 +134,8 @@ impl GoVal {
             Ty::Address => Self::Array(vec![0; 32]),
             Ty::Strings | Ty::FastSlice(_) | Ty::Slice(..) => Self::Slice(GoSlice::nil()),
             Ty::Map(..) => Self::Map(None),
-            Ty::Ptr(_) => Self::Ptr(None),
+            // `Ty::Any` is a JSON-only type: a nil `interface{}`.
+            Ty::Ptr(_) | Ty::Any => Self::Ptr(None),
             Ty::Struct(fields) => Self::Struct(fields.iter().map(|f| Self::zero(&f.1)).collect()),
         }
     }
@@ -338,6 +339,7 @@ fn size_align(ty: &Ty) -> (usize, usize) {
         Ty::U16 => (2, 2),
         Ty::U32 => (4, 4),
         Ty::U64 | Ty::I64 | Ty::Map(..) | Ty::Ptr(_) => (8, 8),
+        Ty::Any => (16, 8),
         Ty::Str => (16, 8),
         Ty::Bytes | Ty::Strings | Ty::FastSlice(_) | Ty::Slice(..) => (24, 8),
         Ty::ByteArray(n) => (*n, 1),
