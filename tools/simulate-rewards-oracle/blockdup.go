@@ -43,6 +43,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -59,6 +60,7 @@ import (
 	"github.com/algorand/go-algorand/ledger"
 	"github.com/algorand/go-algorand/ledger/eval"
 	"github.com/algorand/go-algorand/ledger/ledgercore"
+	"github.com/algorand/go-algorand/ledger/simulation"
 	"github.com/algorand/go-algorand/logging"
 	"github.com/algorand/go-algorand/protocol"
 	"github.com/algorand/go-algorand/util/execpool"
@@ -116,13 +118,35 @@ type blockDupWFRow struct {
 	Name      string   `json:"name"`
 	Group     []string `json:"group"`
 	TestError string   `json:"test_error"`
-	// VerifyError is go's `verify.TxnGroup` error; a `transaction <dump>
-	// invalid : ` frame is reduced to the reason after it.
+	// VerifyError is go's `verify.TxnGroup` error in full (issue #2451): a
+	// member's failure carries the `transaction <%+v of the SignedTxn>
+	// invalid : ` frame, see maskPointers for the one token masked.
 	VerifyError string `json:"verify_error"`
 	// VerifyFramed: go's error carried the `transaction <dump> invalid : `
 	// frame (a not-well-formed or unsigned member, a failed signature or
 	// LogicSig of one member); group-level errors are returned bare.
 	VerifyFramed bool `json:"verify_framed,omitempty"`
+	// Issue #2451: `Simulator.Simulate` of the same group (no request
+	// overrides): its request error, else the group's `FailureMessage` and
+	// `FailedAt`. A `verify.TxnGroup` failure ends simulate in `check`, before
+	// any evaluation.
+	SimulateError    string `json:"simulate_error"`
+	SimulateFailure  string `json:"simulate_failure"`
+	SimulateFailedAt []int  `json:"simulate_failed_at,omitempty"`
+	// SimulateFailureIsVerifyError: the `FailureMessage` is VerifyError
+	// itself (the same framed dump), left out of SimulateFailure.
+	SimulateFailureIsVerifyError bool `json:"simulate_failure_is_verify_error,omitempty"`
+}
+
+// heartbeatPointer is go's `%+v` of the embedded `*HeartbeatTxnFields` of a
+// heartbeat transaction: at depth > 0 fmt prints a non-nil pointer as its
+// address (`0xc000123456`), which differs from run to run.
+var heartbeatPointer = regexp.MustCompile(`HeartbeatTxnFields:0x[0-9a-f]+`)
+
+// maskPointers replaces that address with a fixed token so the fixture is
+// reproducible (issue #2451); the Rust side masks its own text the same way.
+func maskPointers(s string) string {
+	return heartbeatPointer.ReplaceAllString(s, "HeartbeatTxnFields:0xPTR")
 }
 
 // blockDupDecodeRow is go's decode of one encoded `SignedTxn`.
@@ -838,6 +862,9 @@ func blockDupOracle() {
 		orderSpec{name: "verify_no_signature", group: one(noSig)},
 		orderSpec{name: "verify_two_signature_types", group: one(twoSigs)},
 	)
+	for _, r := range sigFailureRows(secrets, payTxn) {
+		wfSpecs = append(wfSpecs, orderSpec{name: r.name, group: one(r.tx)})
+	}
 	for _, ws := range wfSpecs {
 		pev, err := l.StartEvaluator(poolHdr, 0, 0, nil)
 		must(err)
@@ -846,16 +873,27 @@ func blockDupOracle() {
 			row.Group = append(row.Group, b64(protocol.Encode(&ws.group[i])))
 		}
 		_, verr := verify.TxnGroup(ws.group, &poolHdr, nil, l)
-		row.VerifyError = errText(verr)
 		// go wraps a not-well-formed (or unsigned) member as `transaction
-		// <%+v of the SignedTxn> invalid : <reason>`. The dump is go's own
-		// struct formatting (it prints pointer addresses, so it is not even
-		// reproducible between runs); keep the reason, which is what
-		// algod-rust reproduces.
-		if strings.HasPrefix(row.VerifyError, "transaction ") {
-			if at := strings.Index(row.VerifyError, " invalid : "); at >= 0 {
-				row.VerifyError = row.VerifyError[at+len(" invalid : "):]
-				row.VerifyFramed = true
+		// <%+v of the SignedTxn> invalid : <reason>`, kept in full (issue
+		// #2451): only a heartbeat's pointer address is masked.
+		row.VerifyError = maskPointers(errText(verr))
+		if strings.HasPrefix(row.VerifyError, "transaction {") &&
+			strings.Contains(row.VerifyError, "} invalid : ") {
+			row.VerifyFramed = true
+		}
+		res, serr := simulation.MakeSimulator(l, false).Simulate(simulation.Request{
+			TxnGroups: [][]transactions.SignedTxn{ws.group},
+		})
+		row.SimulateError = maskPointers(errText(serr))
+		if serr == nil {
+			row.SimulateFailure = maskPointers(res.TxnGroups[0].FailureMessage)
+			// The framed texts are the same dump twice: keep one copy.
+			if row.VerifyFramed && row.SimulateFailure == row.VerifyError {
+				row.SimulateFailure = ""
+				row.SimulateFailureIsVerifyError = true
+			}
+			for _, i := range res.TxnGroups[0].FailedAt {
+				row.SimulateFailedAt = append(row.SimulateFailedAt, int(i))
 			}
 		}
 		f.WellFormed = append(f.WellFormed, row)

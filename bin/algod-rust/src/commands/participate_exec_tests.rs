@@ -2992,8 +2992,8 @@ struct WellFormedRow {
     /// `Err` when the Rust decoder refuses go's encoding of the group.
     group: Result<Vec<SignedTransaction>, String>,
     test_error: String,
-    /// go's `verify.TxnGroup` error, its `transaction <dump> invalid : `
-    /// frame (if any) reduced to the reason.
+    /// go's `verify.TxnGroup` error in full, its `transaction <%+v of the
+    /// SignedTxn> invalid : ` frame included (a heartbeat's pointer masked).
     verify_error: String,
     /// go's error carried that frame.
     verify_framed: bool,
@@ -3044,10 +3044,32 @@ fn rest_error_text(e: &algo_error::AlgoError) -> (String, Option<algo_error::Ver
     }
 }
 
+/// go's oracle masks a heartbeat's pointer address; mask the Rust text alike.
+fn mask_heartbeat_pointer(text: &str) -> String {
+    algo_validate::mask_heartbeat_pointer(text)
+}
+
+/// The two texts from shortly before their first differing byte, for a
+/// readable mismatch report of two multi-kilobyte frames.
+fn first_difference(go: &str, rust: &str) -> (String, String) {
+    let at = go
+        .bytes()
+        .zip(rust.bytes())
+        .position(|(a, b)| a != b)
+        .unwrap_or(go.len().min(rust.len()));
+    let lo = at.saturating_sub(60);
+    let cut = |s: &str| {
+        let lo = (0..=lo).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+        let hi = (at + 120).min(s.len());
+        let hi = (hi..=s.len())
+            .find(|&i| s.is_char_boundary(i))
+            .unwrap_or(s.len());
+        format!("[byte {at}] ...{:?}", &s[lo..hi])
+    };
+    (cut(go), cut(rust))
+}
+
 /// Splits go's `transaction <dump> invalid : <reason>` into (framed, reason).
-/// go's dump is its own `%+v` struct formatting (the Rust frame prints an
-/// abbreviated one with the same `transaction {` prefix and ` invalid : `
-/// infix), so the SHAPE of the frame is compared and then the reason.
 fn split_frame(text: &str) -> (bool, &str) {
     match (text.starts_with("transaction {"), text.find("} invalid : ")) {
         (true, Some(at)) => (true, &text[at + "} invalid : ".len()..]),
@@ -3110,16 +3132,21 @@ fn wellformed_and_group_error_texts_match_go() {
             )),
             (Err(e), want) => {
                 let (text, kind) = rest_error_text(&e);
-                let (rust_framed, rust_reason) = split_frame(&text);
-                // A LogicSig that ERRORS (`verify_logicsig_err_*`, one row per AVM error
-                // kind, and `verify_logicsig_errors`): go prints the AVM's own error
-                // and the byte offset `pc` of its `EvalError` (`err=/ 0. Details:
-                // pc=5`), compared in full (issue #2200).
-                let (rust_reason, want) = (rust_reason.to_string(), want.to_string());
-                if rust_reason != want || rust_framed != row.verify_framed {
+                // go's text in full, its `transaction <%+v of the SignedTxn>
+                // invalid : ` frame included (issue #2451); only a heartbeat's
+                // pointer address is masked, on both sides. A LogicSig that
+                // ERRORS (`verify_logicsig_err_*`, one row per AVM error kind,
+                // and `verify_logicsig_errors`): go prints the AVM's own error
+                // and the byte offset `pc` of its `EvalError` (`err=/ 0.
+                // Details: pc=5`, issue #2200).
+                let text = mask_heartbeat_pointer(&text);
+                let rust_framed = split_frame(&text).0;
+                if text != want || rust_framed != row.verify_framed {
                     mismatches.push(format!(
-                        "{} (REST path)\n  go:   {:?} (framed: {})\n  rust: {:?} (framed: {})",
-                        row.name, want, row.verify_framed, rust_reason, rust_framed
+                        "{} (REST path)\n  go:   {}\n  rust: {}",
+                        row.name,
+                        first_difference(want, &text).0,
+                        first_difference(want, &text).1
                     ));
                 }
                 // The pool tag follows the failure's kind, as on gossip.

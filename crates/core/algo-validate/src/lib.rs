@@ -23,6 +23,7 @@ pub mod batch_verify;
 pub mod block;
 pub mod checks;
 pub mod fee;
+pub mod go_dump;
 pub mod merkle;
 pub mod overspend;
 pub mod rules;
@@ -43,6 +44,7 @@ pub use fee::{
     required_fee_for_usage, signature_fee_contribution, summarize_fees, txn_fee_factor,
     FEE_RESIDUE_SCALE, ONE_MICROS,
 };
+pub use go_dump::{frame_invalid_txn, go_signed_txn_dump, mask_heartbeat_pointer};
 pub use rules::{
     compute_group_id, consensus_params_for_version, has_heartbeat, is_free_heartbeat,
     max_txn_bytes_per_block, validate_genesis_consistency, validate_group_fees,

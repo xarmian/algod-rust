@@ -26,9 +26,10 @@
 //! `SignedTxn` (top-level `pqsig` and PQ-delegated LogicSig) and runs it
 //! through `verify.TxnGroup`, recording the error text of `PQSig.Verify` /
 //! `VerifyFalcon1024` as wrapped by `stxnCoreChecks` /
-//! `logicSigSanityCheckBatchPrep` (go's `transaction %+v invalid : ` struct
-//! dump frame is stripped by the oracle). Each case is decoded here from go's
-//! own bytes and verified the way the pool does.
+//! `logicSigSanityCheckBatchPrep`, in full: go's `transaction %+v invalid : `
+//! struct-dump frame is stripped here and compared in `go_dump_test`. Each
+//! case is decoded here from go's own bytes and verified the way the pool
+//! does.
 
 use algo_avm::group::GroupBudget;
 use algo_error::AlgoError;
@@ -71,7 +72,19 @@ fn pq_failure_texts_match_go_on_the_pool_path() {
         assert_eq!(group.len(), 1, "{name}");
         let protocol = case["protocol"].as_str().unwrap();
         let consensus = consensus_params_for_version(protocol).expect("known protocol");
-        let want = case["want"].as_str().unwrap();
+        // go's text is recorded in full; these functions return the reason
+        // inside go's `transaction %+v invalid : ` frame, which the REST path
+        // adds (`go_dump_test` pins the frame itself, issue #2451).
+        let full = case["want"].as_str().unwrap();
+        let want = match full.find("} invalid : ") {
+            Some(at) if full.starts_with("transaction {") => &full[at + "} invalid : ".len()..],
+            _ => full,
+        };
+        assert_eq!(
+            case["framed"].as_bool().unwrap(),
+            want.len() != full.len(),
+            "{name}"
+        );
 
         let mut budget = GroupBudget::for_logicsig(1);
         let got = verify_transaction_signature(&group[0], &group, 0, &mut budget, &consensus)
