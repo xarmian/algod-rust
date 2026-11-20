@@ -4778,7 +4778,7 @@ crates/core/algo-ledger	inner_txn_ids_accumulate_across_submissions	crates/core/
 crates/core/algo-ledger	h1_nested_inner_txns_in_eval_delta	crates/core/algo-ledger/src/avm_context.rs	13922
 crates/core/algo-ledger	inner_appl_state_delta_without_logging_in_eval_delta	crates/core/algo-ledger/src/avm_context.rs	13983
 crates/core/algo-ledger	h2_asset_and_app_creation_ids_sequential	crates/core/algo-ledger/src/avm_context.rs	14049
-crates/core/algo-ledger	h3_clearstate_inner_appl_no_budget_inflation	crates/core/algo-ledger/src/avm_context.rs	14112
+crates/core/algo-ledger	h3_inner_clearstate_credits_pool_and_spends_its_cost	crates/core/algo-ledger/src/avm_context.rs	14112
 crates/core/algo-ledger	inner_clearstate_rejected_when_shared_budget_below_max_app_program_cost	crates/core/algo-ledger/src/avm_context.rs	14170
 crates/core/algo-ledger	h4_snapshot_includes_appl_accounts	crates/core/algo-ledger/src/avm_context.rs	14230
 crates/core/algo-ledger	h5_fee_credit_propagated_from_child	crates/core/algo-ledger/src/avm_context.rs	14299

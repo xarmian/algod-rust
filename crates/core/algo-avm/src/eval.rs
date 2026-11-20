@@ -374,13 +374,29 @@ pub fn run_clear_state_program(
     ctx: &mut dyn AvmContext,
     consensus: &ConsensusParams,
 ) -> AvmResult {
+    run_clear_state_program_costed(program, ctx, consensus).0
+}
+
+/// [`run_clear_state_program`], also returning the opcode cost the program
+/// consumed (go's `cx.cost`; 0 when it never ran).
+///
+/// go's `step()` deducts every opcode a ClearState program executes from
+/// the shared `PooledApplicationBudget` even though `remainingBudget()`
+/// caps the program itself at its isolated `MaxAppProgramCost`
+/// (`data/transactions/logic/eval.go`), so an inner ClearState call's
+/// caller needs this figure to keep the pool in step.
+pub fn run_clear_state_program_costed(
+    program: &[u8],
+    ctx: &mut dyn AvmContext,
+    consensus: &ConsensusParams,
+) -> (AvmResult, u64) {
     // Reject programs declaring a version above the active consensus
     // LogicSigVersion ceiling (go-algorand eval.go pre-eval check).
     if let Some(version) = bytecode::peek_version(program) {
         if crate::validator::check_program_version_allowed(version, consensus.logic_sig_version)
             .is_err()
         {
-            return AvmResult::empty();
+            return (AvmResult::empty(), 0);
         }
         // Reject a pre-sharedResources program (version < 9) invoked with a
         // non-empty tx.Access array (go-algorand eval.go `begin()`; see
@@ -388,12 +404,12 @@ pub fn run_clear_state_program(
         if crate::validator::check_pre_shared_resources_access(version, ctx.txn_has_access())
             .is_err()
         {
-            return AvmResult::empty();
+            return (AvmResult::empty(), 0);
         }
         // Reject programs below the group's minimum required AVM version
         // (go-algorand's computeMinAvmVersion floor; see AvmContext::min_avm_version).
         if crate::validator::check_min_avm_version(version, ctx.min_avm_version()).is_err() {
-            return AvmResult::empty();
+            return (AvmResult::empty(), 0);
         }
     }
 
@@ -401,7 +417,7 @@ pub fn run_clear_state_program(
         Ok(p) => p,
         Err(_) => {
             // Parse failure: reject with empty result.
-            return AvmResult::empty();
+            return (AvmResult::empty(), 0);
         }
     };
 
@@ -413,7 +429,7 @@ pub fn run_clear_state_program(
             let coverage = machine.opcode_coverage();
             let scratch = scratch_snapshot(&machine.scratch);
             // Program approved — extract accumulated state from the context.
-            AvmResult {
+            let result = AvmResult {
                 global_delta: ctx.take_global_delta(),
                 local_deltas: ctx.take_local_deltas(),
                 local_delta_order: ctx.take_local_delta_order(),
@@ -424,7 +440,8 @@ pub fn run_clear_state_program(
                 error_detail: None,
                 coverage,
                 scratch,
-            }
+            };
+            (result, machine.cost)
         }
         Ok(false) => {
             // Program cleanly rejected: return empty result with no
@@ -435,7 +452,7 @@ pub fn run_clear_state_program(
             let mut result = AvmResult::empty();
             result.coverage = machine.opcode_coverage();
             result.scratch = scratch_snapshot(&machine.scratch);
-            result
+            (result, machine.cost)
         }
         Err(e) => {
             // Program errored: return empty result but capture the error
@@ -460,7 +477,7 @@ pub fn run_clear_state_program(
             result.scratch = scratch_snapshot(&machine.scratch);
             result.error = Some(msg);
             result.error_detail = Some(detail);
-            result
+            (result, machine.cost)
         }
     }
 }
@@ -708,6 +725,17 @@ pub fn run_clear_state_program_with_tracer(
     consensus: &ConsensusParams,
     tracer: &mut dyn EvalTracer,
 ) -> AvmResult {
+    run_clear_state_program_with_tracer_costed(program, ctx, consensus, tracer).0
+}
+
+/// [`run_clear_state_program_with_tracer`], also returning the opcode cost
+/// the program consumed -- see [`run_clear_state_program_costed`].
+pub fn run_clear_state_program_with_tracer_costed(
+    program: &[u8],
+    ctx: &mut dyn AvmContext,
+    consensus: &ConsensusParams,
+    tracer: &mut dyn EvalTracer,
+) -> (AvmResult, u64) {
     // Reject programs declaring a version above the active consensus
     // LogicSigVersion ceiling (go-algorand eval.go pre-eval check).
     if let Some(version) = bytecode::peek_version(program) {
@@ -716,14 +744,14 @@ pub fn run_clear_state_program_with_tracer(
         {
             tracer.before_program(ProgramType::ClearState, program_trace_hash(program));
             tracer.after_program(ProgramType::ClearState, false, Some(&e.to_string()));
-            return AvmResult::empty();
+            return (AvmResult::empty(), 0);
         }
         // Reject programs below the group's minimum required AVM version
         // (go-algorand's computeMinAvmVersion floor; see AvmContext::min_avm_version).
         if let Err(e) = crate::validator::check_min_avm_version(version, ctx.min_avm_version()) {
             tracer.before_program(ProgramType::ClearState, program_trace_hash(program));
             tracer.after_program(ProgramType::ClearState, false, Some(&e.to_string()));
-            return AvmResult::empty();
+            return (AvmResult::empty(), 0);
         }
     }
 
@@ -734,7 +762,7 @@ pub fn run_clear_state_program_with_tracer(
             // before/after calls even on parse errors.
             tracer.before_program(ProgramType::ClearState, program_trace_hash(program));
             tracer.after_program(ProgramType::ClearState, false, Some(&e.to_string()));
-            return AvmResult::empty();
+            return (AvmResult::empty(), 0);
         }
     };
 
@@ -749,7 +777,7 @@ pub fn run_clear_state_program_with_tracer(
             tracer.record_program_cost(ProgramType::ClearState, machine.cost);
             let coverage = machine.opcode_coverage();
             let scratch = scratch_snapshot(&machine.scratch);
-            AvmResult {
+            let result = AvmResult {
                 global_delta: ctx.take_global_delta(),
                 local_deltas: ctx.take_local_deltas(),
                 local_delta_order: ctx.take_local_delta_order(),
@@ -760,7 +788,8 @@ pub fn run_clear_state_program_with_tracer(
                 error_detail: None,
                 coverage,
                 scratch,
-            }
+            };
+            (result, machine.cost)
         }
         Ok(false) => {
             tracer.after_program(ProgramType::ClearState, false, None);
@@ -771,7 +800,7 @@ pub fn run_clear_state_program_with_tracer(
             let mut result = AvmResult::empty();
             result.coverage = machine.opcode_coverage();
             result.scratch = scratch_snapshot(&machine.scratch);
-            result
+            (result, machine.cost)
         }
         Err(e) => {
             let app_index = ctx.current_app_id();
@@ -790,7 +819,7 @@ pub fn run_clear_state_program_with_tracer(
             result.scratch = scratch_snapshot(&machine.scratch);
             result.error = Some(msg);
             result.error_detail = Some(detail);
-            result
+            (result, machine.cost)
         }
     }
 }
