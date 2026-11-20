@@ -1584,7 +1584,10 @@ fn row(goal: &Path, c: &Case) -> serde_json::Value {
     // An output that is not valid UTF-8 is kept byte for byte: masked through
     // the lossless `raw_text` form, then written as `base64:<bytes>`.
     let mask = |b: &[u8]| {
-        let mut t = algo_types::raw_text::encode(b).into_owned();
+        let mut t = match std::str::from_utf8(b) {
+            Ok(s) => s.to_string(),
+            Err(_) => algo_types::raw_text::encode(b).into_owned(),
+        };
         if !uname.is_empty() {
             t = t.replace(
                 &uname, "<UNAME>
