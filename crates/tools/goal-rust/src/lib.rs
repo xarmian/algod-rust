@@ -45,6 +45,7 @@ pub mod groups;
 pub mod kmdcontrol;
 pub mod nodecontrol;
 pub mod resource_resolution;
+pub mod transcode;
 pub mod wallet_token;
 
 /// goal-rust — CLI for interacting with Algorand.
@@ -71,7 +72,13 @@ pub struct Cli {
     ///
     /// Mirrors Go's `-d, --datadir stringArray` persistent flag
     /// (`commands.go:107`).
-    #[arg(short = 'd', long = "datadir", global = true, value_name = "PATH")]
+    #[arg(
+        short = 'd',
+        long = "datadir",
+        global = true,
+        value_name = "PATH",
+        value_parser = record_datadir
+    )]
     pub datadir: Vec<String>,
 
     /// Data directory for kmd.
@@ -193,7 +200,11 @@ pub enum RootCommand {
     Report,
 
     /// The current version of the Algorand daemon (algod).
-    Version,
+    Version {
+        /// Print all version info available.
+        #[arg(short = 'v', long = "verbose")]
+        verbose: bool,
+    },
 
     /// Manage wallets: encrypted collections of Algorand account keys.
     Wallet {
@@ -229,6 +240,47 @@ pub fn unimplemented(group: &str, leaf: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
+/// Every `-d` value of the command line, in order, wherever it stands:
+/// cobra's persistent `--datadir` string array collects them all (`goal -d
+/// a version -d b` is two data dirs), where clap keeps a global argument's
+/// values from one command level only. The value parser of `--datadir`
+/// records each value as clap meets it.
+static DATADIRS_SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn record_datadir(value: &str) -> Result<String, std::convert::Infallible> {
+    DATADIRS_SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(value.to_string());
+    Ok(value.to_string())
+}
+
+/// The `-d` values clap parsed (`seen`, not in command-line order: clap
+/// parses a value given before a subcommand after the subcommand's), in
+/// the order they stand in `argv`.
+fn in_argv_order(mut seen: Vec<String>, argv: &[String]) -> Vec<String> {
+    let mut ordered = Vec::with_capacity(seen.len());
+    let mut i = 1;
+    while i < argv.len() {
+        let a = argv[i].as_str();
+        let (value, used) = if a == "-d" || a == "--datadir" {
+            (argv.get(i + 1).map(String::as_str), 2)
+        } else if let Some(v) = a.strip_prefix("--datadir=") {
+            (Some(v), 1)
+        } else if let Some(v) = a.strip_prefix("-d").filter(|_| !a.starts_with("--")) {
+            (Some(v.strip_prefix('=').unwrap_or(v)), 1)
+        } else {
+            (None, 1)
+        };
+        if let Some(pos) = value.and_then(|v| seen.iter().position(|s| s == v)) {
+            ordered.push(seen.remove(pos));
+        }
+        i += used;
+    }
+    ordered.extend(seen);
+    ordered
+}
+
 /// Main entry. The binary in `src/main.rs` is a one-liner that calls
 /// this — keeping the dispatch table here lets integration tests
 /// reach the same code path without spawning a subprocess.
@@ -238,8 +290,24 @@ pub fn run() -> ExitCode {
         cobra_compat::Preflight::Run(args) => args,
         cobra_compat::Preflight::Exit(code) => return code,
     };
+    DATADIRS_SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    let argv: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     let cli = Cli::parse_from(args);
-    let datadirs: Vec<std::path::PathBuf> = cli.datadir.iter().map(Into::into).collect();
+    let seen = std::mem::take(
+        &mut *DATADIRS_SEEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    let datadirs: Vec<std::path::PathBuf> = in_argv_order(seen, &argv)
+        .into_iter()
+        .map(Into::into)
+        .collect();
     let kmddir = cli.kmddir.as_ref().map(Into::into);
     cli_state::install(datadirs, kmddir);
     if cli.version {
@@ -287,10 +355,36 @@ pub fn run() -> ExitCode {
         RootCommand::Node { cmd: None } => print_group_help(&["node"]),
         RootCommand::Protocols => unimplemented("", "protocols"),
         RootCommand::Report => unimplemented("", "report"),
-        RootCommand::Version => unimplemented("", "version"),
+        RootCommand::Version { verbose } => cmd::ledger::run_version(verbose, cli_state::datadirs()),
         RootCommand::Wallet { cmd: Some(c), .. } => groups::wallet::run(c),
         RootCommand::Wallet { cmd: None, default } => {
             cmd::wallet::run_root(default, cli_state::datadirs(), cli_state::kmddir())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_dirs_keep_their_command_line_order() {
+        let argv = |s: &str| -> Vec<String> { s.split(' ').map(String::from).collect() };
+        let seen = |s: &[&str]| -> Vec<String> { s.iter().map(|x| x.to_string()).collect() };
+        assert_eq!(
+            in_argv_order(seen(&["/b", "/a"]), &argv("goal -d /a node lastround -d /b")),
+            seen(&["/a", "/b"])
+        );
+        assert_eq!(
+            in_argv_order(
+                seen(&["/c", "/b", "/a"]),
+                &argv("goal --datadir=/a node -d/b lastround --datadir /c")
+            ),
+            seen(&["/a", "/b", "/c"])
+        );
+        assert_eq!(
+            in_argv_order(seen(&["/x", "/x"]), &argv("goal -d /x version -d /x")),
+            seen(&["/x", "/x"])
+        );
     }
 }

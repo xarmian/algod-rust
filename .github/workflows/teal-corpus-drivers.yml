@@ -38,6 +38,8 @@ on:
       - "crates/tools/goal-rust/**"
       - "crates/core/algo-codec/src/logicsig_go.rs"
       - "crates/core/algo-codec/tests/common/**"
+      - "bin/kmd-rust/**"
+      - "crates/node/algo-kmd/**"
       - ".github/workflows/teal-corpus-drivers.yml"
   push:
     branches: [main]
@@ -66,6 +68,8 @@ on:
       - "crates/tools/goal-rust/**"
       - "crates/core/algo-codec/src/logicsig_go.rs"
       - "crates/core/algo-codec/tests/common/**"
+      - "bin/kmd-rust/**"
+      - "crates/node/algo-kmd/**"
       - ".github/workflows/teal-corpus-drivers.yml"
   workflow_dispatch:
 
@@ -269,3 +273,8 @@ jobs:
           # (go1.25.3, as released): a newer `stable` go changes
           # encoding/json's error texts.
           GOTOOLCHAIN=go1.25.3 MIXED_CLUSTER=1 cargo test -p goal-rust --test goal_client_e2e -- --nocapture
+          # #2460: `ledger block` (go's msgpack-to-JSON transcode), `version`,
+          # `account list` (the one wallet ensureWalletHandle picks) and
+          # errorRequestFail against a mock algod; fixtures/goal_algod_reads.jsonl
+          # is go's output (a stale one fails goal_algod_reads_fixture_matches_go_goal).
+          GOTOOLCHAIN=go1.25.3 MIXED_CLUSTER=1 cargo test -p goal-rust --test goal_algod_reads_e2e -- --nocapture

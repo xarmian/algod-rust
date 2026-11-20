@@ -486,13 +486,38 @@ fn http() -> reqwest::Client {
         .unwrap_or_default()
 }
 
-/// go: `HTTPError.Error()` is `HTTP <status>: <message>`, where the message is
-/// the `message` field of the node's JSON error body when there is one.
+/// go: `HTTPError.Error()` is `HTTP <status>: <message>` (`extractError`):
+/// the message is the body decoded as a `model.ErrorResponse` (its
+/// `message`, matched case-insensitively like `encoding/json`), else the
+/// raw body, keeping only printable ASCII (`filterASCII`).
 pub fn http_error_text(status: reqwest::StatusCode, body: &str) -> String {
-    let message = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("message").and_then(|m| m.as_str().map(String::from)))
-        .unwrap_or_else(|| body.trim().to_string());
+    let decoded = match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(serde_json::Value::Null) => Some(String::new()),
+        Ok(serde_json::Value::Object(m)) => {
+            let field = |name: &str| {
+                m.iter()
+                    .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v)
+                    .next_back()
+            };
+            let message = match field("message") {
+                None | Some(serde_json::Value::Null) => Some(String::new()),
+                Some(serde_json::Value::String(s)) => Some(s.clone()),
+                Some(_) => None,
+            };
+            let data_ok = matches!(
+                field("data"),
+                None | Some(serde_json::Value::Null) | Some(serde_json::Value::Object(_))
+            );
+            message.filter(|_| data_ok)
+        }
+        _ => None,
+    };
+    let message: String = decoded
+        .unwrap_or_else(|| body.to_string())
+        .chars()
+        .filter(|c| (' '..='~').contains(c))
+        .collect();
     format!("HTTP {status}: {message}")
 }
 

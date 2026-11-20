@@ -277,7 +277,7 @@ fn run_send_inner(
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| format!("Request failed: {e}"))?;
+        .map_err(|e| format!("Error processing command: {e}"))?;
 
     // The wallet (kmd) is only needed when no LogicSig source was supplied AND we
     // intend to sign: `signTx := sign || (out == "")` (clerk.go:495). With a
@@ -2729,65 +2729,7 @@ pub(crate) fn resolve_wallet_and_init(
     password_flag: Option<&str>,
 ) -> Result<(String, String, String), String> {
     let (wallet_id, wallet_name) =
-        match wallet_flag {
-            Some(name) => {
-                let listed = rt
-                    .block_on(client.list_wallets())
-                    .map_err(|e| format!("Request failed: {}", kmd_msg(&e)))?;
-                let mut matched: Option<String> = None;
-                for w in listed.wallets {
-                    if w.name == name {
-                        if matched.is_some() {
-                            return Err(format!(
-                                "Wallet name '{name}' is ambiguous; multiple wallets share it."
-                            ));
-                        }
-                        matched = Some(w.id);
-                    }
-                }
-                match matched {
-                    Some(id) => (id, name.to_string()),
-                    None => return Err(format!("Could not find a wallet named '{name}'.")),
-                }
-            }
-            None => {
-                let mut wallet_id = accounts.default_wallet_id.clone();
-                let mut wallet_name = String::new();
-                if wallet_id.is_empty() {
-                    let listed = rt
-                        .block_on(client.list_wallets())
-                        .map_err(|e| format!("Request failed: {}", kmd_msg(&e)))?;
-                    match listed.wallets.len() {
-                        0 => {
-                            return Err("No wallets found. Create a new wallet with `goal wallet \
-                                 new [wallet name]`"
-                                .to_string())
-                        }
-                        1 => {
-                            wallet_id = listed.wallets[0].id.clone();
-                            wallet_name = listed.wallets[0].name.clone();
-                            let _ = accounts.set_default_wallet_id(&wallet_id);
-                        }
-                        _ => {
-                            return Err("No default wallet found. Specify a wallet by name with \
-                                 -w, or set a default with `goal wallet -f [wallet name]"
-                                .to_string())
-                        }
-                    }
-                }
-                if wallet_name.is_empty() {
-                    if let Ok(listed) = rt.block_on(client.list_wallets()) {
-                        for w in listed.wallets {
-                            if w.id == wallet_id {
-                                wallet_name = w.name;
-                                break;
-                            }
-                        }
-                    }
-                }
-                (wallet_id, wallet_name)
-            }
-        };
+        crate::cmd::account::wallet_id_and_name(rt, client, accounts, wallet_flag)?;
 
     let (handle, password) = crate::wallet_token::wallet_handle_and_password(
         rt,

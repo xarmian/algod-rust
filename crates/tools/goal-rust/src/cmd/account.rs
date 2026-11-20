@@ -65,9 +65,8 @@ const ERROR_NAME_ALREADY_TAKEN: &str =
 /// Mirrors `messages.go:38` (`errorNameDoesntExist`).
 const ERROR_NAME_DOESNT_EXIST: &str = "An account named '{}' does not exist.";
 
-/// Mirrors Go's generic `errorRequestFail` template
-/// (`messages.go:46`).
-const ERROR_REQUEST_FAIL: &str = "Request failed: {}";
+/// go: `errorRequestFail` (`cmd/goal/messages.go`).
+pub(crate) const ERROR_REQUEST_FAIL: &str = "Error processing command: {}";
 
 /// go: `errNoWallets` / `errNoDefaultWallet` (`cmd/goal/messages.go`).
 const ERROR_NO_WALLETS: &str =
@@ -208,6 +207,10 @@ pub fn run_new(args: NewArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>
 
 // ---- account list ---------------------------------------------------------
 
+/// Port of `listCmd` (`account.go`): the accounts of the one wallet go's
+/// `ensureWalletHandle` picks (`-w`, else the default wallet, else the
+/// only one), each with what algod knows of it (`outputAccount`), and
+/// with `--info` its assets and apps (`printAccountInfo`).
 pub fn run_list(args: ListArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>) -> ExitCode {
     let data_dir_path = match data_dir::ensure_single_data_dir(&cli_d) {
         Ok(d) => d,
@@ -217,12 +220,13 @@ pub fn run_list(args: ListArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBu
         }
     };
     // go builds the accounts list first (account.go:508).
-    let accounts = match load_accounts(&data_dir_path) {
+    let mut accounts = match load_accounts(&data_dir_path) {
         Ok(a) => a,
         Err(()) => return ExitCode::from(1),
     };
-    let _ = kmd_dir_flag;
-    let client = match build_wallet_handle_kmd_client(&data_dir_path) {
+    // go: `ensureWalletHandle(dataDir, walletName)`, whose own kmd client
+    // fails with `kmd client init error: ...` (issue #2454).
+    let wh_client = match build_wallet_handle_kmd_client(&data_dir_path) {
         Ok(c) => c,
         Err(()) => return ExitCode::from(1),
     };
@@ -230,194 +234,161 @@ pub fn run_list(args: ListArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBu
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
     };
+    let (handle, _wallet_name, _pw) = match resolve_wallet_no_password(
+        &rt,
+        &wh_client,
+        &mut accounts,
+        args.wallet.as_deref(),
+        args.password.as_deref(),
+    ) {
+        Ok(v) => v,
+        Err(()) => return ExitCode::from(1),
+    };
+    // go: `client := ensureKmdClient(dataDir)`.
+    let client = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
 
-    // Enumerate wallets (filtered by -w if given).
-    let listed = match rt.block_on(client.list_wallets()) {
-        Ok(l) => l.wallets,
+    // go: `client.ListAddressesWithInfo(wh)` -- the keys, then the
+    // multisig addresses.
+    let listed = rt.block_on(async {
+        let keys = client.list_keys(&handle).await?.addresses;
+        let msigs = client.list_multisig_addrs(&handle).await?.addresses;
+        Ok::<_, KmdError>((keys, msigs))
+    });
+    let (keys, msigs) = match listed {
+        Ok(l) => l,
         Err(e) => {
             eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&kmd_msg(&e)]));
             return ExitCode::from(1);
         }
     };
-    let wallets: Vec<_> = match &args.wallet {
-        Some(name) => {
-            let filtered: Vec<_> = listed.into_iter().filter(|w| &w.name == name).collect();
-            // An explicit -w that matches nothing should error rather
-            // than silently print infoNoAccounts (Codex round-1 P2 — a
-            // typo'd wallet name was previously indistinguishable from
-            // an empty wallet). No -w + no wallets ⇒ still prints
-            // infoNoAccounts below.
-            if filtered.is_empty() {
-                eprintln!("Could not find a wallet named '{name}'.");
-                return ExitCode::from(1);
-            }
-            filtered
-        }
-        None => listed,
-    };
-    if wallets.is_empty() {
-        // go's `ensureWalletHandle` with no wallet at all: `errNoWallets`
-        // (`getWalletHandleMaybePassword`), exit 1 (issue #2454).
-        if accounts.default_wallet_id.is_empty() {
-            eprintln!("{ERROR_NO_WALLETS}");
-            return ExitCode::from(1);
-        }
+    if keys.is_empty() && msigs.is_empty() {
         println!("{INFO_NO_ACCOUNTS}");
         return ExitCode::SUCCESS;
     }
 
-    // Optional REST client for balances. Failure to read algod files
-    // is non-fatal — we still list addresses with `[n/a]` balance.
+    // `client.AccountInformation(addr, true)` builds the algod client on
+    // first use; any failure leaves the account `[n/a]`.
     let algod = build_algod_endpoint(&data_dir_path);
-
-    // Collect every (address, wallet_name) pair. init_wallet requires
-    // a password; for non-interactive use, --password applies to ALL
-    // wallets (kmd's single-password mode).
-    let mut rows: Vec<AccountRow> = Vec::new();
-    let mut had_kmd_error = false;
-    for w in &wallets {
-        // go's `ensureWalletHandle` (getPassword = false): the cached handle
-        // token, a prompt only when none could be had without the password.
-        let (handle, _pw) = match crate::wallet_token::wallet_handle_and_password(
-            &rt,
-            &client,
-            &data_dir_path,
-            &w.id,
-            &w.name,
-            args.password.as_deref(),
-            false,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("{e}");
-                return ExitCode::from(1);
+    let mut account_info_error = false;
+    let listed = keys
+        .into_iter()
+        .map(|a| (a, false))
+        .chain(msigs.into_iter().map(|a| (a, true)));
+    for (addr, multisig) in listed {
+        let info = algod
+            .as_ref()
+            .and_then(|ep| account_information(&rt, ep, &addr))
+            .unwrap_or_else(|| serde_json::json!({}));
+        let msig = if multisig {
+            match rt.block_on(client.export_multisig(&handle, &addr)) {
+                Ok(m) => Some((m.threshold, m.pks.len())),
+                Err(e) => {
+                    println!("multisig lookup err");
+                    eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&kmd_msg(&e)]));
+                    return ExitCode::from(1);
+                }
             }
+        } else {
+            None
         };
-        let key_list = match rt.block_on(client.list_keys(&handle)) {
-            Ok(r) => r.addresses,
-            Err(e) => {
-                eprintln!(
-                    "Could not list keys for wallet '{}': {}",
-                    w.name,
-                    kmd_msg(&e)
-                );
-                had_kmd_error = true;
-                continue;
+        match output_account(&accounts, &addr, &info, msig) {
+            Ok(line) => println!("{line}"),
+            Err(status) => {
+                // go panics here (`outputAccount`)
+                eprintln!("panic: unexpected account status: {status}");
+                return ExitCode::from(2);
             }
-        };
-        // Multisig preimages are stored separately in kmd; Go's
-        // ListAddressesWithInfo returns the union AND surfaces an
-        // error if ListMultisigAddrs fails (mirror that — a silent
-        // unwrap_or_default would let a wallet that holds only msig
-        // preimages print infoNoAccounts and exit 0).
-        let msig_list = match rt.block_on(client.list_multisig_addrs(&handle)) {
-            Ok(r) => r.addresses,
-            Err(e) => {
-                eprintln!(
-                    "Could not list multisig accounts for wallet '{}': {}",
-                    w.name,
-                    kmd_msg(&e)
-                );
-                had_kmd_error = true;
-                continue;
-            }
-        };
-
-        for addr in key_list {
-            rows.push(AccountRow {
-                address: addr,
-                wallet_name: w.name.clone(),
-                is_multisig: false,
-            });
         }
-        for addr in msig_list {
-            rows.push(AccountRow {
-                address: addr,
-                wallet_name: w.name.clone(),
-                is_multisig: true,
-            });
+        if args.info {
+            let held = held_asset_params(&rt, algod.as_ref(), &info, false);
+            let (report, errors, has_error) = format_info(&info, &held, false);
+            eprint!("{errors}");
+            print!("{report}");
+            account_info_error |= has_error;
         }
     }
-
-    if rows.is_empty() {
-        println!("{INFO_NO_ACCOUNTS}");
-        return if had_kmd_error {
-            ExitCode::from(1)
-        } else {
-            ExitCode::SUCCESS
-        };
-    }
-
-    // Fetch balances + statuses (best-effort).
-    let mut any_balance_error = false;
-    for row in &rows {
-        let (status, amount) = match &algod {
-            Some((base, token)) => fetch_status_and_amount(&rt, base, token, &row.address)
-                .unwrap_or_else(|_| {
-                    any_balance_error = true;
-                    ("n/a".to_string(), None)
-                }),
-            None => {
-                any_balance_error = true;
-                ("n/a".to_string(), None)
-            }
-        };
-        // Go's getNameByAddress falls back to the address itself when
-        // no friendly name is registered (accountsList.go:174-177);
-        // `AccountsList::name_for` already does that. Use as-is —
-        // earlier `<no name>` placeholder broke the fixed-column
-        // contract (Codex round-2 finding).
-        let name_display = accounts.name_for(&row.address);
-        let amount_display = match amount {
-            Some(a) => format!("{a} microAlgos"),
-            None => "[n/a] microAlgos".to_string(),
-        };
-        // Column order matches Go's outputAccount (accountsList.go:207-280):
-        // `[status]\t<name>\t<address>\t<amount> microAlgos[\t*Default]`.
-        // Round-1 Codex review flagged that the earlier prefix-`*` /
-        // address-before-name layout broke existing scripts that key
-        // on field position.
-        let default_suffix = if accounts.is_default(&row.address) {
-            "\t*Default"
-        } else {
-            ""
-        };
-        let multisig_suffix = if row.is_multisig {
-            // Go renders `\t[N/M multisig]` after the amount; we
-            // don't yet know N/M without an export_multisig call
-            // per address, so emit the constant marker. B8's
-            // multisig leaves can fill in the threshold later.
-            "\t[multisig]"
-        } else {
-            ""
-        };
-        println!(
-            "[{status}]\t{name_display}\t{}\t{amount_display}{multisig_suffix}{default_suffix}",
-            row.address
-        );
-    }
-
-    if had_kmd_error {
+    if account_info_error {
         ExitCode::from(1)
     } else {
-        // Balance fetch failures are non-fatal — Go's listCmd also
-        // proceeds without algod info when AccountInformation errors
-        // (account.go:519 "it's okay to proceed without algod info").
-        let _ = any_balance_error;
         ExitCode::SUCCESS
     }
 }
 
-struct AccountRow {
-    address: String,
-    // wallet_name kept for future per-wallet headers (multi-wallet
-    // grouping when len > 1). Currently informational only.
-    #[allow(dead_code)]
-    wallet_name: String,
-    /// True if this address came from `list_multisig_addrs` rather
-    /// than `list_keys`. Used to render `[multisig]` suffix matching
-    /// Go's outputAccount path.
-    is_multisig: bool,
+/// go's `AccountsList.outputAccount`: one `account list` line (without the
+/// newline). `Err` is a status go's switch does not know (go panics).
+fn output_account(
+    accounts: &AccountsList,
+    addr: &str,
+    info: &serde_json::Value,
+    multisig: Option<(u8, usize)>,
+) -> Result<String, String> {
+    use std::fmt::Write as _;
+    let name = accounts.name_for(addr);
+    let mut line = match info.get("address").and_then(|a| a.as_str()) {
+        None | Some("") => format!("[n/a]\t{name}\t{addr}\t[n/a] microAlgos"),
+        Some(_) => {
+            let status = info.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            let status = match status {
+                "Online" => "online",
+                "Offline" => "offline",
+                "Not Participating" => "excluded",
+                other => return Err(other.to_string()),
+            };
+            let amount = info.get("amount").and_then(|a| a.as_u64()).unwrap_or(0);
+            format!("[{status}]\t{name}\t{addr}\t{amount} microAlgos")
+        }
+    };
+    if let Some((threshold, pks)) = multisig {
+        let _ = write!(line, "\t[{threshold}/{pks} multisig]");
+    }
+    let list = |key: &str| {
+        info.get(key)
+            .and_then(|a| a.as_array())
+            .filter(|a| !a.is_empty())
+    };
+    if let Some(assets) = list("created-assets") {
+        let out: Vec<String> = assets
+            .iter()
+            .map(|a| {
+                let params = a.get("params");
+                let field = |k: &str| params.and_then(|p| p.get(k));
+                let unit = field("unit-name")
+                    .and_then(|u| u.as_str())
+                    .map(|u| crate::formatting::unicode_printable(u).1)
+                    .unwrap_or_default();
+                format!(
+                    "{} ({} {unit})",
+                    a.get("index").and_then(|i| i.as_u64()).unwrap_or(0),
+                    field("total").and_then(|t| t.as_u64()).unwrap_or(0)
+                )
+            })
+            .collect();
+        let _ = write!(line, "\t[created asset IDs: {}]", out.join(", "));
+    }
+    let ids = |apps: &Vec<serde_json::Value>| {
+        apps.iter()
+            .map(|a| {
+                a.get("id")
+                    .and_then(|i| i.as_u64())
+                    .unwrap_or(0)
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if let Some(apps) = list("created-apps") {
+        let _ = write!(line, "\t[created app IDs: {}]", ids(apps));
+    }
+    if let Some(apps) = list("apps-local-state") {
+        let _ = write!(line, "\t[opted in app IDs: {}]", ids(apps));
+    }
+    if accounts.is_default(addr) {
+        line.push_str("\t*Default");
+    }
+    Ok(line)
 }
 
 /// Resolve algod base URL + token for the data dir. Returns None when
@@ -465,46 +436,29 @@ fn build_algod_endpoint(data_dir_path: &Path) -> Option<(String, String)> {
     Some((base, tok))
 }
 
-fn fetch_status_and_amount(
+/// go's `client.AccountInformation(addr, true)`: the account as algod
+/// reports it, `None` on any failure.
+fn account_information(
     rt: &tokio::runtime::Runtime,
-    base: &str,
-    token: &str,
+    endpoint: &(String, String),
     address: &str,
-) -> Result<(String, Option<u64>), String> {
-    let url = format!("{}/v2/accounts/{}", base.trim_end_matches('/'), address);
+) -> Option<serde_json::Value> {
+    let url = format!(
+        "{}/v2/accounts/{}?exclude=none&format=json",
+        endpoint.0.trim_end_matches('/'),
+        address
+    );
     rt.block_on(async {
-        let http = reqwest::Client::new();
-        let resp = http
+        let resp = reqwest::Client::new()
             .get(&url)
-            .header("X-Algo-API-Token", token)
+            .header("X-Algo-API-Token", &endpoint.1)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
-        let status = resp.status();
-        let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-        if !status.is_success() {
-            return Err(format!("HTTP {}", status.as_u16()));
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
         }
-        let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        let status_str = match v.get("status").and_then(|s| s.as_str()) {
-            Some("Online") => "online",
-            Some("Offline") => "offline",
-            // Go renders NotParticipating as `[excluded]`
-            // (accountsList.go:217-218, matching `basics.NotParticipating
-            // .String()` == "Not Participating", with a space). Match for
-            // parity -- verified live against go-algorand v4.6.0-stable
-            // (issue #129) that this is the actual wire value.
-            Some("Not Participating") => "excluded",
-            Some(other) => {
-                // Pass through anything algod returns we don't model;
-                // matches the spirit of Go's switch+default-panic by
-                // surfacing the verbatim status instead.
-                return Ok((other.to_string(), v.get("amount").and_then(|a| a.as_u64())));
-            }
-            None => "n/a",
-        };
-        let amount = v.get("amount").and_then(|a| a.as_u64());
-        Ok::<_, String>((status_str.to_string(), amount))
+        serde_json::from_slice(&resp.bytes().await.ok()?).ok()
     })
 }
 
@@ -746,71 +700,8 @@ fn resolve_wallet(
     get_password: bool,
 ) -> Result<(String, String, String), ()> {
     // 1. Resolve wallet ID + name.
-    let (wallet_id, wallet_name) = match wallet_flag {
-        Some(name) => {
-            // Find by name.
-            let listed = rt.block_on(client.list_wallets()).map_err(|e| {
-                eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&kmd_msg(&e)]));
-            })?;
-            let mut matched: Option<String> = None;
-            for w in listed.wallets {
-                if w.name == name {
-                    if matched.is_some() {
-                        eprintln!("Wallet name '{name}' is ambiguous; multiple wallets share it.");
-                        return Err(());
-                    }
-                    matched = Some(w.id);
-                }
-            }
-            match matched {
-                Some(id) => (id, name.to_string()),
-                None => {
-                    eprintln!("Could not find a wallet named '{name}'.");
-                    return Err(());
-                }
-            }
-        }
-        None => {
-            // No -w: use accountList.json's default, or fall back to
-            // single-wallet auto-promote.
-            let mut wallet_id = accounts.default_wallet_id.clone();
-            let mut wallet_name = String::new();
-            if wallet_id.is_empty() {
-                let listed = rt.block_on(client.list_wallets()).map_err(|e| {
-                    eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&kmd_msg(&e)]));
-                })?;
-                match listed.wallets.len() {
-                    0 => {
-                        eprintln!("{ERROR_NO_WALLETS}");
-                        return Err(());
-                    }
-                    1 => {
-                        wallet_id = listed.wallets[0].id.clone();
-                        wallet_name = listed.wallets[0].name.clone();
-                        // Promote to default (best-effort, mirrors Go's
-                        // accountList.setDefaultWalletID call).
-                        let _ = accounts.set_default_wallet_id(&wallet_id);
-                    }
-                    _ => {
-                        eprintln!("{ERROR_NO_DEFAULT_WALLET}");
-                        return Err(());
-                    }
-                }
-            }
-            if wallet_name.is_empty() {
-                // Look up name for prompting / error messages.
-                if let Ok(listed) = rt.block_on(client.list_wallets()) {
-                    for w in listed.wallets {
-                        if w.id == wallet_id {
-                            wallet_name = w.name;
-                            break;
-                        }
-                    }
-                }
-            }
-            (wallet_id, wallet_name)
-        }
-    };
+    let (wallet_id, wallet_name) =
+        wallet_id_and_name(rt, client, accounts, wallet_flag).map_err(|e| eprintln!("{e}"))?;
 
     // 2. The (cached) wallet handle token and the password.
     let (handle, password) = crate::wallet_token::wallet_handle_and_password(
@@ -828,7 +719,78 @@ fn resolve_wallet(
     Ok((handle, wallet_name, password))
 }
 
-fn kmd_msg(e: &KmdError) -> String {
+/// The wallet ID and name of go's `getWalletHandleMaybePassword`
+/// (`cmd/goal/commands.go`): the wallet named by `-w`, else the default
+/// wallet of the accounts list, else the only wallet kmd has (made the
+/// default). `Err` is go's error text.
+pub(crate) fn wallet_id_and_name(
+    rt: &tokio::runtime::Runtime,
+    client: &KmdClient,
+    accounts: &mut AccountsList,
+    wallet_flag: Option<&str>,
+) -> Result<(String, String), String> {
+    let wallets = || {
+        rt.block_on(client.list_wallets())
+            .map(|l| l.wallets)
+            .map_err(|e| kmd_msg(&e))
+    };
+    match wallet_flag.filter(|n| !n.is_empty()) {
+        Some(name) => {
+            // `FindWalletIDByName`
+            let listed = wallets().map_err(|e| format!("Couldn't find wallet: {e}"))?;
+            let matching: Vec<_> = listed.iter().filter(|w| w.name == name).collect();
+            if matching.len() > 1 {
+                return Err(format!(
+                    "More than one wallet named '{name}' exists. Please remove any wallets                      with the same name from the kmd wallet directory"
+                ));
+            }
+            match matching.last() {
+                Some(w) if !w.id.is_empty() => Ok((w.id.clone(), name.to_string())),
+                _ => Err(format!("Wallet '{name}' not found")),
+            }
+        }
+        None => {
+            let mut wallet_id = accounts.default_wallet_id.clone();
+            if wallet_id.is_empty() {
+                let listed = wallets().map_err(|e| format!("Couldn't list wallets: {e}"))?;
+                match listed.len() {
+                    0 => return Err(ERROR_NO_WALLETS.to_string()),
+                    1 => {
+                        wallet_id = listed[0].id.clone();
+                        let _ = accounts.set_default_wallet_id(&wallet_id);
+                    }
+                    _ => return Err(ERROR_NO_DEFAULT_WALLET.to_string()),
+                }
+            }
+            // `FindWalletNameByID`: a duplicate before an error
+            let listed = wallets();
+            let matching: Vec<_> = listed
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter(|w| w.id == wallet_id)
+                .collect();
+            if matching.len() > 1 {
+                return Err(format!(
+                    "More than one wallet with ID '{wallet_id}' exists. Please remove any                      wallets with the samd ID from the kmd wallet directory"
+                ));
+            }
+            if let Err(e) = listed {
+                return Err(format!(
+                    "Couldn't get wallet name from ID '{wallet_id}': {e}"
+                ));
+            }
+            match matching.last() {
+                Some(w) if !w.name.is_empty() => Ok((wallet_id, w.name.clone())),
+                _ => Err(format!(
+                    "Wallet with ID '{wallet_id}' not found. Was the default wallet deleted?"
+                )),
+            }
+        }
+    }
+}
+
+pub(crate) fn kmd_msg(e: &KmdError) -> String {
     match e {
         KmdError::Api { message, .. } => message.clone(),
         other => other.to_string(),
@@ -2691,27 +2653,7 @@ pub fn run_info(args: InfoArgs, cli_d: Vec<PathBuf>) -> ExitCode {
     // fetch entirely. Mirrors Go's onlyShowAssetIDs branch
     // (account.go:660-664) which prints `\tID N\n` per holding without
     // an AssetInformation call.
-    let mut held_params: std::collections::HashMap<u64, AssetFetch> =
-        std::collections::HashMap::new();
-    if !args.only_show_asset_ids {
-        // An absent `assets` key and an empty array both mean "no holdings"
-        // (go always emits `assets`, `[]` when empty), so there is nothing to
-        // fetch. Without an algod endpoint every holding is `AssetFetch::Error`
-        // so the rendered row is `	ID N, error`.
-        for h in held_asset_entries(&v) {
-            let aid = h.get("asset-id").and_then(|x| x.as_u64()).unwrap_or(0);
-            let fetched = match &endpoint {
-                Some(ep) => match fetch_asset_params_with_status(&rt, ep, aid) {
-                    Ok((404, _)) => AssetFetch::Missing,
-                    Ok((_, Some(p))) => AssetFetch::Found(p),
-                    Ok((_, None)) => AssetFetch::Error,
-                    Err(_) => AssetFetch::Error,
-                },
-                None => AssetFetch::Error,
-            };
-            held_params.insert(aid, fetched);
-        }
-    }
+    let held_params = held_asset_params(&rt, endpoint.as_ref(), &v, args.only_show_asset_ids);
 
     let (report, errors, has_error) = format_info(&v, &held_params, args.only_show_asset_ids);
     if !errors.is_empty() {
@@ -2726,6 +2668,38 @@ pub fn run_info(args: InfoArgs, cli_d: Vec<PathBuf>) -> ExitCode {
 }
 
 // ---- read-path helpers ----------------------------------------------------
+
+/// The params of each asset `v` holds (go's `client.AssetInformation` in
+/// `printAccountInfo`), none with `only_show_asset_ids`.
+fn held_asset_params(
+    rt: &tokio::runtime::Runtime,
+    endpoint: Option<&(String, String)>,
+    v: &serde_json::Value,
+    only_show_asset_ids: bool,
+) -> std::collections::HashMap<u64, AssetFetch> {
+    let mut held_params = std::collections::HashMap::new();
+    if only_show_asset_ids {
+        return held_params;
+    }
+    // An absent `assets` key and an empty array both mean "no holdings"
+    // (go always emits `assets`, `[]` when empty), so there is nothing to
+    // fetch. Without an algod endpoint every holding is `AssetFetch::Error`
+    // so the rendered row is `	ID N, error`.
+    for h in held_asset_entries(v) {
+        let aid = h.get("asset-id").and_then(|x| x.as_u64()).unwrap_or(0);
+        let fetched = match endpoint {
+            Some(ep) => match fetch_asset_params_with_status(rt, ep, aid) {
+                Ok((404, _)) => AssetFetch::Missing,
+                Ok((_, Some(p))) => AssetFetch::Found(p),
+                Ok((_, None)) => AssetFetch::Error,
+                Err(_) => AssetFetch::Error,
+            },
+            None => AssetFetch::Error,
+        };
+        held_params.insert(aid, fetched);
+    }
+    held_params
+}
 
 fn build_algod_endpoint_from(cli_d: &[PathBuf]) -> Option<(String, String)> {
     let dd = data_dir::ensure_single_data_dir(cli_d).ok()?;
@@ -2767,10 +2741,9 @@ fn fetch_account_json(address: &str, cli_d: &[PathBuf]) -> Result<serde_json::Va
             eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
         })?;
         if !status.is_success() {
-            eprintln!(
-                "{}",
-                format_message(ERROR_REQUEST_FAIL, &[&format!("HTTP {}", status.as_u16())])
-            );
+            // go's `HTTPError`: `HTTP <status>: <message>`
+            let text = crate::cmd::node::http_error_text(status, &String::from_utf8_lossy(&bytes));
+            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&text]));
             return Err(());
         }
         serde_json::from_slice(&bytes).map_err(|e| {
