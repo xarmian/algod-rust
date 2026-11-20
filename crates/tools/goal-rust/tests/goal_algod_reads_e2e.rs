@@ -276,6 +276,9 @@ fn addr_bytes(i: u8) -> Vec<u8> {
         .to_vec()
 }
 
+/// The all-zero address.
+const ZERO_ADDRESS: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ";
+
 /// What the mock algod answers for `GET /v2/accounts/<addr>?format=msgpack`:
 /// go's `basics.AccountData`, as algod encodes it (`protocol.CodecHandle`).
 fn account_msgpack(addr: &str) -> Option<(u16, Vec<u8>)> {
@@ -374,6 +377,8 @@ fn account_msgpack(addr: &str) -> Option<(u16, Vec<u8>)> {
         ))
     } else if addr == key(2).1 {
         Some((200, mp_obj(&[])))
+    } else if addr == ZERO_ADDRESS {
+        Some((200, mp_obj(&[("algo", mp_u(5))])))
     } else if addr == key(3).1 {
         Some((200, mp_obj(&[("algo", mp_u(42)), ("onl", mp_u(2))])))
     } else if addr == key(4).1 {
@@ -698,6 +703,8 @@ struct Case {
     refused: bool,
     /// The data dir holds no `genesis.json`.
     no_genesis: bool,
+    /// The data dir holds a `consensus.json`.
+    consensus_json: bool,
 }
 
 fn case(name: &str, args: &[&str]) -> Case {
@@ -709,6 +716,7 @@ fn case(name: &str, args: &[&str]) -> Case {
         answers: Vec::new(),
         refused: false,
         no_genesis: false,
+        consensus_json: false,
     }
 }
 
@@ -1124,6 +1132,13 @@ fn info_cases() -> Vec<Case> {
         case("account dump bad address", &["account", "dump", "-a", "XYZ"]),
         case("account dump no address", &["account", "dump"]),
     ];
+    v.push(case(
+        "account dump zero address",
+        &["account", "dump", "-a", ZERO_ADDRESS],
+    ));
+    let mut c = case("protocols with consensus.json", &["protocols"]);
+    c.consensus_json = true;
+    v.push(c);
     let mut c = case("report failing", &["report"]);
     c.versions = Versions::Fail;
     v.push(c);
@@ -1156,21 +1171,183 @@ fn info_cases() -> Vec<Case> {
         body: br#"{"message":"Invalid API Token"}"#.to_vec(),
     }];
     v.push(c);
-    for (name, body) in [
-        ("account dump json answer", &br#"{"amount":5}"#[..]),
-        ("account dump unknown field", &[0x81, 0xa3, b'f', b'o', b'o', 0x01][..]),
-        ("account dump truncated", &[0x82, 0xa3, b'o', b'n', b'l', 0x01][..]),
-        ("account dump empty answer", &b""[..]),
-    ] {
+    let mut answers: Vec<(&str, Vec<u8>)> = vec![
+        ("account dump json answer", br#"{"amount":5}"#.to_vec()),
+        ("account dump unknown field", vec![0x81, 0xa3, b'f', b'o', b'o', 0x01]),
+        ("account dump truncated", vec![0x82, 0xa3, b'o', b'n', b'l', 0x01]),
+        ("account dump empty answer", Vec::new()),
+    ];
+    answers.extend(malformed_account_data());
+    for (name, body) in answers {
         let mut c = case(name, &["account", "dump", "-a", "<A1>"]);
         c.answers = vec![Answer {
             prefix: "/v2/accounts/",
             status: 200,
-            body: body.to_vec(),
+            body,
         }];
         v.push(c);
     }
     v
+}
+
+/// msgpack `basics.AccountData` answers go's msgp decoder accepts or fails
+/// in its own ways: the array form of a struct, nil, short and long fixed
+/// byte arrays, bin keys, type errors at each nesting, unknown fields in a
+/// struct decoded inline or by its own method, bounds.
+fn malformed_account_data() -> Vec<(&'static str, Vec<u8>)> {
+    let one = |k: &str, v: Vec<u8>| mp_obj(&[(k, v)]);
+    let imap1 = |v: Vec<u8>| mp_imap(&[(1, v)]);
+    let arr = |items: &[Vec<u8>]| {
+        let mut v = vec![0xdc];
+        v.extend_from_slice(&(items.len() as u16).to_be_bytes());
+        for i in items {
+            v.extend_from_slice(i);
+        }
+        v
+    };
+    let nils = |n: usize| arr(&vec![vec![0xc0]; n]);
+    let mut nested = vec![vec![0xc0]; 13];
+    // the 14th field, `Assets`: asset 3 holding `[7, true]`
+    nested.push(mp_imap(&[(3, vec![0x92, 0x07, 0xc3])]));
+    vec![
+        ("account dump string status", one("onl", s("x"))),
+        ("account dump array form", vec![0x92, 0x01, 0x05]),
+        ("account dump too many array fields", nils(23)),
+        ("account dump array form nested", arr(&nested)),
+        ("account dump nil", vec![0xc0]),
+        (
+            "account dump trailing bytes",
+            [one("algo", mp_u(9)), vec![0xc1, 0xc1]].concat(),
+        ),
+        ("account dump negative", one("algo", vec![0xff])),
+        (
+            "account dump negative int16",
+            one("ebase", vec![0xd1, 0xff, 0x00]),
+        ),
+        ("account dump status overflow", one("onl", mp_u(300))),
+        ("account dump invalid prefix", one("onl", vec![0xc1])),
+        ("account dump short vote", one("vote", mp_bin(&[1, 2, 3]))),
+        ("account dump long vote", one("vote", mp_bin(&[9; 40]))),
+        ("account dump vote as array", one("vote", vec![0x92, 0x01, 0x02])),
+        ("account dump vote as string", one("vote", s("abc"))),
+        ("account dump vote as int", one("vote", mp_u(5))),
+        (
+            "account dump bin key",
+            [vec![0x81], mp_bin(b"algo"), mp_u(7)].concat(),
+        ),
+        ("account dump int key", vec![0x81, 0x01, 0x02]),
+        (
+            "account dump nested unknown field",
+            one("apar", imap1(one("zz", mp_u(1)))),
+        ),
+        (
+            "account dump inline unknown field",
+            one("asset", imap1(one("zz", mp_u(1)))),
+        ),
+        (
+            "account dump schema unknown field",
+            one("appp", imap1(one("lsch", one("zz", mp_u(1))))),
+        ),
+        (
+            "account dump total schema unknown field",
+            one("tsch", one("zz", mp_u(1))),
+        ),
+        (
+            "account dump teal value unknown field",
+            one("appl", imap1(one("tkv", one("k", one("zz", mp_u(1)))))),
+        ),
+        (
+            "account dump teal key not a string",
+            one("appl", imap1(one("tkv", mp_imap(&[(5, mp_obj(&[]))])))),
+        ),
+        (
+            "account dump teal type",
+            one("appp", imap1(one("gs", one("k", one("tt", s("x")))))),
+        ),
+        (
+            "account dump asset key",
+            one("apar", mp_obj(&[("x", mp_obj(&[]))])),
+        ),
+        ("account dump asset map", one("apar", mp_u(1))),
+        ("account dump bool", one("ie", mp_u(1))),
+        (
+            "account dump decimals overflow",
+            one("apar", imap1(one("dc", mp_u(1 << 33)))),
+        ),
+        (
+            "account dump long unit name",
+            one("apar", imap1(one("un", s("123456789")))),
+        ),
+        (
+            "account dump unit name int",
+            one("apar", imap1(one("un", mp_u(5)))),
+        ),
+        (
+            "account dump unit name bin",
+            one("apar", imap1(one("un", mp_bin(b"U<")))),
+        ),
+        (
+            "account dump manager short",
+            one("apar", imap1(one("m", vec![0xc4, 0x05, 0x01]))),
+        ),
+        (
+            "account dump program as array",
+            one("appp", imap1(one("approv", vec![0x92, 0x06, 0x81]))),
+        ),
+        (
+            "account dump program bad byte",
+            one("appp", imap1(one("approv", vec![0x91, 0xcd, 0x01, 0x00]))),
+        ),
+        (
+            "account dump holding array form",
+            one("asset", imap1(vec![0x92, 0x05, 0xc3])),
+        ),
+        (
+            "account dump holding too many fields",
+            one("asset", imap1(vec![0x93, 0x05, 0xc3, 0xc0])),
+        ),
+        (
+            "account dump holding array bad",
+            one("asset", imap1(vec![0x92, 0x05, 0x05])),
+        ),
+        (
+            "account dump app array form",
+            one("appp", imap1(arr(&[mp_bin(&[1]), vec![0xc0], one("g", mp_obj(&[("ui", mp_u(4))]))]))),
+        ),
+        (
+            "account dump nil fields",
+            mp_obj(&[
+                ("algo", vec![0xc0]),
+                ("apar", vec![0xc0]),
+                ("ie", vec![0xc0]),
+                ("vote", vec![0xc0]),
+            ]),
+        ),
+        (
+            "account dump duplicate fields",
+            [
+                vec![0x84],
+                s("tsch"),
+                one("nui", mp_u(1)),
+                s("tsch"),
+                one("nbs", mp_u(2)),
+                s("vote"),
+                mp_bin(&[5; 32]),
+                s("vote"),
+                mp_bin(&[6; 2]),
+            ]
+            .concat(),
+        ),
+        (
+            "account dump truncated nested",
+            one("apar", vec![0x81, 0x01, 0x81, 0xa1, b't']),
+        ),
+        (
+            "account dump map32",
+            [vec![0xdf, 0, 0, 0, 1], s("algo"), mp_u(3)].concat(),
+        ),
+        ("account dump short map16", vec![0xde, 0x00]),
+    ]
 }
 
 /// What `uname -a` prints on this host: `goal report` prints it.
@@ -1303,6 +1480,10 @@ fn row(goal: &Path, c: &Case) -> serde_json::Value {
     });
     if !c.no_genesis {
         std::fs::write(dd.join("genesis.json"), GENESIS).unwrap();
+    }
+    if c.consensus_json {
+        let doc = serde_json::json!({"v7": {"MinBalance": 123}, "extra": {"MinBalance": 5}});
+        std::fs::write(dd.join("consensus.json"), doc.to_string()).unwrap();
     }
     let net = if c.refused {
         CLOSED_ALGOD.to_string()
