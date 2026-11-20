@@ -4540,8 +4540,8 @@ fn execute_inner_appl<L: LedgerStore>(
     caller_txids: CallerTxids,
 ) -> Result<crate::apply::InnerApplyData, AlgoError> {
     use algo_avm::eval::{
-        run_approval_program, run_approval_program_with_tracer, run_clear_state_program_costed,
-        run_clear_state_program_with_tracer_costed,
+        run_approval_program, run_approval_program_with_tracer, run_clear_state_program_pooled,
+        run_clear_state_program_with_tracer_pooled,
     };
     use algo_avm::group::GroupBudget;
 
@@ -4623,6 +4623,8 @@ fn execute_inner_appl<L: LedgerStore>(
     // ClearState (mirrors go's TestInnerClearStateBadCaller) must not be
     // able to "shortchange" the callee this way.
     if on_completion == ON_COMPLETION_CLEAR_STATE
+        && consensus.isolate_clear_state
+        && consensus.enable_app_cost_pooling
         && *opcode_budget < consensus.max_app_program_cost as i64
     {
         return Err(AlgoError::Avm {
@@ -4804,18 +4806,19 @@ fn execute_inner_appl<L: LedgerStore>(
     // ── Execute the program ──
     let avm_result = if on_completion == ON_COMPLETION_CLEAR_STATE {
         // ClearStateOC: run clear state program. On failure, still clear state.
-        let (result, cost) = if let Some(ref mut t) = tracer {
-            run_clear_state_program_with_tracer_costed(&program, &mut inner_ctx, &consensus, *t)
+        // Charged to the shared pool as go's `step()` charges it; `budget`
+        // is copied back into the shared pool below.
+        if let Some(ref mut t) = tracer {
+            run_clear_state_program_with_tracer_pooled(
+                &program,
+                &mut inner_ctx,
+                &consensus,
+                *t,
+                Some(&mut budget),
+            )
         } else {
-            run_clear_state_program_costed(&program, &mut inner_ctx, &consensus)
-        };
-        // The program is capped at its own isolated budget, but go's
-        // `step()` still deducts each opcode from the shared pool
-        // (`*cx.PooledApplicationBudget -= opcost`), which the check above
-        // guarantees holds at least `MaxAppProgramCost`. `budget` is copied
-        // back into the shared pool below.
-        budget.add(-(cost as i64));
-        result
+            run_clear_state_program_pooled(&program, &mut inner_ctx, &consensus, Some(&mut budget))
+        }
     } else {
         let res = if let Some(ref mut t) = tracer {
             run_approval_program_with_tracer(&program, &mut inner_ctx, &mut budget, *t)
@@ -6456,10 +6459,10 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 message: "itxn_begin without itxn_submit".to_string(),
             });
         }
-        // Per go-algorand IsolateClearState: clear state programs cannot
-        // issue inner transactions.
+        // go `opItxnBegin`: under IsolateClearState (v31+) clear state
+        // programs cannot issue inner transactions; at v30 they could.
         let on_completion = self.group[self.group_index].txn.on_completion;
-        if on_completion == ON_COMPLETION_CLEAR_STATE {
+        if self.consensus.isolate_clear_state && on_completion == ON_COMPLETION_CLEAR_STATE {
             return Err(AlgoError::Avm {
                 message: "clear state programs can not issue inner transactions".to_string(),
             });

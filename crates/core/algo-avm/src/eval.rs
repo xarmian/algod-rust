@@ -364,39 +364,81 @@ pub fn run_approval_program(
 /// On program failure: `approved = false`, no deltas/logs/inner txns are
 /// propagated, but local state is still cleared by the caller.
 ///
-/// ClearState budget is capped at `max_app_program_cost` from the consensus
-/// params (700 for V41), independent of the pooled budget. Per go-algorand
-/// `IsolateClearState`, this runs with its own isolated budget and does not
-/// draw from `GroupBudget`.
-///
+/// Runs with no shared pool: the program gets `max_app_program_cost` (go's
+/// `remainingBudget()` when `PooledApplicationBudget` is nil). Callers that
+/// evaluate a real group use [`run_clear_state_program_pooled`].
 pub fn run_clear_state_program(
     program: &[u8],
     ctx: &mut dyn AvmContext,
     consensus: &ConsensusParams,
 ) -> AvmResult {
-    run_clear_state_program_costed(program, ctx, consensus).0
+    run_clear_state_program_pooled(program, ctx, consensus, None)
 }
 
-/// [`run_clear_state_program`], also returning the opcode cost the program
-/// consumed (go's `cx.cost`; 0 when it never ran).
-///
-/// go's `step()` deducts every opcode a ClearState program executes from
-/// the shared `PooledApplicationBudget` even though `remainingBudget()`
-/// caps the program itself at its isolated `MaxAppProgramCost`
-/// (`data/transactions/logic/eval.go`), so an inner ClearState call's
-/// caller needs this figure to keep the pool in step.
-pub fn run_clear_state_program_costed(
+/// The budget a ClearState program starts with, go's `remainingBudget()`
+/// (`data/transactions/logic/eval.go`): under `IsolateClearState` (v31+) the
+/// program is capped at `MaxAppProgramCost - cx.cost` whatever the pool
+/// holds; before it, a ClearState program runs on the pool like an approval
+/// program; with no pool (pre-v30) it gets `MaxAppProgramCost`.
+fn clear_state_start_budget(consensus: &ConsensusParams, pool: Option<&GroupBudget>) -> i64 {
+    match pool {
+        Some(p) if !consensus.isolate_clear_state => p.remaining(),
+        _ => consensus.max_app_program_cost as i64,
+    }
+}
+
+/// Charges a ClearState run to the shared pool. go's `step()` takes every
+/// opcode out of `*cx.PooledApplicationBudget` even when `remainingBudget()`
+/// isolates the program (the pool only gives up `cx.cost`). Without
+/// isolation the machine ran on the pool itself, so its whole budget delta,
+/// inner transactions' credits included, is the pool's.
+fn charge_clear_state_to_pool(
+    consensus: &ConsensusParams,
+    pool: Option<&mut GroupBudget>,
+    start_budget: i64,
+    spent: Option<(u64, i64)>,
+) {
+    if let (Some(p), Some((cost, final_budget))) = (pool, spent) {
+        if consensus.isolate_clear_state {
+            p.add(-(cost as i64));
+        } else {
+            p.add(final_budget - start_budget);
+        }
+    }
+}
+
+/// [`run_clear_state_program`] for a program evaluated inside a group whose
+/// pooled app budget is `pool` (`None` when `EnableAppCostPooling` is off).
+/// The program's opcodes are charged to `pool` as go's `step()` charges
+/// them, see [`charge_clear_state_to_pool`]. The caller applies go's
+/// `IsolateClearState` low-budget gate before calling.
+pub fn run_clear_state_program_pooled(
     program: &[u8],
     ctx: &mut dyn AvmContext,
     consensus: &ConsensusParams,
-) -> (AvmResult, u64) {
+    pool: Option<&mut GroupBudget>,
+) -> AvmResult {
+    let start = clear_state_start_budget(consensus, pool.as_deref());
+    let (result, spent) = clear_state_body(program, ctx, consensus, start);
+    charge_clear_state_to_pool(consensus, pool, start, spent);
+    result
+}
+
+/// Runs the program on `start_budget`; also returns the machine's own cost
+/// and final budget when it ran at all.
+fn clear_state_body(
+    program: &[u8],
+    ctx: &mut dyn AvmContext,
+    consensus: &ConsensusParams,
+    start_budget: i64,
+) -> (AvmResult, Option<(u64, i64)>) {
     // Reject programs declaring a version above the active consensus
     // LogicSigVersion ceiling (go-algorand eval.go pre-eval check).
     if let Some(version) = bytecode::peek_version(program) {
         if crate::validator::check_program_version_allowed(version, consensus.logic_sig_version)
             .is_err()
         {
-            return (AvmResult::empty(), 0);
+            return (AvmResult::empty(), None);
         }
         // Reject a pre-sharedResources program (version < 9) invoked with a
         // non-empty tx.Access array (go-algorand eval.go `begin()`; see
@@ -404,12 +446,12 @@ pub fn run_clear_state_program_costed(
         if crate::validator::check_pre_shared_resources_access(version, ctx.txn_has_access())
             .is_err()
         {
-            return (AvmResult::empty(), 0);
+            return (AvmResult::empty(), None);
         }
         // Reject programs below the group's minimum required AVM version
         // (go-algorand's computeMinAvmVersion floor; see AvmContext::min_avm_version).
         if crate::validator::check_min_avm_version(version, ctx.min_avm_version()).is_err() {
-            return (AvmResult::empty(), 0);
+            return (AvmResult::empty(), None);
         }
     }
 
@@ -417,12 +459,11 @@ pub fn run_clear_state_program_costed(
         Ok(p) => p,
         Err(_) => {
             // Parse failure: reject with empty result.
-            return (AvmResult::empty(), 0);
+            return (AvmResult::empty(), None);
         }
     };
 
-    let clear_budget = consensus.max_app_program_cost as i64;
-    let mut machine = AvmMachine::new(parsed, ExecMode::Application, clear_budget);
+    let mut machine = AvmMachine::new(parsed, ExecMode::Application, start_budget);
 
     match machine.run(ctx) {
         Ok(true) => {
@@ -441,7 +482,7 @@ pub fn run_clear_state_program_costed(
                 coverage,
                 scratch,
             };
-            (result, machine.cost)
+            (result, Some((machine.cost, machine.budget)))
         }
         Ok(false) => {
             // Program cleanly rejected: return empty result with no
@@ -452,7 +493,7 @@ pub fn run_clear_state_program_costed(
             let mut result = AvmResult::empty();
             result.coverage = machine.opcode_coverage();
             result.scratch = scratch_snapshot(&machine.scratch);
-            (result, machine.cost)
+            (result, Some((machine.cost, machine.budget)))
         }
         Err(e) => {
             // Program errored: return empty result but capture the error
@@ -477,7 +518,7 @@ pub fn run_clear_state_program_costed(
             result.scratch = scratch_snapshot(&machine.scratch);
             result.error = Some(msg);
             result.error_detail = Some(detail);
-            (result, machine.cost)
+            (result, Some((machine.cost, machine.budget)))
         }
     }
 }
@@ -725,17 +766,30 @@ pub fn run_clear_state_program_with_tracer(
     consensus: &ConsensusParams,
     tracer: &mut dyn EvalTracer,
 ) -> AvmResult {
-    run_clear_state_program_with_tracer_costed(program, ctx, consensus, tracer).0
+    run_clear_state_program_with_tracer_pooled(program, ctx, consensus, tracer, None)
 }
 
-/// [`run_clear_state_program_with_tracer`], also returning the opcode cost
-/// the program consumed -- see [`run_clear_state_program_costed`].
-pub fn run_clear_state_program_with_tracer_costed(
+/// [`run_clear_state_program_pooled`] with an [`EvalTracer`] attached.
+pub fn run_clear_state_program_with_tracer_pooled(
     program: &[u8],
     ctx: &mut dyn AvmContext,
     consensus: &ConsensusParams,
     tracer: &mut dyn EvalTracer,
-) -> (AvmResult, u64) {
+    pool: Option<&mut GroupBudget>,
+) -> AvmResult {
+    let start = clear_state_start_budget(consensus, pool.as_deref());
+    let (result, spent) = clear_state_body_with_tracer(program, ctx, consensus, tracer, start);
+    charge_clear_state_to_pool(consensus, pool, start, spent);
+    result
+}
+
+fn clear_state_body_with_tracer(
+    program: &[u8],
+    ctx: &mut dyn AvmContext,
+    consensus: &ConsensusParams,
+    tracer: &mut dyn EvalTracer,
+    start_budget: i64,
+) -> (AvmResult, Option<(u64, i64)>) {
     // Reject programs declaring a version above the active consensus
     // LogicSigVersion ceiling (go-algorand eval.go pre-eval check).
     if let Some(version) = bytecode::peek_version(program) {
@@ -744,14 +798,14 @@ pub fn run_clear_state_program_with_tracer_costed(
         {
             tracer.before_program(ProgramType::ClearState, program_trace_hash(program));
             tracer.after_program(ProgramType::ClearState, false, Some(&e.to_string()));
-            return (AvmResult::empty(), 0);
+            return (AvmResult::empty(), None);
         }
         // Reject programs below the group's minimum required AVM version
         // (go-algorand's computeMinAvmVersion floor; see AvmContext::min_avm_version).
         if let Err(e) = crate::validator::check_min_avm_version(version, ctx.min_avm_version()) {
             tracer.before_program(ProgramType::ClearState, program_trace_hash(program));
             tracer.after_program(ProgramType::ClearState, false, Some(&e.to_string()));
-            return (AvmResult::empty(), 0);
+            return (AvmResult::empty(), None);
         }
     }
 
@@ -762,12 +816,11 @@ pub fn run_clear_state_program_with_tracer_costed(
             // before/after calls even on parse errors.
             tracer.before_program(ProgramType::ClearState, program_trace_hash(program));
             tracer.after_program(ProgramType::ClearState, false, Some(&e.to_string()));
-            return (AvmResult::empty(), 0);
+            return (AvmResult::empty(), None);
         }
     };
 
-    let clear_budget = consensus.max_app_program_cost as i64;
-    let mut machine = AvmMachine::new(parsed, ExecMode::Application, clear_budget);
+    let mut machine = AvmMachine::new(parsed, ExecMode::Application, start_budget);
 
     tracer.before_program(ProgramType::ClearState, program_trace_hash(program));
 
@@ -789,7 +842,7 @@ pub fn run_clear_state_program_with_tracer_costed(
                 coverage,
                 scratch,
             };
-            (result, machine.cost)
+            (result, Some((machine.cost, machine.budget)))
         }
         Ok(false) => {
             tracer.after_program(ProgramType::ClearState, false, None);
@@ -800,7 +853,7 @@ pub fn run_clear_state_program_with_tracer_costed(
             let mut result = AvmResult::empty();
             result.coverage = machine.opcode_coverage();
             result.scratch = scratch_snapshot(&machine.scratch);
-            (result, machine.cost)
+            (result, Some((machine.cost, machine.budget)))
         }
         Err(e) => {
             let app_index = ctx.current_app_id();
@@ -819,7 +872,7 @@ pub fn run_clear_state_program_with_tracer_costed(
             result.scratch = scratch_snapshot(&machine.scratch);
             result.error = Some(msg);
             result.error_detail = Some(detail);
-            (result, machine.cost)
+            (result, Some((machine.cost, machine.budget)))
         }
     }
 }

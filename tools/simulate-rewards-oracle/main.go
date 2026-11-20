@@ -382,4 +382,6 @@ func main() {
 	appErrOracle()
 	// The issue #2148 oracle (pastround.go) too.
 	pastRoundOracle()
+	// The issue #2499 ClearState pooled-budget oracle (clearstatepool.go) too.
+	clearStatePoolOracle()
 }
