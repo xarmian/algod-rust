@@ -23,7 +23,7 @@
 //! Implements the Source Map v3 format matching go-algorand's `sourcemap.go`.
 //! Maps program counter offsets to source file locations using VLQ encoding.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use serde::Serialize;
 
@@ -52,27 +52,21 @@ pub struct SourceMap {
 /// `offset_to_location` maps program counter offsets to source locations.
 pub fn get_source_map(
     source_names: Vec<String>,
-    offset_to_location: &HashMap<usize, SourceLocation>,
+    offset_to_location: &BTreeMap<usize, SourceLocation>,
 ) -> SourceMap {
-    let max_pc = offset_to_location.keys().copied().max().unwrap_or(0);
-
+    // go's `pcToLine` joined with `;`: one segment per pc from 0 to the
+    // largest recorded pc, empty where no instruction starts. The segment of
+    // `pc` therefore follows exactly `pc` separators.
     let mut prev_location = SourceLocation { line: 0, col: 0 };
-    let mut pc_to_line: Vec<String> = Vec::with_capacity(max_pc + 1);
-
-    for pc in 0..=max_pc {
-        if let Some(location) = offset_to_location.get(&pc) {
-            let line_delta = location.line as isize - prev_location.line as isize;
-            let col_delta = location.col as isize - prev_location.col as isize;
-            pc_to_line.push(make_source_map_line(
-                0,
-                0,
-                line_delta as i32,
-                col_delta as i32,
-            ));
-            prev_location = *location;
-        } else {
-            pc_to_line.push(String::new());
-        }
+    let mut mappings: Vec<u8> = Vec::new();
+    let mut separators = 0usize;
+    for (&pc, location) in offset_to_location {
+        mappings.resize(mappings.len() + (pc - separators), b';');
+        separators = pc;
+        let line_delta = location.line as isize - prev_location.line as isize;
+        let col_delta = location.col as isize - prev_location.col as isize;
+        write_source_map_line(0, 0, line_delta as i32, col_delta as i32, &mut mappings);
+        prev_location = *location;
     }
 
     SourceMap {
@@ -81,7 +75,7 @@ pub fn get_source_map(
         source_root: String::new(),
         sources: source_names,
         names: Vec::new(),
-        mappings: pc_to_line.join(";"),
+        mappings: String::from_utf8(mappings).expect("VLQ digits and `;` are ASCII"),
     }
 }
 
@@ -116,11 +110,16 @@ fn int_to_vlq_buf(v: i32, buf: &mut Vec<u8>) {
 /// - `scol`: source column delta
 pub fn make_source_map_line(tcol: i32, sindex: i32, sline: i32, scol: i32) -> String {
     let mut buf = Vec::new();
-    int_to_vlq_buf(tcol, &mut buf);
-    int_to_vlq_buf(sindex, &mut buf);
-    int_to_vlq_buf(sline, &mut buf);
-    int_to_vlq_buf(scol, &mut buf);
+    write_source_map_line(tcol, sindex, sline, scol, &mut buf);
     String::from_utf8(buf).unwrap()
+}
+
+/// [`make_source_map_line`], appended to `buf`.
+fn write_source_map_line(tcol: i32, sindex: i32, sline: i32, scol: i32, buf: &mut Vec<u8>) {
+    int_to_vlq_buf(tcol, buf);
+    int_to_vlq_buf(sindex, buf);
+    int_to_vlq_buf(sline, buf);
+    int_to_vlq_buf(scol, buf);
 }
 
 #[cfg(test)]
@@ -144,9 +143,57 @@ mod tests {
         assert!(!line.is_empty());
     }
 
+    /// The source map as the former implementation built it: probe every pc
+    /// up to the largest, one `String` segment each, joined with `;`.
+    fn reference_mappings(offset_to_location: &BTreeMap<usize, SourceLocation>) -> String {
+        let max_pc = offset_to_location.keys().copied().max().unwrap_or(0);
+        let mut prev = SourceLocation { line: 0, col: 0 };
+        let mut pc_to_line: Vec<String> = Vec::with_capacity(max_pc + 1);
+        for pc in 0..=max_pc {
+            if let Some(location) = offset_to_location.get(&pc) {
+                let line_delta = location.line as isize - prev.line as isize;
+                let col_delta = location.col as isize - prev.col as isize;
+                pc_to_line.push(make_source_map_line(
+                    0,
+                    0,
+                    line_delta as i32,
+                    col_delta as i32,
+                ));
+                prev = *location;
+            } else {
+                pc_to_line.push(String::new());
+            }
+        }
+        pc_to_line.join(";")
+    }
+
+    #[test]
+    fn get_source_map_matches_the_per_pc_join() {
+        let mut cases: Vec<BTreeMap<usize, SourceLocation>> = vec![BTreeMap::new()];
+        let mut seed = 0x2410_u64;
+        for n in [1usize, 2, 7, 40, 300] {
+            let mut map = BTreeMap::new();
+            let mut pc = 0usize;
+            for _ in 0..n {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let line = (seed >> 33) as usize % 500;
+                let col = (seed >> 13) as usize % 40;
+                map.insert(pc, SourceLocation { line, col });
+                pc += 1 + (seed >> 50) as usize % 9;
+            }
+            cases.push(map);
+        }
+        // An instruction that starts past pc 0 (a version byte and cblocks).
+        cases.push(BTreeMap::from([(5, SourceLocation { line: 3, col: 2 })]));
+        for map in &cases {
+            let sm = get_source_map(vec!["x".to_string()], map);
+            assert_eq!(sm.mappings, reference_mappings(map), "{map:?}");
+        }
+    }
+
     #[test]
     fn test_get_source_map() {
-        let mut offset_to_location = HashMap::new();
+        let mut offset_to_location = BTreeMap::new();
         offset_to_location.insert(0, SourceLocation { line: 0, col: 0 });
         offset_to_location.insert(3, SourceLocation { line: 1, col: 0 });
         offset_to_location.insert(5, SourceLocation { line: 2, col: 0 });

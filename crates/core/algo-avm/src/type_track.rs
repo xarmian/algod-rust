@@ -33,6 +33,8 @@
 //! (an incremental slice), issue #2368 (the full port, driven by the
 //! ARC56Registry reassembly corpus).
 
+use std::borrow::Cow;
+
 use crate::assembler::OpStream;
 use crate::type_track_table::OPS;
 
@@ -226,10 +228,15 @@ pub(crate) fn op_entry_by_name(name: &str) -> Option<&'static OpEntry> {
     op_entry(name)
 }
 
+/// Read several times per assembled instruction, so a name index built once
+/// replaces a binary search of `OPS` (one string comparison per step).
 fn op_entry(name: &str) -> Option<&'static OpEntry> {
-    OPS.binary_search_by(|e| e.name.cmp(name))
-        .ok()
-        .map(|i| &OPS[i])
+    static INDEX: std::sync::OnceLock<crate::opcode::NameMap<&'static OpEntry>> =
+        std::sync::OnceLock::new();
+    INDEX
+        .get_or_init(|| OPS.iter().map(|e| (e.name, e)).collect())
+        .get(name)
+        .copied()
 }
 
 impl OpEntry {
@@ -769,17 +776,19 @@ fn run_refine(
 }
 
 /// The spec `getSpec` resolves for one instruction, as the tracker needs it.
-struct Spec {
+/// Borrows the static tables wherever go's spec is a table entry: the tracker
+/// resolves one per assembled instruction.
+struct Spec<'a> {
     /// The name error messages use (`txn without immediates`, ...).
-    instruction: String,
-    args: Vec<StackType>,
-    returns: Vec<StackType>,
-    refine: String,
+    instruction: Cow<'a, str>,
+    args: Cow<'static, [StackType]>,
+    returns: Cow<'static, [StackType]>,
+    refine: &'static str,
     /// The opcode whose group immediates assemble the field immediates.
     asm_entry: Option<&'static OpEntry>,
     /// The tracked opcode's own entry (for `deadens`, `typeTxField`'s group).
     entry: Option<&'static OpEntry>,
-    name: String,
+    name: &'a str,
 }
 
 /// go's `pseudoOps` table: `(immediate count -> real opcode)`; the arity-free
@@ -825,7 +834,7 @@ pub(crate) fn pseudo_merged_min_version(name: &str, version: u8) -> Option<u8> {
 
 /// go's `getSpec` (the tracker's view of it): `None` when go gives up, so
 /// nothing is tracked.
-fn get_spec(ops: &OpStream, name: &str, argc: usize) -> Option<Spec> {
+fn get_spec<'a>(ops: &OpStream, name: &'a str, argc: usize) -> Option<Spec<'a>> {
     let version = ops.effective_version();
     match name {
         "int" | "byte" | "addr" | "method" => {
@@ -834,40 +843,35 @@ fn get_spec(ops: &OpStream, name: &str, argc: usize) -> Option<Spec> {
                 "byte" => "typeByte",
                 _ => "",
             };
-            let ret = if name == "int" { UINT64 } else { BYTES };
-            let instruction = if argc == 0 {
-                format!("{name} without immediates")
+            let ret: &'static [StackType] = if name == "int" {
+                &[UINT64]
             } else {
-                name.to_string()
+                &[BYTES]
             };
             return Some(Spec {
-                instruction,
-                args: vec![],
-                returns: vec![ret],
-                refine: refine.to_string(),
+                instruction: instruction_name(name, argc),
+                args: Cow::Borrowed(&[]),
+                returns: Cow::Borrowed(ret),
+                refine,
                 asm_entry: None,
                 entry: None,
-                name: name.to_string(),
+                name,
             });
         }
         _ => {}
     }
     if let Some(targets) = pseudo_targets(name) {
-        let instruction = if argc == 0 {
-            format!("{name} without immediates")
-        } else {
-            name.to_string()
-        };
+        let instruction = instruction_name(name, argc);
         if let Some((_, real)) = targets.iter().find(|(n, _)| *n == argc) {
             let (entry, v) = pseudo_variant(real, version)?;
             return Some(Spec {
                 instruction,
-                args: v.args.to_vec(),
-                returns: v.returns.to_vec(),
-                refine: v.refine.to_string(),
+                args: Cow::Borrowed(v.args),
+                returns: Cow::Borrowed(v.returns),
+                refine: v.refine,
                 asm_entry: Some(entry),
                 entry: Some(entry),
-                name: name.to_string(),
+                name,
             });
         }
         // go's `mergeProtos`: the immediate count matched no spec, so type
@@ -901,12 +905,12 @@ fn get_spec(ops: &OpStream, name: &str, argc: usize) -> Option<Spec> {
         }
         return Some(Spec {
             instruction,
-            args: args.unwrap_or_default(),
-            returns: returns.unwrap_or_default(),
-            refine: String::new(),
+            args: Cow::Owned(args.unwrap_or_default()),
+            returns: Cow::Owned(returns.unwrap_or_default()),
+            refine: "",
             asm_entry: None,
             entry: None,
-            name: name.to_string(),
+            name,
         });
     }
     let entry = op_entry(name)?;
@@ -918,14 +922,24 @@ fn get_spec(ops: &OpStream, name: &str, argc: usize) -> Option<Spec> {
         _ => Some(entry),
     };
     Some(Spec {
-        instruction: name.to_string(),
-        args: v.args.to_vec(),
-        returns: v.returns.to_vec(),
-        refine: v.refine.to_string(),
+        instruction: Cow::Borrowed(name),
+        args: Cow::Borrowed(v.args),
+        returns: Cow::Borrowed(v.returns),
+        refine: v.refine,
         asm_entry,
         entry: Some(entry),
-        name: name.to_string(),
+        name,
     })
+}
+
+/// go's `spec.Name` for a pseudo-op: `"<name> without immediates"` when none
+/// were given.
+fn instruction_name(name: &str, argc: usize) -> Cow<'_, str> {
+    if argc == 0 {
+        Cow::Owned(format!("{name} without immediates"))
+    } else {
+        Cow::Borrowed(name)
+    }
 }
 
 fn type_error(ops: &mut OpStream, col: usize, msg: String) {
@@ -1079,14 +1093,14 @@ pub(crate) fn track_instruction(
     let mut arg_types = spec.args.clone();
     let mut return_types = spec.returns.clone();
     if spec.refine == "typePushInt" || spec.refine == "typeByte" {
-        if let Some(r) = pseudo_refine(&spec.refine, args, byte_len) {
-            return_types = r;
+        if let Some(r) = pseudo_refine(spec.refine, args, byte_len) {
+            return_types = Cow::Owned(r);
         }
     } else if !spec.refine.is_empty() {
         let txn_fields = op_entry("itxn_field")
             .and_then(|e| e.imms.first())
             .and_then(|i| i.group);
-        let r = run_refine(&spec.refine, &mut ops.known, args, txn_fields);
+        let r = run_refine(spec.refine, &mut ops.known, args, txn_fields);
         if let Some(e) = r.err {
             type_error(ops, col, e);
         }
@@ -1094,10 +1108,10 @@ pub(crate) fn track_instruction(
             ops.panic.get_or_insert(p);
         }
         if let Some(a) = r.args {
-            arg_types = a;
+            arg_types = Cow::Owned(a);
         }
         if let Some(rt) = r.returns {
-            return_types = rt;
+            return_types = Cow::Owned(rt);
         }
     }
     track_stack(ops, col, &arg_types, &return_types, &spec.instruction, args);
@@ -1115,6 +1129,21 @@ pub(crate) fn track_instruction(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `OPS` names are unique (strictly sorted), so the name index finds the
+    /// one entry the former binary search found, and nothing for other names.
+    #[test]
+    fn op_entry_index_matches_a_binary_search() {
+        assert!(OPS.windows(2).all(|w| w[0].name < w[1].name));
+        let search = |name: &str| OPS.binary_search_by(|e| e.name.cmp(name)).ok();
+        for (i, e) in OPS.iter().enumerate() {
+            assert!(std::ptr::eq(op_entry(e.name).unwrap(), &OPS[i]));
+            assert_eq!(search(e.name), Some(i));
+        }
+        for name in ["", "nonexistent", "int", "byte", "txn ", "SHA256"] {
+            assert_eq!(op_entry(name).is_some(), search(name).is_some(), "{name:?}");
+        }
+    }
 
     #[test]
     fn overlaps_matches_go_semantics() {

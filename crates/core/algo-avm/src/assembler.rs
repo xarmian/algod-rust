@@ -28,7 +28,8 @@
 //! - Constant block optimization (v4+)
 //! - Field name resolution
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use sha2::{Digest, Sha512_256};
@@ -238,20 +239,31 @@ struct ByteReference {
 #[derive(Debug, Clone)]
 struct MacroDef {
     /// The macro name token (go's `ops.macros[name][0]`): its line and column.
-    name: Tok,
+    name: Tok<'static>,
     /// The substitution tokens, each keeping the line and column of the
     /// `#define` line they were written on (go expands `replacement[1:]`
     /// verbatim, so errors in expanded text point at the definition).
-    body: Vec<Tok>,
+    body: Vec<Tok<'static>>,
 }
 
 /// One source token with the line (1-based) and column (0-based byte offset)
-/// go's `tokensFromLine` gives it.
+/// go's `tokensFromLine` gives it. It borrows the source text; only a macro's
+/// stored tokens own theirs.
 #[derive(Debug, Clone)]
-struct Tok {
+struct Tok<'a> {
     line: usize,
     col: usize,
-    s: String,
+    s: Cow<'a, str>,
+}
+
+impl Tok<'_> {
+    fn into_owned(self) -> Tok<'static> {
+        Tok {
+            line: self.line,
+            col: self.col,
+            s: Cow::Owned(self.s.into_owned()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -273,8 +285,14 @@ pub struct OpStream {
     /// Non-fatal warnings accumulated during assembly. Assembly can still
     /// succeed (`Ok`) with warnings present.
     pub warnings: Vec<AssemblyWarning>,
-    /// PC-to-source-line mapping.
-    pub offset_to_source: HashMap<usize, SourceLocation>,
+    /// PC-to-source-line mapping (go's `OffsetToSource`), filled once the
+    /// program is assembled.
+    pub offset_to_source: BTreeMap<usize, SourceLocation>,
+    /// `offset_to_source` while assembling: one entry per recorded pending
+    /// offset, in increasing offset order (an instruction is only recorded at
+    /// the end of `pending`, and every later edit shifts a suffix of offsets
+    /// without reordering them), so shifting it is an in-place pass.
+    source_locs: Vec<(usize, SourceLocation)>,
 
     // Internal state
     pending: Vec<u8>,
@@ -349,7 +367,8 @@ impl OpStream {
             errors: Vec::new(),
             panic: None,
             warnings: Vec::new(),
-            offset_to_source: HashMap::new(),
+            offset_to_source: BTreeMap::new(),
+            source_locs: Vec::new(),
             pending: Vec::new(),
             labels: HashMap::new(),
             label_references: Vec::new(),
@@ -451,13 +470,30 @@ impl OpStream {
 
     fn record_source_location(&mut self, line: usize, col: usize) {
         // Go uses 0-based lines in OffsetToSource (line - 1).
-        self.offset_to_source.insert(
-            self.pending.len(),
-            SourceLocation {
-                line: line.saturating_sub(1),
-                col,
-            },
-        );
+        let pos = self.pending.len();
+        let loc = SourceLocation {
+            line: line.saturating_sub(1),
+            col,
+        };
+        // go's map assignment: a statement that emitted nothing leaves the
+        // next one at the same offset, which replaces it.
+        match self.source_locs.last_mut() {
+            Some(last) if last.0 == pos => last.1 = loc,
+            _ => {
+                debug_assert!(self.source_locs.last().is_none_or(|l| l.0 < pos));
+                self.source_locs.push((pos, loc));
+            }
+        }
+    }
+
+    /// Adds `delta` to every recorded source offset at or after `first`
+    /// (they are sorted, so that is a suffix).
+    fn shift_source_locs_from(&mut self, first: usize, delta: isize) {
+        let start = self.source_locs.partition_point(|&(pos, _)| pos < first);
+        for (pos, _) in &mut self.source_locs[start..] {
+            *pos = (*pos as isize + delta) as usize;
+        }
+        debug_assert!(self.source_locs.windows(2).all(|w| w[0].0 < w[1].0));
     }
 
     // ---------- int literal handling ----------
@@ -646,15 +682,7 @@ impl OpStream {
                 lr.offset_position = (lr.offset_position as isize + delta) as usize;
             }
         }
-        let mut new_map = HashMap::new();
-        for (&pos, &loc) in &self.offset_to_source {
-            if pos >= boundary {
-                new_map.insert((pos as isize + delta) as usize, loc);
-            } else {
-                new_map.insert(pos, loc);
-            }
-        }
-        self.offset_to_source = new_map;
+        self.shift_source_locs_from(boundary, delta);
     }
 
     fn resolve_labels(&mut self) {
@@ -983,15 +1011,7 @@ impl OpStream {
                 lr.offset_position = (lr.offset_position as isize + delta) as usize;
             }
         }
-        let mut new_map = HashMap::new();
-        for (&pos, &loc) in &self.offset_to_source {
-            if pos > position {
-                new_map.insert((pos as isize + delta) as usize, loc);
-            } else {
-                new_map.insert(pos, loc);
-            }
-        }
-        self.offset_to_source = new_map;
+        self.shift_source_locs_from(position + 1, delta);
     }
 
     // ---------- prepend constant blocks ----------
@@ -1044,11 +1064,11 @@ impl OpStream {
     /// version byte plus any cblocks prepended by [`Self::finalize_program`]).
     /// Matches go-algorand's `adjustOffsetToSource` (`assembler.go`).
     fn adjust_offset_to_source(&mut self, prefix_len: usize) {
-        let mut new_map = HashMap::with_capacity(self.offset_to_source.len());
-        for (&pos, &loc) in &self.offset_to_source {
-            new_map.insert(pos + prefix_len, loc);
-        }
-        self.offset_to_source = new_map;
+        self.offset_to_source = self
+            .source_locs
+            .iter()
+            .map(|&(pos, loc)| (pos + prefix_len, loc))
+            .collect();
     }
 
     // ---------- auto-salt ----------
@@ -1351,8 +1371,8 @@ fn handle_define(ops: &mut OpStream, tokens: &[Tok]) {
         );
         return;
     }
-    let name_tok = tokens[1].clone();
-    let name = name_tok.s.clone();
+    let name_tok = tokens[1].clone().into_owned();
+    let name = name_tok.s.to_string();
     if let Err(e) = check_macro_name(&name, ops) {
         ops.record_error(name_tok.line, name_tok.col, e);
         return;
@@ -1361,7 +1381,7 @@ fn handle_define(ops: &mut OpStream, tokens: &[Tok]) {
         name.clone(),
         MacroDef {
             name: name_tok.clone(),
-            body: tokens[2..].to_vec(),
+            body: tokens[2..].iter().map(|t| t.clone().into_owned()).collect(),
         },
     );
     if let Some(cycle) = find_macro_cycle(&ops.macros, &name) {
@@ -1390,10 +1410,10 @@ fn handle_define(ops: &mut OpStream, tokens: &[Tok]) {
 /// (different, non-cyclical) macro name. The expansion keeps the body's own
 /// lines and columns, like go. Returns `(current, rest)`: the tokens making
 /// up this statement, and whatever tokens remain unprocessed on the line.
-fn next_statement(ops: &OpStream, mut tokens: Vec<Tok>) -> (Vec<Tok>, Vec<Tok>) {
+fn next_statement<'a>(ops: &OpStream, mut tokens: Vec<Tok<'a>>) -> (Vec<Tok<'a>>, Vec<Tok<'a>>) {
     let mut i = 0usize;
     while i < tokens.len() {
-        if let Some(def) = ops.macros.get(&tokens[i].s) {
+        if let Some(def) = ops.macros.get(tokens[i].s.as_ref()) {
             let mut expanded = tokens[..i].to_vec();
             expanded.extend(def.body.iter().cloned());
             expanded.extend_from_slice(&tokens[i + 1..]);
@@ -1433,7 +1453,7 @@ fn handle_pragma(ops: &mut OpStream, tokens: &[Tok]) {
         err(ops, &tokens[0], "empty pragma".into());
         return;
     }
-    let key = tokens[1].s.as_str();
+    let key = tokens[1].s.as_ref();
     match key {
         "version" => {
             if tokens.len() < 3 {
@@ -1453,7 +1473,7 @@ fn handle_pragma(ops: &mut OpStream, tokens: &[Tok]) {
                 );
                 return;
             }
-            let value = tokens[2].s.as_str();
+            let value = tokens[2].s.as_ref();
             let Some(ver) = type_track::go_parse_uint_base0(value, 64) else {
                 err(
                     ops,
@@ -1498,7 +1518,7 @@ fn handle_pragma(ops: &mut OpStream, tokens: &[Tok]) {
                 err(ops, &tokens[3], msg);
                 return;
             }
-            let value = tokens[2].s.as_str();
+            let value = tokens[2].s.as_ref();
             let Some(on) = parse_pragma_bool(value) else {
                 err(
                     ops,
@@ -1534,7 +1554,7 @@ fn handle_pragma(ops: &mut OpStream, tokens: &[Tok]) {
                 );
                 return;
             }
-            let value = tokens[2].s.as_str();
+            let value = tokens[2].s.as_ref();
             let Some(on) = parse_pragma_bool(value) else {
                 err(
                     ops,
@@ -1605,10 +1625,10 @@ fn process_statement(ops: &mut OpStream, current: &[Tok]) {
         }
     }
 
-    let mnemonic = current[tok_idx].s.as_str();
+    let mnemonic = current[tok_idx].s.as_ref();
     let args: Vec<&str> = current[tok_idx + 1..]
         .iter()
-        .map(|t| t.s.as_str())
+        .map(|t| t.s.as_ref())
         .collect();
 
     // go's `line, column := current[0].line, current[0].col` (after any
@@ -1617,8 +1637,13 @@ fn process_statement(ops: &mut OpStream, current: &[Tok]) {
     ops.stmt_col = col;
     ops.stmt_line = current[tok_idx].line;
     ops.stmt_len = raw_text::raw_len(&current[tok_idx].s);
-    ops.arg_cols = current[tok_idx + 1..].iter().map(|t| t.col).collect();
-    ops.arg_lines = current[tok_idx + 1..].iter().map(|t| t.line).collect();
+    // Reuse the previous statement's buffers.
+    ops.arg_cols.clear();
+    ops.arg_cols
+        .extend(current[tok_idx + 1..].iter().map(|t| t.col));
+    ops.arg_lines.clear();
+    ops.arg_lines
+        .extend(current[tok_idx + 1..].iter().map(|t| t.line));
     ops.record_source_location(ops.stmt_line, col);
     pseudo_get_spec_errors(ops, mnemonic, &args);
     type_track::track_instruction(ops, col, mnemonic, &args, &|a| {
@@ -1807,10 +1832,10 @@ fn assemble_core(text: &str) -> Result<OpStream, Box<OpStream>> {
         }
         let tokens: Vec<Tok> = full_tokens
             .iter()
-            .map(|(col, s)| Tok {
+            .map(|&(col, s)| Tok {
                 line: ops.source_line,
-                col: *col,
-                s: s.to_string(),
+                col,
+                s: Cow::Borrowed(s),
             })
             .collect();
 
@@ -3688,10 +3713,7 @@ fn zigzag_varint_encode(v: i64) -> Vec<u8> {
 
 /// Replace `original_len` bytes starting at `index` in `s` with `new_bytes`.
 fn replace_bytes(s: &mut Vec<u8>, index: usize, original_len: usize, new_bytes: &[u8]) {
-    let tail = s[index + original_len..].to_vec();
-    s.truncate(index);
-    s.extend_from_slice(new_bytes);
-    s.extend_from_slice(&tail);
+    s.splice(index..index + original_len, new_bytes.iter().copied());
 }
 
 // Simple hex encode fallback (since we may not have the `hex` crate)
