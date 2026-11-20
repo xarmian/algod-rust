@@ -39,6 +39,9 @@ pub enum Stdin<'a> {
     Pipe(&'a str),
     /// A pseudo-terminal; once stdout contains `prompt`, `line` + `\n` is typed.
     Pty { prompt: &'a str, line: &'a str },
+    /// A pseudo-terminal answering several prompts: each time stdout shows one
+    /// more `prompt` of a pair, its `line` + `\n` is typed.
+    PtyAnswers(&'a [(&'a str, &'a str)]),
 }
 
 pub struct Ran {
@@ -68,6 +71,26 @@ fn open_pty() -> (OwnedFd, OwnedFd) {
     }
 }
 
+/// The start of go's `infoPasswordPrompt` (`Please enter the password for
+/// wallet '%s': `).
+pub const PASSWORD_PROMPT: &str = "Please enter the password for wallet";
+
+/// `bin wallet new <name> --no-display-seed` with `password` typed into a
+/// terminal at go's two prompts (`infoChoosePasswordPrompt`,
+/// `infoPasswordConfirmation`): the one way to create an encrypted wallet.
+pub fn wallet_new(bin: &Path, dd: &Path, name: &str, password: &str) -> Ran {
+    let choose = format!("Please choose a password for wallet '{name}': ");
+    run(
+        bin,
+        dd,
+        &["wallet", "new", name, "--no-display-seed"],
+        Stdin::PtyAnswers(&[
+            (&choose, password),
+            ("Please confirm the password: ", password),
+        ]),
+    )
+}
+
 /// `bin -d <dd> <args>` in `dd`, `ALGORAND_DATA` unset.
 pub fn run(bin: &Path, dd: &Path, args: &[&str], stdin: Stdin<'_>) -> Ran {
     run_env(bin, dd, args, stdin, &[])
@@ -91,7 +114,7 @@ pub fn run_env(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut master = None;
-    let mut answer: Option<(String, String)> = None;
+    let mut answers: Vec<(String, String, usize)> = Vec::new();
     let mut pipe_input = None;
     match stdin {
         Stdin::Null => {
@@ -105,7 +128,13 @@ pub fn run_env(
             let (m, slave) = open_pty();
             cmd.stdin(Stdio::from(slave));
             master = Some(std::fs::File::from(m));
-            answer = Some((prompt.to_string(), line.to_string()));
+            answers.push((prompt.to_string(), line.to_string(), 0));
+        }
+        Stdin::PtyAnswers(pairs) => {
+            let (m, slave) = open_pty();
+            cmd.stdin(Stdio::from(slave));
+            master = Some(std::fs::File::from(m));
+            answers.extend(pairs.iter().map(|(p, l)| (p.to_string(), l.to_string(), 0)));
         }
     }
     let mut child = cmd.spawn().expect("spawn goal");
@@ -135,7 +164,6 @@ pub fn run_env(
     });
     let mut so = child.stdout.take().unwrap();
     let mut stdout = Vec::new();
-    let mut typed = 0usize;
     let mut chunk = [0u8; 4096];
     loop {
         let n = match so.read(&mut chunk) {
@@ -143,14 +171,15 @@ pub fn run_env(
             Ok(n) => n,
         };
         stdout.extend_from_slice(&chunk[..n]);
-        if let (Some((prompt, line)), Some(m)) = (&answer, master.as_mut()) {
-            let seen = String::from_utf8_lossy(&stdout)
-                .matches(prompt.as_str())
-                .count();
-            while typed < seen {
-                m.write_all(format!("{line}\n").as_bytes())
-                    .expect("type into the pty");
-                typed += 1;
+        if let Some(m) = master.as_mut() {
+            let shown = String::from_utf8_lossy(&stdout).into_owned();
+            for (prompt, line, typed) in answers.iter_mut() {
+                let seen = shown.matches(prompt.as_str()).count();
+                while *typed < seen {
+                    m.write_all(format!("{line}\n").as_bytes())
+                        .expect("type into the pty");
+                    *typed += 1;
+                }
             }
         }
     }
