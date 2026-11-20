@@ -49,7 +49,12 @@
 //!   that build a transaction (`asset`, `app`, `account
 //!   changeonlinestatus` / `marknonparticipating`) through go's REST client:
 //!   a refused connection, a 401, an error answer and a malformed answer of
-//!   each request.
+//!   each request;
+//! - issue #2489 (second slice): the same for `app box info` / `app box
+//!   list`, `app read` (the account's application resource as msgpack),
+//!   `account deletepartkey` (a DELETE that expects no content) and
+//!   `installpartkey` (the key's POST, then its listing), and the reads of
+//!   `account renewpartkey` / `renewallpartkeys`.
 //!
 //! `fixtures/goal_algod_reads.jsonl` holds what go v5.0.5-stable's `goal`
 //! printed (exit code, stdout, stderr, the data dir masked; a stdout longer
@@ -614,7 +619,8 @@ fn reason(status: u16) -> &'static str {
 }
 
 /// A canned answer replacing `route`'s for the request paths starting with
-/// `prefix` (`""`: every path; a trailing `$`: that path only).
+/// `prefix` (`""`: every path; a trailing `$`: that path only; a leading
+/// `<METHOD> `: requests of that method only).
 #[derive(Clone)]
 struct Answer {
     prefix: &'static str,
@@ -803,6 +809,94 @@ fn route_2489(method: &str, path: &str) -> Option<(u16, String)> {
     }
 }
 
+/// A `basics.TealValue` in msgpack (`tt` 1: bytes, 2: uint).
+fn mp_teal(bytes: Option<&[u8]>, uint: u64) -> Vec<u8> {
+    match bytes {
+        Some(b) => mp_obj(&[("tb", mp_str(b)), ("tt", mp_u(1))]),
+        None => mp_obj(&[("tt", mp_u(2)), ("ui", mp_u(uint))]),
+    }
+}
+
+/// What the mock algod answers for the reads of the second slice of issue
+/// #2489: app 7's boxes, the application resources of keys 1 and 2, the
+/// DELETE and POST of participation keys.
+fn route_2489_reads(method: &str, path: &str, query: &str) -> Option<(u16, &'static str, Vec<u8>)> {
+    let json = "application/json";
+    let has = |kv: &str| query.split('&').any(|q| q == kv);
+    let ok = |v: serde_json::Value| Some((200, json, v.to_string().into_bytes()));
+    let not_found = |m: &str| {
+        Some((
+            404,
+            json,
+            serde_json::json!({ "message": m }).to_string().into_bytes(),
+        ))
+    };
+    match (method, path) {
+        ("GET", "/v2/applications/7/box") => {
+            if has("name=str%3Ak") || has("name=b64%3Aaw%3D%3D") {
+                ok(serde_json::json!({"name": "aw==", "round": 5, "value": "dmFs"}))
+            } else if has("name=str%3Aother") {
+                ok(serde_json::json!({"name": "aw==", "round": 5, "value": "dmFs"}))
+            } else {
+                not_found("box not found")
+            }
+        }
+        ("GET", "/v2/applications/7/boxes") => {
+            let values = has("include=values");
+            let b = |name: &str, value: &str| {
+                if values {
+                    serde_json::json!({"name": name, "value": value})
+                } else {
+                    serde_json::json!({ "name": name })
+                }
+            };
+            if has("next=tok") {
+                ok(serde_json::json!({"boxes": [b("Yg==", "djI=")], "round": 5}))
+            } else if has("limit=1") {
+                ok(
+                    serde_json::json!({"boxes": [b("aw==", "dmFs")], "next-token": "tok", "round": 5}),
+                )
+            } else {
+                ok(serde_json::json!({"boxes": [b("aw==", "dmFs"), b("AQI=", "")], "round": 5}))
+            }
+        }
+        ("GET", "/v2/applications/8/boxes") => ok(serde_json::json!({"boxes": [], "round": 5})),
+        ("GET", p) if p.starts_with("/v2/accounts/") && p.ends_with("/applications/7") => {
+            let addr = p
+                .trim_start_matches("/v2/accounts/")
+                .trim_end_matches("/applications/7");
+            if addr != key(1).1 {
+                return not_found("account application info not found");
+            }
+            let tkv = mp_map(&[
+                (s("count"), mp_teal(None, 3)),
+                (s("name"), mp_teal(Some(b"alice"), 0)),
+            ]);
+            let gs = mp_map(&[
+                (s("g"), mp_teal(Some(b"\x01\x02"), 0)),
+                (s("n"), mp_teal(None, 9)),
+            ]);
+            let body = mp_obj(&[
+                (
+                    "app-local-state",
+                    mp_obj(&[
+                        ("hsch", mp_obj(&[("nbs", mp_u(1)), ("nui", mp_u(1))])),
+                        ("tkv", tkv),
+                    ]),
+                ),
+                ("app-params", mp_obj(&[("gs", gs)])),
+            ]);
+            Some((200, "application/msgpack", body))
+        }
+        ("DELETE", "/v2/participation/PARTKEYIDTWO") => Some((200, json, Vec::new())),
+        ("DELETE", p) if p.starts_with("/v2/participation/") => {
+            not_found("participation id not found")
+        }
+        ("POST", "/v2/participation") => ok(serde_json::json!({"partId": "PARTKEYIDTWO"})),
+        _ => None,
+    }
+}
+
 /// `(status, content type, body)` for a request path (status 1: `body` is
 /// the whole raw reply).
 fn route(method: &str, path: &str, mock: &Mock) -> (u16, &'static str, Vec<u8>) {
@@ -812,18 +906,24 @@ fn route(method: &str, path: &str, mock: &Mock) -> (u16, &'static str, Vec<u8>) 
     let query = path.split_once('?').map_or("", |(_, q)| q);
     let path = path.split('?').next().unwrap_or("");
     let json = "application/json";
-    if let Some(a) = mock
-        .answers
-        .iter()
-        .find(|a| match a.prefix.strip_suffix('$') {
-            Some(exact) => path == exact,
-            None => path.starts_with(a.prefix),
-        })
-    {
+    if let Some(a) = mock.answers.iter().find(|a| {
+        let (m, prefix) = match a.prefix.split_once(' ') {
+            Some((m, p)) => (Some(m), p),
+            None => (None, a.prefix),
+        };
+        m.is_none_or(|m| m == method)
+            && match prefix.strip_suffix('$') {
+                Some(exact) => path == exact,
+                None => path.starts_with(prefix),
+            }
+    }) {
         return (a.status, json, a.body.clone());
     }
     // where the redirect rows send go
     let path = path.strip_prefix("/moved").unwrap_or(path);
+    if let Some((code, ctype, body)) = route_2489_reads(method, path, query) {
+        return (code, ctype, body);
+    }
     if let Some((code, body)) = route_2476(method, path, query) {
         return (code, json, body.into_bytes());
     }
@@ -1336,6 +1436,267 @@ fn cases() -> Vec<Case> {
     v.extend(remaining_reader_cases());
     v.extend(transport_cases());
     v.extend(txn_cases());
+    v.extend(read_cases_2489());
+    v
+}
+
+/// Issue #2489, second slice: `app box info` / `list`, `app read`, `account
+/// deletepartkey` / `installpartkey` and the reads of the renew commands,
+/// each request failing in each of go's ways.
+fn read_cases_2489() -> Vec<Case> {
+    let answer = |prefix: &'static str, status: u16, body: &str| Answer {
+        prefix,
+        status,
+        body: body.as_bytes().to_vec(),
+    };
+    let fails = |prefix: &'static str| {
+        vec![
+            (
+                "401",
+                vec![answer(prefix, 401, r#"{"message":"Invalid API Token"}"#)],
+            ),
+            (
+                "500",
+                vec![answer(prefix, 500, r#"{"message":"down \u0001 now"}"#)],
+            ),
+            (
+                "malformed",
+                vec![answer(prefix, 200, r#"{"round":"five"}"#)],
+            ),
+            ("unknown field", vec![answer(prefix, 200, r#"{"foo":1}"#)]),
+        ]
+    };
+    let commands: Vec<(&str, Vec<&str>, &'static str, bool)> = vec![
+        (
+            "app box info",
+            vec!["app", "box", "info", "--app-id", "7", "-n", "str:k"],
+            "/v2/applications/7/box",
+            false,
+        ),
+        (
+            "app box list",
+            vec!["app", "box", "list", "--app-id", "7"],
+            "/v2/applications/7/boxes",
+            false,
+        ),
+        (
+            "app read --global",
+            vec!["app", "read", "--app-id", "7", "--global"],
+            "/v2/applications/7$",
+            false,
+        ),
+        (
+            "app read --global account",
+            vec!["app", "read", "--app-id", "7", "--global"],
+            "/v2/accounts/",
+            false,
+        ),
+        (
+            "app read --local",
+            vec!["app", "read", "--app-id", "7", "--local", "--from", "<A1>"],
+            "/v2/accounts/",
+            false,
+        ),
+        (
+            "account deletepartkey",
+            vec!["account", "deletepartkey", "--partkeyid", "PARTKEYIDTWO"],
+            "/v2/participation/",
+            false,
+        ),
+        (
+            "account installpartkey",
+            vec![
+                "account",
+                "installpartkey",
+                "--partkey",
+                "key.part",
+                "--delete-input",
+            ],
+            "POST /v2/participation",
+            false,
+        ),
+        (
+            "account installpartkey listing",
+            vec![
+                "account",
+                "installpartkey",
+                "--partkey",
+                "key.part",
+                "--delete-input",
+            ],
+            "GET /v2/participation",
+            false,
+        ),
+        (
+            "account renewpartkey status",
+            vec![
+                "account",
+                "renewpartkey",
+                "-a",
+                "<A1>",
+                "--roundLastValid",
+                "3000",
+            ],
+            "/v2/status",
+            true,
+        ),
+        (
+            "account renewpartkey params",
+            vec![
+                "account",
+                "renewpartkey",
+                "-a",
+                "<A1>",
+                "--roundLastValid",
+                "3000",
+            ],
+            "/v2/transactions/params",
+            true,
+        ),
+        (
+            "account renewpartkey listing",
+            vec![
+                "account",
+                "renewpartkey",
+                "-a",
+                "<A1>",
+                "--roundLastValid",
+                "3000",
+            ],
+            "/v2/participation",
+            true,
+        ),
+        (
+            "account renewallpartkeys listing",
+            vec!["account", "renewallpartkeys", "--roundLastValid", "3000"],
+            "/v2/participation",
+            true,
+        ),
+    ];
+    let key_file = || vec![("key.part", b"not really a key".to_vec())];
+    let mut v = Vec::new();
+    let mut seen_ok = std::collections::HashSet::new();
+    for (name, args, prefix, accounts) in &commands {
+        let base = name.split(" status").next().unwrap();
+        let base = base.split(" params").next().unwrap();
+        let base = base.split(" listing").next().unwrap();
+        let base = base.split(" account").next().unwrap();
+        let mk = |suffix: &str, answers: Vec<Answer>| {
+            let mut c = case(&format!("{name} {suffix}"), args);
+            c.accounts = *accounts;
+            c.inputs = key_file();
+            c.answers = answers;
+            c
+        };
+        if seen_ok.insert(base.to_string()) {
+            // `renewpartkey` goes on to generate a key and
+            // `renewallpartkeys` walks go's map of keys in random order:
+            // their own rows are in wallet_password_e2e
+            if !base.starts_with("account renew") {
+                v.push(mk("ok", vec![]));
+            }
+            let mut refused = mk("refused", vec![]);
+            refused.refused = true;
+            v.push(refused);
+        }
+        // the msgpack answer of `RawAccountApplicationInformation` is decoded
+        // by the msgp-generated decoder, not go-codec's JSON one: only its
+        // request errors here
+        let msgpack = *prefix == "/v2/accounts/";
+        for (what, answers) in fails(prefix) {
+            if msgpack && (what == "malformed" || what == "unknown field") {
+                continue;
+            }
+            v.push(mk(what, answers));
+        }
+    }
+    // the rest of each command's own cases
+    let extra: Vec<(&str, Vec<&str>, Vec<Answer>, Vec<(&'static str, Vec<u8>)>)> = vec![
+        (
+            "app box info no such box",
+            vec!["app", "box", "info", "--app-id", "7", "-n", "str:nope"],
+            vec![],
+            vec![],
+        ),
+        (
+            "app box info name mismatch",
+            vec!["app", "box", "info", "--app-id", "7", "-n", "str:other"],
+            vec![],
+            vec![],
+        ),
+        (
+            "app box list --values",
+            vec!["app", "box", "list", "--app-id", "7", "--values"],
+            vec![],
+            vec![],
+        ),
+        (
+            "app box list --limit 1",
+            vec!["app", "box", "list", "--app-id", "7", "--limit", "1"],
+            vec![],
+            vec![],
+        ),
+        (
+            "app box list --next",
+            vec![
+                "app", "box", "list", "--app-id", "7", "--next", "tok", "--round", "5",
+            ],
+            vec![],
+            vec![],
+        ),
+        (
+            "app box list no boxes",
+            vec!["app", "box", "list", "--app-id", "8"],
+            vec![],
+            vec![],
+        ),
+        (
+            "app read --local not opted in",
+            vec!["app", "read", "--app-id", "7", "--local", "--from", "<A2>"],
+            vec![],
+            vec![],
+        ),
+        (
+            "app read --global --guess-format",
+            vec!["app", "read", "--app-id", "7", "--global", "--guess-format"],
+            vec![],
+            vec![],
+        ),
+        (
+            "account deletepartkey no such key",
+            vec!["account", "deletepartkey", "--partkeyid", "NOPE"],
+            vec![],
+            vec![],
+        ),
+        (
+            "account deletepartkey content",
+            vec!["account", "deletepartkey", "--partkeyid", "PARTKEYIDTWO"],
+            vec![answer("/v2/participation/", 200, r#"{"x":1}"#)],
+            vec![],
+        ),
+        (
+            "account installpartkey no such file",
+            vec![
+                "account",
+                "installpartkey",
+                "--partkey",
+                "nosuch.part",
+                "--delete-input",
+            ],
+            vec![],
+            vec![],
+        ),
+    ];
+    for (name, args, answers, inputs) in extra {
+        let mut c = case(name, &args);
+        c.answers = answers;
+        c.inputs = if inputs.is_empty() {
+            key_file()
+        } else {
+            inputs
+        };
+        v.push(c);
+    }
     v
 }
 
