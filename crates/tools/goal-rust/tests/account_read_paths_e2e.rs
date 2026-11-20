@@ -67,7 +67,9 @@ fn spawn_mock_algod(
                     let n = sock.read(&mut buf).unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]).to_string();
                     let first_line = req.lines().next().unwrap_or("");
+                    // go's `AccountInformation` adds `?exclude=..&format=json`
                     let path = first_line.split_whitespace().nth(1).unwrap_or("");
+                    let path = path.split('?').next().unwrap_or("");
                     let lookup = { table.lock().unwrap().get(path).cloned() };
                     let body = match lookup {
                         Some(v) => v.to_string().into_bytes(),
