@@ -1479,10 +1479,14 @@ mod tests {
         assert_eq!(left, 0, "bytes left over after UnmarshalMsg()");
         assert_eq!(&a2, addr);
         assert_eq!(marshal(&a2, &ad2), bts);
-        // the JSON `goal account dump` prints of it, too
+        // `goal account dump` of the record's `AccountData` (its encoding
+        // is the record's without `addr`): the same bytes for `-o`, and the
+        // JSON of the record
+        let ad_bts = marshal(&[0; 32], ad);
+        assert_eq!(dump(addr, &ad_bts, true).as_deref(), Ok(&bts[..]));
         assert_eq!(
-            dump(addr, &bts, false).ok(),
-            Some(encode_protocol_json(&to_json(&balance_record(addr, ad))))
+            dump(addr, &ad_bts, false),
+            Ok(encode_protocol_json(&to_json(&balance_record(addr, ad))))
         );
     }
 
@@ -1506,7 +1510,7 @@ mod tests {
         }
         /// Zero half of the time (an omitted field), else a value below `n`.
         fn below(&mut self, n: u64) -> u64 {
-            if self.next() % 2 == 0 {
+            if self.next().is_multiple_of(2) {
                 0
             } else {
                 self.next() % n
