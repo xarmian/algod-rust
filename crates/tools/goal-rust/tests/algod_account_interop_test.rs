@@ -370,9 +370,9 @@ fn goal_rust_account_group_against_go_algod_and_kmd() {
          likely `/v2/accounts/{{addr}}.amount` wire drift"
     );
 
-    // 6. addpartkey — server-side key generation against Go algod's admin-gated
-    // `/v2/participation/generate`. goal-rust now sends the admin token
-    // (TASK-261), so this no longer 401s.
+    // 6. addpartkey — the key generated locally, like go's goal, and
+    // installed through Go algod's admin-gated `POST /v2/participation`
+    // (goal-rust sends the admin token, TASK-261; issue #2488).
     assert_ok(
         &goal(
             dd,
@@ -403,8 +403,7 @@ fn goal_rust_account_group_against_go_algod_and_kmd() {
         .enable_all()
         .build()
         .unwrap();
-    // Generation via `/v2/participation/generate` is asynchronous server-side,
-    // so poll until the new key registers (bounded).
+    // Poll until the new key is listed (bounded).
     let part_id = {
         let start = Instant::now();
         loop {
