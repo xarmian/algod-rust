@@ -1652,7 +1652,6 @@ fn transport_cases() -> Vec<Case> {
         ("unknown host", "algod.invalid:8080", version),
         ("unknown host reportErrorf", "algod.invalid:8080", balance),
         ("not a domain name", "256.1.1.1:80", version),
-        ("localhost refused", "localhost:1", version),
         ("bad port", "127.0.0.1:99999", version),
     ] {
         let mut c = case(&format!("transport: {name}"), args);

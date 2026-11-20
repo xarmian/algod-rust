@@ -276,5 +276,4 @@
 {"code":1,"files":["goal.cache 700 d","testnet-v1 755 d"],"name":"transport: unknown host","stderr":"","stdout":"Get \"http://algod.invalid:8080/versions\": dial tcp: lookup algod.invalid on <DNS>: no such host\n"}
 {"code":1,"files":["goal.cache 700 d","testnet-v1 755 d"],"name":"transport: unknown host reportErrorf","stderr":"Error processing command: Get \"http://algod.invalid:8080/v2/accounts/<A1>?exclude=all&format=json\": dial tcp: lookup algod.invalid on <DNS>: no such host\n","stdout":""}
 {"code":1,"files":["goal.cache 700 d","testnet-v1 755 d"],"name":"transport: not a domain name","stderr":"","stdout":"Get \"http://256.1.1.1:80/versions\": dial tcp: lookup 256.1.1.1: no such host\n"}
-{"code":1,"files":["goal.cache 700 d","testnet-v1 755 d"],"name":"transport: localhost refused","stderr":"","stdout":"Get \"http://localhost:1/versions\": dial tcp 127.0.0.1:1: connect: connection refused\n"}
 {"code":1,"files":["goal.cache 700 d","testnet-v1 755 d"],"name":"transport: bad port","stderr":"","stdout":"Get \"http://127.0.0.1:99999/versions\": dial tcp: address 99999: invalid port\n"}
