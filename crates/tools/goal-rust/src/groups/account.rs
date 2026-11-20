@@ -309,14 +309,8 @@ pub struct RenewallpartkeysArgs {
 }
 
 /// `account addpartkey --address <addr> --roundFirstValid <r> --roundLastValid <r> [--keyDilution <n>]`.
-/// Mirrors Go's `addParticipationKeyCmd` (account.go:973-1011).
-///
-/// **Divergence from Go**: Go's addpartkey calls
-/// `participation.GenParticipationKeysTo` (client-side generation to
-/// disk, then upload). We use B9's `generate_participation_keys` REST
-/// endpoint (server-side generation) since algokey-rust has no lib
-/// facade yet. As a result, `--partkeyoutputdir` is omitted — algod
-/// picks the on-disk location. Documented in PR #383.
+/// Mirrors Go's `addParticipationKeyCmd` (cmd/goal/account.go): the key is
+/// generated locally (`participation.GenParticipationKeysTo`).
 #[derive(Args, Debug)]
 pub struct AddpartkeyArgs {
     #[arg(short = 'a', long = "address")]
@@ -327,10 +321,14 @@ pub struct AddpartkeyArgs {
     /// Last valid round for the new participation key.
     #[arg(long = "roundLastValid", alias = "round-last-valid")]
     pub round_last_valid: u64,
-    /// Key dilution (subkeys per batch). Optional; algod picks a
-    /// sensible default when omitted. Mirrors Go's `--keyDilution`.
+    /// Key dilution (subkeys per batch); 0 or unset is go's
+    /// `DefaultKeyDilution`. Mirrors Go's `--keyDilution`.
     #[arg(long = "keyDilution", alias = "key-dilution")]
     pub key_dilution: Option<u64>,
+    /// Save the key file into this directory instead of installing it.
+    /// Mirrors Go's `-o/--outdir`.
+    #[arg(short = 'o', long = "outdir")]
+    pub outdir: Option<String>,
 }
 
 /// `account installpartkey --partkey <path> --delete-input`. Mirrors
