@@ -57,7 +57,8 @@ use algo_types::consensus::{consensus_params_for_version, ConsensusParams};
 use algo_types::{Address, Round, SignedTransaction};
 use algo_validate::{
     check_txn_group, validate_pqsig_envelope, validate_pqsig_scheme,
-    validate_transaction_wellformed, verify_transaction_signature_with_tracer, SpecialAddresses,
+    validate_transaction_wellformed_in_mode, verify_transaction_signature_with_tracer,
+    SpecialAddresses, WellFormedMode,
 };
 use ed25519_dalek::{Signer, SigningKey};
 
@@ -669,14 +670,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             }));
         }
 
-        if request.txn_groups.is_empty() {
-            return Err(SimulatorError::InvalidRequest(InvalidRequestError {
-                message: "simulation request must contain at least one transaction group"
-                    .to_string(),
-            }));
-        }
-
-        if request.txn_groups.len() > 1 {
+        if request.txn_groups.len() != 1 {
             // Matches go-algorand's exact wording
             // (`ledger/simulation/simulator.go`: `"expected 1 transaction
             // group, got %d"`), verified by `TestSimulateTransactionMultipleGroups`
@@ -1276,11 +1270,13 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     // Record failure. Collect any partial trace data before
                     // stopping (the tracer may have captured events up to
                     // the point of failure).
+                    // go's `EvalFailureError` text carries no `validation
+                    // error: ` category prefix (issue #2451).
                     failure_message = Some(
                         algo_error::go_app_failure_message(&e, || {
                             algo_codec::compute_txn_id(&eval_group[i].txn).to_string()
                         })
-                        .unwrap_or_else(|| e.to_string()),
+                        .unwrap_or_else(|| go_error_text(&e)),
                     );
                     // The tracer descended into this top-level transaction's
                     // own inner-txn tree (if any) and, on the first failure
@@ -1500,17 +1496,19 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
         let proxy_key = SigningKey::from_bytes(&PROXY_SIGNER_SEED);
 
-        // Pass 1: reject unsupported transaction types, check well-formedness,
-        // and proxy-sign unsigned transactions. Matches go-algorand's ordering
-        // where all proxy-signing happens before group verification.
+        // Reject StateProof transactions (go-algorand: simulator.go:164), in
+        // go's copy loop, before any member is verified.
+        if verify_group.iter().any(|stx| stx.txn.txn_type == "stpf") {
+            return Err(SimulatorError::InvalidRequest(InvalidRequestError {
+                message: "cannot simulate StateProof transactions".to_string(),
+            }));
+        }
+
+        // Pass 1: check well-formedness and proxy-sign unsigned transactions.
+        // Matches go-algorand's ordering where all proxy-signing happens
+        // before group verification.
         for i in 0..verify_group.len() {
             let stx = &mut verify_group[i];
-            // Reject StateProof transactions (go-algorand: simulator.go:164).
-            if stx.txn.txn_type == "stpf" {
-                return Err(SimulatorError::InvalidRequest(InvalidRequestError {
-                    message: "cannot simulate StateProof transactions".to_string(),
-                }));
-            }
 
             // Check well-formedness. Pass `allow_fee_pooling = enable_fee_pooling`
             // so that on pre-fee-pooling protocols (before v28) each transaction
@@ -1526,15 +1524,20 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // `FailedAt` on an otherwise-successful `Result` rather than a
             // hard request error, exactly like TestDefaultSignatureCheck's
             // unknown-type/box-index/incentive-pool-sender siblings).
-            if let Err(e) = validate_transaction_wellformed(
+            // go's `txnGroupBatchPrep` puts its `transaction %+v invalid : `
+            // frame OUTSIDE the `TxGroupError`, and `Simulate` reports the
+            // `TxGroupError`'s own text: the bare reason (issue #2451). It is
+            // the submission's `WellFormed`, which rejects an unknown type.
+            if let Err(e) = validate_transaction_wellformed_in_mode(
                 &stx.txn,
                 consensus.enable_fee_pooling,
                 consensus,
                 Some(&spec),
+                WellFormedMode::Admission,
             ) {
                 return Ok(CheckOutcome::RecoverableFailure {
                     index: i,
-                    message: e.to_string(),
+                    message: go_error_text(&e),
                     logicsig_traces: vec![None; verify_group.len()],
                     logicsig_budgets: vec![0; verify_group.len()],
                 });
@@ -1634,7 +1637,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // AVM evaluation.
         check_txn_group(&verify_group).map_err(|e| {
             SimulatorError::InvalidRequest(InvalidRequestError {
-                message: e.to_string(),
+                message: go_error_text(&e),
             })
         })?;
 
@@ -1685,6 +1688,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // see `algo_validate::block.rs`/`verified_txn_cache.rs`), it can supply
         // one.
         let sig_block_source = StoreSigBlockSource::new(&*self.store);
+        let mut batch_failure = false;
         for (i, stx) in verify_group.iter().enumerate() {
             let budget_before = budget.remaining();
             let result = if trace_config.is_enabled()
@@ -1716,79 +1720,37 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // A non-LogicSig transaction consumes no LogicSig budget, leaving
             // the delta at 0.
             logicsig_budgets[i] = (budget_before - budget.remaining()).max(0) as u64;
+            // go's `txnGroupBatchPrep` preps every member, then verifies the
+            // ed25519 batch. A member's prep failure is its `TxGroupError`
+            // (`GroupIndex: i`), which `Simulate` reports as the group's
+            // `FailureMessage` with the member's `transaction %+v invalid : `
+            // frame (`prepErr.err` is re-wrapped in place), of the copy it
+            // verified (issue #2451): no signature or two kinds, a malformed
+            // multisig, a PQ envelope or signature, every LogicSig verdict --
+            // a delegated LogicSig's signature too, checked by its own batch
+            // inside the prep. The batch's failure has no index: a request
+            // error, its bare text (issue #1969), and only when no later
+            // member fails its prep.
             if let Err(e) = result {
-                if is_pq_signature_failure(&e) {
+                if algo_validate::verify_failure_is_framed(stx, &e) {
                     return Ok(CheckOutcome::RecoverableFailure {
                         index: i,
-                        message: go_error_text(&e),
+                        message: algo_validate::frame_invalid_txn(
+                            stx,
+                            &algo_validate::simulate_member_reason(stx, &e),
+                        ),
                         logicsig_traces,
                         logicsig_budgets,
                     });
                 }
-                let message = e.to_string();
-                // Signature-*format* failures (no signature at all, more
-                // than one signature category present) are per-transaction
-                // attributable in go-algorand (`checkTxnSigTypeCounts`
-                // wraps them as `TxGroupError{GroupIndex: groupIndex}`) --
-                // recoverable, like TestDefaultSignatureCheck's first
-                // (missing-signature) assertion. An actual cryptographic
-                // verification failure (wrong key, tampered signature bytes)
-                // stays a hard request error: go-algorand's batch verifier
-                // reports these with no attributable index
-                // (TestDefaultSignatureCheck's "one signature didn't pass"
-                // / TestOptionalSignaturesIncorrect), and even though this
-                // engine verifies signatures sequentially (so the index
-                // *is* technically known here), matching go's observable
-                // hard-error behavior is the parity target.
-                // A LogicSig program that rejects (top of stack zero) or
-                // errors during evaluation is likewise per-transaction
-                // attributable in go-algorand
-                // (`TxGroupErrorReasonLogicSigFailed`, `verify/txn.go:393`,
-                // `GroupIndex: gi`) -- recoverable, matching
-                // TestInvalidLogicSigPCandStack/TestInvalidApp's
-                // `require.NoError(t, err)` + `FailureMessage` pattern.
-                // `e.to_string()` on the underlying `AlgoError::Validation`
-                // prepends a `"validation error: "` prefix (see
-                // `algo_error::AlgoError`'s `Display` impl), so match on
-                // substring containment rather than the bare message.
-                //
-                // A LogicSig runtime evaluation failure (bad opcode args,
-                // type mismatch, overflow, etc.) surfaces as
-                // `AlgoError::AvmLogicSig` rather than the generic
-                // `Validation` wrapper -- `verify_logicsig_with_tracer`
-                // (`algo_validate::signature`) propagates it unwrapped so
-                // its structured pc/group-index/eval-states diagnostics
-                // (issue #1113) survive, so it can't be recognized by the
-                // `"LogicSig program error:"` message substring below and
-                // is matched on the error variant instead.
-                let is_format_failure = matches!(e, AlgoError::AvmLogicSig { .. })
-                    || message.contains("signedtxn has no sig")
-                    || message.contains("signedtxn should have only one type of signature")
-                    || message.contains(": rejected by logic")
-                    || message.contains("LogicSig program error:")
-                    // go's static check (`pc=%3d <err>`, issue #2225).
-                    || message.contains("validation error: pc=");
-                if is_format_failure {
-                    return Ok(CheckOutcome::RecoverableFailure {
-                        index: i,
-                        message,
-                        logicsig_traces,
-                        logicsig_budgets,
-                    });
-                }
-                // go's batch verifier reports a cryptographic failure as its
-                // bare error text (issue #1969), not as a wrapped validation
-                // error. Decided on the error type, after the format-failure
-                // classification above has used the original message.
-                let message = if e.is_batch_sig_failure() {
-                    algo_error::BATCH_HAS_FAILED_SIGS.to_string()
-                } else {
-                    message
-                };
-                return Err(SimulatorError::InvalidRequest(InvalidRequestError {
-                    message,
-                }));
+                batch_failure = true;
             }
+        }
+        // A heartbeat's proof is in go's batch too.
+        if batch_failure || algo_validate::check_heartbeat_proofs(&verify_group).is_err() {
+            return Err(SimulatorError::InvalidRequest(InvalidRequestError {
+                message: algo_error::BATCH_HAS_FAILED_SIGS.to_string(),
+            }));
         }
 
         Ok(CheckOutcome::Passed {
@@ -1922,20 +1884,6 @@ fn go_error_text(e: &AlgoError) -> String {
         AlgoError::Validation { message } => message.clone(),
         other => other.to_string(),
     }
-}
-
-/// Whether a signature-verification error is a post-quantum envelope or
-/// signature failure. go attributes each to its transaction
-/// (`stxnCoreChecks`' `TxGroupError{GroupIndex: gi}` for the pre-activation
-/// gate and a top-level `PQsig`, `logicSigVerify`'s for a PQ-delegated
-/// LogicSig): PQ signatures are verified in place, never in the ed25519
-/// batch, so `Simulate` reports them as the group's `FailureMessage`, not as
-/// a request error (issue #2438).
-fn is_pq_signature_failure(e: &AlgoError) -> bool {
-    matches!(e, AlgoError::Validation { message }
-        if message == "pq signature not enabled"
-            || message.starts_with("pq signature validation failed: ")
-            || message.starts_with("pq delegated logic signature validation failed: "))
 }
 
 /// Validate a placeholder `PQSig` envelope, matching go-algorand's

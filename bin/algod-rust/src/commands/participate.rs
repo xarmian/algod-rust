@@ -2073,44 +2073,20 @@ impl SimpleBlockEvaluator {
     /// `TransactionPool.Remember` / `ingest` frame), typed so the pool tags it
     /// as the same failure is tagged on the gossip test stage (issue #2193).
     /// A failure of one member (`member`) is framed as go frames it,
-    /// `transaction <dump of the SignedTxn> invalid : <reason>`; go's dump is
-    /// its own `%+v` struct formatting (it even prints pointer addresses), so
-    /// this prints an abbreviated one -- `{Txn:{Type:.. Sender:..} TxID:..}` --
-    /// that keeps the `transaction {` prefix and the ` invalid : ` infix a
-    /// client may match on. A group-level failure (`member` is `None`) is bare.
+    /// `transaction <%+v of the SignedTxn> invalid : <reason>`, go's struct
+    /// dump reproduced byte for byte (`algo_validate::frame_invalid_txn`, issue
+    /// #2451). A group-level failure (`member` is `None`) is bare.
     fn verify_rejection(
         kind: algo_error::VerifyKind,
         member: Option<&algo_types::SignedTransaction>,
         e: algo_error::AlgoError,
     ) -> algo_error::AlgoError {
-        let reason = match &e {
-            algo_error::AlgoError::Validation { message } => message.clone(),
-            // go's `logicSigVerify`: `transaction <txid>: %w` of the program's
-            // `EvalError` (`rejected by logic err=<err>. Details: pc=<pc>`).
-            // The AVM's own error wording (`<err>`) is not this issue's.
-            algo_error::AlgoError::AvmLogicSig {
-                message,
-                pc,
-                group_index,
-                app_index: None,
-                ..
-            } => format!(
-                "transaction {}: rejected by logic err={}. Details: pc={pc}",
-                member
-                    .map(|stx| algo_codec::compute_txn_id(&stx.txn).to_string())
-                    .unwrap_or_else(|| format!("#{group_index}")),
-                message.strip_prefix("AVM: ").unwrap_or(message),
-            ),
-            other => other.to_string(),
-        };
-        let message = match member {
-            Some(stx) => format!(
-                "transaction {{Txn:{{Type:{} Sender:{}}} TxID:{}}} invalid : {reason}",
-                stx.txn.txn_type.as_str(),
-                stx.txn.sender,
-                algo_codec::compute_txn_id(&stx.txn),
-            ),
-            None => reason,
+        let message = match (member, &e) {
+            (Some(stx), e) => {
+                algo_validate::frame_invalid_txn(stx, &algo_validate::verify_member_reason(stx, e))
+            }
+            (None, algo_error::AlgoError::Validation { message }) => message.clone(),
+            (None, other) => other.to_string(),
         };
         match e {
             // Keep the structured AVM diagnostics (`avm_eval_detail` walks
@@ -2289,26 +2265,35 @@ impl SimpleBlockEvaluator {
         // (`stxnCoreChecks`) behind the same `transaction ... invalid : ` frame
         // as well-formedness, and the batch verifier's failure bare; the
         // batch failure keeps its own mapping in the pool (issue #1969).
+        //
+        // go preps every member before it verifies the batch: a member's prep
+        // failure (framed) is reported even when an earlier member's
+        // signature is the one in the batch that fails. A delegated
+        // LogicSig's signature is checked by its own batch inside the prep, so
+        // its failure is framed too (`verify_failure_is_framed`, issue #2451).
         let verify_member_signatures = || -> Result<(), algo_error::AlgoError> {
             // Create a per-group LogicSig budget for logicsig evaluation.
             let mut lsig_budget = GroupBudget::for_logicsig(txgroup.len());
+            let mut batch_failure = None;
             for (intra_group_idx, stx) in txgroup.iter().enumerate() {
-                verify_transaction_signature(
+                if let Err(e) = verify_transaction_signature(
                     stx,
                     txgroup,
                     intra_group_idx,
                     &mut lsig_budget,
                     params,
-                )
-                .map_err(|e| {
-                    if e.is_batch_sig_failure() {
-                        e
-                    } else {
-                        Self::verify_rejection(algo_error::VerifyKind::Other, Some(stx), e)
+                ) {
+                    if algo_validate::verify_failure_is_framed(stx, &e) {
+                        return Err(Self::verify_rejection(
+                            algo_error::VerifyKind::Other,
+                            Some(stx),
+                            e,
+                        ));
                     }
-                })?;
+                    batch_failure.get_or_insert(e);
+                }
             }
-            Ok(())
+            batch_failure.map_or(Ok(()), Err)
         };
         if let Some(cache) = &self.verified_txn_cache {
             let context = algo_validate::VerificationContext {
@@ -2321,14 +2306,16 @@ impl SimpleBlockEvaluator {
             if let Err(e) =
                 algo_validate::verify_transaction_group_cached(txgroup, &context, params, cache)
             {
-                if e.is_batch_sig_failure() {
-                    return Err(e);
-                }
-                // The cached verification does not say which member failed:
-                // find it by verifying the members one by one (the error
-                // path only), so the error is framed like go's.
+                // The cached verification does not say which member failed,
+                // nor whether a failed signature was a delegated LogicSig's:
+                // find it by verifying the members one by one (the error path
+                // only), so the error is framed like go's.
                 return Err(verify_member_signatures().err().unwrap_or_else(|| {
-                    Self::verify_rejection(algo_error::VerifyKind::Other, None, e)
+                    if e.is_batch_sig_failure() {
+                        e
+                    } else {
+                        Self::verify_rejection(algo_error::VerifyKind::Other, None, e)
+                    }
                 }));
             }
         } else {

@@ -470,122 +470,17 @@ fn compute_multisig_address(msig: &MultisigSig) -> Address {
     Address(addr)
 }
 
-/// Validate multisig parameters (version, threshold, subsig count).
-///
-/// Rejects unsupported versions, threshold of 0, threshold exceeding subsig count,
-/// and more than 255 subsigs (which would overflow a u8 counter).
-fn validate_multisig_params(msig: &MultisigSig) -> Result<(), AlgoError> {
-    // Matches go's `crypto.MultisigBatchPrep` (`crypto/multisig.go`), which
-    // begins with:
-    //   if (len(sig.Subsigs) == 0 || sig.Subsigs[0] == MultisigSubsig{}) {
-    //       return errInvalidNumberOfSignature
-    //   }
-    // -- unconditionally rejecting a MultisigSig whose first subsig is the
-    // zero-valued {Key: zero pubkey, Sig: zero signature} placeholder,
-    // before ever computing/comparing the multisig address. Without this,
-    // a multisig address that happens to include an all-zero pubkey as one
-    // of its configured signers (a slot no private key can ever sign for)
-    // could be accepted here on the strength of its *other* signers
-    // reaching threshold, even though go-algorand always rejects it
-    // outright (issue #1307).
-    if msig.subsigs.is_empty()
-        || (msig.subsigs[0].public_key == [0u8; 32] && msig.subsigs[0].signature == [0u8; 64])
-    {
-        return Err(AlgoError::Validation {
-            message: "invalid number of signatures: first multisig subsig is empty".into(),
-        });
-    }
-    if msig.version != 1 {
-        return Err(AlgoError::Validation {
-            message: format!("unsupported multisig version: {}", msig.version),
-        });
-    }
-    if msig.threshold == 0 || msig.threshold as usize > msig.subsigs.len() {
-        return Err(AlgoError::Validation {
-            message: format!(
-                "invalid multisig threshold: {} (subsigs: {})",
-                msig.threshold,
-                msig.subsigs.len()
-            ),
-        });
-    }
-    if msig.subsigs.len() > 255 {
-        return Err(AlgoError::Validation {
-            message: format!(
-                "too many multisig subsigs: {} (max 255)",
-                msig.subsigs.len()
-            ),
-        });
-    }
-    Ok(())
-}
-
-/// Verify multisig subsignatures against a message, returning Ok if threshold is met.
-///
-/// This is the shared inner function used by both transaction multisig and logicsig
-/// delegated multisig verification.
-fn verify_multisig_subsigs(msig: &MultisigSig, msg: &[u8], context: &str) -> Result<(), AlgoError> {
-    validate_multisig_params(msig)?;
-
-    let mut valid_count: u16 = 0;
-    for subsig in &msig.subsigs {
-        // Public key length is now enforced by the type system ([u8; 32]).
-
-        if subsig.signature == [0u8; 64] {
-            continue;
-        }
-
-        if !ed25519_bv_compatible_verify(&subsig.public_key, msg, &subsig.signature) {
-            return Err(AlgoError::Validation {
-                message: algo_error::BATCH_HAS_FAILED_SIGS.into(),
-            });
-        }
-
-        valid_count += 1;
-    }
-
-    if valid_count < msig.threshold as u16 {
-        return Err(AlgoError::Validation {
-            message: format!(
-                "{context} threshold not met: have {valid_count} valid signatures, need {}",
-                msig.threshold
-            ),
-        });
-    }
-
-    Ok(())
-}
-
-/// Check that the multisig address matches the expected sender/auth_addr.
-fn check_multisig_address(
-    stx: &SignedTransaction,
-    msig: &MultisigSig,
-    context: &str,
-) -> Result<(), AlgoError> {
-    let msig_addr = compute_multisig_address(msig);
-    let expected_addr = match &stx.auth_addr {
-        Some(addr) => addr,
-        None => &stx.txn.sender,
-    };
-    if *expected_addr != msig_addr {
-        return Err(AlgoError::Validation {
-            message: format!(
-                "{context}: sender/auth_addr does not match computed multisig address"
-            ),
-        });
-    }
-    Ok(())
-}
-
-/// Verify a multisig signature on a signed transaction.
-///
-/// 1. Validate multisig parameters (version, threshold, subsig count).
-/// 2. Compute the multisig address from the subsig public keys.
-/// 3. Check that sender (or auth_addr if rekeyed) matches the multisig address.
-/// 4. Verify each non-empty subsig against the transaction signing message.
-/// 5. Check that the number of valid signatures >= threshold.
+/// Verify a multisig signature on a signed transaction: go's
+/// `stxnCoreChecks` multisig case. `crypto.MultisigBatchPrep` runs its
+/// structural checks against the authorizer (sender, or `auth_addr` when
+/// rekeyed) in go's order, a failure reported as `multisig validation
+/// failed: <err>` (issue #2451), then each non-blank subsignature goes to the
+/// batch, whose failure is go's bare [`algo_error::BATCH_HAS_FAILED_SIGS`].
 pub fn verify_multisig(stx: &SignedTransaction, msig: &MultisigSig) -> Result<(), AlgoError> {
-    check_multisig_address(stx, msig, "multisig address mismatch")?;
+    let authorizer = stx.auth_addr.unwrap_or(stx.txn.sender);
+    logic_multisig_prep(&authorizer, msig).map_err(|e| AlgoError::Validation {
+        message: format!("multisig validation failed: {e}"),
+    })?;
 
     // Build the signing message: "TX" || canonical_encode(txn)
     let canonical = canonical_encode_transaction(&stx.txn);
@@ -593,13 +488,20 @@ pub fn verify_multisig(stx: &SignedTransaction, msig: &MultisigSig) -> Result<()
     msg.extend_from_slice(TX_PREFIX);
     msg.extend_from_slice(&canonical);
 
-    verify_multisig_subsigs(msig, &msg, "multisig")
+    for subsig in msig.subsigs.iter().filter(|s| s.signature != [0u8; 64]) {
+        if !ed25519_bv_compatible_verify(&subsig.public_key, &msg, &subsig.signature) {
+            return Err(AlgoError::Validation {
+                message: algo_error::BATCH_HAS_FAILED_SIGS.into(),
+            });
+        }
+    }
+    Ok(())
 }
 
-/// go's `crypto.MultisigBatchPrep` (`crypto/multisig.go`) of a LogicSig's
-/// delegation multisig: the structural checks, with go's texts and in go's
-/// order. The signatures themselves are go's batch: [`logicsig_sanity_check`]
-/// verifies them after every structural check passed.
+/// go's `crypto.MultisigBatchPrep` (`crypto/multisig.go`) of a multisig
+/// (a transaction's, or a LogicSig's delegation): the structural checks, with
+/// go's texts and in go's order. The signatures themselves are go's batch,
+/// verified after every structural check passed.
 fn logic_multisig_prep(addr: &Address, msig: &MultisigSig) -> Result<(), &'static str> {
     // go's `errInvalidNumberOfSignature` / `errUnknownVersion` /
     // `errInvalidThreshold` / `errInvalidAddress` (`crypto/cryptoerror.go`).
@@ -2264,7 +2166,11 @@ mod tests {
         };
 
         let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();
-        assert!(err.to_string().contains("threshold not met"));
+        // go `MultisigBatchPrep`: fewer signatures than the threshold.
+        assert_eq!(
+            err.to_string(),
+            "validation error: multisig validation failed: Invalid number of signatures"
+        );
     }
 
     /// TestOneSignatureIsEmpty (`crypto/multisig_test.go`): a threshold ==
@@ -2303,7 +2209,11 @@ mod tests {
         };
 
         let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();
-        assert!(err.to_string().contains("threshold not met"));
+        // go `MultisigBatchPrep`: fewer signatures than the threshold.
+        assert_eq!(
+            err.to_string(),
+            "validation error: multisig validation failed: Invalid number of signatures"
+        );
     }
 
     #[test]
@@ -2327,7 +2237,10 @@ mod tests {
         };
 
         let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();
-        assert!(err.to_string().contains("address mismatch"));
+        assert_eq!(
+            err.to_string(),
+            "validation error: multisig validation failed: Invalid address"
+        );
     }
 
     /// Go-parity (issue #1307): go-algorand's `MultisigBatchPrep`
@@ -2400,7 +2313,8 @@ mod tests {
         // would otherwise verify successfully.
         let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();
         assert!(
-            err.to_string().contains("subsig") || err.to_string().contains("zero"),
+            err.to_string()
+                == "validation error: multisig validation failed: Invalid number of signatures",
             "expected a subsig/zero-related rejection, got: {err}"
         );
     }
@@ -2440,7 +2354,8 @@ mod tests {
 
         let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();
         assert!(
-            err.to_string().contains("too many multisig subsigs"),
+            err.to_string()
+                == "validation error: multisig validation failed: Invalid number of signatures",
             "unexpected error: {err}"
         );
     }
@@ -2696,7 +2611,7 @@ mod tests {
 
         let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();
         assert!(
-            err.to_string().contains("invalid multisig threshold"),
+            err.to_string() == "validation error: multisig validation failed: Invalid threshold",
             "expected threshold validation error, got: {err}"
         );
     }
@@ -2724,7 +2639,7 @@ mod tests {
 
         let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();
         assert!(
-            err.to_string().contains("unsupported multisig version"),
+            err.to_string() == "validation error: multisig validation failed: unknown version",
             "expected version validation error, got: {err}"
         );
     }
@@ -2749,7 +2664,7 @@ mod tests {
 
         let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();
         assert!(
-            err.to_string().contains("invalid multisig threshold"),
+            err.to_string() == "validation error: multisig validation failed: Invalid threshold",
             "expected threshold validation error, got: {err}"
         );
     }

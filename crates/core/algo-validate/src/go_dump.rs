@@ -59,6 +59,58 @@ pub fn frame_invalid_txn(stx: &SignedTransaction, reason: &str) -> String {
     format!("transaction {} invalid : {reason}", go_signed_txn_dump(stx))
 }
 
+/// go's reason for a member's `txnBatchPrep` failure, the `<err>` of its
+/// frame: the error's own text (never `AlgoError::Validation`'s `validation
+/// error: ` prefix), and for a LogicSig program that errors, `logicSigVerify`'s
+/// `transaction <txid>: %w` of the program's `EvalError` (`rejected by logic
+/// err=<err>. Details: pc=<pc>`).
+pub fn verify_member_reason(stx: &SignedTransaction, e: &algo_error::AlgoError) -> String {
+    member_reason(stx, e, false)
+}
+
+/// [`verify_member_reason`] as simulate prints it: simulate's tracer asks
+/// for detailed eval errors (`DetailedEvalErrors`), so a LogicSig program's
+/// error carries the failing instructions too, `Details: pc=<pc>,
+/// opcodes=<pcDetails>` (`logic.(*EvalContext).evalError`).
+pub fn simulate_member_reason(stx: &SignedTransaction, e: &algo_error::AlgoError) -> String {
+    member_reason(stx, e, true)
+}
+
+fn member_reason(stx: &SignedTransaction, e: &algo_error::AlgoError, detailed: bool) -> String {
+    match e {
+        algo_error::AlgoError::Validation { message } => message.clone(),
+        algo_error::AlgoError::AvmLogicSig {
+            message,
+            pc,
+            app_index: None,
+            ..
+        } => {
+            let opcodes = match (detailed, stx.lsig.as_ref()) {
+                (true, Some(lsig)) => format!(
+                    ", opcodes={}",
+                    algo_avm::disassembler::pc_details(&lsig.logic, *pc)
+                ),
+                _ => String::new(),
+            };
+            format!(
+                "transaction {}: rejected by logic err={}. Details: pc={pc}{opcodes}",
+                algo_codec::compute_txn_id(&stx.txn),
+                message.strip_prefix("AVM: ").unwrap_or(message),
+            )
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Whether go reports `e`, a member's signature verdict, with the member's
+/// frame. Every `txnBatchPrep` failure is framed; the batch verifier's own
+/// failure is bare, except a delegated LogicSig's: `logicSigVerify` checks
+/// that signature with a batch of its own, inside the framed prep
+/// (`LogicSigSanityCheck`).
+pub fn verify_failure_is_framed(stx: &SignedTransaction, e: &algo_error::AlgoError) -> bool {
+    !e.is_batch_sig_failure() || stx.lsig.as_ref().is_some_and(|l| l.has_program())
+}
+
 /// go's `fmt.Sprintf("%+v", stxn)` of a `transactions.SignedTxn`.
 pub fn go_signed_txn_dump(stx: &SignedTransaction) -> String {
     let mut w = String::with_capacity(4096);

@@ -20,9 +20,11 @@
 
 //! Issue #2193: `validate_transaction_wellformed_in_mode`'s mode decides what
 //! an unknown transaction type does, so every PRODUCTION call site must pass
-//! the intended one: block validation and simulation the block mode (they
-//! reject an unknown type earlier, in `check_txn_group`), the REST and gossip
-//! admission paths (`participate.rs`) the admission mode.
+//! the intended one: block validation the block mode (it rejects an unknown
+//! type earlier, in `check_txn_group`), the REST and gossip admission paths
+//! (`participate.rs`) and simulate (go's `verify.TxnGroup`, whose `WellFormed`
+//! reports `unknown tx type <type>` at the member, issue #2451) the admission
+//! mode.
 
 use std::path::{Path, PathBuf};
 
@@ -110,7 +112,7 @@ fn wellformed_callers_pass_the_intended_mode() {
         ),
         (
             "crates/core/algo-ledger/src/simulation/mod.rs".into(),
-            "block",
+            "admission",
         ),
         ("crates/core/algo-validate/src/block.rs".into(), "block"),
     ];
