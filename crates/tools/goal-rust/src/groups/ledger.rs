@@ -22,21 +22,38 @@
 
 use std::process::ExitCode;
 
-use clap::Subcommand;
-
-use crate::unimplemented;
+use clap::{Args, Subcommand};
 
 #[derive(Subcommand, Debug)]
 pub enum LedgerCmd {
     /// Dump a block to a file or stdout.
-    Block,
+    Block(BlockArgs),
     /// Show ledger token supply.
     Supply,
 }
 
+/// go: `blockCmd`'s flags (`cmd/goal/ledger.go`).
+#[derive(Args, Debug)]
+pub struct BlockArgs {
+    /// The round number.
+    pub round: String,
+    /// The filename to dump the block to (if not set, use stdout).
+    #[arg(short = 'o', long = "out", default_value = "-")]
+    pub out: String,
+    /// Format block as msgpack.
+    #[arg(short = 'r', long = "raw")]
+    pub raw: bool,
+    /// Encode binary blobs using base32 instead of base64.
+    #[arg(long = "b32")]
+    pub b32: bool,
+    /// Strict JSON decode: turn all keys into strings.
+    #[arg(long = "strict")]
+    pub strict: bool,
+}
+
 pub fn run(cmd: LedgerCmd) -> ExitCode {
     match cmd {
-        LedgerCmd::Block => unimplemented("ledger", "block"),
+        LedgerCmd::Block(args) => crate::cmd::ledger::run_block(args, crate::cli_state::datadirs()),
         LedgerCmd::Supply => crate::cmd::node::run_ledger_supply(crate::cli_state::datadirs()),
     }
 }

@@ -196,6 +196,8 @@ fn spawn_mock_algod(
                     // Parse the path from "GET /v2/accounts/<addr> HTTP/1.1"
                     let first_line = req.lines().next().unwrap_or("");
                     let path = first_line.split_whitespace().nth(1).unwrap_or("");
+                    // go's (and goal-rust's) `?exclude=none&format=json`
+                    let path = path.split('?').next().unwrap_or("");
                     let addr = path.strip_prefix("/v2/accounts/").unwrap_or("");
                     let lookup = { table.lock().unwrap().get(addr).cloned() };
                     let body = match lookup {
@@ -446,7 +448,7 @@ fn account_list_w_unknown_wallet_errors() {
         "list with unknown -w must fail; stderr={stderr:?}",
     );
     assert!(
-        stderr.contains("Could not find a wallet named 'nosuchwallet'"),
+        stderr.contains("Wallet 'nosuchwallet' not found"),
         "stderr must explain missing wallet; got {stderr:?}",
     );
 }

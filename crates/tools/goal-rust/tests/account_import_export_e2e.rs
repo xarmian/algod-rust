@@ -317,7 +317,7 @@ fn account_export_wrong_password_surfaces_kmd_error() {
     let stderr = String::from_utf8_lossy(&exp.stderr);
     assert!(!exp.status.success(), "wrong-password export must fail");
     assert!(
-        stderr.contains("Request failed:"),
+        stderr.contains("Error processing command:"),
         "stderr must use errorRequestFail template; got {stderr:?}",
     );
 }

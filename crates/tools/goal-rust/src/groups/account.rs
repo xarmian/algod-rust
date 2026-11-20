@@ -456,10 +456,15 @@ pub struct ExportArgs {
 /// with Go's actual filter semantics.
 #[derive(Args, Debug)]
 pub struct ListArgs {
-    /// Restrict to a single wallet by name. When omitted, list every
-    /// address across every wallet kmd knows about.
+    /// The wallet to list (go's `-w`); without it go's default wallet, or
+    /// the only one.
     #[arg(short = 'w', long = "wallet")]
     pub wallet: Option<String>,
+
+    /// Include additional information about each account's assets and
+    /// applications.
+    #[arg(long = "info")]
+    pub info: bool,
 
     /// Wallet password for the open-handle step. Required for each
     /// wallet's `init_wallet` call; non-TTY stdin reads one line.

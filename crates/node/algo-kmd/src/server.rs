@@ -63,6 +63,42 @@ pub const NET_FILENAME: &str = "kmd.net";
 pub const PID_FILENAME: &str = "kmd.pid";
 /// `LockFilename` (server.go:44).
 pub const LOCK_FILENAME: &str = "kmd.lock";
+/// The mode gofrs/flock creates `kmd.lock` with (`flock.New`).
+const LOCK_FILE_MODE: u32 = 0o600;
+/// The mode go's kmd writes `kmd.net` / `kmd.pid` with (server.go:146-151).
+const NET_PID_FILE_MODE: u32 = 0o640;
+
+/// `opts.open(path)`, a file it creates getting `mode` (less the umask) on
+/// Unix, like go's `os.OpenFile(.., perm)`.
+fn open_with_mode(
+    opts: &mut std::fs::OpenOptions,
+    path: &Path,
+    mode: u32,
+) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    opts.open(path)
+}
+
+/// go's `os.WriteFile(path, data, mode)`: truncate or create (with `mode`).
+fn write_file_with_mode(path: &Path, data: &[u8], mode: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    open_with_mode(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true),
+        path,
+        mode,
+    )?
+    .write_all(data)
+}
+
 /// `DefaultKMDPort` (server.go:46).
 pub const DEFAULT_KMD_PORT: u16 = 7833;
 /// `DefaultKMDHost` (server.go:48). kmd binds localhost only.
@@ -176,13 +212,17 @@ impl WalletServer {
         // `fs2::try_lock_exclusive` which compiles to the same
         // `flock(LOCK_EX|LOCK_NB)` on Unix and `LockFileEx` on
         // Windows.
-        let lock_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(Error::Io)?;
+        // gofrs/flock opens the lock file with mode 0600.
+        let lock_file = open_with_mode(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false),
+            &lock_path,
+            LOCK_FILE_MODE,
+        )
+        .map_err(Error::Io)?;
         if let Err(e) = lock_file.try_lock_exclusive() {
             // fs2 returns `WouldBlock` on Unix (`flock` maps `EWOULDBLOCK`
             // cleanly) when another process holds the lock; surface that as
@@ -216,9 +256,15 @@ impl WalletServer {
         };
         let addr = listener.local_addr().map_err(Error::Io)?;
 
-        // Write kmd.net + kmd.pid (server.go:143-152).
-        std::fs::write(&net_path, addr.to_string().as_bytes()).map_err(Error::Io)?;
-        std::fs::write(&pid_path, std::process::id().to_string().as_bytes()).map_err(Error::Io)?;
+        // Write kmd.net + kmd.pid (server.go:143-152), `os.WriteFile(.., 0640)`.
+        write_file_with_mode(&net_path, addr.to_string().as_bytes(), NET_PID_FILE_MODE)
+            .map_err(Error::Io)?;
+        write_file_with_mode(
+            &pid_path,
+            std::process::id().to_string().as_bytes(),
+            NET_PID_FILE_MODE,
+        )
+        .map_err(Error::Io)?;
 
         // `lock_path` is kept in scope only via the open `lock_file`
         // handle — `fs2` ties the OS lock to the file descriptor, so

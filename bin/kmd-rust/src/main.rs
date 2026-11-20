@@ -98,32 +98,39 @@ enum Command {
     },
 }
 
+/// go: `kmdLogFileName` / `kmdLogFilePerm` (`cmd/kmd/main.go`).
+const KMD_LOG_FILENAME: &str = "kmd.log";
+const KMD_LOG_FILE_MODE: u32 = 0o640;
+
+/// go: `cmd/kmd/codes` -- the log file cannot be opened, any other start
+/// error, another kmd holds the data dir.
+const EXIT_CODE_KMD_LOG_ERROR: u8 = 2;
+const EXIT_CODE_KMD_ERROR: u8 = 3;
+const EXIT_CODE_KMD_ALREADY_RUNNING: u8 = 4;
+
+/// go's `runKmd`: `<data_dir>/kmd.log`, opened `O_CREATE|O_WRONLY|O_APPEND`
+/// with mode 0640, receives kmd's log.
+fn open_kmd_log(data_dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(KMD_LOG_FILE_MODE);
+    }
+    #[cfg(not(unix))]
+    let _ = KMD_LOG_FILE_MODE;
+    opts.open(data_dir.join(KMD_LOG_FILENAME))
+}
+
 fn main() -> ExitCode {
-    init_tracing();
     let cli = Cli::parse();
 
     match cli.command {
-        Command::CheckConfig { data_dir } => match load_kmd_config(&data_dir) {
-            Ok(cfg) => {
-                tracing::info!(
-                    data_dir = %data_dir.display(),
-                    session_lifetime_secs = cfg.session_lifetime_secs,
-                    scrypt_n = cfg.driver_config.sqlite.scrypt_params.scrypt_n,
-                    scrypt_r = cfg.driver_config.sqlite.scrypt_params.scrypt_r,
-                    scrypt_p = cfg.driver_config.sqlite.scrypt_params.scrypt_p,
-                    "kmd-rust: config OK",
-                );
-                ExitCode::SUCCESS
-            }
-            Err(err) => {
-                eprintln!(
-                    "kmd-rust: failed to load config from {}: {}",
-                    data_dir.display(),
-                    err,
-                );
-                ExitCode::from(1)
-            }
-        },
+        Command::CheckConfig { data_dir } => {
+            init_tracing();
+            check_config(&data_dir)
+        }
         Command::Serve {
             data_dir,
             address,
@@ -131,34 +138,85 @@ fn main() -> ExitCode {
             allowed_origins,
             allow_header_pna,
         } => {
-            if timeout.is_some() {
-                tracing::warn!(
-                    "kmd-rust: --timeout is accepted for CLI parity but not yet enforced \
-                     (Go's watchdog timer is not ported)",
-                );
-            }
-            // Build a single-threaded tokio runtime — kmd is I/O-bound
-            // and dispatches CPU-heavy SQLite/scrypt work to
-            // `spawn_blocking`, so a single reactor thread is enough.
-            // A multi-threaded runtime would also work; the choice
-            // doesn't affect correctness.
-            let rt = match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
+            // go's `runKmd` logs to `kmd.log` in the data dir, not to stdout.
+            let log = match open_kmd_log(&data_dir) {
+                Ok(f) => f,
                 Err(err) => {
-                    eprintln!("kmd-rust: failed to build tokio runtime: {err}");
-                    return ExitCode::from(1);
+                    init_tracing();
+                    tracing::error!("failed to open log file: {err}");
+                    return ExitCode::from(EXIT_CODE_KMD_LOG_ERROR);
                 }
             };
-            match rt.block_on(serve(data_dir, address, allowed_origins, allow_header_pna)) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(err) => {
-                    eprintln!("kmd-rust: serve failed: {err}");
-                    ExitCode::from(1)
-                }
-            }
+            init_file_tracing(log);
+            run_serve(
+                data_dir,
+                address,
+                timeout,
+                allowed_origins,
+                allow_header_pna,
+            )
+        }
+    }
+}
+
+fn check_config(data_dir: &std::path::Path) -> ExitCode {
+    match load_kmd_config(data_dir) {
+        Ok(cfg) => {
+            tracing::info!(
+                data_dir = %data_dir.display(),
+                session_lifetime_secs = cfg.session_lifetime_secs,
+                scrypt_n = cfg.driver_config.sqlite.scrypt_params.scrypt_n,
+                scrypt_r = cfg.driver_config.sqlite.scrypt_params.scrypt_r,
+                scrypt_p = cfg.driver_config.sqlite.scrypt_params.scrypt_p,
+                "kmd-rust: config OK",
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!(
+                "kmd-rust: failed to load config from {}: {}",
+                data_dir.display(),
+                err,
+            );
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_serve(
+    data_dir: PathBuf,
+    address: Option<SocketAddr>,
+    timeout: Option<u64>,
+    allowed_origins: Vec<String>,
+    allow_header_pna: bool,
+) -> ExitCode {
+    if timeout.is_some() {
+        tracing::warn!(
+            "kmd-rust: --timeout is accepted for CLI parity but not yet enforced \
+                     (Go's watchdog timer is not ported)",
+        );
+    }
+    // Build a single-threaded tokio runtime — kmd is I/O-bound
+    // and dispatches CPU-heavy SQLite/scrypt work to
+    // `spawn_blocking`, so a single reactor thread is enough.
+    // A multi-threaded runtime would also work; the choice
+    // doesn't affect correctness.
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            eprintln!("kmd-rust: failed to build tokio runtime: {err}");
+            return ExitCode::from(EXIT_CODE_KMD_ERROR);
+        }
+    };
+    match rt.block_on(serve(data_dir, address, allowed_origins, allow_header_pna)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err((code, err)) => {
+            tracing::error!("couldn't start kmd: {err}");
+            eprintln!("kmd-rust: serve failed: {err}");
+            ExitCode::from(code)
         }
     }
 }
@@ -168,18 +226,19 @@ async fn serve(
     cli_address: Option<SocketAddr>,
     cli_allowed_origins: Vec<String>,
     cli_allow_header_pna: bool,
-) -> Result<(), String> {
-    let cfg = load_kmd_config(&data_dir).map_err(|e| format!("load config: {e}"))?;
+) -> Result<(), (u8, String)> {
+    let fail = |e: String| (EXIT_CODE_KMD_ERROR, e);
+    let cfg = load_kmd_config(&data_dir).map_err(|e| fail(format!("load config: {e}")))?;
 
     // Validate or generate the API token.  We do this on the runtime
     // thread (it's cheap; reading 64 hex chars from disk).
     let api_token = validate_or_generate_api_token(&data_dir)
-        .map_err(|e| format!("validate or generate kmd.token: {e}"))?;
+        .map_err(|e| fail(format!("validate or generate kmd.token: {e}")))?;
 
     // Spin up the wallet driver (creates the wallets/ subdir if
     // needed) and the session manager.
     let wallet_driver = WalletDriver::from_kmd_config(&data_dir, &cfg.driver_config.sqlite)
-        .map_err(|e| format!("wallet driver init: {e}"))?;
+        .map_err(|e| fail(format!("wallet driver init: {e}")))?;
     let session_manager = Arc::new(SessionManager::from_lifetime_secs(
         cfg.session_lifetime_secs,
     ));
@@ -201,7 +260,7 @@ async fn serve(
         None => Some(
             resolve_address(&cfg.address)
                 .await
-                .map_err(|e| format!("kmd_config.json address {:?}: {e}", cfg.address))?,
+                .map_err(|e| fail(format!("kmd_config.json address {:?}: {e}", cfg.address)))?,
         ),
     };
     let allowed_origins = if !cli_allowed_origins.is_empty() {
@@ -225,9 +284,14 @@ async fn serve(
         wallet_driver: Arc::new(wallet_driver),
     };
 
-    let server = WalletServer::bind(server_cfg)
-        .await
-        .map_err(|e| format!("server bind: {e}"))?;
+    let server = WalletServer::bind(server_cfg).await.map_err(|e| {
+        let code = if matches!(e, algo_kmd::Error::AlreadyRunning) {
+            EXIT_CODE_KMD_ALREADY_RUNNING
+        } else {
+            EXIT_CODE_KMD_ERROR
+        };
+        (code, format!("server bind: {e}"))
+    })?;
     let bound = server.local_addr();
     tracing::info!(
         data_dir = %data_dir.display(),
@@ -267,7 +331,7 @@ async fn serve(
     // runtime tears down (not load-bearing for correctness).
     let _ = tokio::time::timeout(Duration::from_millis(50), cleanup).await;
 
-    result.map_err(|e| format!("server error: {e}"))
+    result.map_err(|e| fail(format!("server error: {e}")))
 }
 
 /// Resolve a Go-style `net.Listen` address string into a single
@@ -321,10 +385,24 @@ async fn wait_for_shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+fn env_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+}
+
 fn init_tracing() {
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter())
+        .init();
+}
+
+/// kmd's log into `kmd.log`, one JSON object per line (go's logrus JSON).
+fn init_file_tracing(log: std::fs::File) {
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter())
+        .json()
+        .with_writer(std::sync::Mutex::new(log))
+        .init();
 }
 
 #[cfg(test)]
