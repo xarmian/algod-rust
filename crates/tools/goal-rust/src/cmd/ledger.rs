@@ -211,7 +211,11 @@ pub fn run_version(verbose: bool, cli_d: Vec<PathBuf>) -> ExitCode {
         let v = match response {
             Ok(v) => v,
             Err(e) => {
-                println!("{e}");
+                // go: `fmt.Println(err)`, the reason phrase's bytes as sent
+                use std::io::Write as _;
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(&algo_types::raw_text::decode(&e));
+                let _ = out.write_all(b"\n");
                 return ExitCode::from(1);
             }
         };

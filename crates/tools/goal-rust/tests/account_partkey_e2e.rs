@@ -335,6 +335,14 @@ fn listpartkeys_renders_columns_and_short_address_id() {
         ("GET".to_string(), "/v2/participation".to_string()),
         sample_partkey_list(),
     );
+    // go lists a key only once its account was read (`AccountInformation`)
+    initial.table.insert(
+        (
+            "GET".to_string(),
+            "/v2/accounts/ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_string(),
+        ),
+        serde_json::json!({"amount": 0}),
+    );
     let (_state, stop, jh, port) = spawn_mock_algod(initial);
     wire_algod(&dd, port);
 

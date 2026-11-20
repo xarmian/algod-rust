@@ -86,7 +86,19 @@ impl std::fmt::Display for Error {
 /// go's `Decoder.Decode(&response)` with `response` an `any` holding a
 /// pointer to `ty`: the decoded value, or go-codec's error.
 pub fn decode(body: &[u8], ty: &'static Ty) -> Result<Value, Error> {
+    decode_reading(body, ty).0
+}
+
+/// [`decode`], and whether it read past the end of `body`: on a body that
+/// broke off there, go-codec's read gets the body's error instead
+/// (`ioDecReader.readn1` panics with it), which is what `Decode` returns.
+pub fn decode_reading(body: &[u8], ty: &'static Ty) -> (Result<Value, Error>, bool) {
     let mut d = Dec::new(body);
+    let res = decode_with(&mut d, ty);
+    (res, d.hit_end)
+}
+
+fn decode_with(d: &mut Dec<'_>, ty: &'static Ty) -> Result<Value, Error> {
     let mut v = zero(ty);
     // mustDecode: a top-level `null` leaves the struct zero
     if d.try_decode_as_nil()? {
@@ -167,6 +179,8 @@ struct Dec<'a> {
     ls: LastByte,
     tok: u8,
     c: Container,
+    /// A read went past the end of the body.
+    hit_end: bool,
 }
 
 fn is_ws(b: u8) -> bool {
@@ -196,6 +210,7 @@ impl<'a> Dec<'a> {
             ls: LastByte::Undefined,
             tok: 0,
             c: Container::None,
+            hit_end: false,
         }
     }
 
@@ -212,7 +227,10 @@ impl<'a> Dec<'a> {
             self.ls = LastByte::CanUnread;
             return Some(self.last);
         }
-        let b = *self.src.get(self.off)?;
+        let Some(&b) = self.src.get(self.off) else {
+            self.hit_end = true;
+            return None;
+        };
         self.off += 1;
         self.last = b;
         self.ls = LastByte::CanUnread;
@@ -257,6 +275,7 @@ impl<'a> Dec<'a> {
             self.ls = LastByte::CanUnread;
         }
         if out.len() < k {
+            self.hit_end = true;
             return Err(Error::Eof);
         }
         self.n += k;
@@ -1515,6 +1534,65 @@ pub const SUPPLY: Ty = Ty::Struct(&[
     Field("online-stake", Ty::U64),
     Field("total-money", Ty::U64),
 ]);
+
+/// `model.Asset` (`GET /v2/assets/{asset-id}`).
+pub const ASSET: Ty = Ty::Struct(&[
+    Field("index", Ty::U64),
+    Field("params", Ty::Ptr(&ASSET_PARAMS)),
+]);
+
+/// `model.Application` (`GET /v2/applications/{application-id}`).
+pub const APPLICATION: Ty = Ty::Struct(&[
+    Field("id", Ty::U64),
+    Field("params", Ty::Ptr(&APPLICATION_PARAMS)),
+]);
+
+/// `model.AccountAssetsInformationResponse` (`GET
+/// /v2/accounts/{address}/assets`).
+pub const ACCOUNT_ASSETS_INFORMATION: Ty = Ty::Struct(&[
+    Field(
+        "asset-holdings",
+        Ty::Ptr(&Ty::Slice(
+            &Ty::Struct(&[
+                Field("asset-holding", ASSET_HOLDING),
+                Field("asset-params", Ty::Ptr(&ASSET_PARAMS)),
+            ]),
+            "[]model.AccountAssetHolding",
+        )),
+    ),
+    Field("next-token", Ty::Ptr(&Ty::Str)),
+    Field("round", ROUND),
+]);
+
+/// `model.AccountAssetResponse` (`GET
+/// /v2/accounts/{address}/assets/{asset-id}`).
+pub const ACCOUNT_ASSET: Ty = Ty::Struct(&[
+    Field("asset-holding", Ty::Ptr(&ASSET_HOLDING)),
+    Field("created-asset", Ty::Ptr(&ASSET_PARAMS)),
+    Field("round", ROUND),
+]);
+
+/// `model.ParticipationKeysResponse` (`GET /v2/participation`).
+pub const PARTICIPATION_KEYS: Ty = Ty::Slice(
+    &Ty::Struct(&[
+        Field("address", Ty::Str),
+        Field("effective-first-valid", Ty::Ptr(&ROUND)),
+        Field("effective-last-valid", Ty::Ptr(&ROUND)),
+        Field("id", Ty::Str),
+        Field("key", ACCOUNT_PARTICIPATION),
+        Field("last-block-proposal", Ty::Ptr(&ROUND)),
+        Field("last-state-proof", Ty::Ptr(&ROUND)),
+        Field("last-vote", Ty::Ptr(&ROUND)),
+    ]),
+    "[]model.ParticipationKey",
+);
+
+/// `model.PostParticipationResponse` (`POST /v2/participation`).
+pub const POST_PARTICIPATION: Ty = Ty::Struct(&[Field("partId", Ty::Str)]);
+
+/// `model.CatchpointStartResponse` / `model.CatchpointAbortResponse`
+/// (`POST` / `DELETE /v2/catchup/{catchpoint}`).
+pub const CATCHPOINT_RESPONSE: Ty = Ty::Struct(&[Field("catchup-message", Ty::Str)]);
 
 #[cfg(test)]
 mod tests {

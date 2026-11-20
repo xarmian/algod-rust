@@ -411,19 +411,6 @@ pub fn catchpoint_lookup_url(genesis_id: &str) -> String {
     CATCHPOINT_URL.replacen("{}", channel, 1)
 }
 
-/// go: `submitForm(... "/v2/catchup/<label>", catchupParams{Min})` -- `min`
-/// is only sent when non-zero. The label's `#` is percent-encoded as go's
-/// `url.URL{Path: ...}` does; sent raw it would start a URL fragment and cut
-/// off the hash and the query.
-pub fn catchup_path(label: &str, min: u64) -> String {
-    let label = label.replace('#', "%23");
-    if min == 0 {
-        format!("/v2/catchup/{label}")
-    } else {
-        format!("/v2/catchup/{label}?min={min}")
-    }
-}
-
 /// The text `goal node pendingtxns` prints for the REST API's
 /// `{"top-transactions": [...], "total-transactions": N}` document.
 pub fn format_pending_txns(doc: &serde_json::Value, max: u64) -> String {
@@ -504,8 +491,8 @@ fn node_status_error(e: &str) -> String {
 
 /// Port of `catchupCmd` (`node.go:155-212`).
 pub fn run_catchup(args: crate::groups::node::CatchupArgs, cli_d: Vec<PathBuf>) -> ExitCode {
-    let label_arg = match validate_catchpoint_args(&args.catchpoint) {
-        Ok(l) => l,
+    let mut catchpoint = match validate_catchpoint_args(&args.catchpoint) {
+        Ok(l) => l.unwrap_or_default(),
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::from(1);
@@ -534,8 +521,7 @@ pub fn run_catchup(args: crate::groups::node::CatchupArgs, cli_d: Vec<PathBuf>) 
                 return ExitCode::from(1);
             }
         };
-        let endpoint = (url.clone(), token.clone());
-        let http = http();
+        let endpoint = (url, token);
 
         if args.abort {
             // go: libgoal AbortCatchup -- only when a catchup is running
@@ -549,90 +535,76 @@ pub fn run_catchup(args: crate::groups::node::CatchupArgs, cli_d: Vec<PathBuf>) 
             let Some(label) = status.catchpoint.filter(|c| !c.is_empty()) else {
                 continue; // not catching up: no error
             };
-            // (the request future must be created inside the runtime: reqwest's
-            // timeout needs the reactor at construction)
-            let res = rt.block_on(async {
-                http.delete(format!("{url}{}", catchup_path(&label, 0)))
-                    .header("X-Algo-API-Token", &token)
-                    .send()
-                    .await
-            });
-            match res {
-                Err(e) => {
-                    eprintln!("{}", node_status_error(&e.to_string()));
-                    return ExitCode::from(1);
-                }
-                Ok(resp) if !resp.status().is_success() => {
-                    let status = resp.status();
-                    let body = rt.block_on(resp.text()).unwrap_or_default();
-                    eprintln!("{}", node_status_error(&http_error_text(status, &body)));
-                    return ExitCode::from(1);
-                }
-                Ok(_) => {}
+            if let Err(e) = algod_rest::delete(
+                &rt,
+                &endpoint,
+                &format!("/v2/catchup/{label}"),
+                &go_codec_json::CATCHPOINT_RESPONSE,
+                false,
+            ) {
+                eprintln!("{}", node_status_error(&e));
+                return ExitCode::from(1);
             }
             continue;
         }
 
-        let catchpoint = match &label_arg {
-            Some(l) => l.clone(),
-            None => {
-                // lookup the latest catchpoint for this network
-                let versions = match fetch_versions(&rt, &endpoint) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("{}", node_status_error(&e));
-                        return ExitCode::from(1);
-                    }
-                };
-                let lookup = catchpoint_lookup_url(&versions.genesis_id);
-                let label = match rt.block_on(get_missing_catchpoint_label(&lookup)) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        eprintln!(
-                            "{ERROR_CATCHPOINT_LABEL_MISSING}{ERROR_UNABLE_TO_LOOKUP_CATCHPOINT_LABEL}: {e}"
-                        );
-                        return ExitCode::from(1);
-                    }
-                };
-                if !args.force {
-                    print!("{}", format_message(NODE_CONFIRM_IMPLICIT_CATCHPOINT, &[&label]));
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
-                    let mut line = String::new();
-                    let _ = std::io::stdin().read_line(&mut line);
-                    if !consent_given(&line) {
-                        eprintln!("{ERROR_ABORTED_PER_USER_REQUEST}");
-                        return ExitCode::from(1);
-                    }
+        // go: the label looked up for the first data dir serves them all
+        if catchpoint.is_empty() {
+            let versions = match fetch_versions(&rt, &endpoint) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", node_status_error(&e));
+                    return ExitCode::from(1);
                 }
-                label
+            };
+            let lookup = catchpoint_lookup_url(&versions.genesis_id);
+            let label = match rt.block_on(get_missing_catchpoint_label(&lookup)) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!(
+                        "{ERROR_CATCHPOINT_LABEL_MISSING}{ERROR_UNABLE_TO_LOOKUP_CATCHPOINT_LABEL}: {e}"
+                    );
+                    return ExitCode::from(1);
+                }
+            };
+            catchpoint = label;
+            if !args.force {
+                print!(
+                    "{}",
+                    format_message(NODE_CONFIRM_IMPLICIT_CATCHPOINT, &[&catchpoint])
+                );
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+                if !consent_given(&line) {
+                    eprintln!("{ERROR_ABORTED_PER_USER_REQUEST}");
+                    return ExitCode::from(1);
+                }
             }
-        };
+        }
 
-        let sent = rt.block_on(async {
-            http.post(format!("{url}{}", catchup_path(&catchpoint, args.min)))
-                .header("X-Algo-API-Token", &token)
-                .send()
-                .await
-        });
-        let resp = match sent {
+        // go: `catchupParams{Min}`, `url:"min"` (sent even when 0)
+        let min = args.min.to_string();
+        let resp = match algod_rest::post_json(
+            &rt,
+            &endpoint,
+            &format!("/v2/catchup/{catchpoint}"),
+            &[("min", &min)],
+            None,
+            &go_codec_json::CATCHPOINT_RESPONSE,
+        ) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("{}", node_status_error(&e.to_string()));
+                eprintln!("{}", node_status_error(&e));
                 return ExitCode::from(1);
             }
         };
-        let status = resp.status();
-        let body = rt.block_on(resp.text()).unwrap_or_default();
-        if !status.is_success() {
-            eprintln!("{}", node_status_error(&http_error_text(status, &body)));
-            return ExitCode::from(1);
-        }
-        let message = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| v.get("catchup-message").and_then(|m| m.as_str().map(String::from)))
-            .unwrap_or_default();
+        let message = resp["catchup-message"].as_str().unwrap_or("");
         if message != catchpoint {
-            println!("node response: {message}");
+            print!(
+                "{}",
+                crate::formatting::report_info_text(&format!("node response: {message}"))
+            );
         }
     }
     ExitCode::SUCCESS
@@ -1699,7 +1671,7 @@ mod tests {
     }
 
     #[test]
-    fn the_lookup_url_and_catchup_path_match_go() {
+    fn the_lookup_url_matches_go() {
         assert_eq!(
             catchpoint_lookup_url("mainnet-v1.0"),
             "https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/mainnet/latest.catchpoint"
@@ -1708,8 +1680,6 @@ mod tests {
             catchpoint_lookup_url("testnet-v1.0"),
             "https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/testnet/latest.catchpoint"
         );
-        assert_eq!(catchup_path("1#AB", 0), "/v2/catchup/1%23AB");
-        assert_eq!(catchup_path("1#AB", 50), "/v2/catchup/1%23AB?min=50");
     }
 
     #[test]

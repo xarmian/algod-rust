@@ -908,58 +908,91 @@ pub fn run_info(args: InfoArgs) -> ExitCode {
 fn run_info_inner(args: InfoArgs) -> Result<ExitCode, String> {
     let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
         .map_err(|e| e.to_string())?;
-    let algod = build_full_algod_client_for_dir(&data_dir_path)?;
+    let endpoint = crate::goal_client::ensure_algod_endpoint(
+        &data_dir_path,
+        crate::goal_client::ClientType::Full,
+    )?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("Error processing command: {e}"))?;
 
-    let meta = rt
-        .block_on(algod.get_application(args.app_id))
-        .map_err(|e| format!("Error processing command: {e}"))?;
-    let params = &meta.params;
+    // go: `client.ApplicationInformation(appIdx)` into a `model.Application`
+    let meta = crate::algod_rest::get_json(
+        &rt,
+        &endpoint,
+        &format!("/v2/applications/{}", args.app_id),
+        &[],
+        &crate::go_codec_json::APPLICATION,
+    )
+    .map_err(|e| crate::formatting::report_error_text(&format!("Error processing command: {e}")))?;
+    let params = &meta["params"];
+    let program = |f: &str| {
+        use base64::Engine as _;
+        params[f]
+            .as_str()
+            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+            .unwrap_or_default()
+    };
+    let u = |v: &serde_json::Value| v.as_u64().unwrap_or(0);
 
     // Field labels/spacing are copied byte-for-byte from
-    // `application.go:1087-1124`'s `fmt.Printf` calls (verified against the
-    // pinned source's exact column offsets, not eyeballed).
-    println!("Application ID:        {}", args.app_id);
-    println!(
-        "Application account:   {}",
-        app_address(args.app_id).to_algorand_string()
-    );
-    println!("Creator:               {}", params.creator);
-    println!(
-        "Approval hash:         {}",
-        program_address(&params.approval_program).to_algorand_string()
-    );
-    println!(
-        "Clear hash:            {}",
-        program_address(&params.clear_state_program).to_algorand_string()
-    );
-
-    if let Some(ver) = params.version {
-        println!("Program version:       {ver}");
+    // `application.go:1087-1124`'s `fmt.Printf` calls.
+    let mut out = String::new();
+    {
+        use std::fmt::Write as _;
+        let _ = writeln!(out, "Application ID:        {}", args.app_id);
+        let _ = writeln!(
+            out,
+            "Application account:   {}",
+            app_address(args.app_id).to_algorand_string()
+        );
+        let _ = writeln!(
+            out,
+            "Creator:               {}",
+            params["creator"].as_str().unwrap_or("")
+        );
+        let _ = writeln!(
+            out,
+            "Approval hash:         {}",
+            program_address(&program("approval-program")).to_algorand_string()
+        );
+        let _ = writeln!(
+            out,
+            "Clear hash:            {}",
+            program_address(&program("clear-state-program")).to_algorand_string()
+        );
+        if params["version"].is_u64() {
+            let _ = writeln!(out, "Program version:       {}", u(&params["version"]));
+        }
+        if let Some(sponsor) = params["size-sponsor"].as_str() {
+            let _ = writeln!(out, "Size sponsor:        {sponsor}");
+        }
+        if params["extra-program-pages"].is_u64() {
+            let _ = writeln!(
+                out,
+                "Extra program pages:   {}",
+                u(&params["extra-program-pages"])
+            );
+        }
+        if params["foreign-box-reads"] == true {
+            let _ = writeln!(out, "Foreign box reads:     enabled");
+        }
+        if params["family-box-access"] == true {
+            let _ = writeln!(out, "Family box access:     enabled");
+        }
+        let gsch = &params["global-state-schema"];
+        if gsch.is_object() {
+            let _ = writeln!(out, "Max global byteslices: {}", u(&gsch["num-byte-slice"]));
+            let _ = writeln!(out, "Max global integers:   {}", u(&gsch["num-uint"]));
+        }
+        let lsch = &params["local-state-schema"];
+        if lsch.is_object() {
+            let _ = writeln!(out, "Max local byteslices:  {}", u(&lsch["num-byte-slice"]));
+            let _ = writeln!(out, "Max local integers:    {}", u(&lsch["num-uint"]));
+        }
     }
-    if let Some(sponsor) = &params.size_sponsor {
-        println!("Size sponsor:        {sponsor}");
-    }
-    if let Some(epp) = params.extra_program_pages {
-        println!("Extra program pages:   {epp}");
-    }
-    if params.foreign_box_reads == Some(true) {
-        println!("Foreign box reads:     enabled");
-    }
-    if params.family_box_access == Some(true) {
-        println!("Family box access:     enabled");
-    }
-    if let Some(gsch) = &params.global_state_schema {
-        println!("Max global byteslices: {}", gsch.num_byte_slice);
-        println!("Max global integers:   {}", gsch.num_uint);
-    }
-    if let Some(lsch) = &params.local_state_schema {
-        println!("Max local byteslices:  {}", lsch.num_byte_slice);
-        println!("Max local integers:    {}", lsch.num_uint);
-    }
+    print!("{out}");
     Ok(ExitCode::SUCCESS)
 }
 
