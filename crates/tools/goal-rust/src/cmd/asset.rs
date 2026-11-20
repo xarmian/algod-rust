@@ -191,31 +191,18 @@ fn submit_single(
 
     let last_valid = txn.last_valid.0;
     let encoded_stx = canonical_encode_signed_transaction(&stx);
-    let pipeline = algo_txn_pipeline::TxnPipeline::new(algod, None);
-    let info = rt.block_on(async {
-        let txid = pipeline
-            .submit(&encoded_stx)
-            .await
-            .map_err(|e| format!("Couldn't broadcast tx with algod: {e}"))?;
-        println!(
-            "Issued transaction from account {}, txid {} (fee {})",
-            txn.sender.to_algorand_string(),
-            txid,
-            txn.fee
-        );
-        if txn_args.no_wait {
-            return Ok::<Option<algo_rest_client::PendingTxnInfo>, String>(None);
-        }
-        let info = pipeline
-            .wait_for_confirmation(&txid, last_valid)
-            .await
-            .map_err(|e| e.to_string())?;
-        if let Some(round) = info.confirmed_round {
-            println!("Transaction {txid} committed in round {round}");
-        }
-        Ok(Some(info))
-    })?;
-    Ok(info)
+    let txid = crate::algod_txn::broadcast(rt, &algod, &encoded_stx)
+        .map_err(|e| format!("Couldn't broadcast tx with algod: {e}"))?;
+    println!(
+        "Issued transaction from account {}, txid {} (fee {})",
+        txn.sender.to_algorand_string(),
+        txid,
+        txn.fee
+    );
+    if txn_args.no_wait {
+        return Ok(None);
+    }
+    crate::algod_txn::wait_for_commit_info(rt, &algod, &txid, last_valid).map(Some)
 }
 
 /// go's `lookupAssetID` through go's REST client (issue #2476): the
@@ -480,9 +467,8 @@ fn run_create_inner(args: CreateArgs, wallet: Option<String>) -> Result<ExitCode
         .enable_all()
         .build()
         .map_err(|e| format!("Error processing command: {e}"))?;
-    let params = rt
-        .block_on(algod.suggested_transaction_params())
-        .map_err(|e| e.to_string())?;
+    let params = crate::algod_txn::suggested_params(&rt, &algod)
+        .map_err(|e| format!("Cannot construct transaction: {e}"))?;
     let header = resolve_txn_header(&args.txn, &data_dir_path, &params)?;
 
     let signer_addr = args
@@ -577,9 +563,8 @@ fn run_destroy_inner(args: DestroyArgs, wallet: Option<String>) -> Result<ExitCo
         .map_err(|e| format!("Error processing command: {e}"))?;
     let asset_id = lookup_asset_id(&algod, &rt, &creator_resolved, &args.lookup)?;
 
-    let params = rt
-        .block_on(algod.suggested_transaction_params())
-        .map_err(|e| e.to_string())?;
+    let params = crate::algod_txn::suggested_params(&rt, &algod)
+        .map_err(|e| format!("Cannot determine last valid round: {e}"))?;
     let header = resolve_txn_header(&args.txn, &data_dir_path, &params)?;
 
     let signer_addr = args
@@ -713,9 +698,8 @@ fn run_config_inner(args: ConfigArgs, wallet: Option<String>) -> Result<ExitCode
         ..AssetParams::default()
     };
 
-    let params = rt
-        .block_on(algod.suggested_transaction_params())
-        .map_err(|e| e.to_string())?;
+    let params = crate::algod_txn::suggested_params(&rt, &algod)
+        .map_err(|e| format!("Cannot determine last valid round: {e}"))?;
     let header = resolve_txn_header(&args.txn, &data_dir_path, &params)?;
 
     let signer_addr = args
@@ -801,9 +785,8 @@ fn submit_asset_send(
         .enable_all()
         .build()
         .map_err(|e| format!("Error processing command: {e}"))?;
-    let params = rt
-        .block_on(algod.suggested_transaction_params())
-        .map_err(|e| e.to_string())?;
+    let params = crate::algod_txn::suggested_params(&rt, &algod)
+        .map_err(|e| format!("Cannot determine last valid round: {e}"))?;
     let header = resolve_txn_header(txn_args, data_dir_path, &params)?;
 
     let signer_addr = txn_args
@@ -987,9 +970,8 @@ fn run_freeze_inner(args: FreezeArgs, wallet: Option<String>) -> Result<ExitCode
         .map_err(|e| format!("Error processing command: {e}"))?;
     let asset_id = lookup_asset_id(&algod, &rt, &creator_resolved, &args.lookup)?;
 
-    let params = rt
-        .block_on(algod.suggested_transaction_params())
-        .map_err(|e| e.to_string())?;
+    let params = crate::algod_txn::suggested_params(&rt, &algod)
+        .map_err(|e| format!("Cannot determine last valid round: {e}"))?;
     let header = resolve_txn_header(&args.txn, &data_dir_path, &params)?;
 
     let signer_addr = args

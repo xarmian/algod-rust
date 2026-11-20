@@ -275,6 +275,66 @@ pub const POST_PARTICIPATION: Ty = Ty::Struct(&[Field("partId", Ty::Str)]);
 /// (`POST` / `DELETE /v2/catchup/{catchpoint}`).
 pub const CATCHPOINT_RESPONSE: Ty = Ty::Struct(&[Field("catchup-message", Ty::Str)]);
 
+/// `model.TransactionParametersResponse` (`GET /v2/transactions/params`).
+pub const TRANSACTION_PARAMETERS: Ty = Ty::Struct(&[
+    Field("consensus-version", Ty::Str),
+    Field("fee", Ty::U64),
+    Field("genesis-hash", Ty::Bytes),
+    Field("genesis-id", Ty::Str),
+    Field("last-round", ROUND),
+    Field("min-fee", Ty::U64),
+]);
+
+/// `model.PostTransactionsResponse` (`POST /v2/transactions`).
+pub const POST_TRANSACTIONS: Ty = Ty::Struct(&[Field("txId", Ty::Str)]);
+
+/// `model.StateDelta` (`[]model.EvalDeltaKeyValue`).
+const STATE_DELTA: Ty = Ty::Slice(
+    &Ty::Struct(&[
+        Field("key", Ty::Str),
+        Field(
+            "value",
+            Ty::Struct(&[
+                Field("action", Ty::U64),
+                Field("bytes", Ty::Ptr(&Ty::Str)),
+                Field("uint", Ty::Ptr(&Ty::U64)),
+            ]),
+        ),
+    ]),
+    "[]model.EvalDeltaKeyValue",
+);
+
+/// `model.PendingTransactionResponse` (`GET
+/// /v2/transactions/pending/{txid}`); its `inner-txns` are of the same type.
+pub static PENDING_TRANSACTION: Ty = Ty::Struct(&[
+    Field("application-index", Ty::Ptr(&Ty::U64)),
+    Field("asset-closing-amount", Ty::Ptr(&Ty::U64)),
+    Field("asset-index", Ty::Ptr(&Ty::U64)),
+    Field("close-rewards", Ty::Ptr(&Ty::I64)),
+    Field("closing-amount", Ty::Ptr(&Ty::U64)),
+    Field("confirmed-round", Ty::Ptr(&ROUND)),
+    Field("global-state-delta", Ty::Ptr(&STATE_DELTA)),
+    Field(
+        "inner-txns",
+        Ty::Ptr(&Ty::Slice(
+            &PENDING_TRANSACTION,
+            "[]model.PendingTransactionResponse",
+        )),
+    ),
+    Field(
+        "local-state-delta",
+        Ty::Ptr(&Ty::Slice(
+            &Ty::Struct(&[Field("address", Ty::Str), Field("delta", STATE_DELTA)]),
+            "[]model.AccountStateDelta",
+        )),
+    ),
+    Field("logs", Ty::Ptr(&Ty::Slice(&Ty::Bytes, "[][]uint8"))),
+    Field("pool-error", Ty::Str),
+    Field("receiver-rewards", Ty::Ptr(&Ty::U64)),
+    Field("sender-rewards", Ty::Ptr(&Ty::U64)),
+    Field("txn", Ty::Map(&Ty::Str, &Ty::Any)),
+]);
+
 #[cfg(test)]
 mod tests {
     use super::*;

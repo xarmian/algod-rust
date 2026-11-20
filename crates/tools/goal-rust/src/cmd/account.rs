@@ -1475,24 +1475,24 @@ fn choose_participation<'a>(
 
 /// Sign (via kmd), broadcast, and optionally wait for a status-change keyreg.
 /// `label` is interpolated into Go's `Transaction id for {label} transaction:`
-/// line (account.go:921 / 1542). On confirmation prints Go's `infoTxCommitted`
-/// (messages.go:113).
-async fn sign_submit_confirm(
+/// line (account.go:921 / 1542); go's `waitForCommit` prints the commit, and
+/// its error is prefixed with `wait_prefix`.
+#[allow(clippy::too_many_arguments)]
+fn sign_submit_confirm(
+    rt: &tokio::runtime::Runtime,
     pipeline: &algo_txn_pipeline::TxnPipeline,
     txn: &algo_types::Transaction,
     handle: &str,
     password: &str,
     no_wait: bool,
     label: &str,
+    wait_prefix: &str,
 ) -> Result<(), String> {
     let last_valid = txn.last_valid.0;
-    let signed = pipeline
-        .sign_with_kmd(handle, password, txn)
-        .await
+    let signed = rt
+        .block_on(pipeline.sign_with_kmd(handle, password, txn))
         .map_err(|e| format!("Couldn't sign tx with kmd: {e}"))?;
-    let txid = pipeline
-        .submit(&signed)
-        .await
+    let txid = crate::algod_txn::broadcast(rt, pipeline.algod(), &signed)
         .map_err(|e| format!("Couldn't broadcast tx with algod: {e}"))?;
     println!("Transaction id for {label} transaction: {txid}");
 
@@ -1500,18 +1500,9 @@ async fn sign_submit_confirm(
         println!("Note: status will not change until transaction is finalized");
         return Ok(());
     }
-
-    // Wait until the txn commits or its last valid round passes (go's
-    // waitForCommit takes the txn's lastTxRound, not a relative window).
-    let info = pipeline
-        .wait_for_confirmation(&txid, last_valid)
-        .await
-        .map_err(|e| e.to_string())?;
-    if let Some(round) = info.confirmed_round {
-        // Mirrors `infoTxCommitted` (messages.go:113).
-        println!("Transaction {txid} committed in round {round}");
-    }
-    Ok(())
+    crate::algod_txn::wait_for_commit(rt, pipeline.algod(), &txid, last_valid)
+        .map(|_| ())
+        .map_err(|e| format!("{wait_prefix}{e}"))
 }
 
 /// `account changeonlinestatus`. Mirrors Go's `changeOnlineCmd` and
@@ -1642,26 +1633,13 @@ fn change_online_status(
 
     // go's `client.ComputeValidityRounds(firstValid, lastValid,
     // numValidRounds)`: the suggested params, the protocol's MaxTxnLife.
-    let params = crate::algod_rest::get(&rt, &endpoint, "/v2/transactions/params", &[])?;
-    let params: serde_json::Value = serde_json::from_slice(&params).map_err(|e| e.to_string())?;
-    let consensus_version = params["consensus-version"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-    let last_round = params["last-round"].as_u64().unwrap_or(0);
-    let suggested_fee = params["fee"].as_u64().unwrap_or(0);
-    let min_fee = params["min-fee"].as_u64().unwrap_or(0);
-    let genesis_hash: [u8; 32] = {
-        use base64::Engine as _;
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(params["genesis-hash"].as_str().unwrap_or(""))
-            .map_err(|e| e.to_string())?;
-        let mut h = [0u8; 32];
-        if raw.len() == 32 {
-            h.copy_from_slice(&raw);
-        }
-        h
-    };
+    let algod = algo_rest_client::AlgodClient::new(&endpoint.0, &endpoint.1);
+    let params = crate::algod_txn::suggested_params(&rt, &algod)?;
+    let consensus_version = params.consensus_version.clone();
+    let last_round = params.last_round;
+    let suggested_fee = params.fee;
+    let min_fee = params.min_fee;
+    let genesis_hash = params.genesis_hash.0;
     let max_txn_life = crate::cmd::clerk::resolve_max_txn_life(&data_dir_path, &consensus_version)?;
     let (first, last) = crate::cmd::clerk::compute_validity(
         args.first_valid,
@@ -1734,23 +1712,14 @@ fn change_online_status(
     let signed = rt
         .block_on(kmd.sign_transaction(&handle, &password, encoded, signer_pk))
         .map_err(|e| signing_error(crate::cmd::clerk::kmd_msg(&e)))?;
-    let algod = algo_rest_client::AlgodClient::new(&endpoint.0, &endpoint.1);
-    let pipeline = algo_txn_pipeline::TxnPipeline::new(algod, None);
-    let txid = rt
-        .block_on(pipeline.submit(&signed.signed_transaction))
+    let txid = crate::algod_txn::broadcast(&rt, &algod, &signed.signed_transaction)
         .map_err(|e| format!("Couldn't broadcast tx with algod: {e}"))?;
     println!("Transaction id for status change transaction: {txid}");
     if args.no_wait {
         println!("Note: status will not change until transaction is finalized");
         return Ok(());
     }
-    let info = rt
-        .block_on(pipeline.wait_for_confirmation(&txid, last))
-        .map_err(|e| e.to_string())?;
-    if let Some(round) = info.confirmed_round {
-        println!("Transaction {txid} committed in round {round}");
-    }
-    Ok(())
+    crate::algod_txn::wait_for_commit(&rt, &algod, &txid, last).map(|_| ())
 }
 
 /// go's `writeTxnToFile(client, false, ..)`: `--signer` is checked but not
@@ -1848,10 +1817,10 @@ pub fn run_marknonparticipating(
     };
 
     let pipeline = algo_txn_pipeline::TxnPipeline::new(algod, Some(kmd));
-    let params = match rt.block_on(pipeline.suggested_params()) {
+    let params = match crate::algod_txn::suggested_params(&rt, pipeline.algod()) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
+            eprintln!("Couldn't construct tx: {e}");
             return ExitCode::from(1);
         }
     };
@@ -1906,14 +1875,16 @@ pub fn run_marknonparticipating(
         Err(()) => return ExitCode::from(1),
     };
 
-    match rt.block_on(sign_submit_confirm(
+    match sign_submit_confirm(
+        &rt,
         &pipeline,
         &txn,
         &handle,
         &password,
         args.no_wait,
         "mark-nonparticipating",
-    )) {
+        "error waiting for transaction to be committed: ",
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e}");
@@ -1935,9 +1906,7 @@ fn build_online_keyreg(
     first_valid: Option<u64>,
     last_valid: Option<u64>,
 ) -> Result<algo_types::Transaction, String> {
-    let params = rt
-        .block_on(algod.suggested_transaction_params())
-        .map_err(|e| e.to_string())?;
+    let params = crate::algod_txn::suggested_params(rt, algod)?;
     let max_txn_life =
         crate::cmd::clerk::resolve_max_txn_life(data_dir, &params.consensus_version)?;
     let (first, last) = compute_validity(first_valid, last_valid, params.last_round, max_txn_life)?;
@@ -2239,14 +2208,16 @@ fn register_renewed_key(
         std::process::exit(1);
     };
     let pipeline = algo_txn_pipeline::TxnPipeline::new(algod, Some(kmd));
-    rt.block_on(sign_submit_confirm(
+    sign_submit_confirm(
+        rt,
         &pipeline,
         &txn,
         &handle,
         &password,
         flags.no_wait,
         "status change",
-    ))
+        "",
+    )
 }
 
 /// `account renewpartkey`: go's `renewParticipationKeyCmd`.

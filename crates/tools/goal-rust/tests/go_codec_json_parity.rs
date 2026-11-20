@@ -43,7 +43,8 @@
 use base64::Engine as _;
 use goal_rust::go_codec_json::{
     decode, Ty, ACCOUNT, ACCOUNT_ASSET, ACCOUNT_ASSETS_INFORMATION, APPLICATION, ASSET,
-    CATCHPOINT_RESPONSE, NODE_STATUS, PARTICIPATION_KEYS, POST_PARTICIPATION, SUPPLY, VERSION,
+    CATCHPOINT_RESPONSE, NODE_STATUS, PARTICIPATION_KEYS, PENDING_TRANSACTION, POST_PARTICIPATION,
+    POST_TRANSACTIONS, SUPPLY, TRANSACTION_PARAMETERS, VERSION,
 };
 
 const FIXTURE: &str = include_str!("fixtures/go_codec_json_decode.jsonl");
@@ -61,6 +62,9 @@ fn ty(name: &str) -> &'static Ty {
         "participation-keys" => &PARTICIPATION_KEYS,
         "post-participation" => &POST_PARTICIPATION,
         "catchpoint" => &CATCHPOINT_RESPONSE,
+        "params" => &TRANSACTION_PARAMETERS,
+        "post-transactions" => &POST_TRANSACTIONS,
+        "pending" => &PENDING_TRANSACTION,
         other => panic!("unknown type {other}"),
     }
 }

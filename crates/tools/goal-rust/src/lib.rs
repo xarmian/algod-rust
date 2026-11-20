@@ -33,6 +33,7 @@ use clap::{Parser, Subcommand};
 
 pub mod accounts_list;
 pub mod algod_rest;
+pub mod algod_txn;
 pub mod balance_record;
 pub mod cli_state;
 pub mod cmd;

@@ -293,9 +293,7 @@ fn run_send_inner(
 
     // Build the payment: resolve validity off suggested params (Go's
     // ComputeValidityRounds + ConstructPayment), then the fee.
-    let params = rt
-        .block_on(pipeline.suggested_params())
-        .map_err(|e| e.to_string())?;
+    let params = crate::algod_txn::suggested_params(&rt, pipeline.algod())?;
     let max_txn_life = resolve_max_txn_life(&data_dir_path, &params.consensus_version)?;
     let (first, last) = compute_validity(
         args.first_valid,
@@ -458,32 +456,17 @@ fn run_send_inner(
 
     // Broadcast path: submit the assembled SignedTxn, report, optionally wait.
     let encoded_stx = canonical_encode_signed_transaction(&stx);
-    let result = rt.block_on(async {
-        let txid = pipeline
-            .submit(&encoded_stx)
-            .await
-            .map_err(|e| format!("Couldn't broadcast tx with algod: {e}"))?;
-
-        // infoTxIssued (messages.go:112): the fee reported is the txn's actual fee.
-        println!(
-            "Sent {} MicroAlgos from account {} to address {}, transaction ID: {}. Fee set to {}",
-            args.amount, from_resolved, to_resolved, txid, txn.fee
-        );
-
-        if args.no_wait {
-            return Ok::<(), String>(());
-        }
-        let info = pipeline
-            .wait_for_confirmation(&txid, last_valid)
-            .await
-            .map_err(|e| e.to_string())?;
-        if let Some(round) = info.confirmed_round {
-            // infoTxCommitted (messages.go:113).
-            println!("Transaction {txid} committed in round {round}");
-        }
-        Ok(())
-    });
-    result?;
+    let txid = crate::algod_txn::broadcast(&rt, pipeline.algod(), &encoded_stx)
+        .map_err(|e| format!("Couldn't broadcast tx with algod: {e}"))?;
+    // infoTxIssued (messages.go:112): the fee reported is the txn's actual fee.
+    println!(
+        "Sent {} MicroAlgos from account {} to address {}, transaction ID: {}. Fee set to {}",
+        args.amount, from_resolved, to_resolved, txid, txn.fee
+    );
+    if args.no_wait {
+        return Ok(ExitCode::SUCCESS);
+    }
+    crate::algod_txn::wait_for_commit(&rt, pipeline.algod(), &txid, last_valid)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1172,6 +1155,14 @@ fn write_stderr(bytes: &[u8]) {
 /// runes dropped, each invalid byte one U+FFFD) and a line that lost anything is
 /// preceded by `notice`. `msg` is in the lossless text form
 /// (`algo_avm::raw_text`), so the bytes of the source are the bytes go sees.
+/// go's `reportWarnf`: `Warning: <msg>` on stderr, filtered like an error.
+fn report_warn(msg: &str) {
+    report_lines(
+        &format!("Warning: {msg}"),
+        crate::formatting::INFO_NON_PRINTABLE_CHARACTERS,
+    );
+}
+
 fn report_lines(msg: &str, notice: &str) {
     let bytes = algo_avm::raw_text::decode(msg);
     let mut out = Vec::with_capacity(bytes.len() + 1);
@@ -2551,8 +2542,6 @@ fn run_rawsend_inner(args: RawsendArgs, cli_d: Vec<PathBuf>) -> Result<ExitCode,
         .enable_all()
         .build()
         .map_err(|e| format!("Error processing command: {e}"))?;
-    let pipeline = algo_txn_pipeline::TxnPipeline::new(algod, None);
-
     // Group the transactions by their group ID, preserving file order, and
     // broadcast each group together (clerk.go:617-637, SignedTxnsToGroups +
     // BroadcastTransactionGroup).
@@ -2563,57 +2552,68 @@ fn run_rawsend_inner(args: RawsendArgs, cli_d: Vec<PathBuf>) -> Result<ExitCode,
     // txid of every successfully-broadcast txn, to poll for confirmation.
     let mut pending: Vec<String> = Vec::new();
 
-    rt.block_on(async {
-        for group in &groups {
-            let mut raw = Vec::new();
-            for stxn in group {
-                raw.extend_from_slice(&canonical_encode_signed_transaction(stxn));
+    for group in &groups {
+        let mut raw = Vec::new();
+        for stxn in group {
+            raw.extend_from_slice(&canonical_encode_signed_transaction(stxn));
+        }
+        match crate::algod_txn::broadcast(&rt, &algod, &raw) {
+            Ok(_) => {
+                for stxn in group {
+                    let txid = compute_txn_id(&stxn.txn).to_string();
+                    // infoRawTxIssued (messages.go:126).
+                    println!("Raw transaction ID {txid} issued");
+                    pending.push(txid);
+                }
             }
-            match pipeline.submit(&raw).await {
-                Ok(_) => {
-                    for stxn in group {
-                        let txid = compute_txn_id(&stxn.txn).to_string();
-                        // infoRawTxIssued (messages.go:126).
-                        println!("Raw transaction ID {txid} issued");
-                        pending.push(txid);
-                    }
+            Err(msg) => {
+                for stxn in group {
+                    txn_errors.insert(compute_txn_id(&stxn.txn).to_string(), msg.clone());
                 }
-                Err(e) => {
-                    let msg = e.to_string();
-                    for stxn in group {
-                        txn_errors.insert(compute_txn_id(&stxn.txn).to_string(), msg.clone());
-                    }
-                    // reportWarnf(errorBroadcastingTX) — a warning, not fatal.
-                    eprintln!("Couldn't broadcast tx with algod: {msg}");
-                }
+                // reportWarnf(errorBroadcastingTX): a warning, not fatal.
+                report_warn(&format!("Couldn't broadcast tx with algod: {msg}"));
             }
         }
-    });
+    }
 
     if args.no_wait {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Poll each pending txn to confirmation. `last_valid == 0` waits until the
-    // node either commits or evicts the txn (mirrors Go's per-round loop, which
-    // has no explicit deadline beyond the node forgetting the txid).
-    rt.block_on(async {
-        for txid in &pending {
-            let tid = algo_rest_client::TxId(txid.clone());
-            match pipeline.wait_for_confirmation(&tid, 0).await {
-                Ok(info) => {
-                    if let Some(round) = info.confirmed_round {
-                        // infoTxCommitted (messages.go:113).
-                        println!("Transaction {txid} committed in round {round}");
-                    }
-                }
+    // go: the current round, then each pending txn until it is committed; a
+    // failing pending read or a pool error is warned about and read again.
+    let mut last_round = crate::algod_txn::status_last_round(&rt, &algod)
+        .map_err(|e| format!("Error processing command: {e}"))?;
+    for txid in &pending {
+        loop {
+            let txn = match crate::algod_txn::pending_transaction_information(&rt, &algod, txid)
+            {
+                Ok(t) => t,
                 Err(e) => {
-                    txn_errors.insert(txid.clone(), e.to_string());
-                    eprintln!("Error processing command: {e}");
+                    txn_errors.insert(txid.clone(), e.clone());
+                    report_warn(&format!("Error processing command: {e}"));
+                    continue;
                 }
+            };
+            let confirmed = crate::algod_txn::confirmed_round(&txn);
+            if confirmed > 0 {
+                // infoTxCommitted (messages.go:113).
+                println!("Transaction {txid} committed in round {confirmed}");
+                break;
             }
+            let pool_error = txn["pool-error"].as_str().unwrap_or("").to_string();
+            if !pool_error.is_empty() {
+                txn_errors.insert(txid.clone(), pool_error.clone());
+                report_warn(&format!(
+                    "Transaction {txid} kicked out of local node pool: {pool_error}"
+                ));
+                continue;
+            }
+            println!("Transaction {txid} still pending as of round {last_round}");
+            last_round = crate::algod_txn::wait_for_round(&rt, &algod, last_round + 1)
+                .map_err(|e| format!("Error processing command: {e}"))?;
         }
-    });
+    }
 
     if !txn_errors.is_empty() {
         println!(
