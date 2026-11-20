@@ -2288,7 +2288,11 @@ impl NodeInterface for AlgodNodeInterface {
                 // none until the first block); idempotent thereafter.
                 pool.ensure_evaluator_primed();
                 pool.remember(tx_group).map_err(|e| {
-                    let message = format!("pool rejected group: {e}");
+                    // go's dev mode runs the same `broadcastSignedTxGroup`
+                    // and answers its error as is: no adapter prefix (the
+                    // non-dev path's `local_tx_error_to_node_error`, issues
+                    // #1776, #2451).
+                    let message = e.to_string();
                     // Preserve structured pc/group-index/app-index/eval-states
                     // diagnostics from a rejected app-call or logicsig
                     // program (issue #1135), matching go's `returnError()`
@@ -3650,18 +3654,17 @@ impl AlgodNodeInterface {
     ///   pre-execution signature / well-formedness checks.
     /// - `Internal` → [`NodeError::Internal`].
     ///
-    /// Each variant's message keeps a `simulate: <category>: …` prefix
-    /// so logs and client-visible bodies remain traceable to the
+    /// `InvalidRequest` is go's bare text; the other variants keep a
+    /// `simulate: <category>: …` prefix so logs remain traceable to the
     /// underlying cause.
     fn map_simulator_error(err: SimulatorError) -> NodeError {
         match err {
-            // go reports a failed signature as the batch verifier's bare text.
-            SimulatorError::InvalidRequest(e) if e.is_batch_sig_failure() => {
-                NodeError::BadRequest(algo_error::BATCH_HAS_FAILED_SIGS.to_string())
-            }
-            SimulatorError::InvalidRequest(e) => {
-                NodeError::BadRequest(format!("simulate: invalid request: {e}"))
-            }
+            // go answers an `InvalidRequestError` with its own text and nothing
+            // else (`badRequest(ctx, invalidTxErr, invalidTxErr.Error(), ..)`,
+            // daemon/algod/api/server/v2/handlers.go `SimulateTransaction`):
+            // the batch verifier's failure (issue #1969), a group-wide verify
+            // error, a malformed request (issue #2451).
+            SimulatorError::InvalidRequest(e) => NodeError::BadRequest(e.message),
             SimulatorError::EvalFailure(e) => {
                 NodeError::Internal(format!("simulate: eval failure: {e}"))
             }
@@ -5119,7 +5122,7 @@ mod tests {
             NodeError::BadRequest(message) => assert_eq!(
                 message,
                 format!(
-                    "pool rejected group: TransactionPool.Remember: transaction {txid}: should have been authorized by {new_auth} but was actually authorized by {sender}"
+                    "TransactionPool.Remember: transaction {txid}: should have been authorized by {new_auth} but was actually authorized by {sender}"
                 )
             ),
             other => panic!("expected a 400, got {other:?}"),
@@ -6484,13 +6487,12 @@ err
         ));
         match invalid {
             NodeError::BadRequest(m) => {
-                assert_eq!(m, "simulate: invalid request: no groups")
+                assert_eq!(m, "no groups")
             }
             other => panic!("expected BadRequest, got {other:?}"),
         }
 
-        // Issue #1969: go's batch verifier text is the whole message, with no
-        // `simulate: invalid request:` prefix.
+        // Issue #1969: go's batch verifier text is the whole message.
         let bad_sig = AlgodNodeInterface::map_simulator_error(SimulatorError::InvalidRequest(
             InvalidRequestError {
                 message: algo_error::BATCH_HAS_FAILED_SIGS.into(),
@@ -6639,14 +6641,8 @@ err
         };
         match adapter.simulate(request).await {
             Err(NodeError::BadRequest(msg)) => {
-                assert!(
-                    msg.starts_with("simulate: invalid request:"),
-                    "expected invalid-request prefix, got {msg:?}"
-                );
-                assert!(
-                    msg.contains("at least one transaction group"),
-                    "expected message to mention required txn group, got {msg:?}"
-                );
+                // go's `Simulate` text, bare (issue #2451).
+                assert_eq!(msg, "expected 1 transaction group, got 0");
             }
             other => panic!("expected BadRequest(invalid request), got {other:?}"),
         }

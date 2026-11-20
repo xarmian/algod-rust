@@ -35,8 +35,8 @@
 //
 // verify.TxnGroup frames a member's error as "transaction %+v invalid : <err>"
 // (a Go struct dump of the whole SignedTxn, data/transactions/verify/txn.go);
-// that frame is recorded as "framed": true and only the <err> text after it
-// is kept, which is the part this oracle pins.
+// the texts are recorded in full (issue #2451) with "framed": true when they
+// carry that frame. A simulate case also carries the SignedTxn go submitted.
 package simulation_test
 
 import (
@@ -84,6 +84,7 @@ type simulateCase struct {
 	Path           string `json:"path"`
 	Name           string `json:"name"`
 	Kind           string `json:"kind"`
+	Stxn           string `json:"stxn"`
 	FixSigners     bool   `json:"fix_signers"`
 	Sender         string `json:"sender"`
 	Scheme         string `json:"scheme"`
@@ -122,15 +123,10 @@ func errText(err error) string {
 	return err.Error()
 }
 
-// splitFrame strips verify.TxnGroup's "transaction %+v invalid : " frame.
-func splitFrame(s string) (bool, string) {
-	const tail = "} invalid : "
-	if strings.HasPrefix(s, "transaction {") {
-		if i := strings.Index(s, tail); i >= 0 {
-			return true, s[i+len(tail):]
-		}
-	}
-	return false, s
+// framed reports whether s carries verify.TxnGroup's "transaction %+v
+// invalid : " frame.
+func framed(s string) bool {
+	return strings.HasPrefix(s, "transaction {") && strings.Contains(s, "} invalid : ")
 }
 
 func TestAlgodRustPQFailureTextOracle(t *testing.T) {
@@ -238,14 +234,14 @@ func TestAlgodRustPQFailureTextOracle(t *testing.T) {
 				stxn.Lsig = transactions.LogicSig{Logic: oracleProgram, PQsig: pq}
 			}
 			_, verr := verify.TxnGroup([]transactions.SignedTxn{stxn}, &hdr, nil, ledger)
-			framed, want := splitFrame(errText(verr))
+			want := errText(verr)
 			require.NoError(t, enc.Encode(poolCase{
 				Path:     "pool",
 				Name:     v.name,
 				Kind:     kind,
 				Protocol: string(hdr.CurrentProtocol),
 				Stxn:     hex.EncodeToString(protocol.Encode(&stxn)),
-				Framed:   framed,
+				Framed:   framed(want),
 				Want:     want,
 			}))
 		}
@@ -288,6 +284,10 @@ func TestAlgodRustPQFailureTextOracle(t *testing.T) {
 				Receiver: sender,
 				Fee:      minFee * 3,
 			}).Txn()
+			// NewTxn takes FirstValid from the environment's latest header,
+			// which moves with the funding block's commit: pin the window so
+			// the encoded transaction (and its signature) is reproducible.
+			txn.FirstValid, txn.LastValid = 1, 1001
 			if !v.placeholder {
 				var sig crypto.FalconSignature
 				if kind == "pqsig" {
@@ -320,6 +320,7 @@ func TestAlgodRustPQFailureTextOracle(t *testing.T) {
 				stxn.Lsig = transactions.LogicSig{Logic: oracleProgram, PQsig: pq}
 				c.Program = hex.EncodeToString(oracleProgram)
 			}
+			c.Stxn = hex.EncodeToString(protocol.Encode(&stxn))
 			result, serr := simulation.MakeSimulator(env.Ledger, false).Simulate(simulation.Request{
 				TxnGroups:            [][]transactions.SignedTxn{{stxn}},
 				AllowEmptySignatures: true,
@@ -327,7 +328,8 @@ func TestAlgodRustPQFailureTextOracle(t *testing.T) {
 			})
 			c.WantError = errText(serr)
 			if serr == nil {
-				c.FailureFramed, c.FailureMessage = splitFrame(result.TxnGroups[0].FailureMessage)
+				c.FailureMessage = result.TxnGroups[0].FailureMessage
+				c.FailureFramed = framed(c.FailureMessage)
 				for _, i := range result.TxnGroups[0].FailedAt {
 					c.FailedAt = append(c.FailedAt, int(i))
 				}

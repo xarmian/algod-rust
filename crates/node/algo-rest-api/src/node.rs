@@ -60,7 +60,7 @@ pub enum NodeError {
     /// options, out-of-domain values) — handlers map to 400. Use this
     /// variant when the failure is attributable to the caller's input,
     /// not a node-side problem. Introduced so adapter-level errors like
-    /// `simulate: invalid request: ...` and `broadcast: empty group`
+    /// simulate's invalid-request errors and `broadcast: empty group`
     /// surface as 4xx responses instead of being collapsed into 500.
     #[error("{0}")]
     BadRequest(String),

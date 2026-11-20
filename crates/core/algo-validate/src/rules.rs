@@ -139,10 +139,11 @@ pub fn validate_transaction_wellformed(
 /// Which caller class a well-formedness check serves (issue #2193).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WellFormedMode {
-    /// Block validation and simulation: an unknown transaction type is
-    /// rejected earlier and differently, in [`crate::checks::check_txn_group`].
+    /// Block validation: an unknown transaction type is rejected earlier and
+    /// differently, in [`crate::checks::check_txn_group`].
     Block,
-    /// The submission paths (REST and gossip admission), which also reject an
+    /// The submission paths (REST, gossip admission and simulate, whose
+    /// `check` runs go's `verify.TxnGroup`), which also reject an
     /// unknown transaction type with go's `unknown tx type <type>` (the
     /// `default` case of `WellFormed`'s type switch). Apart from that case the
     /// two modes run the same rules, the state-proof payload check included.

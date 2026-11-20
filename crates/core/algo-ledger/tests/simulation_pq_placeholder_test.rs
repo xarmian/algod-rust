@@ -217,7 +217,11 @@ fn full_placeholder_pqsig_mismatched_authorizer_rejected() {
     assert_eq!(group.failed_at, Some(vec![0]));
     let message = group.failure_message.as_deref().unwrap_or_default();
     assert!(
-        message.starts_with("pq signature validation failed: pq signature authorizer mismatch: "),
+        // go's `transaction %+v invalid : ` frame of the member (issue #2451).
+        message.starts_with("transaction {")
+            && message.contains(
+                "} invalid : pq signature validation failed: pq signature authorizer mismatch: "
+            ),
         "{message}"
     );
 }
@@ -303,9 +307,11 @@ fn delegated_placeholder_pqsig_mismatched_authorizer_rejected() {
     assert_eq!(group.failed_at, Some(vec![0]));
     let message = group.failure_message.as_deref().unwrap_or_default();
     assert!(
-        message.starts_with(
-            "pq delegated logic signature validation failed: pq signature authorizer mismatch: "
-        ),
+        // go's `transaction %+v invalid : ` frame of the member (issue #2451).
+        message.starts_with("transaction {")
+            && message.contains(
+                "} invalid : pq delegated logic signature validation failed: pq signature authorizer mismatch: "
+            ),
         "{message}"
     );
 }
@@ -356,7 +362,11 @@ fn non_placeholder_pqsig_with_wrong_authorizer_is_not_silently_proxy_signed() {
     );
     let message = group.failure_message.as_deref().unwrap_or_default();
     assert!(
-        message.starts_with("pq signature validation failed: pq signature authorizer mismatch: "),
+        // go's `transaction %+v invalid : ` frame of the member (issue #2451).
+        message.starts_with("transaction {")
+            && message.contains(
+                "} invalid : pq signature validation failed: pq signature authorizer mismatch: "
+            ),
         "{message}"
     );
 }

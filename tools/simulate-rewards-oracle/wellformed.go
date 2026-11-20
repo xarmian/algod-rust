@@ -31,8 +31,8 @@
 //   - `verify.TxnGroup` (the REST submit path), whose error is
 //     `transaction <%+v of the SignedTxn> invalid : <WellFormed error>`.
 //
-// The `%+v` struct dump is go's own formatting of its in-memory type, so the
-// Rust side compares the part after ` invalid : ` for those rows.
+// The `%+v` struct dump is compared in full (issue #2451), with only a
+// heartbeat's pointer address masked (blockdup.go's maskPointers).
 package main
 
 import (

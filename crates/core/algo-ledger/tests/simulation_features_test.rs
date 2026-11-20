@@ -1226,17 +1226,16 @@ fn simulate_rejects_unknown_txn_type() {
         ..Default::default()
     };
 
-    let err = simulate(&mut state, request).expect_err("unknown txn type must be rejected");
-    match err {
-        SimulatorError::InvalidRequest(e) => {
-            assert!(
-                e.message.contains("unknown"),
-                "expected an unknown-type rejection, got: {}",
-                e.message
-            );
-        }
-        other => panic!("expected InvalidRequest, got {other:?}"),
-    }
+    // go's simulate runs `verify.TxnGroup`, whose `WellFormed` rejects the
+    // type at the member: the group's failure, not a request error (issue
+    // #2451, pinned by the go oracle in simulation_sig_failure_texts_test).
+    let result = simulate(&mut state, request).expect("a group failure, not a request error");
+    let group = &result.txn_groups[0];
+    assert_eq!(
+        group.failure_message.as_deref(),
+        Some("unknown tx type bogus")
+    );
+    assert_eq!(group.failed_at.as_deref(), Some(&[0usize][..]));
 }
 
 #[test]
