@@ -1641,6 +1641,30 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             })
         })?;
 
+        // The group-ID rules that end go's `CheckTxnGroup` (`checkTxnGroupID`,
+        // `data/transactions/checks.go`), issue #2468. `txnGroupBatchPrep`
+        // wraps the `TxGroupMalformedError` in a `TxGroupError` at its
+        // `GroupIndex`: a zero group in a multi-member group (index 0) or an
+        // inconsistent member is the group's failure at that member, an
+        // incomplete group (`GroupIndex: -1`) the request error. go's
+        // texts, unprefixed.
+        if let Some(first) = verify_group.first() {
+            let mut ids = algo_validate::GroupIdChecker::new(&first.txn, verify_group.len());
+            for (i, stx) in verify_group.iter().enumerate() {
+                if let Err(message) = ids.check_member(i, &stx.txn) {
+                    return Ok(CheckOutcome::RecoverableFailure {
+                        index: i,
+                        message,
+                        logicsig_traces: vec![None; verify_group.len()],
+                        logicsig_budgets: vec![0; verify_group.len()],
+                    });
+                }
+            }
+            ids.finish().map_err(|message| {
+                SimulatorError::InvalidRequest(InvalidRequestError { message })
+            })?;
+        }
+
         // Group-level LogicSig size check (go: `txnGroupBatchPrep` ->
         // `logicSigGroupSizeCheck`, `verify/txn.go`), run after
         // well-formedness and `CheckTxnGroup` and before any signature work,
