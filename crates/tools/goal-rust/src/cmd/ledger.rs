@@ -24,7 +24,8 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use crate::cmd::node::http_error_text;
+use crate::algod_rest;
+use crate::formatting::report_error_text;
 use crate::goal_client::{ensure_algod_endpoint, ClientType};
 use crate::groups::ledger::BlockArgs;
 
@@ -89,30 +90,6 @@ fn runtime() -> Result<tokio::runtime::Runtime, ExitCode> {
         .map_err(|e| fail(format!("tokio runtime: {e}")))
 }
 
-/// `GET <path>` against algod with its token: the body, or go's request
-/// error text.
-fn algod_get(
-    rt: &tokio::runtime::Runtime,
-    (base, token): &(String, String),
-    path: &str,
-) -> Result<Vec<u8>, String> {
-    let url = format!("{}{path}", base.trim_end_matches('/'));
-    rt.block_on(async {
-        let resp = reqwest::Client::new()
-            .get(&url)
-            .header("X-Algo-API-Token", token)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let status = resp.status();
-        let body = resp.bytes().await.map_err(|e| e.to_string())?;
-        if !(status == 200 || status == 201) {
-            return Err(http_error_text(status, &String::from_utf8_lossy(&body)));
-        }
-        Ok(body.to_vec())
-    })
-}
-
 /// Port of `blockCmd`: the block of a round, as go's `transcode` JSON
 /// unless `-r`, to `-o` (stdout by default).
 pub fn run_block(args: BlockArgs, cli_d: Vec<PathBuf>) -> ExitCode {
@@ -133,10 +110,10 @@ pub fn run_block(args: BlockArgs, cli_d: Vec<PathBuf>) -> ExitCode {
         Err(code) => return code,
     };
     // go: `client.RawBlock(round)` -- `GET /v2/blocks/<round>?format=msgpack`.
-    let path = format!("/v2/blocks/{round}?format=msgpack");
-    let mut response = match algod_get(&rt, &endpoint, &path) {
+    let path = format!("/v2/blocks/{round}");
+    let mut response = match algod_rest::get(&rt, &endpoint, &path, &[("format", "msgpack")]) {
         Ok(b) => b,
-        Err(e) => return fail(format!("Error processing command: {e}")),
+        Err(e) => return fail(report_error_text(&format!("Error processing command: {e}"))),
     };
     if !args.raw {
         response = match crate::transcode::msgpack_to_json(&response, args.b32, args.strict) {
@@ -223,8 +200,14 @@ pub fn run_version(verbose: bool, cli_d: Vec<PathBuf>) -> ExitCode {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
-        let response = algod_get(&rt, &endpoint, "/versions")
-            .and_then(|body| serde_json::from_slice::<Version>(&body).map_err(|e| e.to_string()));
+        let response = algod_rest::get_json(
+            &rt,
+            &endpoint,
+            "/versions",
+            &[],
+            &crate::go_codec_json::VERSION,
+        )
+        .and_then(|v| serde_json::from_value::<Version>(v).map_err(|e| e.to_string()));
         let v = match response {
             Ok(v) => v,
             Err(e) => {

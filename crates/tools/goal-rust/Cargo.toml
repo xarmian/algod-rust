@@ -35,6 +35,7 @@ algo-error = { workspace = true }
 algo-netdeploy = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
+hyper = { workspace = true }
 rand = { workspace = true }
 rpassword = "7"
 thiserror = { workspace = true }

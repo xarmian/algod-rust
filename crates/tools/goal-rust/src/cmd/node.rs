@@ -29,12 +29,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use algo_rest_client::{AlgodClient, BlockSource, NodeStatus};
+use algo_rest_client::{AlgodVersions, NodeStatus};
 
-#[cfg(test)]
-use algo_rest_client::AlgodVersions;
-
+use crate::algod_rest;
 use crate::data_dir::{read_algod_admin_token, read_algod_net, read_algod_token};
+use crate::formatting::report_error_text;
+use crate::go_codec_json;
 use crate::groups::node::StatusArgs;
 
 /// Mirrors `messages.go:64` (`infoNodeStatus`).
@@ -113,7 +113,7 @@ pub fn run_status(args: StatusArgs, cli_d: Vec<PathBuf>) -> ExitCode {
             // Mirrors `cmd/util/datadir/messages.go:infoDataDir`.
             println!("[Data Directory: {}]", dir.display());
         }
-        if let Err(()) = runtime.block_on(get_status(dir, args.watch)) {
+        if let Err(()) = get_status(&runtime, dir, args.watch) {
             exit = ExitCode::from(1);
         }
     }
@@ -123,27 +123,27 @@ pub fn run_status(args: StatusArgs, cli_d: Vec<PathBuf>) -> ExitCode {
 /// Port of `getStatus(dataDir string)`. Loops printing status (with
 /// `--watch`'s ANSI cleanup between frames) until single-shot mode
 /// breaks out.
-async fn get_status(data_dir: &Path, watch_ms: u64) -> Result<(), ()> {
+fn get_status(rt: &tokio::runtime::Runtime, data_dir: &Path, watch_ms: u64) -> Result<(), ()> {
     /// ANSI cursor-up + delete-line. Same constants Go uses
     /// (`node.go:425-426`).
     const CUU: &str = "\x1b[A";
     const DL: &str = "\x1b[M";
 
-    let client = build_client(data_dir)?;
+    let endpoint = build_endpoint(data_dir)?;
 
     let mut cleanup_fmt = String::new();
     loop {
-        let stat = match client.get_status().await {
+        let stat = match fetch_status(rt, &endpoint) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("{}", format_message(ERROR_NODE_STATUS, &[&e.to_string()]));
+                eprintln!("{}", node_status_error(&e));
                 return Err(());
             }
         };
-        let vers = match client.get_versions().await {
+        let vers = match fetch_versions(rt, &endpoint) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("{}", format_message(ERROR_NODE_STATUS, &[&e.to_string()]));
+                eprintln!("{}", node_status_error(&e));
                 return Err(());
             }
         };
@@ -158,7 +158,7 @@ async fn get_status(data_dir: &Path, watch_ms: u64) -> Result<(), ()> {
         if watch_ms == 0 {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(watch_ms)).await;
+        std::thread::sleep(Duration::from_millis(watch_ms));
         cleanup_fmt = String::new();
         let lines = status_str.split('\n').count();
         for _ in 0..lines {
@@ -491,38 +491,12 @@ fn http() -> reqwest::Client {
 /// `message`, matched case-insensitively like `encoding/json`), else the
 /// raw body, keeping only printable ASCII (`filterASCII`).
 pub fn http_error_text(status: reqwest::StatusCode, body: &str) -> String {
-    let decoded = match serde_json::from_str::<serde_json::Value>(body) {
-        Ok(serde_json::Value::Null) => Some(String::new()),
-        Ok(serde_json::Value::Object(m)) => {
-            let field = |name: &str| {
-                m.iter()
-                    .filter(|(k, _)| k.eq_ignore_ascii_case(name))
-                    .map(|(_, v)| v)
-                    .next_back()
-            };
-            let message = match field("message") {
-                None | Some(serde_json::Value::Null) => Some(String::new()),
-                Some(serde_json::Value::String(s)) => Some(s.clone()),
-                Some(_) => None,
-            };
-            let data_ok = matches!(
-                field("data"),
-                None | Some(serde_json::Value::Null) | Some(serde_json::Value::Object(_))
-            );
-            message.filter(|_| data_ok)
-        }
-        _ => None,
-    };
-    let message: String = decoded
-        .unwrap_or_else(|| body.to_string())
-        .chars()
-        .filter(|c| (' '..='~').contains(c))
-        .collect();
-    format!("HTTP {status}: {message}")
+    format!("HTTP {status}: {}", algod_rest::error_message(body))
 }
 
+/// go: `reportErrorf(errorNodeStatus, err)`.
 fn node_status_error(e: &str) -> String {
-    format_message(ERROR_NODE_STATUS, &[e])
+    report_error_text(&format_message(ERROR_NODE_STATUS, &[e]))
 }
 
 /// Port of `catchupCmd` (`node.go:155-212`).
@@ -557,15 +531,15 @@ pub fn run_catchup(args: crate::groups::node::CatchupArgs, cli_d: Vec<PathBuf>) 
                 return ExitCode::from(1);
             }
         };
-        let client = AlgodClient::new(url.clone(), token.clone());
+        let endpoint = (url.clone(), token.clone());
         let http = http();
 
         if args.abort {
             // go: libgoal AbortCatchup -- only when a catchup is running
-            let status = match rt.block_on(client.get_status()) {
+            let status = match fetch_status(&rt, &endpoint) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("{}", node_status_error(&e.to_string()));
+                    eprintln!("{}", node_status_error(&e));
                     return ExitCode::from(1);
                 }
             };
@@ -600,10 +574,10 @@ pub fn run_catchup(args: crate::groups::node::CatchupArgs, cli_d: Vec<PathBuf>) 
             Some(l) => l.clone(),
             None => {
                 // lookup the latest catchpoint for this network
-                let versions = match rt.block_on(client.get_versions()) {
+                let versions = match fetch_versions(&rt, &endpoint) {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("{}", node_status_error(&e.to_string()));
+                        eprintln!("{}", node_status_error(&e));
                         return ExitCode::from(1);
                     }
                 };
@@ -671,17 +645,17 @@ pub fn run_wait(args: crate::groups::node::WaitArgs, cli_d: Vec<PathBuf>) -> Exi
             return ExitCode::from(1);
         }
     };
-    let Ok(client) = build_client(&dir) else {
+    let Ok(endpoint) = build_endpoint(&dir) else {
         return ExitCode::from(1);
     };
     let rt = match runtime() {
         Ok(r) => r,
         Err(code) => return code,
     };
-    let start_round = match rt.block_on(client.get_status()) {
+    let start_round = match fetch_status(&rt, &endpoint) {
         Ok(s) => s.last_round,
         Err(e) => {
-            eprintln!("{}", node_status_error(&e.to_string()));
+            eprintln!("{}", node_status_error(&e));
             return ExitCode::from(1);
         }
     };
@@ -692,11 +666,11 @@ pub fn run_wait(args: crate::groups::node::WaitArgs, cli_d: Vec<PathBuf>) -> Exi
             return ExitCode::from(1);
         }
         std::thread::sleep(Duration::from_millis(500));
-        match rt.block_on(client.get_status()) {
+        match fetch_status(&rt, &endpoint) {
             Ok(s) if s.last_round != start_round => return ExitCode::SUCCESS,
             Ok(_) => {}
             Err(e) => {
-                eprintln!("{}", node_status_error(&e.to_string()));
+                eprintln!("{}", node_status_error(&e));
                 return ExitCode::from(1);
             }
         }
@@ -787,20 +761,13 @@ pub fn run_ledger_supply(cli_d: Vec<PathBuf>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let fetched = rt.block_on(async {
-        let resp = http()
-            .get(format!("{url}/v2/ledger/supply"))
-            .header("X-Algo-API-Token", &token)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let status = resp.status();
-        let body = resp.text().await.map_err(|e| e.to_string())?;
-        if !status.is_success() {
-            return Err(http_error_text(status, &body));
-        }
-        serde_json::from_str::<serde_json::Value>(&body).map_err(|e| e.to_string())
-    });
+    let fetched = algod_rest::get_json(
+        &rt,
+        &(url, token),
+        "/v2/ledger/supply",
+        &[],
+        &go_codec_json::SUPPLY,
+    );
     match fetched {
         Ok(doc) => {
             let field = |k: &str| doc.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
@@ -813,7 +780,10 @@ pub fn run_ledger_supply(cli_d: Vec<PathBuf>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("Error processing command: {e}");
+            eprintln!(
+                "{}",
+                report_error_text(&format!("Error processing command: {e}"))
+            );
             ExitCode::from(1)
         }
     }
@@ -845,17 +815,17 @@ pub fn run_lastround(cli_d: Vec<PathBuf>) -> ExitCode {
         if multi {
             println!("[Data Directory: {}]", dir.display());
         }
-        let client = match build_client(dir) {
-            Ok(c) => c,
+        let endpoint = match build_endpoint(dir) {
+            Ok(e) => e,
             Err(()) => {
                 exit = ExitCode::from(1);
                 continue;
             }
         };
-        match rt.block_on(client.get_status()) {
+        match fetch_status(&rt, &endpoint) {
             Ok(stat) => println!("{}", stat.last_round),
             Err(e) => {
-                eprintln!("{}", format_message(ERROR_NODE_STATUS, &[&e.to_string()]));
+                eprintln!("{}", node_status_error(&e));
                 exit = ExitCode::from(1);
             }
         }
@@ -1142,15 +1112,12 @@ fn endpoint(data_dir: &Path) -> Result<(String, String), String> {
 /// go: `makeStatusString(client.Status())` for one node -- what
 /// `goal network status` prints per node.
 pub(crate) fn status_text(data_dir: &Path) -> Result<String, String> {
-    let (url, token) = endpoint(data_dir)?;
-    let client = AlgodClient::new(url, token);
+    let endpoint = endpoint(data_dir)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-    let stat = runtime
-        .block_on(client.get_status())
-        .map_err(|e| e.to_string())?;
+    let stat = fetch_status(&runtime, &endpoint)?;
     Ok(make_status_string(&stat))
 }
 
@@ -1169,14 +1136,44 @@ fn client_endpoint(data_dir: &Path) -> Result<(String, String), String> {
     }
 }
 
-fn build_client(data_dir: &Path) -> Result<AlgodClient, ()> {
-    match client_endpoint(data_dir) {
-        Ok((url, token)) => Ok(AlgodClient::new(url, token)),
-        Err(e) => {
-            eprintln!("{}", format_message(ERROR_NODE_STATUS, &[&e]));
-            Err(())
+fn build_endpoint(data_dir: &Path) -> Result<(String, String), ()> {
+    client_endpoint(data_dir).map_err(|e| {
+        eprintln!("{}", node_status_error(&e));
+    })
+}
+
+/// go: `client.Status()` -- `GET /v2/status` into a
+/// `model.NodeStatusResponse` (issue #2466).
+fn fetch_status(
+    rt: &tokio::runtime::Runtime,
+    endpoint: &(String, String),
+) -> Result<NodeStatus, String> {
+    let mut v = algod_rest::get_json(rt, endpoint, "/v2/status", &[], &go_codec_json::NODE_STATUS)?;
+    // go's `int64` nanoseconds: `NodeStatus` keeps their bits, which
+    // `format_secs` reads back as signed
+    for k in ["time-since-last-round", "catchup-time"] {
+        if let Some(n) = v.get(k).and_then(serde_json::Value::as_i64) {
+            v[k] = serde_json::Value::from(n as u64);
         }
     }
+    serde_json::from_value(v).map_err(|e| e.to_string())
+}
+
+/// go: `client.AlgodVersions()` -- `GET /versions` into a `common.Version`.
+fn fetch_versions(
+    rt: &tokio::runtime::Runtime,
+    endpoint: &(String, String),
+) -> Result<AlgodVersions, String> {
+    let v = algod_rest::get_json(rt, endpoint, "/versions", &[], &go_codec_json::VERSION)?;
+    let text = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+    Ok(AlgodVersions {
+        versions: v["versions"]
+            .as_array()
+            .map(|a| a.iter().map(|s| s.as_str().unwrap_or_default().to_string()).collect())
+            .unwrap_or_default(),
+        genesis_id: text("genesis_id"),
+        genesis_hash_b64: text("genesis_hash_b64"),
+    })
 }
 
 /// Pure formatter — covers the three Go branches at `node.go:455-516`.
@@ -1293,7 +1290,8 @@ pub fn make_status_string(stat: &NodeStatus) -> String {
 /// Format a duration in nanoseconds like Go's
 /// `fmt.Sprintf("%.1fs", time.Duration(ns).Seconds())`.
 fn format_secs(ns: u64) -> String {
-    let secs = ns as f64 / 1_000_000_000.0;
+    // go's `int64` nanoseconds (see `fetch_status`)
+    let secs = ns as i64 as f64 / 1_000_000_000.0;
     format!("{secs:.1}s")
 }
 

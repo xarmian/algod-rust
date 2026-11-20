@@ -32,6 +32,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 pub mod accounts_list;
+pub mod algod_rest;
 pub mod cli_state;
 pub mod cmd;
 pub mod cobra_compat;
@@ -39,6 +40,7 @@ mod cobra_usage;
 pub mod consensus_json;
 pub mod data_dir;
 pub mod formatting;
+pub mod go_codec_json;
 pub mod go_json;
 pub mod goal_client;
 pub mod groups;
