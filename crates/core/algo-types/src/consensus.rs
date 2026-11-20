@@ -295,7 +295,8 @@ pub struct ConsensusParams {
     pub max_txn_bytes_per_block: u64,
     /// Absolute hard cap on note field size in bytes, beyond which a
     /// transaction is not well-formed regardless of size-pricing fee paid
-    /// (Go: `MaxAbsoluteTxnNoteBytes`, v42+). `MaxTxnNoteBytes` remains the
+    /// (Go: `MaxAbsoluteTxnNoteBytes`: 1024 from v7, the soft cap, raised to
+    /// 4096 at v42). `MaxTxnNoteBytes` remains the
     /// free/soft cap; bytes between the soft and absolute cap are billable
     /// via `PerByteTxnSurcharge`.
     pub max_absolute_txn_note_bytes: usize,
@@ -305,7 +306,8 @@ pub struct ConsensusParams {
     pub max_absolute_extra_program_pages: u32,
     /// Absolute hard cap on the summed length of ApplicationArgs, beyond
     /// which an app call is not well-formed regardless of size-pricing fee
-    /// paid (Go: `MaxAbsoluteTotalArgLen`, v42+).
+    /// paid (Go: `MaxAbsoluteTotalArgLen`: 2048 from v24, the soft cap,
+    /// raised to 16384 at v42).
     pub max_absolute_total_arg_len: usize,
     /// Per-byte fee surcharge (fixed-point `basics.Micros`, 1_000_000 == one
     /// `MinTxnFee`) charged for txn/app-call/logicsig bytes beyond the old
@@ -1094,7 +1096,8 @@ fn built_in_consensus_params(version: &str) -> Option<ConsensusParams> {
         max_txn_note_bytes: 1_024,
         max_tx_group_size: 1,
         max_txn_bytes_per_block: 1_000_000,
-        max_absolute_txn_note_bytes: 0,
+        // go: `MaxAbsoluteTxnNoteBytes: 1024` in the v7 base (issue #2467)
+        max_absolute_txn_note_bytes: 1_024,
         max_absolute_extra_program_pages: 0,
         max_absolute_total_arg_len: 0,
         per_byte_txn_surcharge: 0,
@@ -1425,6 +1428,7 @@ fn built_in_consensus_params(version: &str) -> Option<ConsensusParams> {
     v24.maximum_minimum_balance = 100_100_000;
     v24.max_app_args = 16;
     v24.max_app_total_arg_len = 2048;
+    v24.max_absolute_total_arg_len = 2048;
     v24.max_app_program_len = 1024;
     v24.max_app_total_program_len = 2048;
     v24.max_app_key_len = 64;
@@ -3136,12 +3140,13 @@ mod tests {
         assert!(!v41.enable_pq_scheme_falcon1024);
         assert!(!v41.load_tracking);
         assert!(!v41.enable_select_f128);
-        assert_eq!(v41.max_absolute_txn_note_bytes, 0);
+        // go sets the absolute caps to the soft caps before v42
+        assert_eq!(v41.max_absolute_txn_note_bytes, 1_024);
         // MaxAbsoluteExtraProgramPages was introduced at v28 (=3), not v42 —
         // v42 only raises it to 7. Unlike the other `max_absolute_*`/feature
         // fields above, it is NOT zero/unset pre-v42.
         assert_eq!(v41.max_absolute_extra_program_pages, 3);
-        assert_eq!(v41.max_absolute_total_arg_len, 0);
+        assert_eq!(v41.max_absolute_total_arg_len, 2_048);
         assert_eq!(v41.per_byte_txn_surcharge, 0);
     }
 

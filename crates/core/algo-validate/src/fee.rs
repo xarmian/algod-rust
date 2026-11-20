@@ -169,11 +169,9 @@ pub fn fee_for_usage(base: u64, usage: u64, multiplier: u64, residue: u64) -> (u
 /// cap (`MaxTxnNoteBytes`) at config-load time for every protocol version, so
 /// upstream's `WellFormed` check (`len(tx.Note) > proto.MaxAbsoluteTxnNoteBytes`)
 /// is unconditional and always at least as strict as the old soft cap.
-/// `ConsensusParams::max_absolute_txn_note_bytes` is left `0` ("unset") for
-/// protocol versions at/before v41 (matching how the field was introduced in
-/// `algo-types`), so this falls back to the soft cap in that case, exactly
-/// reproducing `checkSetMax`'s effect without hand-copying `1_024` into every
-/// pre-v42 version definition.
+/// Every built-in protocol sets it (go's v7 base: 1024, the soft cap); a
+/// `0` (a `consensus.json` entry that leaves it out) falls back to the soft
+/// cap.
 pub fn effective_max_note_bytes(params: &ConsensusParams) -> usize {
     if params.max_absolute_txn_note_bytes > 0 {
         params.max_absolute_txn_note_bytes
@@ -187,8 +185,8 @@ pub fn effective_max_note_bytes(params: &ConsensusParams) -> usize {
 /// `MaxAbsoluteTotalArgLen`, analogous to [`effective_max_note_bytes`]: go's
 /// `checkSetMax(p.MaxAbsoluteTotalArgLen, &bounds.MaxAppTotalArgLen)` clamps it
 /// to at least the free/soft cap (`MaxAppTotalArgLen`) at config-load time, so
-/// this falls back to the soft cap for protocol versions where
-/// `max_absolute_total_arg_len` is left `0` ("unset", at/before v41).
+/// this falls back to the soft cap when `max_absolute_total_arg_len` is `0`
+/// (go sets it from v24, to the soft cap 2048).
 pub fn effective_max_total_arg_len(params: &ConsensusParams) -> usize {
     if params.max_absolute_total_arg_len > 0 {
         params.max_absolute_total_arg_len

@@ -180,10 +180,11 @@ fn root_version_flag_is_lowercase_v_not_uppercase_v() {
         .arg("-v")
         .output()
         .expect("run goal-rust -v");
-    let stderr = String::from_utf8_lossy(&ok.stderr);
+    // go's `config.FormatVersionAndLicense()` (issue #2467)
+    let stdout = String::from_utf8_lossy(&ok.stdout);
     assert!(
-        stderr.contains("goal-rust:  version is not yet implemented"),
-        "expected `-v` to hit the version stub; stderr={stderr:?}",
+        ok.status.success() && stdout.contains("go-algorand is licensed with AGPLv3.0"),
+        "expected `-v` to print the version and license; stdout={stdout:?}",
     );
 
     let nope = Command::new(GOAL_RUST_BIN)

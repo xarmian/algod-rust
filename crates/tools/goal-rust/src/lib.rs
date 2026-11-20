@@ -33,6 +33,7 @@ use clap::{Parser, Subcommand};
 
 pub mod accounts_list;
 pub mod algod_rest;
+pub mod balance_record;
 pub mod cli_state;
 pub mod cmd;
 pub mod cobra_compat;
@@ -46,6 +47,7 @@ pub mod goal_client;
 pub mod groups;
 pub mod kmdcontrol;
 pub mod nodecontrol;
+pub mod protocols_json;
 pub mod resource_resolution;
 pub mod transcode;
 pub mod wallet_token;
@@ -319,7 +321,7 @@ pub fn run() -> ExitCode {
     let kmddir = cli.kmddir.as_ref().map(Into::into);
     cli_state::install(datadirs, kmddir);
     if cli.version {
-        return unimplemented("", "version");
+        return cmd::info::run_version_check();
     }
     let Some(command) = cli.command else {
         let mut cmd = <Cli as clap::CommandFactory>::command();
@@ -353,7 +355,7 @@ pub fn run() -> ExitCode {
         RootCommand::Kmd { cmd: None } => print_group_help(&["kmd"]),
         RootCommand::Ledger { cmd: Some(c) } => groups::ledger::run(c),
         RootCommand::Ledger { cmd: None } => print_group_help(&["ledger"]),
-        RootCommand::License => unimplemented("", "license"),
+        RootCommand::License => cmd::info::run_license(),
         RootCommand::Network {
             rootdir,
             cmd: Some(c),
@@ -361,8 +363,8 @@ pub fn run() -> ExitCode {
         RootCommand::Network { cmd: None, .. } => print_group_help(&["network"]),
         RootCommand::Node { cmd: Some(c) } => groups::node::run(c),
         RootCommand::Node { cmd: None } => print_group_help(&["node"]),
-        RootCommand::Protocols => unimplemented("", "protocols"),
-        RootCommand::Report => unimplemented("", "report"),
+        RootCommand::Protocols => cmd::info::run_protocols(),
+        RootCommand::Report => cmd::info::run_report(cli_state::datadirs()),
         RootCommand::Version { verbose } => cmd::ledger::run_version(verbose, cli_state::datadirs()),
         RootCommand::Wallet { cmd: Some(c), .. } => groups::wallet::run(c),
         RootCommand::Wallet { cmd: None, default } => {

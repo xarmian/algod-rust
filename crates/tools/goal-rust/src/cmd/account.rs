@@ -24,9 +24,8 @@
 //! - `new`   → account.go:313-359
 //! - `delete`→ account.go:379-398
 //! - `rename`→ account.go:281-310
-//! - `dump`  → account.go:828-855 (REST-shaped pretty JSON — see
-//!   [`crate::groups::account::DumpArgs`] for the intentional
-//!   divergence vs Go's `protocol.EncodeJSONStrict(&BalanceRecord)`).
+//! - `dump`  → account.go `dumpCmd` (the `basics.BalanceRecord`, see
+//!   [`crate::balance_record`]).
 //!
 //! Wallet-handle resolution mirrors Go's `getWalletHandleMaybePassword`
 //! (commands.go:342-410): explicit `-w` ⇒ look up by name; no `-w` ⇒
@@ -562,69 +561,62 @@ pub fn run_dump(args: DumpArgs, cli_d: Vec<PathBuf>) -> ExitCode {
         }
     };
     // go's dumpCmd: `ensureAlgodClient(dataDir)` (issue #2454), then the
-    // address (`basics.UnmarshalChecksumAddress`).
-    let Ok((base, token)) = ensure_algod_endpoint(&data_dir_path) else {
+    // address (`basics.UnmarshalChecksumAddress`), then `client.AccountData`:
+    // algod's msgpack `basics.AccountData` (issue #2467).
+    let Ok(endpoint) = ensure_algod_endpoint(&data_dir_path) else {
         return ExitCode::from(1);
     };
-    if let Err(e) = algo_types::Address::from_algorand_string(&args.address) {
-        eprintln!("Could not parse address: {e}");
-        return ExitCode::from(1);
-    }
+    let addr: [u8; 32] = match algo_avm::assembler::unmarshal_checksum_address(&args.address)
+        .and_then(|a| <[u8; 32]>::try_from(a.as_slice()).map_err(|e| e.to_string()))
+    {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("Failed to parse addr: {e}");
+            return ExitCode::from(1);
+        }
+    };
     let rt = match build_runtime() {
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
     };
-    // Fetch as untyped JSON so unknown fields (assets, created-assets,
-    // apps-local-state, created-apps, participation, etc.) round-trip
-    // unmolested. The narrow `algo_rest_client::AccountInfo` deserialize
-    // would silently drop them (Codex review TASK-235 round 1).
-    let url = format!(
-        "{}/v2/accounts/{}",
-        base.trim_end_matches('/'),
-        args.address
-    );
-    let body_result = rt.block_on(async {
-        let http = reqwest::Client::new();
-        let resp = http
-            .get(&url)
-            .header("X-Algo-API-Token", &token)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let status = resp.status();
-        let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-        if !status.is_success() {
-            return Err(format!(
-                "HTTP {}: {}",
-                status.as_u16(),
-                String::from_utf8_lossy(&bytes).trim()
-            ));
-        }
-        // Re-pretty-print to match Go's MarshalIndent shape (2-space
-        // indent). Use serde_json::Value so all REST fields survive.
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(|e| format!("invalid JSON from algod: {e}"))?;
-        let pretty =
-            serde_json::to_string_pretty(&parsed).map_err(|e| format!("re-encode failed: {e}"))?;
-        Ok::<String, String>(pretty)
-    });
-    let body = match body_result {
-        Ok(b) => b,
+    let path = format!("/v2/accounts/{}", args.address);
+    let record = crate::algod_rest::get(&rt, &endpoint, &path, &[("format", "msgpack")])
+        .and_then(|answer| crate::balance_record::dump(&addr, &answer, args.outfile.is_some()));
+    let data = match record {
+        Ok(d) => d,
         Err(e) => {
-            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e]));
+            eprintln!(
+                "{}",
+                crate::formatting::report_error_text(&format_message(ERROR_REQUEST_FAIL, &[&e]))
+            );
             return ExitCode::from(1);
         }
     };
     match args.outfile {
+        // go: `writeFile(dumpOutFile, data, 0644)`, its error ignored
         Some(path) => {
-            if let Err(e) = std::fs::write(&path, body.as_bytes()) {
-                eprintln!("Failed to write {}: {e}", path.display());
-                return ExitCode::from(1);
-            }
+            let _ = write_file_0644(&path, &data);
         }
-        None => println!("{body}"),
+        None => println!("{}", String::from_utf8_lossy(&data)),
     }
     ExitCode::SUCCESS
+}
+
+/// go's `writeFile(filename, data, 0644)`: `-` is stdout.
+fn write_file_0644(filename: &str, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if filename == "-" {
+        let mut out = std::io::stdout().lock();
+        return out.write_all(data).and_then(|()| out.flush());
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o644);
+    }
+    opts.open(filename)?.write_all(data)
 }
 
 // ---- shared helpers -------------------------------------------------------

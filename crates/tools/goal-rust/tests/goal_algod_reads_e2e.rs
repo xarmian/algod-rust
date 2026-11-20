@@ -1114,7 +1114,10 @@ fn info_cases() -> Vec<Case> {
         case("report two data dirs", &["report", "-d", "<DD>"]),
         case("account dump", &["account", "dump", "-a", "<A1>"]),
         case("account dump empty", &["account", "dump", "-a", "<A2>"]),
-        case("account dump offline", &["account", "dump", "--address", "<A3>"]),
+        case(
+            "account dump offline",
+            &["account", "dump", "--address", "<A3>"],
+        ),
         case(
             "account dump -o",
             &["account", "dump", "-a", "<A1>", "-o", "out.mp"],
@@ -1129,7 +1132,10 @@ fn info_cases() -> Vec<Case> {
         ),
         case("account dump 500", &["account", "dump", "-a", "<A4>"]),
         case("account dump not found", &["account", "dump", "-a", "<A5>"]),
-        case("account dump bad address", &["account", "dump", "-a", "XYZ"]),
+        case(
+            "account dump bad address",
+            &["account", "dump", "-a", "XYZ"],
+        ),
         case("account dump no address", &["account", "dump"]),
     ];
     v.push(case(
@@ -1149,7 +1155,10 @@ fn info_cases() -> Vec<Case> {
     c.no_genesis = true;
     v.push(c);
     for (name, args) in [
-        ("account dump refused", &["account", "dump", "-a", "<A1>"][..]),
+        (
+            "account dump refused",
+            &["account", "dump", "-a", "<A1>"][..],
+        ),
         ("report 401", &["report"]),
     ] {
         let mut c = case(name, args);
@@ -1173,8 +1182,14 @@ fn info_cases() -> Vec<Case> {
     v.push(c);
     let mut answers: Vec<(&str, Vec<u8>)> = vec![
         ("account dump json answer", br#"{"amount":5}"#.to_vec()),
-        ("account dump unknown field", vec![0x81, 0xa3, b'f', b'o', b'o', 0x01]),
-        ("account dump truncated", vec![0x82, 0xa3, b'o', b'n', b'l', 0x01]),
+        (
+            "account dump unknown field",
+            vec![0x81, 0xa3, b'f', b'o', b'o', 0x01],
+        ),
+        (
+            "account dump truncated",
+            vec![0x82, 0xa3, b'o', b'n', b'l', 0x01],
+        ),
         ("account dump empty answer", Vec::new()),
     ];
     answers.extend(malformed_account_data());
@@ -1228,7 +1243,10 @@ fn malformed_account_data() -> Vec<(&'static str, Vec<u8>)> {
         ("account dump invalid prefix", one("onl", vec![0xc1])),
         ("account dump short vote", one("vote", mp_bin(&[1, 2, 3]))),
         ("account dump long vote", one("vote", mp_bin(&[9; 40]))),
-        ("account dump vote as array", one("vote", vec![0x92, 0x01, 0x02])),
+        (
+            "account dump vote as array",
+            one("vote", vec![0x92, 0x01, 0x02]),
+        ),
         ("account dump vote as string", one("vote", s("abc"))),
         ("account dump vote as int", one("vote", mp_u(5))),
         (
@@ -1312,7 +1330,14 @@ fn malformed_account_data() -> Vec<(&'static str, Vec<u8>)> {
         ),
         (
             "account dump app array form",
-            one("appp", imap1(arr(&[mp_bin(&[1]), vec![0xc0], one("g", mp_obj(&[("ui", mp_u(4))]))]))),
+            one(
+                "appp",
+                imap1(arr(&[
+                    mp_bin(&[1]),
+                    vec![0xc0],
+                    one("g", mp_obj(&[("ui", mp_u(4))])),
+                ])),
+            ),
         ),
         (
             "account dump nil fields",
@@ -1506,8 +1531,10 @@ fn row(goal: &Path, c: &Case) -> serde_json::Value {
     let mask = |b: &[u8]| {
         let mut t = text(b);
         if !uname.is_empty() {
-            t = t.replace(&uname, "<UNAME>
-");
+            t = t.replace(
+                &uname, "<UNAME>
+",
+            );
         }
         let mut t = t.replace(dd.to_str().unwrap(), "<DD>");
         for i in 1..=5u8 {

@@ -120,6 +120,31 @@ pub fn run_status(args: StatusArgs, cli_d: Vec<PathBuf>) -> ExitCode {
     exit
 }
 
+/// go's `datadir.OnDataDirs(getStatus)` without `--watch`, as `goal report`
+/// runs it: `getStatus` exits at the first failure (`reportErrorf`).
+pub(crate) fn run_status_of(dirs: &[PathBuf]) -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("tokio runtime: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let multi = dirs.len() > 1;
+    for dir in dirs {
+        if multi {
+            println!("[Data Directory: {}]", dir.display());
+        }
+        if get_status(&runtime, dir, 0).is_err() {
+            return ExitCode::from(1);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 /// Port of `getStatus(dataDir string)`. Loops printing status (with
 /// `--watch`'s ANSI cleanup between frames) until single-shot mode
 /// breaks out.

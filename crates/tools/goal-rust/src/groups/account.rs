@@ -23,7 +23,6 @@
 //! Leaf list and `Short` text taken from cobra `Use` / `Short` fields
 //! (account.go:81-109).
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
@@ -396,16 +395,8 @@ pub struct ExportArgs {
     pub wallet: Option<String>,
 }
 
-/// `account dump -a <address>` — pretty-print the REST
-/// `/v2/accounts/{addr}` response.
-///
-/// **Intentional divergence from Go** (TASK-235 scope, documented in
-/// PR description): Go uses `protocol.EncodeJSONStrict(&BalanceRecord)`
-/// at `account.go:851` which emits the internal `basics.BalanceRecord`
-/// struct with msgpack-keyed JSON fields. Per task body, we fetch the
-/// REST response (`/v2/accounts/{addr}`) and pretty-print it instead —
-/// more useful for operators piping into `jq`, less Go-byte-exact.
-/// Porting the BalanceRecord JSON encoder is out of scope for B3.
+/// `account dump -a <address>`: go's `basics.BalanceRecord` of the account
+/// (`account.go` `dumpCmd`), as JSON or, with `-o`, msgpack in a file.
 /// `account list [-w <wallet>]` — TASK-236 / B4. Lists every address
 /// kmd knows about with status flag, balance, friendly name, and the
 /// `*` default-account marker.
@@ -432,17 +423,15 @@ pub struct ListArgs {
 
 #[derive(Args, Debug)]
 pub struct DumpArgs {
-    /// Address to dump. Mirrors Go's `-a, --address` flag.
-    #[arg(short = 'a', long = "address")]
+    /// Account address to retrieve balance (go's `-a, --address`; not
+    /// marked required: go marks `balanceCmd`'s flag a second time).
+    #[arg(short = 'a', long = "address", default_value = "")]
     pub address: String,
 
-    /// Write the response to this file instead of stdout. Mirrors
-    /// Go's `-o, --outfile` flag (`account.go`). Go writes msgpack-
-    /// encoded `BalanceRecord` to disk; since we render the REST JSON
-    /// instead (see [`DumpArgs`] doc), the file gets the same raw
-    /// JSON body that would otherwise hit stdout.
+    /// Save balance record to specified output file (go's `-o,
+    /// --outfile`): the msgpack `BalanceRecord`.
     #[arg(short = 'o', long = "outfile")]
-    pub outfile: Option<PathBuf>,
+    pub outfile: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
