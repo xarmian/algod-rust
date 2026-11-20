@@ -395,8 +395,6 @@ pub struct ExportArgs {
     pub wallet: Option<String>,
 }
 
-/// `account dump -a <address>`: go's `basics.BalanceRecord` of the account
-/// (`account.go` `dumpCmd`), as JSON or, with `-o`, msgpack in a file.
 /// `account list [-w <wallet>]` — TASK-236 / B4. Lists every address
 /// kmd knows about with status flag, balance, friendly name, and the
 /// `*` default-account marker.
@@ -421,6 +419,8 @@ pub struct ListArgs {
     pub info: bool,
 }
 
+/// `account dump -a <address>`: go's `basics.BalanceRecord` of the account
+/// (`account.go` `dumpCmd`), as JSON or, with `-o`, msgpack in a file.
 #[derive(Args, Debug)]
 pub struct DumpArgs {
     /// Account address to retrieve balance (go's `-a, --address`; not
