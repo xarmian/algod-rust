@@ -34,6 +34,8 @@ use clap::{Parser, Subcommand};
 pub mod accounts_list;
 pub mod cli_state;
 pub mod cmd;
+pub mod cobra_compat;
+mod cobra_usage;
 pub mod consensus_json;
 pub mod data_dir;
 pub mod formatting;
@@ -231,7 +233,12 @@ pub fn unimplemented(group: &str, leaf: &str) -> ExitCode {
 /// this — keeping the dispatch table here lets integration tests
 /// reach the same code path without spawning a subprocess.
 pub fn run() -> ExitCode {
-    let cli = Cli::parse();
+    // cobra's lookup of `account` / `wallet` subcommands (issue #2453).
+    let args = match cobra_compat::preflight(std::env::args_os().collect()) {
+        cobra_compat::Preflight::Run(args) => args,
+        cobra_compat::Preflight::Exit(code) => return code,
+    };
+    let cli = Cli::parse_from(args);
     let datadirs: Vec<std::path::PathBuf> = cli.datadir.iter().map(Into::into).collect();
     let kmddir = cli.kmddir.as_ref().map(Into::into);
     cli_state::install(datadirs, kmddir);

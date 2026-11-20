@@ -22,7 +22,9 @@
 //! <name>` set the default account / wallet kept in the data dir's
 //! `accountList.json` (`cmd/goal/account.go` `accountCmd`,
 //! `cmd/goal/wallet.go` `walletCmd`), and `goal account import` takes `-m`
-//! for `--mnemonic` (issue #2448).
+//! for `--mnemonic` (issue #2448). Extra arguments to `account` / `wallet`
+//! and a `-f` placed before a subcommand fail with cobra's error and usage
+//! text (issue #2453).
 //!
 //! `fixtures/default_flags.jsonl` holds what go v5.0.5-stable's `goal`
 //! printed (exit code, stdout, stderr) and the `accountList.json` it left, for
@@ -338,6 +340,39 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
         &go(&["wallet", "--default", "w"], Stdin::Null),
     ));
     rows.push(list_row("accountList after wallet --default", &dd, &masks));
+    // #2453: `account` and `wallet` take no positional arguments
+    // (`validateNoPosArgsFn` = `cobra.NoArgs`), and their `-f/--default` is a
+    // local flag, so before a subcommand it is that subcommand's flag: an
+    // unknown one, or the subcommand's own `-f`. cobra prints the error and
+    // the command's usage.
+    for args in [
+        &["account", "-f", "imported", "extra"][..],
+        &["account", "-f", "imported", "extra", "more"],
+        &["account", "extra"],
+        &["account", "-w", "w", "lsit"],
+        &["wallet", "-f", "w2", "extra"],
+        &["wallet", "extra"],
+        &["account", "-f", "imported", "list"],
+        &["account", "--default", "imported", "list"],
+        &["account", "-fimported", "list", "--info"],
+        &["account", "-w", "w", "-f", "imported", "balance"],
+        &["account", "--default=imported", "multisig", "info"],
+        &["account", "-f", "imported", "multisig"],
+        &["account", "--default", "1000", "changeonlinestatus"],
+        &["wallet", "-f", "w2", "list"],
+        &["wallet", "--default=w2", "new", "w3"],
+        &["wallet", "-f", "w2", "rename", "w", "w4"],
+    ] {
+        rows.push(row(&args.join(" "), &masks, &go(args, Stdin::Null)));
+    }
+    // A subcommand with its own `-f` takes it: `account -f first new` is
+    // `account new -f first` (a bool `-f`, and `first` is a name in use).
+    rows.push(row(
+        "account -f first new",
+        &masks,
+        &go(&["account", "-f", "first", "new"], Stdin::Null),
+    ));
+    rows.push(list_row("accountList after the cobra errors", &dd, &masks));
     // kmd gone: the default account needs no kmd. (go's `wallet -f` would
     // then try to start a kmd, which is not compared here.)
     drop(kmd);
