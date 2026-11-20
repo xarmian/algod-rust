@@ -433,23 +433,26 @@ fn account_information(
     endpoint: &(String, String),
     address: &str,
 ) -> Option<serde_json::Value> {
-    let url = format!(
-        "{}/v2/accounts/{}?exclude=none&format=json",
-        endpoint.0.trim_end_matches('/'),
-        address
-    );
-    rt.block_on(async {
-        let resp = reqwest::Client::new()
-            .get(&url)
-            .header("X-Algo-API-Token", &endpoint.1)
-            .send()
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        serde_json::from_slice(&resp.bytes().await.ok()?).ok()
-    })
+    get_account(rt, endpoint, address, true).ok()
+}
+
+/// go's `RestClient.AccountInformation(address, includeCreatables)`:
+/// `GET /v2/accounts/<address>?exclude=<none|all>&format=json` decoded into
+/// a `model.Account`, or go's error text (issue #2466).
+fn get_account(
+    rt: &tokio::runtime::Runtime,
+    endpoint: &(String, String),
+    address: &str,
+    include_creatables: bool,
+) -> Result<serde_json::Value, String> {
+    let exclude = if include_creatables { "none" } else { "all" };
+    crate::algod_rest::get_json(
+        rt,
+        endpoint,
+        &format!("/v2/accounts/{address}"),
+        &[("exclude", exclude), ("format", "json")],
+        &crate::go_codec_json::ACCOUNT,
+    )
 }
 
 // ---- account delete -------------------------------------------------------
@@ -2438,7 +2441,7 @@ fn parse_signature_secrets_blob(blob: &[u8]) -> Result<RootKeySecrets, String> {
 /// `account balance -a <addr>` — print `<microAlgos> microAlgos\n`.
 /// Mirrors `account.go:810-825` (`balanceCmd`).
 pub fn run_balance(args: AddressArgs, cli_d: Vec<PathBuf>) -> ExitCode {
-    match fetch_account_json(&args.address, &cli_d) {
+    match fetch_account_json(&args.address, &cli_d, false) {
         Ok(v) => {
             let amount = v.get("amount").and_then(|a| a.as_u64()).unwrap_or(0);
             println!("{amount} microAlgos");
@@ -2451,7 +2454,7 @@ pub fn run_balance(args: AddressArgs, cli_d: Vec<PathBuf>) -> ExitCode {
 /// `account rewards -a <addr>` — print `<rewards> microAlgos\n`.
 /// Mirrors `account.go:856-870` (`rewardsCmd`).
 pub fn run_rewards(args: AddressArgs, cli_d: Vec<PathBuf>) -> ExitCode {
-    match fetch_account_json(&args.address, &cli_d) {
+    match fetch_account_json(&args.address, &cli_d, false) {
         Ok(v) => {
             let rewards = v.get("rewards").and_then(|a| a.as_u64()).unwrap_or(0);
             println!("{rewards} microAlgos");
@@ -2568,7 +2571,7 @@ fn held_asset_entries(v: &serde_json::Value) -> &[serde_json::Value] {
 /// Held Assets, Created Apps, Opted In Apps, Minimum Balance.
 /// Mirrors `printAccountInfo` (`account.go:592-770`).
 pub fn run_info(args: InfoArgs, cli_d: Vec<PathBuf>) -> ExitCode {
-    let v = match fetch_account_json(&args.address, &cli_d) {
+    let v = match fetch_account_json(&args.address, &cli_d, true) {
         Ok(v) => v,
         Err(()) => return ExitCode::from(1),
     };
@@ -2635,7 +2638,11 @@ fn build_algod_endpoint_from(cli_d: &[PathBuf]) -> Option<(String, String)> {
     build_algod_endpoint(&dd)
 }
 
-fn fetch_account_json(address: &str, cli_d: &[PathBuf]) -> Result<serde_json::Value, ()> {
+fn fetch_account_json(
+    address: &str,
+    cli_d: &[PathBuf],
+    include_creatables: bool,
+) -> Result<serde_json::Value, ()> {
     let dd = match data_dir::ensure_single_data_dir(cli_d) {
         Ok(d) => d,
         Err(e) => {
@@ -2650,34 +2657,11 @@ fn fetch_account_json(address: &str, cli_d: &[PathBuf]) -> Result<serde_json::Va
         return Err(());
     }
     let rt = build_runtime()?;
-    let url = format!(
-        "{}/v2/accounts/{}",
-        endpoint.0.trim_end_matches('/'),
-        address
-    );
-    rt.block_on(async {
-        let http = reqwest::Client::new();
-        let resp = http
-            .get(&url)
-            .header("X-Algo-API-Token", &endpoint.1)
-            .send()
-            .await
-            .map_err(|e| {
-                eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
-            })?;
-        let status = resp.status();
-        let bytes = resp.bytes().await.map_err(|e| {
-            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
-        })?;
-        if !status.is_success() {
-            // go's `HTTPError`: `HTTP <status>: <message>`
-            let text = crate::cmd::node::http_error_text(status, &String::from_utf8_lossy(&bytes));
-            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&text]));
-            return Err(());
-        }
-        serde_json::from_slice(&bytes).map_err(|e| {
-            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
-        })
+    get_account(&rt, &endpoint, address, include_creatables).map_err(|e| {
+        eprintln!(
+            "{}",
+            crate::formatting::report_error_text(&format_message(ERROR_REQUEST_FAIL, &[&e]))
+        );
     })
 }
 

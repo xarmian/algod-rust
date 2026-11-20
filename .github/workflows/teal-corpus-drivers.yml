@@ -36,6 +36,7 @@ on:
       - "crates/core/algo-avm/src/sourcemap.rs"
       - "scripts/teal-corpus/**"
       - "crates/tools/goal-rust/**"
+      - "tools/go-codec-json-oracle/**"
       - "crates/core/algo-codec/src/logicsig_go.rs"
       - "crates/core/algo-codec/tests/common/**"
       - "bin/kmd-rust/**"
@@ -66,6 +67,7 @@ on:
       - "crates/core/algo-avm/src/sourcemap.rs"
       - "scripts/teal-corpus/**"
       - "crates/tools/goal-rust/**"
+      - "tools/go-codec-json-oracle/**"
       - "crates/core/algo-codec/src/logicsig_go.rs"
       - "crates/core/algo-codec/tests/common/**"
       - "bin/kmd-rust/**"
@@ -287,3 +289,17 @@ jobs:
           # errorRequestFail against a mock algod; fixtures/goal_algod_reads.jsonl
           # is go's output (a stale one fails goal_algod_reads_fixture_matches_go_goal).
           GOTOOLCHAIN=go1.25.3 MIXED_CLUSTER=1 cargo test -p goal-rust --test goal_algod_reads_e2e -- --nocapture
+          # #2466: its rows also hold go's request errors (a refused or
+          # answer-less connection, a 401) and go-codec's decode of malformed
+          # JSON answers. The go-codec port itself is checked against go's own
+          # decode of a corpus: fixtures/go_codec_json_decode.jsonl must be
+          # exactly what tools/go-codec-json-oracle prints for it.
+          GO_ALGORAND="$(dirname "$GITHUB_WORKSPACE")/go-algorand"
+          mkdir -p "$GO_ALGORAND/cmd/go-codec-json-oracle"
+          cp tools/go-codec-json-oracle/main.go "$GO_ALGORAND/cmd/go-codec-json-oracle/"
+          (cd "$GO_ALGORAND" && GOTOOLCHAIN=go1.25.3 go build -o "$RUNNER_TEMP/go-codec-json-oracle" ./cmd/go-codec-json-oracle)
+          "$RUNNER_TEMP/go-codec-json-oracle" \
+            < crates/tools/goal-rust/tests/fixtures/go_codec_json_decode.jsonl \
+            > "$RUNNER_TEMP/go_codec_json_decode.jsonl"
+          cmp "$RUNNER_TEMP/go_codec_json_decode.jsonl" crates/tools/goal-rust/tests/fixtures/go_codec_json_decode.jsonl
+          cargo test -p goal-rust --test go_codec_json_parity

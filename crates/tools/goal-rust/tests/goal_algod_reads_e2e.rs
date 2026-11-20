@@ -29,7 +29,14 @@
 //!   the one wallet `ensureWalletHandle` picks, with their status, balance,
 //!   multisig threshold, created assets/apps and opted-in apps, and `--info`;
 //! - go's `errorRequestFail` (`Error processing command: %s`) for a failing
-//!   `/v2/accounts` request (`account balance` / `rewards` / `info`).
+//!   `/v2/accounts` request (`account balance` / `rewards` / `info`);
+//! - go's request errors (`restClient.submitForm`, issue #2466) for every
+//!   command above plus `node status` and `ledger supply`: a refused
+//!   connection (`Get "<url>": dial tcp <addr>: connect: connection
+//!   refused`, `algod.net` naming a closed port), an answer-less close
+//!   (`Get "<url>": EOF`), a 401 (`Unauthorized request to ...`), and
+//!   go-codec's decode of malformed JSON answers (`json decode error [pos
+//!   N]: ...`, or what go-codec accepts that JSON does not).
 //!
 //! `fixtures/goal_algod_reads.jsonl` holds what go v5.0.5-stable's `goal`
 //! printed (exit code, stdout, stderr, the data dir masked; a stdout longer
@@ -404,16 +411,47 @@ fn versions_body(v: Versions) -> (u16, String) {
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        401 => "Unauthorized",
         404 => "Not Found",
         500 => "Internal Server Error",
         _ => "Unknown",
     }
 }
 
+/// A canned answer replacing `route`'s for the request paths starting with
+/// `prefix` (`""`: every path).
+#[derive(Clone)]
+struct Answer {
+    prefix: &'static str,
+    status: u16,
+    body: Vec<u8>,
+}
+
+/// The mock algod of a row.
+#[derive(Clone)]
+struct Mock {
+    versions: Versions,
+    answers: Vec<Answer>,
+}
+
+const STATUS_JSON: &str = r#"{"catchup-time":0,"last-round":5,"last-version":"future","next-version":"future","next-version-round":6,"next-version-supported":true,"stopped-at-unsupported-round":false,"time-since-last-round":1500000000}"#;
+
+const SUPPLY_JSON: &str = r#"{"current_round":5,"online-money":1000000,"total-money":3000042}"#;
+
 /// `(status, content type, body)` for a request path.
-fn route(path: &str, versions: Versions) -> (u16, &'static str, Vec<u8>) {
+fn route(path: &str, mock: &Mock) -> (u16, &'static str, Vec<u8>) {
     let path = path.split('?').next().unwrap_or("");
     let json = "application/json";
+    if let Some(a) = mock.answers.iter().find(|a| path.starts_with(a.prefix)) {
+        return (a.status, json, a.body.clone());
+    }
+    let versions = mock.versions;
+    if path == "/v2/status" {
+        return (200, json, STATUS_JSON.as_bytes().to_vec());
+    }
+    if path == "/v2/ledger/supply" {
+        return (200, json, SUPPLY_JSON.as_bytes().to_vec());
+    }
     if path == "/versions" {
         let (code, body) = versions_body(versions);
         return (code, json, body.into_bytes());
@@ -438,14 +476,14 @@ fn route(path: &str, versions: Versions) -> (u16, &'static str, Vec<u8>) {
 }
 
 /// Serve `route` on a fresh port until the test process exits.
-fn spawn_mock(versions: Versions) -> u16 {
+fn spawn_mock(mock: Mock) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
-    let versions = Arc::new(versions);
+    let mock = Arc::new(mock);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
-            let versions = versions.clone();
+            let mock = mock.clone();
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(stream.try_clone().expect("clone"));
                 let mut first = String::new();
@@ -465,7 +503,11 @@ fn spawn_mock(versions: Versions) -> u16 {
                 let mut body = vec![0u8; len];
                 let _ = reader.read_exact(&mut body);
                 let path = first.split_whitespace().nth(1).unwrap_or("/");
-                let (code, ctype, body) = route(path, *versions);
+                let (code, ctype, body) = route(path, &mock);
+                if code == 0 {
+                    // close the connection without an answer
+                    return;
+                }
                 let head = format!(
                     "HTTP/1.1 {code} {}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     reason(code),
@@ -482,19 +524,281 @@ fn spawn_mock(versions: Versions) -> u16 {
 // ---- the rows -----------------------------------------------------------------
 
 struct Case {
-    name: &'static str,
+    name: String,
     args: Vec<String>,
     versions: Versions,
     accounts: bool,
+    answers: Vec<Answer>,
+    /// `algod.net` names a closed port instead of the mock.
+    refused: bool,
 }
 
-fn case(name: &'static str, args: &[&str]) -> Case {
+fn case(name: &str, args: &[&str]) -> Case {
     Case {
-        name,
+        name: name.to_string(),
         args: args.iter().map(|a| a.to_string()).collect(),
         versions: Versions::Full,
         accounts: false,
+        answers: Vec::new(),
+        refused: false,
     }
+}
+
+/// The address `algod.net` names in the `refused` rows: nothing listens on
+/// port 1, so go's dial fails with `connection refused`.
+const CLOSED_ALGOD: &str = "127.0.0.1:1";
+
+/// The commands of go's `goal` that read from algod, each as
+/// `(name, args, the account rows' setup)`.
+fn algod_readers() -> Vec<(&'static str, Vec<&'static str>, bool)> {
+    vec![
+        ("version", vec!["version"], false),
+        ("version -v", vec!["version", "-v"], false),
+        ("node status", vec!["node", "status"], false),
+        ("ledger block", vec!["ledger", "block", "1"], false),
+        ("ledger supply", vec!["ledger", "supply"], false),
+        (
+            "account balance",
+            vec!["account", "balance", "-a", "<A1>"],
+            false,
+        ),
+        (
+            "account rewards",
+            vec!["account", "rewards", "-a", "<A1>"],
+            false,
+        ),
+        ("account info", vec!["account", "info", "-a", "<A1>"], false),
+        (
+            "account list --info",
+            vec!["account", "list", "--info"],
+            true,
+        ),
+    ]
+}
+
+/// What a malformed algod answer does to go's go-codec JSON decode
+/// (`protocol.NewJSONDecoder`, `restClient.submitForm`): `(row name, path
+/// prefix, body, args)`.
+fn malformed() -> Vec<(
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+)> {
+    const BAL: &[&str] = &["account", "balance", "-a", "<A1>"];
+    const INFO: &[&str] = &["account", "info", "-a", "<A1>"];
+    const VER: &[&str] = &["version", "-v"];
+    const STATUS: &[&str] = &["node", "status"];
+    const SUPPLY: &[&str] = &["ledger", "supply"];
+    let acct = "/v2/accounts/";
+    vec![
+        ("unknown field", acct, r#"{"amount":5,"foo":1}"#, BAL),
+        (
+            "unknown nested field",
+            acct,
+            r#"{"amount":5,"created-assets":[{"index":1,"params":{"total":1,"bar":2}}]}"#,
+            INFO,
+        ),
+        ("string for a number", acct, r#"{"amount":"abc"}"#, BAL),
+        ("quoted number", acct, r#"{"amount":"42"}"#, BAL),
+        ("negative number", acct, r#"{"amount":-1}"#, BAL),
+        ("fraction", acct, r#"{"amount":1.5}"#, BAL),
+        ("float integer", acct, r#"{"amount":1e3}"#, BAL),
+        ("overflow", acct, r#"{"amount":18446744073709551616}"#, BAL),
+        ("bad exponent", acct, r#"{"amount":1e}"#, BAL),
+        ("word for a number", acct, r#"{"amount":abc}"#, BAL),
+        ("truncated", acct, r#"{"amount":5"#, BAL),
+        ("truncated after colon", acct, r#"{"amount":"#, BAL),
+        ("truncated string", acct, r#"{"address":"abc"#, BAL),
+        ("missing comma", acct, r#"{"amount":5 "rewards":1}"#, BAL),
+        ("missing colon", acct, r#"{"amount" 5}"#, BAL),
+        ("empty body", acct, "", BAL),
+        ("not json", acct, "<html>", BAL),
+        ("array", acct, "[]", BAL),
+        ("array of values", acct, "[1,2]", BAL),
+        ("null", acct, "null", BAL),
+        ("bad literal", acct, r#"{"amount":nul}"#, BAL),
+        ("bad true", acct, r#"{"incentive-eligible":tru}"#, BAL),
+        (
+            "bool for a string",
+            acct,
+            r#"{"address":true,"amount":3}"#,
+            BAL,
+        ),
+        ("object for a string", acct, r#"{"status":{}}"#, BAL),
+        (
+            "string for a bool",
+            acct,
+            r#"{"incentive-eligible":"x"}"#,
+            BAL,
+        ),
+        ("bad escape", acct, r#"{"address":"\x"}"#, BAL),
+        ("short unicode escape", acct, r#"{"address":"\u12"}"#, BAL),
+        ("number key", acct, r#"{1:2}"#, BAL),
+        ("trailing garbage", acct, r#"{"amount":7}xyz"#, BAL),
+        (
+            "nested null",
+            acct,
+            r#"{"amount":8,"created-assets":null,"participation":null}"#,
+            BAL,
+        ),
+        (
+            "string for an array",
+            acct,
+            r#"{"created-assets":"x"}"#,
+            BAL,
+        ),
+        ("number for a struct", acct, r#"{"participation":5}"#, BAL),
+        (
+            "bad base64",
+            acct,
+            r#"{"created-apps":[{"id":1,"params":{"approval-program":"!!"}}]}"#,
+            INFO,
+        ),
+        (
+            "map for an array",
+            acct,
+            r#"{"created-assets":{"a":1}}"#,
+            BAL,
+        ),
+        (
+            "bad array separator",
+            acct,
+            r#"{"created-assets":[{"index":1};{}]}"#,
+            BAL,
+        ),
+        ("unclosed object", acct, r#"{"amount":2,"#, BAL),
+        ("bad versions", "/versions", r#"{"versions":"v1"}"#, VER),
+        (
+            "bad genesis hash",
+            "/versions",
+            r#"{"genesis_hash_b64":"???"}"#,
+            VER,
+        ),
+        (
+            "unknown versions field",
+            "/versions",
+            r#"{"versions":[],"x":1}"#,
+            VER,
+        ),
+        ("bad build", "/versions", r#"{"build":{"major":"x"}}"#, VER),
+        ("bad status", "/v2/status", r#"{"last-round":"x"}"#, STATUS),
+        (
+            "negative catchup time",
+            "/v2/status",
+            r#"{"last-round":3,"catchup-time":-5}"#,
+            STATUS,
+        ),
+        (
+            "fractional time",
+            "/v2/status",
+            r#"{"time-since-last-round":1.5}"#,
+            STATUS,
+        ),
+        (
+            "unknown status field",
+            "/v2/status",
+            r#"{"last-round":3,"y":true}"#,
+            STATUS,
+        ),
+        (
+            "bad supply",
+            "/v2/ledger/supply",
+            r#"{"total-money":true}"#,
+            SUPPLY,
+        ),
+        (
+            "unknown supply field",
+            "/v2/ledger/supply",
+            r#"{"current_round":1,"z":0}"#,
+            SUPPLY,
+        ),
+    ]
+}
+
+/// The rows of go's request errors (issue #2466): a refused connection and
+/// a 401 for each reader, then the malformed answers.
+fn request_error_cases() -> Vec<Case> {
+    let mut v = Vec::new();
+    for (name, args, accounts) in algod_readers() {
+        let mut c = case(name, &args);
+        c.name = format!("{name} refused");
+        c.accounts = accounts;
+        c.refused = true;
+        v.push(c);
+        let mut c = case(name, &args);
+        c.name = format!("{name} 401");
+        c.accounts = accounts;
+        c.answers = vec![Answer {
+            prefix: "",
+            status: 401,
+            body: br#"{"message":"Invalid API Token"}"#.to_vec(),
+        }];
+        v.push(c);
+    }
+    for (name, args) in [
+        (
+            "account balance closed",
+            &["account", "balance", "-a", "<A1>"][..],
+        ),
+        ("version closed", &["version"]),
+        ("node status closed", &["node", "status"]),
+    ] {
+        let mut c = case(name, args);
+        c.answers = vec![Answer {
+            prefix: "",
+            status: 0,
+            body: Vec::new(),
+        }];
+        v.push(c);
+    }
+    let mut c = case(
+        "account balance 401 raw body",
+        &["account", "balance", "-a", "<A1>"],
+    );
+    c.answers = vec![Answer {
+        prefix: "",
+        status: 401,
+        body: b"no\ttoken\n".to_vec(),
+    }];
+    v.push(c);
+    for (name, args) in [
+        ("node status", &["node", "status"][..]),
+        ("ledger supply", &["ledger", "supply"]),
+    ] {
+        v.push(case(name, args));
+    }
+    for (name, prefix, body, args) in malformed() {
+        let mut c = case(name, args);
+        c.name = format!("malformed: {name}");
+        c.answers = vec![Answer {
+            prefix,
+            status: 200,
+            body: body.as_bytes().to_vec(),
+        }];
+        v.push(c);
+    }
+    // `account list --info` keeps what go decoded before the error
+    for (name, body) in [
+        (
+            "malformed: list --info unknown field",
+            r#"{"amount":5,"foo":1}"#,
+        ),
+        (
+            "malformed: list --info truncated",
+            r#"{"amount":6,"status":"Online""#,
+        ),
+    ] {
+        let mut c = case(name, &["account", "list", "--info", "-w", "b"]);
+        c.accounts = true;
+        c.answers = vec![Answer {
+            prefix: "/v2/accounts/",
+            status: 200,
+            body: body.as_bytes().to_vec(),
+        }];
+        v.push(c);
+    }
+    v
 }
 
 fn cases() -> Vec<Case> {
@@ -617,6 +921,7 @@ fn cases() -> Vec<Case> {
         c.accounts = true;
         v.push(c);
     }
+    v.extend(request_error_cases());
     v
 }
 
@@ -735,9 +1040,17 @@ fn stop_kmd(dd: &Path) {
 fn row(goal: &Path, c: &Case) -> serde_json::Value {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dd = tmp.path().canonicalize().unwrap();
-    let port = spawn_mock(c.versions);
+    let port = spawn_mock(Mock {
+        versions: c.versions,
+        answers: c.answers.clone(),
+    });
     std::fs::write(dd.join("genesis.json"), GENESIS).unwrap();
-    std::fs::write(dd.join("algod.net"), format!("127.0.0.1:{port}\n")).unwrap();
+    let net = if c.refused {
+        CLOSED_ALGOD.to_string()
+    } else {
+        format!("127.0.0.1:{port}")
+    };
+    std::fs::write(dd.join("algod.net"), format!("{net}\n")).unwrap();
     std::fs::write(dd.join("algod.token"), "a".repeat(64)).unwrap();
     // The genesis directory algod creates, where goal keeps its accounts list.
     std::fs::create_dir(dd.join("testnet-v1")).unwrap();
