@@ -6648,6 +6648,65 @@ err
         }
     }
 
+    /// Issue #2470: every request-validation failure of `POST
+    /// /v2/transactions/simulate` answers with go v5.0.5-stable's exact HTTP
+    /// status and body. The expected responses come from go's own
+    /// `Handlers.SimulateTransaction` over a real simulator
+    /// (`tools/simulate-request-text-oracle`, re-checked in CI by
+    /// `simulate-rewards-oracle.yml`); here the same request bytes go through
+    /// the full REST router onto the real adapter and simulator.
+    #[tokio::test]
+    async fn simulate_request_validation_responses_match_go() {
+        use tower::ServiceExt;
+
+        const FIXTURE: &str = include_str!(
+            "../../../crates/node/algo-rest-api/tests/fixtures/simulate_request_texts.jsonl"
+        );
+        let router = algo_rest_api::router::build_router(
+            Arc::new(make_adapter()),
+            algo_rest_api::router::TokenConfig {
+                api_token: "t".repeat(64),
+                admin_token: "a".repeat(64),
+                enable_experimental_api: false,
+                disable_api_auth: true,
+                enable_private_network_access_header: false,
+            },
+        );
+        let mut cases = 0;
+        for line in FIXTURE.lines().filter(|l| !l.trim().is_empty()) {
+            let case: serde_json::Value = serde_json::from_str(line).expect("fixture line");
+            let name = case["name"].as_str().expect("name");
+            let mut body = hex::decode(case["body_hex"].as_str().expect("body_hex")).expect("hex");
+            if let Some(pad_to) = case["pad_to"].as_u64() {
+                body.resize(pad_to as usize, b' ');
+            }
+            let uri = match case["format"].as_str().unwrap_or_default() {
+                "" => "/v2/transactions/simulate".to_string(),
+                f => format!("/v2/transactions/simulate?format={f}"),
+            };
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .body(axum::body::Body::from(body))
+                .expect("request");
+            let response = router.clone().oneshot(request).await.expect("response");
+            let status = response.status().as_u16();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            assert_eq!(
+                (status, String::from_utf8_lossy(&bytes).into_owned()),
+                (
+                    case["status"].as_u64().expect("status") as u16,
+                    case["response"].as_str().expect("response").to_string()
+                ),
+                "{name}"
+            );
+            cases += 1;
+        }
+        assert!(cases >= 19, "fixture has {cases} cases");
+    }
+
     /// Build a simulate request with one dummy transaction and an
     /// exec-trace config asking for the basic trace.
     fn trace_simulate_request() -> SimulateRequest {
