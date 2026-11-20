@@ -21,7 +21,9 @@ name: Simulate rewards oracle drift check
 #
 # Issue #2470: it also re-runs tools/simulate-request-text-oracle (a test
 # file staged into daemon/algod/api/server/v2/test) and diffs
-# crates/node/algo-rest-api/tests/fixtures/simulate_request_texts.jsonl.
+# crates/node/algo-rest-api/tests/fixtures/simulate_request_texts.jsonl;
+# issue #2477 adds the generated go-codec schema of the request,
+# crates/node/algo-rest-api/src/simulate_request_schema.rs, to the diff.
 #
 # Building go-algorand's ledger requires cgo + the vendored libsodium fork
 # (see CLAUDE.md's CI Workflows section) -- `make libsodium` below.
@@ -31,6 +33,7 @@ on:
     paths:
       - "tools/simulate-request-text-oracle/**"
       - "crates/node/algo-rest-api/tests/fixtures/simulate_request_texts.jsonl"
+      - "crates/node/algo-rest-api/src/simulate_request_schema.rs"
       - "tools/simulate-rewards-oracle/**"
       - "crates/core/algo-ledger/tests/fixtures/simulate_rewards/**"
       - "crates/core/algo-ledger/tests/fixtures/simulate_checkdup/**"
@@ -43,6 +46,7 @@ on:
     paths:
       - "tools/simulate-request-text-oracle/**"
       - "crates/node/algo-rest-api/tests/fixtures/simulate_request_texts.jsonl"
+      - "crates/node/algo-rest-api/src/simulate_request_schema.rs"
       - "tools/simulate-rewards-oracle/**"
       - "crates/core/algo-ledger/tests/fixtures/simulate_rewards/**"
       - "crates/core/algo-ledger/tests/fixtures/simulate_checkdup/**"
@@ -129,9 +133,11 @@ jobs:
           STAGED="$GO_ALGORAND/daemon/algod/api/server/v2/test/zz_algod_rust_simulate_request_text_oracle_test.go"
           cp tools/simulate-request-text-oracle/oracle_test.go "$STAGED"
           (cd "$GO_ALGORAND" && ORACLE_OUT="$GITHUB_WORKSPACE/crates/node/algo-rest-api/tests/fixtures/simulate_request_texts.jsonl" \
-            go test -count=1 -run '^TestAlgodRustSimulateRequestTextOracle$' ./daemon/algod/api/server/v2/test/)
+            SCHEMA_OUT="$GITHUB_WORKSPACE/crates/node/algo-rest-api/src/simulate_request_schema.rs" \
+            go test -count=1 -run '^TestAlgodRustSimulateRequest(TextOracle|Schema)$' ./daemon/algod/api/server/v2/test/)
           rm -f "$STAGED"
-          git diff --exit-code -- crates/node/algo-rest-api/tests/fixtures/simulate_request_texts.jsonl || {
-            echo "::error::simulate_request_texts.jsonl is stale -- regenerate via tools/simulate-request-text-oracle/run-in-docker.sh against the pinned go-algorand checkout and commit the result"
+          git diff --exit-code -- crates/node/algo-rest-api/tests/fixtures/simulate_request_texts.jsonl \
+            crates/node/algo-rest-api/src/simulate_request_schema.rs || {
+            echo "::error::simulate_request_texts.jsonl or simulate_request_schema.rs is stale -- regenerate via tools/simulate-request-text-oracle/run-in-docker.sh against the pinned go-algorand checkout and commit the result"
             exit 1
           }

@@ -3312,31 +3312,49 @@ pub async fn simulate_transaction<N: NodeInterface>(
     // survive (`serde_json::Value` cannot hold a `bin`; issue #1968): the
     // request carries `null` placeholders and each transaction's own msgpack
     // bytes travel alongside in `raw_txns`.
-    use crate::simulate_strict::{parse_msgpack_request, MsgpackSimulate, GO_MSGPACK_REJECTION};
+    //
+    // Every body go's msgpack decode rejects is answered by its JSON decode of
+    // the same bytes, `failed to decode object: <go-codec's error>` with its
+    // byte position (issue #2477).
+    use crate::simulate_strict::{
+        go_json_decode, parse_json_request, parse_msgpack_request, request_from_go_value,
+        JsonSimulate, MsgpackSimulate, GO_MSGPACK_REJECTION,
+    };
     let (mut request, has_raw_txns, raw_txns) = match parse_msgpack_request(&body) {
         MsgpackSimulate::Decoded(d) => (d.request, true, d.raw_txns),
-        MsgpackSimulate::Rejected => return error::bad_request(GO_MSGPACK_REJECTION),
-        // JSON: go's own JSON form (base64 bytes, address strings) goes
-        // through the same pipeline as msgpack (issue #1972); anything else
-        // keeps the older serde-form handling.
-        MsgpackSimulate::NotMsgpack => match crate::simulate_strict::parse_json_request(&body) {
-            crate::simulate_strict::JsonSimulate::Decoded(d) => (d.request, true, d.raw_txns),
-            // go's strict JSON decode names the first unknown key and its offset
-            // (issue #1971).
-            crate::simulate_strict::JsonSimulate::UnknownField(u) => {
-                return error::bad_request(u.message());
+        MsgpackSimulate::Rejected => {
+            return match go_json_decode(&body) {
+                Err(text) => error::bad_request_bytes(&text),
+                Ok(_) => error::bad_request(GO_MSGPACK_REJECTION),
+            };
+        }
+        MsgpackSimulate::NotMsgpack => {
+            let value = match go_json_decode(&body) {
+                Ok(value) => value,
+                Err(text) => return error::bad_request_bytes(&text),
+            };
+            // go's own JSON form (base64 bytes, address strings) goes through
+            // the same pipeline as msgpack (issue #1972); the rest of what
+            // go-codec accepts goes through it as the msgpack go would
+            // encode from the decoded value.
+            match parse_json_request(&body) {
+                JsonSimulate::Decoded(d) => (d.request, true, d.raw_txns),
+                // go's strict JSON decode names the first unknown key and its
+                // offset (issue #1971).
+                JsonSimulate::UnknownField(u) => return error::bad_request(u.message()),
+                JsonSimulate::NotGoForm => match request_from_go_value(&value) {
+                    Some(d) => (d.request, true, d.raw_txns),
+                    None => match serde_json::from_slice::<models::SimulateRequest>(&body) {
+                        Ok(req) => (req, false, Vec::new()),
+                        Err(e) => {
+                            return error::bad_request(format!(
+                                "could not decode simulate request: {e}"
+                            ));
+                        }
+                    },
+                },
             }
-            crate::simulate_strict::JsonSimulate::NotGoForm => {
-                match serde_json::from_slice::<models::SimulateRequest>(&body) {
-                    Ok(req) => (req, false, Vec::new()),
-                    Err(e) => {
-                        return error::bad_request(format!(
-                            "could not decode simulate request: {e}"
-                        ));
-                    }
-                }
-            }
-        },
+        }
     };
 
     // Decode each transaction to SignedTransaction. A msgpack body, and a JSON
@@ -3349,8 +3367,7 @@ pub async fn simulate_transaction<N: NodeInterface>(
         for (j, txn_val) in group.txns.iter().enumerate() {
             let decode_result = if has_raw_txns {
                 match raw_txns.get(i).and_then(|g| g.get(j)) {
-                    Some(bytes) => rmp_serde::from_slice::<algo_types::SignedTransaction>(bytes)
-                        .map_err(|e| e.to_string()),
+                    Some(bytes) => crate::simulate_strict::decode_signed_txn(bytes),
                     None => Err("transaction bytes missing".to_string()),
                 }
             } else {
