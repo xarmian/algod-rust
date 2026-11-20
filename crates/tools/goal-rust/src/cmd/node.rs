@@ -83,9 +83,8 @@ const INFO_NODE_WROTE_TOKEN: &str = "Successfully wrote new API token: {}";
 /// variant but Go's source rotates the public token. We mirror Go.
 const ALGOD_TOKEN_ROTATE_FILE: &str = "algod.token";
 
-/// Top-level entry point invoked from `groups::node::run`. Maps
-/// resolved data dirs onto algod connections and prints status for
-/// each, mirroring Go's `datadir.OnDataDirs(getStatus)`.
+/// Top-level entry point invoked from `groups::node::run`: go's
+/// `datadir.OnDataDirs(getStatus)`.
 pub fn run_status(args: StatusArgs, cli_d: Vec<PathBuf>) -> ExitCode {
     let dirs = match crate::data_dir::resolve_data_dirs(&cli_d) {
         Ok(dirs) => dirs,
@@ -94,35 +93,13 @@ pub fn run_status(args: StatusArgs, cli_d: Vec<PathBuf>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("tokio runtime: {e}");
-            return ExitCode::from(1);
-        }
-    };
-
-    let multi = dirs.len() > 1;
-    let mut exit = ExitCode::SUCCESS;
-    for dir in &dirs {
-        if multi {
-            // Mirrors `cmd/util/datadir/messages.go:infoDataDir`.
-            println!("[Data Directory: {}]", dir.display());
-        }
-        if let Err(()) = get_status(&runtime, dir, args.watch) {
-            exit = ExitCode::from(1);
-        }
-    }
-    exit
+    run_status_of(&dirs, args.watch)
 }
 
-/// go's `datadir.OnDataDirs(getStatus)` without `--watch`, as `goal report`
-/// runs it: `getStatus` exits at the first failure (`reportErrorf`).
-pub(crate) fn run_status_of(dirs: &[PathBuf]) -> ExitCode {
+/// go's `datadir.OnDataDirs(getStatus)`, as `goal node status` and `goal
+/// report` run it: `getStatus` exits at the first failure (`reportErrorf`),
+/// so the data dirs after a failing one are not visited.
+pub(crate) fn run_status_of(dirs: &[PathBuf], watch_ms: u64) -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -136,9 +113,10 @@ pub(crate) fn run_status_of(dirs: &[PathBuf]) -> ExitCode {
     let multi = dirs.len() > 1;
     for dir in dirs {
         if multi {
+            // Mirrors `cmd/util/datadir/messages.go:infoDataDir`.
             println!("[Data Directory: {}]", dir.display());
         }
-        if get_status(&runtime, dir, 0).is_err() {
+        if get_status(&runtime, dir, watch_ms).is_err() {
             return ExitCode::from(1);
         }
     }

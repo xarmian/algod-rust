@@ -178,7 +178,7 @@ pub fn run_report(cli_d: Vec<PathBuf>) -> ExitCode {
         }
     }
     println!();
-    super::node::run_status_of(&dirs)
+    super::node::run_status_of(&dirs, 0)
 }
 
 #[cfg(test)]

@@ -693,9 +693,14 @@ fn de_struct<T: Default>(r: &mut Rd<'_>, z: &mut T, ctx: &[String], fields: &[Fi
                 match fields.iter().find(|(codec, _, _)| codec.as_bytes() == key) {
                     Some((_, go, de)) => de(r, z, &with(ctx, &[go]))?,
                     None => {
+                        // go's `ErrNoField(string(field))` keeps the key's
+                        // bytes; its only sink, `reportErrorf`'s
+                        // `unicodePrintable`, reads each invalid byte as one
+                        // `utf8.RuneError` (not `from_utf8_lossy`'s one per
+                        // truncated sequence).
                         let e = MErr::Plain(format!(
                             "Unknown field: {}",
-                            String::from_utf8_lossy(&key)
+                            algo_types::raw_text::go_lossy(&key)
                         ));
                         return Err(wrap(e, ctx));
                     }
@@ -1408,6 +1413,10 @@ mod tests {
             "Unknown field: foo"
         );
         assert_eq!(
+            err(&[0x81, 0xa3, 0xf0, 0x9f, 0x98, 0x01]),
+            "Unknown field: \u{fffd}\u{fffd}\u{fffd}"
+        );
+        assert_eq!(
             err(&[0x91, 0xa1, b'x']),
             "msgp: attempted to decode type \"str\" with method for \"uint\" at struct-from-array/Status"
         );
@@ -1424,5 +1433,196 @@ mod tests {
         );
         let mp = dump(&a, &[0x80], true).unwrap();
         assert_eq!(&mp[..7], &[0x81, 0xa4, b'a', b'd', b'd', b'r', 0xc4]);
+    }
+
+    /// go's msgp-generated `(*BalanceRecord).UnmarshalMsg`, map form: `Addr`
+    /// and the fields of the embedded `AccountData` in one map. Returns the
+    /// record and how many bytes are left over.
+    fn unmarshal_balance_record(b: &[u8]) -> R<([u8; 32], AccountData, usize)> {
+        let mut r = Rd(b);
+        let mut addr = [0u8; 32];
+        let mut ad = AccountData::default();
+        let (n, _) = r.map_header()?;
+        for _ in 0..n {
+            let key = r.map_key()?;
+            if key == b"addr" {
+                method_exact(&mut r, &mut addr, &["Addr".to_string()])?;
+                continue;
+            }
+            let (_, go, de) = ACCOUNT_DATA
+                .iter()
+                .find(|(codec, _, _)| codec.as_bytes() == key)
+                .ok_or_else(|| {
+                    MErr::Plain(format!(
+                        "Unknown field: {}",
+                        algo_types::raw_text::go_lossy(&key)
+                    ))
+                })?;
+            de(&mut r, &mut ad, &[go.to_string()])?;
+        }
+        Ok((addr, ad, r.0.len()))
+    }
+
+    /// `MarshalMsg` of a `BalanceRecord`.
+    fn marshal(addr: &[u8; 32], ad: &AccountData) -> Vec<u8> {
+        let mut out = Vec::new();
+        to_msgpack(&mut out, &balance_record(addr, ad));
+        out
+    }
+
+    /// `MarshalMsg` → `UnmarshalMsg` (nothing left over) → `MarshalMsg`
+    /// gives the same bytes.
+    fn round_trip(addr: &[u8; 32], ad: &AccountData) {
+        let bts = marshal(addr, ad);
+        let (a2, ad2, left) = unmarshal_balance_record(&bts)
+            .unwrap_or_else(|e| panic!("UnmarshalMsg of {}: {e}", hex::encode(&bts)));
+        assert_eq!(left, 0, "bytes left over after UnmarshalMsg()");
+        assert_eq!(&a2, addr);
+        assert_eq!(marshal(&a2, &ad2), bts);
+        // the JSON `goal account dump` prints of it, too
+        assert_eq!(
+            dump(addr, &bts, false).ok(),
+            Some(encode_protocol_json(&to_json(&balance_record(addr, ad))))
+        );
+    }
+
+    /// go: `data/basics/msgp_gen_test.go` `TestMarshalUnmarshalBalanceRecord`.
+    #[test]
+    fn marshal_unmarshal_balance_record() {
+        let zero = [0u8; 32];
+        assert_eq!(marshal(&zero, &AccountData::default()), [0x80]);
+        round_trip(&zero, &AccountData::default());
+    }
+
+    /// A small xorshift, so the randomized records are reproducible.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        /// Zero half of the time (an omitted field), else a value below `n`.
+        fn below(&mut self, n: u64) -> u64 {
+            if self.next() % 2 == 0 {
+                0
+            } else {
+                self.next() % n
+            }
+        }
+        fn bytes(&mut self, max: u64) -> Vec<u8> {
+            let n = self.below(max + 1);
+            (0..n).map(|_| self.next() as u8).collect()
+        }
+        fn fill(&mut self, b: &mut [u8]) {
+            if self.next() % 2 == 1 {
+                b.iter_mut().for_each(|x| *x = self.next() as u8);
+            }
+        }
+        fn schema(&mut self) -> StateSchema {
+            StateSchema {
+                num_uint: self.below(u64::MAX),
+                num_byte_slice: self.below(100),
+            }
+        }
+        fn key_value(&mut self) -> TealKeyValue {
+            (0..self.below(4))
+                .map(|_| {
+                    let v = TealValue {
+                        typ: self.below(3),
+                        bytes: self.bytes(16),
+                        uint: self.below(u64::MAX),
+                    };
+                    (self.bytes(8), v)
+                })
+                .collect()
+        }
+    }
+
+    fn random_account_data(g: &mut Rng) -> AccountData {
+        let mut ad = AccountData {
+            status: g.below(3),
+            micro_algos: g.below(u64::MAX),
+            rewards_base: g.below(u64::MAX),
+            rewarded_micro_algos: g.below(u64::MAX),
+            vote_first_valid: g.below(u64::MAX),
+            vote_last_valid: g.below(u64::MAX),
+            vote_key_dilution: g.below(u64::MAX),
+            last_proposed: g.below(u64::MAX),
+            last_heartbeat: g.below(u64::MAX),
+            incentive_eligible: g.next() % 2 == 1,
+            total_app_schema: g.schema(),
+            total_extra_app_pages: g.below(4),
+            total_boxes: g.below(u64::MAX),
+            total_box_bytes: g.below(u64::MAX),
+            ..AccountData::default()
+        };
+        g.fill(&mut ad.vote_id);
+        g.fill(&mut ad.selection_id);
+        g.fill(&mut ad.state_proof_id);
+        g.fill(&mut ad.auth_addr);
+        for _ in 0..g.below(3) {
+            let mut p = AssetParams {
+                total: g.below(u64::MAX),
+                decimals: g.below(20),
+                default_frozen: g.next() % 2 == 1,
+                unit_name: g.bytes(8),
+                asset_name: g.bytes(32),
+                url: g.bytes(96),
+                ..AssetParams::default()
+            };
+            g.fill(&mut p.metadata_hash);
+            g.fill(&mut p.manager);
+            g.fill(&mut p.reserve);
+            g.fill(&mut p.freeze);
+            g.fill(&mut p.clawback);
+            ad.asset_params.insert(g.next() % 1000, p);
+        }
+        for _ in 0..g.below(3) {
+            let h = AssetHolding {
+                amount: g.below(u64::MAX),
+                frozen: g.next() % 2 == 1,
+            };
+            ad.assets.insert(g.next() % 1000, h);
+        }
+        for _ in 0..g.below(3) {
+            let l = AppLocalState {
+                schema: g.schema(),
+                key_value: g.key_value(),
+            };
+            ad.app_local_states.insert(g.next() % 1000, l);
+        }
+        for _ in 0..g.below(3) {
+            let mut p = AppParams {
+                approval_program: g.bytes(64),
+                clear_state_program: g.bytes(64),
+                global_state: g.key_value(),
+                local_state_schema: g.schema(),
+                global_state_schema: g.schema(),
+                extra_program_pages: g.below(4),
+                version: g.below(u64::MAX),
+                foreign_box_reads: g.next() % 2 == 1,
+                family_box_access: g.next() % 2 == 1,
+                ..AppParams::default()
+            };
+            g.fill(&mut p.size_sponsor);
+            ad.app_params.insert(g.next() % 1000, p);
+        }
+        ad
+    }
+
+    /// go: `data/basics/msgp_gen_test.go` `TestRandomizedEncodingBalanceRecord`
+    /// (`protocol.RunEncodingTest`: 1000 random records, each round-tripped).
+    #[test]
+    fn randomized_encoding_balance_record() {
+        let mut g = Rng(0x2485_2485_2485_2485);
+        for _ in 0..1000 {
+            let mut addr = [0u8; 32];
+            g.fill(&mut addr);
+            let ad = random_account_data(&mut g);
+            round_trip(&addr, &ad);
+        }
     }
 }
