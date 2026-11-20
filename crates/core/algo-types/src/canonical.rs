@@ -652,8 +652,10 @@ fn transaction_map(
     m.add_raw_string("gen", genesis_id);
     m.add_bytes("gh", genesis_hash);
     m.add_bytes("grp", group);
+    // go's msgp writes `hb` whenever the pointer is set, even to an empty
+    // struct (`HeartbeatTxnFields == nil` is its only omit check)
     if let Some(ref hb) = tx.heartbeat {
-        m.add_map("hb", canonical_encode_heartbeat(hb));
+        m.add_map_always("hb", canonical_encode_heartbeat(hb));
     }
     m.add_u64("lv", tx.last_valid.0);
     m.add_bytes("lx", &tx.lease);

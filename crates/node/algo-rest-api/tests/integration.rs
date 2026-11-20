@@ -6984,14 +6984,11 @@ async fn raw_transaction_invalid_msgpack_returns_400() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 
+    // go-codec's own text (issue #2492, `raw_submit_texts.jsonl`)
     let json: serde_json::Value = resp.json().await.unwrap();
-    assert!(
-        json["message"]
-            .as_str()
-            .unwrap()
-            .contains("could not decode transaction"),
-        "error should mention decode failure, got: {}",
-        json["message"]
+    assert_eq!(
+        json["message"],
+        "msgpack decode error [pos 1]: only encoded map or array can be decoded into a struct"
     );
 }
 

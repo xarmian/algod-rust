@@ -468,6 +468,38 @@ func rawSubmitBodies() []rawSubmitCase {
 		add(fmt.Sprintf("lenient_%02d", i), b)
 	}
 
+	// ---- past msgp's allocbounds (go-codec has none)
+	many := func(k int, item []byte) []byte {
+		var items [][]byte
+		for i := 0; i < k; i++ {
+			items = append(items, item)
+		}
+		return cat([]byte{0xdc, byte(k >> 8), byte(k)}, cat(items...))
+	}
+	bin16 := func(b []byte) []byte { return cat([]byte{0xc5, byte(len(b) >> 8), byte(len(b))}, b) }
+	for i, b := range [][]byte{
+		stxnWith(nil, str("gen"), str(string(bytes.Repeat([]byte("g"), 100)))),
+		stxnWith(nil, str("apaa"), many(20, bin([]byte("a")))),
+		stxnWith(nil, str("apat"), many(10, bin(zeros(32)))),
+		stxnWith(nil, str("apas"), many(10, u(1))),
+		stxnWith(nil, str("apfa"), many(10, u(1))),
+		stxnWith(nil, str("apbx"), many(20, kv(str("i"), u(1)))),
+		stxnWith(nil, str("al"), many(30, kv(str("s"), u(1)))),
+		stxnWith(nil, str("note"), bin16(zeros(2000))),
+		stxnWith(nil, str("apap"), bin16(zeros(10000))),
+		stxnWith(nil, str("apar"), kv(str("an"), str(string(bytes.Repeat([]byte("n"), 200))))),
+		stxnWith(nil, str("apar"), kv(str("au"), str(string(bytes.Repeat([]byte("u"), 200))))),
+		stxnWith(nil, str("sp"), kv(str("pr"), many(1100, u(1)))),
+		stxnWith(nil, str("sp"), kv(str("S"), kv(str("pth"), many(40, bin([]byte("p")))))),
+		stxnWith([][]byte{str("msig"), kv(str("subsig"), many(300, kv()))}),
+		stxnWith([][]byte{str("lsig"), kv(str("l"), bin16(zeros(2000)))}),
+		stxnWith([][]byte{str("lsig"), kv(str("arg"), many(300, bin([]byte("x"))))}),
+		stxnWith([][]byte{str("pqsig"), kv(str("pk"), bin16(zeros(3000)))}),
+		stxnWith(nil, str("type"), str(string(bytes.Repeat([]byte("t"), 100)))),
+	} {
+		add(fmt.Sprintf("bounds_%02d", i), b)
+	}
+
 	// ---- huge declared lengths
 	for i, b := range [][]byte{
 		kv(str("sig"), []byte{0xc6, 0xff, 0xff, 0xff, 0xff}),

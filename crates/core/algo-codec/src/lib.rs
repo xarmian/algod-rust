@@ -21,6 +21,7 @@
 mod canonical;
 mod digest;
 pub mod go_codec_json;
+pub mod go_codec_msgpack;
 pub mod hash;
 mod json_escape;
 mod logicsig_go;
