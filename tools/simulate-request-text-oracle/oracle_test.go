@@ -325,6 +325,217 @@ func malformedSimulateBodies(msgpReq func(v2.PreEncodedSimulateRequest) []byte) 
 	} {
 		add(fmt.Sprintf("msgpack_malformed_%02d", i), b)
 	}
+	return append(cases, decodeEdgeBodies()...)
+}
+
+// decodeEdgeBodies are the go-codec decode edges of issue #2494: a struct
+// sent as a msgpack array (or a slice as a map) at every level, a nested
+// reserved 0xc1 byte, struct keys sent as bin, and string fields holding
+// bytes that are not UTF-8, in msgpack and in JSON. Bodies that decode
+// carry two groups (they stop at the simulator's group-count check); the
+// `one_` bodies carry one group and show what go makes of the decoded value.
+func decodeEdgeBodies() []simulateRequestTextCase {
+	var cases []simulateRequestTextCase
+	add := func(name string, body []byte) {
+		cases = append(cases, simulateRequestTextCase{Name: name, BodyHex: hex.EncodeToString(body), dropIfSimulated: true})
+	}
+	cat := func(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
+	str := func(s string) []byte {
+		if len(s) < 32 {
+			return cat([]byte{0xa0 | byte(len(s))}, []byte(s))
+		}
+		return cat([]byte{0xd9, byte(len(s))}, []byte(s))
+	}
+	bin := func(b []byte) []byte { return cat([]byte{0xc4, byte(len(b))}, b) }
+	mapN := func(n int) []byte { return []byte{0x80 | byte(n)} }
+	arrN := func(n int) []byte { return []byte{0x90 | byte(n)} }
+	arr := func(items ...[]byte) []byte { return cat(arrN(len(items)), cat(items...)) }
+	nilB := []byte{0xc0}
+	trueB := []byte{0xc3}
+	falseB := []byte{0xc2}
+	u := func(v uint64) []byte { return protocol.EncodeReflect(v) }
+
+	st := oracleSignedPay(1)
+	stx := protocol.EncodeReflect(st)
+	stx2 := protocol.EncodeReflect(oracleSignedPay(2))
+	txnMap := protocol.EncodeReflect(st.Txn)
+	sig := bin(st.Sig[:])
+	snd := bin(st.Txn.Sender[:])
+	grp := func(txns ...[]byte) []byte { return cat(mapN(1), str("txns"), arr(txns...)) }
+	req := func(groups ...[]byte) []byte { return cat(mapN(1), str("txn-groups"), arr(groups...)) }
+	two := func(g1 []byte) []byte { return req(g1, grp(stx2)) }
+	// one signed transaction from (key, value) pairs, keys in the given order
+	stxnOf := func(kv ...[]byte) []byte { return cat(mapN(len(kv)/2), cat(kv...)) }
+	txnWith := func(kv ...[]byte) []byte {
+		return stxnOf(str("sig"), sig, str("txn"), cat(mapN(len(kv)/2), cat(kv...)))
+	}
+	pay := func(kv ...[]byte) []byte {
+		base := [][]byte{str("type"), str("pay"), str("snd"), snd, str("fee"), u(1000), str("fv"), u(1), str("lv"), u(1000)}
+		return txnWith(append(base, kv...)...)
+	}
+	appl := func(kv ...[]byte) []byte {
+		base := [][]byte{str("type"), str("appl"), str("snd"), snd, str("fee"), u(1000), str("fv"), u(1), str("lv"), u(1000)}
+		return txnWith(append(base, kv...)...)
+	}
+	acfg := func(kv ...[]byte) []byte {
+		base := [][]byte{str("type"), str("acfg"), str("snd"), snd, str("fee"), u(1000), str("fv"), u(1), str("lv"), u(1000)}
+		return txnWith(append(base, kv...)...)
+	}
+	topWith := func(kv ...[]byte) []byte {
+		return cat(mapN(1+len(kv)/2), str("txn-groups"), arr(grp(stx), grp(stx2)), cat(kv...))
+	}
+
+	// a struct from an array, a slice from a map
+	for i, b := range [][]byte{
+		two(arr(arr(stx))),
+		two(arr(nilB)),
+		two(arr()),
+		two(arr(arr(stx), u(1))),
+		two(arr(arr(stx), nilB)),
+		two(arr(cat(mapN(1), stx, stx2))),
+		two(nilB),
+		req(nilB, grp(stx2)),
+		two(grp(arr(sig, nilB, nilB, nilB, txnMap))),
+		two(grp(arr(sig, nilB, nilB, nilB, txnMap, bin(make([]byte, 32))))),
+		two(grp(arr(sig, nilB, nilB, nilB, txnMap, nilB, nilB))),
+		two(grp(arr(sig))),
+		two(grp(arr())),
+		two(grp(arr(u(5)))),
+		two(grp(txnWith(str("type"), str("pay")), arr(sig, nilB, nilB, nilB, txnMap))),
+		two(grp(stxnOf(str("sig"), sig, str("txn"), arr(str("pay"), snd, u(1000), u(1), u(1000))))),
+		two(grp(stxnOf(str("sig"), sig, str("txn"), arr(str("pay"), u(5))))),
+		two(grp(stxnOf(str("sig"), sig, str("txn"), arr(str("pay"), snd, arr(u(1000)))))),
+		two(grp(stxnOf(str("txn"), txnMap, str("msig"), arr(u(1), u(1), arr(arr(bin(make([]byte, 32)))))))),
+		two(grp(stxnOf(str("txn"), txnMap, str("msig"), arr(u(1), u(1), arr(arr(bin(make([]byte, 32)), bin(make([]byte, 64)), u(1))))))),
+		two(grp(stxnOf(str("txn"), txnMap, str("lsig"), arr(bin([]byte{0x06, 0x81, 0x01}))))),
+		two(grp(stxnOf(str("txn"), txnMap, str("lsig"), arr(bin([]byte{0x06, 0x81, 0x01}), nilB, nilB, nilB, nilB, arr(bin([]byte("a"))))))),
+		two(grp(stxnOf(str("txn"), txnMap, str("pqsig"), arr(bin([]byte("ab")), u(1))))),
+		two(grp(appl(str("apbx"), arr(arr(u(0), bin([]byte("x"))))))),
+		two(grp(appl(str("apbx"), arr(arr(u(0), bin([]byte("x")), u(1)))))),
+		two(grp(appl(str("al"), arr(arr(nilB, u(1)), arr(nilB, nilB, nilB, arr(u(1), u(2))))))),
+		two(grp(appl(str("apls"), arr(u(1), u(2)), str("apgs"), arr(u(3))))),
+		two(grp(appl(str("apaa"), cat(mapN(1), bin([]byte("a")), bin([]byte("b")))))),
+		two(grp(appl(str("apas"), cat(mapN(1), u(1), u(2))))),
+		two(grp(acfg(str("apar"), arr(u(1000), u(0), falseB, str("U"), str("Asset"))))),
+		two(grp(acfg(str("apar"), arr(u(1000), u(0), falseB, str("U"), str("Asset"), nilB, nilB, nilB, nilB, nilB, nilB, nilB)))),
+		two(grp(txnWith(str("type"), str("hb"), str("hb"), arr(snd, arr(bin(make([]byte, 64))), nilB, nilB, u(5), trueB)))),
+		two(grp(txnWith(str("type"), str("stpf"), str("sp"), arr(bin([]byte("c")), u(1), arr(nilB, arr(u(1)), u(0))), str("spmsg"), arr(bin([]byte("b")))))),
+		two(grp(txnWith(str("type"), str("stpf"), str("sp"), cat(mapN(1), str("r"), cat(mapN(1), u(1), arr(arr(nilB, u(2)), arr(nilB, u(3)))))))),
+		cat(mapN(2), str("txn-groups"), arr(grp(stx), grp(stx2)), str("exec-trace-config"), arr(trueB)),
+		cat(mapN(2), str("txn-groups"), arr(grp(stx), grp(stx2)), str("exec-trace-config"), arr(trueB, trueB, trueB, trueB, trueB)),
+		cat(mapN(2), str("txn-groups"), arr(grp(stx)), str("exec-trace-config"), arr(trueB)),
+		cat(mapN(2), str("txn-groups"), arr(grp(stx)), str("exec-trace-config"), arr(falseB, trueB)),
+		arr(arr(arr(arr(stx)), arr(arr(stx2)))),
+		arr(arr(arr(arr(arr(sig, nilB, nilB, nilB, txnMap))), grp(stx2)), u(5)),
+		cat(mapN(1), str("txn-groups"), cat(mapN(1), grp(stx), grp(stx2))),
+		cat(mapN(1), str("txn-groups"), cat(mapN(1), arr(arr(stx)), arr(arr(stx2)))),
+		cat(mapN(1), str("txn-groups"), arr(cat(mapN(1), str("txns"), cat(mapN(1), stx, stx2)))),
+		cat(mapN(1), str("txn-groups"), cat(mapN(1), grp(stx), nilB)),
+		cat(mapN(1), str("txn-groups"), cat(mapN(1), nilB, grp(stx2))),
+		cat(mapN(1), bin([]byte("txn-groups")), arr(grp(stx), grp(stx2))),
+		cat(mapN(1), str("txn-groups"), arr(cat(mapN(1), bin([]byte("txns")), arr(stx)), grp(stx2))),
+		two(grp(cat(mapN(2), bin([]byte("sig")), sig, bin([]byte("txn")), txnMap))),
+		two(grp(txnWith(bin([]byte("type")), str("pay"), bin([]byte("fee")), u(5)))),
+		cat(mapN(1), u(1), arr(grp(stx), grp(stx2))),
+		cat(mapN(1), nilB, arr(grp(stx), grp(stx2))),
+		cat(mapN(1), arr(), arr(grp(stx), grp(stx2))),
+		cat(mapN(1), str(""), arr(grp(stx), grp(stx2))),
+		topWith(str("round"), arr()),
+		topWith(str("round"), cat(mapN(0))),
+		topWith(str("fix-signers"), arr()),
+		topWith(str("extra-opcode-budget"), arr(u(1))),
+	} {
+		add(fmt.Sprintf("msgpack_shape_%02d", i), b)
+	}
+
+	// the reserved 0xc1 byte nested in a body
+	c1 := []byte{0xc1}
+	for i, b := range [][]byte{
+		cat(mapN(1), str("txn-groups"), c1),
+		req(c1, grp(stx2)),
+		two(cat(mapN(1), str("txns"), c1)),
+		two(grp(c1)),
+		two(grp(stx, c1)),
+		two(grp(txnWith(str("type"), c1))),
+		two(grp(txnWith(str("fee"), c1))),
+		two(grp(stxnOf(str("sig"), c1, str("txn"), txnMap))),
+		two(grp(stxnOf(str("txn"), c1))),
+		two(grp(stxnOf(str("sgnr"), c1, str("txn"), txnMap))),
+		two(grp(appl(str("apaa"), arr(c1)))),
+		two(grp(appl(str("apas"), arr(c1)))),
+		two(grp(appl(str("apbx"), arr(cat(mapN(1), str("n"), c1))))),
+		two(grp(stxnOf(str("msig"), cat(mapN(1), str("thr"), c1), str("txn"), txnMap))),
+		two(grp(stxnOf(str("sig"), arr(c1), str("txn"), txnMap))),
+		two(grp(txnWith(str("note"), arr(u(1), c1)))),
+		two(grp(cat(mapN(1), c1, u(1)))),
+		cat(mapN(1), c1, arr(grp(stx), grp(stx2))),
+		topWith(str("round"), c1),
+		topWith(str("allow-empty-signatures"), c1),
+		topWith(str("extra-opcode-budget"), c1),
+		topWith(str("exec-trace-config"), c1),
+		topWith(str("exec-trace-config"), cat(mapN(1), str("enable"), c1)),
+		topWith(str("exec-trace-config"), arr(c1)),
+		topWith(str("zzz"), c1),
+		arr(c1),
+		arr(arr(grp(stx), grp(stx2)), c1),
+		cat(two(grp(stx)), c1),
+		cat(two(grp(stx)), c1, c1, []byte{0xff}),
+	} {
+		add(fmt.Sprintf("msgpack_c1_%02d", i), b)
+	}
+
+	// string fields holding bytes that are not UTF-8
+	bad := string([]byte{0xff, 0xfe, 'a', 0xc3})
+	badStr := func(s string) []byte { return cat([]byte{0xa0 | byte(len(s))}, []byte(s)) }
+	for i, b := range [][]byte{
+		two(grp(txnWith(str("type"), badStr(bad)))),
+		two(grp(pay(str("gen"), badStr(bad)))),
+		two(grp(acfg(str("apar"), cat(mapN(3), str("an"), badStr(bad), str("un"), badStr("\xe2\x82"), str("au"), badStr("\x80"))))),
+		two(grp(pay(str("note"), badStr(bad)))),
+		two(grp(pay(str("gh"), badStr(bad)))),
+		two(grp(pay(str("rcv"), badStr(bad)))),
+		two(grp(cat(mapN(2), str("sig"), sig, badStr("tx\xff"), txnMap))),
+		cat(mapN(1), badStr("txn-groups\xff"), arr(grp(stx), grp(stx2))),
+		two(grp(txnWith(str("type"), cat([]byte{0xc4, 2}, []byte{0xff, 0xfe})))),
+		req(grp(pay(str("gen"), badStr(bad)))),
+		req(grp(txnWith(str("type"), badStr(bad), str("snd"), snd, str("fee"), u(1000), str("fv"), u(1), str("lv"), u(1000)))),
+		cat(mapN(2), str("txn-groups"), arr(grp(acfg(str("apar"), cat(mapN(2), str("t"), u(5), str("an"), badStr(bad))))), str("allow-empty-signatures"), trueB),
+	} {
+		add(fmt.Sprintf("msgpack_utf8_%02d", i), b)
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, protocol.EncodeJSON(oracleSignedPay(1))); err != nil {
+		panic(err)
+	}
+	twoJSON := func(stxnJSON string) []byte {
+		return []byte(`{"txn-groups":[{"txns":[` + stxnJSON + `]},{"txns":[` + compact.String() + `]}]}`)
+	}
+	oneJSON := func(stxnJSON string) []byte {
+		return []byte(`{"txn-groups":[{"txns":[` + stxnJSON + `]}],"allow-empty-signatures":true}`)
+	}
+	sndJSON := basics.Address(st.Txn.Sender).String()
+	for i, b := range [][]byte{
+		twoJSON(`{"txn":{"type":"` + bad + `"}}`),
+		twoJSON(`{"txn":{"type":"pay","gen":"` + bad + `"}}`),
+		twoJSON(`{"txn":{"type":"acfg","apar":{"an":"` + bad + `","un":"\xe2\x82","au":"\x80"}}}`),
+		twoJSON(`{"txn":{"type":"pay","note":"` + bad + `"}}`),
+		twoJSON(`{"txn":{"type":"pay","rcv":"` + bad + `"}}`),
+		twoJSON(`{"sig":"` + bad + `"}`),
+		twoJSON(`{"tx` + bad + `":{}}`),
+		twoJSON(`{"txn":{"ty\xffpe":"pay"}}`),
+		[]byte(`{"txn-groups":[],"r` + bad + `":1}`),
+		twoJSON(`{"txn":{"type":"pay","fee":"1` + bad + `"}}`),
+		twoJSON(`{"txn":{"type":"pay","gen":"ÿ` + bad + `\n"}}`),
+		twoJSON(`{"txn":{"type":["` + bad + `"]}}`),
+		oneJSON(`{"txn":{"type":"` + bad + `","snd":"` + sndJSON + `","fee":1000,"fv":1,"lv":1000}}`),
+		oneJSON(`{"txn":{"type":"pay","snd":"` + sndJSON + `","fee":1000,"fv":1,"lv":1000,"gen":"` + bad + `"}}`),
+		oneJSON(`{"txn":{"type":"acfg","snd":"` + sndJSON + `","fee":1000,"fv":1,"lv":1000,"apar":{"t":5,"an":"` + bad + `"}}}`),
+		append([]byte(`{"txn-groups":[]}`), 0xff),
+		[]byte("\xff{\"txn-groups\":[]}"),
+		[]byte("{\"txn-groups\":[]\xff}"),
+	} {
+		add(fmt.Sprintf("json_utf8_%02d", i), b)
+	}
 	return cases
 }
 

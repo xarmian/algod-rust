@@ -129,22 +129,148 @@ pub enum MsgpackSimulate {
 /// addresses and signatures); each keeps its own msgpack bytes.
 pub fn parse_msgpack_request(body: &[u8]) -> MsgpackSimulate {
     let mut rd = body;
-    let pairs = match rmpv::decode::read_value(&mut rd) {
-        Ok(Value::Map(pairs)) => pairs,
+    let value = match rmpv::decode::read_value(&mut rd) {
+        Ok(v @ (Value::Map(_) | Value::Array(_))) => v,
         // go-codec: `nil` leaves the struct zero (issue #2477)
         // (`rmpv` also reads the reserved 0xc1 as `nil`; go-codec rejects it)
-        Ok(Value::Nil) if body.first() == Some(&0xc0) => Vec::new(),
-        // ... and an array is the struct's fields in order, `nil` ones zero
-        Ok(Value::Array(items)) if items.len() <= REQUEST_KEYS.len() => REQUEST_KEYS
-            .iter()
-            .zip(items)
-            .filter(|(_, v)| !v.is_nil())
-            .map(|(k, v)| (Value::String((*k).into()), v))
-            .collect(),
-        Ok(Value::Array(_)) => return MsgpackSimulate::Rejected,
+        Ok(Value::Nil) if body.first() == Some(&0xc0) => return decoded_or_rejected(Vec::new()),
         _ => return MsgpackSimulate::NotMsgpack,
     };
+    // `rmpv` reads a nested reserved 0xc1 as `nil` too: go-codec decodes it
+    // into no type (issue #2494)
+    if first_value_has_reserved_byte(body) {
+        return MsgpackSimulate::Rejected;
+    }
+    match go_codec_shape(value, &crate::simulate_request_schema::SIMULATE_REQUEST) {
+        Some(Value::Map(pairs)) => decoded_or_rejected(pairs),
+        _ => MsgpackSimulate::Rejected,
+    }
+}
+
+fn decoded_or_rejected(pairs: Vec<(Value, Value)>) -> MsgpackSimulate {
     parse_request_pairs(pairs).map_or(MsgpackSimulate::Rejected, MsgpackSimulate::Decoded)
+}
+
+/// Whether the first msgpack value of `body` holds the reserved marker 0xc1
+/// (outside any `str`/`bin`/`ext` payload). Walked iteratively: the count of
+/// values still to read grows by a container's element count.
+fn first_value_has_reserved_byte(body: &[u8]) -> bool {
+    let mut at = 0usize;
+    let mut pending = 1usize;
+    let be = |at: usize, n: usize| -> Option<usize> {
+        let b = body.get(at..at + n)?;
+        Some(b.iter().fold(0usize, |acc, &x| (acc << 8) | usize::from(x)))
+    };
+    while pending > 0 {
+        pending -= 1;
+        let Some(&m) = body.get(at) else {
+            return false;
+        };
+        at += 1;
+        // (header bytes, payload length) of a scalar; containers add to `pending`
+        let (hdr, payload) = match m {
+            0xc1 => return true,
+            0x00..=0x7f | 0xe0..=0xff | 0xc0 | 0xc2 | 0xc3 => (0, 0),
+            0x80..=0x8f => {
+                pending += 2 * usize::from(m & 0x0f);
+                (0, 0)
+            }
+            0x90..=0x9f => {
+                pending += usize::from(m & 0x0f);
+                (0, 0)
+            }
+            0xa0..=0xbf => (0, usize::from(m & 0x1f)),
+            0xcc | 0xd0 => (0, 1),
+            0xcd | 0xd1 => (0, 2),
+            0xca | 0xce | 0xd2 => (0, 4),
+            0xcb | 0xcf | 0xd3 => (0, 8),
+            0xc4 | 0xd9 => (1, be(at, 1).unwrap_or(0)),
+            0xc5 | 0xda => (2, be(at, 2).unwrap_or(0)),
+            0xc6 | 0xdb => (4, be(at, 4).unwrap_or(0)),
+            0xd4 => (0, 2),
+            0xd5 => (0, 3),
+            0xd6 => (0, 5),
+            0xd7 => (0, 9),
+            0xd8 => (0, 17),
+            0xc7 => (1, be(at, 1).unwrap_or(0) + 1),
+            0xc8 => (2, be(at, 2).unwrap_or(0) + 1),
+            0xc9 => (4, be(at, 4).unwrap_or(0) + 1),
+            0xdc | 0xde => {
+                let n = be(at, 2).unwrap_or(0);
+                pending += if m == 0xde { 2 * n } else { n };
+                (2, 0)
+            }
+            0xdd | 0xdf => {
+                let n = be(at, 4).unwrap_or(0);
+                pending += if m == 0xdf { 2 * n } else { n };
+                (4, 0)
+            }
+        };
+        at = at.saturating_add(hdr).saturating_add(payload);
+    }
+    false
+}
+
+/// A msgpack value as go-codec's reflection decodes it into `ty`, rewritten
+/// into the map form the strict readers take (issue #2494): a struct sent as
+/// an array is its fields in go-codec's order (`kStruct`, more elements than
+/// fields fail), a slice sent as a map is its keys and values in turn
+/// (`decSliceHelperStart`), and a struct key may be a `bin` too
+/// (`DecodeStringAsBytes`). `None` where go-codec fails: an excess array
+/// element, a struct key that is not a known field.
+fn go_codec_shape(v: Value, ty: &'static algo_codec::go_codec_json::Ty) -> Option<Value> {
+    use algo_codec::go_codec_json::{Field, Ty};
+    let key = |name: &'static str| Value::String(name.into());
+    Some(match (ty, v) {
+        (Ty::Ptr(t), v) => go_codec_shape(v, t)?,
+        (Ty::Struct(fields), Value::Map(pairs)) => Value::Map(
+            pairs
+                .into_iter()
+                .map(|(k, x)| {
+                    let name: &[u8] = match &k {
+                        Value::String(s) => s.as_bytes(),
+                        Value::Binary(b) => b,
+                        _ => return None,
+                    };
+                    let Field(name, t) = fields.iter().find(|f| f.0.as_bytes() == name)?;
+                    Some((key(name), go_codec_shape(x, t)?))
+                })
+                .collect::<Option<_>>()?,
+        ),
+        (Ty::Struct(fields), Value::Array(items)) => {
+            if items.len() > fields.len() {
+                return None;
+            }
+            Value::Map(
+                fields
+                    .iter()
+                    .zip(items)
+                    .map(|(Field(name, t), x)| Some((key(name), go_codec_shape(x, t)?)))
+                    .collect::<Option<_>>()?,
+            )
+        }
+        (Ty::Slice(elem, _) | Ty::FastSlice(elem), Value::Array(items)) => Value::Array(
+            items
+                .into_iter()
+                .map(|x| go_codec_shape(x, elem))
+                .collect::<Option<_>>()?,
+        ),
+        (Ty::Slice(elem, _) | Ty::FastSlice(elem), Value::Map(pairs)) => Value::Array(
+            pairs
+                .into_iter()
+                .flat_map(|(k, x)| [k, x])
+                .map(|x| go_codec_shape(x, elem))
+                .collect::<Option<_>>()?,
+        ),
+        (Ty::Map(_, val), Value::Map(pairs)) => Value::Map(
+            pairs
+                .into_iter()
+                .map(|(k, x)| Some((k, go_codec_shape(x, val)?)))
+                .collect::<Option<_>>()?,
+        ),
+        // anything else is decoded (or rejected) by the readers as it is
+        (_, v) => v,
+    })
 }
 
 fn parse_request_pairs(pairs: Vec<(Value, Value)>) -> Option<DecodedMsgpackRequest> {
@@ -156,8 +282,11 @@ fn parse_request_pairs(pairs: Vec<(Value, Value)>) -> Option<DecodedMsgpackReque
             (Some("txn-groups"), Value::Array(groups)) => {
                 let mut new_groups = Vec::with_capacity(groups.len());
                 for group in groups {
-                    let Value::Map(gpairs) = group else {
-                        return None;
+                    let gpairs = match group {
+                        Value::Map(gpairs) => gpairs,
+                        // go-codec: a `nil` element is a zero group
+                        Value::Nil => Vec::new(),
+                        _ => return None,
                     };
                     map_keys_within(&gpairs, &["txns"])?;
                     let mut raw_group = Vec::new();
@@ -786,9 +915,183 @@ mod tests {
         );
         assert_eq!(rejection(&neg_budget), None, "a signed int is a valid Go int");
         let mut out = Vec::new();
-        let not_a_map_group = map(vec![("txn-groups", Value::Array(vec![Value::Nil]))]);
+        let not_a_map_group = map(vec![("txn-groups", Value::Array(vec![Value::from(5u64)]))]);
         rmpv::encode::write_value(&mut out, &not_a_map_group).unwrap();
         assert_eq!(rejection(&out), Some(GO_MSGPACK_REJECTION));
+        // a `nil` group is a zero one (issue #2494, `msgpack_shape_07`)
+        let mut out = Vec::new();
+        let nil_group = map(vec![("txn-groups", Value::Array(vec![Value::Nil]))]);
+        rmpv::encode::write_value(&mut out, &nil_group).unwrap();
+        assert!(decode(&out).is_some_and(|d| d.request.txn_groups[0].txns.is_empty()));
+    }
+
+    fn encode(v: &Value) -> Vec<u8> {
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, v).unwrap();
+        out
+    }
+
+    /// go-codec decodes a struct from an array of its fields and a slice from
+    /// a map of its elements in turn, at every level (issue #2494): each body
+    /// decodes to the same transactions as its map form.
+    #[test]
+    fn struct_from_array_and_slice_from_map_decode_like_their_map_form() {
+        let st = stxn(vec![], vec![]);
+        let Value::Map(st_pairs) = &st else {
+            unreachable!()
+        };
+        let field = |k: &str| {
+            st_pairs
+                .iter()
+                .find(|(x, _)| x.as_str() == Some(k))
+                .unwrap()
+                .1
+                .clone()
+        };
+        // SignedTxn fields in go-codec's order: sig, msig, lsig, pqsig, txn
+        let st_array = Value::Array(vec![
+            field("sig"),
+            Value::Nil,
+            Value::Nil,
+            Value::Nil,
+            field("txn"),
+        ]);
+        let want = decode(&request(vec![st.clone(), st.clone()], vec![], vec![])).unwrap();
+        for body in [
+            // the group as an array, the signed transaction as an array
+            map(vec![(
+                "txn-groups",
+                Value::Array(vec![Value::Array(vec![Value::Array(vec![
+                    st.clone(),
+                    st_array.clone(),
+                ])])]),
+            )]),
+            // the request as an array, `txns` as a map
+            Value::Array(vec![Value::Array(vec![map(vec![(
+                "txns",
+                Value::Map(vec![(st.clone(), st_array.clone())]),
+            )])])]),
+            // a struct key sent as a `bin`
+            Value::Map(vec![(
+                bin(b"txn-groups"),
+                Value::Array(vec![map(vec![(
+                    "txns",
+                    Value::Array(vec![st.clone(), st]),
+                )])]),
+            )]),
+        ] {
+            let got = decode(&encode(&body)).expect("decodes");
+            let typed = |d: &DecodedMsgpackRequest| -> Vec<SignedTransaction> {
+                d.raw_txns[0]
+                    .iter()
+                    .map(|b| decode_signed_txn(b).unwrap())
+                    .collect()
+            };
+            assert_eq!(typed(&got), typed(&want), "{body}");
+        }
+        // more elements than fields, a key no field has, a non-string key
+        for body in [
+            map(vec![(
+                "txn-groups",
+                Value::Array(vec![Value::Array(vec![Value::Array(vec![]), Value::Nil])]),
+            )]),
+            Value::Map(vec![(bin(b"txn-groupz"), Value::Array(vec![]))]),
+            Value::Map(vec![(Value::from(1u64), Value::Array(vec![]))]),
+            Value::Map(vec![(s(""), Value::Array(vec![]))]),
+        ] {
+            assert_eq!(
+                rejection(&encode(&body)),
+                Some(GO_MSGPACK_REJECTION),
+                "{body}"
+            );
+        }
+    }
+
+    /// go-codec decodes the reserved 0xc1 into no type; after the first value
+    /// it is never read (issue #2494, `msgpack_c1_*`).
+    #[test]
+    fn a_nested_reserved_byte_is_rejected_but_trailing_bytes_are_not_read() {
+        let ok = request(vec![stxn(vec![], vec![])], vec![], vec![]);
+        assert!(!first_value_has_reserved_byte(&ok));
+        assert!(decode(&[ok.as_slice(), &[0xc1, 0xc1]].concat()).is_some());
+        // 0xc1 inside a bin or str payload is data
+        assert!(!first_value_has_reserved_byte(&encode(&bin(&[0xc1; 40]))));
+        assert!(!first_value_has_reserved_byte(&encode(&Value::String(
+            String::from_utf8(vec![b'a'; 300]).unwrap().into()
+        ))));
+        let c1_round = [
+            &[0x82][..],
+            &encode(&s("txn-groups")),
+            &[0x90],
+            &encode(&s("round")),
+            &[0xc1],
+        ]
+        .concat();
+        assert!(first_value_has_reserved_byte(&c1_round));
+        assert_eq!(rejection(&c1_round), Some(GO_MSGPACK_REJECTION));
+        // a 0xc1 replacing any single-byte value of a real body is found
+        let target = encode(&Value::from(1000u64));
+        let at = ok.windows(target.len()).position(|w| w == target).unwrap();
+        let mut bad = ok.clone();
+        bad.splice(at..at + target.len(), [0xc1]);
+        assert!(first_value_has_reserved_byte(&bad));
+        assert_eq!(rejection(&bad), Some(GO_MSGPACK_REJECTION));
+    }
+
+    /// Every JSON body go-codec decodes (the go-recorded ones and every
+    /// one-byte change of them) reaches the msgpack pipeline, so the handler's
+    /// conversion failure is unreachable (issue #2494).
+    #[test]
+    fn every_body_go_decodes_reaches_the_msgpack_pipeline() {
+        const FIXTURE: &str = include_str!("../tests/fixtures/simulate_request_texts.jsonl");
+        let reaches = |body: &[u8]| -> bool {
+            if !matches!(parse_msgpack_request(body), MsgpackSimulate::NotMsgpack) {
+                return true;
+            }
+            let Ok(value) = go_json_decode(body) else {
+                return true;
+            };
+            match parse_json_request(body) {
+                JsonSimulate::NotGoForm => request_from_go_value(&value).is_some(),
+                _ => true,
+            }
+        };
+        let mut checked = 0;
+        for line in FIXTURE.lines() {
+            let case: serde_json::Value = serde_json::from_str(line).unwrap();
+            let body = hex::decode(case["body_hex"].as_str().unwrap()).unwrap();
+            if body.len() > 400 {
+                assert!(reaches(&body), "{}", case["name"]);
+                continue;
+            }
+            // every byte offset, with one of the changes in turn
+            for at in 0..=body.len() {
+                let c = [
+                    None,
+                    Some(b'['),
+                    Some(b'1'),
+                    Some(b'"'),
+                    Some(b'n'),
+                    Some(0xff),
+                ][at % 6];
+                let mut b = body.clone();
+                match (c, at < b.len()) {
+                    (Some(c), true) => b[at] = c,
+                    (None, true) => {
+                        b.remove(at);
+                    }
+                    (_, false) => {}
+                }
+                assert!(
+                    reaches(&b),
+                    "{}: {}",
+                    case["name"],
+                    String::from_utf8_lossy(&b)
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 30_000, "{checked}");
     }
 
     #[test]

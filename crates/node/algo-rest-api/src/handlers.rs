@@ -3320,8 +3320,8 @@ pub async fn simulate_transaction<N: NodeInterface>(
         go_json_decode, parse_json_request, parse_msgpack_request, request_from_go_value,
         JsonSimulate, MsgpackSimulate, GO_MSGPACK_REJECTION,
     };
-    let (mut request, has_raw_txns, raw_txns) = match parse_msgpack_request(&body) {
-        MsgpackSimulate::Decoded(d) => (d.request, true, d.raw_txns),
+    let (mut request, raw_txns) = match parse_msgpack_request(&body) {
+        MsgpackSimulate::Decoded(d) => (d.request, d.raw_txns),
         MsgpackSimulate::Rejected => {
             return match go_json_decode(&body) {
                 Err(text) => error::bad_request_bytes(&text),
@@ -3338,41 +3338,34 @@ pub async fn simulate_transaction<N: NodeInterface>(
             // go-codec accepts goes through it as the msgpack go would
             // encode from the decoded value.
             match parse_json_request(&body) {
-                JsonSimulate::Decoded(d) => (d.request, true, d.raw_txns),
+                JsonSimulate::Decoded(d) => (d.request, d.raw_txns),
                 // go's strict JSON decode names the first unknown key and its
                 // offset (issue #1971).
                 JsonSimulate::UnknownField(u) => return error::bad_request(u.message()),
                 JsonSimulate::NotGoForm => match request_from_go_value(&value) {
-                    Some(d) => (d.request, true, d.raw_txns),
-                    None => match serde_json::from_slice::<models::SimulateRequest>(&body) {
-                        Ok(req) => (req, false, Vec::new()),
-                        Err(e) => {
-                            return error::bad_request(format!(
-                                "could not decode simulate request: {e}"
-                            ));
-                        }
-                    },
+                    Some(d) => (d.request, d.raw_txns),
+                    // Unreachable: the msgpack go encodes from what go-codec
+                    // decoded always decodes (issue #2494,
+                    // `every_body_go_decodes_reaches_the_msgpack_pipeline`).
+                    None => {
+                        tracing::error!("simulate: a request go decodes did not convert");
+                        return error::internal_error("failed to decode simulate request");
+                    }
                 },
             }
         }
     };
 
-    // Decode each transaction to SignedTransaction. A msgpack body, and a JSON
-    // body in go's own JSON form, carry each transaction's msgpack bytes in
-    // `raw_txns` (a `serde_json::Value` cannot hold a msgpack binary); any other
-    // JSON body falls back to `serde_json::from_value` on the Rust serde form.
+    // Decode each transaction to SignedTransaction from the msgpack bytes
+    // carried in `raw_txns` (a `serde_json::Value` cannot hold a msgpack
+    // binary).
     let mut decoded_groups = Vec::with_capacity(request.txn_groups.len());
     for (i, group) in request.txn_groups.iter().enumerate() {
         let mut decoded_txns = Vec::with_capacity(group.txns.len());
-        for (j, txn_val) in group.txns.iter().enumerate() {
-            let decode_result = if has_raw_txns {
-                match raw_txns.get(i).and_then(|g| g.get(j)) {
-                    Some(bytes) => crate::simulate_strict::decode_signed_txn(bytes),
-                    None => Err("transaction bytes missing".to_string()),
-                }
-            } else {
-                serde_json::from_value::<algo_types::SignedTransaction>(txn_val.clone())
-                    .map_err(|e| e.to_string())
+        for j in 0..group.txns.len() {
+            let decode_result = match raw_txns.get(i).and_then(|g| g.get(j)) {
+                Some(bytes) => crate::simulate_strict::decode_signed_txn(bytes),
+                None => Err("transaction bytes missing".to_string()),
             };
             match decode_result {
                 Ok(stx) => decoded_txns.push(stx),
