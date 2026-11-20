@@ -261,7 +261,10 @@ jobs:
           # `wallet new -w/--driver`, `--offline`, `--register`) are cobra's
           # `unknown flag`; fixtures/wallet_password.jsonl is go's output for
           # the pipe, /dev/null and pty paths (a stale one fails
-          # wallet_password_fixture_matches_go_goal).
+          # wallet_password_fixture_matches_go_goal). #2474: its later rows,
+          # against a mock algod, hold every other command that reads a wallet
+          # password (clerk send/sign/multisig, app, asset, changeonlinestatus,
+          # ...) and go's renewpartkey / renewallpartkeys flow.
           MIXED_CLUSTER=1 cargo test -p goal-rust --test wallet_password_e2e -- --nocapture
           # #2436: a data dir whose genesis ID cannot be read stops every
           # command that builds go's accounts list (errorGenesisIDFail);

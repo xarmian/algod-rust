@@ -275,8 +275,16 @@ pub struct FreezeArgs {
     /// Account address to freeze/unfreeze (Go `--account`). Required.
     #[arg(long = "account")]
     pub account: String,
-    /// Freeze or unfreeze (Go `--freeze`). Required.
-    #[arg(long = "freeze")]
+    /// Freeze or unfreeze (Go `--freeze`). Required. go's bool flag:
+    /// `--freeze` or `--freeze=<bool>`.
+    #[arg(
+        long = "freeze",
+        num_args = 0..=1,
+        require_equals = true,
+        default_value = "false",
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     pub freeze: bool,
     #[command(flatten)]
     pub txn: AssetTxnArgs,

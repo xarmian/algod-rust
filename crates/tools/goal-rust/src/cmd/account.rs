@@ -1668,12 +1668,6 @@ pub fn run_marknonparticipating(
         txn.fee = algo_txn_pipeline::estimate_fee(&txn, params.fee, params.min_fee);
     }
 
-    eprintln!(
-        "Warning: marking {} non-participating is permanent and irreversible; \
-         the account can never go online or offline again and earns no rewards.",
-        args.address
-    );
-
     // go: `ensureWalletHandleMaybePassword` → `makeAccountsList`.
     let mut accounts = match load_accounts(&data_dir_path) {
         Ok(a) => a,
@@ -1705,120 +1699,10 @@ pub fn run_marknonparticipating(
     }
 }
 
-// ---- account renewpartkey / renewallpartkeys (TASK-243 / B11) -------------
-
-/// `account renewpartkey -a <addr> --roundLastValid <r> [--keyDilution]`:
-/// renew, then register the new key online. Mirrors `renewParticipationKeyCmd`
-/// (account.go:1053-1099). See `RenewpartkeyArgs` for divergences.
-pub fn run_renewpartkey(
-    args: RenewpartkeyArgs,
-    cli_d: Vec<PathBuf>,
-    kmd_dir_flag: Option<PathBuf>,
-) -> ExitCode {
-    let sender = match algo_types::Address::from_algorand_string(&args.address) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("Could not parse address: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let data_dir_path = match data_dir::ensure_single_data_dir(&cli_d) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(1);
-        }
-    };
-    let client = match build_algod_client_for_dir(&data_dir_path) {
-        Ok(c) => c,
-        Err(()) => return ExitCode::from(1),
-    };
-    let rt = match build_runtime() {
-        Ok(r) => r,
-        Err(()) => return ExitCode::from(1),
-    };
-    // Preflight: list existing partkeys; reject if a key for this
-    // address already covers roundLastValid. Mirrors Go's
-    // errExistingPartKey at account.go:1080-1088. A list failure is
-    // fatal — silently proceeding would re-introduce the
-    // duplicate-install path (Codex round-2 finding).
-    let preflight = rt.block_on(client.list_participation_keys());
-    match preflight {
-        Ok(parts) => {
-            if parts.iter().any(|p| {
-                p.address == args.address && p.key.vote_last_valid >= args.round_last_valid
-            }) {
-                eprintln!(
-                    "An existing partkey for {} is already valid through round >= {}; \
-                     renewing would install an older duplicate.",
-                    args.address, args.round_last_valid,
-                );
-                return ExitCode::from(1);
-            }
-        }
-        Err(e) => {
-            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
-            return ExitCode::from(1);
-        }
-    }
-    if let Err(e) = rt.block_on(renew_one(
-        &client,
-        &args.address,
-        args.round_last_valid,
-        args.key_dilution,
-    )) {
-        eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e]));
-        return ExitCode::from(1);
-    }
-
-    // Issue a keyreg-online transaction for the freshly generated key, as go's
-    // `generateAndRegisterPartKey` always does.
-    let kmd = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
-        Ok(c) => c,
-        Err(()) => return ExitCode::from(1),
-    };
-    let pipeline = algo_txn_pipeline::TxnPipeline::new(client, Some(kmd));
-    // go: `ensureWalletHandleMaybePassword` → `makeAccountsList`.
-    let mut accounts = match load_accounts(&data_dir_path) {
-        Ok(a) => a,
-        Err(()) => return ExitCode::from(1),
-    };
-    let (handle, _wallet_name, password) = match resolve_wallet_and_init(
-        &rt,
-        pipeline.kmd().expect("kmd configured above"),
-        &mut accounts,
-        None,
-    ) {
-        Ok(v) => v,
-        Err(()) => return ExitCode::from(1),
-    };
-    match rt.block_on(register_online_keyreg(
-        &pipeline,
-        &data_dir_path,
-        sender,
-        &args.address,
-        None,
-        None,
-        None,
-        &handle,
-        &password,
-        false,
-    )) {
-        Ok(()) => {
-            println!("Participation key registered successfully");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("Error registering keys: {e}");
-            ExitCode::from(1)
-        }
-    }
-}
-
 /// Build → sign → submit a go-online keyreg for `address`, selecting the
 /// node's participation key via `/v2/participation` (Go's `chooseParticipation`
-/// + `changeAccountOnlineStatus(goOnline=true)`). Shared by `changeonlinestatus
-/// --online` and `renewpartkey --register`.
+/// + `changeAccountOnlineStatus(goOnline=true)`) for `changeonlinestatus
+/// --online`.
 #[allow(clippy::too_many_arguments)]
 async fn register_online_keyreg(
     pipeline: &algo_txn_pipeline::TxnPipeline,
@@ -1832,15 +1716,38 @@ async fn register_online_keyreg(
     password: &str,
     no_wait: bool,
 ) -> Result<(), String> {
-    let params = pipeline
-        .suggested_params()
+    let txn = build_online_keyreg(
+        pipeline.algod(),
+        data_dir,
+        sender,
+        address,
+        fee,
+        first_valid,
+        last_valid,
+    )
+    .await?;
+    sign_submit_confirm(pipeline, &txn, handle, password, no_wait, "status change").await
+}
+
+/// go's `MakeUnsignedGoOnlineTx`: the go-online keyreg of `address` with the
+/// node's participation key valid at its first round (`chooseParticipation`).
+async fn build_online_keyreg(
+    algod: &algo_rest_client::AlgodClient,
+    data_dir: &Path,
+    sender: algo_types::Address,
+    address: &str,
+    fee: Option<u64>,
+    first_valid: Option<u64>,
+    last_valid: Option<u64>,
+) -> Result<algo_types::Transaction, String> {
+    let params = algod
+        .suggested_transaction_params()
         .await
         .map_err(|e| e.to_string())?;
     let max_txn_life =
         crate::cmd::clerk::resolve_max_txn_life(data_dir, &params.consensus_version)?;
     let (first, last) = compute_validity(first_valid, last_valid, params.last_round, max_txn_life)?;
-    let parts = pipeline
-        .algod()
+    let parts = algod
         .list_participation_keys()
         .await
         .map_err(|e| e.to_string())?;
@@ -1860,121 +1767,459 @@ async fn register_online_keyreg(
     if fee.is_none() {
         txn.fee = algo_txn_pipeline::estimate_fee(&txn, params.fee, params.min_fee);
     }
-    sign_submit_confirm(pipeline, &txn, handle, password, no_wait, "status change").await
+    Ok(txn)
 }
 
-/// `account renewallpartkeys --roundLastValid <r> [--keyDilution]
-/// [--register]`. Mirrors `renewAllParticipationKeyCmd`
-/// (account.go:1132-1219). Iterates every -d data dir; per dir,
-/// lists existing partkeys, renews each unique address. Skips
-/// addresses that already have a partkey with `vote_last_valid >=
-/// round_last_valid` (Go's preflight check at
-/// account.go:1080-1088).
-pub fn run_renewallpartkeys(args: RenewallpartkeysArgs, cli_d: Vec<PathBuf>) -> ExitCode {
-    let dirs = match data_dir::resolve_data_dirs(&cli_d) {
+// ---- account renewpartkey / renewallpartkeys (issue #2474) -----------------
+
+/// go: `errLastRoundInvalid` (`cmd/goal/messages.go`).
+const ERR_LAST_ROUND_INVALID: &str = "roundLastValid needs to be well after the current round ({})";
+
+/// go: `errExistingPartKey`.
+const ERR_EXISTING_PART_KEY: &str =
+    "Account already has a participation key valid at least until roundLastValid ({}) - current is {}";
+
+/// The state of the node a renewal starts from: go's `client.CurrentRound()`,
+/// `client.SuggestedParams()` and the `MaxTxnLife` of its consensus version
+/// (`config.Consensus[...]`: zero for a version goal does not know).
+struct RenewRounds {
+    current_round: u64,
+    max_txn_life: u64,
+}
+
+fn renew_rounds(
+    rt: &tokio::runtime::Runtime,
+    endpoint: &(String, String),
+    dd: &Path,
+) -> Result<RenewRounds, String> {
+    let fail = |e: String| format_message(ERROR_REQUEST_FAIL, &[&e]);
+    let status = crate::algod_rest::get(rt, endpoint, "/v2/status", &[]).map_err(fail)?;
+    let status: serde_json::Value =
+        serde_json::from_slice(&status).map_err(|e| fail(e.to_string()))?;
+    let current_round = status["last-round"].as_u64().unwrap_or(0);
+    let params =
+        crate::algod_rest::get(rt, endpoint, "/v2/transactions/params", &[]).map_err(fail)?;
+    let params: serde_json::Value =
+        serde_json::from_slice(&params).map_err(|e| fail(e.to_string()))?;
+    let version = params["consensus-version"].as_str().unwrap_or("");
+    let max_txn_life = algo_types::consensus::preload_configurable_consensus_protocols(dd)
+        .ok()
+        .and_then(|t| t.get(version).map(|p| p.max_txn_life))
+        .unwrap_or(0);
+    Ok(RenewRounds {
+        current_round,
+        max_txn_life,
+    })
+}
+
+/// go's `client.ListParticipationKeys()`.
+fn list_part_keys(
+    rt: &tokio::runtime::Runtime,
+    endpoint: &(String, String),
+) -> Result<Vec<algo_rest_client::ParticipationKey>, String> {
+    let fail = |e: String| format_message(ERROR_REQUEST_FAIL, &[&e]);
+    let body = crate::algod_rest::get(rt, endpoint, "/v2/participation", &[]).map_err(fail)?;
+    serde_json::from_slice(&body).map_err(|e| fail(e.to_string()))
+}
+
+/// go's `util.RunFuncWithSpinningCursor`: `f` runs while one of `/-\|` and a
+/// backspace is drawn on stdout every 100 ms.
+fn run_with_spinning_cursor<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    use std::io::Write as _;
+    use std::sync::mpsc;
+    let (done, finished) = mpsc::channel::<()>();
+    std::thread::scope(|s| {
+        let job = s.spawn(move || {
+            let out = f();
+            let _ = done.send(());
+            out
+        });
+        let progress = ["/", "-", "\\", "|"];
+        let mut i = 0;
+        while let Err(mpsc::RecvTimeoutError::Timeout) =
+            finished.recv_timeout(std::time::Duration::from_millis(100))
+        {
+            let mut stdout = std::io::stdout();
+            let _ = write!(stdout, "{}\u{8}", progress[i]);
+            let _ = stdout.flush();
+            i = (i + 1) % progress.len();
+        }
+        job.join().expect("the spinning-cursor job panicked")
+    })
+}
+
+/// Removes a file when dropped (go's `defer os.Remove(name)`).
+struct RemoveOnDrop<'a>(&'a Path);
+
+impl Drop for RemoveOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
+}
+
+/// go's `participation.GenParticipationKeysTo(address, first, last, dilution,
+/// "", installFunc)` as `client.GenParticipationKeys` calls it: the key is
+/// generated into `os.TempDir()/<address>.<first>.<last>.partkey`, posted to
+/// algod (`AddParticipationKey`) and the file removed. Returns the key's
+/// `ParticipationID` and the file's path.
+fn gen_participation_keys(
+    rt: &tokio::runtime::Runtime,
+    endpoint: &(String, String),
+    address: &str,
+    first: u64,
+    last: u64,
+    dilution: u64,
+) -> Result<(String, PathBuf), String> {
+    let parsed = algo_avm::assembler::unmarshal_checksum_address(address)?;
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(&parsed);
+    let path = std::env::temp_dir().join(format!("{address}.{first}.{last}.partkey"));
+    match std::fs::metadata(&path) {
+        Ok(_) => {
+            return Err(format!(
+                "ParticipationKeys exist for the range {first} to {last}"
+            ))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "participation key file '{}' cannot be accessed : {e}",
+                path.display()
+            ))
+        }
+    }
+    let _remove = RemoveOnDrop(&path);
+    let dilution = if dilution == 0 {
+        algo_ledger::participation::default_key_dilution(
+            algo_types::Round(first),
+            algo_types::Round(last),
+        )
+    } else {
+        dilution
+    };
+    let part = {
+        let mut db =
+            algo_ledger::erasable_db::ErasableDb::open(&path).map_err(|e| e.to_string())?;
+        algo_ledger::participation::fill_db_with_participation_keys(
+            &mut db,
+            algo_types::Address(pk),
+            algo_types::Round(first),
+            algo_types::Round(last),
+            dilution,
+        )
+        .map_err(|e| e.to_string())?
+    };
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    crate::algod_rest::post(
+        rt,
+        endpoint,
+        "/v2/participation",
+        "application/msgpack",
+        bytes,
+    )?;
+    Ok((part.id().to_string(), path.clone()))
+}
+
+/// The flags of `renewpartkey` / `renewallpartkeys` a renewal passes on.
+struct RenewFlags<'a> {
+    fee: u64,
+    dilution: u64,
+    wallet: Option<&'a str>,
+    no_wait: bool,
+    rekey_to: &'a str,
+}
+
+/// go's `generateAndRegisterPartKey`: generate and install a key valid for
+/// `current_round..=key_last_valid`, then register it online with the
+/// wallet of `-w` (`changeAccountOnlineStatus`, the keyreg valid for
+/// `current_round..=tx_last_valid`). A failed registration only prints a
+/// note; a failed generation is the error.
+#[allow(clippy::too_many_arguments)]
+fn generate_and_register_part_key(
+    rt: &tokio::runtime::Runtime,
+    endpoint: &(String, String),
+    dd: &Path,
+    address: &str,
+    current_round: u64,
+    key_last_valid: u64,
+    tx_last_valid: u64,
+    flags: &RenewFlags<'_>,
+) -> Result<(), String> {
+    use std::io::Write as _;
+    println!("Please stand by while generating keys. This might take a few minutes...");
+    let generated = run_with_spinning_cursor(|| {
+        let r = gen_participation_keys(
+            rt,
+            endpoint,
+            address,
+            current_round,
+            key_last_valid,
+            flags.dilution,
+        )
+        .map_err(|e| format_message(ERROR_REQUEST_FAIL, &[&e]));
+        // go prints this whether or not the generation failed.
+        println!("Participation key generation successful");
+        let _ = std::io::stdout().flush();
+        r
+    });
+    let (part_id, key_path) = generated?;
+    if register_renewed_key(
+        rt,
+        endpoint,
+        dd,
+        address,
+        current_round,
+        tx_last_valid,
+        flags,
+    )
+    .is_err()
+    {
+        let _ = std::fs::remove_file(&key_path);
+        eprintln!(
+            "  Error registering keys - deleting newly-generated key file: {}",
+            key_path.display()
+        );
+    }
+    println!("Participation key installed successfully, Participation ID: {part_id}");
+    Ok(())
+}
+
+/// go's `changeAccountOnlineStatus(address, goOnline=true, "", wallet, first,
+/// last, fee, lease, dataDir, client)`: build the go-online keyreg
+/// (`MakeUnsignedGoOnlineTx`), then get the wallet handle and password, sign,
+/// broadcast and wait. Failing to get the wallet handle exits, like go's
+/// `ensureWalletHandleMaybePassword`.
+fn register_renewed_key(
+    rt: &tokio::runtime::Runtime,
+    endpoint: &(String, String),
+    dd: &Path,
+    address: &str,
+    first: u64,
+    last: u64,
+    flags: &RenewFlags<'_>,
+) -> Result<(), String> {
+    let sender = algo_types::Address::from_algorand_string(address).map_err(|e| e.to_string())?;
+    let algod = algo_rest_client::AlgodClient::new(&endpoint.0, &endpoint.1);
+    let mut txn = rt.block_on(build_online_keyreg(
+        &algod,
+        dd,
+        sender,
+        address,
+        Some(flags.fee).filter(|f| *f != 0),
+        Some(first),
+        Some(last),
+    ))?;
+    match crate::cmd::clerk::parse_rekey(flags.rekey_to) {
+        Ok(a) if a != algo_types::Address::default() => txn.rekey_to = Some(a),
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+    let Ok(kmd) = build_wallet_handle_kmd_client(dd) else {
+        std::process::exit(1);
+    };
+    let Ok(mut accounts) = load_accounts(dd) else {
+        std::process::exit(1);
+    };
+    let Ok((handle, _wallet_name, password)) =
+        resolve_wallet_and_init(rt, &kmd, &mut accounts, flags.wallet)
+    else {
+        std::process::exit(1);
+    };
+    let pipeline = algo_txn_pipeline::TxnPipeline::new(algod, Some(kmd));
+    rt.block_on(sign_submit_confirm(
+        &pipeline,
+        &txn,
+        &handle,
+        &password,
+        flags.no_wait,
+        "status change",
+    ))
+}
+
+/// `account renewpartkey`: go's `renewParticipationKeyCmd`.
+pub fn run_renewpartkey(args: RenewpartkeyArgs, cli_d: Vec<PathBuf>) -> ExitCode {
+    let dd = match data_dir::ensure_single_data_dir(&cli_d) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::from(1);
         }
     };
-    let rt = match build_runtime() {
-        Ok(r) => r,
-        Err(()) => return ExitCode::from(1),
+    let Ok(endpoint) = ensure_algod_endpoint(&dd) else {
+        return ExitCode::from(1);
     };
-    let mut had_error = false;
-    for dd in &dirs {
-        println!("Renewing participation keys in {}...", dd.display());
-        let client = match build_algod_client_for_dir(dd) {
-            Ok(c) => c,
-            Err(()) => {
-                had_error = true;
-                continue;
-            }
-        };
-        let parts = match rt.block_on(client.list_participation_keys()) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
-                had_error = true;
-                continue;
-            }
-        };
-        let mut seen_addrs: std::collections::HashSet<String> = Default::default();
-        for part in &parts {
-            if !seen_addrs.insert(part.address.clone()) {
-                continue;
-            }
-            // Skip accounts that already have a partkey valid through
-            // the requested roundLastValid (Go's preflight check at
-            // account.go:1080-1088 — "renewed partkey would be older
-            // than current one").
-            if parts.iter().any(|p| {
-                p.address == part.address && p.key.vote_last_valid >= args.round_last_valid
-            }) {
-                let part_address = &part.address;
-                println!(
-                    "  Skipping {part_address}: an existing partkey is already valid \
-                     through round {}",
-                    args.round_last_valid
-                );
-                continue;
-            }
-            if let Err(e) = rt.block_on(renew_one(
-                &client,
-                &part.address,
-                args.round_last_valid,
-                args.key_dilution,
-            )) {
-                let part_address = &part.address;
-                eprintln!("  Renew failed for {part_address}: {e}");
-                had_error = true;
-            }
+    let Ok(rt) = build_runtime() else {
+        return ExitCode::from(1);
+    };
+    let rounds = match renew_rounds(&rt, &endpoint, &dd) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
         }
+    };
+    let earliest = rounds.current_round.saturating_add(rounds.max_txn_life);
+    if args.round_last_valid <= earliest {
+        eprintln!(
+            "{}",
+            format_message(ERR_LAST_ROUND_INVALID, &[&rounds.current_round.to_string()])
+        );
+        return ExitCode::from(1);
     }
-    if had_error {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
+    // Make sure there is no key valid for (or after) roundLastValid already.
+    let parts = match list_part_keys(&rt, &endpoint) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(p) = parts
+        .iter()
+        .find(|p| p.address == args.address && p.key.vote_last_valid >= args.round_last_valid)
+    {
+        eprintln!(
+            "{}",
+            format_message(
+                ERR_EXISTING_PART_KEY,
+                &[
+                    &args.round_last_valid.to_string(),
+                    &p.key.vote_last_valid.to_string()
+                ]
+            )
+        );
+        return ExitCode::from(1);
+    }
+    let flags = RenewFlags {
+        fee: args.fee,
+        dilution: args.key_dilution.unwrap_or(0),
+        wallet: args.wallet.as_deref(),
+        no_wait: args.no_wait,
+        rekey_to: args.rekey_to.as_deref().unwrap_or(""),
+    };
+    if let Err(e) = generate_and_register_part_key(
+        &rt,
+        &endpoint,
+        &dd,
+        &args.address,
+        rounds.current_round,
+        args.round_last_valid,
+        earliest,
+        &flags,
+    ) {
+        eprintln!("{e}");
+        return ExitCode::from(1);
+    }
+    println!(
+        "\nGenerated with goal v{}",
+        crate::cmd::info::current_version_string()
+    );
+    ExitCode::SUCCESS
+}
+
+/// `account renewallpartkeys`: go's `renewAllParticipationKeyCmd`, every
+/// data dir (`OnDataDirs`), a failed one reported as `  Error: <err>`
+/// without failing the command.
+pub fn run_renewallpartkeys(args: RenewallpartkeysArgs, cli_d: Vec<PathBuf>) -> ExitCode {
+    let Ok(rt) = build_runtime() else {
+        return ExitCode::from(1);
+    };
+    let flags = RenewFlags {
+        fee: args.fee,
+        dilution: args.key_dilution.unwrap_or(0),
+        wallet: args.wallet.as_deref(),
+        no_wait: args.no_wait,
+        rekey_to: args.rekey_to.as_deref().unwrap_or(""),
+    };
+    let ran = data_dir::on_data_dirs(&cli_d, |dd| {
+        println!("Renewing participation keys in {}...", dd.display());
+        if let Err(e) = renew_part_keys_in_dir(&rt, dd, args.round_last_valid, &flags) {
+            eprintln!("  Error: {e}");
+        }
+    });
+    match ran {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        }
     }
 }
 
-/// Issue one renew via the REST generate endpoint. Uses
-/// `first = current_round` (matches Go's `client.GenParticipationKeys`
-/// call which passes `currentRound` as first) and the requested
-/// `last`. Status fetch picks up `last_round` from `/v2/status`.
-async fn renew_one(
-    client: &algo_rest_client::AlgodClient,
-    address: &str,
-    round_last_valid: u64,
-    key_dilution: Option<u64>,
+/// go's `renewPartKeysInDir`.
+fn renew_part_keys_in_dir(
+    rt: &tokio::runtime::Runtime,
+    dd: &Path,
+    last_valid_round: u64,
+    flags: &RenewFlags<'_>,
 ) -> Result<(), String> {
-    use algo_rest_client::BlockSource;
-    let status = BlockSource::get_status(client)
-        .await
-        .map_err(|e| e.to_string())?;
-    let first = status.last_round;
-    // Go's renew commands require `roundLastValid > currentRound +
-    // MaxTxnLife` (account.go:1074-1076 + 1180-1184) — the generated
-    // key must stay valid long enough for the keyreg-online
-    // transaction to land. We don't have the consensus-param table
-    // loaded, so use the typical default MaxTxnLife=1000. Operators
-    // who know their consensus version can bypass via a wider window.
-    // Codex round-1 finding.
-    const TYPICAL_MAX_TXN_LIFE: u64 = 1000;
-    let earliest_valid = first.saturating_add(TYPICAL_MAX_TXN_LIFE);
-    if round_last_valid <= earliest_valid {
-        return Err(format!(
-            "--roundLastValid ({round_last_valid}) must be greater than \
-             current round ({first}) + MaxTxnLife (~{TYPICAL_MAX_TXN_LIFE}) = {earliest_valid}"
+    let Ok(endpoint) = ensure_algod_endpoint(dd) else {
+        std::process::exit(1);
+    };
+    // The accounts to renew: every account with a key, with its latest one.
+    let parts = list_part_keys(rt, &endpoint)?;
+    let mut renew_accounts: Vec<algo_rest_client::ParticipationKey> = Vec::new();
+    for part in parts {
+        match renew_accounts
+            .iter_mut()
+            .find(|p| p.address == part.address)
+        {
+            // go keeps the key it saw first when that one starts after this
+            // one ends.
+            Some(existing) if existing.key.vote_first_valid >= part.key.vote_last_valid => {}
+            Some(existing) => *existing = part,
+            None => renew_accounts.push(part),
+        }
+    }
+    let rounds = renew_rounds(rt, &endpoint, dd)?;
+    let earliest = rounds.current_round.saturating_add(rounds.max_txn_life);
+    if last_valid_round <= earliest {
+        return Err(format_message(
+            ERR_LAST_ROUND_INVALID,
+            &[&rounds.current_round.to_string()],
         ));
     }
-    println!("Renewing participation key for {address} (rounds {first}..{round_last_valid})");
-    client
-        .generate_participation_keys(address, first, round_last_valid, key_dilution)
-        .await
-        .map_err(|e| e.to_string())?;
-    println!("  Participation key generation requested");
+    let mut any_errors = false;
+    for renew_part in &renew_accounts {
+        let vote_last_valid = renew_part.key.vote_last_valid;
+        if vote_last_valid >= last_valid_round {
+            println!(
+                "  Skipping account {}: Already has a part key valid beyond {last_valid_round} (currently {vote_last_valid})",
+                renew_part.address
+            );
+            continue;
+        }
+        // go: an account whose latest key ends before roundLastValid is left
+        // to an explicit `renewpartkey`, so no account reaches the renewal
+        // below (as in go v5.0.5-stable).
+        if vote_last_valid < last_valid_round {
+            println!(
+                "  Skipping account {}: This account has part keys that have expired.  Please renew this account explicitly using 'renewpartkey'",
+                renew_part.address
+            );
+            continue;
+        }
+        let address = &renew_part.address;
+        if let Err(e) = generate_and_register_part_key(
+            rt,
+            &endpoint,
+            dd,
+            address,
+            rounds.current_round,
+            last_valid_round,
+            earliest,
+            flags,
+        ) {
+            eprintln!("  Error renewing part key for account {address}: {e}");
+            any_errors = true;
+        }
+    }
+    if any_errors {
+        return Err("one or more renewal attempts had errors".to_string());
+    }
     Ok(())
 }
 

@@ -285,13 +285,9 @@ const ON_COMPLETION_UPDATE_APPLICATION: u64 = 4;
 /// `--clear-prog`/`--clear-prog-raw` into compiled program bytes. Mirrors
 /// Go's `mustParseProgArgs` (`application.go:472-494`): exactly one of the
 /// (uncompiled TEAL) / (compiled bytecode) pair is required for each
-/// program; the uncompiled source is compiled via the node's
-/// `POST /v2/teal/compile` (goal-rust compiles server-side here rather than
-/// with a local assembler as Go's `assembleFile` does; `clerk compile` itself
-/// assembles locally).
+/// program; the uncompiled source is assembled locally, like go's
+/// `assembleFile(fname, false)`.
 fn resolve_programs(
-    algod: &AlgodClient,
-    rt: &tokio::runtime::Runtime,
     approval_prog: Option<&Path>,
     approval_prog_raw: Option<&Path>,
     clear_prog: Option<&Path>,
@@ -304,39 +300,20 @@ fn resolve_programs(
         return Err("Exactly one of --clear-prog or --clear-prog-raw is required".into());
     }
     let approval = match approval_prog {
-        Some(p) => compile_via_node(algod, rt, p)?,
+        Some(p) => crate::cmd::clerk::assemble_file(&p.to_string_lossy())?,
         None => {
             let p = approval_prog_raw.expect("checked above");
             std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?
         }
     };
     let clear = match clear_prog {
-        Some(p) => compile_via_node(algod, rt, p)?,
+        Some(p) => crate::cmd::clerk::assemble_file(&p.to_string_lossy())?,
         None => {
             let p = clear_prog_raw.expect("checked above");
             std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?
         }
     };
     Ok((approval, clear))
-}
-
-fn compile_via_node(
-    algod: &AlgodClient,
-    rt: &tokio::runtime::Runtime,
-    path: &Path,
-) -> Result<Vec<u8>, String> {
-    let source = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let result = rt
-        .block_on(algod.teal_compile(&source))
-        .map_err(|e| format!("Could not assemble: {e}"))?;
-    base64::engine::general_purpose::STANDARD
-        .decode(&result.result)
-        .map_err(|e| {
-            format!(
-                "{}: node returned an undecodable program: {e}",
-                path.display()
-            )
-        })
 }
 
 /// The common fee/validity/note/lease/rekey header, resolved from
@@ -380,7 +357,8 @@ fn resolve_txn_header(
         first_valid: first,
         last_valid: last,
         genesis_hash: params.genesis_hash.0,
-        genesis_id: params.genesis_id.clone(),
+        // go's `FillUnsignedTxTemplate` sets the genesis hash only.
+        genesis_id: String::new(),
         note,
         lease,
         rekey_to,
@@ -656,8 +634,6 @@ fn run_create_inner(args: CreateArgs, wallet: Option<String>) -> Result<ExitCode
         .build()
         .map_err(|e| format!("Error processing command: {e}"))?;
     let (approval_prog, clear_prog) = resolve_programs(
-        &algod,
-        &rt,
         args.programs.approval_prog.as_deref(),
         args.programs.approval_prog_raw.as_deref(),
         args.programs.clear_prog.as_deref(),
@@ -754,8 +730,6 @@ fn run_update_inner(args: UpdateArgs, wallet: Option<String>) -> Result<ExitCode
         .build()
         .map_err(|e| format!("Error processing command: {e}"))?;
     let (approval_prog, clear_prog) = resolve_programs(
-        &algod,
-        &rt,
         args.programs.approval_prog.as_deref(),
         args.programs.approval_prog_raw.as_deref(),
         args.programs.clear_prog.as_deref(),
@@ -1447,8 +1421,6 @@ fn run_method_inner(args: MethodArgs, wallet: Option<String>) -> Result<ExitCode
     let (approval_prog, clear_prog) =
         if args.create || on_completion == ON_COMPLETION_UPDATE_APPLICATION {
             let (a, c) = resolve_programs(
-                &algod,
-                &rt,
                 args.approval_prog.as_deref(),
                 args.approval_prog_raw.as_deref(),
                 args.clear_prog.as_deref(),

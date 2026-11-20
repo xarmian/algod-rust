@@ -2639,6 +2639,7 @@ dependencies = [
  "algo-error",
  "algo-kmd-api-types",
  "algo-kmd-client",
+ "algo-ledger",
  "algo-netdeploy",
  "algo-rest-client",
  "algo-txn-pipeline",

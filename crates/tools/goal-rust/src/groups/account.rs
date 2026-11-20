@@ -187,15 +187,11 @@ pub struct AssetdetailsArgs {
     pub next: Option<String>,
 }
 
-/// `account renewpartkey --address <addr> --roundLastValid <r>
-/// [--keyDilution <n>]`. Mirrors Go's
-/// `renewParticipationKeyCmd` (account.go:1053-1099).
-///
-/// **Divergences (documented):**
-/// - Same algokey-rust-no-lib limitation as addpartkey: uses B9's
-///   REST generate endpoint (server-side generation + install).
-/// - Like go's, the new key is registered online right after it is
-///   generated.
+/// `account renewpartkey -a <addr> --roundLastValid <r> [--keyDilution <n>]
+/// [-f <fee>] [-N] [--rekey-to <addr>] [-w <wallet>]`. Mirrors Go's
+/// `renewParticipationKeyCmd`: the key is generated locally
+/// (`GenParticipationKeys`), installed and registered online with the
+/// wallet of `-w`.
 #[derive(Args, Debug)]
 pub struct RenewpartkeyArgs {
     #[arg(short = 'a', long = "address")]
@@ -206,6 +202,18 @@ pub struct RenewpartkeyArgs {
     /// Optional key dilution.
     #[arg(long = "keyDilution", alias = "key-dilution")]
     pub key_dilution: Option<u64>,
+    /// The fee of the status change transaction (0: the suggested fee).
+    #[arg(short = 'f', long = "fee", default_value_t = 0)]
+    pub fee: u64,
+    /// Don't wait for the transaction to commit.
+    #[arg(short = 'N', long = "no-wait")]
+    pub no_wait: bool,
+    /// Rekey the account to this address.
+    #[arg(long = "rekey-to")]
+    pub rekey_to: Option<String>,
+    /// The wallet that signs the status change transaction.
+    #[arg(short = 'w', long = "wallet")]
+    pub wallet: Option<String>,
 }
 
 /// `account changeonlinestatus -a <addr> [-o=false] [--firstvalid <r>]
@@ -286,6 +294,18 @@ pub struct RenewallpartkeysArgs {
     pub round_last_valid: u64,
     #[arg(long = "keyDilution", alias = "key-dilution")]
     pub key_dilution: Option<u64>,
+    /// The fee of the status change transactions (0: the suggested fee).
+    #[arg(short = 'f', long = "fee", default_value_t = 0)]
+    pub fee: u64,
+    /// Don't wait for the transactions to commit.
+    #[arg(short = 'N', long = "no-wait")]
+    pub no_wait: bool,
+    /// Rekey the accounts to this address.
+    #[arg(long = "rekey-to")]
+    pub rekey_to: Option<String>,
+    /// The wallet that signs the status change transactions.
+    #[arg(short = 'w', long = "wallet")]
+    pub wallet: Option<String>,
 }
 
 /// `account addpartkey --address <addr> --roundFirstValid <r> --roundLastValid <r> [--keyDilution <n>]`.
@@ -518,7 +538,7 @@ pub fn run(cmd: AccountCmd) -> ExitCode {
         AccountCmd::Partkeyinfo => h::run_partkeyinfo(datadirs()),
         AccountCmd::Rename(args) => h::run_rename(args, datadirs()),
         AccountCmd::Renewallpartkeys(args) => h::run_renewallpartkeys(args, datadirs()),
-        AccountCmd::Renewpartkey(args) => h::run_renewpartkey(args, datadirs(), kmddir()),
+        AccountCmd::Renewpartkey(args) => h::run_renewpartkey(args, datadirs()),
         AccountCmd::Rewards(args) => h::run_rewards(args, datadirs()),
     }
 }

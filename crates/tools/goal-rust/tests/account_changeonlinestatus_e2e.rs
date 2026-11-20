@@ -18,9 +18,9 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `goal-rust account changeonlinestatus / marknonparticipating` and
-//! `renewpartkey` (which registers the new key, like go's) E2E (TASK-244 /
-//! B12).
+//! `goal-rust account changeonlinestatus / marknonparticipating` E2E
+//! (TASK-244 / B12); `renewpartkey` is covered against go's own output by
+//! `wallet_password_e2e.rs` (issue #2474).
 //!
 //! Drives the full build → sign → submit → confirm pipeline: a real spawned
 //! `kmd-rust` signs the keyreg transaction (so the wallet/handle/signing path
@@ -193,11 +193,6 @@ struct AlgodState {
     last_round: u64,
     /// Raw bodies POSTed to /v2/transactions (the broadcast signed txns).
     submitted: Vec<Vec<u8>>,
-    /// Set once `/v2/participation/generate/*` has been called. Before that the
-    /// node reports only the pre-existing key; after, it also reports the freshly
-    /// generated one (so `renewpartkey`'s preflight passes, then the
-    /// register step finds the new key).
-    generated: bool,
 }
 
 fn spawn_mock_algod(
@@ -213,7 +208,6 @@ fn spawn_mock_algod(
         address,
         last_round,
         submitted: Vec::new(),
-        generated: false,
     }));
     let state_clone = state.clone();
 
@@ -238,10 +232,6 @@ fn spawn_mock_algod(
                             let body = &raw[idx + 4..];
                             state_clone.lock().unwrap().submitted.push(body.to_vec());
                         }
-                    }
-                    // A renew issues server-side key generation before registering.
-                    if method == "POST" && path_no_qs.starts_with("/v2/participation/generate/") {
-                        state_clone.lock().unwrap().generated = true;
                     }
 
                     let body = route(method, path_no_qs, &state_clone);
@@ -291,26 +281,12 @@ fn route(method: &str, path: &str, state: &Arc<Mutex<AlgodState>>) -> Vec<u8> {
     } else if path == "/v2/status" {
         serde_json::json!({ "last-round": st.last_round })
     } else if path == "/v2/participation" {
-        // The pre-existing key (always present). For the changeonlinestatus
-        // tests this is the key registered; for renew its short validity keeps
-        // the preflight (reject if a key already covers roundLastValid) happy.
-        let existing = part_entry(
+        // The key the changeonlinestatus tests register.
+        serde_json::json!([part_entry(
             &st.address,
             "PARTOLDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             4000,
-        );
-        if st.generated {
-            // After a renew's generation, also report the new longer-lived key,
-            // which choose_participation picks (farthest expiry).
-            let fresh = part_entry(
-                &st.address,
-                "PARTNEWAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                5000,
-            );
-            serde_json::json!([existing, fresh])
-        } else {
-            serde_json::json!([existing])
-        }
+        )])
     } else if path == "/v2/transactions" && method == "POST" {
         serde_json::json!({ "txId": "TXIDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" })
     } else if path.starts_with("/v2/transactions/pending/") {
@@ -470,54 +446,9 @@ fn marknonparticipating_warns_and_submits() {
         stdout.contains("Transaction id for mark-nonparticipating transaction:"),
         "missing mark-nonparticipating txid line; got {stdout:?}"
     );
-    assert!(
-        stderr.contains("permanent and irreversible"),
-        "missing irreversibility warning; got {stderr:?}"
-    );
     stop.store(true, Ordering::Relaxed);
 
     let submitted = &state.lock().unwrap().submitted;
     assert_eq!(submitted.len(), 1);
     assert_submitted_keyreg(&submitted[0], &addr, true);
-}
-
-#[test]
-fn renewpartkey_registers_the_new_key_online() {
-    let (_tmp, dd, kmd_dir) = setup_data_dir();
-    let _kmd = spawn_kmd(&kmd_dir);
-    let addr = create_wallet_and_account(&dd);
-    let (state, stop, port) = spawn_mock_algod(addr.clone(), 100);
-    wire_algod(&dd, port);
-
-    // Like go's, renewpartkey registers the new key with the default wallet
-    // (unencrypted here, so no password prompt).
-    let out = common::pty::run(
-        Path::new(GOAL_RUST_BIN),
-        &dd,
-        &[
-            "account",
-            "renewpartkey",
-            "-a",
-            &addr,
-            "--roundLastValid",
-            "5000",
-        ],
-        common::pty::Stdin::Null,
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(
-        out.code,
-        Some(0),
-        "renewpartkey failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        stdout.contains("Transaction id for status change transaction:"),
-        "register must broadcast a keyreg; got {stdout:?}"
-    );
-    stop.store(true, Ordering::Relaxed);
-
-    let submitted = &state.lock().unwrap().submitted;
-    assert_eq!(submitted.len(), 1, "register broadcasts one online keyreg");
-    assert_submitted_keyreg(&submitted[0], &addr, false);
 }
