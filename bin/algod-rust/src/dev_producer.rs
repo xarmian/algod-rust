@@ -132,7 +132,8 @@ fn payset_txids(block: &Block) -> Vec<Digest> {
 /// 3. Commit block + state atomically (`begin_block` → `put_block` →
 ///    `apply_block_with_mode(Execute)` → `commit_block`). Execute mode runs the
 ///    AVM, so a rejecting app program fails the apply and the whole commit rolls
-///    back (the submission errors; nothing is confirmed). No certificate is
+///    back; the rejected group is dropped and the block assembled again
+///    without it (see [`produce_dev_block`]). No certificate is
 ///    stored — dev blocks aren't agreed upon, so `get_block_cert` returns `None`
 ///    (a valid `{block}`-only envelope, exactly as for the genesis block).
 /// 4. `on_new_block` so the pool drops the now-committed transactions and
@@ -186,11 +187,31 @@ fn canonical_encode_dev_mode_certificate(round: u64) -> Vec<u8> {
 /// Returns the committed block plus the per-transaction [`ApplyData`] from the
 /// Execute apply (payset order), so the caller can surface created asset/app ids
 /// and eval deltas on confirmation (TASK-278).
+///
+/// A group the commit rejects is dropped from the pool and the block is
+/// assembled again without it, as go's `AssembleDevModeBlock` drops a group
+/// its fresh evaluator rejects and still writes the block (issue #2470): the
+/// submission succeeds and `pending/{txid}` reports the rejection.
 pub fn produce_dev_block(
     pool: &Arc<TransactionPool>,
     ledger: &Arc<Mutex<SqliteLedger>>,
     timestamp_offset: Option<i64>,
 ) -> anyhow::Result<(Block, Vec<ApplyData>)> {
+    // Each retry follows an eviction of at least one group, so this ends.
+    loop {
+        if let Some(produced) = produce_dev_block_once(pool, ledger, timestamp_offset)? {
+            return Ok(produced);
+        }
+    }
+}
+
+/// One assemble-and-commit attempt of [`produce_dev_block`]: `Ok(None)` when
+/// the commit rejected a group and that group was dropped from the pool.
+fn produce_dev_block_once(
+    pool: &Arc<TransactionPool>,
+    ledger: &Arc<Mutex<SqliteLedger>>,
+    timestamp_offset: Option<i64>,
+) -> anyhow::Result<Option<(Block, Vec<ApplyData>)>> {
     let mut block = pool
         .assemble_dev_mode_block()
         .map_err(|e| anyhow::anyhow!("assemble dev-mode block: {e}"))?;
@@ -306,14 +327,13 @@ pub fn produce_dev_block(
                 // single transaction owns drops the block's groups (a dev
                 // block is the pool's whole content). A storage failure says
                 // nothing about the payset: the pool is left as it is.
-                match rejected {
-                    Some(Some(index)) => {
-                        evict_failed_group(pool, &block, index, &e);
-                    }
-                    Some(None) => {
-                        pool.evict_groups(&committed_txids, &e);
-                    }
-                    None => {}
+                let evicted = match rejected {
+                    Some(Some(index)) => evict_failed_group(pool, &block, index, &e),
+                    Some(None) => pool.evict_groups(&committed_txids, &e),
+                    None => 0,
+                };
+                if evicted > 0 {
+                    return Ok(None);
                 }
                 return Err(anyhow::anyhow!(message));
             }
@@ -323,7 +343,7 @@ pub fn produce_dev_block(
     // Advance the pool past the committed block: drops confirmed transactions
     // and rebuilds the evaluator for the next round.
     pool.on_new_block(&block, &committed_txids);
-    Ok((block, apply_data))
+    Ok(Some((block, apply_data)))
 }
 
 /// Evict from `pool` the group of `block.payset[index]` (payset form: the

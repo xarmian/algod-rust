@@ -19,12 +19,18 @@ name: Simulate rewards oracle drift check
 # staged into the go-algorand checkout's ledger/simulation package) and diffs
 # crates/core/algo-validate/tests/fixtures/pq_failure_texts.jsonl.
 #
+# Issue #2470: it also re-runs tools/simulate-request-text-oracle (a test
+# file staged into daemon/algod/api/server/v2/test) and diffs
+# crates/node/algo-rest-api/tests/fixtures/simulate_request_texts.jsonl.
+#
 # Building go-algorand's ledger requires cgo + the vendored libsodium fork
 # (see CLAUDE.md's CI Workflows section) -- `make libsodium` below.
 
 on:
   pull_request:
     paths:
+      - "tools/simulate-request-text-oracle/**"
+      - "crates/node/algo-rest-api/tests/fixtures/simulate_request_texts.jsonl"
       - "tools/simulate-rewards-oracle/**"
       - "crates/core/algo-ledger/tests/fixtures/simulate_rewards/**"
       - "crates/core/algo-ledger/tests/fixtures/simulate_checkdup/**"
@@ -35,6 +41,8 @@ on:
   push:
     branches: [main]
     paths:
+      - "tools/simulate-request-text-oracle/**"
+      - "crates/node/algo-rest-api/tests/fixtures/simulate_request_texts.jsonl"
       - "tools/simulate-rewards-oracle/**"
       - "crates/core/algo-ledger/tests/fixtures/simulate_rewards/**"
       - "crates/core/algo-ledger/tests/fixtures/simulate_checkdup/**"
@@ -111,5 +119,19 @@ jobs:
           rm -f "$STAGED"
           git diff --exit-code -- crates/core/algo-validate/tests/fixtures/pq_failure_texts.jsonl || {
             echo "::error::pq_failure_texts.jsonl is stale -- regenerate via tools/pq-failure-text-oracle/run-in-docker.sh against the pinned go-algorand checkout and commit the result"
+            exit 1
+          }
+
+      - name: Run the simulate request-text oracle and diff against the committed fixture
+        run: |
+          set -euo pipefail
+          GO_ALGORAND="$(dirname "$GITHUB_WORKSPACE")/go-algorand"
+          STAGED="$GO_ALGORAND/daemon/algod/api/server/v2/test/zz_algod_rust_simulate_request_text_oracle_test.go"
+          cp tools/simulate-request-text-oracle/oracle_test.go "$STAGED"
+          (cd "$GO_ALGORAND" && ORACLE_OUT="$GITHUB_WORKSPACE/crates/node/algo-rest-api/tests/fixtures/simulate_request_texts.jsonl" \
+            go test -count=1 -run '^TestAlgodRustSimulateRequestTextOracle$' ./daemon/algod/api/server/v2/test/)
+          rm -f "$STAGED"
+          git diff --exit-code -- crates/node/algo-rest-api/tests/fixtures/simulate_request_texts.jsonl || {
+            echo "::error::simulate_request_texts.jsonl is stale -- regenerate via tools/simulate-request-text-oracle/run-in-docker.sh against the pinned go-algorand checkout and commit the result"
             exit 1
           }

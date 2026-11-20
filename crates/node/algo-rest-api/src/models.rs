@@ -1760,6 +1760,15 @@ pub struct SimulateTraceConfig {
     pub state_change: Option<bool>,
 }
 
+/// Decode a list that may be `null`, as go decodes `null` into a nil slice.
+fn null_as_empty<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// A transaction group in a simulate request.
 ///
 /// Matches go-algorand's `model.SimulateRequestTransactionGroup`.
@@ -1767,7 +1776,9 @@ pub struct SimulateTraceConfig {
 pub struct SimulateRequestTransactionGroup {
     /// Signed transactions in this group. Uses `serde_json::Value` to match
     /// go-algorand's `json.RawMessage` -- the handler handles msgpack
-    /// decoding separately.
+    /// decoding separately. Absent or `null` decodes to none, like go's nil
+    /// slice (go's own JSON encoder writes an empty group as `"txns":null`).
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub txns: Vec<serde_json::Value>,
 }
 
@@ -1806,7 +1817,8 @@ pub struct SimulateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub round: Option<u64>,
 
-    #[serde(rename = "txn-groups")]
+    /// Absent or `null` decodes to none, like go's nil slice (issue #2470).
+    #[serde(rename = "txn-groups", default, deserialize_with = "null_as_empty")]
     pub txn_groups: Vec<SimulateRequestTransactionGroup>,
 
     /// Decoded transaction groups. Populated by the handler after decoding

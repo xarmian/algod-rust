@@ -7445,7 +7445,10 @@ async fn get_pending_transactions_returns_list() {
     // issue #2304: go's JSON form, byte fields as base64 strings (never integer arrays)
     let txn = &top[0]["txn"];
     assert!(txn["gh"].is_string(), "gh must be base64: {txn}");
-    assert!(txn["snd"].is_string(), "snd must be an address string: {txn}");
+    assert!(
+        txn["snd"].is_string(),
+        "snd must be an address string: {txn}"
+    );
 }
 
 #[tokio::test]
@@ -8251,9 +8254,14 @@ async fn simulate_empty_body_returns_400() {
     assert_eq!(resp.status(), 400);
 }
 
+/// go's handler has no check of its own for an empty `txn-groups`: the
+/// request reaches the node, whose simulator answers "expected 1 transaction
+/// group, got 0" (issue #2470; the real simulator's response is pinned by
+/// `simulate_request_validation_responses_match_go` in `bin/algod-rust`).
 #[tokio::test]
-async fn simulate_empty_txn_groups_returns_400() {
+async fn simulate_empty_txn_groups_reaches_the_node() {
     let node = MockNode::synced();
+    let log = node.simulate_log.clone();
     let server = TestServer::start(node).await;
 
     let request_json = serde_json::json!({
@@ -8270,7 +8278,11 @@ async fn simulate_empty_txn_groups_returns_400() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400);
+    // The mock node has no simulator: it answers 500 "simulate not implemented".
+    assert_eq!(resp.status(), 500);
+    let log = log.lock().unwrap();
+    assert_eq!(log.len(), 1, "the node is asked to simulate");
+    assert!(log[0].txn_groups.is_empty());
 }
 
 #[tokio::test]
@@ -8841,14 +8853,27 @@ async fn simulate_msgpack_with_binary_fields_decodes_like_json() {
     assert_eq!(seen[0].decoded_txn_groups[0][0].sig, stxn.sig);
 }
 
+/// go reads the format option only to encode a successful simulation
+/// (`getCodecHandle` after `Node.Simulate`, handlers.go SimulateTransaction):
+/// a failing request answers its own error whatever the format (issue #2470,
+/// `simulate_request_texts.jsonl`), a successful one this text.
 #[tokio::test]
 async fn simulate_invalid_format_returns_400() {
-    let node = MockNode::synced();
+    let mut node = MockNode::synced();
+    node.simulate_result = Some(algo_rest_api::models::SimulateResponse {
+        version: 2,
+        last_round: 1000,
+        txn_groups: Vec::new(),
+        eval_overrides: None,
+        exec_trace_config: None,
+        initial_states: None,
+    });
     let server = TestServer::start(node).await;
 
+    let stx_val = serde_json::to_value(SignedTransaction::default()).unwrap();
     let request_json = serde_json::json!({
         "txn-groups": [{
-            "txns": [{"txn": {"type": "pay"}}]
+            "txns": [stx_val]
         }]
     });
     let body = serde_json::to_vec(&request_json).unwrap();
@@ -8863,6 +8888,11 @@ async fn simulate_invalid_format_returns_400() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
+    assert_eq!(
+        resp.text().await.unwrap(),
+        "{\"message\":\"failed to parse the format option\"}
+"
+    );
 }
 
 /// The simulate endpoint enforces go-algorand's 1MB request body limit

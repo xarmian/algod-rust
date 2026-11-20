@@ -2324,16 +2324,13 @@ impl NodeInterface for AlgodNodeInterface {
                         Ok::<(), NodeError>(())
                     }
                     Err(e) => {
-                        // The block (including this just-remembered group) failed
-                        // to commit. `produce_dev_block` already dropped the
-                        // rejected group from the pool (go's dev assembly drops
-                        // a group its evaluator rejects), with the rejection as
-                        // its `pending/{txid}` reason, so nothing wedges later
-                        // blocks. The pool is not reset: that would discard the
-                        // rebuilt evaluator and the reason (go never resets it).
-                        Err(NodeError::BadRequest(format!(
-                            "dev block production rejected the group: {e}"
-                        )))
+                        // No block could be written (a group the commit rejects
+                        // is dropped and the block written without it, like
+                        // go's dev assembly). go's `BroadcastSignedTxGroup`
+                        // returns `writeDevmodeBlock`'s error as is and the
+                        // handler answers it bare (issue #2470). The pool is
+                        // not reset: go never resets it.
+                        Err(NodeError::BadRequest(e.to_string()))
                     }
                 }
             })
@@ -5010,9 +5007,11 @@ mod tests {
     }
 
     /// A dev-mode commit that rejects the submitted group drops that group
-    /// with the rejection as its reason, end to end: `pending/{txid}`
-    /// reports it (the pool is not reset), and the next submission still
-    /// produces a block (issue #2127).
+    /// with the rejection as its reason and still writes the block, as go's
+    /// `AssembleDevModeBlock` drops a group its evaluator rejects and
+    /// `writeDevmodeBlock` writes what remains (issue #2470): the submission
+    /// succeeds, `pending/{txid}` reports the rejection (the pool is not
+    /// reset), and the next submission produces the next block (issue #2127).
     #[tokio::test]
     async fn dev_mode_commit_rejection_is_reported_by_pending_lookup() {
         use algo_types::{Round, Transaction, TxnType};
@@ -5038,19 +5037,23 @@ mod tests {
         };
 
         let (rejected, rejected_id) = pay(crate::dev_producer::test_hooks::REJECT_NOTE);
-        let err = adapter
+        adapter
             .broadcast_signed_tx_group(vec![rejected])
             .await
-            .expect_err("the dev-mode commit rejects the group");
-        assert!(
-            err.to_string()
-                .contains("dev block production rejected the group"),
-            "{err}"
-        );
+            .expect("go answers the submission as accepted");
         assert_eq!(
             ledger.lock().unwrap().current_round().0,
-            0,
-            "nothing committed"
+            1,
+            "the block is written without the rejected group"
+        );
+        assert!(
+            adapter
+                .get_block(1)
+                .await
+                .expect("block 1")
+                .payset
+                .is_empty(),
+            "the rejected group is not in the block"
         );
 
         let status = adapter
@@ -5072,13 +5075,13 @@ mod tests {
             .broadcast_signed_tx_group(vec![ok])
             .await
             .expect("the next submission produces a block");
-        assert_eq!(ledger.lock().unwrap().current_round().0, 1);
+        assert_eq!(ledger.lock().unwrap().current_round().0, 2);
         let status = adapter
             .get_pending_transaction(&ok_id)
             .await
             .expect("lookup ok")
             .expect("confirmed");
-        assert_eq!(status.confirmed_round, 1);
+        assert_eq!(status.confirmed_round, 2);
     }
 
     /// A rekey-authorizer failure submitted to a node (issue #2130): the
@@ -6646,6 +6649,65 @@ err
             }
             other => panic!("expected BadRequest(invalid request), got {other:?}"),
         }
+    }
+
+    /// Issue #2470: every request-validation failure of `POST
+    /// /v2/transactions/simulate` answers with go v5.0.5-stable's exact HTTP
+    /// status and body. The expected responses come from go's own
+    /// `Handlers.SimulateTransaction` over a real simulator
+    /// (`tools/simulate-request-text-oracle`, re-checked in CI by
+    /// `simulate-rewards-oracle.yml`); here the same request bytes go through
+    /// the full REST router onto the real adapter and simulator.
+    #[tokio::test]
+    async fn simulate_request_validation_responses_match_go() {
+        use tower::ServiceExt;
+
+        const FIXTURE: &str = include_str!(
+            "../../../crates/node/algo-rest-api/tests/fixtures/simulate_request_texts.jsonl"
+        );
+        let router = algo_rest_api::router::build_router(
+            Arc::new(make_adapter()),
+            algo_rest_api::router::TokenConfig {
+                api_token: "t".repeat(64),
+                admin_token: "a".repeat(64),
+                enable_experimental_api: false,
+                disable_api_auth: true,
+                enable_private_network_access_header: false,
+            },
+        );
+        let mut cases = 0;
+        for line in FIXTURE.lines().filter(|l| !l.trim().is_empty()) {
+            let case: serde_json::Value = serde_json::from_str(line).expect("fixture line");
+            let name = case["name"].as_str().expect("name");
+            let mut body = hex::decode(case["body_hex"].as_str().expect("body_hex")).expect("hex");
+            if let Some(pad_to) = case["pad_to"].as_u64() {
+                body.resize(pad_to as usize, b' ');
+            }
+            let uri = match case["format"].as_str().unwrap_or_default() {
+                "" => "/v2/transactions/simulate".to_string(),
+                f => format!("/v2/transactions/simulate?format={f}"),
+            };
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .body(axum::body::Body::from(body))
+                .expect("request");
+            let response = router.clone().oneshot(request).await.expect("response");
+            let status = response.status().as_u16();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            assert_eq!(
+                (status, String::from_utf8_lossy(&bytes).into_owned()),
+                (
+                    case["status"].as_u64().expect("status") as u16,
+                    case["response"].as_str().expect("response").to_string()
+                ),
+                "{name}"
+            );
+            cases += 1;
+        }
+        assert!(cases >= 19, "fixture has {cases} cases");
     }
 
     /// Build a simulate request with one dummy transaction and an

@@ -3289,12 +3289,6 @@ pub async fn simulate_transaction<N: NodeInterface>(
     Query(format_params): Query<FormatParams>,
     body: axum::body::Bytes,
 ) -> Response {
-    // Negotiate response format
-    let resp_format = match format::negotiate_format(&format_params) {
-        Ok(f) => f,
-        Err(e) => return *e,
-    };
-
     // Check catchpoint status
     let status = match node.status().await {
         Ok(s) => s,
@@ -3308,7 +3302,7 @@ pub async fn simulate_transaction<N: NodeInterface>(
     // the body in `http.MaxBytesReader(nil, body, MaxSimulateBytes)` and
     // returns 400 when the read overflows (handlers.go SimulateTransaction).
     if body.len() > MAX_SIMULATE_BYTES {
-        return error::bad_request("request body too large");
+        return error::bad_request(REQUEST_BODY_TOO_LARGE);
     }
 
     // go decodes the body into `PreEncodedSimulateRequest` with the strict
@@ -3344,26 +3338,6 @@ pub async fn simulate_transaction<N: NodeInterface>(
             }
         },
     };
-
-    // Validate: must have at least one transaction group
-    if request.txn_groups.is_empty() {
-        return error::bad_request("empty txn-groups");
-    }
-
-    // Validate: check group sizes
-    let max_group_size = node.max_tx_group_size();
-    for (i, group) in request.txn_groups.iter().enumerate() {
-        if group.txns.is_empty() {
-            return error::bad_request(format!("txn-groups[{i}] has no transactions"));
-        }
-        if group.txns.len() > max_group_size {
-            return error::bad_request(format!(
-                "txn-groups[{i}] has {} transactions, max group size is {}",
-                group.txns.len(),
-                max_group_size
-            ));
-        }
-    }
 
     // Decode each transaction to SignedTransaction. A msgpack body, and a JSON
     // body in go's own JSON form, carry each transaction's msgpack bytes in
@@ -3402,9 +3376,29 @@ pub async fn simulate_transaction<N: NodeInterface>(
     }
     request.decoded_txn_groups = decoded_groups;
 
+    // go checks each group's size once the whole body has decoded; the group
+    // count (none, or more than one) is the simulator's own check, with its
+    // own text (handlers.go SimulateTransaction, simulator.go Simulate).
+    let max_group_size = node.max_tx_group_size();
+    for group in &request.txn_groups {
+        if group.txns.is_empty() {
+            return error::bad_request("empty txgroup");
+        }
+        if group.txns.len() > max_group_size {
+            return error::bad_request(format!(
+                "transaction group size {} exceeds protocol max {max_group_size}",
+                group.txns.len()
+            ));
+        }
+    }
+
     // Call the node's simulate method
     match node.simulate(request).await {
-        Ok(response) => format::encode_response(&response, resp_format),
+        // go reads the format option only to encode a successful result.
+        Ok(response) => match format::negotiate_format(&format_params) {
+            Ok(resp_format) => format::encode_response(&response, resp_format),
+            Err(e) => *e,
+        },
         Err(NodeError::NotFound(msg)) => error::not_found(msg),
         Err(NodeError::BadRequest(msg)) => error::bad_request(msg),
         // A simulated app-call/logicsig failure carrying structured
