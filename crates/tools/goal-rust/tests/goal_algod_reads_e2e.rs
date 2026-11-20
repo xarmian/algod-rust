@@ -239,11 +239,19 @@ fn mp_u(n: u64) -> Vec<u8> {
     }
 }
 
+fn mp_map_head(n: usize) -> Vec<u8> {
+    if n < 16 {
+        vec![0x80 | n as u8]
+    } else {
+        [vec![0xde], (n as u16).to_be_bytes().to_vec()].concat()
+    }
+}
+
 /// A canonical msgpack map with string keys, sorted like go's msgp.
 fn mp_obj(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
     let mut sorted: Vec<&(&str, Vec<u8>)> = entries.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
-    let mut v = vec![0x80 | entries.len() as u8];
+    let mut v = mp_map_head(entries.len());
     for (k, e) in sorted {
         v.extend_from_slice(&s(k));
         v.extend_from_slice(e);
@@ -253,7 +261,7 @@ fn mp_obj(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
 
 /// A msgpack map with integer keys.
 fn mp_imap(entries: &[(u64, Vec<u8>)]) -> Vec<u8> {
-    let mut v = vec![0x80 | entries.len() as u8];
+    let mut v = mp_map_head(entries.len());
     for (k, e) in entries {
         v.extend_from_slice(&mp_u(*k));
         v.extend_from_slice(e);
