@@ -216,20 +216,35 @@ pub struct RenewpartkeyArgs {
     pub wallet: Option<String>,
 }
 
-/// `account changeonlinestatus -a <addr> [-o=false] [--firstvalid <r>]
-/// [--lastvalid <r>] [--fee <f>] [--no-wait] [-w <wallet>]`.
-/// Mirrors Go's `changeOnlineCmd` (account.go:873-928).
-///
-/// **Divergences (documented):**
-/// - The online path sources participation material from algod's
-///   `/v2/participation` (Go's `chooseParticipation`); Go's `--partkeyfile`
-///   (load from a local file) is out of scope — install the key first, then run
-///   this command.
-/// - `--signer`, `--lease`, `--txfile`, and `--validrounds` are not yet wired.
+/// `account changeonlinestatus [-a <addr>] [--partkeyfile <file>] [-o=false]
+/// [--firstvalid <r>] [--lastvalid <r> | -v <n>] [--fee <f>] [-x <lease>]
+/// [-S <signer>] [--rekey-to <addr>] [-t <txfile>] [--no-wait]
+/// [-w <wallet>]`. Mirrors Go's `changeOnlineCmd` and
+/// `changeAccountOnlineStatus` (`cmd/goal/account.go`). As in go, the online
+/// keyreg takes the node's participation key (`chooseParticipation`);
+/// `--partkeyfile` only names the account when `-a` is not given.
 #[derive(Args, Debug)]
 pub struct ChangeonlinestatusArgs {
-    #[arg(short = 'a', long = "address")]
+    #[arg(short = 'a', long = "address", default_value = "")]
     pub address: String,
+    /// Participation key file (required if no --address).
+    #[arg(long = "partkeyfile", default_value = "")]
+    pub partkeyfile: String,
+    /// Address of key to sign with, if different due to rekeying.
+    #[arg(short = 'S', long = "signer", default_value = "")]
+    pub signer: String,
+    /// The validity period for the status change transaction.
+    #[arg(short = 'v', long = "validrounds")]
+    pub valid_rounds: Option<u64>,
+    /// Lease value (base64, optional).
+    #[arg(short = 'x', long = "lease")]
+    pub lease: Option<String>,
+    /// Write status change transaction to this file.
+    #[arg(short = 't', long = "txfile", default_value = "")]
+    pub txfile: String,
+    /// Rekey account to the given spending key/address.
+    #[arg(long = "rekey-to", default_value = "")]
+    pub rekey_to: String,
     /// Set this account to online or offline. go's bool flag defaulting to
     /// true: `-o=false` / `--online=false` takes the account offline.
     #[arg(

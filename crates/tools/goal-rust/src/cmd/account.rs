@@ -1514,136 +1514,300 @@ async fn sign_submit_confirm(
     Ok(())
 }
 
-/// `account changeonlinestatus -a <addr> [--online|--offline] ...`. Mirrors
-/// Go's `changeOnlineCmd` + `changeAccountOnlineStatus` (account.go:873-972).
+/// `account changeonlinestatus`. Mirrors Go's `changeOnlineCmd` and
+/// `changeAccountOnlineStatus` (`cmd/goal/account.go`): every failure is
+/// go's text, in go's order.
 pub fn run_changeonlinestatus(
     args: ChangeonlinestatusArgs,
     cli_d: Vec<PathBuf>,
     kmd_dir_flag: Option<PathBuf>,
 ) -> ExitCode {
-    let sender = match algo_types::Address::from_algorand_string(&args.address) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("Could not parse address: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let data_dir_path = match data_dir::ensure_single_data_dir(&cli_d) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(1);
-        }
-    };
-    // go: `ensureFullClient(dataDir)`, which starts kmd; the wallet handle
-    // comes after the keyreg is built (`changeAccountOnlineStatus`).
-    let _ = kmd_dir_flag;
-    let endpoint = match crate::goal_client::ensure_algod_endpoint(
-        &data_dir_path,
-        crate::goal_client::ClientType::Full,
-    ) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(1);
-        }
-    };
-    let algod = algo_rest_client::AlgodClient::new(&endpoint.0, &endpoint.1);
-    let rt = match build_runtime() {
-        Ok(r) => r,
-        Err(()) => return ExitCode::from(1),
-    };
-
-    // go's `MakeUnsignedGoOnlineTx` (the node's participation key chosen by
-    // `chooseParticipation`) or `MakeUnsignedGoOfflineTx` (a bare keyreg
-    // clearing the account's voting keys).
-    let built = if args.online {
-        build_online_keyreg(
-            &rt,
-            &endpoint,
-            &algod,
-            &data_dir_path,
-            sender,
-            args.fee,
-            args.first_valid,
-            args.last_valid,
-        )
-    } else {
-        rt.block_on(build_offline_keyreg(
-            &algod,
-            &data_dir_path,
-            sender,
-            args.fee,
-            args.first_valid,
-            args.last_valid,
-        ))
-    };
-    let txn = match built {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(1);
-        }
-    };
-
-    // go: `ensureWalletHandleMaybePassword` → `makeAccountsList`.
-    let kmd = match build_wallet_handle_kmd_client(&data_dir_path) {
-        Ok(c) => c,
-        Err(()) => return ExitCode::from(1),
-    };
-    let mut accounts = match load_accounts(&data_dir_path) {
-        Ok(a) => a,
-        Err(()) => return ExitCode::from(1),
-    };
-    let (handle, _wallet_name, password) =
-        match resolve_wallet_and_init(&rt, &kmd, &mut accounts, args.wallet.as_deref()) {
-            Ok(v) => v,
-            Err(()) => return ExitCode::from(1),
-        };
-    let pipeline = algo_txn_pipeline::TxnPipeline::new(algod, Some(kmd));
-    match rt.block_on(sign_submit_confirm(
-        &pipeline,
-        &txn,
-        &handle,
-        &password,
-        args.no_wait,
-        "status change",
-    )) {
+    match change_online_status(args, &cli_d, kmd_dir_flag) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("{e}");
+            // go's `reportErrorf`/`reportErrorln`: the text, then a newline.
+            // An empty text: the helper that failed already reported it.
+            if !e.is_empty() {
+                eprintln!("{e}");
+            }
             ExitCode::from(1)
         }
     }
 }
 
-/// go's `MakeUnsignedGoOfflineTx`: a go-offline keyreg (clears the account's
-/// voting keys).
-async fn build_offline_keyreg(
-    algod: &algo_rest_client::AlgodClient,
-    data_dir: &Path,
-    sender: algo_types::Address,
-    fee: Option<u64>,
-    first_valid: Option<u64>,
+/// go's `checkTxValidityPeriodCmdFlags` (`cmd/goal/commands.go`).
+fn check_tx_validity_period_flags(
+    valid_rounds: Option<u64>,
     last_valid: Option<u64>,
-) -> Result<algo_types::Transaction, String> {
-    let params = algod
-        .suggested_transaction_params()
-        .await
-        .map_err(|e| algo_txn_pipeline::PipelineError::from(e).to_string())?;
-    let max_txn_life =
-        crate::cmd::clerk::resolve_max_txn_life(data_dir, &params.consensus_version)?;
-    let (first, last) = compute_validity(first_valid, last_valid, params.last_round, max_txn_life)?;
-    let mut txn = algo_txn_pipeline::KeyregBuilder::offline(sender)
-        .fee(fee.unwrap_or(0))
+) -> Result<(), String> {
+    if valid_rounds.is_some() && last_valid.is_some() {
+        return Err("Only one of [--validrounds] or [--lastvalid] can be specified".to_string());
+    }
+    if valid_rounds == Some(0) {
+        return Err("[--validrounds] can not be zero".to_string());
+    }
+    Ok(())
+}
+
+/// go's `scLeaseBytes`: the 32-byte `--lease`. Its error names go's other
+/// `lease` variable (`malformedLease, lease, err`), which this command never
+/// sets, so the value printed is empty.
+fn status_change_lease(lease: Option<&str>) -> Result<[u8; 32], String> {
+    let Some(raw) = lease else {
+        return Ok([0; 32]);
+    };
+    let malformed = |e: String| format!("Cannot base64-decode lease : {e}");
+    if let Err(at) = crate::go_json::go_base64_check(raw.as_bytes()) {
+        return Err(malformed(format!("illegal base64 data at input byte {at}")));
+    }
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        base64::engine::GeneralPurposeConfig::new()
+            .with_decode_allow_trailing_bits(true)
+            .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+    )
+    .decode(raw.replace(['\r', '\n'], ""))
+    .map_err(|e| malformed(e.to_string()))?;
+    if bytes.len() != 32 {
+        return Err(malformed(format!("lease length {} != 32", bytes.len())));
+    }
+    let mut out = [0; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// go's `MakeErasableAccessor(partKeyFile)` + `RestoreParticipation`: the
+/// parent address of the participation key in `path`.
+fn partkey_file_parent(path: &str) -> Result<algo_types::Address, String> {
+    use algo_ledger::erasable_db::{ErasableDb, Error as DbError};
+    let db = ErasableDb::open(path).map_err(|e| {
+        let e = match e {
+            DbError::Sqlite { source, .. } => source.to_string(),
+            other => other.to_string(),
+        };
+        format!("Cannot open partkey {path}: {e}\n")
+    })?;
+    let load = |e: String| format!("Cannot load partkey {path}: {e}\n");
+    // go's `Migrate` → `partMigrate` (`data/account/partInstall.go`): the
+    // `schema` table must name the `parttable` at version 3.
+    const UNSUPPORTED: &str = "unsupported participation file schema version (expected 3)";
+    let version: Option<i64> = db
+        .conn()
+        .query_row(
+            "SELECT version FROM schema WHERE tablename = 'parttable'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if version != Some(3) {
+        return Err(load(UNSUPPORTED.to_string()));
+    }
+    algo_ledger::participation::restore::restore_participation(&db)
+        .map(|p| p.parent)
+        .map_err(|e| load(e.to_string()))
+}
+
+fn change_online_status(
+    args: ChangeonlinestatusArgs,
+    cli_d: &[PathBuf],
+    kmd_dir_flag: Option<PathBuf>,
+) -> Result<(), String> {
+    check_tx_validity_period_flags(args.valid_rounds, args.last_valid)?;
+    let mut address = args.address.clone();
+    if address.is_empty() && args.partkeyfile.is_empty() {
+        return Err("Must specify one of --address or --partkeyfile\n".to_string());
+    }
+    if !args.partkeyfile.is_empty() && !args.online {
+        return Err("Going offline does not support --partkeyfile\n".to_string());
+    }
+    let data_dir_path = data_dir::ensure_single_data_dir(cli_d).map_err(|e| e.to_string())?;
+    // go: writing a txn needs no kmd (`ensureAlgodClient`), else
+    // `ensureFullClient`.
+    let _ = kmd_dir_flag;
+    let client_type = if args.txfile.is_empty() {
+        crate::goal_client::ClientType::Full
+    } else {
+        crate::goal_client::ClientType::Algod
+    };
+    let endpoint = crate::goal_client::ensure_algod_endpoint(&data_dir_path, client_type)
+        .map_err(|e| e.to_string())?;
+    if !args.partkeyfile.is_empty() {
+        let parent = partkey_file_parent(&args.partkeyfile)?;
+        if address.is_empty() {
+            address = parent.to_string();
+        }
+    }
+    let rt = build_runtime().map_err(|()| String::new())?;
+
+    // go's `client.ComputeValidityRounds(firstValid, lastValid,
+    // numValidRounds)`: the suggested params, the protocol's MaxTxnLife.
+    let params = crate::algod_rest::get(&rt, &endpoint, "/v2/transactions/params", &[])?;
+    let params: serde_json::Value = serde_json::from_slice(&params).map_err(|e| e.to_string())?;
+    let consensus_version = params["consensus-version"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let last_round = params["last-round"].as_u64().unwrap_or(0);
+    let suggested_fee = params["fee"].as_u64().unwrap_or(0);
+    let min_fee = params["min-fee"].as_u64().unwrap_or(0);
+    let genesis_hash: [u8; 32] = {
+        use base64::Engine as _;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(params["genesis-hash"].as_str().unwrap_or(""))
+            .map_err(|e| e.to_string())?;
+        let mut h = [0u8; 32];
+        if raw.len() == 32 {
+            h.copy_from_slice(&raw);
+        }
+        h
+    };
+    let max_txn_life = crate::cmd::clerk::resolve_max_txn_life(&data_dir_path, &consensus_version)?;
+    let (first, last) = crate::cmd::clerk::compute_validity(
+        args.first_valid,
+        args.last_valid,
+        args.valid_rounds,
+        last_round,
+        max_txn_life,
+    )?;
+    let lease = status_change_lease(args.lease.as_deref())?;
+
+    // go's `MakeUnsignedGoOnlineTx` / `MakeUnsignedGoOfflineTx`.
+    let sender = algo_avm::assembler::unmarshal_checksum_address(&address)?;
+    let sender = algo_types::Address(sender.try_into().expect("32-byte address"));
+    let fee = args.fee.unwrap_or(0);
+    let builder = if args.online {
+        let parts = list_part_keys_raw(&rt, &endpoint)?;
+        let part = choose_participation(&parts, &address, first).ok_or_else(|| {
+            format!(
+                "couldn't find a participation key database for address {address} valid at \
+                 round {first} in participation registry"
+            )
+        })?;
+        algo_txn_pipeline::KeyregBuilder::online(sender, &part.key).map_err(|e| e.to_string())?
+    } else {
+        algo_txn_pipeline::KeyregBuilder::offline(sender)
+    };
+    let mut txn = builder
+        .fee(fee)
         .validity(first, last)
-        .genesis_hash(params.genesis_hash.0)
+        .lease(lease)
+        .genesis_hash(genesis_hash)
         .build()
         .map_err(|e| e.to_string())?;
-    if fee.is_none() {
-        txn.fee = algo_txn_pipeline::estimate_fee(&txn, params.fee, params.min_fee);
+    if fee == 0 {
+        txn.fee = algo_txn_pipeline::estimate_fee(&txn, suggested_fee, min_fee);
     }
-    Ok(txn)
+    // go: `utx.RekeyTo = parseRekey(rekeyToAddress)`, after the fee.
+    if !args.rekey_to.is_empty() {
+        let rekey = algo_avm::assembler::unmarshal_checksum_address(&args.rekey_to)?;
+        txn.rekey_to = Some(algo_types::Address(
+            rekey.try_into().expect("32-byte address"),
+        ));
+    }
+
+    if !args.txfile.is_empty() {
+        return write_status_change_txn(&rt, &data_dir_path, &args, txn);
+    }
+
+    // Sign & broadcast (go: `ensureWalletHandleMaybePassword`, then
+    // `SignTransactionWithWalletAndSigner`).
+    let kmd = build_wallet_handle_kmd_client(&data_dir_path).map_err(|()| String::new())?;
+    let mut accounts = load_accounts(&data_dir_path).map_err(|()| String::new())?;
+    let (handle, _wallet_name, password) =
+        resolve_wallet_and_init(&rt, &kmd, &mut accounts, args.wallet.as_deref())
+            .map_err(|()| String::new())?;
+    let signing_error = |e: String| {
+        format!(
+            "Couldn't sign tx with kmd: {e} (for multisig accounts, write tx to file and sign \
+             manually)"
+        )
+    };
+    let signer_pk = if args.signer.is_empty() {
+        [0u8; 32]
+    } else {
+        let pk =
+            algo_avm::assembler::unmarshal_checksum_address(&args.signer).map_err(signing_error)?;
+        pk.try_into().expect("32-byte address")
+    };
+    let encoded = algo_codec::canonical_encode_transaction(&txn);
+    let signed = rt
+        .block_on(kmd.sign_transaction(&handle, &password, encoded, signer_pk))
+        .map_err(|e| signing_error(crate::cmd::clerk::kmd_msg(&e)))?;
+    let algod = algo_rest_client::AlgodClient::new(&endpoint.0, &endpoint.1);
+    let pipeline = algo_txn_pipeline::TxnPipeline::new(algod, None);
+    let txid = rt
+        .block_on(pipeline.submit(&signed.signed_transaction))
+        .map_err(|e| format!("Couldn't broadcast tx with algod: {e}"))?;
+    println!("Transaction id for status change transaction: {txid}");
+    if args.no_wait {
+        println!("Note: status will not change until transaction is finalized");
+        return Ok(());
+    }
+    let info = rt
+        .block_on(pipeline.wait_for_confirmation(&txid, last))
+        .map_err(|e| e.to_string())?;
+    if let Some(round) = info.confirmed_round {
+        println!("Transaction {txid} committed in round {round}");
+    }
+    Ok(())
+}
+
+/// go's `writeTxnToFile(client, false, ..)`: `--signer` is checked but not
+/// used, the txn is written unsigned with the blank multisig of a multisig
+/// sender (`populateBlankMultisig`, whose wallet lookup failures are
+/// ignored).
+fn write_status_change_txn(
+    rt: &tokio::runtime::Runtime,
+    data_dir_path: &Path,
+    args: &ChangeonlinestatusArgs,
+    txn: algo_types::Transaction,
+) -> Result<(), String> {
+    if !args.signer.is_empty() {
+        let auth = algo_avm::assembler::unmarshal_checksum_address(&args.signer)
+            .map_err(|e| format!("Signer invalid ({}): {e}", args.signer))?;
+        if auth.as_slice() == txn.sender.0.as_slice() {
+            return Err("AuthAddr cannot be the same as the transaction sender".to_string());
+        }
+    }
+    let msig = blank_multisig_of(rt, data_dir_path, args.wallet.as_deref(), &txn.sender);
+    let stx = algo_types::SignedTransaction {
+        txn,
+        msig,
+        ..algo_types::SignedTransaction::default()
+    };
+    let encoded = algo_codec::canonical_encode_signed_transaction(&stx);
+    crate::cmd::clerk::write_file_0600(Path::new(&args.txfile), &encoded)
+}
+
+/// go's `populateBlankMultisig`: the blank multisig of `sender` when the
+/// wallet (opened without a password) knows it as a multisig account.
+fn blank_multisig_of(
+    rt: &tokio::runtime::Runtime,
+    data_dir_path: &Path,
+    wallet: Option<&str>,
+    sender: &algo_types::Address,
+) -> Option<algo_types::MultisigSig> {
+    let kmd = crate::goal_client::wallet_handle_kmd_client(data_dir_path).ok()?;
+    let mut accounts = AccountsList::load(data_dir_path).ok()?;
+    let (wallet_id, wallet_name) = wallet_id_and_name(rt, &kmd, &mut accounts, wallet).ok()?;
+    let (handle, _) = crate::wallet_token::wallet_handle_and_password(
+        rt,
+        &kmd,
+        &accounts.data_dir,
+        &wallet_id,
+        &wallet_name,
+        false,
+    )
+    .ok()?;
+    let exp = rt
+        .block_on(kmd.export_multisig(&handle, &sender.to_string()))
+        .ok()?;
+    Some(algo_consensus_crypto::multisig_preimage_from_pks(
+        exp.version,
+        exp.threshold,
+        &exp.pks,
+    ))
 }
 
 /// `account marknonparticipating -a <addr> ...`. Mirrors Go's

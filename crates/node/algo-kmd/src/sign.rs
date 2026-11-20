@@ -130,14 +130,16 @@ impl Wallet {
         let msg = txn_signing_message(txn);
         let sig = signing.sign(&msg).to_bytes();
 
+        // go `Transaction.Sign` (`data/transactions/transaction.go`): the
+        // AuthAddr is set when the signing key is not the sender's (issue
+        // #2497: `goal account changeonlinestatus --signer`).
+        let signer = Address(signer_addr);
         let stx = SignedTransaction {
             txn: txn.clone(),
             sig,
             msig: None,
             lsig: None,
-            // auth_addr is None unless the caller passed a rekey override
-            // — Go exposes that on the REST surface only (TASK-216).
-            auth_addr: None,
+            auth_addr: (signer != txn.sender).then_some(signer),
             ..SignedTransaction::default()
         };
         Ok(algo_codec::canonical_encode_signed_transaction(&stx))

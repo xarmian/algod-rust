@@ -38,7 +38,10 @@
 //! `renewallpartkeys` (`renewPartKeysInDir`), then (issue #2488) go's
 //! `account addpartkey` (the key generated locally into `--outdir`, or into
 //! `$TMPDIR` and installed) and `changeonlinestatus` failing to choose a
-//! participation key before any password is read. The last row holds the SHA-256
+//! participation key before any password is read, then (issue #2497) go's
+//! `changeonlinestatus` flags (`--txfile`, `--partkeyfile`, `--signer`,
+//! `--lease`, `--validrounds`, `--rekey-to`) and its failure to fetch the
+//! suggested parameters. The last row holds the SHA-256
 //! of every transaction the commands broadcast or wrote. Masked as
 //! nondeterministic: the IDs of the new participation keys (`<PART_ID>`) and
 //! go's spinning cursor (`/-\|` + backspace, one per 100 ms).
@@ -1358,6 +1361,151 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         three(name, &args, &nothing);
     }
+
+    // `account changeonlinestatus` flags (issue #2497): go's `changeOnlineCmd`
+    // checks the flags, reads `--partkeyfile`'s parent address, computes the
+    // validity window, then `changeAccountOnlineStatus` builds the keyreg with
+    // `--lease` and `--rekey-to` and either writes it unsigned to `--txfile`
+    // (`writeTxnToFile`, which only checks `--signer`) or signs it with
+    // `--signer`'s key and broadcasts it.
+    fresh_renew(1100);
+    algod.lock().unwrap().parts = vec![part_entry(&a1, 1, 2000)];
+    let partkey = format!("partkeys/{a1}.5.1100.partkey");
+    let lease = b64(&[0x5a; 32]);
+    let short_lease = b64(&[1; 8]);
+    let cos = |extra: &[&str]| -> Vec<String> {
+        ["account", "changeonlinestatus"]
+            .iter()
+            .chain(extra)
+            .map(|s| s.to_string())
+            .collect()
+    };
+    let flag_rows: Vec<(&str, Vec<String>)> = vec![
+        (
+            "--txfile online",
+            cos(&["-a", &a1, "-w", "sig", "--txfile", "cos-online.tx"]),
+        ),
+        (
+            "--txfile offline",
+            cos(&["-a", &a1, "-o=false", "-w", "sig", "-t", "cos-offline.tx"]),
+        ),
+        (
+            "--partkeyfile --txfile",
+            cos(&[
+                "--partkeyfile",
+                &partkey,
+                "-w",
+                "sig",
+                "-t",
+                "cos-partkey.tx",
+            ]),
+        ),
+        (
+            "--partkeyfile offline",
+            cos(&["--partkeyfile", &partkey, "-o=false", "-t", "x.tx"]),
+        ),
+        (
+            "--partkeyfile missing",
+            cos(&["--partkeyfile", "partkeys/missing.partkey", "-t", "x.tx"]),
+        ),
+        (
+            "--partkeyfile not a database",
+            cos(&["--partkeyfile", "a.teal", "-t", "x.tx"]),
+        ),
+        ("no address nor partkeyfile", cos(&["-t", "x.tx"])),
+        (
+            "--lease --validrounds --rekey-to --txfile",
+            cos(&[
+                "-a",
+                &a1,
+                "-w",
+                "sig",
+                "-x",
+                &lease,
+                "-v",
+                "10",
+                "--rekey-to",
+                &a2,
+                "-t",
+                "cos-flags.tx",
+            ]),
+        ),
+        (
+            "--lease not base64",
+            cos(&["-a", &a1, "-x", "!!", "-t", "x.tx"]),
+        ),
+        (
+            "--lease too short",
+            cos(&["-a", &a1, "-x", &short_lease, "-t", "x.tx"]),
+        ),
+        (
+            "--validrounds zero",
+            cos(&["-a", &a1, "-v", "0", "-t", "x.tx"]),
+        ),
+        (
+            "--validrounds and --lastvalid",
+            cos(&["-a", &a1, "-v", "10", "--lastvalid", "100", "-t", "x.tx"]),
+        ),
+        (
+            "--validrounds too large",
+            cos(&["-a", &a1, "-v", "100000000", "-t", "x.tx"]),
+        ),
+        (
+            "--rekey-to unparsable",
+            cos(&["-a", &a1, "--rekey-to", "NOTANADDRESS", "-t", "x.tx"]),
+        ),
+        (
+            "--signer --txfile",
+            cos(&["-a", &a1, "-w", "sig", "-S", &a2, "-t", "cos-signer.tx"]),
+        ),
+        (
+            "--signer unparsable --txfile",
+            cos(&["-a", &a1, "-S", "NOTANADDRESS", "-t", "x.tx"]),
+        ),
+        (
+            "--signer is the sender --txfile",
+            cos(&["-a", &a1, "-S", &a1, "-t", "x.tx"]),
+        ),
+        (
+            "--signer broadcast",
+            cos(&["-a", &a1, "-w", "sig", "-S", &a2, "-N"]),
+        ),
+        (
+            "--signer unparsable broadcast",
+            cos(&["-a", &a1, "-w", "sig", "-S", "NOTANADDRESS", "-N"]),
+        ),
+        (
+            "unparsable address",
+            cos(&["-a", "NOTANADDRESS", "-t", "x.tx"]),
+        ),
+    ];
+    for (name, args) in &flag_rows {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        step_env(
+            &format!("account changeonlinestatus {name} pty"),
+            &args,
+            Stdin::Pty {
+                prompt: &e_sig,
+                line: "spw",
+            },
+        );
+    }
+    // go's error when the suggested parameters cannot be fetched
+    // (`ComputeValidityRounds` → `cachedSuggestedParams`), online and offline.
+    for (name, online) in [("online", "-o=true"), ("offline", "-o=false")] {
+        algod.lock().unwrap().fail = vec![(
+            "GET",
+            "/v2/transactions/params",
+            500,
+            r#"{"message":"no params"}"#,
+        )];
+        step_env(
+            &format!("account changeonlinestatus suggested params fail {name}"),
+            &["account", "changeonlinestatus", "-a", &a1, online, "-N"],
+            Stdin::Null,
+        );
+    }
+    algod.lock().unwrap().fail.clear();
     // What the signing commands broadcast and wrote, as `<file> <SHA-256>`
     // lines (kmd-rust signs for either goal, so the bytes must be equal).
     let mut written = String::new();
@@ -1367,6 +1515,12 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
         "signed-send.tx",
         "pay.stx",
         "prog.lsig",
+        "cos-online.tx",
+        "cos-offline.tx",
+        "cos-partkey.tx",
+        "cos-flags.tx",
+        "cos-signer.tx",
+        "x.tx",
     ] {
         let sum = match std::fs::read(dd.join(f)) {
             Ok(b) => {

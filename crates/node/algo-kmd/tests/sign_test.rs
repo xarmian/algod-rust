@@ -132,6 +132,29 @@ fn sign_transaction_with_explicit_public_key() {
     let encoded = wallet.sign_transaction(&txn, Some(signer), b"pw").unwrap();
     let stx: SignedTransaction = rmp_serde::from_slice(&encoded).unwrap();
     verify_single_sig(&stx).expect("explicit-pk path must verify");
+    assert_eq!(stx.auth_addr, None, "the sender's own key sets no AuthAddr");
+}
+
+/// go's `Transaction.Sign` (`data/transactions/transaction.go`), which kmd's
+/// `SignTransaction` calls: signing with a key other than the sender's (a
+/// rekeyed account, `goal ... --signer`) sets the AuthAddr to that key
+/// (issue #2497).
+#[test]
+fn sign_transaction_with_another_key_sets_auth_addr() {
+    let dir = TempDir::new().unwrap();
+    let driver = WalletDriver::new(weak_cfg(dir.path())).unwrap();
+    driver
+        .create_wallet(b"sign-auth", b"id-sa", b"pw", Some([6u8; 32]))
+        .unwrap();
+    let mut wallet = driver.fetch_wallet(b"id-sa").unwrap();
+    wallet.init(b"pw").unwrap();
+
+    let signer = wallet.generate_key().unwrap();
+    let txn = payment_txn([0x44u8; 32], [0x11u8; 32]);
+    let encoded = wallet.sign_transaction(&txn, Some(signer), b"pw").unwrap();
+    let stx: SignedTransaction = rmp_serde::from_slice(&encoded).unwrap();
+    assert_eq!(stx.auth_addr, Some(Address(signer)));
+    verify_single_sig(&stx).expect("the AuthAddr's signature must verify");
 }
 
 /// Parity with go-algorand's
