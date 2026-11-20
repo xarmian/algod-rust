@@ -509,10 +509,7 @@ impl<'a> Dec<'a> {
         }
         let p = parse_integer(&bs);
         if p.overflow {
-            return self.err(format!(
-                "overflow parsing unsigned integer: {}",
-                lossy(&bs)
-            ));
+            return self.err(format!("overflow parsing unsigned integer: {}", lossy(&bs)));
         }
         if p.neg {
             return self.err(format!(
@@ -762,7 +759,7 @@ impl<'a> Dec<'a> {
         if ctyp == VALUE_TYPE_MAP {
             self.read_map_start()?;
             let mut seen = None;
-        while self.more(&mut seen)? {
+            while self.more(&mut seen)? {
                 self.read_map_elem_key()?;
                 let (key, _) = self.append_string_as_bytes()?;
                 self.read_map_elem_value()?;
@@ -860,12 +857,7 @@ impl<'a> Dec<'a> {
     }
 
     /// `kSlice` of a `[]T`: decoded into the elements already there.
-    fn decode_slice(
-        &mut self,
-        elem: &'static Ty,
-        name: &str,
-        v: &mut Value,
-    ) -> Result<(), Error> {
+    fn decode_slice(&mut self, elem: &'static Ty, name: &str, v: &mut Value) -> Result<(), Error> {
         let ctyp = self.container_type();
         if ctyp == VALUE_TYPE_STRING {
             return self.err(format!(
@@ -1071,7 +1063,12 @@ fn go_special(s: &[u8]) -> Option<f64> {
 /// or decimal exponent)` as a cleaned string for the decimal case.
 enum ReadFloat {
     Dec(String),
-    Hex { neg: bool, mant: u64, trunc: bool, exp: i64 },
+    Hex {
+        neg: bool,
+        mant: u64,
+        trunc: bool,
+        exp: i64,
+    },
 }
 
 fn read_float(s: &[u8]) -> Option<ReadFloat> {
@@ -1331,10 +1328,8 @@ fn go_base64_decode(src: &[u8]) -> Result<Vec<u8>, usize> {
 const ROUND: Ty = Ty::U64;
 
 /// `model.ApplicationStateSchema`.
-pub const APPLICATION_STATE_SCHEMA: Ty = Ty::Struct(&[
-    Field("num-byte-slice", Ty::U64),
-    Field("num-uint", Ty::U64),
-]);
+pub const APPLICATION_STATE_SCHEMA: Ty =
+    Ty::Struct(&[Field("num-byte-slice", Ty::U64), Field("num-uint", Ty::U64)]);
 
 /// `model.TealValue`.
 const TEAL_VALUE: Ty = Ty::Struct(&[
@@ -1556,7 +1551,10 @@ mod tests {
         // process runs out of memory)
         assert_eq!(err(r#"{"versions":[1,"#, &VERSION), "EOF");
         assert_eq!(
-            err(r#"{"created-apps":[{"id":1,"params":{"approval-program":[1,"#, &ACCOUNT),
+            err(
+                r#"{"created-apps":[{"id":1,"params":{"approval-program":[1,"#,
+                &ACCOUNT
+            ),
             "EOF"
         );
     }
@@ -1567,9 +1565,15 @@ mod tests {
         assert_eq!(v["amount"], 42);
         assert_eq!(v["address"], "true");
         let v = decode(b"[1,2]", &ACCOUNT).unwrap();
-        assert_eq!((v["address"].as_str(), v["amount"].as_u64()), (Some("1"), Some(2)));
+        assert_eq!(
+            (v["address"].as_str(), v["amount"].as_u64()),
+            (Some("1"), Some(2))
+        );
         assert_eq!(decode(b"null", &ACCOUNT).unwrap()["amount"], 0);
-        assert_eq!(decode(br#"{"amount":1e3}"#, &ACCOUNT).unwrap()["amount"], 1000);
+        assert_eq!(
+            decode(br#"{"amount":1e3}"#, &ACCOUNT).unwrap()["amount"],
+            1000
+        );
     }
 
     #[test]

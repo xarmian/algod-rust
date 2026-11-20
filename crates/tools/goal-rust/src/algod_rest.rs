@@ -47,7 +47,11 @@ pub fn get(
     rt.block_on(async {
         let mut req = reqwest::Client::new().get(url.clone());
         // go: every path but `/health` carries the token
-        let sent_token = if path == "/health" { "" } else { token.as_str() };
+        let sent_token = if path == "/health" {
+            ""
+        } else {
+            token.as_str()
+        };
         if path != "/health" {
             req = req.header(AUTH_HEADER, token);
         }
@@ -112,9 +116,7 @@ fn transport_error(op: &str, url: &str, e: &reqwest::Error) -> String {
         if let Some(io) = s.downcast_ref::<std::io::Error>() {
             if io.kind() == std::io::ErrorKind::ConnectionRefused {
                 if let Some(addr) = dial_addr(url) {
-                    return format!(
-                        "{op} \"{url}\": dial tcp {addr}: connect: connection refused"
-                    );
+                    return format!("{op} \"{url}\": dial tcp {addr}: connect: connection refused");
                 }
             }
         }

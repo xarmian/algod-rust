@@ -436,8 +436,7 @@ struct Mock {
 
 const STATUS_JSON: &str = r#"{"catchup-time":0,"last-round":5,"last-version":"future","next-version":"future","next-version-round":6,"next-version-supported":true,"stopped-at-unsupported-round":false,"time-since-last-round":1500000000}"#;
 
-const SUPPLY_JSON: &str =
-    r#"{"current_round":5,"online-money":1000000,"total-money":3000042}"#;
+const SUPPLY_JSON: &str = r#"{"current_round":5,"online-money":1000000,"total-money":3000042}"#;
 
 /// `(status, content type, body)` for a request path.
 fn route(path: &str, mock: &Mock) -> (u16, &'static str, Vec<u8>) {
@@ -558,17 +557,34 @@ fn algod_readers() -> Vec<(&'static str, Vec<&'static str>, bool)> {
         ("node status", vec!["node", "status"], false),
         ("ledger block", vec!["ledger", "block", "1"], false),
         ("ledger supply", vec!["ledger", "supply"], false),
-        ("account balance", vec!["account", "balance", "-a", "<A1>"], false),
-        ("account rewards", vec!["account", "rewards", "-a", "<A1>"], false),
+        (
+            "account balance",
+            vec!["account", "balance", "-a", "<A1>"],
+            false,
+        ),
+        (
+            "account rewards",
+            vec!["account", "rewards", "-a", "<A1>"],
+            false,
+        ),
         ("account info", vec!["account", "info", "-a", "<A1>"], false),
-        ("account list --info", vec!["account", "list", "--info"], true),
+        (
+            "account list --info",
+            vec!["account", "list", "--info"],
+            true,
+        ),
     ]
 }
 
 /// What a malformed algod answer does to go's go-codec JSON decode
 /// (`protocol.NewJSONDecoder`, `restClient.submitForm`): `(row name, path
 /// prefix, body, args)`.
-fn malformed() -> Vec<(&'static str, &'static str, &'static str, &'static [&'static str])> {
+fn malformed() -> Vec<(
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+)> {
     const BAL: &[&str] = &["account", "balance", "-a", "<A1>"];
     const INFO: &[&str] = &["account", "info", "-a", "<A1>"];
     const VER: &[&str] = &["version", "-v"];
@@ -577,7 +593,12 @@ fn malformed() -> Vec<(&'static str, &'static str, &'static str, &'static [&'sta
     let acct = "/v2/accounts/";
     vec![
         ("unknown field", acct, r#"{"amount":5,"foo":1}"#, BAL),
-        ("unknown nested field", acct, r#"{"amount":5,"created-assets":[{"index":1,"params":{"total":1,"bar":2}}]}"#, INFO),
+        (
+            "unknown nested field",
+            acct,
+            r#"{"amount":5,"created-assets":[{"index":1,"params":{"total":1,"bar":2}}]}"#,
+            INFO,
+        ),
         ("string for a number", acct, r#"{"amount":"abc"}"#, BAL),
         ("quoted number", acct, r#"{"amount":"42"}"#, BAL),
         ("negative number", acct, r#"{"amount":-1}"#, BAL),
@@ -598,30 +619,100 @@ fn malformed() -> Vec<(&'static str, &'static str, &'static str, &'static [&'sta
         ("null", acct, "null", BAL),
         ("bad literal", acct, r#"{"amount":nul}"#, BAL),
         ("bad true", acct, r#"{"incentive-eligible":tru}"#, BAL),
-        ("bool for a string", acct, r#"{"address":true,"amount":3}"#, BAL),
+        (
+            "bool for a string",
+            acct,
+            r#"{"address":true,"amount":3}"#,
+            BAL,
+        ),
         ("object for a string", acct, r#"{"status":{}}"#, BAL),
-        ("string for a bool", acct, r#"{"incentive-eligible":"x"}"#, BAL),
+        (
+            "string for a bool",
+            acct,
+            r#"{"incentive-eligible":"x"}"#,
+            BAL,
+        ),
         ("bad escape", acct, r#"{"address":"\x"}"#, BAL),
         ("short unicode escape", acct, r#"{"address":"\u12"}"#, BAL),
         ("number key", acct, r#"{1:2}"#, BAL),
         ("trailing garbage", acct, r#"{"amount":7}xyz"#, BAL),
-        ("nested null", acct, r#"{"amount":8,"created-assets":null,"participation":null}"#, BAL),
-        ("string for an array", acct, r#"{"created-assets":"x"}"#, BAL),
+        (
+            "nested null",
+            acct,
+            r#"{"amount":8,"created-assets":null,"participation":null}"#,
+            BAL,
+        ),
+        (
+            "string for an array",
+            acct,
+            r#"{"created-assets":"x"}"#,
+            BAL,
+        ),
         ("number for a struct", acct, r#"{"participation":5}"#, BAL),
-        ("bad base64", acct, r#"{"created-apps":[{"id":1,"params":{"approval-program":"!!"}}]}"#, INFO),
-        ("map for an array", acct, r#"{"created-assets":{"a":1}}"#, BAL),
-        ("bad array separator", acct, r#"{"created-assets":[{"index":1};{}]}"#, BAL),
+        (
+            "bad base64",
+            acct,
+            r#"{"created-apps":[{"id":1,"params":{"approval-program":"!!"}}]}"#,
+            INFO,
+        ),
+        (
+            "map for an array",
+            acct,
+            r#"{"created-assets":{"a":1}}"#,
+            BAL,
+        ),
+        (
+            "bad array separator",
+            acct,
+            r#"{"created-assets":[{"index":1};{}]}"#,
+            BAL,
+        ),
         ("unclosed object", acct, r#"{"amount":2,"#, BAL),
         ("bad versions", "/versions", r#"{"versions":"v1"}"#, VER),
-        ("bad genesis hash", "/versions", r#"{"genesis_hash_b64":"???"}"#, VER),
-        ("unknown versions field", "/versions", r#"{"versions":[],"x":1}"#, VER),
+        (
+            "bad genesis hash",
+            "/versions",
+            r#"{"genesis_hash_b64":"???"}"#,
+            VER,
+        ),
+        (
+            "unknown versions field",
+            "/versions",
+            r#"{"versions":[],"x":1}"#,
+            VER,
+        ),
         ("bad build", "/versions", r#"{"build":{"major":"x"}}"#, VER),
         ("bad status", "/v2/status", r#"{"last-round":"x"}"#, STATUS),
-        ("negative catchup time", "/v2/status", r#"{"last-round":3,"catchup-time":-5}"#, STATUS),
-        ("fractional time", "/v2/status", r#"{"time-since-last-round":1.5}"#, STATUS),
-        ("unknown status field", "/v2/status", r#"{"last-round":3,"y":true}"#, STATUS),
-        ("bad supply", "/v2/ledger/supply", r#"{"total-money":true}"#, SUPPLY),
-        ("unknown supply field", "/v2/ledger/supply", r#"{"current_round":1,"z":0}"#, SUPPLY),
+        (
+            "negative catchup time",
+            "/v2/status",
+            r#"{"last-round":3,"catchup-time":-5}"#,
+            STATUS,
+        ),
+        (
+            "fractional time",
+            "/v2/status",
+            r#"{"time-since-last-round":1.5}"#,
+            STATUS,
+        ),
+        (
+            "unknown status field",
+            "/v2/status",
+            r#"{"last-round":3,"y":true}"#,
+            STATUS,
+        ),
+        (
+            "bad supply",
+            "/v2/ledger/supply",
+            r#"{"total-money":true}"#,
+            SUPPLY,
+        ),
+        (
+            "unknown supply field",
+            "/v2/ledger/supply",
+            r#"{"current_round":1,"z":0}"#,
+            SUPPLY,
+        ),
     ]
 }
 
@@ -646,7 +737,10 @@ fn request_error_cases() -> Vec<Case> {
         v.push(c);
     }
     for (name, args) in [
-        ("account balance closed", &["account", "balance", "-a", "<A1>"][..]),
+        (
+            "account balance closed",
+            &["account", "balance", "-a", "<A1>"][..],
+        ),
         ("version closed", &["version"]),
         ("node status closed", &["node", "status"]),
     ] {
@@ -658,7 +752,10 @@ fn request_error_cases() -> Vec<Case> {
         }];
         v.push(c);
     }
-    let mut c = case("account balance 401 raw body", &["account", "balance", "-a", "<A1>"]);
+    let mut c = case(
+        "account balance 401 raw body",
+        &["account", "balance", "-a", "<A1>"],
+    );
     c.answers = vec![Answer {
         prefix: "",
         status: 401,
@@ -683,8 +780,14 @@ fn request_error_cases() -> Vec<Case> {
     }
     // `account list --info` keeps what go decoded before the error
     for (name, body) in [
-        ("malformed: list --info unknown field", r#"{"amount":5,"foo":1}"#),
-        ("malformed: list --info truncated", r#"{"amount":6,"status":"Online""#),
+        (
+            "malformed: list --info unknown field",
+            r#"{"amount":5,"foo":1}"#,
+        ),
+        (
+            "malformed: list --info truncated",
+            r#"{"amount":6,"status":"Online""#,
+        ),
     ] {
         let mut c = case(name, &["account", "list", "--info", "-w", "b"]);
         c.accounts = true;

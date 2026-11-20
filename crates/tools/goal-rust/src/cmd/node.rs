@@ -1169,7 +1169,11 @@ fn fetch_versions(
     Ok(AlgodVersions {
         versions: v["versions"]
             .as_array()
-            .map(|a| a.iter().map(|s| s.as_str().unwrap_or_default().to_string()).collect())
+            .map(|a| {
+                a.iter()
+                    .map(|s| s.as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
             .unwrap_or_default(),
         genesis_id: text("genesis_id"),
         genesis_hash_b64: text("genesis_hash_b64"),
