@@ -116,8 +116,8 @@ enum Kind {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Flag {
-    long: &'static str,
+struct Flag<'a> {
+    long: &'a str,
     /// The shorthand letter, `0` for none.
     short: u8,
     kind: Kind,
@@ -125,7 +125,7 @@ struct Flag {
     required: bool,
 }
 
-const fn opt(long: &'static str, short: u8, kind: Kind) -> Flag {
+const fn opt(long: &'static str, short: u8, kind: Kind) -> Flag<'static> {
     Flag {
         long,
         short,
@@ -134,7 +134,7 @@ const fn opt(long: &'static str, short: u8, kind: Kind) -> Flag {
     }
 }
 
-const fn req(long: &'static str, short: u8, kind: Kind) -> Flag {
+const fn req(long: &'static str, short: u8, kind: Kind) -> Flag<'static> {
     Flag {
         long,
         short,
@@ -144,7 +144,7 @@ const fn req(long: &'static str, short: u8, kind: Kind) -> Flag {
 }
 
 /// cobra's `InitDefaultHelpFlag`, added to the command it found.
-const HELP: Flag = opt("help", b'h', Kind::Bool);
+const HELP: Flag<'static> = opt("help", b'h', Kind::Bool);
 
 /// A command's `Args` rule.
 #[derive(Clone, Copy, Debug)]
@@ -162,9 +162,9 @@ struct Cmd {
     /// The command path without `goal`; `""` is the root.
     path: &'static str,
     /// `Flags()`.
-    local: &'static [Flag],
+    local: &'static [Flag<'static>],
     /// `PersistentFlags()`, inherited by every command below.
-    persistent: &'static [Flag],
+    persistent: &'static [Flag<'static>],
     args: ArgsRule,
 }
 
@@ -446,9 +446,10 @@ fn child(parent: &Cmd, name: &str) -> Option<&'static Cmd> {
 
 /// The flags of `cmd` after `mergePersistentFlags`: its own, then the
 /// persistent ones of it and its parents (a parent's flag never shadows one
-/// of the same name); `with_help` adds cobra's help flag.
-fn flags_of(cmd: &Cmd, with_help: bool) -> Vec<Flag> {
-    let mut out: Vec<Flag> = cmd.local.to_vec();
+/// of the same name); `with_help` adds cobra's help flag, then `extras`
+/// whose names go's flags do not use.
+fn flags_of<'a>(cmd: &Cmd, with_help: bool, extras: &[Flag<'a>]) -> Vec<Flag<'a>> {
+    let mut out: Vec<Flag<'a>> = cmd.local.iter().copied().collect();
     let mut path = Some(cmd.path);
     while let Some(p) = path {
         let c = command(p).expect("a parent of a known command is known");
@@ -466,24 +467,65 @@ fn flags_of(cmd: &Cmd, with_help: bool) -> Vec<Flag> {
     if with_help {
         out.push(HELP);
     }
+    for e in extras {
+        if !e.long.is_empty() && out.iter().any(|o| o.long == e.long) {
+            continue;
+        }
+        let mut e = *e;
+        if out.iter().any(|o| o.short != 0 && o.short == e.short) {
+            e.short = 0;
+        }
+        if !e.long.is_empty() || e.short != 0 {
+            out.push(e);
+        }
+    }
     out
 }
 
-fn by_long<'a>(flags: &'a [Flag], name: &str) -> Option<&'a Flag> {
+/// goal-rust's clap definition of the command `path`.
+fn clap_command(path: &str) -> Option<clap::Command> {
+    let mut c = <crate::Cli as clap::CommandFactory>::command();
+    for name in path.split(' ') {
+        c = c.find_subcommand(name)?.clone();
+    }
+    Some(c)
+}
+
+/// The flags goal-rust's clap command declares beyond go's (`--password`
+/// and the like, which goal-rust already accepted before this parsing was
+/// ported): known to the parse, so a command line using them still reaches
+/// clap.
+fn clap_extras(c: &clap::Command) -> Vec<Flag<'_>> {
+    c.get_arguments()
+        .filter(|a| !a.is_positional())
+        .map(|a| Flag {
+            long: a.get_long().unwrap_or(""),
+            short: a.get_short().filter(char::is_ascii).map_or(0, |c| c as u8),
+            kind: if a.get_action().takes_values() {
+                Kind::Str
+            } else {
+                Kind::Bool
+            },
+            required: false,
+        })
+        .collect()
+}
+
+fn by_long<'f, 'a>(flags: &'f [Flag<'a>], name: &str) -> Option<&'f Flag<'a>> {
     flags.iter().find(|f| f.long == name)
 }
 
-fn by_short(flags: &[Flag], c: u8) -> Option<&Flag> {
+fn by_short<'f, 'a>(flags: &'f [Flag<'a>], c: u8) -> Option<&'f Flag<'a>> {
     flags.iter().find(|f| f.short != 0 && f.short == c)
 }
 
 /// cobra's `hasNoOptDefVal` (`--name`): only bool flags have one here.
-fn has_no_opt_def_val(name: &str, flags: &[Flag]) -> bool {
+fn has_no_opt_def_val(name: &str, flags: &[Flag<'_>]) -> bool {
     by_long(flags, name).is_some_and(|f| f.kind == Kind::Bool)
 }
 
 /// cobra's `shortHasNoOptDefVal` (`-n`).
-fn short_has_no_opt_def_val(name: &str, flags: &[Flag]) -> bool {
+fn short_has_no_opt_def_val(name: &str, flags: &[Flag<'_>]) -> bool {
     name.bytes()
         .next()
         .and_then(|c| by_short(flags, c))
@@ -492,7 +534,7 @@ fn short_has_no_opt_def_val(name: &str, flags: &[Flag]) -> bool {
 
 /// The argument `s` takes the next one as its value while cobra looks for
 /// commands (`stripFlags`, `argsMinusFirstX`).
-fn skips_next(s: &str, flags: &[Flag]) -> bool {
+fn skips_next(s: &str, flags: &[Flag<'_>]) -> bool {
     if s.contains('=') {
         return false;
     }
@@ -505,7 +547,7 @@ fn skips_next(s: &str, flags: &[Flag]) -> bool {
 }
 
 /// cobra's `stripFlags`: the positions in `idx` of the non-flag arguments.
-fn strip_flags(args: &[String], idx: &[usize], flags: &[Flag]) -> Vec<usize> {
+fn strip_flags(args: &[String], idx: &[usize], flags: &[Flag<'_>]) -> Vec<usize> {
     let mut commands = Vec::new();
     let mut i = 0;
     while i < idx.len() {
@@ -531,7 +573,7 @@ fn strip_flags(args: &[String], idx: &[usize], flags: &[Flag]) -> Vec<usize> {
 
 /// cobra's `argsMinusFirstX`: `idx` without the first argument equal to
 /// `x` that is not a flag value.
-fn args_minus_first_x(args: &[String], idx: &[usize], x: &str, flags: &[Flag]) -> Vec<usize> {
+fn args_minus_first_x(args: &[String], idx: &[usize], x: &str, flags: &[Flag<'_>]) -> Vec<usize> {
     let mut pos = 0;
     while pos < idx.len() {
         let s = args[idx[pos]].as_str();
@@ -719,17 +761,17 @@ fn underscore_ok(s: &[u8]) -> bool {
 }
 
 /// What the found command's flag parsing left.
-struct Parsed {
+struct Parsed<'a> {
     /// `Flags().Args()`.
     positional: Vec<String>,
     /// The long names of the flags set.
-    changed: Vec<&'static str>,
+    changed: Vec<&'a str>,
     help: bool,
 }
 
-impl Parsed {
+impl<'a> Parsed<'a> {
     /// pflag's `FlagSet.Set`.
-    fn set(&mut self, flag: &Flag, value: &str) -> Result<(), String> {
+    fn set(&mut self, flag: &Flag<'a>, value: &str) -> Result<(), String> {
         let checked = match flag.kind {
             Kind::Bool => parse_bool(value).map(|v| {
                 if flag.long == HELP.long {
@@ -760,7 +802,7 @@ impl Parsed {
 }
 
 /// pflag's `FlagSet.Parse` (interspersed, `ContinueOnError`).
-fn parse(args: &[&str], flags: &[Flag]) -> Result<Parsed, String> {
+fn parse<'a>(args: &[&str], flags: &[Flag<'a>]) -> Result<Parsed<'a>, String> {
     let mut p = Parsed {
         positional: Vec::new(),
         changed: Vec::new(),
@@ -889,7 +931,7 @@ pub(crate) fn decide(args: &[String]) -> Outcome {
     let mut idx: Vec<usize> = (1..args.len()).collect();
     let mut names = Vec::new();
     loop {
-        let flags = flags_of(cmd, false);
+        let flags = flags_of(cmd, false, &[]);
         let Some(&next) = strip_flags(args, &idx, &flags).first() else {
             break;
         };
@@ -905,7 +947,9 @@ pub(crate) fn decide(args: &[String]) -> Outcome {
     }
 
     // execute: flags, help, `Args`, required flags.
-    let flags = flags_of(cmd, true);
+    let clap_cmd = clap_command(cmd.path);
+    let extras = clap_cmd.as_ref().map(clap_extras).unwrap_or_default();
+    let flags = flags_of(cmd, true, &extras);
     let rest: Vec<&str> = idx.iter().map(|&k| args[k].as_str()).collect();
     let fail = |msg: String| Outcome::Fail {
         msg,
@@ -1208,6 +1252,23 @@ mod tests {
     }
 
     #[test]
+    fn goal_rusts_own_extra_flags_still_reach_clap() {
+        assert_eq!(
+            d(&["wallet", "new", "w", "-w", "pw", "--no-display-seed"]),
+            Outcome::Unchanged
+        );
+        assert_eq!(
+            d(&["account", "import", "x", "-m", "m", "--password", "pw"]),
+            Outcome::Unchanged
+        );
+        // go's flags keep their kinds and errors.
+        assert_eq!(
+            d(&["wallet", "new", "w", "-f", "x"]),
+            fail("unknown shorthand flag: 'f' in -f", "wallet new")
+        );
+    }
+
+    #[test]
     fn parse_uint_matches_strconv() {
         let ok = |s: &str, bits: u32| parse_uint(s, bits).ok();
         assert_eq!(ok("0", 64), Some(0));
@@ -1289,7 +1350,7 @@ mod tests {
                     char::from(short.max(b' '))
                 ));
             }
-            let mut got: Vec<String> = flags_of(cmd, true)
+            let mut got: Vec<String> = flags_of(cmd, true, &[])
                 .iter()
                 .map(|f| {
                     format!(
