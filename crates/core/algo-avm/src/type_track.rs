@@ -1097,9 +1097,14 @@ pub(crate) fn track_instruction(
             return_types = Cow::Owned(r);
         }
     } else if !spec.refine.is_empty() {
-        let txn_fields = op_entry("itxn_field")
-            .and_then(|e| e.imms.first())
-            .and_then(|i| i.group);
+        // Only `typeTxField` reads the group.
+        let txn_fields = if spec.refine == "typeTxField" {
+            op_entry("itxn_field")
+                .and_then(|e| e.imms.first())
+                .and_then(|i| i.group)
+        } else {
+            None
+        };
         let r = run_refine(spec.refine, &mut ops.known, args, txn_fields);
         if let Some(e) = r.err {
             type_error(ops, col, e);

@@ -1816,6 +1816,8 @@ fn assemble_core(text: &str) -> Result<OpStream, Box<OpStream>> {
 
     // First pass: parse lines, emit preliminary bytecode
     let (scanned_lines, line_too_long) = go_scan_lines(text);
+    // Checked once for the text instead of once per line.
+    let text_has_raw = raw_text::has_raw(text);
     for (line_idx, line_text) in scanned_lines.into_iter().enumerate() {
         ops.source_line = line_idx + 1; // 1-based
 
@@ -1825,7 +1827,7 @@ fn assemble_core(text: &str) -> Result<OpStream, Box<OpStream>> {
         }
         // go's columns are byte offsets into the original text, where an
         // invalid byte is one byte (here a four-byte raw character).
-        if raw_text::has_raw(line_text) {
+        if text_has_raw && raw_text::has_raw(line_text) {
             for (col, _) in &mut full_tokens {
                 *col = raw_text::raw_len(&line_text[..*col]);
             }
@@ -3466,7 +3468,8 @@ fn go_scan_lines(text: &str) -> (Vec<&str>, bool) {
             Some(i) => (&rest[..i], &rest[i + 1..]),
             None => (rest, ""),
         };
-        if raw_text::raw_len(raw) >= MAX_SCAN_TOKEN_SIZE {
+        // `raw_len` never exceeds the byte length: only a long line needs it.
+        if raw.len() >= MAX_SCAN_TOKEN_SIZE && raw_text::raw_len(raw) >= MAX_SCAN_TOKEN_SIZE {
             return (lines, true);
         }
         lines.push(raw.strip_suffix('\r').unwrap_or(raw));
