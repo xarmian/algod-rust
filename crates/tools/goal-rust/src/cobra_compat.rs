@@ -18,48 +18,47 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! cobra's command lookup for `goal account` and `goal wallet`, ahead of
-//! clap (issue #2453).
+//! cobra's command lookup and flag parsing for the `goal account` and
+//! `goal wallet` trees, ahead of clap (issues #2453, #2464).
 //!
-//! go's `accountCmd` and `walletCmd` (`cmd/goal/account.go`, `wallet.go`)
-//! take no positional arguments (`Args: validateNoPosArgsFn`, i.e.
-//! `cobra.NoArgs`) and declare `-f, --default` with `Flags()`, a local flag.
-//! cobra (v1.8.1, `Command.Find`) first walks the arguments down to the
-//! deepest subcommand named in them, skipping flags with `stripFlags`, and
-//! that one command then parses every remaining argument with its own flag
-//! set. So:
+//! go's `goal` (cobra v1.8.1, pflag v1.0.6) runs a command line in these
+//! steps, each of which can end it:
 //!
-//! - `goal account -f x extra` (or `goal account extra`) is
-//!   `unknown command "extra" for "goal account"` plus the usage of
-//!   `account`;
-//! - in `goal account -f x list` the `-f` belongs to `list`, which has no
-//!   such flag: `unknown shorthand flag: 'f' in -f` (`unknown flag:
-//!   --default` for the long name) plus the usage of `account list`;
-//! - in `goal account -f x new` it is `new`'s own (bool) `-f`, the same as
-//!   `goal account new -f x`.
+//! 1. `Command.Find` walks the arguments down to the deepest subcommand
+//!    named in them, skipping flags with `stripFlags` (a flag the command
+//!    does not know, and every non-bool one written without `=`, takes the
+//!    next argument as its value; the help flag is not known yet);
+//! 2. that command parses all remaining arguments with its flag set (its
+//!    own flags, the persistent flags of it and its parents, and `-h,
+//!    --help`), left to right: the first unknown flag, missing value or bad
+//!    value is the error;
+//! 3. `-h/--help` prints the command's help on stdout and exits 0;
+//! 4. the command's `Args` rule checks the positional arguments;
+//! 5. its required flags must all be set.
 //!
-//! goal's `main` prints the error once more on stdout (`fmt.Println(err)`)
-//! and exits 1. clap would instead reject the extra argument with its own
-//! text, and take a `-f` before a subcommand as `account`'s and ignore it,
-//! so [`preflight`] settles these cases on the raw arguments first. Anything
-//! it does not recognise (an unknown flag, a help flag, a missing flag
-//! value) is left to clap unchanged.
+//! An error in 2, 4 or 5 is printed as `Error: <err>` and the command's
+//! usage on stderr, then once more by goal's `main` on stdout
+//! (`fmt.Println(err)`), and exits 1. [`preflight`] runs these steps on the
+//! raw arguments for a command under `account` or `wallet`; a command line
+//! that passes them all goes to clap, with the subcommand names moved right
+//! after the group name so that every flag reaches the command cobra found
+//! (`goal account -f x new` is `goal account new -f x`).
 
 use std::ffi::OsString;
 use std::process::ExitCode;
 
-use crate::cobra_usage::usage;
+use crate::cobra_usage::{help, usage};
 
 /// What [`preflight`] decided.
 pub enum Preflight {
     /// Parse these arguments with clap.
     Run(Vec<OsString>),
-    /// go's usage error was printed; exit with this code.
+    /// go's help or usage error was printed; exit with this code.
     Exit(ExitCode),
 }
 
-/// Applies cobra's command lookup for `account` / `wallet` to the process
-/// arguments (`args[0]` is the program name).
+/// Applies cobra's lookup and flag parsing for `account` / `wallet` to the
+/// process arguments (`args[0]` is the program name).
 pub fn preflight(args: Vec<OsString>) -> Preflight {
     let Some(strs) = args
         .iter()
@@ -71,6 +70,11 @@ pub fn preflight(args: Vec<OsString>) -> Preflight {
     match decide(&strs) {
         Outcome::Unchanged => Preflight::Run(args),
         Outcome::Reordered(v) => Preflight::Run(v.into_iter().map(OsString::from).collect()),
+        Outcome::Help(path) => {
+            // cobra's default help function writes to `OutOrStdout()`.
+            print!("{}", help(&path).unwrap_or_default());
+            Preflight::Exit(ExitCode::SUCCESS)
+        }
         Outcome::Fail { msg, usage_path } => {
             let usage = usage(&usage_path).unwrap_or_default();
             // cobra: `c.PrintErrln("Error:", err.Error())` and
@@ -87,295 +91,888 @@ pub fn preflight(args: Vec<OsString>) -> Preflight {
 pub(crate) enum Outcome {
     /// Leave the arguments to clap as they are.
     Unchanged,
-    /// The arguments with the subcommand names moved right after the
-    /// group name, so clap hands the flags before them to the subcommand
-    /// as cobra does.
+    /// The arguments with the subcommand names moved right after the group
+    /// name, so clap hands the flags before them to the subcommand as cobra
+    /// does.
     Reordered(Vec<String>),
+    /// `-h/--help`: go's help of the command `path`.
+    Help(String),
     /// cobra's usage error: `msg`, then the usage of the command `usage_path`.
     Fail { msg: String, usage_path: String },
 }
 
-/// The flags one command knows while cobra looks for a subcommand, short
-/// and long names alike; all of them take a value. (cobra adds the help
-/// flag only to the command it finds, and a help flag is left to clap.)
-type Level = &'static [&'static str];
-
-/// The root's persistent `-d/--datadir` and `-k/--kmddir`. Its local
-/// `-v/--version` is not one of `account`'s flags, so a call with it is left
-/// to clap.
-const ROOT: Level = &["d", "datadir", "k", "kmddir"];
-
-/// `account`: its local `-f/--default`, its persistent `-w/--wallet` and the
-/// root's persistent flags.
-const ACCOUNT: Level = &["d", "datadir", "k", "kmddir", "w", "wallet", "f", "default"];
-
-/// `wallet`: its local `-f/--default` and the root's persistent flags.
-const WALLET: Level = &["d", "datadir", "k", "kmddir", "f", "default"];
-
-/// `account multisig`: the persistent flags it inherits.
-const MULTISIG: Level = &["d", "datadir", "k", "kmddir", "w", "wallet"];
-
-const ACCOUNT_SUBCOMMANDS: &[&str] = &[
-    "addpartkey",
-    "applicationdetails",
-    "assetdetails",
-    "balance",
-    "changeonlinestatus",
-    "delete",
-    "deletepartkey",
-    "dump",
-    "export",
-    "import",
-    "importrootkey",
-    "info",
-    "installpartkey",
-    "list",
-    "listpartkeys",
-    "marknonparticipating",
-    "multisig",
-    "new",
-    "partkeyinfo",
-    "rename",
-    "renewallpartkeys",
-    "renewpartkey",
-    "rewards",
-];
-
-const MULTISIG_SUBCOMMANDS: &[&str] = &["delete", "info", "new"];
-
-const WALLET_SUBCOMMANDS: &[&str] = &["list", "new", "rename"];
-
-/// The commands under `account` / `wallet` with a `-f` of their own
-/// (`--default` on `new` and `import`, `--fee` on the others).
-const OWN_SHORT_F: &[&str] = &[
-    "account changeonlinestatus",
-    "account import",
-    "account marknonparticipating",
-    "account new",
-    "account renewallpartkeys",
-    "account renewpartkey",
-];
-
-/// The commands under `account` / `wallet` with a `--default` of their own.
-const OWN_LONG_DEFAULT: &[&str] = &["account import", "account new"];
-
-/// One argument, seen by cobra's `stripFlags` at a given command.
-enum Token {
-    /// `--`: the end of the flags.
-    End,
-    /// A positional argument (a subcommand name or an argument).
-    Positional,
-    /// A flag the command knows; `takes_next` when its value is the next
-    /// argument (`-f x`, `--default x`).
-    Known { takes_next: bool, default: bool },
-    /// A help flag, a flag the command does not know, a bare `-`, or
-    /// grouped shorthands: left to clap.
-    Other,
+/// A pflag value type, as far as parsing tells them apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// `Bool`: takes no value unless written `--name=v` / `-n=v`
+    /// (`NoOptDefVal` is `"true"`).
+    Bool,
+    /// `String`, `StringArray`: any value.
+    Str,
+    /// `Uint8`: `strconv.ParseUint(s, 0, 8)`.
+    U8,
+    /// `Uint64`: `strconv.ParseUint(s, 0, 64)`.
+    U64,
 }
 
-fn token(s: &str, level: Level) -> Token {
-    if s == "--" {
-        return Token::End;
+#[derive(Clone, Copy, Debug)]
+struct Flag<'a> {
+    long: &'a str,
+    /// The shorthand letter, `0` for none.
+    short: u8,
+    kind: Kind,
+    /// `MarkFlagRequired`.
+    required: bool,
+}
+
+const fn opt(long: &'static str, short: u8, kind: Kind) -> Flag<'static> {
+    Flag {
+        long,
+        short,
+        kind,
+        required: false,
+    }
+}
+
+const fn req(long: &'static str, short: u8, kind: Kind) -> Flag<'static> {
+    Flag {
+        long,
+        short,
+        kind,
+        required: true,
+    }
+}
+
+/// cobra's `InitDefaultHelpFlag`, added to the command it found.
+const HELP: Flag<'static> = opt("help", b'h', Kind::Bool);
+
+/// A command's `Args` rule.
+#[derive(Clone, Copy, Debug)]
+enum ArgsRule {
+    /// `Args` unset on a command without subcommands: anything goes.
+    Arbitrary,
+    /// `cobra.NoArgs` (goal's `validateNoPosArgsFn`).
+    No,
+    Exact(usize),
+    Range(usize, usize),
+    Min(usize),
+}
+
+struct Cmd {
+    /// The command path without `goal`; `""` is the root.
+    path: &'static str,
+    /// `Flags()`.
+    local: &'static [Flag<'static>],
+    /// `PersistentFlags()`, inherited by every command below.
+    persistent: &'static [Flag<'static>],
+    args: ArgsRule,
+}
+
+use Kind::{Bool, Str, U64, U8};
+
+/// go's `cmd/goal` `account.go`, `wallet.go` and the root's flags in
+/// `commands.go`.
+const COMMANDS: &[Cmd] = &[
+    Cmd {
+        path: "",
+        local: &[opt("version", b'v', Bool)],
+        persistent: &[opt("datadir", b'd', Str), opt("kmddir", b'k', Str)],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "account",
+        local: &[opt("default", b'f', Str)],
+        persistent: &[opt("wallet", b'w', Str)],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "account addpartkey",
+        local: &[
+            req("address", b'a', Str),
+            req("roundFirstValid", 0, U64),
+            req("roundLastValid", 0, U64),
+            opt("outdir", b'o', Str),
+            opt("keyDilution", 0, U64),
+        ],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "account applicationdetails",
+        local: &[
+            req("address", b'a', Str),
+            opt("next", b'n', Str),
+            opt("limit", b'l', U64),
+            opt("include-params", 0, Bool),
+        ],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "account assetdetails",
+        local: &[
+            req("address", b'a', Str),
+            opt("next", b'n', Str),
+            opt("limit", b'l', U64),
+        ],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "account balance",
+        local: &[req("address", b'a', Str)],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "account changeonlinestatus",
+        local: &[
+            opt("address", b'a', Str),
+            opt("partkeyfile", 0, Str),
+            opt("signer", b'S', Str),
+            opt("online", b'o', Bool),
+            opt("fee", b'f', U64),
+            opt("firstvalid", 0, U64),
+            opt("validrounds", b'v', U64),
+            opt("lastvalid", 0, U64),
+            opt("lease", b'x', Str),
+            opt("txfile", b't', Str),
+            opt("no-wait", b'N', Bool),
+            opt("rekey-to", 0, Str),
+        ],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "account delete",
+        local: &[req("address", b'a', Str)],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "account deletepartkey",
+        local: &[opt("partkeyid", 0, Str)],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        // go marks `balanceCmd`'s `address` required a second time instead.
+        path: "account dump",
+        local: &[opt("outfile", b'o', Str), opt("address", b'a', Str)],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "account export",
+        local: &[req("address", b'a', Str)],
+        persistent: &[],
+        args: ArgsRule::Arbitrary,
+    },
+    Cmd {
+        path: "account import",
+        local: &[opt("default", b'f', Bool), opt("mnemonic", b'm', Str)],
+        persistent: &[],
+        args: ArgsRule::Arbitrary,
+    },
+    Cmd {
+        path: "account importrootkey",
+        local: &[opt("unencrypted-wallet", b'u', Bool)],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "account info",
+        local: &[req("address", b'a', Str), opt("onlyShowAssetIDs", 0, Bool)],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "account installpartkey",
+        local: &[req("partkey", 0, Str), opt("delete-input", 0, Bool)],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "account list",
+        local: &[opt("info", 0, Bool)],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "account listpartkeys",
+        local: &[],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "account marknonparticipating",
+        local: &[
+            req("address", b'a', Str),
+            opt("signer", b'S', Str),
+            opt("fee", b'f', U64),
+            opt("firstvalid", 0, U64),
+            opt("validrounds", b'v', U64),
+            opt("lastvalid", 0, U64),
+            opt("txfile", b't', Str),
+            opt("no-wait", b'N', Bool),
+            opt("rekey-to", 0, Str),
+        ],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "account multisig",
+        local: &[],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "account multisig delete",
+        local: &[req("address", b'a', Str)],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "account multisig info",
+        local: &[req("address", b'a', Str)],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "account multisig new",
+        local: &[req("threshold", b'T', U8)],
+        persistent: &[],
+        args: ArgsRule::Min(1),
+    },
+    Cmd {
+        path: "account new",
+        local: &[opt("default", b'f', Bool)],
+        persistent: &[],
+        args: ArgsRule::Range(0, 1),
+    },
+    Cmd {
+        path: "account partkeyinfo",
+        local: &[],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "account rename",
+        local: &[],
+        persistent: &[],
+        args: ArgsRule::Exact(2),
+    },
+    Cmd {
+        path: "account renewallpartkeys",
+        local: &[
+            opt("fee", b'f', U64),
+            req("roundLastValid", 0, U64),
+            opt("keyDilution", 0, U64),
+            opt("no-wait", b'N', Bool),
+            opt("rekey-to", 0, Str),
+        ],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "account renewpartkey",
+        local: &[
+            req("address", b'a', Str),
+            opt("fee", b'f', U64),
+            req("roundLastValid", 0, U64),
+            opt("keyDilution", 0, U64),
+            opt("no-wait", b'N', Bool),
+            opt("rekey-to", 0, Str),
+        ],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        // go marks a `partkeyid` flag required here, which `rewards` does
+        // not have (`MarkFlagRequired` fails and is ignored).
+        path: "account rewards",
+        local: &[req("address", b'a', Str)],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "wallet",
+        local: &[opt("default", b'f', Str)],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "wallet list",
+        local: &[],
+        persistent: &[],
+        args: ArgsRule::No,
+    },
+    Cmd {
+        path: "wallet new",
+        local: &[
+            opt("recover", b'r', Bool),
+            opt("unencrypted", 0, Bool),
+            opt("no-display-seed", 0, Bool),
+        ],
+        persistent: &[],
+        args: ArgsRule::Exact(1),
+    },
+    Cmd {
+        path: "wallet rename",
+        local: &[],
+        persistent: &[],
+        args: ArgsRule::Exact(2),
+    },
+];
+
+fn command(path: &str) -> Option<&'static Cmd> {
+    COMMANDS.iter().find(|c| c.path == path)
+}
+
+/// `findNext`: the subcommand `name` of `parent`. Of the root's commands
+/// only `account` and `wallet` are known here; any other one is left to
+/// clap.
+fn child(parent: &Cmd, name: &str) -> Option<&'static Cmd> {
+    if name.is_empty() || name.contains(' ') {
+        return None;
+    }
+    let path = if parent.path.is_empty() {
+        name.to_string()
+    } else {
+        format!("{} {name}", parent.path)
+    };
+    command(&path)
+}
+
+/// The flags of `cmd` after `mergePersistentFlags`: its own, then the
+/// persistent ones of it and its parents (a parent's flag never shadows one
+/// of the same name); `with_help` adds cobra's help flag, then `extras`
+/// whose names go's flags do not use.
+fn flags_of<'a>(cmd: &Cmd, with_help: bool, extras: &[Flag<'a>]) -> Vec<Flag<'a>> {
+    let mut out: Vec<Flag<'a>> = cmd.local.to_vec();
+    let mut path = Some(cmd.path);
+    while let Some(p) = path {
+        let c = command(p).expect("a parent of a known command is known");
+        for f in c.persistent {
+            if !out.iter().any(|o| o.long == f.long) {
+                out.push(*f);
+            }
+        }
+        path = if p.is_empty() {
+            None
+        } else {
+            Some(p.rsplit_once(' ').map_or("", |(parent, _)| parent))
+        };
+    }
+    if with_help {
+        out.push(HELP);
+    }
+    for e in extras {
+        if !e.long.is_empty() && out.iter().any(|o| o.long == e.long) {
+            continue;
+        }
+        let mut e = *e;
+        if out.iter().any(|o| o.short != 0 && o.short == e.short) {
+            e.short = 0;
+        }
+        if !e.long.is_empty() || e.short != 0 {
+            out.push(e);
+        }
+    }
+    out
+}
+
+/// goal-rust's clap definition of the command `path`.
+fn clap_command(path: &str) -> Option<clap::Command> {
+    let mut c = <crate::Cli as clap::CommandFactory>::command();
+    for name in path.split(' ') {
+        c = c.find_subcommand(name)?.clone();
+    }
+    Some(c)
+}
+
+/// The flags goal-rust's clap command declares beyond go's (`--password`
+/// and the like, which goal-rust already accepted before this parsing was
+/// ported): known to the parse, so a command line using them still reaches
+/// clap.
+fn clap_extras(c: &clap::Command) -> Vec<Flag<'_>> {
+    c.get_arguments()
+        .filter(|a| !a.is_positional())
+        .map(|a| Flag {
+            long: a.get_long().unwrap_or(""),
+            short: a.get_short().filter(char::is_ascii).map_or(0, |c| c as u8),
+            kind: if a.get_action().takes_values() {
+                Kind::Str
+            } else {
+                Kind::Bool
+            },
+            required: false,
+        })
+        .collect()
+}
+
+fn by_long<'f, 'a>(flags: &'f [Flag<'a>], name: &str) -> Option<&'f Flag<'a>> {
+    flags.iter().find(|f| f.long == name)
+}
+
+fn by_short<'f, 'a>(flags: &'f [Flag<'a>], c: u8) -> Option<&'f Flag<'a>> {
+    flags.iter().find(|f| f.short != 0 && f.short == c)
+}
+
+/// cobra's `hasNoOptDefVal` (`--name`): only bool flags have one here.
+fn has_no_opt_def_val(name: &str, flags: &[Flag<'_>]) -> bool {
+    by_long(flags, name).is_some_and(|f| f.kind == Kind::Bool)
+}
+
+/// cobra's `shortHasNoOptDefVal` (`-n`).
+fn short_has_no_opt_def_val(name: &str, flags: &[Flag<'_>]) -> bool {
+    name.bytes()
+        .next()
+        .and_then(|c| by_short(flags, c))
+        .is_some_and(|f| f.kind == Kind::Bool)
+}
+
+/// The argument `s` takes the next one as its value while cobra looks for
+/// commands (`stripFlags`, `argsMinusFirstX`).
+fn skips_next(s: &str, flags: &[Flag<'_>]) -> bool {
+    if s.contains('=') {
+        return false;
     }
     if let Some(long) = s.strip_prefix("--") {
-        let (name, has_value) = match long.split_once('=') {
-            Some((n, _)) => (n, true),
-            None => (long, false),
-        };
-        return if level.contains(&name) {
-            Token::Known {
-                takes_next: !has_value,
-                default: name == "default",
-            }
-        } else {
-            Token::Other
-        };
-    }
-    let Some(short) = s.strip_prefix('-') else {
-        return Token::Positional;
-    };
-    let mut chars = short.chars();
-    let Some(c) = chars.next() else {
-        return Token::Other;
-    };
-    if level.contains(&c.to_string().as_str()) {
-        // `-fx` and `-f=x` carry their value.
-        Token::Known {
-            takes_next: chars.as_str().is_empty(),
-            default: c == 'f',
+        if !has_no_opt_def_val(long, flags) {
+            return true;
         }
-    } else {
-        Token::Other
     }
+    s.starts_with('-') && s.len() == 2 && !short_has_no_opt_def_val(&s[1..], flags)
 }
 
-/// cobra's `stripFlags` skip rule for a flag the command does not know:
-/// `-x` and `--name` without `=` take the next argument as their value.
-fn unknown_takes_next(s: &str) -> bool {
-    !s.contains('=') && (s.starts_with("--") || (s.starts_with('-') && s.chars().count() == 2))
+/// cobra's `stripFlags`: the positions in `idx` of the non-flag arguments.
+fn strip_flags(args: &[String], idx: &[usize], flags: &[Flag<'_>]) -> Vec<usize> {
+    let mut commands = Vec::new();
+    let mut i = 0;
+    while i < idx.len() {
+        let s = args[idx[i]].as_str();
+        i += 1;
+        if s == "--" {
+            break;
+        }
+        if skips_next(s, flags) {
+            // '-f arg': skip arg, or stop when it is the last one.
+            if idx.len() - i <= 1 {
+                break;
+            }
+            i += 1;
+            continue;
+        }
+        if !s.is_empty() && !s.starts_with('-') {
+            commands.push(idx[i - 1]);
+        }
+    }
+    commands
 }
 
-/// go's `%q` of a string (`strconv.Quote`), for the argument names in
-/// cobra's errors.
+/// cobra's `argsMinusFirstX`: `idx` without the first argument equal to
+/// `x` that is not a flag value.
+fn args_minus_first_x(args: &[String], idx: &[usize], x: &str, flags: &[Flag<'_>]) -> Vec<usize> {
+    let mut pos = 0;
+    while pos < idx.len() {
+        let s = args[idx[pos]].as_str();
+        if s == "--" {
+            break;
+        }
+        if skips_next(s, flags) {
+            pos += 2;
+            continue;
+        }
+        if !s.starts_with('-') && s == x {
+            let mut out = idx.to_vec();
+            out.remove(pos);
+            return out;
+        }
+        pos += 1;
+    }
+    idx.to_vec()
+}
+
+/// go's `%q` of a string (`strconv.Quote`), for the arguments in cobra's
+/// and pflag's errors.
 fn go_quote(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
-            '\u{07}' => out.push_str("\\a"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{0b}' => out.push_str("\\v"),
-            c if (c as u32) < 0x20 || c == '\u{7f}' => {
-                out.push_str(&format!("\\x{:02x}", c as u32));
-            }
-            c => out.push(c),
+            c => push_escaped(&mut out, c),
         }
     }
     out.push('"');
     out
 }
 
-/// pflag's error for `-f` / `--default` given to a command without it.
-fn unknown_flag_msg(s: &str) -> String {
-    match s.strip_prefix("--") {
-        Some(long) => format!(
-            "unknown flag: --{}",
-            long.split_once('=').map_or(long, |(n, _)| n)
-        ),
-        None => format!("unknown shorthand flag: 'f' in {s}"),
+/// go's `%q` of a byte (`strconv.QuoteRune(rune(b))`): pflag's
+/// `unknown shorthand flag: %q` names the first byte of the shorthands.
+fn go_quote_byte(b: u8) -> String {
+    let c = char::from(b);
+    let mut out = String::from("'");
+    match c {
+        '\'' => out.push_str("\\'"),
+        '\\' => out.push_str("\\\\"),
+        c => push_escaped(&mut out, c),
+    }
+    out.push('\'');
+    out
+}
+
+/// strconv's escaping of one rune that is not the quote character.
+fn push_escaped(out: &mut String, c: char) {
+    match c {
+        '\u{07}' => out.push_str("\\a"),
+        '\u{08}' => out.push_str("\\b"),
+        '\u{0c}' => out.push_str("\\f"),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        '\u{0b}' => out.push_str("\\v"),
+        c if (c as u32) < 0x20 || c == '\u{7f}' => {
+            out.push_str(&format!("\\x{:02x}", c as u32));
+        }
+        // Latin-1's non-printing runes (C1 controls, no-break space, soft
+        // hyphen); other non-ASCII runes are printed as they are.
+        c if (0x80..=0xa0).contains(&(c as u32)) || c == '\u{ad}' => {
+            out.push_str(&format!("\\u{:04x}", c as u32));
+        }
+        c => out.push(c),
     }
 }
 
-pub(crate) fn decide(args: &[String]) -> Outcome {
-    // The group name: the first positional after the root's flags.
-    let mut i = 1;
-    let group = loop {
-        let Some(s) = args.get(i) else {
-            return Outcome::Unchanged;
-        };
-        match token(s, ROOT) {
-            Token::Positional => break i,
-            Token::Known { takes_next, .. } => i += if takes_next { 2 } else { 1 },
-            Token::End | Token::Other => return Outcome::Unchanged,
-        }
-    };
-    let (level, subcommands) = match args[group].as_str() {
-        "account" => (ACCOUNT, ACCOUNT_SUBCOMMANDS),
-        "wallet" => (WALLET, WALLET_SUBCOMMANDS),
-        _ => return Outcome::Unchanged,
-    };
-    let group_name = args[group].as_str();
-
-    // The group's flags up to the first positional; `defaults` are the
-    // `-f` / `--default` arguments among them.
-    let mut defaults = Vec::new();
-    let mut i = group + 1;
-    let first = loop {
-        let Some(s) = args.get(i) else {
-            return Outcome::Unchanged;
-        };
-        match token(s, level) {
-            Token::Positional => break i,
-            Token::Known {
-                takes_next,
-                default,
-            } => {
-                if default {
-                    defaults.push(i);
-                }
-                i += if takes_next { 2 } else { 1 };
-            }
-            // After `--` every argument is positional: the first one is the
-            // unknown command, even a subcommand's name.
-            Token::End => {
-                return match args.get(i + 1) {
-                    Some(arg) => Outcome::Fail {
-                        msg: format!(
-                            "unknown command {} for \"goal {group_name}\"",
-                            go_quote(arg)
-                        ),
-                        usage_path: group_name.to_string(),
-                    },
-                    None => Outcome::Unchanged,
-                };
-            }
-            Token::Other => return Outcome::Unchanged,
-        }
-    };
-
-    if !subcommands.contains(&args[first].as_str()) {
-        // `cobra.NoArgs`, once the group's flags parsed (an unknown or help
-        // flag after the argument wins, left to clap).
-        let mut j = first + 1;
-        while let Some(s) = args.get(j) {
-            match token(s, level) {
-                Token::Positional => j += 1,
-                Token::Known { takes_next, .. } => j += if takes_next { 2 } else { 1 },
-                Token::End => break,
-                Token::Other => return Outcome::Unchanged,
-            }
-        }
-        return Outcome::Fail {
-            msg: format!(
-                "unknown command {} for \"goal {group_name}\"",
-                go_quote(&args[first])
-            ),
-            usage_path: group_name.to_string(),
-        };
+/// go's `strconv.ParseBool`.
+fn parse_bool(s: &str) -> Result<bool, String> {
+    match s {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Ok(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Ok(false),
+        _ => Err(format!(
+            "strconv.ParseBool: parsing {}: invalid syntax",
+            go_quote(s)
+        )),
     }
-    if defaults.is_empty() {
+}
+
+/// go's `strconv.ParseUint(s, 0, bits)`, for the error it returns.
+fn parse_uint(s0: &str, bits: u32) -> Result<u64, String> {
+    let syntax = || {
+        format!(
+            "strconv.ParseUint: parsing {}: invalid syntax",
+            go_quote(s0)
+        )
+    };
+    let range = || {
+        format!(
+            "strconv.ParseUint: parsing {}: value out of range",
+            go_quote(s0)
+        )
+    };
+    let b = s0.as_bytes();
+    if b.is_empty() {
+        return Err(syntax());
+    }
+    let (base, digits): (u64, &[u8]) = if b[0] == b'0' {
+        match b.get(1).map(u8::to_ascii_lowercase) {
+            Some(b'b') if b.len() >= 3 => (2, &b[2..]),
+            Some(b'o') if b.len() >= 3 => (8, &b[2..]),
+            Some(b'x') if b.len() >= 3 => (16, &b[2..]),
+            _ => (8, &b[1..]),
+        }
+    } else {
+        (10, b)
+    };
+    let max_val: u64 = if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    let cutoff = u64::MAX / base + 1;
+    let mut underscores = false;
+    let mut n: u64 = 0;
+    for &c in digits {
+        let lower = c.to_ascii_lowercase();
+        let d = match c {
+            b'_' => {
+                underscores = true;
+                continue;
+            }
+            b'0'..=b'9' => u64::from(c - b'0'),
+            _ if lower.is_ascii_lowercase() => u64::from(lower - b'a' + 10),
+            _ => return Err(syntax()),
+        };
+        if d >= base {
+            return Err(syntax());
+        }
+        if n >= cutoff {
+            return Err(range());
+        }
+        n *= base;
+        let n1 = n.wrapping_add(d);
+        if n1 < n || n1 > max_val {
+            return Err(range());
+        }
+        n = n1;
+    }
+    if underscores && !underscore_ok(b) {
+        return Err(syntax());
+    }
+    Ok(n)
+}
+
+/// go's `strconv.underscoreOK`: underscores only between digits (or after
+/// the base prefix).
+fn underscore_ok(s: &[u8]) -> bool {
+    let mut saw = b'^';
+    let s = match s.first() {
+        Some(b'-' | b'+') => &s[1..],
+        _ => s,
+    };
+    let mut i = 0;
+    let mut hex = false;
+    if s.len() >= 2 && s[0] == b'0' && matches!(s[1].to_ascii_lowercase(), b'b' | b'o' | b'x') {
+        i = 2;
+        saw = b'0';
+        hex = s[1].eq_ignore_ascii_case(&b'x');
+    }
+    while i < s.len() {
+        let c = s[i];
+        i += 1;
+        if c.is_ascii_digit() || (hex && matches!(c.to_ascii_lowercase(), b'a'..=b'f')) {
+            saw = b'0';
+            continue;
+        }
+        if c == b'_' {
+            if saw != b'0' {
+                return false;
+            }
+            saw = b'_';
+            continue;
+        }
+        if saw == b'_' {
+            return false;
+        }
+        saw = b'!';
+    }
+    saw != b'_'
+}
+
+/// What the found command's flag parsing left.
+struct Parsed<'a> {
+    /// `Flags().Args()`.
+    positional: Vec<String>,
+    /// The long names of the flags set.
+    changed: Vec<&'a str>,
+    help: bool,
+}
+
+impl<'a> Parsed<'a> {
+    /// pflag's `FlagSet.Set`.
+    fn set(&mut self, flag: &Flag<'a>, value: &str) -> Result<(), String> {
+        let checked = match flag.kind {
+            Kind::Bool => parse_bool(value).map(|v| {
+                if flag.long == HELP.long {
+                    self.help = v;
+                }
+            }),
+            Kind::Str => Ok(()),
+            Kind::U8 => parse_uint(value, 8).map(drop),
+            Kind::U64 => parse_uint(value, 64).map(drop),
+        };
+        if let Err(e) = checked {
+            let name = if flag.short != 0 {
+                format!("-{}, --{}", char::from(flag.short), flag.long)
+            } else {
+                format!("--{}", flag.long)
+            };
+            return Err(format!(
+                "invalid argument {} for {} flag: {e}",
+                go_quote(value),
+                go_quote(&name)
+            ));
+        }
+        if !self.changed.contains(&flag.long) {
+            self.changed.push(flag.long);
+        }
+        Ok(())
+    }
+}
+
+/// pflag's `FlagSet.Parse` (interspersed, `ContinueOnError`).
+fn parse<'a>(args: &[&str], flags: &[Flag<'a>]) -> Result<Parsed<'a>, String> {
+    let mut p = Parsed {
+        positional: Vec::new(),
+        changed: Vec::new(),
+        help: false,
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let s = args[i];
+        i += 1;
+        if s.len() < 2 || !s.starts_with('-') {
+            p.positional.push(s.to_string());
+            continue;
+        }
+        if s == "--" {
+            p.positional
+                .extend(args[i..].iter().map(|a| (*a).to_string()));
+            break;
+        }
+        if let Some(name) = s.strip_prefix("--") {
+            // parseLongArg
+            if name.starts_with(['-', '=']) {
+                return Err(format!("bad flag syntax: {s}"));
+            }
+            let (name, inline) = match name.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (name, None),
+            };
+            let Some(flag) = by_long(flags, name) else {
+                return Err(format!("unknown flag: --{name}"));
+            };
+            let value = match inline {
+                Some(v) => v,
+                None if flag.kind == Kind::Bool => "true",
+                None if i < args.len() => {
+                    i += 1;
+                    args[i - 1]
+                }
+                None => return Err(format!("flag needs an argument: {s}")),
+            };
+            p.set(flag, value)?;
+            continue;
+        }
+        // parseShortArg: one shorthand letter at a time.
+        let mut shorthands = &s.as_bytes()[1..];
+        while !shorthands.is_empty() {
+            if shorthands.starts_with(b"test.") {
+                break;
+            }
+            let c = shorthands[0];
+            let rest = String::from_utf8_lossy(shorthands);
+            let Some(flag) = by_short(flags, c) else {
+                return Err(format!(
+                    "unknown shorthand flag: {} in -{rest}",
+                    go_quote_byte(c)
+                ));
+            };
+            let value: String;
+            if shorthands.len() > 2 && shorthands[1] == b'=' {
+                value = String::from_utf8_lossy(&shorthands[2..]).into_owned();
+                shorthands = &[];
+            } else if flag.kind == Kind::Bool {
+                value = "true".to_string();
+                shorthands = &shorthands[1..];
+            } else if shorthands.len() > 1 {
+                value = String::from_utf8_lossy(&shorthands[1..]).into_owned();
+                shorthands = &[];
+            } else if i < args.len() {
+                value = args[i].to_string();
+                i += 1;
+                shorthands = &[];
+            } else {
+                return Err(format!(
+                    "flag needs an argument: {} in -{rest}",
+                    go_quote_byte(c)
+                ));
+            }
+            p.set(flag, &value)?;
+        }
+    }
+    Ok(p)
+}
+
+/// The command's `Args` rule on its positional arguments.
+fn validate_args(cmd: &Cmd, args: &[String]) -> Result<(), String> {
+    let n = args.len();
+    match cmd.args {
+        ArgsRule::Arbitrary => Ok(()),
+        ArgsRule::No if n > 0 => Err(format!(
+            "unknown command {} for \"goal {}\"",
+            go_quote(&args[0]),
+            cmd.path
+        )),
+        ArgsRule::No => Ok(()),
+        ArgsRule::Exact(k) if n != k => Err(format!("accepts {k} arg(s), received {n}")),
+        ArgsRule::Range(lo, hi) if n < lo || n > hi => Err(format!(
+            "accepts between {lo} and {hi} arg(s), received {n}"
+        )),
+        ArgsRule::Min(k) if n < k => {
+            Err(format!("requires at least {k} arg(s), only received {n}"))
+        }
+        ArgsRule::Exact(_) | ArgsRule::Range(..) | ArgsRule::Min(_) => Ok(()),
+    }
+}
+
+/// cobra's `ValidateRequiredFlags`: the unset required flags, in pflag's
+/// (sorted) order.
+fn validate_required(flags: &[Flag], changed: &[&str]) -> Result<(), String> {
+    let mut missing: Vec<&str> = flags
+        .iter()
+        .filter(|f| f.required && !changed.contains(&f.long))
+        .map(|f| f.long)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort_unstable();
+    Err(format!(
+        "required flag(s) \"{}\" not set",
+        missing.join("\", \"")
+    ))
+}
+
+pub(crate) fn decide(args: &[String]) -> Outcome {
+    // Find: walk down from the root.
+    let mut cmd = command("").expect("the root is in the table");
+    let mut idx: Vec<usize> = (1..args.len()).collect();
+    let mut names = Vec::new();
+    loop {
+        let flags = flags_of(cmd, false, &[]);
+        let Some(&next) = strip_flags(args, &idx, &flags).first() else {
+            break;
+        };
+        let Some(sub) = child(cmd, &args[next]) else {
+            break;
+        };
+        idx = args_minus_first_x(args, &idx, &args[next], &flags);
+        names.push(next);
+        cmd = sub;
+    }
+    if cmd.path.is_empty() {
         return Outcome::Unchanged;
     }
 
-    // The subcommand path, one level further under `account multisig`.
-    let mut names = vec![first];
-    if group_name == "account" && args[first] == "multisig" {
-        let mut j = first + 1;
-        while let Some(s) = args.get(j) {
-            match token(s, MULTISIG) {
-                Token::Positional => {
-                    if MULTISIG_SUBCOMMANDS.contains(&s.as_str()) {
-                        names.push(j);
-                    }
-                    break;
-                }
-                Token::Known { takes_next, .. } => j += if takes_next { 2 } else { 1 },
-                Token::End => break,
-                Token::Other => j += if unknown_takes_next(s) { 2 } else { 1 },
-            }
-        }
+    // execute: flags, help, `Args`, required flags.
+    let clap_cmd = clap_command(cmd.path);
+    let extras = clap_cmd.as_ref().map(clap_extras).unwrap_or_default();
+    let flags = flags_of(cmd, true, &extras);
+    let rest: Vec<&str> = idx.iter().map(|&k| args[k].as_str()).collect();
+    let fail = |msg: String| Outcome::Fail {
+        msg,
+        usage_path: cmd.path.to_string(),
+    };
+    let parsed = match parse(&rest, &flags) {
+        Ok(p) => p,
+        Err(msg) => return fail(msg),
+    };
+    if parsed.help {
+        return Outcome::Help(cmd.path.to_string());
     }
-    let path = std::iter::once(group)
-        .chain(names.iter().copied())
-        .map(|k| args[k].as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    // The subcommand parses the group's `-f` / `--default` arguments in
-    // order: the first one it does not have is pflag's error.
-    for &k in &defaults {
-        let s = args[k].as_str();
-        let own = if s.starts_with("--") {
-            OWN_LONG_DEFAULT
-        } else {
-            OWN_SHORT_F
-        };
-        if !own.contains(&path.as_str()) {
-            return Outcome::Fail {
-                msg: unknown_flag_msg(s),
-                usage_path: path,
-            };
-        }
+    if let Err(msg) = validate_args(cmd, &parsed.positional) {
+        return fail(msg);
+    }
+    if let Err(msg) = validate_required(&flags, &parsed.changed) {
+        return fail(msg);
     }
 
-    // All of them are the subcommand's own: hand them to it.
+    // Hand every argument after the command names to the found command.
+    let group = names[0];
     let mut out: Vec<String> = args[..=group].to_vec();
-    out.extend(names.iter().map(|&k| args[k].clone()));
+    out.extend(names[1..].iter().map(|&k| args[k].clone()));
     out.extend(
         args.iter()
             .enumerate()
@@ -383,7 +980,11 @@ pub(crate) fn decide(args: &[String]) -> Outcome {
             .filter(|(k, _)| !names.contains(k))
             .map(|(_, s)| s.clone()),
     );
-    Outcome::Reordered(out)
+    if out == args {
+        Outcome::Unchanged
+    } else {
+        Outcome::Reordered(out)
+    }
 }
 
 #[cfg(test)]
@@ -409,6 +1010,10 @@ mod tests {
         Outcome::Reordered(v)
     }
 
+    fn help(path: &str) -> Outcome {
+        Outcome::Help(path.to_string())
+    }
+
     #[test]
     fn extra_arguments_are_cobras_unknown_command() {
         let acct = r#"unknown command "extra" for "goal account""#;
@@ -422,8 +1027,11 @@ mod tests {
             d(&["wallet", "--default=x", "extra"]),
             fail(r#"unknown command "extra" for "goal wallet""#, "wallet")
         );
-        // `-w` is not a `wallet` flag, `-f`'s value is not a command.
-        assert_eq!(d(&["wallet", "-w", "x", "extra"]), Outcome::Unchanged);
+        // `-w` is not a `wallet` flag; `-f`'s value is not a command.
+        assert_eq!(
+            d(&["wallet", "-w", "x", "extra"]),
+            fail("unknown shorthand flag: 'w' in -w", "wallet")
+        );
         assert_eq!(d(&["account", "-f", "list"]), Outcome::Unchanged);
         // After `--` even a subcommand's name is an argument.
         assert_eq!(
@@ -437,19 +1045,13 @@ mod tests {
                 "account"
             )
         );
-    }
-
-    #[test]
-    fn help_and_unknown_flags_are_left_to_clap() {
-        assert_eq!(d(&["account", "extra", "-h"]), Outcome::Unchanged);
-        assert_eq!(d(&["account", "extra", "-z"]), Outcome::Unchanged);
-        assert_eq!(d(&["account", "-h", "-f", "x", "list"]), Outcome::Unchanged);
-        assert_eq!(d(&["account", "-f"]), Outcome::Unchanged);
-        assert_eq!(d(&["account", "-f", "x"]), Outcome::Unchanged);
-        assert_eq!(d(&["account", "list", "-f", "x"]), Outcome::Unchanged);
-        assert_eq!(d(&["clerk", "extra"]), Outcome::Unchanged);
-        assert_eq!(d(&["-v", "account", "extra"]), Outcome::Unchanged);
-        assert_eq!(d(&[]), Outcome::Unchanged);
+        assert_eq!(
+            d(&["account", "list", "--", "x"]),
+            fail(
+                r#"unknown command "x" for "goal account list""#,
+                "account list"
+            )
+        );
     }
 
     #[test]
@@ -496,40 +1098,276 @@ mod tests {
             d(&["account", "--default", "imp", "import"]),
             reordered(&["account", "import", "--default", "imp"])
         );
+        assert_eq!(
+            d(&["account", "-w", "w", "multisig", "info", "-a", "A"]),
+            reordered(&["account", "multisig", "info", "-w", "w", "-a", "A"])
+        );
+        assert_eq!(d(&["account", "list", "--info"]), Outcome::Unchanged);
+        assert_eq!(d(&["clerk", "extra"]), Outcome::Unchanged);
+        assert_eq!(d(&["-v"]), Outcome::Unchanged);
+        assert_eq!(d(&[]), Outcome::Unchanged);
     }
 
     #[test]
-    fn every_command_has_a_usage_and_the_own_flag_lists_match_it() {
-        let mut paths = vec!["account".to_string(), "wallet".to_string()];
-        paths.extend(ACCOUNT_SUBCOMMANDS.iter().map(|s| format!("account {s}")));
-        paths.extend(
-            MULTISIG_SUBCOMMANDS
-                .iter()
-                .map(|s| format!("account multisig {s}")),
+    fn help_is_the_found_commands() {
+        assert_eq!(d(&["account", "-h"]), help("account"));
+        assert_eq!(d(&["wallet", "--help"]), help("wallet"));
+        // The help flag is unknown while cobra looks for the command: it
+        // takes the next argument as its value.
+        assert_eq!(d(&["account", "-h", "list"]), help("account"));
+        assert_eq!(d(&["account", "--help", "list"]), help("account"));
+        assert_eq!(d(&["account", "-f", "x", "-h"]), help("account"));
+        assert_eq!(
+            d(&["account", "multisig", "new", "-h"]),
+            help("account multisig new")
         );
-        paths.extend(WALLET_SUBCOMMANDS.iter().map(|s| format!("wallet {s}")));
-        for p in &paths {
-            let u = usage(p).unwrap_or_else(|| panic!("no usage for {p}"));
-            assert!(u.starts_with(&format!("Usage:\n  goal {p} ")), "{p}");
-            // The command's own flags, before "Global Flags:".
-            let own = u
-                .split("\nFlags:\n")
-                .nth(1)
-                .and_then(|f| f.split("\nGlobal Flags:\n").next())
-                .unwrap_or("");
-            if p == "account" || p == "wallet" {
-                continue;
-            }
+        // Help wins over the arguments and the required flags...
+        assert_eq!(d(&["account", "info", "-h", "extra"]), help("account info"));
+        // ... but not over a flag error, wherever it stands.
+        assert_eq!(
+            d(&["account", "list", "-h", "-z"]),
+            fail("unknown shorthand flag: 'z' in -z", "account list")
+        );
+        assert_eq!(
+            d(&["wallet", "-h", "-f"]),
+            fail("flag needs an argument: 'f' in -f", "wallet")
+        );
+        assert_eq!(
+            d(&["account", "list", "-h=x"]),
+            fail(
+                r#"invalid argument "x" for "-h, --help" flag: strconv.ParseBool: parsing "x": invalid syntax"#,
+                "account list"
+            )
+        );
+        assert_eq!(d(&["account", "list", "--help=false"]), Outcome::Unchanged);
+    }
+
+    #[test]
+    fn flag_errors_are_pflags_first_from_the_left() {
+        let cos = "account changeonlinestatus";
+        assert_eq!(
+            d(&["account", "-f"]),
+            fail("flag needs an argument: 'f' in -f", "account")
+        );
+        assert_eq!(
+            d(&["account", "--default"]),
+            fail("flag needs an argument: --default", "account")
+        );
+        assert_eq!(
+            d(&["account", "list", "-w"]),
+            fail("flag needs an argument: 'w' in -w", "account list")
+        );
+        assert_eq!(
+            d(&["account", "-z", "list"]),
+            fail("unknown shorthand flag: 'z' in -z", "account")
+        );
+        assert_eq!(
+            d(&["-v", "account", "list"]),
+            fail("unknown shorthand flag: 'v' in -v", "account")
+        );
+        assert_eq!(
+            d(&["account", "list", "--nosuch=1"]),
+            fail("unknown flag: --nosuch", "account list")
+        );
+        assert_eq!(
+            d(&["account", "list", "---x"]),
+            fail("bad flag syntax: ---x", "account list")
+        );
+        assert_eq!(
+            d(&["account", "list", "-é"]),
+            fail("unknown shorthand flag: 'Ã' in -é", "account list")
+        );
+        assert_eq!(
+            d(&["account", "changeonlinestatus", "-Nz"]),
+            fail("unknown shorthand flag: 'z' in -z", cos)
+        );
+        assert_eq!(
+            d(&["account", "changeonlinestatus", "-f", "x", "-z"]),
+            fail(
+                r#"invalid argument "x" for "-f, --fee" flag: strconv.ParseUint: parsing "x": invalid syntax"#,
+                cos
+            )
+        );
+        assert_eq!(
+            d(&["account", "changeonlinestatus", "-z", "-f", "x"]),
+            fail("unknown shorthand flag: 'z' in -z", cos)
+        );
+        assert_eq!(
+            d(&["account", "changeonlinestatus", "-ofalse"]),
+            fail(
+                r#"invalid argument "alse" for "-f, --fee" flag: strconv.ParseUint: parsing "alse": invalid syntax"#,
+                cos
+            )
+        );
+        assert_eq!(
+            d(&["account", "changeonlinestatus", "--lastvalid", "1_0"]),
+            Outcome::Unchanged
+        );
+        assert_eq!(
+            d(&["account", "renewallpartkeys", "--roundLastValid=-1"]),
+            fail(
+                r#"invalid argument "-1" for "--roundLastValid" flag: strconv.ParseUint: parsing "-1": invalid syntax"#,
+                "account renewallpartkeys"
+            )
+        );
+    }
+
+    #[test]
+    fn arguments_then_required_flags() {
+        assert_eq!(
+            d(&["wallet", "new"]),
+            fail("accepts 1 arg(s), received 0", "wallet new")
+        );
+        assert_eq!(
+            d(&["account", "new", "a", "b"]),
+            fail("accepts between 0 and 1 arg(s), received 2", "account new")
+        );
+        assert_eq!(
+            d(&["account", "multisig", "new"]),
+            fail(
+                "requires at least 1 arg(s), only received 0",
+                "account multisig new"
+            )
+        );
+        assert_eq!(
+            d(&["account", "balance", "extra"]),
+            fail(
+                r#"unknown command "extra" for "goal account balance""#,
+                "account balance"
+            )
+        );
+        assert_eq!(
+            d(&["account", "addpartkey", "--roundLastValid", "5"]),
+            fail(
+                r#"required flag(s) "address", "roundFirstValid" not set"#,
+                "account addpartkey"
+            )
+        );
+        assert_eq!(
+            d(&["account", "export", "extra"]),
+            fail(r#"required flag(s) "address" not set"#, "account export")
+        );
+        assert_eq!(d(&["account", "dump"]), Outcome::Unchanged);
+        assert_eq!(d(&["account", "rewards", "-a", "A"]), Outcome::Unchanged);
+    }
+
+    #[test]
+    fn goal_rusts_own_extra_flags_still_reach_clap() {
+        assert_eq!(
+            d(&["wallet", "new", "w", "-w", "pw", "--no-display-seed"]),
+            Outcome::Unchanged
+        );
+        assert_eq!(
+            d(&["account", "import", "x", "-m", "m", "--password", "pw"]),
+            Outcome::Unchanged
+        );
+        // go's flags keep their kinds and errors.
+        assert_eq!(
+            d(&["wallet", "new", "w", "-f", "x"]),
+            fail("unknown shorthand flag: 'f' in -f", "wallet new")
+        );
+    }
+
+    #[test]
+    fn parse_uint_matches_strconv() {
+        let ok = |s: &str, bits: u32| parse_uint(s, bits).ok();
+        assert_eq!(ok("0", 64), Some(0));
+        assert_eq!(ok("0x_1F", 64), Some(31));
+        assert_eq!(ok("0b101", 64), Some(5));
+        assert_eq!(ok("0o17", 64), Some(15));
+        assert_eq!(ok("017", 64), Some(15));
+        assert_eq!(ok("1_000", 64), Some(1000));
+        assert_eq!(ok("255", 8), Some(255));
+        assert_eq!(ok("18446744073709551615", 64), Some(u64::MAX));
+        for bad in ["", "0x", "08", "1__0", "_1", "1_", "-1", "+1", "x", "0x_"] {
             assert_eq!(
-                own.contains("\n  -f, --") || own.starts_with("  -f, --"),
-                OWN_SHORT_F.contains(&p.as_str()),
-                "{p}: -f"
-            );
-            assert_eq!(
-                own.contains(" --default "),
-                OWN_LONG_DEFAULT.contains(&p.as_str()),
-                "{p}: --default"
+                parse_uint(bad, 64),
+                Err(format!(
+                    "strconv.ParseUint: parsing {}: invalid syntax",
+                    go_quote(bad)
+                )),
+                "{bad}"
             );
         }
+        for big in [
+            ("256", 8),
+            ("18446744073709551616", 64),
+            ("0x1_0000_0000_0000_0000", 64),
+        ] {
+            assert_eq!(
+                parse_uint(big.0, big.1),
+                Err(format!(
+                    "strconv.ParseUint: parsing \"{}\": value out of range",
+                    big.0
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn go_quotes() {
+        assert_eq!(go_quote_byte(b'f'), "'f'");
+        assert_eq!(go_quote_byte(b'\''), r"'\''");
+        assert_eq!(go_quote_byte(1), r"'\x01'");
+        assert_eq!(go_quote_byte(0xc3), "'Ã'");
+        assert_eq!(go_quote_byte(0x85), r"'\u0085'");
+        assert_eq!(go_quote("a\"b\n"), r#""a\"b\n""#);
+    }
+
+    /// The flag table against go's usage text: each command's flags,
+    /// shorthands and value-taking (a bool flag shows no type) and its
+    /// inherited ones.
+    #[test]
+    fn the_flag_table_matches_gos_usage() {
+        for cmd in COMMANDS.iter().filter(|c| !c.path.is_empty()) {
+            let u = usage(cmd.path).unwrap_or_else(|| panic!("no usage for {}", cmd.path));
+            assert!(help_text_of(cmd.path).is_some(), "{}: no help", cmd.path);
+            let mut want: Vec<String> = Vec::new();
+            let mut section = "";
+            for line in u.lines() {
+                if line.ends_with(':') && !line.starts_with(' ') {
+                    section = line;
+                    continue;
+                }
+                if section != "Flags:" && section != "Global Flags:"
+                    || !line.trim_start().starts_with('-')
+                {
+                    continue;
+                }
+                let spec = line.trim_start();
+                let (short, rest) = match spec.strip_prefix('-').filter(|_| !spec.starts_with("--"))
+                {
+                    Some(r) => (r.as_bytes()[0], &r[3..]),
+                    None => (0, spec),
+                };
+                let rest = rest.strip_prefix("--").expect("a long name");
+                let head = rest.split("  ").next().unwrap_or("");
+                let (long, typ) = head.split_once(' ').unwrap_or((head, ""));
+                // `--recover` is a bool with a backquoted name in its usage.
+                let bool_flag = typ.is_empty() || long == "recover";
+                want.push(format!(
+                    "{long}/{}/{bool_flag}",
+                    char::from(short.max(b' '))
+                ));
+            }
+            let mut got: Vec<String> = flags_of(cmd, true, &[])
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{}/{}/{}",
+                        f.long,
+                        char::from(f.short.max(b' ')),
+                        f.kind == Kind::Bool
+                    )
+                })
+                .collect();
+            want.sort();
+            got.sort();
+            assert_eq!(got, want, "{}", cmd.path);
+        }
+    }
+
+    fn help_text_of(path: &str) -> Option<String> {
+        crate::cobra_usage::help(path)
     }
 }

@@ -234,8 +234,10 @@ fn group_without_leaf_falls_back_to_help_and_exits_zero() {
         // must include the binary name in the Usage line, not just
         // the leaf subcommand name — otherwise it diverges from
         // `goal-rust <group> --help` and loses the global flag list.
+        // `account multisig` and `wallet` print go's own help, `goal ...`
+        // (issue #2464; `default_flags_e2e` compares it with go's).
         assert!(
-            stdout.contains("goal-rust"),
+            stdout.contains("goal-rust") || stdout.contains("\nUsage:\n  goal "),
             "argv={argv:?} fallback help missing bin name; got {stdout:?}",
         );
         let datadir_mentioned = stdout.contains("--datadir") || stdout.contains("-d, --datadir");
