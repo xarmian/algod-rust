@@ -37,13 +37,13 @@
 //! `fixtures/goal_client.jsonl` holds what go v5.0.5-stable's `goal` printed
 //! (exit code, stdout, stderr, the data dir and the binary dir masked) and
 //! the files it left in the data dir, for each command below (all of go's
-//! call sites but `ledger block` and `version`, which goal-rust does not
-//! implement yet), run against a data dir holding a genesis but no node:
+//! call sites), run against a data dir holding a genesis but no node:
 //! - with no kmd next to the binary (a copy of it in a temporary directory,
 //!   `PATH=/usr/bin:/bin`);
 //! - with a kmd next to it, which the command starts (go's `kmd` for go's
-//!   goal, `kmd-rust` for goal-rust; the files kmd itself writes are left out
-//!   of the comparison, only those goal creates are compared), then stopped;
+//!   goal, `kmd-rust` for goal-rust; the files kmd writes, `kmd.lock` 0600,
+//!   `kmd.net` / `kmd.pid` / `kmd.log` 0640, are compared too, issue #2460),
+//!   then stopped;
 //! - with a `consensus.json` go's decoder rejects, or accepts.
 //!
 //! goal-rust must produce the same rows (a default test, no go needed); a
@@ -81,18 +81,6 @@ const ZERO_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon aba
 
 /// The files the data dir holds before the command runs.
 const INPUTS: [&str; 5] = ["genesis.json", "consensus.json", "p.teal", "x.txn", "d.txn"];
-
-/// The files a running kmd writes in its own directory: what kmd-rust writes
-/// there is kmd's parity, not goal's, so the rows with a kmd leave them out.
-const KMD_OWN: [&str; 7] = [
-    "kmd-v0.5/kmd.lock",
-    "kmd-v0.5/kmd.log",
-    "kmd-v0.5/kmd.net",
-    "kmd-v0.5/kmd.pid",
-    "kmd-v0.5/kmd.token",
-    "kmd-v0.5/kmd_config.json.example",
-    "kmd-v0.5/sqlite_wallets",
-];
 
 fn mixed_cluster_enabled() -> bool {
     matches!(std::env::var("MIXED_CLUSTER").as_deref(), Ok(v) if !v.is_empty() && v != "0")
@@ -321,6 +309,8 @@ fn cases() -> Vec<(&'static str, Vec<&'static str>)> {
         ("node wait", vec!["node", "wait"]),
         ("node catchup", vec!["node", "catchup", "--abort"]),
         ("ledger supply", vec!["ledger", "supply"]),
+        ("ledger block", vec!["ledger", "block", "1"]),
+        ("version", vec!["version"]),
     ]
 }
 
@@ -337,6 +327,8 @@ const KMD_CASES: &[&str] = &[
     "account info",
     "node status",
     "ledger supply",
+    "ledger block",
+    "version",
 ];
 
 /// `consensus.json` contents go's `encoding/json` decoder rejects, or
@@ -419,13 +411,13 @@ const CONSENSUS_CASES: &[(&str, &str)] = &[
 
 /// The sorted list of every file and directory under `dd` but the inputs, as
 /// `<path> <mode> <d|f>`.
-fn files(dd: &Path, skip: &[&str]) -> Vec<String> {
+fn files(dd: &Path) -> Vec<String> {
     use std::os::unix::fs::PermissionsExt;
-    fn walk(root: &Path, dir: &Path, skip: &[&str], out: &mut Vec<String>) {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
         for e in std::fs::read_dir(dir).expect("read_dir").flatten() {
             let p = e.path();
             let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
-            if INPUTS.contains(&rel.as_str()) || skip.contains(&rel.as_str()) {
+            if INPUTS.contains(&rel.as_str()) {
                 continue;
             }
             let meta = std::fs::symlink_metadata(&p).expect("metadata");
@@ -435,12 +427,12 @@ fn files(dd: &Path, skip: &[&str]) -> Vec<String> {
                 meta.permissions().mode() & 0o777
             ));
             if meta.is_dir() {
-                walk(root, &p, skip, out);
+                walk(root, &p, out);
             }
         }
     }
     let mut out = Vec::new();
-    walk(dd, dd, skip, &mut out);
+    walk(dd, dd, &mut out);
     out.sort();
     out
 }
@@ -469,13 +461,7 @@ fn stop_kmd(dd: &Path) {
 
 /// One row: exit code, stdout, stderr and the files created; the data dir and
 /// the binary dir masked.
-fn row(
-    bin_dir: &Path,
-    name: String,
-    args: &[&str],
-    consensus: Option<&str>,
-    with_kmd: bool,
-) -> serde_json::Value {
+fn row(bin_dir: &Path, name: String, args: &[&str], consensus: Option<&str>) -> serde_json::Value {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dd = tmp.path().canonicalize().unwrap();
     std::fs::write(dd.join("genesis.json"), GENESIS).unwrap();
@@ -496,7 +482,7 @@ fn row(
         Stdin::Null,
         &[("PATH", "/usr/bin:/bin")],
     );
-    let files = files(&dd, if with_kmd { &KMD_OWN } else { &[] });
+    let files = files(&dd);
     stop_kmd(&dd);
     let mask = |b: &[u8]| {
         text(b)
@@ -521,7 +507,7 @@ fn sequence(goal: &Path, kmd: (&Path, &str)) -> Vec<serde_json::Value> {
     let all = cases();
     let mut rows = Vec::new();
     for (name, args) in &all {
-        rows.push(row(&bin_dir, name.to_string(), args, None, false));
+        rows.push(row(&bin_dir, name.to_string(), args, None));
     }
     for (name, consensus) in CONSENSUS_CASES {
         rows.push(row(
@@ -529,7 +515,6 @@ fn sequence(goal: &Path, kmd: (&Path, &str)) -> Vec<serde_json::Value> {
             format!("consensus.json {name}"),
             &["account", "list"],
             Some(consensus),
-            false,
         ));
     }
     // An `AlgodClient` fails on the algod token before it loads the file.
@@ -538,7 +523,6 @@ fn sequence(goal: &Path, kmd: (&Path, &str)) -> Vec<serde_json::Value> {
         "consensus.json not json: node status".to_string(),
         &["node", "status"],
         Some("not json"),
-        false,
     ));
     std::fs::copy(kmd.0, bin_dir.join(kmd.1)).expect("copy the kmd binary");
     for name in KMD_CASES {
@@ -546,7 +530,7 @@ fn sequence(goal: &Path, kmd: (&Path, &str)) -> Vec<serde_json::Value> {
             .iter()
             .find(|(n, _)| n == name)
             .expect("a kmd case is a case");
-        rows.push(row(&bin_dir, format!("with kmd: {name}"), args, None, true));
+        rows.push(row(&bin_dir, format!("with kmd: {name}"), args, None));
     }
     rows
 }
