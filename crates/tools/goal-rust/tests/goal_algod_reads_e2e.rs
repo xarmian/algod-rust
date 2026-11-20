@@ -40,7 +40,8 @@
 //!
 //! `fixtures/goal_algod_reads.jsonl` holds what go v5.0.5-stable's `goal`
 //! printed (exit code, stdout, stderr, the data dir masked; a stdout longer
-//! than 8 KiB as its SHA-256) and the files it left in the data dir. Each row
+//! than 8 KiB as its SHA-256, an output that is not valid UTF-8 as
+//! `base64:<bytes>`) and the files it left in the data dir. Each row
 //! runs in a fresh data dir with its own mock algod; the account rows first
 //! create two unencrypted wallets and import keys with the same `goal` (and
 //! the `kmd` next to it, go's for go's goal, `kmd-rust` for goal-rust).
