@@ -286,23 +286,17 @@ fn setup_node_and_dev_wallet() -> (tempfile::TempDir, DaemonGuard, DaemonGuard) 
     );
 
     assert_cli_ok(
-        &goal_rust(dd, &["wallet", "new", "w", "-w", "pw", "--no-display-seed"]),
+        &goal_rust(
+            dd,
+            &["wallet", "new", "w", "--unencrypted", "--no-display-seed"],
+        ),
         "wallet new",
         &node,
     );
     let imported = assert_cli_ok(
         &goal_rust(
             dd,
-            &[
-                "account",
-                "import",
-                "-w",
-                "w",
-                "--password",
-                "pw",
-                "--mnemonic",
-                DEV_MNEMONIC,
-            ],
+            &["account", "import", "-w", "w", "--mnemonic", DEV_MNEMONIC],
         ),
         "account import",
         &node,
@@ -339,7 +333,7 @@ fn localnet_asset_create_send_destroy_lifecycle() {
     // account -- mirrors `localnet_app_lifecycle_e2e.rs`'s user-account
     // setup.
     let user_new = assert_cli_ok(
-        &goal_rust(dd, &["account", "new", "user", "--password", "pw"]),
+        &goal_rust(dd, &["account", "new", "user"]),
         "account new (user)",
         &node,
     );
@@ -363,8 +357,6 @@ fn localnet_asset_create_send_destroy_lifecycle() {
                 &user_addr,
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "fund user account",
@@ -376,7 +368,7 @@ fn localnet_asset_create_send_destroy_lifecycle() {
     );
 
     // asset create --creator DEV_ADDR --total 1000 --unitname tst --name
-    // "Test Asset" --decimals 0 -w w --password pw
+    // "Test Asset" --decimals 0 -w w
     let create_out = assert_cli_ok(
         &goal_rust(
             dd,
@@ -393,8 +385,6 @@ fn localnet_asset_create_send_destroy_lifecycle() {
                 "TestAsset",
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "asset create",
@@ -431,7 +421,7 @@ fn localnet_asset_create_send_destroy_lifecycle() {
         "asset info should report the unit name; got:\n{info_out}"
     );
 
-    // asset optin --assetid <id> -a <user_addr> -w w --password pw
+    // asset optin --assetid <id> -a <user_addr> -w w
     let optin_out = assert_cli_ok(
         &goal_rust(
             dd,
@@ -444,8 +434,6 @@ fn localnet_asset_create_send_destroy_lifecycle() {
                 &user_addr,
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "asset optin",
@@ -457,7 +445,7 @@ fn localnet_asset_create_send_destroy_lifecycle() {
     );
 
     // asset send --assetid <id> -f DEV_ADDR -t <user_addr> -a 400 -w w
-    // --password pw
+    //
     let send_out = assert_cli_ok(
         &goal_rust(
             dd,
@@ -474,8 +462,6 @@ fn localnet_asset_create_send_destroy_lifecycle() {
                 "400",
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "asset send (to user)",
@@ -500,7 +486,7 @@ fn localnet_asset_create_send_destroy_lifecycle() {
     );
 
     // asset send --assetid <id> -f <user_addr> -t DEV_ADDR -a 400 -c
-    // DEV_ADDR -w w --password pw -- send the full balance back to the
+    // DEV_ADDR -w w -- send the full balance back to the
     // creator and close the holding out, so the creator again holds the
     // full 1000-unit supply (required for `asset destroy` to succeed).
     let send_back_out = assert_cli_ok(
@@ -521,8 +507,6 @@ fn localnet_asset_create_send_destroy_lifecycle() {
                 DEV_ADDR,
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "asset send (close back to creator)",
@@ -541,7 +525,7 @@ fn localnet_asset_create_send_destroy_lifecycle() {
         "user's asset holding should be closed out (404) after the close-to send"
     );
 
-    // asset destroy --creator DEV_ADDR --assetid <id> -w w --password pw
+    // asset destroy --creator DEV_ADDR --assetid <id> -w w
     let destroy_out = assert_cli_ok(
         &goal_rust(
             dd,
@@ -554,8 +538,6 @@ fn localnet_asset_create_send_destroy_lifecycle() {
                 &asset_id.to_string(),
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "asset destroy",

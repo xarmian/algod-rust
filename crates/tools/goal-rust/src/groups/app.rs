@@ -197,10 +197,6 @@ pub struct AppTxnArgs {
     /// rekeying (Go `-S/--signer`).
     #[arg(short = 'S', long = "signer")]
     pub signer: Option<String>,
-    /// Wallet password (skip the prompt). goal-rust convention shared with
-    /// the other signing leaves.
-    #[arg(long = "password")]
-    pub password: Option<String>,
 }
 
 /// The `--app-arg` flag shared by every `app` leaf that submits an

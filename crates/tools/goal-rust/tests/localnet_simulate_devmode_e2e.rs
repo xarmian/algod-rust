@@ -290,23 +290,17 @@ fn localnet_dev_node_simulate_is_dry_run() {
     );
 
     assert_cli_ok(
-        &goal_rust(dd, &["wallet", "new", "w", "-w", "pw", "--no-display-seed"]),
+        &goal_rust(
+            dd,
+            &["wallet", "new", "w", "--unencrypted", "--no-display-seed"],
+        ),
         "wallet new",
         &node,
     );
     assert_cli_ok(
         &goal_rust(
             dd,
-            &[
-                "account",
-                "import",
-                "-w",
-                "w",
-                "--password",
-                "pw",
-                "--mnemonic",
-                DEV_MNEMONIC,
-            ],
+            &["account", "import", "-w", "w", "--mnemonic", DEV_MNEMONIC],
         ),
         "account import",
         &node,
@@ -429,8 +423,6 @@ fn localnet_dev_node_simulate_is_dry_run() {
                 FEE_SINK,
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "clerk send (real, after simulate)",
@@ -514,23 +506,17 @@ fn localnet_dev_node_simulate_scratch_slot_change() {
     );
 
     assert_cli_ok(
-        &goal_rust(dd, &["wallet", "new", "w", "-w", "pw", "--no-display-seed"]),
+        &goal_rust(
+            dd,
+            &["wallet", "new", "w", "--unencrypted", "--no-display-seed"],
+        ),
         "wallet new",
         &node,
     );
     assert_cli_ok(
         &goal_rust(
             dd,
-            &[
-                "account",
-                "import",
-                "-w",
-                "w",
-                "--password",
-                "pw",
-                "--mnemonic",
-                DEV_MNEMONIC,
-            ],
+            &["account", "import", "-w", "w", "--mnemonic", DEV_MNEMONIC],
         ),
         "account import",
         &node,
@@ -572,8 +558,6 @@ fn localnet_dev_node_simulate_scratch_slot_change() {
                 clear_teal.to_str().unwrap(),
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "app create (scratch-change)",

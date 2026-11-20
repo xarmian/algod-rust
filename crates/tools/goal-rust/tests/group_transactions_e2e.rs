@@ -212,7 +212,7 @@ fn assert_cli_ok(out: &std::process::Output, what: &str, node: &DaemonGuard) -> 
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
-/// Spawn a Rust dev node + kmd-rust, and set up wallet "w" (password "pw")
+/// Spawn a Rust dev node + kmd-rust, and set up the unencrypted wallet "w"
 /// with the funded dev account imported. Returns the guards (kept alive for
 /// the duration of the test) and the staged data-dir tempdir.
 fn setup_live_node() -> (tempfile::TempDir, DaemonGuard, DaemonGuard) {
@@ -254,7 +254,7 @@ fn setup_live_node() -> (tempfile::TempDir, DaemonGuard, DaemonGuard) {
     assert_cli_ok(
         &goal_rust(
             &dd,
-            &["wallet", "new", "w", "-w", "pw", "--no-display-seed"],
+            &["wallet", "new", "w", "--unencrypted", "--no-display-seed"],
         ),
         "wallet new",
         &node,
@@ -262,16 +262,7 @@ fn setup_live_node() -> (tempfile::TempDir, DaemonGuard, DaemonGuard) {
     let imported = assert_cli_ok(
         &goal_rust(
             &dd,
-            &[
-                "account",
-                "import",
-                "-w",
-                "w",
-                "--password",
-                "pw",
-                "--mnemonic",
-                DEV_MNEMONIC,
-            ],
+            &["account", "import", "-w", "w", "--mnemonic", DEV_MNEMONIC],
         ),
         "account import",
         &node,
@@ -413,8 +404,6 @@ fn group_transactions_submit_and_confirm_together() {
                 signed.to_str().unwrap(),
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "clerk sign",
@@ -526,8 +515,6 @@ fn group_transactions_escaped_single_member_rejected_live() {
                 signed_a.to_str().unwrap(),
                 "-w",
                 "w",
-                "--password",
-                "pw",
             ],
         ),
         "clerk sign (escaped member a)",

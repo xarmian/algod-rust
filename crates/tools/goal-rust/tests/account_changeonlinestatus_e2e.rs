@@ -19,7 +19,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! `goal-rust account changeonlinestatus / marknonparticipating` and
-//! `renewpartkey --register` E2E (TASK-244 / B12).
+//! `renewpartkey` (which registers the new key, like go's) E2E (TASK-244 /
+//! B12).
 //!
 //! Drives the full build → sign → submit → confirm pipeline: a real spawned
 //! `kmd-rust` signs the keyreg transaction (so the wallet/handle/signing path
@@ -156,15 +157,19 @@ fn goal(dd: &Path, args: &[&str]) -> std::process::Output {
         .expect("goal-rust")
 }
 
-/// Create wallet "w" (password "pw") and a fresh account; return its address.
+/// Create the unencrypted wallet "w" (no password prompt, like go's goal) and
+/// a fresh account; return its address.
 fn create_wallet_and_account(dd: &Path) -> String {
-    let out = goal(dd, &["wallet", "new", "w", "-w", "pw", "--no-display-seed"]);
+    let out = goal(
+        dd,
+        &["wallet", "new", "w", "--unencrypted", "--no-display-seed"],
+    );
     assert!(
         out.status.success(),
         "wallet new failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let out = goal(dd, &["account", "new", "-w", "w", "--password", "pw"]);
+    let out = goal(dd, &["account", "new", "-w", "w"]);
     assert!(
         out.status.success(),
         "account new failed: {}",
@@ -190,7 +195,7 @@ struct AlgodState {
     submitted: Vec<Vec<u8>>,
     /// Set once `/v2/participation/generate/*` has been called. Before that the
     /// node reports only the pre-existing key; after, it also reports the freshly
-    /// generated one (so `renewpartkey --register`'s preflight passes, then the
+    /// generated one (so `renewpartkey`'s preflight passes, then the
     /// register step finds the new key).
     generated: bool,
 }
@@ -356,8 +361,6 @@ fn changeonlinestatus_online_then_offline_round_trip() {
             "--online",
             "-w",
             "w",
-            "--password",
-            "pw",
         ],
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -383,16 +386,14 @@ fn changeonlinestatus_online_then_offline_round_trip() {
             "changeonlinestatus",
             "-a",
             &addr,
-            "--offline",
+            "--online=false",
             "-w",
             "w",
-            "--password",
-            "pw",
         ],
     );
     assert!(
         out.status.success(),
-        "changeonlinestatus --offline failed: {}",
+        "changeonlinestatus --online=false failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -424,11 +425,9 @@ fn changeonlinestatus_no_wait_skips_confirmation() {
             "changeonlinestatus",
             "-a",
             &addr,
-            "--offline",
+            "--online=false",
             "-w",
             "w",
-            "--password",
-            "pw",
             "--no-wait",
         ],
     );
@@ -459,16 +458,7 @@ fn marknonparticipating_warns_and_submits() {
 
     let out = goal(
         &dd,
-        &[
-            "account",
-            "marknonparticipating",
-            "-a",
-            &addr,
-            "-w",
-            "w",
-            "--password",
-            "pw",
-        ],
+        &["account", "marknonparticipating", "-a", &addr, "-w", "w"],
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -492,16 +482,15 @@ fn marknonparticipating_warns_and_submits() {
 }
 
 #[test]
-fn renewpartkey_register_submits_online_keyreg() {
+fn renewpartkey_registers_the_new_key_online() {
     let (_tmp, dd, kmd_dir) = setup_data_dir();
     let _kmd = spawn_kmd(&kmd_dir);
     let addr = create_wallet_and_account(&dd);
     let (state, stop, port) = spawn_mock_algod(addr.clone(), 100);
     wire_algod(&dd, port);
 
-    // renewpartkey has no -w/--password flags (mirrors Go); the --register step
-    // prompts for the default wallet's password, typed into a pseudo-terminal
-    // (go's `terminal.ReadPassword` reads no pipe, issue #2391).
+    // Like go's, renewpartkey registers the new key with the default wallet
+    // (unencrypted here, so no password prompt).
     let out = common::pty::run(
         Path::new(GOAL_RUST_BIN),
         &dd,
@@ -512,18 +501,14 @@ fn renewpartkey_register_submits_online_keyreg() {
             &addr,
             "--roundLastValid",
             "5000",
-            "--register",
         ],
-        common::pty::Stdin::Pty {
-            prompt: "Please enter the password for wallet",
-            line: "pw",
-        },
+        common::pty::Stdin::Null,
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         out.code,
         Some(0),
-        "renewpartkey --register failed: {}",
+        "renewpartkey failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(

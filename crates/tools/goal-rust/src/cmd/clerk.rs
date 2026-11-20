@@ -154,7 +154,7 @@ fn node_consensus_version(cli_d: &[PathBuf]) -> Option<String> {
 /// `clerk send -a <amt> -f <from> -t <to> [-c close] [--rekey-to] [--fee]
 /// [--firstvalid/--lastvalid/--validrounds] [--note/--noteb64] [--lease]
 /// [-F prog | -P progbytes | -L lsig] [--argb64 ...] [--msig-params ...]
-/// [-S signer] [-N] [-o out [-s]] [-w wallet] [--password]`.
+/// [-S signer] [-N] [-o out [-s]] [-w wallet]`.
 ///
 /// Mirrors Go's `sendCmd` (clerk.go:348-576), including the LogicSig /
 /// program-account (`--from-program/-F`, `--from-program-bytes/-P`,
@@ -383,13 +383,8 @@ fn run_send_inner(
         // signature by the *old* sender that won't verify against the AuthAddr.
         let kmd = pipeline.kmd().ok_or("no kmd client configured")?;
         let mut accounts = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
-        let (handle, _wallet_name, password) = resolve_wallet_and_init(
-            &rt,
-            kmd,
-            &mut accounts,
-            wallet.as_deref(),
-            args.password.as_deref(),
-        )?;
+        let (handle, _wallet_name, password) =
+            resolve_wallet_and_init(&rt, kmd, &mut accounts, wallet.as_deref())?;
         let signer_pk: [u8; 32] = auth_addr.map(|a| a.0).unwrap_or([0u8; 32]);
         let encoded = algo_codec::canonical_encode_transaction(&txn);
         let signed = rt
@@ -700,7 +695,7 @@ pub(crate) fn compute_validity(
 // ---- clerk sign -----------------------------------------------------------
 
 /// `clerk sign -i <in> -o <out> [-S signer] [-p prog | -L lsig] [--argb64 ...]
-/// [-P proto] [-w wallet] [--password]`.
+/// [-P proto] [-w wallet]`.
 ///
 /// Mirrors Go's `signCmd` (clerk.go:787-911). When a `--program`/`--logic-sig`
 /// source is supplied, every transaction in the file gets that LogicSig
@@ -749,13 +744,8 @@ fn run_sign_inner(
             .build()
             .map_err(|e| format!("Error processing command: {e}"))?;
         let mut accounts = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
-        let (handle, _wallet_name, password) = resolve_wallet_and_init(
-            &rt,
-            &kmd,
-            &mut accounts,
-            wallet.as_deref(),
-            args.password.as_deref(),
-        )?;
+        let (handle, _wallet_name, password) =
+            resolve_wallet_and_init(&rt, &kmd, &mut accounts, wallet.as_deref())?;
         Some((kmd, rt, handle, password))
     } else {
         None
@@ -1423,7 +1413,7 @@ fn sign_program_to_lsig(
         .build()
         .map_err(|e| format!("Error processing command: {e}"))?;
     let (handle, _wallet_name, password) =
-        resolve_wallet_and_init(&rt, &kmd, &mut accounts, wallet, None)?;
+        resolve_wallet_and_init(&rt, &kmd, &mut accounts, wallet)?;
 
     // Check if the account was specified, else use the default.
     if account.is_empty() {
@@ -1761,7 +1751,7 @@ fn build_simulate_request(
 
 // ---- clerk multisig sign --------------------------------------------------
 
-/// `clerk multisig sign -t <txfile> [-a addr | -n] [-w wallet] [--password]`.
+/// `clerk multisig sign -t <txfile> [-a addr | -n] [-w wallet]`.
 ///
 /// Mirrors Go's `addSigCmd` (multisig.go:75): for each `SignedTxn` in `--tx`,
 /// start or extend its multisig (rewriting the file in place). With `-n/--no-sig`
@@ -1807,13 +1797,8 @@ fn run_multisig_sign_inner(
         .build()
         .map_err(|e| format!("Error processing command: {e}"))?;
     let mut accounts = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
-    let (handle, _wallet_name, password) = resolve_wallet_and_init(
-        &rt,
-        &kmd,
-        &mut accounts,
-        wallet.as_deref(),
-        args.password.as_deref(),
-    )?;
+    let (handle, _wallet_name, password) =
+        resolve_wallet_and_init(&rt, &kmd, &mut accounts, wallet.as_deref())?;
     // go decodes the file after the client and the wallet handle
     // (multisig.go:98-104).
     let mut stxns = decode_signed_txn_stream(&data)
@@ -1874,7 +1859,7 @@ fn run_multisig_sign_inner(
 // ---- clerk multisig signprogram -------------------------------------------
 
 /// `clerk multisig signprogram -a <addr> [-p prog | -P progbytes | -L lsig]
-/// [-A msig-addr] [-o lsig-out] [--legacy-msig] [-w wallet] [--password]`.
+/// [-A msig-addr] [-o lsig-out] [--legacy-msig] [-w wallet]`.
 ///
 /// Mirrors Go's `signProgramCmd` (multisig.go:144): start or extend a multisig
 /// on a LogicSig program and write the (partial) LogicSig blob. The partial
@@ -1920,13 +1905,8 @@ fn run_multisig_signprogram_inner(
         .build()
         .map_err(|e| format!("Error processing command: {e}"))?;
     let mut accounts = AccountsList::load(&data_dir_path).map_err(|e| e.to_string())?;
-    let (handle, _wallet_name, password) = resolve_wallet_and_init(
-        &rt,
-        &kmd,
-        &mut accounts,
-        wallet.as_deref(),
-        args.password.as_deref(),
-    )?;
+    let (handle, _wallet_name, password) =
+        resolve_wallet_and_init(&rt, &kmd, &mut accounts, wallet.as_deref())?;
 
     // Resolve the program + base LogicSig from -p / -P / -L (multisig.go:151-217).
     let collision = "goal multisig signprogram should have at most one of --program/-p, \
@@ -2726,7 +2706,6 @@ pub(crate) fn resolve_wallet_and_init(
     client: &KmdClient,
     accounts: &mut AccountsList,
     wallet_flag: Option<&str>,
-    password_flag: Option<&str>,
 ) -> Result<(String, String, String), String> {
     let (wallet_id, wallet_name) =
         crate::cmd::account::wallet_id_and_name(rt, client, accounts, wallet_flag)?;
@@ -2737,7 +2716,6 @@ pub(crate) fn resolve_wallet_and_init(
         &accounts.data_dir,
         &wallet_id,
         &wallet_name,
-        password_flag,
         true,
     )?;
     Ok((handle, wallet_name, password))
@@ -2835,7 +2813,6 @@ mod tests {
             out: None,
             sign: false,
             no_wait: false,
-            password: None,
         }
     }
 

@@ -21,10 +21,13 @@
 //! End-to-end tests for `goal-rust wallet rename`. Spawns kmd-rust,
 //! seeds wallets via the kmd client directly, then drives the
 //! goal-rust binary and asserts Go-exact output for happy and error
-//! paths.
+//! paths. The password of an encrypted wallet is typed into a
+//! pseudo-terminal (go's `terminal.ReadPassword`, issue #2407).
 
 #![cfg(unix)]
 
+mod common;
+use common::pty::{run, Stdin};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -32,6 +35,9 @@ use std::time::{Duration, Instant};
 use algo_kmd_client::KmdClient;
 
 const GOAL_RUST_BIN: &str = env!("CARGO_BIN_EXE_goal-rust");
+
+/// go's `infoPasswordPrompt` for the wallet `foo`.
+const PROMPT_FOO: &str = "Please enter the password for wallet 'foo': ";
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -149,21 +155,26 @@ fn wallet_rename_happy_path_prints_go_text_and_renames() {
             .expect("seed foo");
     });
 
-    let out = Command::new(GOAL_RUST_BIN)
-        .arg("-d")
-        .arg(data_dir.path())
-        .args(["wallet", "rename", "foo", "bar", "-w", "pw"])
-        .env_remove("ALGORAND_DATA")
-        .output()
-        .expect("run goal-rust wallet rename");
+    let out = run(
+        Path::new(GOAL_RUST_BIN),
+        data_dir.path(),
+        &["wallet", "rename", "foo", "bar"],
+        Stdin::Pty {
+            prompt: PROMPT_FOO,
+            line: "pw",
+        },
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success(),
-        "rename failed: exit={:?} stdout={stdout:?} stderr={stderr:?}",
-        out.status.code(),
+    assert_eq!(
+        out.code,
+        Some(0),
+        "rename failed: stdout={stdout:?} stderr={stderr:?}",
     );
-    assert_eq!(stdout, "Renamed wallet 'foo' to 'bar'\n");
+    assert_eq!(
+        stdout,
+        format!("{PROMPT_FOO}\nRenamed wallet 'foo' to 'bar'\n")
+    );
 
     // Verify the wallet is now named 'bar' in kmd.
     let listed = rt().block_on(async { client.list_wallets().await.unwrap().wallets });
@@ -184,7 +195,7 @@ fn wallet_rename_missing_source_emits_go_couldnt_find() {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(data_dir.path())
-        .args(["wallet", "rename", "nope", "bar", "-w", "pw"])
+        .args(["wallet", "rename", "nope", "bar"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("run goal-rust wallet rename");
@@ -211,17 +222,16 @@ fn wallet_rename_wrong_password_surfaces_server_message() {
             .expect("seed");
     });
 
-    let out = Command::new(GOAL_RUST_BIN)
-        .arg("-d")
-        .arg(data_dir.path())
-        .args(["wallet", "rename", "foo", "bar", "-w", "wrong-pw"])
-        .env_remove("ALGORAND_DATA")
-        .output()
-        .expect("run goal-rust wallet rename");
-    assert!(
-        !out.status.success(),
-        "rename must fail with wrong password",
+    let out = run(
+        Path::new(GOAL_RUST_BIN),
+        data_dir.path(),
+        &["wallet", "rename", "foo", "bar"],
+        Stdin::Pty {
+            prompt: PROMPT_FOO,
+            line: "wrong-pw",
+        },
     );
+    assert_eq!(out.code, Some(1), "rename must fail with wrong password");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.starts_with("Couldn't rename wallet:"),
@@ -233,15 +243,15 @@ fn wallet_rename_wrong_password_surfaces_server_message() {
 
 #[test]
 fn wallet_rename_same_name_rejects_locally() {
-    // Mirrors wallet.go:232-234: Go reports
-    // "new name is identical to current name" without contacting kmd.
-    // We do the same check before listing — exercise it with an
-    // entirely-unstarted kmd to confirm no network call is made.
-    let (data_dir, _kmd_dir) = setup_data_dir();
+    // Mirrors wallet.go:232-234: after `ensureKmdClient`, Go reports
+    // "new name is identical to current name" before it looks the
+    // wallet up.
+    let (data_dir, kmd_dir) = setup_data_dir();
+    let _g = spawn_kmd(&kmd_dir);
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(data_dir.path())
-        .args(["wallet", "rename", "same", "same", "-w", "pw"])
+        .args(["wallet", "rename", "same", "same"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("run goal-rust wallet rename");

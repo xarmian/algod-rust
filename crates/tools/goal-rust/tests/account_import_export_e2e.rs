@@ -26,6 +26,7 @@
 #![cfg(unix)]
 
 use std::io::Write;
+mod common;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -137,7 +138,7 @@ fn create_default_wallet(dd: &Path) {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(dd)
-        .args(["wallet", "new", "w", "-w", "pw", "--no-display-seed"])
+        .args(["wallet", "new", "w", "--unencrypted", "--no-display-seed"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("wallet new");
@@ -158,15 +159,7 @@ fn account_import_export_round_trip_mnemonic() {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args([
-            "account",
-            "import",
-            "imported",
-            "--mnemonic",
-            ZERO_MNEMONIC,
-            "--password",
-            "pw",
-        ])
+        .args(["account", "import", "imported", "--mnemonic", ZERO_MNEMONIC])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("import");
@@ -188,7 +181,7 @@ fn account_import_export_round_trip_mnemonic() {
     let exp = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args(["account", "export", "-a", &address, "--password", "pw"])
+        .args(["account", "export", "-a", &address])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("export");
@@ -226,8 +219,6 @@ fn account_import_bad_mnemonic_errors_with_go_template() {
             "bad",
             "--mnemonic",
             "this is definitely not a real mnemonic",
-            "--password",
-            "pw",
         ])
         .env_remove("ALGORAND_DATA")
         .output()
@@ -251,7 +242,7 @@ fn account_import_stdin_prompt_path_works() {
     let mut child = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args(["account", "import", "fromstdin", "--password", "pw"])
+        .args(["account", "import", "fromstdin"])
         .env_remove("ALGORAND_DATA")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -277,28 +268,32 @@ fn account_import_stdin_prompt_path_works() {
     );
 }
 
+/// The password typed into a terminal (go's `terminal.ReadPassword`, issue
+/// #2407) of an encrypted wallet: a wrong one fails the export in kmd.
 #[test]
 fn account_export_wrong_password_surfaces_kmd_error() {
+    use common::pty::{run, wallet_new, Stdin, PASSWORD_PROMPT};
     let (_t, dd, kmd_dir) = setup_data_dir();
     let _g = spawn_kmd(&kmd_dir);
-    create_default_wallet(&dd);
+    let bin = Path::new(GOAL_RUST_BIN);
+    let out = wallet_new(bin, &dd, "w", "pw");
+    assert_eq!(
+        out.code,
+        Some(0),
+        "wallet new: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Import an account first so there's something to export.
-    let import = Command::new(GOAL_RUST_BIN)
-        .arg("-d")
-        .arg(&dd)
-        .args([
-            "account",
-            "import",
-            "victim",
-            "--mnemonic",
-            ZERO_MNEMONIC,
-            "--password",
-            "pw",
-        ])
-        .env_remove("ALGORAND_DATA")
-        .output()
-        .expect("import");
+    let import = run(
+        bin,
+        &dd,
+        &["account", "import", "victim", "--mnemonic", ZERO_MNEMONIC],
+        Stdin::Pty {
+            prompt: PASSWORD_PROMPT,
+            line: "pw",
+        },
+    );
     let stdout = String::from_utf8_lossy(&import.stdout);
     let address = stdout
         .lines()
@@ -307,15 +302,17 @@ fn account_export_wrong_password_surfaces_kmd_error() {
         .trim();
 
     // Export with wrong password should fail via kmd.
-    let exp = Command::new(GOAL_RUST_BIN)
-        .arg("-d")
-        .arg(&dd)
-        .args(["account", "export", "-a", address, "--password", "wrong"])
-        .env_remove("ALGORAND_DATA")
-        .output()
-        .expect("export");
+    let exp = run(
+        bin,
+        &dd,
+        &["account", "export", "-a", address],
+        Stdin::Pty {
+            prompt: PASSWORD_PROMPT,
+            line: "wrong",
+        },
+    );
     let stderr = String::from_utf8_lossy(&exp.stderr);
-    assert!(!exp.status.success(), "wrong-password export must fail");
+    assert_eq!(exp.code, Some(1), "wrong-password export must fail");
     assert!(
         stderr.contains("Error processing command:"),
         "stderr must use errorRequestFail template; got {stderr:?}",

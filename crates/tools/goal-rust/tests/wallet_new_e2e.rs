@@ -21,8 +21,8 @@
 //! End-to-end smoke tests for `goal-rust wallet new`. Spawns the
 //! in-tree `kmd-rust serve` binary against a temp data dir, fakes up
 //! a "private" algod data dir layout pointing at it via the
-//! kmd-v0.5 subdirectory, runs `goal-rust wallet new <name> -d <dir>
-//! -w <pw>`, and asserts:
+//! kmd-v0.5 subdirectory, runs `goal-rust wallet new <name> -d <dir>`
+//! (the password typed into a pseudo-terminal), and asserts:
 //!
 //! - exit 0 + stdout matches Go's exact text
 //! - the wallet exists in kmd-rust's `/v1/wallets` afterwards
@@ -30,11 +30,12 @@
 //! Plus error-path tests:
 //! - missing kmd produces Go's `Could not contact kmd` text + exit 1
 //! - duplicate name surfaces kmd's server-side message verbatim
-//! - non-TTY stdin password path is exercised
+//! - a non-TTY stdin fails like go's `terminal.ReadPassword` (issue #2407)
 
 #![cfg(unix)]
 
-use std::io::Write;
+mod common;
+use common::pty::{run, wallet_new, Stdin};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -146,19 +147,18 @@ fn wallet_new_creates_wallet_with_go_exact_output() {
     let (data_dir, kmd_dir) = setup_data_dir();
     let _guard = spawn_kmd(&kmd_dir);
 
-    let out = Command::new(GOAL_RUST_BIN)
-        .arg("-d")
-        .arg(data_dir.path())
-        .args(["wallet", "new", "test-wallet", "-w", "pw"])
-        .env_remove("ALGORAND_DATA")
-        .output()
-        .expect("run goal-rust wallet new");
+    let out = wallet_new(
+        Path::new(GOAL_RUST_BIN),
+        data_dir.path(),
+        "test-wallet",
+        "pw",
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success(),
-        "wallet new failed: exit={:?}, stdout={stdout:?}, stderr={stderr:?}",
-        out.status.code(),
+    assert_eq!(
+        out.code,
+        Some(0),
+        "wallet new failed: stdout={stdout:?}, stderr={stderr:?}",
     );
     // Go's exact lines.
     assert!(
@@ -180,7 +180,7 @@ fn wallet_new_missing_kmd_produces_go_unreachable_error() {
     let out = Command::new(&goal)
         .arg("-d")
         .arg(data_dir.path())
-        .args(["wallet", "new", "any-name", "-w", "pw"])
+        .args(["wallet", "new", "any-name"])
         .env_remove("ALGORAND_DATA")
         .env("PATH", "/usr/bin:/bin")
         .output()
@@ -219,7 +219,7 @@ fn wallet_new_duplicate_name_surfaces_server_message() {
     let first = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(data_dir.path())
-        .args(["wallet", "new", "dup", "-w", "pw"])
+        .args(["wallet", "new", "dup", "--unencrypted", "--no-display-seed"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("run first wallet new");
@@ -230,7 +230,7 @@ fn wallet_new_duplicate_name_surfaces_server_message() {
     let second = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(data_dir.path())
-        .args(["wallet", "new", "dup", "-w", "pw"])
+        .args(["wallet", "new", "dup", "--unencrypted", "--no-display-seed"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("run second wallet new");
@@ -253,39 +253,34 @@ fn wallet_new_duplicate_name_surfaces_server_message() {
     );
 }
 
+/// go reads both passwords with `terminal.ReadPassword(stdin)`: a pipe fails
+/// with go's text before anything is created, a terminal works.
 #[test]
-fn wallet_new_reads_password_from_non_tty_stdin() {
-    // When --password is omitted and stdin is a pipe (non-TTY), we
-    // read one line as the password. This is the CI / scripting
-    // path Go also supports.
+fn wallet_new_password_comes_from_a_terminal_only() {
     let (data_dir, kmd_dir) = setup_data_dir();
     let _guard = spawn_kmd(&kmd_dir);
-    let mut child = Command::new(GOAL_RUST_BIN)
-        .arg("-d")
-        .arg(data_dir.path())
-        .args(["wallet", "new", "from-stdin"])
-        .env_remove("ALGORAND_DATA")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn goal-rust wallet new");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(b"stdin-password\n")
-        .unwrap();
-    let out = child.wait_with_output().expect("wait");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success(),
-        "stdin-password path must succeed; exit={:?}, stdout={stdout:?}, stderr={stderr:?}",
-        out.status.code(),
+    let bin = Path::new(GOAL_RUST_BIN);
+    let out = run(
+        bin,
+        data_dir.path(),
+        &["wallet", "new", "from-stdin"],
+        Stdin::Pipe("stdin-password\nstdin-password\n"),
     );
+    assert_eq!(out.code, Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Please choose a password for wallet 'from-stdin': "
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Couldn't read password: inappropriate ioctl for device\n"
+    );
+
+    let out = wallet_new(bin, data_dir.path(), "from-tty", "pw");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.code, Some(0), "stdout={stdout:?}");
     assert!(
-        stdout.contains("Created wallet 'from-stdin'"),
+        stdout.contains("Created wallet 'from-tty'"),
         "stdout must confirm creation: {stdout:?}",
     );
 }
@@ -304,41 +299,31 @@ fn wallet_new_recover_mnemonic_creates_wallet_from_seed() {
     let (data_dir, kmd_dir) = setup_data_dir();
     let _guard = spawn_kmd(&kmd_dir);
 
-    // Feed the password on stdin (non-TTY path) after the mnemonic.
-    // Order matches Go: mnemonic read first (`wallet.go:101-117`),
-    // password second. --no-display-seed suppresses the backup prompt
-    // so we don't have to feed a third line.
-    let mut child = Command::new(GOAL_RUST_BIN)
-        .arg("-d")
-        .arg(data_dir.path())
-        .args([
+    // The mnemonic line first (`wallet.go:101-117`), then the password
+    // and its confirmation, each typed into a terminal once its prompt
+    // shows. --no-display-seed suppresses the backup prompt.
+    let out = run(
+        Path::new(GOAL_RUST_BIN),
+        data_dir.path(),
+        &[
             "wallet",
             "new",
             "recovered",
             "--recover",
             "--no-display-seed",
-        ])
-        .env_remove("ALGORAND_DATA")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn");
-    {
-        let mut stdin = child.stdin.take().unwrap();
-        // Mnemonic first (terminated with newline so read_line
-        // returns), then password.
-        stdin.write_all(ZERO_MNEMONIC.as_bytes()).unwrap();
-        stdin.write_all(b"\n").unwrap();
-        stdin.write_all(b"pw\n").unwrap();
-    }
-    let out = child.wait_with_output().expect("wait");
+        ],
+        Stdin::PtyAnswers(&[
+            ("hit return when you are done: ", ZERO_MNEMONIC),
+            ("Please choose a password for wallet 'recovered': ", "pw"),
+            ("Please confirm the password: ", "pw"),
+        ]),
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success(),
-        "recover path must succeed; exit={:?}, stdout={stdout:?}, stderr={stderr:?}",
-        out.status.code(),
+    assert_eq!(
+        out.code,
+        Some(0),
+        "recover path must succeed; stdout={stdout:?}, stderr={stderr:?}",
     );
     assert!(
         stdout.contains("Created wallet 'recovered'"),
@@ -376,10 +361,10 @@ fn wallet_new_unencrypted_prints_info_unencrypted() {
         "unencrypted create must succeed; exit={:?}, stdout={stdout:?}, stderr={stderr:?}",
         out.status.code(),
     );
-    // Go's infoUnencrypted line — byte-exact.
+    // Go's infoUnencrypted line (`reportInfoln`: stdout) — byte-exact.
     assert!(
-        stderr.contains("Creating unencrypted wallet"),
-        "stderr missing infoUnencrypted: {stderr:?}",
+        stdout.starts_with("Creating unencrypted wallet\n"),
+        "stdout missing infoUnencrypted: {stdout:?}",
     );
     assert!(
         stdout.contains("Created wallet 'unenc'"),
@@ -395,7 +380,13 @@ fn wallet_new_no_display_seed_suppresses_backup_phrase() {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(data_dir.path())
-        .args(["wallet", "new", "no-seed", "-w", "pw", "--no-display-seed"])
+        .args([
+            "wallet",
+            "new",
+            "no-seed",
+            "--unencrypted",
+            "--no-display-seed",
+        ])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("run");
@@ -448,7 +439,13 @@ fn wallet_new_first_wallet_persists_default_for_wallet_list() {
     let create = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&data_dir)
-        .args(["wallet", "new", "primary", "-w", "pw", "--no-display-seed"])
+        .args([
+            "wallet",
+            "new",
+            "primary",
+            "--unencrypted",
+            "--no-display-seed",
+        ])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("run wallet new");

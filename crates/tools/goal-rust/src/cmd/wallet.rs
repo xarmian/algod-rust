@@ -21,12 +21,12 @@
 //! `goal-rust wallet new` — port of `../go-algorand/cmd/goal/
 //! wallet.go:85-198` (`newWalletCmd`).
 //!
-//! Phase A (TASK-226) shipped: --password / driver + create. Phase B
-//! (TASK-234) retro-fits the four deferrals:
-//! - `--recover` (alias `--recover-mnemonic` in the CLI body, mirroring
-//!   Go's `recoverWallet` bool) — reads a mnemonic on stdin and seeds
-//!   the wallet with the derived 32-byte master derivation key.
-//! - `--unencrypted-wallet` — creates with empty password and prints
+//! - The password and its confirmation are read like go's `ensurePassword`
+//!   (a terminal on stdin only, issue #2407).
+//! - `--recover` (mirroring Go's `recoverWallet` bool) — reads a mnemonic
+//!   line on stdin and seeds the wallet with the derived 32-byte master
+//!   derivation key.
+//! - `--unencrypted` — creates with empty password and prints
 //!   `infoUnencrypted`.
 //! - Post-create backup-phrase prompt (suppressible via
 //!   `--no-display-seed`) — exports the new wallet's MDK and renders
@@ -35,7 +35,7 @@
 //!   only wallet on the data dir, the wallet ID is persisted into
 //!   `accountList.json` so `wallet list` can mark it `(default)`.
 
-use std::io::{BufRead, IsTerminal};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -58,6 +58,10 @@ const INFO_CREATED: &str = "Created wallet '{}'";
 const ERROR_COULDNT_CREATE: &str = "Couldn't create wallet: {}";
 /// Mirrors `messages.go:186` (`errorPasswordConfirmation`).
 const ERROR_PW_CONFIRM: &str = "Password confirmation did not match";
+/// Mirrors `messages.go` (`errorFailedToReadResponse`).
+const ERROR_FAILED_TO_READ_RESPONSE: &str = "Couldn't read response: {}";
+/// `defaultWalletDriver` (`libgoal/wallets.go`).
+const DEFAULT_WALLET_DRIVER: &str = "sqlite";
 
 /// Mirrors `messages.go:178` (`infoNoWallets`).
 const INFO_NO_WALLETS: &str = "No wallets found. You can create a wallet with `goal wallet new`";
@@ -108,11 +112,6 @@ const ERROR_COULDNT_EXPORT_MDK: &str = "Couldn't export master derivation key: {
 
 /// Mirrors `messages.go:183` (`errorCouldntMakeMnemonic`).
 const ERROR_COULDNT_MAKE_MNEMONIC: &str = "Couldn't make mnemonic: {}";
-
-/// Mirrors `messages.go:194` (`infoPasswordPrompt` for the
-/// existing-wallet password). Distinct from `infoChoosePasswordPrompt`
-/// (which is the `wallet new` prompt).
-const PROMPT_EXISTING_PASSWORD: &str = "Please enter the password for wallet '{}': ";
 
 /// Banner / separator emitted between and around each wallet block.
 /// Mirrors `wallet.go:275` and `:281`
@@ -182,14 +181,11 @@ pub fn run_new(args: NewArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>
     }
 
     let password = if args.unencrypted_wallet {
-        // Go's reportInfoln writes to stderr (it's a top-level
-        // log-like helper used for both info and error in goal). We
-        // route it to stderr to match — goal-rust's parity fixtures
-        // capture both streams.
-        eprintln!("{INFO_UNENCRYPTED}");
+        // go's `reportInfoln` prints on stdout.
+        println!("{INFO_UNENCRYPTED}");
         String::new()
     } else {
-        match resolve_password(&args) {
+        match resolve_password(&args.name) {
             Ok(p) => p,
             Err(()) => return ExitCode::from(1),
         }
@@ -211,20 +207,24 @@ pub fn run_new(args: NewArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>
             return ExitCode::from(1);
         }
     };
-    let create_resp =
-        match rt.block_on(client.create_wallet(&args.name, &args.driver, &password, mdk)) {
-            Ok(resp) => resp,
-            Err(e) => {
-                // Surface kmd's server-side `message` verbatim where we
-                // have it — operators rely on this text for diagnosis.
-                let msg = match &e {
-                    KmdError::Api { message, .. } => message.clone(),
-                    other => other.to_string(),
-                };
-                eprintln!("{}", format_message(ERROR_COULDNT_CREATE, &[&msg]));
-                return ExitCode::from(1);
-            }
-        };
+    let create_resp = match rt.block_on(client.create_wallet(
+        &args.name,
+        DEFAULT_WALLET_DRIVER,
+        &password,
+        mdk,
+    )) {
+        Ok(resp) => resp,
+        Err(e) => {
+            // Surface kmd's server-side `message` verbatim where we
+            // have it — operators rely on this text for diagnosis.
+            let msg = match &e {
+                KmdError::Api { message, .. } => message.clone(),
+                other => other.to_string(),
+            };
+            eprintln!("{}", format_message(ERROR_COULDNT_CREATE, &[&msg]));
+            return ExitCode::from(1);
+        }
+    };
     println!("{}", format_message(INFO_CREATED, &[&args.name]));
 
     // Post-create backup-phrase prompt. Suppressed when we just
@@ -253,39 +253,46 @@ pub fn run_new(args: NewArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>
             }
         }
         Err(e) => {
-            // Non-fatal: the wallet was created. Surface the error
-            // message but exit 0 (matches Go's reportErrorf flow
-            // would actually exit, but only if ListWallets fails after
-            // a successful create — in practice this is exceedingly
-            // rare and operators care more about the create
-            // succeeding). We log and continue.
+            // go: `reportErrorf(errorCouldntListWallets, err)`.
             let msg = match &e {
                 KmdError::Api { message, .. } => message.clone(),
                 other => other.to_string(),
             };
             eprintln!("{}", format_message(ERROR_COULDNT_LIST, &[&msg]));
+            return ExitCode::from(1);
         }
     }
 
     ExitCode::SUCCESS
 }
 
-/// Read a 25-word mnemonic from stdin (TTY: prompt then ReadString;
-/// non-TTY: read one line). Returns the derived 32-byte MDK. On
-/// failure, emits Go's exact error text to stderr and returns Err.
+/// go's `reader.ReadString('\n')` on stdin, trimmed: the line, or go's
+/// `errorFailedToReadResponse` text (a line without its newline is `EOF`).
+fn read_response() -> Result<String, String> {
+    let mut line = String::new();
+    let fail = |e: &dyn std::fmt::Display| {
+        format_message(ERROR_FAILED_TO_READ_RESPONSE, &[&e.to_string()])
+    };
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| fail(&e))?;
+    if !line.ends_with('\n') {
+        return Err(fail(&"EOF"));
+    }
+    Ok(line.trim().to_string())
+}
+
+/// Read the recovery mnemonic (`wallet.go:101-118`): the prompt, one line
+/// from stdin, the derived 32-byte MDK. On failure, emits Go's exact error
+/// text to stderr and returns Err.
 fn read_recovery_mnemonic() -> Result<[u8; 32], ()> {
     // Go uses `fmt.Println(infoRecoveryPrompt)` which adds a trailing
     // newline. The prompt itself ends with a space — we keep that as
     // shipped and let Println add the newline.
     println!("{INFO_RECOVERY_PROMPT}");
-    let stdin = std::io::stdin();
-    let mut line = String::new();
-    if let Err(e) = stdin.lock().read_line(&mut line) {
-        eprintln!("{}", format_message(ERROR_BAD_MNEMONIC, &[&e.to_string()]));
-        return Err(());
-    }
-    let trimmed = line.trim();
-    match mnemonic_to_key(trimmed) {
+    let line = read_response().map_err(|e| eprintln!("{e}"))?;
+    match mnemonic_to_key(&line) {
         Ok(key) => {
             if key.len() != 32 {
                 eprintln!("{ERROR_BAD_RECOVERED_KEY}");
@@ -312,13 +319,9 @@ fn maybe_show_backup_phrase(
     // already ends with `): ` so Println's trailing newline puts the
     // user's response on the next line. Mirror exactly.
     println!("{INFO_BACKUP_EXPLANATION}");
-    let stdin = std::io::stdin();
-    let mut line = String::new();
-    if let Err(e) = stdin.lock().read_line(&mut line) {
-        eprintln!("{}", format_message(ERROR_BAD_MNEMONIC, &[&e.to_string()]));
-        return Err(());
-    }
-    let resp = line.trim().to_lowercase();
+    let resp = read_response()
+        .map_err(|e| eprintln!("{e}"))?
+        .to_lowercase();
     if resp == "n" {
         return Ok(());
     }
@@ -586,6 +589,11 @@ pub fn run_rename(
     cli_d: Vec<PathBuf>,
     kmd_dir_flag: Option<PathBuf>,
 ) -> ExitCode {
+    let client = match ensure_kmd_client_single(&cli_d, kmd_dir_flag.as_deref()) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
+
     if args.old_name == args.new_name {
         eprintln!(
             "{}",
@@ -596,11 +604,6 @@ pub fn run_rename(
         );
         return ExitCode::from(1);
     }
-
-    let client = match ensure_kmd_client_single(&cli_d, kmd_dir_flag.as_deref()) {
-        Ok(c) => c,
-        Err(()) => return ExitCode::from(1),
-    };
 
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -656,9 +659,19 @@ pub fn run_rename(
         return ExitCode::from(1);
     }
 
-    let password = match resolve_password_for_existing(&args) {
-        Ok(p) => p,
-        Err(()) => return ExitCode::from(1),
+    // go: the password only of an encrypted wallet (`WalletIsUnencrypted`:
+    // a blank password initialises it), `infoPasswordPrompt` +
+    // `ensurePassword`.
+    let password = if crate::wallet_token::wallet_is_unencrypted(&rt, &client, &wallet_id) {
+        String::new()
+    } else {
+        match crate::wallet_token::read_password_for(&args.old_name) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(1);
+            }
+        }
     };
 
     match rt.block_on(client.rename_wallet(&wallet_id, &args.new_name, &password)) {
@@ -680,126 +693,21 @@ pub fn run_rename(
     }
 }
 
-/// Password prompt for `wallet rename` — distinct from `wallet new`'s
-/// because we're asking for an EXISTING wallet's password (no
-/// confirmation step). Same TTY-vs-non-TTY Phase-A semantics as
-/// `resolve_password`.
-fn resolve_password_for_existing(args: &RenameArgs) -> Result<String, ()> {
-    if let Some(pw) = &args.password {
-        return Ok(pw.clone());
+/// The password of a new wallet (`wallet.go:126-137`): go's
+/// `infoChoosePasswordPrompt` and `infoPasswordConfirmation`, each answered
+/// through `ensurePassword` (a terminal on stdin only), then the check that
+/// both match. `Err` after go's error text was printed.
+fn resolve_password(name: &str) -> Result<String, ()> {
+    use crate::wallet_token::ensure_password;
+    print!("{}", format_message(PROMPT_CHOOSE, &[name]));
+    let p1 = ensure_password().map_err(|e| eprintln!("{e}"))?;
+    print!("{PROMPT_CONFIRM}");
+    let p2 = ensure_password().map_err(|e| eprintln!("{e}"))?;
+    if p1 != p2 {
+        eprintln!("{ERROR_PW_CONFIRM}");
+        return Err(());
     }
-    let stdin = std::io::stdin();
-    if stdin.is_terminal() {
-        use std::io::Write;
-        print!(
-            "{}",
-            format_message(PROMPT_EXISTING_PASSWORD, &[&args.old_name])
-        );
-        let _ = std::io::stdout().flush();
-        let pw = rpassword::read_password().map_err(|e| {
-            eprintln!(
-                "{}",
-                format_message(ERROR_COULDNT_RENAME, &[&e.to_string()])
-            );
-        })?;
-        println!();
-        Ok(pw)
-    } else {
-        let mut line = String::new();
-        if let Err(e) = std::io::stdin().read_line(&mut line) {
-            eprintln!(
-                "{}",
-                format_message(ERROR_COULDNT_RENAME, &[&e.to_string()])
-            );
-            return Err(());
-        }
-        let trimmed = line.strip_suffix('\n').unwrap_or(&line);
-        let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
-        Ok(trimmed.to_string())
-    }
-}
-
-/// Resolve the wallet password:
-/// - `--password <pw>` flag → use it.
-/// - TTY stdin → prompt twice and confirm. Mirrors
-///   `wallet.go:127-137`.
-/// - Non-TTY stdin (piped) → read one line as the password.
-///
-/// **Intentional divergence from Go (TASK-226 scope):** Go's
-/// `wallet.go` always calls `terminal.ReadPassword(os.Stdin.Fd())`,
-/// which errors on piped stdin. The Phase-A task spec explicitly
-/// chose "non-TTY stdin reads one line" for CI/scripting
-/// friendliness — this lets `echo pw | goal-rust wallet new …`
-/// work in CI without a tty allocation, and it's the behavior
-/// goal-rust's downstream users expect when wrapping the binary.
-/// Operators who want Go-strict behavior should pass `--password`
-/// (still the safest in scripts anyway).
-fn resolve_password(args: &NewArgs) -> Result<String, ()> {
-    if let Some(pw) = &args.password {
-        return Ok(pw.clone());
-    }
-    let stdin = std::io::stdin();
-    if stdin.is_terminal() {
-        // Print the prompt to stdout via Rust's print! (matches Go's
-        // fmt.Printf at wallet.go:130-136 which goes to stdout —
-        // tools that capture stdout from an interactive run see the
-        // prompt text). Then use rpassword::read_password() for the
-        // masked terminal read so the typed password isn't echoed.
-        // (Codex review TASK-226 round 2: rpassword::prompt_password
-        // writes the prompt to /dev/tty rather than stdout, which
-        // diverges from Go.)
-        use std::io::Write;
-        print!("{}", format_message(PROMPT_CHOOSE, &[&args.name]));
-        let _ = std::io::stdout().flush();
-        let p1 = match rpassword::read_password() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!(
-                    "{}",
-                    format_message(ERROR_COULDNT_CREATE, &[&e.to_string()])
-                );
-                return Err(());
-            }
-        };
-        // Go's ensurePassword() emits a trailing newline on stdout
-        // after each masked read (terminal.ReadPassword consumes the
-        // user's CR but doesn't echo it). Match that so callers
-        // capturing stdout see the same line breaks Go produces.
-        // (Codex review TASK-226 round 3.)
-        println!();
-        print!("{PROMPT_CONFIRM}");
-        let _ = std::io::stdout().flush();
-        let p2 = match rpassword::read_password() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!(
-                    "{}",
-                    format_message(ERROR_COULDNT_CREATE, &[&e.to_string()])
-                );
-                return Err(());
-            }
-        };
-        println!();
-        if p1 != p2 {
-            eprintln!("{ERROR_PW_CONFIRM}");
-            return Err(());
-        }
-        Ok(p1)
-    } else {
-        let mut line = String::new();
-        if let Err(e) = std::io::stdin().read_line(&mut line) {
-            eprintln!(
-                "{}",
-                format_message(ERROR_COULDNT_CREATE, &[&e.to_string()])
-            );
-            return Err(());
-        }
-        // Strip a single trailing newline only — passwords with
-        // intentional trailing whitespace are valid otherwise.
-        let trimmed = line.strip_suffix('\n').unwrap_or(&line);
-        let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
-        Ok(trimmed.to_string())
-    }
+    Ok(p1)
 }
 
 /// Trivial template formatter (same shape as `cmd/node.rs`): replaces

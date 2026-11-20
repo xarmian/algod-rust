@@ -109,12 +109,6 @@ pub struct NewArgs {
     #[arg(short = 'w', long = "wallet")]
     pub wallet: Option<String>,
 
-    /// Wallet password (skip the prompt). Phase-A divergence: when
-    /// stdin is non-TTY and `--password` is omitted, we read one line
-    /// from stdin (same pattern as `wallet new`).
-    #[arg(long = "password")]
-    pub password: Option<String>,
-
     /// Mark this account as the default account in accountList.json.
     /// Mirrors Go's `-f, --default` bool (`account.go:118`).
     #[arg(short = 'f', long = "default")]
@@ -137,11 +131,6 @@ pub struct DeleteArgs {
     /// Wallet that holds the key. Mirrors Go's persistent `-w` flag.
     #[arg(short = 'w', long = "wallet")]
     pub wallet: Option<String>,
-
-    /// Wallet password (skip the prompt). Non-TTY stdin reads one
-    /// line.
-    #[arg(long = "password")]
-    pub password: Option<String>,
 }
 
 /// `account rename <old> <new>` — local-only rename of the friendly
@@ -200,16 +189,14 @@ pub struct AssetdetailsArgs {
 }
 
 /// `account renewpartkey --address <addr> --roundLastValid <r>
-/// [--keyDilution <n>] [--register]`. Mirrors Go's
+/// [--keyDilution <n>]`. Mirrors Go's
 /// `renewParticipationKeyCmd` (account.go:1053-1099).
 ///
 /// **Divergences (documented):**
 /// - Same algokey-rust-no-lib limitation as addpartkey: uses B9's
 ///   REST generate endpoint (server-side generation + install).
-/// - Go's renewpartkey ALWAYS issues a keyreg (online) transaction
-///   after generating; we skip that step (lands in B12) and the
-///   operator runs `goal account changeonlinestatus` themselves.
-///   `--register` is wired but errors with a deferral message.
+/// - Like go's, the new key is registered online right after it is
+///   generated.
 #[derive(Args, Debug)]
 pub struct RenewpartkeyArgs {
     #[arg(short = 'a', long = "address")]
@@ -220,20 +207,13 @@ pub struct RenewpartkeyArgs {
     /// Optional key dilution.
     #[arg(long = "keyDilution", alias = "key-dilution")]
     pub key_dilution: Option<u64>,
-    /// Issue a keyreg-online transaction after generation. Defers to
-    /// B12 — set today exits 1 with a clear deferral message.
-    #[arg(long = "register")]
-    pub register: bool,
 }
 
-/// `account changeonlinestatus -a <addr> [--online|--offline] [--firstvalid <r>]
-/// [--lastvalid <r>] [--fee <f>] [--no-wait] [-w <wallet>] [--password <pw>]`.
+/// `account changeonlinestatus -a <addr> [-o=false] [--firstvalid <r>]
+/// [--lastvalid <r>] [--fee <f>] [--no-wait] [-w <wallet>]`.
 /// Mirrors Go's `changeOnlineCmd` (account.go:873-928).
 ///
 /// **Divergences (documented):**
-/// - Go's `--online` is a single bool defaulting to `true`; we expose the
-///   clearer `--online`/`--offline` pair, defaulting to online when neither is
-///   given (same effective default as Go).
 /// - The online path sources participation material from algod's
 ///   `/v2/participation` (Go's `chooseParticipation`); Go's `--partkeyfile`
 ///   (load from a local file) is out of scope — install the key first, then run
@@ -243,13 +223,18 @@ pub struct RenewpartkeyArgs {
 pub struct ChangeonlinestatusArgs {
     #[arg(short = 'a', long = "address")]
     pub address: String,
-    /// Bring the account online (register its participation key). Default when
-    /// neither `--online` nor `--offline` is given.
-    #[arg(short = 'o', long = "online", conflicts_with = "offline")]
+    /// Set this account to online or offline. go's bool flag defaulting to
+    /// true: `-o=false` / `--online=false` takes the account offline.
+    #[arg(
+        short = 'o',
+        long = "online",
+        num_args = 0..=1,
+        require_equals = true,
+        default_value = "true",
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     pub online: bool,
-    /// Bring the account offline (clear its voting keys).
-    #[arg(long = "offline", conflicts_with = "online")]
-    pub offline: bool,
     /// First valid round for the status-change transaction (0/unset ⇒ current).
     #[arg(long = "firstvalid", alias = "first-valid")]
     pub first_valid: Option<u64>,
@@ -262,16 +247,13 @@ pub struct ChangeonlinestatusArgs {
     /// Wallet name.
     #[arg(short = 'w', long = "wallet")]
     pub wallet: Option<String>,
-    /// Wallet password (skip the prompt).
-    #[arg(long = "password")]
-    pub password: Option<String>,
     /// Don't wait for the transaction to commit.
     #[arg(short = 'N', long = "no-wait")]
     pub no_wait: bool,
 }
 
 /// `account marknonparticipating -a <addr> [--firstvalid <r>] [--lastvalid <r>]
-/// [--fee <f>] [--no-wait] [-w <wallet>] [--password <pw>]`. Mirrors Go's
+/// [--fee <f>] [--no-wait] [-w <wallet>]`. Mirrors Go's
 /// `markNonparticipatingCmd` (account.go:1503-1554).
 ///
 /// Permanently marks the account non-participating — irreversible on-chain.
@@ -291,16 +273,13 @@ pub struct MarknonparticipatingArgs {
     /// Wallet name.
     #[arg(short = 'w', long = "wallet")]
     pub wallet: Option<String>,
-    /// Wallet password (skip the prompt).
-    #[arg(long = "password")]
-    pub password: Option<String>,
     /// Don't wait for the transaction to commit.
     #[arg(short = 'N', long = "no-wait")]
     pub no_wait: bool,
 }
 
-/// `account renewallpartkeys --roundLastValid <r> [--keyDilution <n>]
-/// [--register]`. Mirrors Go's `renewAllParticipationKeyCmd`
+/// `account renewallpartkeys --roundLastValid <r> [--keyDilution <n>]`.
+/// Mirrors Go's `renewAllParticipationKeyCmd`
 /// (account.go:1132-1219).
 #[derive(Args, Debug)]
 pub struct RenewallpartkeysArgs {
@@ -308,8 +287,6 @@ pub struct RenewallpartkeysArgs {
     pub round_last_valid: u64,
     #[arg(long = "keyDilution", alias = "key-dilution")]
     pub key_dilution: Option<u64>,
-    #[arg(long = "register")]
-    pub register: bool,
 }
 
 /// `account addpartkey --address <addr> --roundFirstValid <r> --roundLastValid <r> [--keyDilution <n>]`.
@@ -379,11 +356,6 @@ pub struct ImportRootKeyArgs {
     /// Wallet to import into. Mirrors Go's persistent `-w` flag.
     #[arg(short = 'w', long = "wallet")]
     pub wallet: Option<String>,
-
-    /// Wallet password (skip the prompt). Non-TTY stdin reads one
-    /// line.
-    #[arg(long = "password")]
-    pub password: Option<String>,
 }
 
 /// `account import [name]` — read mnemonic on stdin (or supply via
@@ -399,11 +371,6 @@ pub struct ImportArgs {
     /// Wallet to import into. Mirrors Go's persistent `-w` flag.
     #[arg(short = 'w', long = "wallet")]
     pub wallet: Option<String>,
-
-    /// Wallet password (skip the prompt). Non-TTY stdin reads one
-    /// line after the mnemonic.
-    #[arg(long = "password")]
-    pub password: Option<String>,
 
     /// 25-word mnemonic instead of reading from stdin. Mirrors Go's
     /// `-m, --mnemonic` flag (`account.go` `importCmd`).
@@ -427,10 +394,6 @@ pub struct ExportArgs {
     /// Wallet holding the key.
     #[arg(short = 'w', long = "wallet")]
     pub wallet: Option<String>,
-
-    /// Wallet password (skip the prompt).
-    #[arg(long = "password")]
-    pub password: Option<String>,
 }
 
 /// `account dump -a <address>` — pretty-print the REST
@@ -465,11 +428,6 @@ pub struct ListArgs {
     /// applications.
     #[arg(long = "info")]
     pub info: bool,
-
-    /// Wallet password for the open-handle step. Required for each
-    /// wallet's `init_wallet` call; non-TTY stdin reads one line.
-    #[arg(long = "password")]
-    pub password: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -499,7 +457,7 @@ pub enum MultisigCmd {
 
 // ---- TASK-240 (B8) multisig args ----
 
-/// `account multisig new [-T <threshold>] <addr1> <addr2> ... [-w] [--password]`
+/// `account multisig new [-T <threshold>] <addr1> <addr2> ... [-w]`
 /// Mirrors Go's `newMultisigCmd` (account.go:400-441).
 #[derive(Args, Debug)]
 pub struct MsigNewArgs {
@@ -512,12 +470,9 @@ pub struct MsigNewArgs {
     /// Wallet to import into.
     #[arg(short = 'w', long = "wallet")]
     pub wallet: Option<String>,
-    /// Wallet password (skip the prompt).
-    #[arg(long = "password")]
-    pub password: Option<String>,
 }
 
-/// `account multisig delete -a <addr> [-w] [--password]`. Mirrors
+/// `account multisig delete -a <addr> [-w]`. Mirrors
 /// `deleteMultisigCmd` (account.go:443-462).
 #[derive(Args, Debug)]
 pub struct MsigDeleteArgs {
@@ -526,11 +481,9 @@ pub struct MsigDeleteArgs {
     pub address: String,
     #[arg(short = 'w', long = "wallet")]
     pub wallet: Option<String>,
-    #[arg(long = "password")]
-    pub password: Option<String>,
 }
 
-/// `account multisig info -a <addr> [-w] [--password]`. Mirrors
+/// `account multisig info -a <addr> [-w]`. Mirrors
 /// `infoMultisigCmd` (account.go:464-487).
 #[derive(Args, Debug)]
 pub struct MsigInfoArgs {
@@ -539,8 +492,6 @@ pub struct MsigInfoArgs {
     pub address: String,
     #[arg(short = 'w', long = "wallet")]
     pub wallet: Option<String>,
-    #[arg(long = "password")]
-    pub password: Option<String>,
 }
 
 pub fn run(cmd: AccountCmd) -> ExitCode {

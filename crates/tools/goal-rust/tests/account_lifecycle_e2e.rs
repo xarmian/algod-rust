@@ -146,13 +146,13 @@ fn spawn_kmd(kmd_dir: &Path) -> KmdGuard {
     guard
 }
 
-/// Run `goal-rust wallet new w -w pw --no-display-seed -d <dd>`,
+/// Run `goal-rust wallet new w --unencrypted --no-display-seed -d <dd>`,
 /// returning the resulting accountList.json default wallet id.
 fn create_default_wallet(data_dir: &Path) {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(data_dir)
-        .args(["wallet", "new", "w", "-w", "pw", "--no-display-seed"])
+        .args(["wallet", "new", "w", "--unencrypted", "--no-display-seed"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("wallet new");
@@ -172,7 +172,7 @@ fn account_new_creates_address_and_prints_go_text() {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args(["account", "new", "alice", "--password", "pw"])
+        .args(["account", "new", "alice"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("account new");
@@ -212,7 +212,7 @@ fn account_new_duplicate_name_errs() {
     let first = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args(["account", "new", "duplicate_account", "--password", "pw"])
+        .args(["account", "new", "duplicate_account"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("account new");
@@ -221,7 +221,7 @@ fn account_new_duplicate_name_errs() {
     let second = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args(["account", "new", "duplicate_account", "--password", "pw"])
+        .args(["account", "new", "duplicate_account"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("account new (duplicate)");
@@ -266,7 +266,7 @@ fn account_rename_swaps_friendly_name() {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args(["account", "new", "alice", "--password", "pw"])
+        .args(["account", "new", "alice"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("account new");
@@ -308,7 +308,7 @@ fn account_rename_to_existing_name_errors() {
         let out = Command::new(GOAL_RUST_BIN)
             .arg("-d")
             .arg(&dd)
-            .args(["account", "new", n, "--password", "pw"])
+            .args(["account", "new", n])
             .env_remove("ALGORAND_DATA")
             .output()
             .expect("account new");
@@ -361,7 +361,7 @@ fn account_delete_removes_key_and_local_entry() {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args(["account", "new", "victim", "--password", "pw"])
+        .args(["account", "new", "victim"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("account new");
@@ -377,7 +377,7 @@ fn account_delete_removes_key_and_local_entry() {
     let d = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args(["account", "delete", "-a", addr, "--password", "pw"])
+        .args(["account", "delete", "-a", addr])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("delete");
@@ -561,7 +561,11 @@ fn account_dump_writes_outfile_when_o_flag_given() {
 fn account_new_password_comes_from_a_terminal_only() {
     let (_t, dd, kmd_dir) = setup_data_dir();
     let _g = spawn_kmd(&kmd_dir);
-    create_default_wallet(&dd);
+    // An encrypted wallet: its password typed into a terminal.
+    let out = common::pty::wallet_new(Path::new(GOAL_RUST_BIN), &dd, "w", "pw");
+    assert_eq!(out.code, Some(0), "wallet new");
+    // A cold handle cache: `account new` needs the password.
+    let _ = std::fs::remove_dir_all(dd.join("goal.cache"));
 
     let mut child = Command::new(GOAL_RUST_BIN)
         .arg("-d")

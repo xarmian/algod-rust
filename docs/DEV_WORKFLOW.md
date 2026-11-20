@@ -1514,7 +1514,7 @@ Sequence:
    for its `*.net` + `*.token` readiness markers.
 3. Drive `goal-rust account` against the pair:
    - `wallet new` + `account new` (Go kmd) → capture the new address.
-   - `account list --password …` (Go kmd open-handle) → new address
+   - `account list` (Go kmd open-handle, unencrypted wallet) → new address
      rendered.
    - `account info` + `account balance` on a genesis-funded `WalletN`
      address (Go algod read paths; assertions cross-check the

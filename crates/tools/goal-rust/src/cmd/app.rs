@@ -843,13 +843,8 @@ fn submit_single(
     let stx = if want_wallet_sign {
         let kmd = build_wallet_handle_kmd_client(data_dir_path)?;
         let mut accounts = AccountsList::load(data_dir_path).map_err(|e| e.to_string())?;
-        let (handle, _name, password) = resolve_wallet_and_init(
-            rt,
-            &kmd,
-            &mut accounts,
-            wallet.as_deref(),
-            txn_args.password.as_deref(),
-        )?;
+        let (handle, _name, password) =
+            resolve_wallet_and_init(rt, &kmd, &mut accounts, wallet.as_deref())?;
         let signer_pk: [u8; 32] = signer_addr.map(|a| a.0).unwrap_or([0u8; 32]);
         let encoded = canonical_encode_transaction(&txn);
         let signed = rt
@@ -1539,7 +1534,6 @@ fn run_method_inner(args: MethodArgs, wallet: Option<String>) -> Result<ExitCode
             kmd,
             &mut acc,
             wallet.as_deref(),
-            args.txn.password.as_deref(),
         )?)
     } else {
         None

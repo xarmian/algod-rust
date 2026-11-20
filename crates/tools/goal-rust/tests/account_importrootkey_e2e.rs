@@ -141,7 +141,7 @@ fn create_default_wallet(dd: &Path) {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(dd)
-        .args(["wallet", "new", "w", "-w", "pw", "--no-display-seed"])
+        .args(["wallet", "new", "w", "--unencrypted", "--no-display-seed"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("wallet new");
@@ -204,7 +204,7 @@ fn importrootkey_imports_every_rootkey_in_data_dir() {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args(["account", "importrootkey", "--password", "pw"])
+        .args(["account", "importrootkey"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("importrootkey");
@@ -239,7 +239,7 @@ fn importrootkey_pluralization_singular_for_one_key() {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args(["account", "importrootkey", "--password", "pw"])
+        .args(["account", "importrootkey"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("importrootkey");
@@ -261,7 +261,7 @@ fn importrootkey_empty_directory_prints_imported_zero_keys() {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args(["account", "importrootkey", "--password", "pw"])
+        .args(["account", "importrootkey"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("importrootkey");
@@ -361,7 +361,7 @@ fn importrootkey_skips_corrupt_files_and_imports_the_rest() {
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
-        .args(["account", "importrootkey", "--password", "pw"])
+        .args(["account", "importrootkey"])
         .env_remove("ALGORAND_DATA")
         .output()
         .expect("importrootkey");

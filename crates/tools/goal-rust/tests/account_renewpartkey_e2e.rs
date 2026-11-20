@@ -146,11 +146,10 @@ fn partkey_entry(address: &str, id: &str, vote_last: u64) -> serde_json::Value {
     })
 }
 
-/// `renewpartkey --register` is now implemented (B12); the batch
-/// `renewallpartkeys --register` remains deferred and must still exit with a
-/// clear message rather than silently renewing without registering.
+/// go's goal has no `--register` flag (its renew commands always register,
+/// issue #2407): cobra's `unknown flag`.
 #[test]
-fn renewallpartkeys_register_flag_exits_with_deferral() {
+fn renewallpartkeys_has_no_register_flag() {
     let (_t, dd) = mk_data_dir();
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
@@ -166,10 +165,10 @@ fn renewallpartkeys_register_flag_exits_with_deferral() {
         .output()
         .expect("renewallpartkeys");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "--register must error");
+    assert_eq!(out.status.code(), Some(1), "--register must error");
     assert!(
-        stderr.contains("not yet supported"),
-        "stderr must carry deferral message; got {stderr:?}",
+        stderr.starts_with("Error: unknown flag: --register\n"),
+        "stderr must carry cobra's unknown flag; got {stderr:?}",
     );
 }
 
@@ -208,18 +207,17 @@ fn renewpartkey_invokes_generate_with_current_round_as_first() {
         .expect("renewpartkey");
     stop.store(true, Ordering::Relaxed);
     let _ = jh.join();
+    // The key is generated first; registering it afterwards (like go's
+    // `generateAndRegisterPartKey`) needs a kmd this test does not run.
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success(),
-        "renewpartkey: stdout={stdout:?}, stderr={stderr:?}"
-    );
     let s = state.lock().unwrap();
     let gen_req = s
         .requests
         .iter()
         .find(|(m, p)| m == "POST" && p.starts_with(&format!("/v2/participation/generate/{addr}")));
-    let (_, path) = gen_req.expect("must POST generate");
+    let (_, path) = gen_req
+        .unwrap_or_else(|| panic!("must POST generate; stdout={stdout:?}, stderr={stderr:?}"));
     assert!(
         path.contains("first=1000"),
         "first=current round; got {path}"

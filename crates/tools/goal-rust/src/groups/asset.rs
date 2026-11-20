@@ -90,10 +90,6 @@ pub struct AssetTxnArgs {
     /// rekeying (Go `-S/--signer`).
     #[arg(short = 'S', long = "signer")]
     pub signer: Option<String>,
-    /// Wallet password (skip the prompt). goal-rust convention shared with
-    /// the other signing leaves.
-    #[arg(long = "password")]
-    pub password: Option<String>,
 }
 
 /// The `[--assetid <id> | --unitname <name> --creator <addr>]` asset-lookup

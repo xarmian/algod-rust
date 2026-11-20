@@ -165,16 +165,11 @@ pub fn run_new(args: NewArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>
     }
 
     // Resolve wallet + open handle.
-    let (wallet_id, _wallet_name, _password) = match resolve_wallet_no_password(
-        &rt,
-        &client,
-        &mut accounts,
-        args.wallet.as_deref(),
-        args.password.as_deref(),
-    ) {
-        Ok(v) => v,
-        Err(()) => return ExitCode::from(1),
-    };
+    let (wallet_id, _wallet_name, _password) =
+        match resolve_wallet_no_password(&rt, &client, &mut accounts, args.wallet.as_deref()) {
+            Ok(v) => v,
+            Err(()) => return ExitCode::from(1),
+        };
     let handle = wallet_id; // resolve_wallet_and_init returns (handle, name, pw)
 
     // Generate the key.
@@ -234,16 +229,11 @@ pub fn run_list(args: ListArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBu
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
     };
-    let (handle, _wallet_name, _pw) = match resolve_wallet_no_password(
-        &rt,
-        &wh_client,
-        &mut accounts,
-        args.wallet.as_deref(),
-        args.password.as_deref(),
-    ) {
-        Ok(v) => v,
-        Err(()) => return ExitCode::from(1),
-    };
+    let (handle, _wallet_name, _pw) =
+        match resolve_wallet_no_password(&rt, &wh_client, &mut accounts, args.wallet.as_deref()) {
+            Ok(v) => v,
+            Err(()) => return ExitCode::from(1),
+        };
     // go: `client := ensureKmdClient(dataDir)`.
     let client = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
         Ok(c) => c,
@@ -491,16 +481,11 @@ pub fn run_delete(
         Err(()) => return ExitCode::from(1),
     };
 
-    let (handle, _wallet_name, password) = match resolve_wallet_and_init(
-        &rt,
-        &client,
-        &mut accounts,
-        args.wallet.as_deref(),
-        args.password.as_deref(),
-    ) {
-        Ok(v) => v,
-        Err(()) => return ExitCode::from(1),
-    };
+    let (handle, _wallet_name, password) =
+        match resolve_wallet_and_init(&rt, &client, &mut accounts, args.wallet.as_deref()) {
+            Ok(v) => v,
+            Err(()) => return ExitCode::from(1),
+        };
 
     match rt.block_on(client.delete_key(&handle, &password, &args.address)) {
         Ok(_) => {}
@@ -674,9 +659,8 @@ fn resolve_wallet_and_init(
     client: &KmdClient,
     accounts: &mut AccountsList,
     wallet_flag: Option<&str>,
-    password_flag: Option<&str>,
 ) -> Result<(String, String, String), ()> {
-    resolve_wallet(rt, client, accounts, wallet_flag, password_flag, true)
+    resolve_wallet(rt, client, accounts, wallet_flag, true)
 }
 
 /// `getWalletHandleMaybePassword(.., getPassword = false)`: callers that need
@@ -686,9 +670,8 @@ fn resolve_wallet_no_password(
     client: &KmdClient,
     accounts: &mut AccountsList,
     wallet_flag: Option<&str>,
-    password_flag: Option<&str>,
 ) -> Result<(String, String, String), ()> {
-    resolve_wallet(rt, client, accounts, wallet_flag, password_flag, false)
+    resolve_wallet(rt, client, accounts, wallet_flag, false)
 }
 
 fn resolve_wallet(
@@ -696,7 +679,6 @@ fn resolve_wallet(
     client: &KmdClient,
     accounts: &mut AccountsList,
     wallet_flag: Option<&str>,
-    password_flag: Option<&str>,
     get_password: bool,
 ) -> Result<(String, String, String), ()> {
     // 1. Resolve wallet ID + name.
@@ -710,7 +692,6 @@ fn resolve_wallet(
         &accounts.data_dir,
         &wallet_id,
         &wallet_name,
-        password_flag,
         get_password,
     )
     .map_err(|e| {
@@ -815,7 +796,7 @@ fn format_message(template: &str, args: &[&str]) -> String {
 
 // ---- account import / export (TASK-238 / B6) ------------------------------
 
-/// `account import [name] [-w] [--password] [--mnemonic] [-f]` —
+/// `account import [name] [-w] [--mnemonic] [-f]` —
 /// recover a key from a 25-word mnemonic into the chosen wallet's kmd.
 /// Mirrors `importCmd` (account.go:1281-1338).
 pub fn run_import(
@@ -893,16 +874,11 @@ pub fn run_import(
     let expanded = expand_seed_to_sk(&seed);
 
     // Resolve wallet + open handle.
-    let (handle, _wallet_name, _password) = match resolve_wallet_no_password(
-        &rt,
-        &client,
-        &mut accounts,
-        args.wallet.as_deref(),
-        args.password.as_deref(),
-    ) {
-        Ok(v) => v,
-        Err(()) => return ExitCode::from(1),
-    };
+    let (handle, _wallet_name, _password) =
+        match resolve_wallet_no_password(&rt, &client, &mut accounts, args.wallet.as_deref()) {
+            Ok(v) => v,
+            Err(()) => return ExitCode::from(1),
+        };
 
     let imported = match rt.block_on(client.import_key(&handle, expanded)) {
         Ok(r) => r.address,
@@ -927,7 +903,7 @@ pub fn run_import(
     ExitCode::SUCCESS
 }
 
-/// `account export -a <addr> [-w] [--password]` — export the account
+/// `account export -a <addr> [-w]` — export the account
 /// key as a 25-word mnemonic. Mirrors `exportCmd`
 /// (account.go:1339-1371).
 pub fn run_export(
@@ -960,16 +936,11 @@ pub fn run_export(
         Ok(a) => a,
         Err(()) => return ExitCode::from(1),
     };
-    let (handle, _wallet_name, password) = match resolve_wallet_and_init(
-        &rt,
-        &client,
-        &mut accounts,
-        args.wallet.as_deref(),
-        args.password.as_deref(),
-    ) {
-        Ok(v) => v,
-        Err(()) => return ExitCode::from(1),
-    };
+    let (handle, _wallet_name, password) =
+        match resolve_wallet_and_init(&rt, &client, &mut accounts, args.wallet.as_deref()) {
+            Ok(v) => v,
+            Err(()) => return ExitCode::from(1),
+        };
 
     let exported = match rt.block_on(client.export_key(&handle, &password, &args.address)) {
         Ok(r) => r.private_key,
@@ -1532,7 +1503,7 @@ pub fn run_changeonlinestatus(
         Err(()) => return ExitCode::from(1),
     };
 
-    let go_online = !args.offline;
+    let go_online = args.online;
     let pipeline = algo_txn_pipeline::TxnPipeline::new(algod, Some(kmd));
 
     // go: `ensureWalletHandleMaybePassword` → `makeAccountsList`.
@@ -1545,7 +1516,6 @@ pub fn run_changeonlinestatus(
         pipeline.kmd().expect("kmd configured above"),
         &mut accounts,
         args.wallet.as_deref(),
-        args.password.as_deref(),
     ) {
         Ok(v) => v,
         Err(()) => return ExitCode::from(1),
@@ -1719,7 +1689,6 @@ pub fn run_marknonparticipating(
         pipeline.kmd().expect("kmd configured above"),
         &mut accounts,
         args.wallet.as_deref(),
-        args.password.as_deref(),
     ) {
         Ok(v) => v,
         Err(()) => return ExitCode::from(1),
@@ -1743,17 +1712,8 @@ pub fn run_marknonparticipating(
 
 // ---- account renewpartkey / renewallpartkeys (TASK-243 / B11) -------------
 
-/// `renewallpartkeys --register` is deferred: batch-registering every renewed
-/// key requires per-account wallet resolution + signing, tracked as a
-/// follow-up. The single-account `renewpartkey --register` (B12) is wired.
-const RENEWALL_REGISTER_DEFERRED: &str =
-    "--register on renewallpartkeys is not yet supported (batch keyreg \
-     submission is a follow-up). Renew, then run `goal-rust account \
-     changeonlinestatus -a <addr> --online` per account, or use \
-     `renewpartkey --register` for a single account.";
-
-/// `account renewpartkey -a <addr> --roundLastValid <r> [--keyDilution]
-/// [--register]`. Mirrors `renewParticipationKeyCmd`
+/// `account renewpartkey -a <addr> --roundLastValid <r> [--keyDilution]`:
+/// renew, then register the new key online. Mirrors `renewParticipationKeyCmd`
 /// (account.go:1053-1099). See `RenewpartkeyArgs` for divergences.
 pub fn run_renewpartkey(
     args: RenewpartkeyArgs,
@@ -1816,12 +1776,8 @@ pub fn run_renewpartkey(
         return ExitCode::from(1);
     }
 
-    if !args.register {
-        return ExitCode::SUCCESS;
-    }
-
-    // --register: issue a keyreg-online transaction for the freshly generated
-    // key, mirroring Go's `generateAndRegisterPartKey` (account.go:1101-1131).
+    // Issue a keyreg-online transaction for the freshly generated key, as go's
+    // `generateAndRegisterPartKey` always does.
     let kmd = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
         Ok(c) => c,
         Err(()) => return ExitCode::from(1),
@@ -1836,7 +1792,6 @@ pub fn run_renewpartkey(
         &rt,
         pipeline.kmd().expect("kmd configured above"),
         &mut accounts,
-        None,
         None,
     ) {
         Ok(v) => v,
@@ -1921,10 +1876,6 @@ async fn register_online_keyreg(
 /// round_last_valid` (Go's preflight check at
 /// account.go:1080-1088).
 pub fn run_renewallpartkeys(args: RenewallpartkeysArgs, cli_d: Vec<PathBuf>) -> ExitCode {
-    if args.register {
-        eprintln!("{RENEWALL_REGISTER_DEFERRED}");
-        return ExitCode::from(1);
-    }
     let dirs = match data_dir::resolve_data_dirs(&cli_d) {
         Ok(d) => d,
         Err(e) => {
@@ -2103,16 +2054,11 @@ pub fn run_multisig_new(
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
     };
-    let (handle, _wallet_name, _pw) = match resolve_wallet_no_password(
-        &rt,
-        &client,
-        &mut accounts,
-        args.wallet.as_deref(),
-        args.password.as_deref(),
-    ) {
-        Ok(v) => v,
-        Err(()) => return ExitCode::from(1),
-    };
+    let (handle, _wallet_name, _pw) =
+        match resolve_wallet_no_password(&rt, &client, &mut accounts, args.wallet.as_deref()) {
+            Ok(v) => v,
+            Err(()) => return ExitCode::from(1),
+        };
 
     // Multisig version is fixed at 1 (Algorand's only ratified
     // version — protocol/multisig.go).
@@ -2167,16 +2113,11 @@ pub fn run_multisig_delete(
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
     };
-    let (handle, _wallet_name, password) = match resolve_wallet_and_init(
-        &rt,
-        &client,
-        &mut accounts,
-        args.wallet.as_deref(),
-        args.password.as_deref(),
-    ) {
-        Ok(v) => v,
-        Err(()) => return ExitCode::from(1),
-    };
+    let (handle, _wallet_name, password) =
+        match resolve_wallet_and_init(&rt, &client, &mut accounts, args.wallet.as_deref()) {
+            Ok(v) => v,
+            Err(()) => return ExitCode::from(1),
+        };
     if let Err(e) = rt.block_on(client.delete_multisig(&handle, &password, &args.address)) {
         eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&kmd_msg(&e)]));
         return ExitCode::from(1);
@@ -2214,24 +2155,13 @@ pub fn run_multisig_info(
         Ok(a) => a,
         Err(()) => return ExitCode::from(1),
     };
-    // Multisig info is structural metadata, but kmd still requires
-    // a wallet handle which requires a password for encrypted
-    // wallets. The earlier code forced empty password unconditionally,
-    // which failed encrypted wallets even when the operator passed
-    // --password explicitly. Go's libgoal uses a cached-handle path
-    // we don't have; mirror the other read-leaves and let
-    // resolve_wallet_and_init prompt on TTY when --password is
-    // omitted. Unencrypted wallets still work via `--password ''`.
-    let (handle, _wallet_name, _pw) = match resolve_wallet_no_password(
-        &rt,
-        &client,
-        &mut accounts,
-        args.wallet.as_deref(),
-        args.password.as_deref(),
-    ) {
-        Ok(v) => v,
-        Err(()) => return ExitCode::from(1),
-    };
+    // go: `ensureWalletHandle` (the password prompt only when no handle
+    // token can be had without one).
+    let (handle, _wallet_name, _pw) =
+        match resolve_wallet_no_password(&rt, &client, &mut accounts, args.wallet.as_deref()) {
+            Ok(v) => v,
+            Err(()) => return ExitCode::from(1),
+        };
 
     let exp = match rt.block_on(client.export_multisig(&handle, &args.address)) {
         Ok(r) => r,
@@ -2335,7 +2265,6 @@ pub fn run_importrootkey(
                     &client,
                     &mut accounts,
                     args.wallet.as_deref(),
-                    args.password.as_deref(),
                 ) {
                     Ok(v) => v,
                     Err(()) => return ExitCode::from(1),
