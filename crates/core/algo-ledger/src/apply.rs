@@ -22,8 +22,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use algo_avm::eval::{
-    run_approval_program, run_approval_program_with_tracer, run_clear_state_program,
-    run_clear_state_program_with_tracer,
+    run_approval_program, run_approval_program_with_tracer, run_clear_state_program_pooled,
+    run_clear_state_program_with_tracer_pooled,
 };
 use algo_avm::group::GroupBudget;
 use algo_avm::tracer::EvalTracer;
@@ -6863,21 +6863,55 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     .unwrap_or_default();
 
                 if !clear_program.is_empty() {
+                    let mut fallback_budget = GroupBudget::new(1);
+                    let budget = group_budget.unwrap_or(&mut fallback_budget);
+                    // go `EvalContract` (`data/transactions/logic/eval.go`):
+                    // under IsolateClearState a ClearState program does not
+                    // start while the pooled budget is below
+                    // `MaxAppProgramCost`. It is a plain error, not a
+                    // `logic.EvalError`, so `ledger/apply/application.go`
+                    // fails the transaction instead of swallowing it.
+                    let pooled = ctx.consensus.enable_app_cost_pooling;
+                    if ctx.consensus.isolate_clear_state
+                        && pooled
+                        && budget.remaining() < ctx.consensus.max_app_program_cost as i64
+                    {
+                        return Err(algo_error::framed_rejection(
+                            algo_codec::compute_txn_id(txn),
+                            format_args!(
+                                "attempted ClearState execution with low OpcodeBudget {}",
+                                budget.remaining()
+                            ),
+                        ));
+                    }
                     let ph = program_hash(&clear_program);
 
                     // Snapshot store BEFORE AVM execution so we can roll back
                     // any state mutations if the program rejects/errors.
                     // We snapshot the sender, any accounts in the txn's accounts
-                    // array, and the app's global state (via app_ids).
+                    // array, and the app's global state (via app_ids). Before
+                    // IsolateClearState (v30) the program may also issue inner
+                    // transactions, so the accounts and assets those can touch
+                    // (the app and foreign-app addresses, the fee sink, the
+                    // foreign assets) are covered too.
                     let mut cs_addrs = vec![txn.sender];
-                    if let Some(ref accounts) = txn.accounts {
-                        for acct in accounts {
-                            if !acct.is_zero() && !cs_addrs.contains(acct) {
-                                cs_addrs.push(*acct);
-                            }
+                    let mut cs_assets = Vec::new();
+                    let mut extra = Vec::new();
+                    if !ctx.consensus.isolate_clear_state {
+                        use crate::avm_context::app_address;
+                        extra.push(Address(app_address(app_id)));
+                        extra.push(ctx.fee_sink);
+                        for app in txn.foreign_apps.iter().flatten() {
+                            extra.push(Address(app_address(*app)));
+                        }
+                        cs_assets.extend(txn.foreign_assets.iter().flatten().copied());
+                    }
+                    for acct in txn.accounts.iter().flatten().chain(&extra) {
+                        if !acct.is_zero() && !cs_addrs.contains(acct) {
+                            cs_addrs.push(*acct);
                         }
                     }
-                    let cs_snapshot = store.snapshot_with_ids(&cs_addrs, &[], &[app_id]);
+                    let cs_snapshot = store.snapshot_with_ids(&cs_addrs, &cs_assets, &[app_id]);
 
                     let (avm_group, avm_group_index) = build_avm_group(stx, group_info);
                     let mut avm_ctx = LedgerAvmContext::new(
@@ -6966,18 +7000,21 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                         }
                         Ok(()) => {
                             let _avm_timer = crate::follow_timing::AvmTimer::start(&ctx.avm_timing);
+                            let pool = pooled.then_some(&mut *budget);
                             if let Some(ref mut t) = tracer {
-                                run_clear_state_program_with_tracer(
+                                run_clear_state_program_with_tracer_pooled(
                                     &clear_program,
                                     &mut avm_ctx,
                                     &ctx.consensus,
                                     *t,
+                                    pool,
                                 )
                             } else {
-                                run_clear_state_program(
+                                run_clear_state_program_pooled(
                                     &clear_program,
                                     &mut avm_ctx,
                                     &ctx.consensus,
+                                    pool,
                                 )
                             }
                         }
