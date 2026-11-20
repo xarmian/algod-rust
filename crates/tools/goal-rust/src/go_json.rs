@@ -728,7 +728,7 @@ impl<'a> Dec<'a> {
 /// go's `base64.StdEncoding.Decode` of `src`, only for its error: the
 /// `CorruptInputError` offset. `\r` and `\n` are skipped; the fast paths of
 /// `Decode` only take whole valid quanta, so `decodeQuantum` alone decides.
-fn go_base64_check(src: &[u8]) -> Result<(), usize> {
+pub(crate) fn go_base64_check(src: &[u8]) -> Result<(), usize> {
     let valid = |c: u8| c.is_ascii_alphanumeric() || c == b'+' || c == b'/';
     let skip_nl = |mut si: usize| {
         while si < src.len() && (src[si] == b'\n' || src[si] == b'\r') {

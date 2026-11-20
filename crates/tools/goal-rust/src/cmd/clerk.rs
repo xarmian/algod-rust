@@ -401,9 +401,9 @@ fn run_send_inner(
         let mut s = decoded
             .pop()
             .ok_or("kmd returned an empty signed transaction")?;
-        // The kmd-rust server signs with the requested key but leaves `sgnr`
-        // unset (TASK-216), so set the AuthAddr here when `--signer` differs
-        // from the sender (mirrors `createSignedTransaction(.., authAddr)`,
+        // kmd sets `sgnr` when the requested key is not the sender's (go's
+        // `Transaction.Sign`; kmd-rust too since issue #2497); setting the
+        // AuthAddr here as well keeps it (mirrors `createSignedTransaction(.., authAddr)`,
         // clerk.go:498, and `Transaction.Sign`, transaction.go:271-274).
         if auth_addr.is_some() {
             s.auth_addr = auth_addr;
@@ -813,11 +813,9 @@ fn run_sign_inner(
                 .map_err(|e| format!("Couldn't sign tx with kmd: {}", kmd_msg(&e)))?;
             // Go's `Transaction.Sign` (transaction.go:271-274) sets AuthAddr
             // whenever the signing key differs from the sender (the rekey
-            // case). The kmd-rust server signs with the requested key but
-            // leaves `sgnr` unset (TASK-216), so set it here when `--signer`
-            // differs from the sender — otherwise the emitted txn would carry
-            // a signature checked against the wrong (sender) key and fail
-            // verification.
+            // case). kmd sets it too (kmd-rust since issue #2497); setting it
+            // here when `--signer` differs from the sender keeps the emitted
+            // txn verifiable against the signing key whatever kmd returns.
             if let Some(signer) = signer_addr {
                 if signer != stxn.txn.sender {
                     let mut signed_txn = decode_signed_txn_stream(&signed.signed_transaction)
