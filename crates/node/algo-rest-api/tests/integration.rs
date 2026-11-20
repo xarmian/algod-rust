@@ -12288,3 +12288,95 @@ async fn simulate_json_is_go_shaped_and_round_trips_with_the_rust_client() {
     let back: SimulateResponse = serde_json::from_value(json).expect("typed round trip");
     assert_eq!(back.txn_groups[0].txn_results[0].txn_result.txn, stxn);
 }
+
+// ===========================================================================
+// Raw transaction submit decode parity (issue #2492)
+// ===========================================================================
+
+/// Issue #2492: `POST /v2/transactions` and `/v2/transactions/async` answer
+/// every body as go v5.0.5-stable's `RawTransaction`/`RawTransactionAsync`
+/// do -- go-codec's msgpack decode texts, positions included, a body cut off
+/// inside a transaction ending the group, and every body go-codec accepts
+/// decoded to the same transactions. The expected responses, and the
+/// canonical encoding of each transaction go decoded, come from go's own
+/// handlers (`tools/raw-submit-text-oracle`, re-checked in CI by
+/// `simulate-rewards-oracle.yml`).
+#[tokio::test]
+async fn raw_submit_responses_match_go() {
+    use tower::ServiceExt;
+
+    const FIXTURE: &str = include_str!("fixtures/raw_submit_texts.jsonl");
+    let mut node = MockNode::synced();
+    node.enable_experimental_api = true;
+    node.enable_developer_api = true;
+    let log = node.broadcast_log.clone();
+    let router = build_router(
+        Arc::new(node),
+        TokenConfig {
+            api_token: generate_token(),
+            admin_token: generate_token(),
+            enable_experimental_api: true,
+            disable_api_auth: true,
+            enable_private_network_access_header: false,
+        },
+    );
+    let mut cases = 0;
+    let mut mismatches = Vec::new();
+    for line in FIXTURE.lines().filter(|l| !l.trim().is_empty()) {
+        let case: serde_json::Value = serde_json::from_str(line).expect("fixture line");
+        let name = case["name"].as_str().expect("name");
+        let endpoint = case["endpoint"].as_str().expect("endpoint");
+        let body = hex::decode(case["body_hex"].as_str().expect("body_hex")).expect("hex");
+        let uri = match endpoint {
+            "async" => "/v2/transactions/async",
+            _ => "/v2/transactions",
+        };
+        log.lock().unwrap().clear();
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Content-Type", "application/x-binary")
+            .body(axum::body::Body::from(body))
+            .expect("request");
+        let response = router.clone().oneshot(request).await.expect("response");
+        let status = response.status().as_u16();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let got = (status, String::from_utf8_lossy(&bytes).into_owned());
+        let want = (
+            case["status"].as_u64().expect("status") as u16,
+            case["response"].as_str().expect("response").to_string(),
+        );
+        if got != want {
+            mismatches.push(format!("{name} ({endpoint}): got {got:?}, go {want:?}"));
+        } else if endpoint == "sync" && status == 200 {
+            let go: Vec<&str> = case["decoded"]
+                .as_array()
+                .expect("decoded")
+                .iter()
+                .map(|v| v.as_str().expect("hex"))
+                .collect();
+            let groups = log.lock().unwrap();
+            let ours: Vec<String> = groups
+                .first()
+                .map(|g| {
+                    g.iter()
+                        .map(|s| hex::encode(algo_codec::canonical_encode_signed_transaction(s)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if ours != go {
+                mismatches.push(format!("{name}: decoded {ours:?}, go {go:?}"));
+            }
+        }
+        cases += 1;
+    }
+    assert!(cases >= 5000, "fixture has {cases} cases");
+    assert!(
+        mismatches.is_empty(),
+        "{} of {cases} cases differ from go:\n{}",
+        mismatches.len(),
+        mismatches.join("\n")
+    );
+}
