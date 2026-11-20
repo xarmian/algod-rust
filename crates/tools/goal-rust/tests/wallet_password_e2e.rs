@@ -1043,7 +1043,12 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
     fresh_renew(1100);
     for (name, a, first, last) in [
         ("unparsable address", "NOTANADDRESS", "5", "1100"),
-        ("roundFirstValid after roundLastValid", a1.as_str(), "1100", "5"),
+        (
+            "roundFirstValid after roundLastValid",
+            a1.as_str(),
+            "1100",
+            "5",
+        ),
         ("validity period too large", a1.as_str(), "5", "20000000"),
     ] {
         step_env(
