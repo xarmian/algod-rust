@@ -22,6 +22,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 GO_ALGORAND_DIR="${GO_ALGORAND_DIR:-$(cd "$REPO_ROOT/../go-algorand" 2>/dev/null && pwd || true)}"
 FIXTURE="$REPO_ROOT/crates/node/algo-rest-api/tests/fixtures/simulate_request_texts.jsonl"
+SCHEMA="$REPO_ROOT/crates/node/algo-rest-api/src/simulate_request_schema.rs"
 
 GO_ALGORAND_PIN="v5.0.5-stable"
 BUILDER_IMAGE="${BUILDER_IMAGE:-golang:1.25-bookworm}"
@@ -97,9 +98,10 @@ STAGED="$CLONE/daemon/algod/api/server/v2/test/zz_algod_rust_simulate_request_te
 cp /io/oracle_test.go "$STAGED"
 trap "rm -f $STAGED" EXIT
 cd "$CLONE"
-ORACLE_OUT=/io/out.jsonl go test -count=1 -run "^TestAlgodRustSimulateRequestTextOracle$" ./daemon/algod/api/server/v2/test/
+ORACLE_OUT=/io/out.jsonl SCHEMA_OUT=/io/schema.rs go test -count=1 -run "^TestAlgodRustSimulateRequest(TextOracle|Schema)$" ./daemon/algod/api/server/v2/test/
 '
 
 mkdir -p "$(dirname "$FIXTURE")"
 cp "$WORKDIR/out.jsonl" "$FIXTURE"
+cp "$WORKDIR/schema.rs" "$SCHEMA"
 echo "==> wrote $(wc -l <"$FIXTURE") cases to $FIXTURE"

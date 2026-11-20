@@ -39,7 +39,7 @@
 //! handled here (see #1971). They are decoded here only in go's JSON form
 //! (see [`parse_json_request`], issue #1972).
 
-use algo_types::{strict_unknown_fields, SignedTransaction};
+use algo_types::{go_codec_reflect, SignedTransaction};
 use rmpv::Value;
 
 use crate::json_scan::{parse_ordered, Member, Node};
@@ -47,7 +47,8 @@ use crate::json_scan::{parse_ordered, Member, Node};
 /// go's response for a msgpack simulate body that its strict msgpack decode rejects.
 pub const GO_MSGPACK_REJECTION: &str = "failed to decode object: json decode error [pos 1]: only encoded map or array can be decoded into a struct";
 
-/// Keys of go's `PreEncodedSimulateRequest`.
+/// Keys of go's `PreEncodedSimulateRequest`, in its field order (a msgpack
+/// array decodes into the fields in this order).
 const REQUEST_KEYS: &[&str] = &[
     "txn-groups",
     "round",
@@ -76,17 +77,28 @@ fn map_keys_within<'a>(
         .collect()
 }
 
+/// Decode one `SignedTxn` as go's simulate handler does: go-codec reflection
+/// (`decode(protocol.CodecHandle, ...)`), which fails on an unknown key but,
+/// unlike the generated msgp decoders, checks no `codec:",required"` field
+/// and no `allocbound` (issue #2477: `{}` is a transaction go decodes).
+///
+/// Synchronous: the decode mode is thread-local and never held across an await.
+pub fn decode_signed_txn(bytes: &[u8]) -> Result<SignedTransaction, String> {
+    let _reflect = go_codec_reflect(bytes);
+    let mut cursor = bytes;
+    let stxn = SignedTransaction::decode_from_reader(&mut cursor).map_err(|e| e.to_string())?;
+    if !cursor.is_empty() {
+        return Err("trailing bytes after the transaction".to_string());
+    }
+    Ok(stxn)
+}
+
 /// Strictly decode one `SignedTxn` value; its msgpack bytes when go's
-/// strict decode would accept it.
+/// decode would accept it.
 fn strict_signed_txn_bytes(stxn: &Value) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     rmpv::encode::write_value(&mut bytes, stxn).ok()?;
-    // Synchronous: the strict mode is thread-local and never held across an await.
-    let strict = strict_unknown_fields(&bytes);
-    let mut cursor = &bytes[..];
-    let ok = SignedTransaction::decode_from_reader(&mut cursor).is_ok() && cursor.is_empty();
-    drop(strict);
-    ok.then_some(bytes)
+    decode_signed_txn(&bytes).is_ok().then_some(bytes)
 }
 
 /// A msgpack simulate request split the way the handler needs it.
@@ -117,8 +129,20 @@ pub enum MsgpackSimulate {
 /// addresses and signatures); each keeps its own msgpack bytes.
 pub fn parse_msgpack_request(body: &[u8]) -> MsgpackSimulate {
     let mut rd = body;
-    let Ok(Value::Map(pairs)) = rmpv::decode::read_value(&mut rd) else {
-        return MsgpackSimulate::NotMsgpack;
+    let pairs = match rmpv::decode::read_value(&mut rd) {
+        Ok(Value::Map(pairs)) => pairs,
+        // go-codec: `nil` leaves the struct zero (issue #2477)
+        // (`rmpv` also reads the reserved 0xc1 as `nil`; go-codec rejects it)
+        Ok(Value::Nil) if body.first() == Some(&0xc0) => Vec::new(),
+        // ... and an array is the struct's fields in order, `nil` ones zero
+        Ok(Value::Array(items)) if items.len() <= REQUEST_KEYS.len() => REQUEST_KEYS
+            .iter()
+            .zip(items)
+            .filter(|(_, v)| !v.is_nil())
+            .map(|(k, v)| (Value::String((*k).into()), v))
+            .collect(),
+        Ok(Value::Array(_)) => return MsgpackSimulate::Rejected,
+        _ => return MsgpackSimulate::NotMsgpack,
     };
     parse_request_pairs(pairs).map_or(MsgpackSimulate::Rejected, MsgpackSimulate::Decoded)
 }
@@ -451,6 +475,124 @@ pub fn parse_json_request(body: &[u8]) -> JsonSimulate {
     parse_request_pairs(pairs).map_or(JsonSimulate::NotGoForm, JsonSimulate::Decoded)
 }
 
+/// go's `decode(protocol.JSONStrictHandle, body, &simulateRequest)` (issue
+/// #2477): go-codec's JSON decode of the body into `PreEncodedSimulateRequest`,
+/// the decoded value, or go's response text for it
+/// (`failed to decode object: <go-codec error>`, as bytes: the text quotes the
+/// body's own tokens).
+pub fn go_json_decode(body: &[u8]) -> Result<serde_json::Value, Vec<u8>> {
+    algo_codec::go_codec_json::decode_slice(body, &crate::simulate_request_schema::SIMULATE_REQUEST)
+        .map_err(|e| [b"failed to decode object: ".as_slice(), &e.to_bytes()].concat())
+}
+
+/// A request go-codec decoded ([`go_json_decode`]) as the msgpack go would
+/// encode it, through the same pipeline as a msgpack body: for the JSON go
+/// accepts beyond its own JSON form (a quoted number, `1e3`, a struct from an
+/// array, a string from a number, text after the first value).
+pub fn request_from_go_value(value: &serde_json::Value) -> Option<DecodedMsgpackRequest> {
+    let Value::Map(pairs) =
+        go_value_to_msgpack(value, &crate::simulate_request_schema::SIMULATE_REQUEST)?
+    else {
+        return None;
+    };
+    parse_request_pairs(pairs)
+}
+
+/// go's msgpack encoding (`omitempty`) of a value go-codec decoded as `ty`.
+fn go_value_to_msgpack(
+    v: &serde_json::Value,
+    ty: &'static algo_codec::go_codec_json::Ty,
+) -> Option<Value> {
+    use algo_codec::go_codec_json::{Field, Ty};
+    use base64::Engine;
+    use serde_json::Value as J;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let list = |v: &J, elem: &'static Ty| -> Option<Value> {
+        match v {
+            J::Null => Some(Value::Nil),
+            J::Array(items) => items
+                .iter()
+                .map(|i| go_value_to_msgpack(i, elem))
+                .collect::<Option<Vec<_>>>()
+                .map(Value::Array),
+            _ => None,
+        }
+    };
+    Some(match ty {
+        Ty::Str => Value::String(v.as_str()?.into()),
+        Ty::U64 | Ty::U32 | Ty::U16 | Ty::U8 => Value::from(v.as_u64()?),
+        Ty::I64 => Value::from(v.as_i64()?),
+        Ty::Bool => Value::Boolean(v.as_bool()?),
+        Ty::Bytes | Ty::ByteArray(_) => match v {
+            J::Null => Value::Nil,
+            _ => Value::Binary(b64.decode(v.as_str()?).ok()?),
+        },
+        Ty::Address => Value::Binary(address_from_base32(v.as_str()?)?.to_vec()),
+        Ty::Strings => list(v, &Ty::Str)?,
+        Ty::FastSlice(elem) | Ty::Slice(elem, _) => list(v, elem)?,
+        Ty::Ptr(t) => go_value_to_msgpack(v, t)?,
+        Ty::Map(key, val) => match v {
+            J::Null => Value::Nil,
+            J::Object(m) => {
+                let mut entries = m
+                    .iter()
+                    .map(|(k, x)| {
+                        let k = match key {
+                            Ty::U64 => k.parse::<u64>().ok()?,
+                            _ => return None,
+                        };
+                        Some((k, go_value_to_msgpack(x, val)?))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                entries.sort_by_key(|(k, _)| *k);
+                Value::Map(
+                    entries
+                        .into_iter()
+                        .map(|(k, x)| (Value::from(k), x))
+                        .collect(),
+                )
+            }
+            _ => return None,
+        },
+        Ty::Struct(fields) => {
+            let J::Object(m) = v else {
+                return None;
+            };
+            let mut pairs = Vec::new();
+            for Field(name, t) in fields.iter() {
+                let Some(x) = m.get(*name) else {
+                    continue;
+                };
+                let x = go_value_to_msgpack(x, t)?;
+                if !go_empty(&x, t) {
+                    pairs.push((Value::String((*name).into()), x));
+                }
+            }
+            // canonical msgpack: keys in byte order
+            pairs.sort_by(|a, b| a.0.as_str().cmp(&b.0.as_str()));
+            Value::Map(pairs)
+        }
+    })
+}
+
+/// go-codec's `omitempty` (`RecursiveEmptyCheck`) of an encoded value.
+fn go_empty(v: &Value, ty: &algo_codec::go_codec_json::Ty) -> bool {
+    use algo_codec::go_codec_json::Ty;
+    match v {
+        Value::Nil => true,
+        Value::Boolean(b) => !b,
+        Value::Integer(i) => i.as_u64() == Some(0) || i.as_i64() == Some(0),
+        Value::String(s) => s.as_bytes().is_empty(),
+        Value::Binary(b) => match ty {
+            Ty::ByteArray(_) | Ty::Address => b.iter().all(|&x| x == 0),
+            _ => b.is_empty(),
+        },
+        Value::Array(a) => a.is_empty(),
+        Value::Map(m) => m.is_empty(),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,7 +734,11 @@ mod tests {
         assert_eq!(rejection(br#"{"txn-groups":[],"zzz":1}"#), None);
         assert_eq!(rejection(b""), None);
         assert_eq!(rejection(&[0xc1, 0xff]), None);
-        assert_eq!(rejection(&[0x91, 0x01]), None); // an array, not a map
+        // go-codec decodes a struct from an array of its fields in order
+        // (issue #2477): `[1]` is a `txn-groups` of 1, which fails
+        assert_eq!(rejection(&[0x91, 0x01]), Some(GO_MSGPACK_REJECTION));
+        assert!(decode(&[0x91, 0x90]).is_some_and(|d| d.request.txn_groups.is_empty()));
+        assert!(decode(&[0xc0]).is_some());
     }
 
     #[test]
@@ -770,8 +916,8 @@ mod tests {
         assert!(not_go(&format!(r#"{{"txn-groups":[{{"txns":[{{"txn":{{"snd":"{bad_addr}"}}}}]}}]}}"#)));
         assert!(not_go(r#"{"txn-groups":[{"txns":[{"sig":"not base64!"}]}]}"#));
         assert!(not_go(r#"{"txn-groups":[{"txns":[{"txn":{"amt":1.5}}]}]}"#));
-        // Rust's own serde form (numbers for bytes) is not go's JSON form either
-        assert!(not_go(&format!(r#"{{"txn-groups":[{{"txns":[{{"sig":{:?}}}]}}]}}"#, vec![0u8; 64])));
+        // bytes as an array of numbers is go-codec's too (issue #2477)
+        assert!(!not_go(&format!(r#"{{"txn-groups":[{{"txns":[{{"sig":{:?}}}]}}]}}"#, vec![0u8; 64])));
         assert!(not_go("[]"));
         assert!(not_go("not json"));
     }
@@ -824,11 +970,11 @@ mod tests {
     fn a_clean_go_form_body_has_no_unknown_field() {
         let body = json_request(&[go_json_stxn_text()], "");
         assert!(matches!(parse_json_request(&body), JsonSimulate::Decoded(_)));
-        // a missing sender is not an unknown field (go's JSON decoder enforces
-        // no required fields); the body then fails the typed pipeline instead
+        // a missing sender is not an unknown field, and go-codec enforces no
+        // required field: go decodes the body (issue #2477)
         assert!(matches!(
             parse_json_request(br#"{"txn-groups":[{"txns":[{"txn":{"type":"pay"}}]}]}"#),
-            JsonSimulate::NotGoForm
+            JsonSimulate::Decoded(_)
         ));
     }
 
@@ -837,5 +983,22 @@ mod tests {
         let boxes = Value::Array(vec![map(vec![("zzz", Value::from(1u64))])]);
         let body = request(vec![stxn(vec![], vec![("apbx", boxes)])], vec![], vec![]);
         assert_eq!(rejection(&body), Some(GO_MSGPACK_REJECTION));
+    }
+
+    /// What go-codec accepts beyond go's own JSON form goes through the
+    /// msgpack pipeline (issue #2477): each of these decodes in go.
+    #[test]
+    fn go_codec_leniency_reaches_the_msgpack_pipeline() {
+        for body in [
+            r#"{"txn-groups":[{"txns":[{"sig":"AAAA"}]},{"txns":[{}]}]}"#,
+            r#"{"txn-groups":[{"txns":[{"txn":{"fee":"12"}}]},{"txns":[{}]}]}"#,
+            r#"{"txn-groups":[{"txns":[{"txn":{"type":5}}]},{"txns":[{}]}]}"#,
+            r#"{"txn-groups":[{"txns":[[]]},{"txns":[{}]}]}"#,
+            r#"{"txn-groups":[]}xyz"#,
+        ] {
+            let value = go_json_decode(body.as_bytes()).expect(body);
+            let decoded = request_from_go_value(&value);
+            assert!(decoded.is_some(), "{body}: {value}");
+        }
     }
 }

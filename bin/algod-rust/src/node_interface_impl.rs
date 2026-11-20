@@ -6676,6 +6676,7 @@ err
             },
         );
         let mut cases = 0;
+        let mut mismatches = Vec::new();
         for line in FIXTURE.lines().filter(|l| !l.trim().is_empty()) {
             let case: serde_json::Value = serde_json::from_str(line).expect("fixture line");
             let name = case["name"].as_str().expect("name");
@@ -6697,17 +6698,24 @@ err
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .expect("body");
-            assert_eq!(
-                (status, String::from_utf8_lossy(&bytes).into_owned()),
-                (
-                    case["status"].as_u64().expect("status") as u16,
-                    case["response"].as_str().expect("response").to_string()
-                ),
-                "{name}"
+            let got = (status, String::from_utf8_lossy(&bytes).into_owned());
+            let want = (
+                case["status"].as_u64().expect("status") as u16,
+                case["response"].as_str().expect("response").to_string(),
             );
+            if got != want {
+                mismatches.push(format!("{name}: got {got:?}, go {want:?}"));
+            }
             cases += 1;
         }
-        assert!(cases >= 19, "fixture has {cases} cases");
+        // the malformed bodies of issue #2477 come in the hundreds
+        assert!(cases >= 400, "fixture has {cases} cases");
+        assert!(
+            mismatches.is_empty(),
+            "{} of {cases} cases differ from go:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
     }
 
     /// Build a simulate request with one dummy transaction and an
