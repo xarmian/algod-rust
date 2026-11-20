@@ -125,7 +125,8 @@ fn resolve_txn_header(
         first_valid: first,
         last_valid: last,
         genesis_hash: params.genesis_hash.0,
-        genesis_id: params.genesis_id.clone(),
+        // go's `FillUnsignedTxTemplate` sets the genesis hash only.
+        genesis_id: String::new(),
         note,
         lease,
         rekey_to,
@@ -572,9 +573,9 @@ fn run_config_inner(args: ConfigArgs, wallet: Option<String>) -> Result<ExitCode
     let creator_addr = parse_addr(&creator_resolved)?;
 
     // Mirrors Go's `client.MakeUnsignedAssetConfigTx`
-    // (`libgoal/transactions.go`): fetch the asset's current params and
-    // apply only the new-manager/reserve/freeze/clawback overrides the CLI
-    // was given, leaving every other field as-is.
+    // (`libgoal/transactions.go`): fetch the asset's current params; the
+    // transaction carries only the four role addresses, each the CLI's
+    // override or the current one.
     let current = rt
         .block_on(algod.get_asset(asset_id))
         .map_err(|e| format!("Error processing command: {e}"))?;
@@ -591,22 +592,6 @@ fn run_config_inner(args: ConfigArgs, wallet: Option<String>) -> Result<ExitCode
     let new_clawback = resolve_new(&args.new_clawback)?;
 
     let asset_params = AssetParams {
-        total: current.params.total,
-        decimals: current.params.decimals as u32,
-        default_frozen: current.params.default_frozen,
-        unit_name: current
-            .params
-            .unit_name
-            .clone()
-            .unwrap_or_default()
-            .into_bytes(),
-        asset_name: current.params.name.clone().unwrap_or_default().into_bytes(),
-        url: current.params.url.clone().unwrap_or_default().into_bytes(),
-        metadata_hash: current
-            .params
-            .metadata_hash
-            .clone()
-            .and_then(|v| v.try_into().ok()),
         manager: match new_manager {
             Some(s) => opt_addr(&s)?,
             None => current
@@ -643,6 +628,7 @@ fn run_config_inner(args: ConfigArgs, wallet: Option<String>) -> Result<ExitCode
                 .map(parse_addr)
                 .transpose()?,
         },
+        ..AssetParams::default()
     };
 
     let params = rt

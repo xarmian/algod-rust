@@ -33,6 +33,7 @@ rmpv = { workspace = true }
 rusqlite = { workspace = true }
 algo-error = { workspace = true }
 algo-netdeploy = { workspace = true }
+algo-ledger = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 hyper = { workspace = true }

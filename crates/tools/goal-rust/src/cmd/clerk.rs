@@ -1190,6 +1190,46 @@ fn report_lines(msg: &str, notice: &str) {
     write_stderr(&out);
 }
 
+/// go's `assembleFile(fname, false)`: `fname` assembled, its assembler
+/// errors written to stderr (`ReportMultipleErrors`) and the error that
+/// `reportErrorf("%s: %s", fname, err)` prints returned.
+pub(crate) fn assemble_file(fname: &str) -> Result<Vec<u8>, String> {
+    let source = read_goal_file(fname).map_err(|e| format!("{fname}: {e}"))?;
+    match algo_avm::assembler::assemble_bytes_reported(&source) {
+        Ok(ops) => Ok(ops.program),
+        Err((algo_avm::assembler::AssembleFailure::Panic(msg), _)) => {
+            eprintln!("panic: {msg}");
+            Err(format!("{fname}: assembler panic"))
+        }
+        Err((algo_avm::assembler::AssembleFailure::Errors(errors), warnings)) => {
+            write_stderr(&algo_avm::assembler::report_multiple_errors_bytes(
+                fname, &errors, &warnings,
+            ));
+            Err(format!("{fname}: {}", assembly_error_text(&errors)))
+        }
+    }
+}
+
+/// The error go's `logic.AssembleString` returns for `errors`.
+fn assembly_error_text(errors: &[algo_avm::assembler::AssemblyError]) -> String {
+    if errors.len() == 1
+        && errors[0].line == 0
+        && errors[0].col == 0
+        && errors[0].message == "Cannot assemble empty program text"
+    {
+        // go's `parseText` returns this one error as is, not `1 error: ...`.
+        errors[0].message.clone()
+    } else if errors.len() == 1 {
+        let e = &errors[0];
+        format!(
+            "1 error: {}",
+            algo_avm::assembler::go_source_error_string(e.line, e.col, &e.message)
+        )
+    } else {
+        format!("{} errors", errors.len())
+    }
+}
+
 /// Read `fname` (`-` is stdin), like goal's `readFile`.
 fn read_goal_file(fname: &str) -> std::io::Result<Vec<u8>> {
     if fname == STDIN_STDOUT {
@@ -1487,23 +1527,7 @@ fn run_compile_inner(
                 write_stderr(&algo_avm::assembler::report_multiple_errors_bytes(
                     &fname_str, &errors, &warnings,
                 ));
-                let err = if errors.len() == 1
-                    && errors[0].line == 0
-                    && errors[0].col == 0
-                    && errors[0].message == "Cannot assemble empty program text"
-                {
-                    // go's `parseText` returns this one error as is, not `1 error: ...`.
-                    errors[0].message.clone()
-                } else if errors.len() == 1 {
-                    let e = &errors[0];
-                    format!(
-                        "1 error: {}",
-                        algo_avm::assembler::go_source_error_string(e.line, e.col, &e.message)
-                    )
-                } else {
-                    format!("{} errors", errors.len())
-                };
-                return Err(format!("{fname_enc}: {err}"));
+                return Err(format!("{fname_enc}: {}", assembly_error_text(&errors)));
             }
         };
         if !ops.warnings.is_empty() {

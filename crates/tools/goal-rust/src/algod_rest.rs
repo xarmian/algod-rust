@@ -59,23 +59,58 @@ pub fn get(
             .send()
             .await
             .map_err(|e| transport_error("Get", url.as_str(), &e))?;
-        let status = resp.status();
-        let final_url = resp.url().to_string();
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| transport_error("Get", url.as_str(), &e))?;
-        if status == 200 || status == 201 {
-            return Ok(body.to_vec());
-        }
-        let message = error_message(&String::from_utf8_lossy(&body));
-        if status == 401 {
-            return Err(format!(
-                "Unauthorized request to `{final_url}` when using token `{sent_token}` : {message}"
-            ));
-        }
-        Err(format!("HTTP {status}: {message}"))
+        answer("Get", url.as_str(), resp, sent_token).await
     })
+}
+
+/// `POST <path>` of `body` (`content_type`) against algod, as go's
+/// `RestClient.submitForm` (e.g. `AddParticipationKey`): the answer's body,
+/// or go's error text.
+pub fn post(
+    rt: &tokio::runtime::Runtime,
+    (base, token): &(String, String),
+    path: &str,
+    content_type: &str,
+    body: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    let url = request_url(base, path, &[])?;
+    rt.block_on(async {
+        let resp = reqwest::Client::new()
+            .post(url.clone())
+            .header(AUTH_HEADER, token)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| transport_error("Post", url.as_str(), &e))?;
+        answer("Post", url.as_str(), resp, token).await
+    })
+}
+
+/// go's `submitForm` once an answer arrived: the body of a 200 / 201, else
+/// go's `extractError` text.
+async fn answer(
+    op: &str,
+    url: &str,
+    resp: reqwest::Response,
+    sent_token: &str,
+) -> Result<Vec<u8>, String> {
+    let status = resp.status();
+    let final_url = resp.url().to_string();
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| transport_error(op, url, &e))?;
+    if status == 200 || status == 201 {
+        return Ok(body.to_vec());
+    }
+    let message = error_message(&String::from_utf8_lossy(&body));
+    if status == 401 {
+        return Err(format!(
+            "Unauthorized request to `{final_url}` when using token `{sent_token}` : {message}"
+        ));
+    }
+    Err(format!("HTTP {status}: {message}"))
 }
 
 /// [`get`], then go-codec's decode of the body into `ty`

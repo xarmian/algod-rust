@@ -68,6 +68,12 @@ pub fn format_version_and_license() -> String {
     )
 }
 
+/// go: `config.GetCurrentVersion().String()` (`<major>.<minor>.<build>`).
+pub fn current_version_string() -> String {
+    let build = convert_to_int(BUILD_NUMBER.unwrap_or(""));
+    format!("{VERSION_MAJOR}.{VERSION_MINOR}.{build}")
+}
+
 /// The root command's `-v, --version`.
 pub fn run_version_check() -> ExitCode {
     println!("{}", format_version_and_license());
