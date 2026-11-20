@@ -946,7 +946,14 @@ mod tests {
         let mut names: Vec<&str> = vec!["", "nonexistent", "int", "byte", "txn ", "SHA256"];
         for entry in OPCODE_TABLE.iter().filter_map(|o| o.as_ref()) {
             names.push(entry.name);
-            names.extend(entry.sub_ops.into_iter().flatten().flatten().map(|s| s.name));
+            names.extend(
+                entry
+                    .sub_ops
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|s| s.name),
+            );
         }
         assert!(names.len() > 200);
         for name in names {

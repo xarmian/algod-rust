@@ -6010,6 +6010,49 @@ dup
         );
     }
 
+    /// Issue #2410: source offsets follow every later byte edit, exactly like
+    /// go's `OffsetToSource` map: a constant the v4+ optimizer turns into a
+    /// longer `pushint`, a varint branch placeholder shrunk to one byte, the
+    /// prepended version byte and `intcblock`.
+    #[test]
+    fn offsets_follow_constant_rewrites_branch_shrinks_and_the_prefix() {
+        let loc = |line, col| SourceLocation { line, col };
+        let entries = |ops: &OpStream| -> Vec<(usize, SourceLocation)> {
+            ops.offset_to_source.iter().map(|(&k, &v)| (k, v)).collect()
+        };
+
+        // `int 7` (used once) becomes `pushint 7`, two bytes instead of one;
+        // the `intcblock 5` prefix is four bytes with the version.
+        let ops = assemble_string("#pragma version 4\nint 5\nint 7\nint 5\n+\n+\n").unwrap();
+        assert_eq!(
+            ops.program,
+            [0x04, 0x20, 0x01, 0x05, 0x22, 0x81, 0x07, 0x22, 0x08, 0x08]
+        );
+        assert_eq!(
+            entries(&ops),
+            vec![
+                (4, loc(1, 0)),
+                (5, loc(2, 0)),
+                (7, loc(3, 0)),
+                (8, loc(4, 0)),
+                (9, loc(5, 0)),
+            ]
+        );
+
+        // v13: `b end`'s three-byte placeholder shrinks to one, moving `err`
+        // and the singleton `int 1` (now `pushint 1`) down by two.
+        let ops = assemble_string("#pragma version 13\nb end\nerr\nend:\nint 1\n").unwrap();
+        assert_eq!(ops.program, [0x0d, 0x42, 0x02, 0x00, 0x81, 0x01]);
+        assert_eq!(
+            entries(&ops),
+            vec![(1, loc(1, 0)), (3, loc(2, 0)), (4, loc(4, 0))]
+        );
+
+        // A label records nothing: the instruction after it owns the offset.
+        let ops = assemble_string("#pragma version 2\nx:\nerr\n").unwrap();
+        assert_eq!(entries(&ops), vec![(1, loc(2, 0))]);
+    }
+
     /// Issue #1394: `OpStream::record_source_location` must report each
     /// instruction's real source column (go's `current[0].col`,
     /// `assembler.go:2208`), not a hardcoded 0 -- matches go's

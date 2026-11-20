@@ -843,11 +843,7 @@ fn get_spec<'a>(ops: &OpStream, name: &'a str, argc: usize) -> Option<Spec<'a>> 
                 "byte" => "typeByte",
                 _ => "",
             };
-            let ret: &'static [StackType] = if name == "int" {
-                &[UINT64]
-            } else {
-                &[BYTES]
-            };
+            let ret: &'static [StackType] = if name == "int" { &[UINT64] } else { &[BYTES] };
             return Some(Spec {
                 instruction: instruction_name(name, argc),
                 args: Cow::Borrowed(&[]),

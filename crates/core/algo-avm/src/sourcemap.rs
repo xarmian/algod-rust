@@ -175,7 +175,9 @@ mod tests {
             let mut map = BTreeMap::new();
             let mut pc = 0usize;
             for _ in 0..n {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let line = (seed >> 33) as usize % 500;
                 let col = (seed >> 13) as usize % 40;
                 map.insert(pc, SourceLocation { line, col });
