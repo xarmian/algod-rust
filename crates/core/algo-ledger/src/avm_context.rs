@@ -4540,8 +4540,8 @@ fn execute_inner_appl<L: LedgerStore>(
     caller_txids: CallerTxids,
 ) -> Result<crate::apply::InnerApplyData, AlgoError> {
     use algo_avm::eval::{
-        run_approval_program, run_approval_program_with_tracer, run_clear_state_program,
-        run_clear_state_program_with_tracer,
+        run_approval_program, run_approval_program_with_tracer, run_clear_state_program_costed,
+        run_clear_state_program_with_tracer_costed,
     };
     use algo_avm::group::GroupBudget;
 
@@ -4614,8 +4614,9 @@ fn execute_inner_appl<L: LedgerStore>(
     // `IsolateClearState`): even though ClearState always runs with its own
     // isolated `MaxAppProgramCost` budget (it never draws from the shared
     // pool -- see below), invoking one still requires the shared pooled
-    // budget to hold at least `MaxAppProgramCost` at the moment of the call.
-    // This is a plain `fmt.Errorf`, not a `logic.EvalError`, so unlike an
+    // budget to hold at least `MaxAppProgramCost` at the moment of the call
+    // (after `itxn_submit` credited the whole inner group, this call
+    // included). This is a plain `fmt.Errorf`, not a `logic.EvalError`, so unlike an
     // ordinary ClearState program rejection it is NOT swallowed by
     // `ledger/apply/application.go` -- it fails the entire outer transaction.
     // A caller that burns down the shared budget before invoking an inner
@@ -4649,13 +4650,9 @@ fn execute_inner_appl<L: LedgerStore>(
     // Compute program hash for ed25519verify domain separation.
     let ph = program_hash(&program);
 
-    // ── Budget pooling: add INNER_APP_BUDGET for this app call ──
-    // Per go-algorand IsolateClearState: ClearState programs run with their
-    // own isolated budget (MAX_APP_PROGRAM_COST = 700) and do NOT add to
-    // the shared pool. Only non-ClearState app calls contribute budget.
-    if on_completion != ON_COMPLETION_CLEAR_STATE {
-        *opcode_budget += consensus.max_app_program_cost as i64;
-    }
+    // The caller's `itxn_submit` already credited this call's
+    // `MaxAppProgramCost` to the shared pool, together with every other app
+    // call of the inner group (go `NewInnerEvalParams`).
 
     // ── Create a GroupBudget from the shared opcode budget ──
     // We create a GroupBudget with 0 app calls (so initial = 0), then add
@@ -4807,11 +4804,18 @@ fn execute_inner_appl<L: LedgerStore>(
     // ── Execute the program ──
     let avm_result = if on_completion == ON_COMPLETION_CLEAR_STATE {
         // ClearStateOC: run clear state program. On failure, still clear state.
-        if let Some(ref mut t) = tracer {
-            run_clear_state_program_with_tracer(&program, &mut inner_ctx, &consensus, *t)
+        let (result, cost) = if let Some(ref mut t) = tracer {
+            run_clear_state_program_with_tracer_costed(&program, &mut inner_ctx, &consensus, *t)
         } else {
-            run_clear_state_program(&program, &mut inner_ctx, &consensus)
-        }
+            run_clear_state_program_costed(&program, &mut inner_ctx, &consensus)
+        };
+        // The program is capped at its own isolated budget, but go's
+        // `step()` still deducts each opcode from the shared pool
+        // (`*cx.PooledApplicationBudget -= opcost`), which the check above
+        // guarantees holds at least `MaxAppProgramCost`. `budget` is copied
+        // back into the shared pool below.
+        budget.add(-(cost as i64));
+        result
     } else {
         let res = if let Some(ref mut t) = tracer {
             run_approval_program_with_tracer(&program, &mut inner_ctx, &mut budget, *t)
@@ -6959,6 +6963,16 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         let snapshotted_app_ids: std::collections::HashSet<u64> = app_ids.iter().copied().collect();
         let mut extra_created_asset_ids: Vec<u64> = Vec::new();
         let mut extra_created_app_ids: Vec<u64> = Vec::new();
+
+        // go `NewInnerEvalParams` (`data/transactions/logic/eval.go`) credits
+        // `MaxAppProgramCost` to the shared pool for EVERY app call in the
+        // inner group, ClearState included, before any sibling runs. An
+        // earlier sibling may therefore spend budget that a later sibling
+        // contributes (mainnet round 67137517, issue #2493).
+        if self.consensus.enable_app_cost_pooling {
+            let inner_apps = txns.iter().filter(|s| s.txn.txn_type == "appl").count() as i64;
+            self.opcode_budget += inner_apps * self.consensus.max_app_program_cost as i64;
+        }
 
         // Notify tracer of the inner transaction group.
         if let Some(p) = self.tracer_ptr {
@@ -14152,12 +14166,14 @@ mod tests {
         assert!(store.get_asset_params(104).is_some());
     }
 
-    // ---- H3: ClearState does not inflate shared budget ----
+    // ---- H3: inner ClearState credits the pool and spends its own cost ----
 
     #[test]
-    fn h3_clearstate_inner_appl_no_budget_inflation() {
-        // An inner appl with ClearState should NOT add INNER_APP_BUDGET to
-        // the shared opcode budget.
+    fn h3_inner_clearstate_credits_pool_and_spends_its_cost() {
+        // go's `NewInnerEvalParams` credits `MaxAppProgramCost` for every
+        // inner app call, ClearState included, and go's `step()` deducts the
+        // ClearState program's opcodes from that same pool even though the
+        // program itself is capped at its isolated budget.
         let mut store = LedgerState::new();
         setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
         setup_app(
@@ -14201,35 +14217,53 @@ mod tests {
         ctx.itxn_field(25, TealValue::Uint(3)).unwrap(); // OnCompletion = ClearStateOC
         ctx.itxn_submit().unwrap();
 
-        // ClearState should NOT have added 700 to the budget.
-        // The clear state program uses its own isolated budget (3 opcodes).
-        // So the shared budget should be unchanged (1000).
+        // +700 credited by itxn_submit, -3 for the ClearState program's own
+        // three opcodes.
         assert_eq!(
-            ctx.opcode_budget, budget_before,
-            "ClearState should not inflate shared budget"
+            ctx.opcode_budget,
+            budget_before + 700 - 3,
+            "inner ClearState must credit MaxAppProgramCost and spend its cost from the pool"
         );
     }
 
     // ---- Caller cannot shortchange an inner ClearState's budget ----
 
-    #[test]
-    fn inner_clearstate_rejected_when_shared_budget_below_max_app_program_cost() {
-        // Mirrors go-algorand's TestInnerClearStateBadCaller
-        // (ledger/apptxn_test.go): even though ClearState always runs with
-        // its own isolated MaxAppProgramCost budget, invoking one still
-        // requires the *shared* pooled budget to hold at least
-        // MaxAppProgramCost at the call site. A caller that has burned the
-        // shared budget down below that threshold must have the whole
-        // itxn_submit (and thus the outer transaction) rejected, not
-        // silently let the callee's ClearState "shortchange" run anyway.
-        let mut store = LedgerState::new();
-        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
-        setup_app(
-            &mut store,
-            100,
-            make_program(6, true),
-            make_program(6, true),
-        );
+    /// v6 approval program that spends the shared pool until
+    /// `global OpcodeBudget < 100`, then approves -- the "waster" of go's
+    /// `TestInnerClearStateBadCaller` (`ledger/apptxn_test.go`).
+    fn make_waster_program() -> Vec<u8> {
+        vec![
+            6, // version
+            0x32, 0x0c, // top: global OpcodeBudget
+            0x81, 0x64, // pushint 100
+            0x0c, // <
+            0x40, 0x00, 0x03, // bnz done
+            0x42, 0xff, 0xf5, // b top
+            0x81, 0x01, // done: pushint 1
+        ]
+    }
+
+    /// v6 approval program with a fixed cost of 803: a 200-iteration
+    /// countdown loop (`pushint 200`, 200 x `pushint 1; -; dup; bnz`, `pop`,
+    /// `pushint 1`).
+    fn make_fixed_803_cost_program() -> Vec<u8> {
+        vec![
+            6, // version
+            0x81, 0xc8, 0x01, // pushint 200
+            0x81, 0x01, // top: pushint 1
+            0x09, // -
+            0x49, // dup
+            0x40, 0xff, 0xf9, // bnz top
+            0x48, // pop
+            0x81, 0x01, // pushint 1
+        ]
+    }
+
+    /// App 42's address, funded and opted in to app 100, inner txn sender.
+    fn setup_inner_budget_apps(store: &mut LedgerState, app_200: Vec<u8>) {
+        setup_app(store, 42, make_program(6, true), make_program(6, true));
+        setup_app(store, 100, make_program(6, true), make_program(6, true));
+        setup_app(store, 200, app_200, make_program(6, true));
         let app_addr = Address(app_address(42));
         store.set_app_local_state(
             &app_addr,
@@ -14247,16 +14281,31 @@ mod tests {
                 ..Default::default()
             },
         );
+    }
+
+    #[test]
+    fn inner_clearstate_rejected_when_shared_budget_below_max_app_program_cost() {
+        // Port of go-algorand's TestInnerClearStateBadCaller
+        // (ledger/apptxn_test.go): even though ClearState always runs with
+        // its own isolated MaxAppProgramCost budget, invoking one still
+        // requires the *shared* pooled budget to hold at least
+        // MaxAppProgramCost at the call site. A sibling that burns the
+        // shared budget down below that threshold must have the whole
+        // itxn_submit (and thus the outer transaction) rejected, not
+        // silently let the callee's ClearState "shortchange" run anyway.
+        let mut store = LedgerState::new();
+        setup_inner_budget_apps(&mut store, make_waster_program());
 
         let sender = [10u8; 32];
-        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let txn = make_appl_txn(sender, 42, vec![], vec![100, 200], vec![]);
         let mut ctx = make_context(&mut store, vec![txn]);
         ctx.fee_sink = Address([0xFEu8; 32]);
-        // Shared budget below max_app_program_cost (700 for the default
-        // consensus params) -- the "waster" scenario from the go test.
         ctx.opcode_budget = 100;
 
         ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(200)).unwrap(); // waster
+        ctx.itxn_next().unwrap();
         ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
         ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // app 100
         ctx.itxn_field(25, TealValue::Uint(3)).unwrap(); // OnCompletion = ClearStateOC
@@ -14268,6 +14317,58 @@ mod tests {
         );
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("low OpcodeBudget"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn inner_clearstate_low_budget_check_counts_its_own_credit() {
+        // go's `NewInnerEvalParams` credits the ClearState call's own
+        // `MaxAppProgramCost` before `EvalContract` checks the pool, so a
+        // caller with 100 left still reaches 800 >= 700 and the ClearState
+        // runs.
+        let mut store = LedgerState::new();
+        setup_inner_budget_apps(&mut store, make_program(6, true));
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 100;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // app 100
+        ctx.itxn_field(25, TealValue::Uint(3)).unwrap(); // OnCompletion = ClearStateOC
+        ctx.itxn_submit()
+            .expect("the ClearState's own credit lifts the pool to 800");
+        assert_eq!(ctx.opcode_budget, 100 + 700 - 3);
+    }
+
+    #[test]
+    fn inner_group_credits_every_app_call_before_the_first_sibling_runs() {
+        // Issue #2493 (mainnet round 67137517): go's `opItxnSubmit` calls
+        // `NewInnerEvalParams`, which adds `MaxAppProgramCost` to the pool
+        // for every app call of the inner group before sibling 0 runs. So
+        // sibling 0 may spend sibling 1's contribution: 100 + 2*700 = 1500
+        // covers its 803. Crediting each call only when it starts left
+        // sibling 0 with 800 and failed with "dynamic cost budget exceeded".
+        let mut store = LedgerState::new();
+        setup_inner_budget_apps(&mut store, make_fixed_803_cost_program());
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100, 200], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 100;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(200)).unwrap(); // costs 803
+        ctx.itxn_next().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // costs 3
+        ctx.itxn_submit()
+            .expect("sibling 0 may spend the budget sibling 1 contributes");
+        assert_eq!(ctx.opcode_budget, 100 + 2 * 700 - 803 - 3);
     }
 
     // ---- H4: Rollback snapshot covers appl accounts ----
