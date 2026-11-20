@@ -2324,16 +2324,13 @@ impl NodeInterface for AlgodNodeInterface {
                         Ok::<(), NodeError>(())
                     }
                     Err(e) => {
-                        // The block (including this just-remembered group) failed
-                        // to commit. `produce_dev_block` already dropped the
-                        // rejected group from the pool (go's dev assembly drops
-                        // a group its evaluator rejects), with the rejection as
-                        // its `pending/{txid}` reason, so nothing wedges later
-                        // blocks. The pool is not reset: that would discard the
-                        // rebuilt evaluator and the reason (go never resets it).
-                        Err(NodeError::BadRequest(format!(
-                            "dev block production rejected the group: {e}"
-                        )))
+                        // No block could be written (a group the commit rejects
+                        // is dropped and the block written without it, like
+                        // go's dev assembly). go's `BroadcastSignedTxGroup`
+                        // returns `writeDevmodeBlock`'s error as is and the
+                        // handler answers it bare (issue #2470). The pool is
+                        // not reset: go never resets it.
+                        Err(NodeError::BadRequest(e.to_string()))
                     }
                 }
             })
@@ -5010,9 +5007,11 @@ mod tests {
     }
 
     /// A dev-mode commit that rejects the submitted group drops that group
-    /// with the rejection as its reason, end to end: `pending/{txid}`
-    /// reports it (the pool is not reset), and the next submission still
-    /// produces a block (issue #2127).
+    /// with the rejection as its reason and still writes the block, as go's
+    /// `AssembleDevModeBlock` drops a group its evaluator rejects and
+    /// `writeDevmodeBlock` writes what remains (issue #2470): the submission
+    /// succeeds, `pending/{txid}` reports the rejection (the pool is not
+    /// reset), and the next submission produces the next block (issue #2127).
     #[tokio::test]
     async fn dev_mode_commit_rejection_is_reported_by_pending_lookup() {
         use algo_types::{Round, Transaction, TxnType};
@@ -5038,19 +5037,23 @@ mod tests {
         };
 
         let (rejected, rejected_id) = pay(crate::dev_producer::test_hooks::REJECT_NOTE);
-        let err = adapter
+        adapter
             .broadcast_signed_tx_group(vec![rejected])
             .await
-            .expect_err("the dev-mode commit rejects the group");
-        assert!(
-            err.to_string()
-                .contains("dev block production rejected the group"),
-            "{err}"
-        );
+            .expect("go answers the submission as accepted");
         assert_eq!(
             ledger.lock().unwrap().current_round().0,
-            0,
-            "nothing committed"
+            1,
+            "the block is written without the rejected group"
+        );
+        assert!(
+            adapter
+                .get_block(1)
+                .await
+                .expect("block 1")
+                .payset
+                .is_empty(),
+            "the rejected group is not in the block"
         );
 
         let status = adapter
@@ -5072,13 +5075,13 @@ mod tests {
             .broadcast_signed_tx_group(vec![ok])
             .await
             .expect("the next submission produces a block");
-        assert_eq!(ledger.lock().unwrap().current_round().0, 1);
+        assert_eq!(ledger.lock().unwrap().current_round().0, 2);
         let status = adapter
             .get_pending_transaction(&ok_id)
             .await
             .expect("lookup ok")
             .expect("confirmed");
-        assert_eq!(status.confirmed_round, 1);
+        assert_eq!(status.confirmed_round, 2);
     }
 
     /// A rekey-authorizer failure submitted to a node (issue #2130): the
