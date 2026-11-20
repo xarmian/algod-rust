@@ -118,6 +118,17 @@ fn pay_txn(sender: Address, receiver: Address) -> SignedTransaction {
     }
 }
 
+/// Stamp `group` with its group ID, as go's `checkTxnGroupID` requires of a
+/// multi-member group submitted to simulate (issue #2468).
+fn grouped(mut group: Vec<SignedTransaction>) -> Vec<SignedTransaction> {
+    let txns: Vec<_> = group.iter().map(|s| s.txn.clone()).collect();
+    let gid = algo_codec::compute_group_id(&txns).0;
+    for stx in &mut group {
+        stx.txn.group = gid;
+    }
+    group
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -592,7 +603,7 @@ fn simulation_captures_state_change_on_local_write() {
     let local_write_txn = make_appl_txn(sender, app_id);
 
     let request = SimulationRequest {
-        txn_groups: vec![vec![opt_in_txn, local_write_txn]],
+        txn_groups: vec![grouped(vec![opt_in_txn, local_write_txn])],
         allow_empty_signatures: true,
         trace_config: ExecTraceConfig {
             enable: true,
@@ -756,7 +767,7 @@ fn simulation_group_pooled_fees_cover_underpaid_transaction() {
     txn_b.txn.fee = 2000; // Covers both transactions' MinTxnFee (1000 each).
 
     let request = SimulationRequest {
-        txn_groups: vec![vec![txn_a, txn_b]],
+        txn_groups: vec![grouped(vec![txn_a, txn_b])],
         allow_empty_signatures: true,
         ..Default::default()
     };
@@ -809,7 +820,7 @@ fn simulation_group_pooled_fees_reject_insufficient_total() {
     // Pooled total: 1000, needed: 2 * MinTxnFee (1000) = 2000.
 
     let request = SimulationRequest {
-        txn_groups: vec![vec![txn_a, txn_b]],
+        txn_groups: vec![grouped(vec![txn_a, txn_b])],
         allow_empty_signatures: true,
         ..Default::default()
     };
@@ -1739,7 +1750,7 @@ fn simulation_logicsig_budget_set_for_txn_after_execution_failure() {
     };
 
     let request = SimulationRequest {
-        txn_groups: vec![vec![app_txn, lsig_txn]],
+        txn_groups: vec![grouped(vec![app_txn, lsig_txn])],
         allow_empty_signatures: true,
         ..Default::default()
     };

@@ -160,6 +160,27 @@ fn app_args(txn: &mut Transaction, args: &[&[u8]]) {
     );
 }
 
+/// Stamp `txns` with their group ID (go `crypto.HashObj(TxGroup{...})`), as
+/// go's `checkTxnGroupID` requires of a multi-member group submitted to
+/// simulate (issue #2468). Before signing: the signature covers it.
+fn stamp_group(txns: &mut [&mut Transaction]) {
+    let plain: Vec<Transaction> = txns.iter().map(|t| (**t).clone()).collect();
+    let gid = algo_codec::compute_group_id(&plain).0;
+    for t in txns.iter_mut() {
+        t.group = gid;
+    }
+}
+
+/// [`stamp_group`] for an unsigned (or LogicSig-only) group.
+fn grouped(mut group: Vec<SignedTransaction>) -> Vec<SignedTransaction> {
+    let txns: Vec<Transaction> = group.iter().map(|s| s.txn.clone()).collect();
+    let gid = algo_codec::compute_group_id(&txns).0;
+    for stx in &mut group {
+        stx.txn.group = gid;
+    }
+    group
+}
+
 fn simulate(
     state: &mut LedgerState,
     request: SimulationRequest,
@@ -373,13 +394,13 @@ fn logicsig_pc_and_stack_exposure() {
     };
 
     let request = SimulationRequest {
-        txn_groups: vec![vec![
+        txn_groups: vec![grouped(vec![
             SignedTransaction {
                 txn: pay,
                 ..Default::default()
             },
             appl_stx,
-        ]],
+        ])],
         allow_empty_signatures: true,
         trace_config: ExecTraceConfig {
             enable: true,
@@ -491,13 +512,13 @@ fn invalid_logicsig_pc_and_stack() {
     };
 
     let request = SimulationRequest {
-        txn_groups: vec![vec![
+        txn_groups: vec![grouped(vec![
             SignedTransaction {
                 txn: pay,
                 ..Default::default()
             },
             appl_stx,
-        ]],
+        ])],
         allow_empty_signatures: true,
         trace_config: ExecTraceConfig {
             enable: true,
@@ -587,13 +608,13 @@ fn invalid_app_with_passing_logicsig_and_trace() {
     };
 
     let request = SimulationRequest {
-        txn_groups: vec![vec![
+        txn_groups: vec![grouped(vec![
             SignedTransaction {
                 txn: pay,
                 ..Default::default()
             },
             appl_stx,
-        ]],
+        ])],
         allow_empty_signatures: true,
         trace_config: ExecTraceConfig {
             enable: true,
@@ -880,7 +901,7 @@ fn local_initial_states() {
     app_args(&mut del, &[b"del", b"key"]);
 
     let request = SimulationRequest {
-        txn_groups: vec![vec![
+        txn_groups: vec![grouped(vec![
             SignedTransaction {
                 txn: put_new,
                 ..Default::default()
@@ -893,7 +914,7 @@ fn local_initial_states() {
                 txn: del,
                 ..Default::default()
             },
-        ]],
+        ])],
         allow_empty_signatures: true,
         trace_config: ExecTraceConfig {
             enable: true,
@@ -1130,7 +1151,7 @@ fn app_initial_box_states() {
 
     // Simulate: read A, then overwrite it.
     let request = SimulationRequest {
-        txn_groups: vec![vec![
+        txn_groups: vec![grouped(vec![
             box_app_call(creator, app_id, &[b"read", b"A"], b"A"),
             box_app_call(
                 creator,
@@ -1138,7 +1159,7 @@ fn app_initial_box_states() {
                 &[b"write", b"A", b"box A get overwritten"],
                 b"A",
             ),
-        ]],
+        ])],
         allow_empty_signatures: true,
         trace_config: ExecTraceConfig {
             enable: true,
@@ -1207,10 +1228,10 @@ fn app_initial_box_states() {
     }
 
     let request2 = SimulationRequest {
-        txn_groups: vec![vec![
+        txn_groups: vec![grouped(vec![
             box_app_call(creator, app_id, &[b"delete", b"C"], b"C"),
             box_app_call(creator, app_id, &[b"read", b"A"], b"A"),
-        ]],
+        ])],
         allow_empty_signatures: true,
         trace_config: ExecTraceConfig {
             enable: true,
@@ -1518,7 +1539,7 @@ end:
     read_local.foreign_apps = Some(vec![app_with_states]);
 
     let request = SimulationRequest {
-        txn_groups: vec![vec![
+        txn_groups: vec![grouped(vec![
             SignedTransaction {
                 txn: read_global,
                 ..Default::default()
@@ -1527,7 +1548,7 @@ end:
                 txn: read_local,
                 ..Default::default()
             },
-        ]],
+        ])],
         allow_empty_signatures: true,
         trace_config: ExecTraceConfig {
             enable: true,
@@ -2296,7 +2317,7 @@ fn partial_missing_signatures() {
     let mut state = base_state();
     fund(&mut state, sender_addr, 20_000_000);
 
-    let txn0 = Transaction {
+    let mut txn0 = Transaction {
         txn_type: "pay".into(),
         sender: sender_addr,
         receiver: sender_addr,
@@ -2307,7 +2328,7 @@ fn partial_missing_signatures() {
         genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
-    let txn1 = Transaction {
+    let mut txn1 = Transaction {
         txn_type: "pay".into(),
         sender: sender_addr,
         receiver: sender_addr,
@@ -2318,6 +2339,8 @@ fn partial_missing_signatures() {
         genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
+
+    stamp_group(&mut [&mut txn0, &mut txn1]);
 
     // txn0 unsigned, txn1 genuinely signed.
     let stx0 = SignedTransaction {
@@ -2470,7 +2493,7 @@ fn simple_group_txn() {
     fund(&mut state, sender1, 20_000_000);
     fund(&mut state, sender2, 20_000_000);
 
-    let txn1 = Transaction {
+    let mut txn1 = Transaction {
         txn_type: "pay".into(),
         sender: sender1,
         receiver: sender2,
@@ -2481,7 +2504,7 @@ fn simple_group_txn() {
         genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
-    let txn2 = Transaction {
+    let mut txn2 = Transaction {
         txn_type: "pay".into(),
         sender: sender2,
         receiver: sender1,
@@ -2492,6 +2515,8 @@ fn simple_group_txn() {
         genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
+
+    stamp_group(&mut [&mut txn1, &mut txn2]);
 
     let request = SimulationRequest {
         txn_groups: vec![vec![sign(txn1, &sender1_key), sign(txn2, &sender2_key)]],
@@ -3258,7 +3283,7 @@ int 1
     );
 
     let request = SimulationRequest {
-        txn_groups: vec![vec![
+        txn_groups: vec![grouped(vec![
             SignedTransaction {
                 txn: check_start,
                 ..Default::default()
@@ -3271,7 +3296,7 @@ int 1
                 txn: check_end,
                 ..Default::default()
             },
-        ]],
+        ])],
         allow_empty_signatures: true,
         ..Default::default()
     };
@@ -3312,7 +3337,7 @@ fn rekey_within_group() {
         genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
-    let txn2 = Transaction {
+    let mut txn2 = Transaction {
         txn_type: "pay".into(),
         sender: sender_addr,
         receiver: sender_addr,
@@ -3323,7 +3348,7 @@ fn rekey_within_group() {
         genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
-    txn1.group = [0u8; 32]; // no real group id needed; simulate doesn't verify it
+    stamp_group(&mut [&mut txn1, &mut txn2]);
 
     let stx1 = sign(txn1, &sender_key);
     let mut stx2 = sign(txn2, &authority_key);

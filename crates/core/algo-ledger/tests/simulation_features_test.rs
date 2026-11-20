@@ -159,6 +159,17 @@ fn logging_program_sized(count: usize, size: usize) -> Vec<u8> {
     p
 }
 
+/// Stamp `group` with its group ID, as go's `checkTxnGroupID` requires of a
+/// multi-member group submitted to simulate (issue #2468).
+fn grouped(mut group: Vec<SignedTransaction>) -> Vec<SignedTransaction> {
+    let txns: Vec<_> = group.iter().map(|s| s.txn.clone()).collect();
+    let gid = algo_codec::compute_group_id(&txns).0;
+    for stx in &mut group {
+        stx.txn.group = gid;
+    }
+    group
+}
+
 fn simulate(
     state: &mut LedgerState,
     request: SimulationRequest,
@@ -261,7 +272,10 @@ fn extra_opcode_budget_with_trace_reports_per_txn_pc_trace() {
 
     let extra_opcode_budget = 100;
     let request = SimulationRequest {
-        txn_groups: vec![vec![make_appl_txn(sender, 100), make_appl_txn(sender, 200)]],
+        txn_groups: vec![grouped(vec![
+            make_appl_txn(sender, 100),
+            make_appl_txn(sender, 200),
+        ])],
         allow_empty_signatures: true,
         extra_opcode_budget,
         trace_config: algo_ledger::simulation::ExecTraceConfig {
@@ -361,7 +375,10 @@ fn extra_opcode_budget_insufficient_still_fails_with_partial_accounting() {
 
     let extra_opcode_budget = 5;
     let request = SimulationRequest {
-        txn_groups: vec![vec![make_appl_txn(sender, 100), make_appl_txn(sender, 200)]],
+        txn_groups: vec![grouped(vec![
+            make_appl_txn(sender, 100),
+            make_appl_txn(sender, 200),
+        ])],
         allow_empty_signatures: true,
         extra_opcode_budget,
         ..Default::default()
@@ -461,7 +478,7 @@ fn app_call_over_budget_matches_go_reported_figures_exactly() {
     let expensive_txn = make_appl_txn(sender, 1);
 
     let request = SimulationRequest {
-        txn_groups: vec![vec![create_txn, expensive_txn]],
+        txn_groups: vec![grouped(vec![create_txn, expensive_txn])],
         allow_empty_signatures: true,
         ..Default::default()
     };
@@ -673,7 +690,7 @@ fn fix_signers_uses_static_rekey_from_earlier_txn() {
     let txn1 = make_pay_txn(sender);
 
     let request = SimulationRequest {
-        txn_groups: vec![vec![txn0, txn1]],
+        txn_groups: vec![grouped(vec![txn0, txn1])],
         allow_empty_signatures: true,
         fix_signers: true,
         ..Default::default()
@@ -717,7 +734,7 @@ fn fix_signers_fixes_txns_after_app_call() {
 
     // txn0 is an app call — the pre-evaluation fix pass stops there, so txn1
     // must be fixed by the post-app-call pass.
-    let txns = vec![make_appl_txn(sender, 100), make_pay_txn(other)];
+    let txns = grouped(vec![make_appl_txn(sender, 100), make_pay_txn(other)]);
 
     let request = SimulationRequest {
         txn_groups: vec![txns],

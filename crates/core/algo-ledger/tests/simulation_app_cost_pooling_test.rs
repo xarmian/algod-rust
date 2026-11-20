@@ -111,6 +111,17 @@ fn expensive_program() -> Vec<u8> {
         .program
 }
 
+/// Stamp `group` with its group ID, as go's `checkTxnGroupID` requires of a
+/// multi-member group submitted to simulate (issue #2468).
+fn grouped(mut group: Vec<SignedTransaction>) -> Vec<SignedTransaction> {
+    let txns: Vec<_> = group.iter().map(|s| s.txn.clone()).collect();
+    let gid = algo_codec::compute_group_id(&txns).0;
+    for stx in &mut group {
+        stx.txn.group = gid;
+    }
+    group
+}
+
 fn simulate(
     state: &mut LedgerState,
     request: SimulationRequest,
@@ -129,7 +140,10 @@ fn issue_1254_app_cost_pooling_disabled_rejects_expensive_sibling() {
     register_app(&mut state, sender, 200, expensive_program());
 
     let request = SimulationRequest {
-        txn_groups: vec![vec![make_appl_txn(sender, 100), make_appl_txn(sender, 200)]],
+        txn_groups: vec![grouped(vec![
+            make_appl_txn(sender, 100),
+            make_appl_txn(sender, 200),
+        ])],
         allow_empty_signatures: true,
         ..Default::default()
     };
@@ -163,7 +177,10 @@ fn issue_1254_app_cost_pooling_enabled_lets_expensive_sibling_borrow() {
     register_app(&mut state, sender, 200, expensive_program());
 
     let request = SimulationRequest {
-        txn_groups: vec![vec![make_appl_txn(sender, 100), make_appl_txn(sender, 200)]],
+        txn_groups: vec![grouped(vec![
+            make_appl_txn(sender, 100),
+            make_appl_txn(sender, 200),
+        ])],
         allow_empty_signatures: true,
         ..Default::default()
     };

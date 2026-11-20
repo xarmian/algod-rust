@@ -100,6 +100,17 @@ fn make_appl_txn(sender: Address, app_id: u64) -> SignedTransaction {
     }
 }
 
+/// Stamp `group` with its group ID, as go's `checkTxnGroupID` requires of a
+/// multi-member group submitted to simulate (issue #2468).
+fn grouped(mut group: Vec<SignedTransaction>) -> Vec<SignedTransaction> {
+    let txns: Vec<_> = group.iter().map(|s| s.txn.clone()).collect();
+    let gid = algo_codec::compute_group_id(&txns).0;
+    for stx in &mut group {
+        stx.txn.group = gid;
+    }
+    group
+}
+
 fn simulate(
     state: &mut LedgerState,
     request: SimulationRequest,
@@ -287,7 +298,7 @@ return",
     other_appl_call.txn.app_arguments = Some(vec![Some(serde_bytes::ByteBuf::from(vec![0u8]))]);
 
     let request = SimulationRequest {
-        txn_groups: vec![vec![clear_state_txn, other_appl_call]],
+        txn_groups: vec![grouped(vec![clear_state_txn, other_appl_call])],
         allow_empty_signatures: true,
         ..Default::default()
     };

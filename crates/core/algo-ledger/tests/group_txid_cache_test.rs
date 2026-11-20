@@ -147,10 +147,16 @@ fn v34_group_does_not_share_txid_cache() {
 
 /// The group as a client submits it to simulate: carrying the ledger's
 /// genesis hash (go `BlockHeader.Alive`, `RequireGenesisHash`), unlike the
-/// stripped payset form [`block`] applies.
+/// stripped payset form [`block`] applies, and the group ID go's
+/// `checkTxnGroupID` requires of a multi-member group (issue #2468).
 fn submitted(mut group: Vec<SignedTransaction>) -> Vec<SignedTransaction> {
     for stx in &mut group {
         stx.txn.genesis_hash = TEST_GENESIS_HASH;
+    }
+    let txns: Vec<Transaction> = group.iter().map(|s| s.txn.clone()).collect();
+    let gid = algo_codec::compute_group_id(&txns).0;
+    for stx in &mut group {
+        stx.txn.group = gid;
     }
     group
 }
