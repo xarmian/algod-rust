@@ -172,6 +172,8 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
     let tmp = setup();
     let root = tmp.path();
     let mut rows = Vec::new();
+    // go makes the data dir absolute: the scratch directory is `<TMP>`.
+    let mask = |b: &[u8]| String::from_utf8_lossy(b).replace(&root.display().to_string(), "<TMP>");
     let mut step = |name: &str, args: &[&str], watch: &[&str]| {
         let mut cmd = Command::new(bin);
         cmd.args(args)
@@ -194,8 +196,8 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
         rows.push(serde_json::json!({
             "name": name,
             "code": out.status.code(),
-            "stdout": String::from_utf8_lossy(&out.stdout),
-            "stderr": String::from_utf8_lossy(&out.stderr),
+            "stdout": mask(&out.stdout),
+            "stderr": mask(&out.stderr),
             "files": files,
         }));
     };
