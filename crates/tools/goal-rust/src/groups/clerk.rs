@@ -331,6 +331,11 @@ pub struct RawsendArgs {
     /// Don't wait for transactions to commit (Go `-N/--no-wait`).
     #[arg(short = 'N', long = "no-wait")]
     pub no_wait: bool,
+    /// Skip post-quantum address checks for submitted transactions (go's
+    /// `--skip-pq-address-check`): sent to algod as the
+    /// `skip-pq-address-check=true` query parameter.
+    #[arg(long = "skip-pq-address-check")]
+    pub skip_pq_address_check: bool,
 }
 
 /// `clerk simulate (-t <txfile> | --request <file>) [--request-only-out <file>

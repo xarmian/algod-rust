@@ -1847,8 +1847,6 @@ mod tests {
         const GAPS: &[&str] = &[
             // issue #2513
             "goal app method --app-arg",
-            // issue #2510
-            "goal clerk rawsend --skip-pq-address-check",
             // issue #2512
             "goal node clone --noledger",
             "goal node clone --targetdir",
