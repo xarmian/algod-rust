@@ -55,7 +55,7 @@ fn parse_uint(s: &str) -> Result<u64, String> {
 }
 
 /// go's `strconv.Quote`, as `ParseUint`'s errors print the input.
-fn go_quote(s: &str) -> String {
+pub(crate) fn go_quote(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
         match c {

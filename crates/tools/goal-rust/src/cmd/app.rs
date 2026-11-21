@@ -49,7 +49,6 @@ use algo_codec::{
 use algo_kmd_client::KmdClient;
 use algo_rest_client::AlgodClient;
 use algo_types::{Address, SignedTransaction, StateSchema, TealValue, Transaction};
-use base64::Engine;
 
 use crate::accounts_list::AccountsList;
 use crate::cmd::app_state_json::{encode_teal_state_json, heuristic_format_entries, TealEntry};
@@ -94,29 +93,70 @@ const ABI_RETURN_HASH: [u8; 4] = [0x15, 0x1f, 0x7c, 0x75];
 /// `address`, `b32`/`base32`/`"byte base32"`, `b64`/`base64`/
 /// `"byte base64"`, and `abi:<type>:<json-value>` (ABI-encoded).
 pub(crate) fn parse_app_call_bytes(arg: &str) -> Result<Vec<u8>, String> {
-    let (encoding, value) = arg.split_once(':').ok_or_else(|| {
+    let (encoding, value) = new_app_call_bytes(arg)?;
+    raw_app_call_bytes(encoding, value)
+}
+
+/// go's `apps.NewAppCallBytes`: split `encoding:value` at the first colon.
+fn new_app_call_bytes(arg: &str) -> Result<(&str, &str), String> {
+    arg.split_once(':').ok_or_else(|| {
         "all arguments and box names should be of the form 'encoding:value'".to_string()
-    })?;
+    })
+}
+
+/// go's `strconv.ParseUint(s, 10, 64)`: the reason of its error
+/// (`errors.Unwrap(err)`): `invalid syntax` or `value out of range`.
+fn go_parse_uint(s: &str) -> Result<u64, &'static str> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("invalid syntax");
+    }
+    s.parse::<u64>().map_err(|_| "value out of range")
+}
+
+/// go's `parseUInt64(number, thing, context...)`.
+fn parse_uint64_ctx(number: &str, thing: &str, context: Option<&str>) -> Result<u64, String> {
+    go_parse_uint(number).map_err(|reason| {
+        let extra = context.map(|c| format!(" in {c}")).unwrap_or_default();
+        format!("Could not parse '{number}' as {thing}{extra}: {reason}")
+    })
+}
+
+/// go's `AppCallBytes.Raw` (`avm-abi/apps/parsing.go`).
+fn raw_app_call_bytes(encoding: &str, value: &str) -> Result<Vec<u8>, String> {
     match encoding {
         "str" | "string" => Ok(value.as_bytes().to_vec()),
         "int" | "integer" => {
-            let num: u64 = value
-                .parse()
-                .map_err(|e| format!("Could not parse uint64 from string ({value}): {e}"))?;
+            let num = go_parse_uint(value).map_err(|reason| {
+                format!(
+                    "Could not parse uint64 from string ({value}): strconv.ParseUint: parsing {}: {reason}",
+                    crate::cmd::ledger::go_quote(value)
+                )
+            })?;
             Ok(num.to_be_bytes().to_vec())
         }
-        "addr" | "address" => {
-            let addr = Address::from_algorand_string(value).map_err(|e| {
-                format!("Could not unmarshal checksummed address from string ({value}): {e}")
-            })?;
-            Ok(addr.0.to_vec())
+        "addr" | "address" => address_from_string(value).map(|a| a.to_vec()).map_err(|e| {
+            format!("Could not unmarshal checksummed address from string ({value}): {e}")
+        }),
+        "b32" | "base32" | "byte base32" => {
+            algo_avm::assembler::go_base32_decode_string(value, true)
+                .map_err(|e| format!("Could not decode base32-encoded string ({value}): {e}"))
         }
-        "b32" | "base32" | "byte base32" => data_encoding::BASE32
-            .decode(value.as_bytes())
-            .map_err(|e| format!("Could not decode base32-encoded string ({value}): {e}")),
-        "b64" | "base64" | "byte base64" => base64::engine::general_purpose::STANDARD
-            .decode(value)
-            .map_err(|e| format!("Could not decode base64-encoded string ({value}): {e}")),
+        "b64" | "base64" | "byte base64" => {
+            if let Err(at) = crate::go_json::go_base64_check(value.as_bytes()) {
+                return Err(format!(
+                    "Could not decode base64-encoded string ({value}): illegal base64 data at input byte {at}"
+                ));
+            }
+            use base64::Engine as _;
+            base64::engine::general_purpose::GeneralPurpose::new(
+                &base64::alphabet::STANDARD,
+                base64::engine::GeneralPurposeConfig::new()
+                    .with_decode_allow_trailing_bits(true)
+                    .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+            )
+            .decode(value.replace(['\r', '\n'], ""))
+            .map_err(|e| format!("Could not decode base64-encoded string ({value}): {e}"))
+        }
         "abi" => {
             let (type_str, json_val) = value.split_once(':').ok_or_else(|| {
                 format!("Could not decode abi string ({value}): should split abi-type and abi-value with colon")
@@ -124,11 +164,44 @@ pub(crate) fn parse_app_call_bytes(arg: &str) -> Result<Vec<u8>, String> {
             let abi_type = algo_abi::type_of(type_str)
                 .map_err(|e| format!("Could not decode abi type string ({type_str}): {e}"))?;
             let abi_value = algo_abi::unmarshal_from_json(&abi_type, json_val)
-                .map_err(|e| format!("Could not decode abi value string ({json_val}): {e}"))?;
+                .map_err(|e| format!("Could not decode abi value string ({json_val}): {e} "))?;
             algo_abi::encode(&abi_value)
         }
         other => Err(format!("Unknown encoding: {other}")),
     }
+}
+
+/// go's `address.FromString` (`avm-abi/address`): unpadded base32 of the 32
+/// byte address and its 4 byte checksum (the last 4 bytes of SHA-512/256).
+fn address_from_string(s: &str) -> Result<[u8; 32], String> {
+    use sha2::{Digest, Sha512_256};
+    let cast =
+        |detail: String| format!("cannot cast encoded address string ({s}) to address: {detail}");
+    let decoded = algo_avm::assembler::go_base32_decode_string(s, false)
+        .map_err(|e| cast(format!("base32 decode error: {e}")))?;
+    if decoded.len() != 36 {
+        return Err(cast(
+            "decoded byte length should equal 36 with address and checksum".to_string(),
+        ));
+    }
+    let mut addr = [0u8; 32];
+    addr.copy_from_slice(&decoded[..32]);
+    let hash = Sha512_256::digest(addr);
+    let checksum = &hash[28..32];
+    if checksum != &decoded[32..] {
+        let show = |b: &[u8]| {
+            format!(
+                "[{}]",
+                b.iter().map(u8::to_string).collect::<Vec<_>>().join(" ")
+            )
+        };
+        return Err(cast(format!(
+            "decoded checksum mismatch, {} != {}",
+            show(checksum),
+            show(&decoded[32..])
+        )));
+    }
+    Ok(addr)
 }
 
 /// Resolve a CLI account/address value the way go's `cliAddress` does
@@ -140,31 +213,26 @@ pub(crate) fn cli_address(acct: &str) -> Result<Address, String> {
         return Ok(Address::ZERO);
     }
     if let Some(inner) = acct.strip_prefix("app(").and_then(|s| s.strip_suffix(')')) {
-        let app_id: u64 = inner
-            .parse()
-            .map_err(|_| format!("Could not parse '{inner}' as app id"))?;
+        let app_id = parse_uint64_ctx(inner, "app id", Some(acct))?;
         return Ok(app_address(app_id));
     }
-    Address::from_algorand_string(acct).map_err(|e| e.to_string())
+    // go: `basics.UnmarshalChecksumAddress`, its error printed as is
+    let addr = algo_avm::assembler::unmarshal_checksum_address(acct)?;
+    Ok(Address(addr.try_into().expect("32-byte address")))
 }
 
 /// Parse a `--box` value: `[<app-id>,]encoding:value` (Go's `parseBoxRef`,
-/// `application.go:280-298`).
-fn parse_box_ref(arg: &str) -> Result<(u64, Vec<u8>), String> {
+/// `application.go:280-298`): the app id (0 when omitted) and the still
+/// undecoded `AppCallBytes`.
+fn parse_box_ref(arg: &str) -> Result<(u64, String, String), String> {
     let (encoding, value) = arg
         .split_once(':')
         .ok_or_else(|| "box refs should be of the form '[<app>,]encoding:value'".to_string())?;
     let (app_id, encoding) = match encoding.split_once(',') {
-        Some((app_str, enc)) => {
-            let app_id: u64 = app_str
-                .parse()
-                .map_err(|_| format!("Could not parse '{app_str}' as app id in box ref"))?;
-            (app_id, enc)
-        }
+        Some((app_str, enc)) => (parse_uint64_ctx(app_str, "app id", Some("box ref"))?, enc),
         None => (0u64, encoding),
     };
-    let name = parse_app_call_bytes(&format!("{encoding}:{value}"))?;
-    Ok((app_id, name))
+    Ok((app_id, encoding.to_string(), value.to_string()))
 }
 
 /// Parse a `--holding` value: `<asset-id>[+<address>]` (Go's
@@ -172,9 +240,7 @@ fn parse_box_ref(arg: &str) -> Result<(u64, Vec<u8>), String> {
 /// Sender.
 fn parse_holding_ref(arg: &str) -> Result<(u64, String), String> {
     let (asset_str, address) = arg.split_once('+').unwrap_or((arg, ""));
-    let asset_id: u64 = asset_str
-        .parse()
-        .map_err(|_| format!("Could not parse '{asset_str}' as asset id in holding ref"))?;
+    let asset_id = parse_uint64_ctx(asset_str, "asset id", Some("holding ref"))?;
     Ok((asset_id, address.to_string()))
 }
 
@@ -185,75 +251,99 @@ fn parse_holding_ref(arg: &str) -> Result<(u64, String), String> {
 /// either; it becomes a no-op reference).
 fn parse_local_ref(arg: &str) -> Result<(u64, String), String> {
     if let Some((one, two)) = arg.split_once('+') {
-        let app_id: u64 = one
-            .parse()
-            .map_err(|_| format!("Could not parse '{one}' as app id in local ref"))?;
+        let app_id = parse_uint64_ctx(one, "app id", Some("local ref"))?;
         return Ok((app_id, two.to_string()));
     }
     // No '+': try as a bare app id number; otherwise treat as a bare address
     // (Go tries `strconv.ParseUint` first and falls back to an address).
-    if let Ok(app_id) = arg.parse::<u64>() {
+    if let Ok(app_id) = go_parse_uint(arg) {
         Ok((app_id, String::new()))
     } else {
         Ok((0, arg.to_string()))
     }
 }
 
-/// Build a [`RefBundle`] from the shared `--foreign-app`/`--foreign-asset`/
-/// `--app-account`/`--box`/`--holding`/`--local`/`--empty-refs`/`--access`
-/// flags. Mirrors Go's `parseAppInputs` (`application.go:344-385`), minus the
-/// `--app-arg` piece (handled separately per leaf: [`CallArgs::app_arg`] /
-/// method-arg reference resolution).
-fn build_ref_bundle_from_flags(refs: &AppRefsArgs) -> Result<RefBundle, String> {
-    let mut accounts = Vec::with_capacity(refs.app_account.len());
-    for a in &refs.app_account {
-        accounts.push(cli_address(a)?);
+/// go's `getAppInputs`: `getAppInputsFromCLI` (every non-empty `--app-arg`
+/// split, then the reference flags parsed: foreign apps and assets, boxes,
+/// holdings, locals) followed by `parseAppInputs` (the arguments decoded,
+/// then the local and holding addresses, the box names and the accounts), each
+/// failure go's text, in go's order. Returns the argument bytes and the
+/// references.
+fn parse_app_inputs(
+    app_arg: &[String],
+    refs: &AppRefsArgs,
+) -> Result<(Vec<Vec<u8>>, RefBundle), String> {
+    // getAppInputsFromCLI
+    let mut args = Vec::new();
+    for a in app_arg.iter().filter(|a| !a.is_empty()) {
+        args.push(new_app_call_bytes(a)?);
     }
     let mut apps = Vec::with_capacity(refs.foreign_app.len());
     for a in &refs.foreign_app {
-        apps.push(
-            a.parse::<u64>()
-                .map_err(|_| format!("Could not parse '{a}' as app id in foreign-app"))?,
-        );
+        apps.push(parse_uint64_ctx(a, "app id", Some("foreign-app"))?);
     }
     let mut assets = Vec::with_capacity(refs.foreign_asset.len());
     for a in &refs.foreign_asset {
-        assets.push(
-            a.parse::<u64>()
-                .map_err(|_| format!("Could not parse '{a}' as asset id in foreign-asset"))?,
+        assets.push(parse_uint64_ctx(a, "asset id", Some("foreign-asset"))?);
+    }
+    let mut parsed_boxes = Vec::with_capacity(refs.app_box.len());
+    for b in &refs.app_box {
+        parsed_boxes.push(parse_box_ref(b)?);
+    }
+    let mut parsed_holdings = Vec::with_capacity(refs.holding.len());
+    for h in &refs.holding {
+        parsed_holdings.push(parse_holding_ref(h)?);
+    }
+    let mut parsed_locals = Vec::with_capacity(refs.local.len());
+    for l in &refs.local {
+        parsed_locals.push(parse_local_ref(l)?);
+    }
+
+    // parseAppInputs
+    let mut raw_args = Vec::with_capacity(args.len());
+    for (encoding, value) in &args {
+        raw_args.push(
+            raw_app_call_bytes(encoding, value)
+                .map_err(|e| format!("Could not decode app-arg {encoding}:{value}: {e}"))?,
         );
     }
-    let mut boxes = Vec::with_capacity(refs.app_box.len());
-    for b in &refs.app_box {
-        let (app, name) = parse_box_ref(b)?;
-        boxes.push(BoxHint { app, name });
-    }
-    let mut holdings = Vec::with_capacity(refs.holding.len());
-    for h in &refs.holding {
-        let (asset, addr) = parse_holding_ref(h)?;
-        holdings.push(HoldingHint {
-            asset,
-            address: cli_address(&addr)?,
-        });
-    }
-    let mut locals = Vec::with_capacity(refs.local.len());
-    for l in &refs.local {
-        let (app, addr) = parse_local_ref(l)?;
+    let mut locals = Vec::with_capacity(parsed_locals.len());
+    for (app, addr) in parsed_locals {
         locals.push(LocalHint {
             app,
             address: cli_address(&addr)?,
         });
     }
-    Ok(RefBundle {
-        use_access: refs.access,
-        accounts,
-        assets,
-        apps,
-        holdings,
-        locals,
-        boxes,
-        empty_refs: refs.empty_refs,
-    })
+    let mut holdings = Vec::with_capacity(parsed_holdings.len());
+    for (asset, addr) in parsed_holdings {
+        holdings.push(HoldingHint {
+            asset,
+            address: cli_address(&addr)?,
+        });
+    }
+    let mut boxes = Vec::with_capacity(parsed_boxes.len());
+    for (app, encoding, value) in parsed_boxes {
+        let name = raw_app_call_bytes(&encoding, &value)
+            .map_err(|e| format!("Could not decode box name {{{encoding} {value}}}: {e}"))?;
+        boxes.push(BoxHint { app, name });
+    }
+    let mut accounts = Vec::with_capacity(refs.app_account.len());
+    for a in &refs.app_account {
+        accounts.push(cli_address(a)?);
+    }
+    Ok((
+        raw_args,
+        RefBundle {
+            use_access: refs.access,
+            accounts,
+            assets,
+            apps,
+            holdings,
+            locals,
+            boxes,
+            empty_refs: refs.empty_refs,
+        },
+    ))
 }
 
 /// Parse `--on-completion` (case-insensitive), mirroring Go's
@@ -503,15 +593,7 @@ fn submit_app_lifecycle_txn(
     let from_addr = Address::from_algorand_string(&from_resolved)
         .map_err(|e| format!("Could not parse from address {from_resolved}: {e}"))?;
 
-    let mut app_arguments = Vec::with_capacity(app_arg.len());
-    for a in app_arg {
-        if a.is_empty() {
-            continue;
-        }
-        app_arguments.push(parse_app_call_bytes(a)?);
-    }
-
-    let refs = build_ref_bundle_from_flags(refs_args)?;
+    let (app_arguments, refs) = parse_app_inputs(app_arg, refs_args)?;
 
     let algod = build_full_algod_client_for_dir(&data_dir_path)?;
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -617,14 +699,7 @@ fn run_create_inner(args: CreateArgs, wallet: Option<String>) -> Result<ExitCode
     let creator_addr = Address::from_algorand_string(&creator_resolved)
         .map_err(|e| format!("Could not parse creator address {creator_resolved}: {e}"))?;
 
-    let mut app_arguments = Vec::with_capacity(args.app_args.app_arg.len());
-    for a in &args.app_args.app_arg {
-        if a.is_empty() {
-            continue;
-        }
-        app_arguments.push(parse_app_call_bytes(a)?);
-    }
-    let refs = build_ref_bundle_from_flags(&args.refs)?;
+    let (app_arguments, refs) = parse_app_inputs(&args.app_args.app_arg, &args.refs)?;
 
     let algod = build_full_algod_client_for_dir(&data_dir_path)?;
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -712,14 +787,7 @@ fn run_update_inner(args: UpdateArgs, wallet: Option<String>) -> Result<ExitCode
     let from_addr = Address::from_algorand_string(&from_resolved)
         .map_err(|e| format!("Could not parse from address {from_resolved}: {e}"))?;
 
-    let mut app_arguments = Vec::with_capacity(args.app_args.app_arg.len());
-    for a in &args.app_args.app_arg {
-        if a.is_empty() {
-            continue;
-        }
-        app_arguments.push(parse_app_call_bytes(a)?);
-    }
-    let refs = build_ref_bundle_from_flags(&args.refs)?;
+    let (app_arguments, refs) = parse_app_inputs(&args.app_args.app_arg, &args.refs)?;
 
     let algod = build_full_algod_client_for_dir(&data_dir_path)?;
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1342,13 +1410,8 @@ fn run_method_inner(args: MethodArgs, wallet: Option<String>) -> Result<ExitCode
     let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
         .map_err(|e| e.to_string())?;
     let _algod = build_full_algod_client_for_dir(&data_dir_path)?;
-    let mut app_args_parsed = 0usize;
-    for a in args.app_arg.iter().filter(|a| !a.is_empty()) {
-        parse_app_call_bytes(a)?;
-        app_args_parsed += 1;
-    }
-    build_ref_bundle_from_flags(&args.refs)?;
-    if app_args_parsed > 0 {
+    let (app_args_parsed, refs_parsed) = parse_app_inputs(&args.app_arg, &args.refs)?;
+    if !app_args_parsed.is_empty() {
         return Err("--arg and --app-arg are mutually exclusive, do not use --app-arg".into());
     }
     let method = resolve_method(&args.method)?;
@@ -1436,7 +1499,7 @@ fn run_method_inner(args: MethodArgs, wallet: Option<String>) -> Result<ExitCode
         }
     }
 
-    let mut refs = build_ref_bundle_from_flags(&args.refs)?;
+    let mut refs = refs_parsed;
     let ref_resolved = populate_method_call_reference_args(
         &args.from,
         app_id,
@@ -2017,16 +2080,16 @@ mod tests {
 
     #[test]
     fn box_ref_without_app_id_defaults_to_zero() {
-        let (app, name) = parse_box_ref("str:mybox").unwrap();
+        let (app, encoding, value) = parse_box_ref("str:mybox").unwrap();
         assert_eq!(app, 0);
-        assert_eq!(name, b"mybox".to_vec());
+        assert_eq!((encoding.as_str(), value.as_str()), ("str", "mybox"));
     }
 
     #[test]
     fn box_ref_with_app_id() {
-        let (app, name) = parse_box_ref("5,str:mybox").unwrap();
+        let (app, encoding, value) = parse_box_ref("5,str:mybox").unwrap();
         assert_eq!(app, 5);
-        assert_eq!(name, b"mybox".to_vec());
+        assert_eq!((encoding.as_str(), value.as_str()), ("str", "mybox"));
     }
 
     #[test]

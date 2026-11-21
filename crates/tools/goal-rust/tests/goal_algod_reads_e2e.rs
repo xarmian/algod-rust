@@ -2197,6 +2197,194 @@ fn txn_cases() -> Vec<Case> {
             &["--app-arg", "x", "--foreign-app", "zz"],
         ),
     ];
+    // Issue #2526: the texts of `getAppInputs` for an `--app-arg` that does not
+    // decode and for the reference flags, in every `app` leaf that reads them.
+    let call_base = [
+        "app", "call", "--app-id", "7", "-f", "<A1>", "-w", "a", "-N",
+    ];
+    let bad_inputs: Vec<(&str, Vec<&str>)> = vec![
+        ("b64 bad char", vec!["--app-arg", "b64:!!"]),
+        ("b64 unpadded", vec!["--app-arg", "b64:aGk"]),
+        ("b64 ok", vec!["--app-arg", "b64:aGk="]),
+        ("base64 long form", vec!["--app-arg", "base64:%%%%"]),
+        ("b32 bad char", vec!["--app-arg", "b32:!!"]),
+        ("b32 unpadded", vec!["--app-arg", "b32:MFRGG"]),
+        ("b32 ok", vec!["--app-arg", "b32:MFRGG==="]),
+        ("int bad", vec!["--app-arg", "int:abc"]),
+        (
+            "int too large",
+            vec!["--app-arg", "int:18446744073709551616"],
+        ),
+        ("int negative", vec!["--app-arg", "int:-1"]),
+        ("int plus", vec!["--app-arg", "int:+1"]),
+        ("int empty", vec!["--app-arg", "int:"]),
+        ("addr short", vec!["--app-arg", "addr:AAAA"]),
+        ("addr bad char", vec!["--app-arg", "addr:!!!!"]),
+        (
+            "addr bad checksum",
+            vec![
+                "--app-arg",
+                "addr:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ],
+        ),
+        ("abi no type", vec!["--app-arg", "abi:uint64"]),
+        ("abi bad type", vec!["--app-arg", "abi:bogus:1"]),
+        ("abi out of range", vec!["--app-arg", "abi:uint8:300"]),
+        ("abi bad value", vec!["--app-arg", "abi:uint64:x"]),
+        ("abi ok", vec!["--app-arg", "abi:uint64:5"]),
+        ("unknown encoding", vec!["--app-arg", "weird:x"]),
+        (
+            "second app-arg bad",
+            vec!["--app-arg", "str:a", "--app-arg", "int:z"],
+        ),
+        ("foreign-app bad", vec!["--foreign-app", "zz"]),
+        (
+            "foreign-app too large",
+            vec!["--foreign-app", "18446744073709551616"],
+        ),
+        ("foreign-app negative", vec!["--foreign-app", "-1"]),
+        ("foreign-app list", vec!["--foreign-app", "5,zz"]),
+        ("foreign-asset bad", vec!["--foreign-asset", "zz"]),
+        ("box no colon", vec!["--box", "zz"]),
+        ("box bad app id", vec!["--box", "x,str:a"]),
+        ("box b64 bad", vec!["--box", "5,b64:!!"]),
+        ("box int bad", vec!["--box", "int:q"]),
+        ("box ok", vec!["--box", "5,str:a"]),
+        ("holding bad asset", vec!["--holding", "x"]),
+        ("holding bad address", vec!["--holding", "5+BADADDR"]),
+        ("holding list", vec!["--holding", "5,6"]),
+        ("local bad app id", vec!["--local", "x+<A2>"]),
+        ("local bad address", vec!["--local", "BADADDR"]),
+        ("local list", vec!["--local", "7,8"]),
+        ("app-account bad", vec!["--app-account", "BAD"]),
+        ("app-account app() bad", vec!["--app-account", "app(x)"]),
+        ("app-account app() ok", vec!["--app-account", "app(5)"]),
+        (
+            "errors in go's order",
+            vec![
+                "--app-account",
+                "BAD",
+                "--local",
+                "BADADDR",
+                "--box",
+                "5,b64:!!",
+                "--app-arg",
+                "b64:!!",
+            ],
+        ),
+    ];
+    for (what, extra) in &bad_inputs {
+        let mut args = call_base.to_vec();
+        args.extend(extra);
+        let mut c = case(&format!("app call input {what}"), &args);
+        c.accounts = true;
+        v.push(c);
+    }
+    let other_leaves: [(&str, Vec<&str>); 7] = [
+        (
+            "optin",
+            vec![
+                "app", "optin", "--app-id", "7", "-f", "<A1>", "-w", "a", "-N",
+            ],
+        ),
+        (
+            "closeout",
+            vec![
+                "app", "closeout", "--app-id", "7", "-f", "<A1>", "-w", "a", "-N",
+            ],
+        ),
+        (
+            "clear",
+            vec![
+                "app", "clear", "--app-id", "7", "-f", "<A1>", "-w", "a", "-N",
+            ],
+        ),
+        (
+            "delete",
+            vec![
+                "app", "delete", "--app-id", "7", "-f", "<A1>", "-w", "a", "-N",
+            ],
+        ),
+        (
+            "update",
+            vec![
+                "app",
+                "update",
+                "--app-id",
+                "7",
+                "-f",
+                "<A1>",
+                "--approval-prog",
+                "a.teal",
+                "--clear-prog",
+                "a.teal",
+                "-w",
+                "a",
+                "-N",
+            ],
+        ),
+        (
+            "create",
+            vec![
+                "app",
+                "create",
+                "--creator",
+                "<A1>",
+                "--approval-prog",
+                "a.teal",
+                "--clear-prog",
+                "a.teal",
+                "-w",
+                "a",
+                "-N",
+            ],
+        ),
+        (
+            "method",
+            vec![
+                "app",
+                "method",
+                "--from",
+                "<A1>",
+                "--app-id",
+                "7",
+                "--method",
+                "add(uint64,uint64)uint64",
+                "-w",
+                "a",
+                "-N",
+            ],
+        ),
+    ];
+    let leaf_inputs: [(&str, [&str; 2]); 4] = [
+        ("b64 app-arg", ["--app-arg", "b64:!!"]),
+        ("bad foreign-app", ["--foreign-app", "zz"]),
+        ("bad box", ["--box", "5,b64:!!"]),
+        ("bad holding", ["--holding", "x"]),
+    ];
+    for (leaf, base) in &other_leaves {
+        for (what, extra) in &leaf_inputs {
+            let mut args = base.clone();
+            args.extend(extra);
+            let mut c = case(&format!("app {leaf} input {what}"), &args);
+            c.accounts = true;
+            c.inputs = vec![("a.teal", b"#pragma version 2\nint 1\n".to_vec())];
+            v.push(c);
+        }
+    }
+    // `app box` names go through the same `AppCallBytes`
+    for (what, name) in [
+        ("b64 bad", "b64:!!"),
+        ("int bad", "int:abc"),
+        ("no colon", "x"),
+    ] {
+        let mut c = case(
+            &format!("app box info name {what}"),
+            &["app", "box", "info", "--app-id", "7", "--name", name],
+        );
+        c.accounts = true;
+        v.push(c);
+    }
     for (what, extra) in method_rows {
         let mut args = method_base.to_vec();
         args.extend(extra);

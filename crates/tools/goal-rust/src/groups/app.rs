@@ -136,11 +136,11 @@ pub struct AppRefsArgs {
     pub app_box: Vec<String>,
     /// A holding that may be accessed from application logic:
     /// `<asset-id>[+<address>]` (Go `--holding`, repeatable).
-    #[arg(long = "holding")]
+    #[arg(long = "holding", value_delimiter = ',')]
     pub holding: Vec<String>,
     /// A local state that may be accessed from application logic:
     /// `[<app-id>][+<address>]` (Go `--local`, repeatable).
-    #[arg(long = "local")]
+    #[arg(long = "local", value_delimiter = ',')]
     pub local: Vec<String>,
     /// Number of empty references to add for additional I/O budget
     /// (Go `--empty-refs`).
