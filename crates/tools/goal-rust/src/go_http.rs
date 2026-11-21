@@ -41,7 +41,25 @@
 //!   (`http: server gave HTTP response to HTTPS client`), one that answers
 //!   neither HTTP nor TLS (`tls: first record does not look like a TLS
 //!   handshake`), a certificate no root vouches for (`tls: failed to verify
-//!   certificate: x509: certificate signed by unknown authority`).
+//!   certificate: x509: certificate signed by unknown authority`); since
+//!   issue #2507 also go's validity-period and host-name errors, which go
+//!   reports before it looks for a chain (`x509: certificate has expired or
+//!   is not yet valid: current time T is after T`, `x509: certificate is
+//!   valid for A, B, not C`, [`crate::x509_leaf`]), an unfit key usage, the
+//!   server's alerts (`remote error: tls: handshake failure`), a close
+//!   between records (`EOF`) or inside one (`unexpected EOF`), an oversized
+//!   record, the transport's 10 s handshake timeout, and `HTTPS_PROXY`
+//!   (`CONNECT host:port` with `Proxy-Authorization`, a non-200 answer is
+//!   its status text, `proxyconnect tcp: ...`).
+//!
+//! Not ported, and why (issue #2507): go offers ALPN `h2` and speaks HTTP/2
+//! when the server picks it. go-algorand's algod does not terminate TLS for
+//! its REST API (`TLSCertFile` / `TLSKeyFile` are the websocket network's), so
+//! an `https:` algod is a TLS-terminating front end, and whether it picks h2
+//! depends on that software; HTTP/1.1 is what a plain algod behind it speaks
+//! and what goal-rust negotiates. A certificate authority used as the leaf is
+//! accepted by go and refused by webpki (`CaUsedAsEndEntity`); goal-rust keeps
+//! the stricter verdict.
 //!
 //! Every error is `<Op> "<url>": <err>` (`*url.Error`). Texts are in the
 //! lossless form of [`algo_types::raw_text`]: a reason phrase that is not
