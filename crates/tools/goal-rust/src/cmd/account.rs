@@ -1740,7 +1740,8 @@ fn finish_status_change(
     let kmd = build_wallet_handle_kmd_client(data_dir_path).map_err(|()| String::new())?;
     let mut accounts = load_accounts(data_dir_path).map_err(|()| String::new())?;
     let (handle, _wallet_name, password) =
-        resolve_wallet_and_init(rt, &kmd, &mut accounts, opts.wallet).map_err(|()| String::new())?;
+        resolve_wallet_and_init(rt, &kmd, &mut accounts, opts.wallet)
+            .map_err(|()| String::new())?;
     let signing_error = |e: String| {
         format!(
             "Couldn't sign tx with kmd: {e} (for multisig accounts, write tx to file and sign \

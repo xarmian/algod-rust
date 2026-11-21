@@ -1520,7 +1520,10 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
                 "mnp-flags.tx",
             ]),
         ),
-        ("--validrounds zero", mnp(&["-a", &a1, "-v", "0", "-t", "x.tx"])),
+        (
+            "--validrounds zero",
+            mnp(&["-a", &a1, "-v", "0", "-t", "x.tx"]),
+        ),
         (
             "--validrounds and --lastvalid",
             mnp(&["-a", &a1, "-v", "10", "--lastvalid", "100", "-t", "x.tx"]),
