@@ -217,7 +217,9 @@ pub(crate) fn cli_address(acct: &str) -> Result<Address, String> {
         let app_id = parse_uint64_ctx(inner, "app id", Some(acct))?;
         return Ok(app_address(app_id));
     }
-    Address::from_algorand_string(acct).map_err(|e| e.to_string())
+    // go: `basics.UnmarshalChecksumAddress`, its error printed as is
+    let addr = algo_avm::assembler::unmarshal_checksum_address(acct)?;
+    Ok(Address(addr.try_into().expect("32-byte address")))
 }
 
 /// Parse a `--box` value: `[<app-id>,]encoding:value` (Go's `parseBoxRef`,

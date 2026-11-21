@@ -443,7 +443,7 @@ pub fn unmarshal_from_json(abi_type: &AbiType, json_str: &str) -> Result<AbiValu
 
     match abi_type {
         AbiType::Uint(bits) => {
-            let num = parse_json_biguint(json_str)?;
+            let num = parse_json_biguint(json_str, *bits)?;
             validate_uint_fits(&num, *bits)?;
             Ok(AbiValue::Uint(num, *bits))
         }
@@ -568,21 +568,35 @@ pub fn unmarshal_from_json(abi_type: &AbiType, json_str: &str) -> Result<AbiValu
 }
 
 /// Parse a JSON number or string as a `BigUint`.
-fn parse_json_biguint(json_str: &str) -> Result<BigUint, String> {
+///
+/// go decodes the JSON into a `*big.Int` and then casts it to the type's
+/// primitive (`castBigIntToNearestPrimitive`): a text `big.Int` does not
+/// take is `math/big: cannot unmarshal "<text>" into a *big.Int`, and a
+/// negative number fails the cast.
+fn parse_json_biguint(json_str: &str, bits: u16) -> Result<BigUint, String> {
     let trimmed = json_str.trim();
     // Accept both JSON numbers and quoted strings
     let num_str = trimmed.trim_matches('"');
+    let cast_err = |detail: String| format!("cannot cast JSON encoded ({json_str}) to uint: {detail}");
+    if let Some(magnitude) = num_str.strip_prefix('-') {
+        if let Ok(m) = magnitude.parse::<BigUint>() {
+            return Err(if m.bits() > u64::from(bits) {
+                format!("cast big int to nearest primitive failure: -{m} >= 2^{bits}")
+            } else {
+                format!("cannot cast big int to near primitive: -{m} < 0")
+            });
+        }
+    }
     num_str
         .parse::<BigUint>()
-        .map_err(|e| format!("cannot cast JSON encoded ({json_str}) to uint: {e}"))
+        .map_err(|_| cast_err(format!("math/big: cannot unmarshal \"{num_str}\" into a *big.Int")))
 }
 
 /// Validate that a `BigUint` value fits in `bits` bits.
 fn validate_uint_fits(num: &BigUint, bits: u16) -> Result<(), String> {
     if num.bits() > u64::from(bits) {
         return Err(format!(
-            "input value bit size {} > abi type bit size {bits}",
-            num.bits()
+            "cast big int to nearest primitive failure: {num} >= 2^{bits}"
         ));
     }
     Ok(())
