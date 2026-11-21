@@ -1845,11 +1845,6 @@ mod tests {
     fn clap_takes_every_flag_of_gos() {
         // Flags go's command reads that goal-rust's does not have yet.
         const GAPS: &[&str] = &[
-            // issue #2509
-            "goal account marknonparticipating --rekey-to",
-            "goal account marknonparticipating --signer",
-            "goal account marknonparticipating --txfile",
-            "goal account marknonparticipating --validrounds",
             // issue #2513
             "goal app method --app-arg",
             // issue #2510
