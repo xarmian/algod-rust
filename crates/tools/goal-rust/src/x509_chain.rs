@@ -280,8 +280,14 @@ fn check_signature_from(
     if parent.key_usage != 0 && parent.key_usage & KEY_CERT_SIGN == 0 {
         return Err(violation.to_string());
     }
+    // the provider's identifiers are the `AlgorithmIdentifier` contents or
+    // the whole element, depending on the version
+    let same = |id: &[u8], der: &[u8]| {
+        id == der || tlv(der).is_some_and(|(_, content, _)| id == content)
+    };
     let alg = algs.all.iter().find(|a| {
-        a.signature_alg_id().as_ref() == c.sig_alg && a.public_key_alg_id().as_ref() == parent.spki_alg
+        same(a.signature_alg_id().as_ref(), c.sig_alg)
+            && same(a.public_key_alg_id().as_ref(), parent.spki_alg)
     });
     let Some(alg) = alg else {
         return Err("x509: cannot verify signature: algorithm unimplemented".to_string());
