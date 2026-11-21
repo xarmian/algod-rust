@@ -220,18 +220,24 @@ pub fn run_version(verbose: bool, cli_d: Vec<PathBuf>) -> ExitCode {
             }
         };
         // go prints the `[]string` with `%v`: `[v1 v2]`
+        // (go-codec's strings are raw bytes, printed unfiltered)
         let versions = format!("[{}]", v.versions.unwrap_or_default().join(" "));
         if !verbose {
-            println!("{versions}");
+            crate::println_raw!("{versions}");
             continue;
         }
-        println!("Version: {versions} ");
-        println!("GenesisID: {} ", v.genesis_id);
+        crate::println_raw!("Version: {versions} ");
+        crate::println_raw!("GenesisID: {} ", v.genesis_id);
         let b = &v.build;
         if *b != BuildVersion::default() {
-            println!(
+            crate::println_raw!(
                 "Build: {}.{}.{}.{} [{}] (commit #{})",
-                b.major, b.minor, b.build_number, b.channel, b.branch, b.commit_hash
+                b.major,
+                b.minor,
+                b.build_number,
+                b.channel,
+                b.branch,
+                b.commit_hash
             );
         }
     }

@@ -156,7 +156,7 @@ fn get_status(rt: &tokio::runtime::Runtime, data_dir: &Path, watch_ms: u64) -> R
             status_str = format!("{status_str}Genesis ID: {}\n", vers.genesis_id);
         }
         status_str = format!("{status_str}Genesis hash: {}", vers.genesis_hash_b64);
-        println!("{status_str}");
+        crate::println_raw!("{status_str}");
 
         if watch_ms == 0 {
             break;

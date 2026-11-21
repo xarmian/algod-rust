@@ -1123,7 +1123,8 @@ fn run_info_inner(args: InfoArgs) -> Result<ExitCode, String> {
     }
     let _ = writeln!(out, "Freeze address:   {}", s(&params["freeze"]));
     let _ = writeln!(out, "Clawback address: {}", s(&params["clawback"]));
-    print!("{out}");
+    // (go-codec's strings are raw bytes, printed unfiltered)
+    crate::formatting::print_raw(&out);
     Ok(ExitCode::SUCCESS)
 }
 

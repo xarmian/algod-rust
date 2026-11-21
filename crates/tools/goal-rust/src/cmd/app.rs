@@ -1043,7 +1043,8 @@ fn run_info_inner(args: InfoArgs) -> Result<ExitCode, String> {
             let _ = writeln!(out, "Max local integers:    {}", u(&lsch["num-uint"]));
         }
     }
-    print!("{out}");
+    // (go-codec's strings are raw bytes, printed unfiltered)
+    crate::formatting::print_raw(&out);
     Ok(ExitCode::SUCCESS)
 }
 
