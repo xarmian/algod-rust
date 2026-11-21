@@ -121,7 +121,8 @@ pub fn parse_leaf(der: &[u8]) -> Option<Leaf> {
                         leaf.ips.push(IpAddr::from(<[u8; 4]>::try_from(name).ok()?));
                     }
                     (0x87, 16) => {
-                        leaf.ips.push(IpAddr::from(<[u8; 16]>::try_from(name).ok()?));
+                        leaf.ips
+                            .push(IpAddr::from(<[u8; 16]>::try_from(name).ok()?));
                     }
                     _ => {}
                 }
@@ -264,11 +265,9 @@ pub fn name_error(leaf: &Leaf, host: &str) -> Option<String> {
         ));
     }
     let lower = host.to_ascii_lowercase();
-    if leaf
-        .dns
-        .iter()
-        .any(|d| lower == d.to_ascii_lowercase() || match_hostnames(&d.to_ascii_lowercase(), &lower))
-    {
+    if leaf.dns.iter().any(|d| {
+        lower == d.to_ascii_lowercase() || match_hostnames(&d.to_ascii_lowercase(), &lower)
+    }) {
         return None;
     }
     if leaf.dns.is_empty() {
@@ -296,7 +295,10 @@ mod tests {
         assert_eq!(rfc3339(1577836800, 0), "2020-01-01T00:00:00Z");
         assert_eq!(rfc3339(4070908800, 0), "2099-01-01T00:00:00Z");
         assert_eq!(rfc3339(1577836800, 3600), "2020-01-01T01:00:00+01:00");
-        assert_eq!(rfc3339(1577836800, -5 * 3600 - 1800), "2019-12-31T18:30:00-05:30");
+        assert_eq!(
+            rfc3339(1577836800, -5 * 3600 - 1800),
+            "2019-12-31T18:30:00-05:30"
+        );
     }
 
     #[test]

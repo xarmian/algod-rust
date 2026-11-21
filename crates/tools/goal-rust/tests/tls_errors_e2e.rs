@@ -171,6 +171,7 @@ fn row(name: &'static str) -> Row {
     }
 }
 
+#[allow(clippy::vec_init_then_push)]
 fn rows() -> Vec<Row> {
     let tls = |name: &'static str, cert: &'static str, key: &'static str| {
         let mut r = row(name);
@@ -194,8 +195,16 @@ fn rows() -> Vec<Row> {
     // the same certificates trusted
     v.push(trusted("trusted", CERT_GOOD, KEY_GOOD));
     v.push(trusted("trusted expired", CERT_EXPIRED, KEY_EXPIRED));
-    v.push(trusted("trusted address mismatch", CERT_IP_MISMATCH, KEY_IP_MISMATCH));
-    v.push(trusted("incompatible key usage", CERT_EKU_CLIENT, KEY_EKU_CLIENT));
+    v.push(trusted(
+        "trusted address mismatch",
+        CERT_IP_MISMATCH,
+        KEY_IP_MISMATCH,
+    ));
+    v.push(trusted(
+        "incompatible key usage",
+        CERT_EKU_CLIENT,
+        KEY_EKU_CLIENT,
+    ));
     // handshake failures of the server's side
     for (name, code) in [
         ("alert handshake failure", 40u8),
@@ -241,7 +250,10 @@ fn rows() -> Vec<Row> {
     };
     v.push(proxied("proxy refused", Proxy::Refused));
     v.push(proxied("proxy 403", Proxy::Status(403, "Forbidden")));
-    v.push(proxied("proxy 407", Proxy::Status(407, "Proxy Authentication Required")));
+    v.push(proxied(
+        "proxy 407",
+        Proxy::Status(407, "Proxy Authentication Required"),
+    ));
     v.push(proxied("proxy 502", Proxy::Status(502, "Bad Gateway")));
     v.push(proxied("proxy 403 without reason", Proxy::Status(403, "")));
     v.push(proxied("proxy closes", Proxy::Close));
@@ -254,7 +266,11 @@ fn rows() -> Vec<Row> {
     r.server = Some(Server::Tls(CERT_PROXIED, KEY_PROXIED));
     v.push(r);
     for (name, cert, key) in [
-        ("proxy tunnel name mismatch", CERT_DNS_MISMATCH, KEY_DNS_MISMATCH),
+        (
+            "proxy tunnel name mismatch",
+            CERT_DNS_MISMATCH,
+            KEY_DNS_MISMATCH,
+        ),
         ("proxy tunnel no names", CERT_NO_NAMES, KEY_NO_NAMES),
         ("proxy tunnel expired", CERT_EXPIRED, KEY_EXPIRED),
     ] {
@@ -284,11 +300,17 @@ fn rows() -> Vec<Row> {
     let mut r = proxied("HTTP_PROXY alone", Proxy::Status(403, "Forbidden"));
     r.env = vec![("HTTP_PROXY", "http://{proxy}")];
     v.push(r);
-    let mut r = proxied("proxy for a loopback algod", Proxy::Status(403, "Forbidden"));
+    let mut r = proxied(
+        "proxy for a loopback algod",
+        Proxy::Status(403, "Forbidden"),
+    );
     r.host = None;
     r.server = Some(Server::Tls(CERT_GOOD, KEY_GOOD));
     v.push(r);
-    let mut r = proxied("proxy with an unsupported scheme", Proxy::Status(403, "Forbidden"));
+    let mut r = proxied(
+        "proxy with an unsupported scheme",
+        Proxy::Status(403, "Forbidden"),
+    );
     r.env = vec![("HTTPS_PROXY", "ftp://{proxy}")];
     v.push(r);
     v

@@ -402,9 +402,8 @@ fn round_trip(
 fn connect_tunnel(stream: &mut TcpStream, addr: &str, auth: Option<&str>) -> Result<(), String> {
     let local = stream.local_addr().ok();
     let peer = stream.peer_addr().ok();
-    let mut req = format!(
-        "CONNECT {addr} HTTP/1.1\r\nHost: {addr}\r\nUser-Agent: Go-http-client/1.1\r\n"
-    );
+    let mut req =
+        format!("CONNECT {addr} HTTP/1.1\r\nHost: {addr}\r\nUser-Agent: Go-http-client/1.1\r\n");
     if let Some(a) = auth {
         req.push_str(&format!("Proxy-Authorization: {a}\r\n"));
     }
@@ -688,7 +687,8 @@ fn tls_error(
     // go's first record check: `typ` an alert or a handshake, `vers` below
     // 0x1000, else `tls.RecordHeaderError`
     let first_record_bad = first.len() == 5
-        && ((first[0] != 21 && first[0] != 22) || u16::from_be_bytes([first[1], first[2]]) >= 0x1000);
+        && ((first[0] != 21 && first[0] != 22)
+            || u16::from_be_bytes([first[1], first[2]]) >= 0x1000);
     match tls {
         Some(TlsError::General(t)) if t.starts_with("x509: ") => {
             format!("tls: failed to verify certificate: {t}")
@@ -1367,7 +1367,10 @@ fn proxy_for(host: &str, https: bool) -> Option<Proxy> {
         let info = &url.authority[..i];
         let (user, pass) = info.split_once(':').unwrap_or((info, ""));
         let credentials = format!("{}:{}", percent_decode(user), percent_decode(pass));
-        format!("Basic {}", data_encoding::BASE64.encode(credentials.as_bytes()))
+        format!(
+            "Basic {}",
+            data_encoding::BASE64.encode(credentials.as_bytes())
+        )
     });
     Some(Proxy {
         addr: url.host().to_string(),

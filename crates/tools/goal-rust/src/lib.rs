@@ -43,7 +43,6 @@ pub mod data_dir;
 pub mod formatting;
 pub mod go_codec_json;
 pub mod go_http;
-pub mod x509_leaf;
 pub mod go_json;
 pub mod goal_client;
 pub mod groups;
@@ -53,6 +52,7 @@ pub mod protocols_json;
 pub mod resource_resolution;
 pub mod transcode;
 pub mod wallet_token;
+pub mod x509_leaf;
 
 /// goal-rust — CLI for interacting with Algorand.
 ///
