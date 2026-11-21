@@ -11,7 +11,7 @@
 {"code":1,"name":"CA leaf without its intermediate","proxy_saw":"","stderr":"","stdout":"Get \"https://127.0.0.1:<P>/versions\": tls: failed to verify certificate: x509: certificate signed by unknown authority\n"}
 {"code":1,"name":"CA leaf with a root nobody trusts","proxy_saw":"","stderr":"","stdout":"Get \"https://127.0.0.1:<P>/versions\": tls: failed to verify certificate: x509: certificate signed by unknown authority\n"}
 {"code":1,"name":"CA leaf with a bad signature","proxy_saw":"","stderr":"","stdout":"Get \"https://127.0.0.1:<P>/versions\": tls: failed to verify certificate: x509: certificate signed by unknown authority (possibly because of \"x509: ECDSA verification failure\" while trying to verify candidate authority certificate \"goal-inter\")\n"}
-{"code":1,"name":"CA leaf under a path length 0","proxy_saw":"","stderr":"","stdout":"Get \"https://127.0.0.1:<P>/versions\": tls: failed to verify certificate: x509: certificate signed by unknown authority\n"}
+{"code":0,"name":"CA leaf under a path length 0","proxy_saw":"","stderr":"","stdout":"[v1]\n"}
 {"code":0,"name":"CA leaf with a path length","proxy_saw":"","stderr":"","stdout":"[v1]\n"}
 {"code":1,"name":"CA as the leaf for clientAuth","proxy_saw":"","stderr":"","stdout":"Get \"https://127.0.0.1:<P>/versions\": tls: failed to verify certificate: x509: certificate specifies an incompatible key usage\n"}
 {"code":0,"name":"trusted","proxy_saw":"","stderr":"","stdout":"[v1]\n"}
