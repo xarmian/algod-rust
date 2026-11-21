@@ -1357,20 +1357,6 @@ pub(crate) fn read_checked_optional_rmpv(
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
 
-/// The `nil`-aware map header of a struct value decoded into `s`: `nil`
-/// resets `s` to its zero value (go `(*z) = T{}`) and reads as no entries.
-#[inline]
-pub fn read_struct_map_len<T: Default>(rd: &mut &[u8], s: &mut T) -> Result<u32> {
-    // DIVERGENCE DIV-004: only the map form is read; go's struct-from-array
-    // branch (ReadArrayHeaderBytes fallback) is intentionally not supported.
-    if let [0xc0, rest @ ..] = *rd {
-        *rd = rest;
-        *s = T::default();
-        return Ok(0);
-    }
-    rmp::decode::read_map_len(rd).map_err(|e| codec_err(format!("read_map_len: {e}")))
-}
-
 // ── Struct from array (issue #2426) ──────────────────────────────────
 //
 // go's generated `UnmarshalMsgWithState` reads a struct from either a map or,
@@ -1404,27 +1390,34 @@ fn go_struct_orders() -> &'static std::collections::HashMap<String, Vec<Vec<u8>>
 /// positional (go's declaration order) for an array.
 pub struct StructKeys {
     left: u32,
-    /// The positional order and the next position, for the array form.
-    order: Option<(&'static [Vec<u8>], usize)>,
+    /// The positional order, for the array form.
+    order: Option<&'static [Vec<u8>]>,
+    /// The next position in `order`.
+    pos: usize,
 }
 
 impl StructKeys {
     /// The next field's key, or `None` when the struct is done. In the array
     /// form no key is on the stream: the field's value is next.
-    #[inline]
+    #[inline(always)]
     pub fn next<'a>(&mut self, rd: &mut &'a [u8]) -> Result<Option<&'a [u8]>> {
         if self.left == 0 {
             return Ok(None);
         }
         self.left -= 1;
-        match &mut self.order {
-            None => read_key_bytes(rd).map(Some),
-            Some((order, i)) => {
-                let key = &order[*i][..];
-                *i += 1;
-                Ok(Some(key))
-            }
+        if self.order.is_none() {
+            return read_key_bytes(rd).map(Some);
         }
+        Ok(Some(self.positional_key()))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn positional_key(&mut self) -> &'static [u8] {
+        let order = self.order.expect("the array form has an order");
+        let key = &order[self.pos][..];
+        self.pos += 1;
+        key
     }
 }
 
@@ -1446,6 +1439,7 @@ pub fn struct_keys<T: Default>(
             Ok(StructKeys {
                 left: 0,
                 order: None,
+                pos: 0,
             })
         }
         // (go-codec's tx-sync decode keeps the map form only, until its own
@@ -1455,6 +1449,7 @@ pub fn struct_keys<T: Default>(
             left: rmp::decode::read_map_len(rd)
                 .map_err(|e| codec_err(format!("read_map_len: {e}")))?,
             order: None,
+            pos: 0,
         }),
     }
 }
@@ -1474,7 +1469,8 @@ fn array_struct_keys(rd: &mut &[u8], go_type: &'static str) -> Result<StructKeys
     }
     Ok(StructKeys {
         left: n,
-        order: Some((order, 0)),
+        order: Some(order),
+        pos: 0,
     })
 }
 

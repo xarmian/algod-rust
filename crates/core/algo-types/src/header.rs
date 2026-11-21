@@ -436,9 +436,8 @@ impl BlockHeader {
     /// means round 0: go-algorand's msgpack omits zero-valued fields, and the
     /// **genesis block** is the one header that carries round 0.
     pub(crate) fn decode_into(rd: &mut &[u8], h: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, h)?;
-        for _ in 0..len {
-            let key = rmp_decode::read_key_bytes(rd)?;
+        let mut keys = rmp_decode::struct_keys(rd, h, "bookkeeping.BlockHeader")?;
+        while let Some(key) = keys.next(rd)? {
             header_key_match!(h, key, rd, {}, {
                 // go's msgp decoder: msgp.ErrNoField (issue #2394)
                 _ => rmp_decode::unknown_key(rd, key)?,

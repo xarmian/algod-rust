@@ -230,14 +230,15 @@ the ones converted by #2426 (done in steps; the remainder is listed here until
 the last one lands): every transaction reader of `algo-types` (the signed
 transaction in its three go shapes, `Transaction`, `ApplyData`/`EvalDelta`
 and their value deltas, the multisig / LogicSig / PQ signature structs, the
-resource references, the heartbeat and state-proof structs) reads go's array
+resource references, the heartbeat and state-proof structs), the block, its
+header and the block response (`rpcs.EncodedBlockCert`) read go's array
 form through `rmp_decode::struct_keys`, positionally in go's declaration
 order from `crates/core/algo-types/src/go_struct_order.json` (dumped from go's
 types by `tools/strict-decode-oracle`, checked against go's generated
 decoders), with `ErrTooManyArrayFields` on excess. Still map-form only: the
-block and its header, the agreement codec (votes, bundles, proposal
-payloads), `msgp_schema`'s raw-subtree validator and the tx-sync response
-(go-codec's own array rules).
+agreement codec (votes, bundles, proposal payloads, the certificate),
+`msgp_schema`'s raw-subtree validator and the tx-sync response (go-codec's
+own array rules).
 
 Everything else about a struct decode is go's. Since #2424 every consensus
 reader (transactions, blocks, headers, the PQ and state-proof structs, the
@@ -267,12 +268,12 @@ changes the header's canonical re-encode and so the block hash); an integer
 where a map key belongs is rejected (serde used it as a field index; go's
 `ReadMapKeyZC` rejects it); a nil integer, boolean or struct decodes to zero
 (serde errors; go decodes zero); a `[N]byte` of another length follows
-`ReadExactBytes` (serde is strict); a struct sent as an array and a
-transaction without `type` are rejected at decode (serde accepts; go decodes
-them, the latter failing later in `WellFormed`: both only for non-canonical
-input no node emits, and never for a block whose digest a certificate
-authenticates); a repeated key decodes into the populated field (serde: last
-wins). Since #2421 a `bin` or uint8 array where a go `string` belongs is read
+`ReadExactBytes` (serde is strict); a transaction without `type` is rejected
+at decode (serde accepts; go decodes it, failing later in `WellFormed`: only
+for non-canonical input no node emits, and never for a block whose digest a
+certificate authenticates); a struct sent as an array is decoded positionally
+like go's (#2426; serde accepts only a degenerate array); a repeated key
+decodes into the populated field (serde: last wins). Since #2421 a `bin` or uint8 array where a go `string` belongs is read
 as its bytes, as go's `ReadStringZC` does (serde rejects it).
 
 **`LogicSig` (#2390).** The `LogicSig` / `MultisigSig` / `PQSig` readers
