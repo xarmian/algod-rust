@@ -1525,6 +1525,7 @@ fn cases() -> Vec<Case> {
     v.extend(info_cases());
     v.extend(followup_cases());
     v.extend(remaining_reader_cases());
+    v.extend(raw_string_cases());
     v.extend(transport_cases());
     v.extend(txn_cases());
     v.extend(read_cases_2489());
@@ -2414,6 +2415,78 @@ fn txn_cases() -> Vec<Case> {
             c.answers = vec![pq_refusal.clone()];
             v.push(c);
         }
+    }
+    v
+}
+
+/// Issue #2506: go-codec keeps a decoded string as the raw bytes of the answer,
+/// so go prints invalid UTF-8 and control bytes unchanged wherever it does not
+/// filter the value (`unicodePrintable`). Each row's mock answers strings with
+/// such bytes.
+fn raw_string_cases() -> Vec<Case> {
+    let answer = |prefix: &'static str, status: u16, body: &[u8]| Answer {
+        prefix,
+        status,
+        body: body.to_vec(),
+    };
+    let versions: &[u8] = b"{\"versions\":[\"v1\xff\",\"v\x022\"],\"genesis_id\":\"g\xffid\x07\\u0001\",\"genesis_hash_b64\":\"AA==\",\"build\":{\"major\":1,\"minor\":2,\"build_number\":3,\"commit_hash\":\"c\xffh\x01\",\"branch\":\"b\xc3\x28r\",\"channel\":\"ch\xe2\x28\xa1\"}}";
+    let app: &[u8] = b"{\"id\":7,\"params\":{\"approval-program\":\"BoEB\",\"clear-state-program\":\"BoEB\",\"creator\":\"C\xff\x01R\",\"size-sponsor\":\"S\xfe\x02\",\"global-state-schema\":{\"num-byte-slice\":1,\"num-uint\":2},\"local-state-schema\":{\"num-uint\":3},\"version\":12}}";
+    let asset: &[u8] = b"{\"index\":12,\"params\":{\"creator\":\"cr\xff\",\"decimals\":2,\"total\":12345,\"unit-name\":\"T\xff\",\"name\":\"na\xffme\x01\",\"url\":\"ur\xfel\",\"manager\":\"m\xff\",\"reserve\":\"r\xfe\x01\",\"freeze\":\"f\xfd\",\"clawback\":\"c\xfc\",\"default-frozen\":false}}";
+    let status: &[u8] = b"{\"catchup-time\":0,\"last-round\":5,\"last-version\":\"f\xffx\",\"next-version\":\"n\xc3\x28\x01\",\"next-version-round\":6,\"next-version-supported\":true,\"stopped-at-unsupported-round\":false,\"time-since-last-round\":1500000000,\"last-catchpoint\":\"lc\xff\x01\"}";
+    let catchup_status: &[u8] = b"{\"catchup-time\":2000000000,\"last-round\":5,\"last-version\":\"f\",\"next-version\":\"n\",\"next-version-round\":6,\"next-version-supported\":true,\"stopped-at-unsupported-round\":false,\"time-since-last-round\":1500000000,\"catchpoint\":\"cp\xff\x01\",\"catchpoint-total-accounts\":10,\"catchpoint-processed-accounts\":5}";
+    let parts: &[u8] = b"[{\"address\":\"ad\xff\x01\",\"id\":\"id\xfe\",\"key\":{\"selection-participation-key\":\"AQID\",\"vote-participation-key\":\"AQID\",\"vote-first-valid\":1,\"vote-last-valid\":3000000,\"vote-key-dilution\":10000}}]";
+    let error: &[u8] = b"{\"message\":\"bad \xff\x01 \xe2\x28 thing\"}";
+    let mut v = Vec::new();
+    let rows: Vec<(&str, Vec<&str>, Vec<Answer>)> = vec![
+        ("version", vec!["version"], vec![answer("/versions", 200, versions)]),
+        ("version -v", vec!["version", "-v"], vec![answer("/versions", 200, versions)]),
+        (
+            "app info",
+            vec!["app", "info", "--app-id", "7"],
+            vec![answer("/v2/applications/7$", 200, app)],
+        ),
+        (
+            "asset info",
+            vec!["asset", "info", "--assetid", "12"],
+            vec![answer("/v2/assets/12$", 200, asset)],
+        ),
+        ("node status", vec!["node", "status"], vec![answer("/v2/status", 200, status)]),
+        (
+            "node status catchpoint",
+            vec!["node", "status"],
+            vec![answer("/v2/status", 200, catchup_status)],
+        ),
+        (
+            "account listpartkeys",
+            vec!["account", "listpartkeys"],
+            vec![answer("/v2/participation", 200, parts)],
+        ),
+        (
+            "account partkeyinfo",
+            vec!["account", "partkeyinfo"],
+            vec![answer("/v2/participation", 200, parts)],
+        ),
+        ("version error", vec!["version"], vec![answer("/versions", 400, error)]),
+        (
+            "node status error",
+            vec!["node", "status"],
+            vec![answer("/v2/status", 400, error)],
+        ),
+        (
+            "app info error",
+            vec!["app", "info", "--app-id", "7"],
+            vec![answer("/v2/applications/7$", 500, error)],
+        ),
+        (
+            "asset info error",
+            vec!["asset", "info", "--assetid", "12"],
+            vec![answer("/v2/assets/12$", 404, error)],
+        ),
+    ];
+    for (name, args, answers) in rows {
+        let mut c = case(&format!("raw strings {name}"), &args);
+        c.answers = answers;
+        v.push(c);
     }
     v
 }
