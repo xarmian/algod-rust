@@ -2435,7 +2435,6 @@ fn raw_string_cases() -> Vec<Case> {
     let status: &[u8] = b"{\"catchup-time\":0,\"last-round\":5,\"last-version\":\"f\xffx\",\"next-version\":\"n\xc3\x28\x01\",\"next-version-round\":6,\"next-version-supported\":true,\"stopped-at-unsupported-round\":false,\"time-since-last-round\":1500000000,\"last-catchpoint\":\"lc\xff\x01\"}";
     let parts: &[u8] = b"[{\"address\":\"ad\xff\x01\",\"id\":\"id\xfe\",\"key\":{\"selection-participation-key\":\"AQID\",\"vote-participation-key\":\"AQID\",\"vote-first-valid\":1,\"vote-last-valid\":3000000,\"vote-key-dilution\":10000}}]";
     let held: &[u8] = b"{\"round\":5,\"asset-holdings\":[{\"asset-holding\":{\"amount\":1,\"asset-id\":12},\"asset-params\":{\"creator\":\"cr\xff\",\"decimals\":0,\"total\":5,\"unit-name\":\"u\xfe\",\"name\":\"n\xff\x01\",\"url\":\"u\xfdl\",\"manager\":\"m\xff\",\"reserve\":\"r\xfe\x01\",\"freeze\":\"f\xfd\",\"clawback\":\"c\xfc\"}}]}";
-    let apps: &[u8] = b"{\"round\":5,\"application-resources\":[{\"id\":7,\"params\":{\"creator\":\"ap\xff\x01\",\"global-state-schema\":{\"num-uint\":1,\"num-byte-slice\":2}}}]}";
     let error: &[u8] = b"{\"message\":\"bad \xff\x01 \xe2\x28 thing\"}";
     let mut v = Vec::new();
     let rows: Vec<(&str, Vec<&str>, Vec<Answer>)> = vec![
@@ -2468,9 +2467,9 @@ fn raw_string_cases() -> Vec<Case> {
             vec![answer("/v2/accounts/", 200, held)],
         ),
         (
-            "account applicationdetails",
-            vec!["account", "applicationdetails", "-a", "<A1>"],
-            vec![answer("/v2/accounts/", 200, apps)],
+            "node catchup",
+            vec!["node", "catchup", "5#AB"],
+            vec![answer("/v2/catchup/", 200, b"{\"catchup-message\":\"m\xff\x01\xc3\x28\"}")],
         ),
         ("version error", vec!["version"], vec![answer("/versions", 400, error)]),
         (
