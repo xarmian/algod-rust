@@ -134,13 +134,13 @@ fn raw_app_call_bytes(encoding: &str, value: &str) -> Result<Vec<u8>, String> {
             })?;
             Ok(num.to_be_bytes().to_vec())
         }
-        "addr" | "address" => address_from_string(value)
-            .map(|a| a.to_vec())
-            .map_err(|e| {
-                format!("Could not unmarshal checksummed address from string ({value}): {e}")
-            }),
-        "b32" | "base32" | "byte base32" => algo_avm::assembler::go_base32_decode_string(value, true)
-            .map_err(|e| format!("Could not decode base32-encoded string ({value}): {e}")),
+        "addr" | "address" => address_from_string(value).map(|a| a.to_vec()).map_err(|e| {
+            format!("Could not unmarshal checksummed address from string ({value}): {e}")
+        }),
+        "b32" | "base32" | "byte base32" => {
+            algo_avm::assembler::go_base32_decode_string(value, true)
+                .map_err(|e| format!("Could not decode base32-encoded string ({value}): {e}"))
+        }
         "b64" | "base64" | "byte base64" => {
             if let Err(at) = crate::go_json::go_base64_check(value.as_bytes()) {
                 return Err(format!(
@@ -175,9 +175,8 @@ fn raw_app_call_bytes(encoding: &str, value: &str) -> Result<Vec<u8>, String> {
 /// byte address and its 4 byte checksum (the last 4 bytes of SHA-512/256).
 fn address_from_string(s: &str) -> Result<[u8; 32], String> {
     use sha2::{Digest, Sha512_256};
-    let cast = |detail: String| {
-        format!("cannot cast encoded address string ({s}) to address: {detail}")
-    };
+    let cast =
+        |detail: String| format!("cannot cast encoded address string ({s}) to address: {detail}");
     let decoded = algo_avm::assembler::go_base32_decode_string(s, false)
         .map_err(|e| cast(format!("base32 decode error: {e}")))?;
     if decoded.len() != 36 {

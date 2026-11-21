@@ -577,7 +577,8 @@ fn parse_json_biguint(json_str: &str, bits: u16) -> Result<BigUint, String> {
     let trimmed = json_str.trim();
     // Accept both JSON numbers and quoted strings
     let num_str = trimmed.trim_matches('"');
-    let cast_err = |detail: String| format!("cannot cast JSON encoded ({json_str}) to uint: {detail}");
+    let cast_err =
+        |detail: String| format!("cannot cast JSON encoded ({json_str}) to uint: {detail}");
     if let Some(magnitude) = num_str.strip_prefix('-') {
         if let Ok(m) = magnitude.parse::<BigUint>() {
             return Err(if m.bits() > u64::from(bits) {
@@ -587,9 +588,11 @@ fn parse_json_biguint(json_str: &str, bits: u16) -> Result<BigUint, String> {
             });
         }
     }
-    num_str
-        .parse::<BigUint>()
-        .map_err(|_| cast_err(format!("math/big: cannot unmarshal \"{num_str}\" into a *big.Int")))
+    num_str.parse::<BigUint>().map_err(|_| {
+        cast_err(format!(
+            "math/big: cannot unmarshal \"{num_str}\" into a *big.Int"
+        ))
+    })
 }
 
 /// Validate that a `BigUint` value fits in `bits` bits.

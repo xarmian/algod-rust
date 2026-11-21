@@ -2211,7 +2211,10 @@ fn txn_cases() -> Vec<Case> {
         ("b32 unpadded", vec!["--app-arg", "b32:MFRGG"]),
         ("b32 ok", vec!["--app-arg", "b32:MFRGG==="]),
         ("int bad", vec!["--app-arg", "int:abc"]),
-        ("int too large", vec!["--app-arg", "int:18446744073709551616"]),
+        (
+            "int too large",
+            vec!["--app-arg", "int:18446744073709551616"],
+        ),
         ("int negative", vec!["--app-arg", "int:-1"]),
         ("int plus", vec!["--app-arg", "int:+1"]),
         ("int empty", vec!["--app-arg", "int:"]),
@@ -2230,9 +2233,15 @@ fn txn_cases() -> Vec<Case> {
         ("abi bad value", vec!["--app-arg", "abi:uint64:x"]),
         ("abi ok", vec!["--app-arg", "abi:uint64:5"]),
         ("unknown encoding", vec!["--app-arg", "weird:x"]),
-        ("second app-arg bad", vec!["--app-arg", "str:a", "--app-arg", "int:z"]),
+        (
+            "second app-arg bad",
+            vec!["--app-arg", "str:a", "--app-arg", "int:z"],
+        ),
         ("foreign-app bad", vec!["--foreign-app", "zz"]),
-        ("foreign-app too large", vec!["--foreign-app", "18446744073709551616"]),
+        (
+            "foreign-app too large",
+            vec!["--foreign-app", "18446744073709551616"],
+        ),
         ("foreign-app negative", vec!["--foreign-app", "-1"]),
         ("foreign-app list", vec!["--foreign-app", "5,zz"]),
         ("foreign-asset bad", vec!["--foreign-asset", "zz"]),
@@ -2253,7 +2262,13 @@ fn txn_cases() -> Vec<Case> {
         (
             "errors in go's order",
             vec![
-                "--app-account", "BAD", "--local", "BADADDR", "--box", "5,b64:!!", "--app-arg",
+                "--app-account",
+                "BAD",
+                "--local",
+                "BADADDR",
+                "--box",
+                "5,b64:!!",
+                "--app-arg",
                 "b64:!!",
             ],
         ),
@@ -2266,29 +2281,78 @@ fn txn_cases() -> Vec<Case> {
         v.push(c);
     }
     let other_leaves: [(&str, Vec<&str>); 7] = [
-        ("optin", vec!["app", "optin", "--app-id", "7", "-f", "<A1>", "-w", "a", "-N"]),
-        ("closeout", vec!["app", "closeout", "--app-id", "7", "-f", "<A1>", "-w", "a", "-N"]),
-        ("clear", vec!["app", "clear", "--app-id", "7", "-f", "<A1>", "-w", "a", "-N"]),
-        ("delete", vec!["app", "delete", "--app-id", "7", "-f", "<A1>", "-w", "a", "-N"]),
+        (
+            "optin",
+            vec![
+                "app", "optin", "--app-id", "7", "-f", "<A1>", "-w", "a", "-N",
+            ],
+        ),
+        (
+            "closeout",
+            vec![
+                "app", "closeout", "--app-id", "7", "-f", "<A1>", "-w", "a", "-N",
+            ],
+        ),
+        (
+            "clear",
+            vec![
+                "app", "clear", "--app-id", "7", "-f", "<A1>", "-w", "a", "-N",
+            ],
+        ),
+        (
+            "delete",
+            vec![
+                "app", "delete", "--app-id", "7", "-f", "<A1>", "-w", "a", "-N",
+            ],
+        ),
         (
             "update",
             vec![
-                "app", "update", "--app-id", "7", "-f", "<A1>", "--approval-prog", "a.teal",
-                "--clear-prog", "a.teal", "-w", "a", "-N",
+                "app",
+                "update",
+                "--app-id",
+                "7",
+                "-f",
+                "<A1>",
+                "--approval-prog",
+                "a.teal",
+                "--clear-prog",
+                "a.teal",
+                "-w",
+                "a",
+                "-N",
             ],
         ),
         (
             "create",
             vec![
-                "app", "create", "--creator", "<A1>", "--approval-prog", "a.teal", "--clear-prog",
-                "a.teal", "-w", "a", "-N",
+                "app",
+                "create",
+                "--creator",
+                "<A1>",
+                "--approval-prog",
+                "a.teal",
+                "--clear-prog",
+                "a.teal",
+                "-w",
+                "a",
+                "-N",
             ],
         ),
         (
             "method",
             vec![
-                "app", "method", "--from", "<A1>", "--app-id", "7", "--method",
-                "add(uint64,uint64)uint64", "-w", "a", "-N",
+                "app",
+                "method",
+                "--from",
+                "<A1>",
+                "--app-id",
+                "7",
+                "--method",
+                "add(uint64,uint64)uint64",
+                "-w",
+                "a",
+                "-N",
             ],
         ),
     ];
@@ -2309,15 +2373,17 @@ fn txn_cases() -> Vec<Case> {
         }
     }
     // `app box` names go through the same `AppCallBytes`
-    for (what, name) in [("b64 bad", "b64:!!"), ("int bad", "int:abc"), ("no colon", "x")] {
-        for sub in ["info"] {
-            let mut c = case(
-                &format!("app box {sub} name {what}"),
-                &["app", "box", sub, "--app-id", "7", "--name", name],
-            );
-            c.accounts = true;
-            v.push(c);
-        }
+    for (what, name) in [
+        ("b64 bad", "b64:!!"),
+        ("int bad", "int:abc"),
+        ("no colon", "x"),
+    ] {
+        let mut c = case(
+            &format!("app box info name {what}"),
+            &["app", "box", "info", "--app-id", "7", "--name", name],
+        );
+        c.accounts = true;
+        v.push(c);
     }
     for (what, extra) in method_rows {
         let mut args = method_base.to_vec();
