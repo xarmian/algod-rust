@@ -71,6 +71,18 @@ const KEY_EKU_CLIENT: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgjv
 const CERT_PROXIED: &str = "MIIBaDCCAQ6gAwIBAgIUN8284nJpYM7ZM8pahN+hmS4Ppb8wCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJZ29hbC10ZXN0MCAXDTI1MDEwMTAwMDAwMFoYDzIxMjUwMTAxMDAwMDAwWjAUMRIwEAYDVQQDDAlnb2FsLXRlc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAThXebkd5Hik8VJbf3+XwznowvkhRE80oJrcGKTS9GmFHeiXPjLi914kVq2pZmzdsrNPAnd2fFHQB/geqZCZFXjozwwOjAVBgNVHREEDjAMggphbGdvZC50ZXN0MAwGA1UdEwEB/wQCMAAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwCgYIKoZIzj0EAwIDSAAwRQIhAOXRwFPC5pK8ZIB40a5FPt627UpFlpo/RQimxzOBielZAiAHA1Tbsbd3QBg/cyewx0k8SrTWY1eeYlF1eERqSROcYg==";
 const KEY_PROXIED: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgIV5T1HPaztYbQWaeVcoum3uiYEz3TiAMj3/dzpMKp7ChRANCAAThXebkd5Hik8VJbf3+XwznowvkhRE80oJrcGKTS9GmFHeiXPjLi914kVq2pZmzdsrNPAnd2fFHQB/geqZCZFXj";
 
+// A CA chain (root, intermediate) and certificates that are CAs themselves,
+// served as the leaf; they share one key (`KEY_CA_LEAF`).
+const CERT_ROOT: &str = "MIIBTTCB9aADAgECAhQsJcM6GawcX2iizFT2NI+gkmJruTAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlnb2FsLXJvb3QwIBcNMjUwMTAxMDAwMDAwWhgPMjEyNTAxMDEwMDAwMDBaMBQxEjAQBgNVBAMMCWdvYWwtcm9vdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABB+Qhxi3a/9ds/G+1fp1p0qGBsDALMfuO+jkQBQaJawOn6ztqtWuEmEw4u9JDqUWklYugH4228jATKEvWvwVVfKjIzAhMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgGGMAoGCCqGSM49BAMCA0cAMEQCIAE1TMf5Cv6pxF7Yr04zQF5xkiGU+gUh7vwwDKiYiEDjAiAQGuj0l+av6ZjMCTAJ9cHTDh12yPhYUyX4XnOfoz9zxg==";
+const CERT_INTER: &str = "MIIBTzCB9qADAgECAhRYvoa6ngzKHjMOvALKRpJqqe/D1jAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlnb2FsLXJvb3QwIBcNMjUwMTAxMDAwMDAwWhgPMjEyNTAxMDEwMDAwMDBaMBUxEzARBgNVBAMMCmdvYWwtaW50ZXIwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAT4rVyu1scHeBIfLW+SDL4hNCdJMncB6BK+3z6fZhOHBzesHVsLXFCdmckDZhpYxpYYnIEfUVsh++cI6i3W86TJoyMwITAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAKBggqhkjOPQQDAgNIADBFAiBq9RmZ5x461cbD7Wc4w9ZLSwbVOuntRBCYlFb4J1RrJgIhAODryLOdKZOIgYl76jJeLT9rMhSqWXTmFt24njU9h7+P";
+const CERT_INTER_PL0: &str = "MIIBVjCB/aADAgECAhRx0Sgig4B3bo+hJp0GFEFC37HxlTAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlnb2FsLXJvb3QwIBcNMjUwMTAxMDAwMDAwWhgPMjEyNTAxMDEwMDAwMDBaMBkxFzAVBgNVBAMMDmdvYWwtaW50ZXItcGwwMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE+K1crtbHB3gSHy1vkgy+ITQnSTJ3AegSvt8+n2YThwc3rB1bC1xQnZnJA2YaWMaWGJyBH1FbIfvnCOot1vOkyaMmMCQwEgYDVR0TAQH/BAgwBgEB/wIBADAOBgNVHQ8BAf8EBAMCAYYwCgYIKoZIzj0EAwIDSAAwRQIhANbxs0ISnRMZwamrFKTh1nysBcLwe9G0EL4wHgg0SOPHAiAtucPn88MB0eXWTn9lopt/RX7KDuiuqYmmlQ70aHIt4g==";
+const CERT_CA_LEAF: &str = "MIIBeDCCAR+gAwIBAgIUNG3K8OjOdOUccXgMX25IbxHMmmowCgYIKoZIzj0EAwIwFTETMBEGA1UEAwwKZ29hbC1pbnRlcjAgFw0yNTAxMDEwMDAwMDBaGA8yMTI1MDEwMTAwMDAwMFowFzEVMBMGA1UEAwwMZ29hbC1jYS1sZWFmMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEaSIMYRtV2/K1PVwEcKc+B2uEy0kOeMtLB0HkzdtCo2oNHC4gVaEnUC1lt8jPM9/F8A3kwrXr7LacWIiiw+gjPKNJMEcwDwYDVR0RBAgwBocEfwAAATAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjATBgNVHSUEDDAKBggrBgEFBQcDATAKBggqhkjOPQQDAgNHADBEAiA6aYEUczxhwmg+x+fIHhEkGq48gfWQdsOHNX4SpdBBHgIgeyjds0m5PR5OXeooQuDWfKY4rcwa4Kpkwgtusja3Uz0=";
+const KEY_CA_LEAF: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgZ+CXwwT6BTfLtQUdP5gynpNHpMTp72qRBTU5Xn2XyLOhRANCAARpIgxhG1Xb8rU9XARwpz4Ha4TLSQ54y0sHQeTN20Kjag0cLiBVoSdQLWW3yM8z38XwDeTCtevstpxYiKLD6CM8";
+const CERT_CA_LEAF_BAD: &str = "MIIBfTCCASOgAwIBAgIUVdcRV8smuKRN/RUuePSuUGlDiKowCgYIKoZIzj0EAwIwFTETMBEGA1UEAwwKZ29hbC1pbnRlcjAgFw0yNTAxMDEwMDAwMDBaGA8yMTI1MDEwMTAwMDAwMFowGzEZMBcGA1UEAwwQZ29hbC1jYS1sZWFmLWJhZDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABGkiDGEbVdvytT1cBHCnPgdrhMtJDnjLSwdB5M3bQqNqDRwuIFWhJ1AtZbfIzzPfxfAN5MK16+y2nFiIosPoIzyjSTBHMA8GA1UdEQQIMAaHBH8AAAEwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAYYwEwYDVR0lBAwwCgYIKwYBBQUHAwEwCgYIKoZIzj0EAwIDSAAwRQIgBTeedKN1VxGN4OlEbM2wKZ1FZ6GflxzOIvEF5esTzzgCIQCKlDtjH+SfQpm61JCKi/gwH1T/KqlGa2lHEkpav8F7Aw==";
+const CERT_SELF_CA: &str = "MIIBejCCASGgAwIBAgIUNXuooYElOmQ6lOkOawGKZp9CxaYwCgYIKoZIzj0EAwIwFzEVMBMGA1UEAwwMZ29hbC1zZWxmLWNhMCAXDTI1MDEwMTAwMDAwMFoYDzIxMjUwMTAxMDAwMDAwWjAXMRUwEwYDVQQDDAxnb2FsLXNlbGYtY2EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARpIgxhG1Xb8rU9XARwpz4Ha4TLSQ54y0sHQeTN20Kjag0cLiBVoSdQLWW3yM8z38XwDeTCtevstpxYiKLD6CM8o0kwRzAPBgNVHREECDAGhwR/AAABMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgGGMBMGA1UdJQQMMAoGCCsGAQUFBwMBMAoGCCqGSM49BAMCA0cAMEQCIG65p+UAbDJNhDoXWfMyL9J8SF8xvg/uD5yk+1eWCr0TAiBCjXMJtDQd5Evdf4G2jO69TTj5vIeMFonqf9o5YL4zxA==";
+const CERT_SELF_CA_CLIENT: &str = "MIIBiTCCAS+gAwIBAgIUD4MbKuB8ChDe1dWKzuVV0jlxCckwCgYIKoZIzj0EAwIwHjEcMBoGA1UEAwwTZ29hbC1zZWxmLWNhLWNsaWVudDAgFw0yNTAxMDEwMDAwMDBaGA8yMTI1MDEwMTAwMDAwMFowHjEcMBoGA1UEAwwTZ29hbC1zZWxmLWNhLWNsaWVudDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABGkiDGEbVdvytT1cBHCnPgdrhMtJDnjLSwdB5M3bQqNqDRwuIFWhJ1AtZbfIzzPfxfAN5MK16+y2nFiIosPoIzyjSTBHMA8GA1UdEQQIMAaHBH8AAAEwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAYYwEwYDVR0lBAwwCgYIKwYBBQUHAwIwCgYIKoZIzj0EAwIDSAAwRQIgBiYsp9Fcu38GC1yW1XKvpj4NFxG+kYxtGn4szQ2hSSQCIQCj5cGMI0ZmndllsCgouKq38wMctGHjpaFhcVeoqNoq8w==";
+const CERT_CA_LEAF_PL: &str = "MIIBfzCCASWgAwIBAgIUMalOTTAHKQ5tBzFED0t3IkcJAFowCgYIKoZIzj0EAwIwFTETMBEGA1UEAwwKZ29hbC1pbnRlcjAgFw0yNTAxMDEwMDAwMDBaGA8yMTI1MDEwMTAwMDAwMFowGjEYMBYGA1UEAwwPZ29hbC1jYS1sZWFmLXBsMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEaSIMYRtV2/K1PVwEcKc+B2uEy0kOeMtLB0HkzdtCo2oNHC4gVaEnUC1lt8jPM9/F8A3kwrXr7LacWIiiw+gjPKNMMEowDwYDVR0RBAgwBocEfwAAATASBgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBhjATBgNVHSUEDDAKBggrBgEFBQcDATAKBggqhkjOPQQDAgNIADBFAiEAxxzXYZWk86AHT0Tck7lx57U6C5lrp7+uetlODo0BsQsCID6HmVCwCx3js6V5qiVGKaW1lggq1aYlKByUj5D6d3Um";
+
 /// The answer of a TLS server that gets as far as an HTTP request.
 const VERSIONS: &str = r#"{"versions":["v1"],"genesis_id":"tls-v1","genesis_hash_b64":"AA==","build":{"major":1,"minor":2,"build_number":3,"commit_hash":"abc","branch":"b","channel":"c"}}"#;
 
@@ -118,6 +130,8 @@ fn try_ensure_go_goal() -> Option<PathBuf> {
 enum Server {
     /// A TLS server with this certificate, which answers `/versions`.
     Tls(&'static str, &'static str),
+    /// A TLS server that sends this chain (leaf first) for this key.
+    TlsChain(&'static [&'static str], &'static str),
     /// Reads the ClientHello, writes a fatal alert record and closes.
     Alert(u8),
     /// Reads the ClientHello and closes the connection.
@@ -192,6 +206,61 @@ fn rows() -> Vec<Row> {
     v.push(tls("expired", CERT_EXPIRED, KEY_EXPIRED));
     v.push(tls("not yet valid", CERT_NOT_YET, KEY_NOT_YET));
     v.push(tls("unknown issuer", CERT_GOOD, KEY_GOOD));
+    // a certificate authority as the leaf: go builds the chain from the roots
+    // and accepts it (issue #2532)
+    let ca_leaf =
+        |name: &'static str, chain: &'static [&'static str], trust: Option<&'static str>| {
+            let mut r = row(name);
+            r.server = Some(Server::TlsChain(chain, KEY_CA_LEAF));
+            r.trust = trust;
+            r
+        };
+    v.push(ca_leaf(
+        "CA as the leaf",
+        &[CERT_SELF_CA],
+        Some(CERT_SELF_CA),
+    ));
+    v.push(ca_leaf("CA as the leaf untrusted", &[CERT_SELF_CA], None));
+    v.push(ca_leaf(
+        "CA as the leaf of another root",
+        &[CERT_SELF_CA],
+        Some(CERT_ROOT),
+    ));
+    v.push(ca_leaf(
+        "CA leaf under a root",
+        &[CERT_CA_LEAF, CERT_INTER],
+        Some(CERT_ROOT),
+    ));
+    v.push(ca_leaf(
+        "CA leaf without its intermediate",
+        &[CERT_CA_LEAF],
+        Some(CERT_ROOT),
+    ));
+    v.push(ca_leaf(
+        "CA leaf with a root nobody trusts",
+        &[CERT_CA_LEAF, CERT_INTER],
+        None,
+    ));
+    v.push(ca_leaf(
+        "CA leaf with a bad signature",
+        &[CERT_CA_LEAF_BAD, CERT_INTER],
+        Some(CERT_ROOT),
+    ));
+    v.push(ca_leaf(
+        "CA leaf under a path length 0",
+        &[CERT_CA_LEAF, CERT_INTER_PL0],
+        Some(CERT_ROOT),
+    ));
+    v.push(ca_leaf(
+        "CA leaf with a path length",
+        &[CERT_CA_LEAF_PL, CERT_INTER],
+        Some(CERT_ROOT),
+    ));
+    v.push(ca_leaf(
+        "CA as the leaf for clientAuth",
+        &[CERT_SELF_CA_CLIENT],
+        Some(CERT_SELF_CA_CLIENT),
+    ));
     // the same certificates trusted
     v.push(trusted("trusted", CERT_GOOD, KEY_GOOD));
     v.push(trusted("trusted expired", CERT_EXPIRED, KEY_EXPIRED));
@@ -317,9 +386,12 @@ fn rows() -> Vec<Row> {
 }
 
 /// A rustls server for `cert` / `key`.
-fn tls_config(cert: &str, key: &str) -> Arc<rustls::ServerConfig> {
+fn tls_config(chain: &[&str], key: &str) -> Arc<rustls::ServerConfig> {
     let decode = |s: &str| data_encoding::BASE64.decode(s.as_bytes()).unwrap();
-    let cert = rustls::pki_types::CertificateDer::from(decode(cert));
+    let chain: Vec<_> = chain
+        .iter()
+        .map(|c| rustls::pki_types::CertificateDer::from(decode(c)))
+        .collect();
     let key = rustls::pki_types::PrivateKeyDer::try_from(decode(key)).unwrap();
     Arc::new(
         rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -328,7 +400,7 @@ fn tls_config(cert: &str, key: &str) -> Arc<rustls::ServerConfig> {
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()
-        .with_single_cert(vec![cert], key)
+        .with_single_cert(chain, key)
         .unwrap(),
     )
 }
@@ -348,7 +420,8 @@ fn spawn_server(server: Server) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
     let config = match server {
-        Server::Tls(cert, key) => Some(tls_config(cert, key)),
+        Server::Tls(cert, key) => Some(tls_config(&[cert], key)),
+        Server::TlsChain(chain, key) => Some(tls_config(chain, key)),
         _ => None,
     };
     std::thread::spawn(move || {
@@ -356,7 +429,7 @@ fn spawn_server(server: Server) -> u16 {
             let Ok(mut stream) = stream else { continue };
             let config = config.clone();
             std::thread::spawn(move || match server {
-                Server::Tls(..) => {
+                Server::Tls(..) | Server::TlsChain(..) => {
                     let mut conn = rustls::ServerConnection::new(config.unwrap()).unwrap();
                     while conn.is_handshaking() {
                         if conn.complete_io(&mut stream).is_err() {
