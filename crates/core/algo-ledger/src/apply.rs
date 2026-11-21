@@ -7360,9 +7360,10 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
 /// Apply a key registration transaction (core state mutation only).
 ///
 /// Transitions account participation status:
-/// - `non_participation == true`: set NotParticipating (irreversible), clear all keys
-/// - `vote_pk` present with non-empty bytes: go Online, copy key material
-/// - Otherwise (offline keyreg): go Offline, clear all keys
+/// - a zero (or absent) `vote_pk` or `selection_pk`: go-algorand's `IsEmpty()`
+///   keys, so offline, or NotParticipating (irreversible) with
+///   `non_participation`; the voting fields are cleared
+/// - otherwise: go Online, copy key material
 ///
 /// Does NOT debit fees — the caller is responsible for calling `apply_fee()`
 /// before dispatching here. This allows the same function to be used for both
@@ -7387,95 +7388,74 @@ pub fn apply_keyreg<L: crate::store_trait::LedgerStore>(
         }
     }
 
-    // Go checks: if VotePK.IsEmpty() || SelectionPK.IsEmpty() -> offline/nonpart,
-    // else -> online.  We must check BOTH keys to determine online vs offline.
-    let vote_pk_empty = !txn.vote_pk.as_ref().is_some_and(|pk| !pk.is_empty());
-    let selection_pk_empty = !txn.selection_pk.as_ref().is_some_and(|pk| !pk.is_empty());
+    // go's `Keyreg` (`ledger/apply/keyreg.go`): the keys are fixed-size
+    // arrays there, and `IsEmpty()` means all zero bytes. An inner keyreg
+    // built with `itxn_field VotePK <32 zero bytes>` carries `Some([0; 32])`
+    // here, which is the same empty key as an absent one (issue #2515).
+    let vote_pk = txn.vote_pk.filter(|k| *k != [0u8; 32]);
+    let selection_pk = txn.selection_pk.filter(|k| *k != [0u8; 32]);
+    let state_proof_pk = txn.state_proof_pk.filter(|k| *k != [0u8; 64]);
 
-    if vote_pk_empty || selection_pk_empty {
+    let mut account = store.get_or_default_account(&txn.sender);
+
+    // Update the registered keys and mark the account online (or, if the
+    // voting or selection key is zero, offline / not participating).
+    account.vote_id = vote_pk;
+    account.selection_id = selection_pk;
+    // Go: `if params.EnableStateProofKeyregCheck { record.StateProofID = keyreg.StateProofPK }`
+    // (v31+). Before v31 the field is left untouched by Keyreg entirely.
+    if consensus.enable_state_proof_keyreg_check {
+        account.state_proof_id = state_proof_pk;
+    }
+
+    if vote_pk.is_none() || selection_pk.is_none() {
         // ── Offline or non-participating ──
-        if txn.non_participation && !consensus.support_become_non_participating_transactions {
-            // Go: SupportBecomeNonParticipatingTransactions (v18+). Before v18,
-            // a keyreg requesting Nonparticipation is rejected outright rather
-            // than silently treated as an ordinary offline keyreg.
-            return Err(AlgoError::Ledger {
-                message: "transaction tries to mark an account as nonparticipating, but that transaction is not supported".to_string(),
-            });
-        }
-        let mut account = store.get_or_default_account(&txn.sender);
         if txn.non_participation {
+            if !consensus.support_become_non_participating_transactions {
+                // Go: SupportBecomeNonParticipatingTransactions (v18+). Before
+                // v18, a keyreg requesting Nonparticipation is rejected
+                // outright rather than treated as an ordinary offline keyreg.
+                return Err(AlgoError::Ledger {
+                    message: "transaction tries to mark an account as nonparticipating, but that transaction is not supported".to_string(),
+                });
+            }
             account.status = AccountStatus::NotParticipating;
         } else {
             account.status = AccountStatus::Offline;
         }
-        account.vote_id = None;
-        account.selection_id = None;
-        account.state_proof_id = None;
         account.vote_first_valid = 0;
         account.vote_last_valid = 0;
         account.vote_key_dilution = 0;
-        store.set_account(&txn.sender, account);
-    } else if txn.vote_pk.as_ref().is_some_and(|pk| !pk.is_empty()) {
+        // IncentiveEligible is not reset: the account has gracefully gone
+        // offline and may come back without paying again.
+    } else {
         // ── Online keyreg ──
-        let vote_bytes = txn.vote_pk.as_ref().unwrap();
-        if vote_bytes.len() != 32 {
-            return Err(AlgoError::Ledger {
-                message: format!("keyreg: vote_pk length {} != 32", vote_bytes.len(),),
-            });
-        }
-        let mut vote_id = [0u8; 32];
-        vote_id.copy_from_slice(vote_bytes);
-
-        let sel_bytes = txn.selection_pk.as_ref().ok_or_else(|| AlgoError::Ledger {
-            message: "keyreg online: selection_pk is missing".to_string(),
-        })?;
-        if sel_bytes.len() != 32 {
-            return Err(AlgoError::Ledger {
-                message: format!("keyreg: selection_pk length {} != 32", sel_bytes.len(),),
-            });
-        }
-        let mut selection_id = [0u8; 32];
-        selection_id.copy_from_slice(sel_bytes);
-
-        let state_proof_id = if let Some(ref sp_bytes) = txn.state_proof_pk {
-            if !sp_bytes.is_empty() {
-                if sp_bytes.len() != 64 {
-                    return Err(AlgoError::Ledger {
-                        message: format!("keyreg: state_proof_pk length {} != 64", sp_bytes.len(),),
-                    });
-                }
-                let mut sp_id = [0u8; 64];
-                sp_id.copy_from_slice(sp_bytes);
-                Some(sp_id)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Validate participation parameters.
-        if txn.vote_key_dilution == 0 {
-            return Err(AlgoError::Ledger {
-                message: "keyreg online: vote_key_dilution must be > 0".to_string(),
-            });
-        }
-        if txn.vote_last < txn.vote_first {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "keyreg online: vote_last {} < vote_first {}",
-                    txn.vote_last, txn.vote_first
-                ),
-            });
-        }
-
         // D14: Round-based keyreg coherency check (Go: EnableKeyregCoherencyCheck, v28+).
         // VoteLast must be beyond the current round, and VoteFirst must start by next round.
         // Before v28 go-algorand did not perform this check at all, so gate it
         // on the consensus flag rather than enforcing it unconditionally --
         // otherwise a pre-v28 historical block containing a keyreg that was
         // valid under its own protocol version would be wrongly rejected.
+        //
+        // go's `Keyreg` has no other check on the fields here. That an online
+        // keyreg has a non-zero VoteKeyDilution and VoteFirst <= VoteLast are
+        // `WellFormed`'s (`KeyregTxnFields.wellFormed`), and only under the
+        // same v28+ flag, so they are checked here under that flag too and
+        // never before v28 (a pre-v28 block may hold such a keyreg).
         if consensus.enable_keyreg_coherency_check {
+            if txn.vote_key_dilution == 0 {
+                return Err(AlgoError::Ledger {
+                    message: "keyreg online: vote_key_dilution must be > 0".to_string(),
+                });
+            }
+            if txn.vote_last < txn.vote_first {
+                return Err(AlgoError::Ledger {
+                    message: format!(
+                        "keyreg online: vote_last {} < vote_first {}",
+                        txn.vote_last, txn.vote_first
+                    ),
+                });
+            }
             if txn.vote_last <= round {
                 return Err(AlgoError::Ledger {
                     message: format!(
@@ -7494,18 +7474,7 @@ pub fn apply_keyreg<L: crate::store_trait::LedgerStore>(
             }
         }
 
-        let mut account = store.get_or_default_account(&txn.sender);
         account.status = AccountStatus::Online;
-        account.vote_id = Some(vote_id);
-        account.selection_id = Some(selection_id);
-        // Go: `if params.EnableStateProofKeyregCheck { record.StateProofID = keyreg.StateProofPK }`
-        // (v31+). Before v31 the field is left untouched by Keyreg entirely,
-        // which is behaviorally equivalent to "stays empty" for any reachable
-        // pre-v31 account (the field could never have been populated by an
-        // earlier keyreg, since the feature didn't exist yet).
-        if consensus.enable_state_proof_keyreg_check {
-            account.state_proof_id = state_proof_id;
-        }
         account.vote_first_valid = txn.vote_first;
         account.vote_last_valid = txn.vote_last;
         account.vote_key_dilution = txn.vote_key_dilution;
@@ -7523,9 +7492,9 @@ pub fn apply_keyreg<L: crate::store_trait::LedgerStore>(
                 account.incentive_eligible = true;
             }
         }
-
-        store.set_account(&txn.sender, account);
     }
+
+    store.set_account(&txn.sender, account);
 
     Ok(InnerApplyData::default())
 }
@@ -10771,6 +10740,85 @@ mod tests {
             result.is_err(),
             "the same incoherent vote_last/vote_first must be rejected under the current protocol"
         );
+    }
+
+    /// Issue #2515: go's `Keyreg` (`ledger/apply/keyreg.go`) holds the keys as
+    /// fixed-size arrays where `IsEmpty()` is "all zero bytes", so an
+    /// explicitly zero key is an empty one, not an online key without a
+    /// VoteKeyDilution.
+    #[test]
+    fn test_keyreg_zero_keys_are_empty_keys() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        apply_transaction(&mut state, &keyreg_online_txn(sender, 1_000), &ctx, 0).unwrap();
+        assert_eq!(
+            state.get_account(&sender).unwrap().status,
+            AccountStatus::Online
+        );
+
+        let mut off = keyreg_offline_txn(sender, 1_000);
+        off.txn.vote_pk = Some([0u8; 32]);
+        off.txn.selection_pk = Some([0u8; 32]);
+        off.txn.state_proof_pk = Some([0u8; 64]);
+        apply_transaction(&mut state, &off, &ctx, 0)
+            .expect("a keyreg with zero keys is an offline keyreg");
+        let acct = state.get_account(&sender).unwrap();
+        assert_eq!(acct.status, AccountStatus::Offline);
+        assert_eq!(acct.vote_id, None);
+        assert_eq!(acct.selection_id, None);
+        assert_eq!(acct.state_proof_id, None);
+        assert_eq!(acct.vote_key_dilution, 0);
+        assert_eq!(acct.vote_last_valid, 0);
+
+        // One zero key is enough for go's `VotePK.IsEmpty() || SelectionPK.IsEmpty()`.
+        let mut one = keyreg_online_txn(sender, 1_000);
+        one.txn.selection_pk = Some([0u8; 32]);
+        one.txn.vote_key_dilution = 0;
+        apply_transaction(&mut state, &one, &ctx, 0)
+            .expect("a keyreg with one zero key is offline in go");
+        assert_eq!(
+            state.get_account(&sender).unwrap().status,
+            AccountStatus::Offline
+        );
+
+        // Zero keys with Nonparticipation take the account out for good.
+        let mut np = keyreg_nonpart_txn(sender, 1_000);
+        np.txn.vote_pk = Some([0u8; 32]);
+        np.txn.selection_pk = Some([0u8; 32]);
+        apply_transaction(&mut state, &np, &ctx, 0).unwrap();
+        assert_eq!(
+            state.get_account(&sender).unwrap().status,
+            AccountStatus::NotParticipating
+        );
+    }
+
+    /// go's `Keyreg` itself never checks VoteKeyDilution or VoteFirst <=
+    /// VoteLast (they are `WellFormed`'s, v28+): before v28 an online keyreg
+    /// without a dilution applies.
+    #[test]
+    fn test_keyreg_online_without_dilution_applies_pre_v28() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+        let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        ctx.consensus = consensus_params_for_version(algo_types::consensus::CONSENSUS_V27)
+            .expect("V27 must be a known protocol version");
+
+        let mut stx = keyreg_online_txn(sender, 1_000);
+        stx.txn.vote_key_dilution = 0;
+        stx.txn.vote_first = 50;
+        stx.txn.vote_last = 10;
+        apply_transaction(&mut state, &stx, &ctx, 0)
+            .expect("go's Keyreg has no VoteKeyDilution or round-order check");
+        let acct = state.get_account(&sender).unwrap();
+        assert_eq!(acct.status, AccountStatus::Online);
+        assert_eq!(acct.vote_key_dilution, 0);
+        assert_eq!(acct.vote_first_valid, 50);
+        assert_eq!(acct.vote_last_valid, 10);
     }
 
     #[test]

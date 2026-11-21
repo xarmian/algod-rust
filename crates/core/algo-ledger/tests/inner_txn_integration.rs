@@ -2557,6 +2557,70 @@ fn inner_keyreg_offline_round_trips() {
     assert!(itxn.selection_pk.is_none() || itxn.selection_pk == Some([0u8; 32]));
 }
 
+/// Issue #2515 (voimain round 24744153, app 406919): an app that goes its own
+/// account offline by setting every key field of an inner keyreg explicitly,
+/// to zero bytes (`itxn_field VotePK <32 zero bytes>`, `SelectionPK`,
+/// `StateProofPK`), with VoteKeyDilution and the vote rounds left 0.
+/// go-algorand copies the bytes into the transaction's key arrays, where the
+/// all-zero keys are `IsEmpty()`: `Keyreg` takes the offline branch
+/// (`keyreg.VotePK.IsEmpty() || keyreg.SelectionPK.IsEmpty()`), the account
+/// goes Offline and the block applies. algod-rust held the keys as
+/// `Some([0; 32])`, which its `apply_keyreg` took for a non-empty key: the
+/// online branch, which then failed with "keyreg online: vote_key_dilution
+/// must be > 0".
+#[test]
+fn inner_keyreg_with_explicit_zero_keys_takes_the_account_offline() {
+    let sender = [0xAA; 32];
+    let app_id = 42u64;
+
+    let mut store = LedgerState::new();
+    seed_app_approve(&mut store, app_id, Address([1u8; 32]));
+    let app_addr = Address(app_address(app_id));
+    fund_account(&mut store, app_addr, 10_000_000);
+    {
+        // The app's account is online with keys of its own.
+        let acct = store.get_or_default_account_mut(&app_addr);
+        acct.status = algo_types::AccountStatus::Online;
+        acct.vote_id = Some([7u8; 32]);
+        acct.selection_id = Some([8u8; 32]);
+        acct.vote_first_valid = 10;
+        acct.vote_last_valid = 1_000;
+        acct.vote_key_dilution = 100;
+    }
+
+    let txn = make_appl_txn(sender, app_id);
+    let mut ctx = make_context(&mut store, vec![txn], app_id);
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    ctx.fee_credit = 10_000;
+
+    let mut code = Vec::new();
+    code.push(0xb1); // itxn_begin
+    code.extend(pushint(2)); // TypeEnum = keyreg
+    code.extend([0xb2, 16]);
+    code.extend(pushbytes(&[0u8; 32]));
+    code.extend([0xb2, 10]); // VotePK
+    code.extend(pushbytes(&[0u8; 32]));
+    code.extend([0xb2, 11]); // SelectionPK
+    code.extend(pushbytes(&[0u8; 64]));
+    code.extend([0xb2, 63]); // StateProofPK
+    code.push(0xb3); // itxn_submit
+    code.extend(pushint(1));
+    code.push(0x43); // return
+
+    let result = run_with_context(6, &code, &mut ctx)
+        .expect("go applies an inner keyreg whose keys are all zero (offline)");
+    assert!(result);
+
+    let acct = ctx.store.get_account(&app_addr).expect("the app account");
+    assert_eq!(acct.status, algo_types::AccountStatus::Offline);
+    assert_eq!(acct.vote_id, None);
+    assert_eq!(acct.selection_id, None);
+    assert_eq!(acct.vote_first_valid, 0);
+    assert_eq!(acct.vote_last_valid, 0);
+    assert_eq!(acct.vote_key_dilution, 0);
+}
+
 /// Self-call (reentrancy) is disallowed.
 #[test]
 fn self_call_disallowed() {
