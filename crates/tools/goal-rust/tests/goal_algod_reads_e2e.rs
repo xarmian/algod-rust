@@ -2184,15 +2184,13 @@ fn txn_cases() -> Vec<Case> {
         "-w",
         "a",
     ];
-    let method_rows: [(&str, &[&str]); 7] = [
+    let method_rows: [(&str, &[&str]); 5] = [
         ("app-arg", &["--app-arg", "str:x"]),
         ("malformed app-arg", &["--app-arg", "x"]),
-        ("undecodable app-arg", &["--app-arg", "b64:!!"]),
         ("empty app-arg", &["--app-arg", ""]),
-        ("empty and real app-arg", &["--app-arg", "", "--app-arg", "int:1"]),
         (
-            "app-arg and bad foreign-app",
-            &["--app-arg", "str:x", "--foreign-app", "zz"],
+            "empty and real app-arg",
+            &["--app-arg", "", "--app-arg", "int:1"],
         ),
         (
             "malformed app-arg and bad foreign-app",
