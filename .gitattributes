@@ -18,6 +18,9 @@ crates/core/algo-consensus-crypto/src/passphrase/wordlist.txt text eol=lf
 crates/node/algo-kmd/src/wallet_schema.sql text eol=lf
 crates/node/algo-kmd/swagger.json text eol=lf
 crates/node/algo-rest-api/resources/algod.oas2.json text eol=lf
+# go goal's cobra tree as tools/goal-cobra-oracle writes it (issue #2472),
+# compared byte-for-byte against a fresh dump in CI.
+crates/tools/goal-rust/src/cobra_tree.json text eol=lf
 
 # Baked localnet-rust data dir (TASK-268): genesis.json is COPYed verbatim
 # into the Docker image and served byte-for-byte by the live `/genesis` REST
