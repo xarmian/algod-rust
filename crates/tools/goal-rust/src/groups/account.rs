@@ -274,8 +274,8 @@ pub struct ChangeonlinestatusArgs {
     pub no_wait: bool,
 }
 
-/// `account marknonparticipating -a <addr> [--firstvalid <r>] [--lastvalid <r>]
-/// [--fee <f>] [--no-wait] [-w <wallet>]`. Mirrors Go's
+/// `account marknonparticipating -a <addr> [--firstvalid <r>] [--lastvalid <r> | -v <n>]
+/// [--fee <f>] [-S <signer>] [--rekey-to <addr>] [-t <txfile>] [--no-wait] [-w <wallet>]`. Mirrors Go's
 /// `markNonparticipatingCmd` (account.go:1503-1554).
 ///
 /// Permanently marks the account non-participating — irreversible on-chain.
@@ -283,6 +283,18 @@ pub struct ChangeonlinestatusArgs {
 pub struct MarknonparticipatingArgs {
     #[arg(short = 'a', long = "address")]
     pub address: String,
+    /// Address of key to sign with, if different from address due to rekeying.
+    #[arg(short = 'S', long = "signer", default_value = "")]
+    pub signer: String,
+    /// The validity period for the status change transaction.
+    #[arg(short = 'v', long = "validrounds")]
+    pub valid_rounds: Option<u64>,
+    /// Write status change transaction to this file, rather than posting to network.
+    #[arg(short = 't', long = "txfile", default_value = "")]
+    pub txfile: String,
+    /// Rekey account to the given spending key/address.
+    #[arg(long = "rekey-to", default_value = "")]
+    pub rekey_to: String,
     /// First valid round (0/unset ⇒ current).
     #[arg(long = "firstvalid", alias = "first-valid")]
     pub first_valid: Option<u64>,

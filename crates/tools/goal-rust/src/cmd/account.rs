@@ -1383,15 +1383,6 @@ pub fn run_deletepartkey(args: DeletepartkeyArgs, cli_d: Vec<PathBuf>) -> ExitCo
     ExitCode::SUCCESS
 }
 
-/// go's `ensureFullClient(dataDir)`: kmd started, then the algod client
-/// (issue #2454).
-fn build_full_algod_client_for_dir(dd: &Path) -> Result<algo_rest_client::AlgodClient, ()> {
-    let (base, token) =
-        crate::goal_client::ensure_algod_endpoint(dd, crate::goal_client::ClientType::Full)
-            .map_err(|e| eprintln!("{e}"))?;
-    Ok(algo_rest_client::AlgodClient::new(&base, &token))
-}
-
 /// go's `ensureAlgodClient(dataDir)`: the algod base URL and token, else go's
 /// `Cannot contact Algorand node: <err>` printed (issue #2454).
 fn ensure_algod_endpoint(dd: &Path) -> Result<(String, String), ()> {
@@ -1698,16 +1689,58 @@ fn change_online_status(
         ));
     }
 
-    if !args.txfile.is_empty() {
-        return write_status_change_txn(&rt, &data_dir_path, &args, txn);
+    finish_status_change(
+        &rt,
+        &algod,
+        &data_dir_path,
+        &StatusChangeOpts {
+            txfile: &args.txfile,
+            signer: &args.signer,
+            wallet: args.wallet.as_deref(),
+            no_wait: args.no_wait,
+            label: "status change",
+            wait_prefix: "",
+        },
+        txn,
+        last,
+    )
+}
+
+/// The flags every status-change command (`changeonlinestatus`,
+/// `marknonparticipating`) shares at its end.
+struct StatusChangeOpts<'a> {
+    txfile: &'a str,
+    signer: &'a str,
+    wallet: Option<&'a str>,
+    no_wait: bool,
+    /// The `Transaction id for {label} transaction` line.
+    label: &'a str,
+    /// Prefix of go's error from waiting for the commit (`reportErrorf` in
+    /// `markNonparticipatingCmd`; `changeAccountOnlineStatus` returns it as is).
+    wait_prefix: &'a str,
+}
+
+/// go's end of `changeAccountOnlineStatus` / `markNonparticipatingCmd`:
+/// `--txfile` writes the txn (`writeTxnToFile`), otherwise it is signed
+/// (`SignTransactionWithWalletAndSigner`), broadcast and waited for.
+fn finish_status_change(
+    rt: &tokio::runtime::Runtime,
+    algod: &algo_rest_client::AlgodClient,
+    data_dir_path: &Path,
+    opts: &StatusChangeOpts<'_>,
+    txn: algo_types::Transaction,
+    last: u64,
+) -> Result<(), String> {
+    if !opts.txfile.is_empty() {
+        return write_status_change_txn(rt, data_dir_path, opts, txn);
     }
 
     // Sign & broadcast (go: `ensureWalletHandleMaybePassword`, then
     // `SignTransactionWithWalletAndSigner`).
-    let kmd = build_wallet_handle_kmd_client(&data_dir_path).map_err(|()| String::new())?;
-    let mut accounts = load_accounts(&data_dir_path).map_err(|()| String::new())?;
+    let kmd = build_wallet_handle_kmd_client(data_dir_path).map_err(|()| String::new())?;
+    let mut accounts = load_accounts(data_dir_path).map_err(|()| String::new())?;
     let (handle, _wallet_name, password) =
-        resolve_wallet_and_init(&rt, &kmd, &mut accounts, args.wallet.as_deref())
+        resolve_wallet_and_init(rt, &kmd, &mut accounts, opts.wallet)
             .map_err(|()| String::new())?;
     let signing_error = |e: String| {
         format!(
@@ -1715,25 +1748,27 @@ fn change_online_status(
              manually)"
         )
     };
-    let signer_pk = if args.signer.is_empty() {
+    let signer_pk = if opts.signer.is_empty() {
         [0u8; 32]
     } else {
         let pk =
-            algo_avm::assembler::unmarshal_checksum_address(&args.signer).map_err(signing_error)?;
+            algo_avm::assembler::unmarshal_checksum_address(opts.signer).map_err(signing_error)?;
         pk.try_into().expect("32-byte address")
     };
     let encoded = algo_codec::canonical_encode_transaction(&txn);
     let signed = rt
         .block_on(kmd.sign_transaction(&handle, &password, encoded, signer_pk))
         .map_err(|e| signing_error(crate::cmd::clerk::kmd_msg(&e)))?;
-    let txid = crate::algod_txn::broadcast(&rt, &algod, &signed.signed_transaction)
+    let txid = crate::algod_txn::broadcast(rt, algod, &signed.signed_transaction)
         .map_err(|e| format!("Couldn't broadcast tx with algod: {e}"))?;
-    println!("Transaction id for status change transaction: {txid}");
-    if args.no_wait {
+    println!("Transaction id for {} transaction: {txid}", opts.label);
+    if opts.no_wait {
         println!("Note: status will not change until transaction is finalized");
         return Ok(());
     }
-    crate::algod_txn::wait_for_commit(&rt, &algod, &txid, last).map(|_| ())
+    crate::algod_txn::wait_for_commit(rt, algod, &txid, last)
+        .map(|_| ())
+        .map_err(|e| format!("{}{e}", opts.wait_prefix))
 }
 
 /// go's `writeTxnToFile(client, false, ..)`: `--signer` is checked but not
@@ -1743,24 +1778,24 @@ fn change_online_status(
 fn write_status_change_txn(
     rt: &tokio::runtime::Runtime,
     data_dir_path: &Path,
-    args: &ChangeonlinestatusArgs,
+    opts: &StatusChangeOpts<'_>,
     txn: algo_types::Transaction,
 ) -> Result<(), String> {
-    if !args.signer.is_empty() {
-        let auth = algo_avm::assembler::unmarshal_checksum_address(&args.signer)
-            .map_err(|e| format!("Signer invalid ({}): {e}", args.signer))?;
+    if !opts.signer.is_empty() {
+        let auth = algo_avm::assembler::unmarshal_checksum_address(opts.signer)
+            .map_err(|e| format!("Signer invalid ({}): {e}", opts.signer))?;
         if auth.as_slice() == txn.sender.0.as_slice() {
             return Err("AuthAddr cannot be the same as the transaction sender".to_string());
         }
     }
-    let msig = blank_multisig_of(rt, data_dir_path, args.wallet.as_deref(), &txn.sender);
+    let msig = blank_multisig_of(rt, data_dir_path, opts.wallet, &txn.sender);
     let stx = algo_types::SignedTransaction {
         txn,
         msig,
         ..algo_types::SignedTransaction::default()
     };
     let encoded = algo_codec::canonical_encode_signed_transaction(&stx);
-    crate::cmd::clerk::write_file_0600(Path::new(&args.txfile), &encoded)
+    crate::cmd::clerk::write_file_0600(Path::new(opts.txfile), &encoded)
 }
 
 /// go's `populateBlankMultisig`: the blank multisig of `sender` when the
@@ -1794,117 +1829,96 @@ fn blank_multisig_of(
 }
 
 /// `account marknonparticipating -a <addr> ...`. Mirrors Go's
-/// `markNonparticipatingCmd` (account.go:1503-1554). Irreversible on-chain.
+/// `markNonparticipatingCmd` (account.go:1605-1658), step by step.
+/// Irreversible on-chain.
 pub fn run_marknonparticipating(
     args: MarknonparticipatingArgs,
     cli_d: Vec<PathBuf>,
     kmd_dir_flag: Option<PathBuf>,
 ) -> ExitCode {
-    let sender = match algo_types::Address::from_algorand_string(&args.address) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("Could not parse address: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let data_dir_path = match data_dir::ensure_single_data_dir(&cli_d) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(1);
-        }
-    };
-    // go: `ensureFullClient(dataDir)`, which starts kmd; the wallet handle
-    // comes later (`ensureWalletHandleMaybePassword`).
-    let _ = kmd_dir_flag;
-    let algod = match build_full_algod_client_for_dir(&data_dir_path) {
-        Ok(c) => c,
-        Err(()) => return ExitCode::from(1),
-    };
-    let kmd = match build_wallet_handle_kmd_client(&data_dir_path) {
-        Ok(c) => c,
-        Err(()) => return ExitCode::from(1),
-    };
-    let rt = match build_runtime() {
-        Ok(r) => r,
-        Err(()) => return ExitCode::from(1),
-    };
-
-    let pipeline = algo_txn_pipeline::TxnPipeline::new(algod, Some(kmd));
-    let params = match crate::algod_txn::suggested_params(&rt, pipeline.algod()) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Couldn't construct tx: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let max_txn_life =
-        match crate::cmd::clerk::resolve_max_txn_life(&data_dir_path, &params.consensus_version) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("{e}");
-                return ExitCode::from(1);
-            }
-        };
-    let (first, last) = match compute_validity(
-        args.first_valid,
-        args.last_valid,
-        params.last_round,
-        max_txn_life,
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("Could not construct transaction: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let mut txn = match algo_txn_pipeline::KeyregBuilder::nonparticipating(sender)
-        .fee(args.fee.unwrap_or(0))
-        .validity(first, last)
-        .genesis_hash(params.genesis_hash.0)
-        .build()
-    {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Could not construct transaction: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    if args.fee.is_none() {
-        txn.fee = algo_txn_pipeline::estimate_fee(&txn, params.fee, params.min_fee);
-    }
-
-    // go: `ensureWalletHandleMaybePassword` → `makeAccountsList`.
-    let mut accounts = match load_accounts(&data_dir_path) {
-        Ok(a) => a,
-        Err(()) => return ExitCode::from(1),
-    };
-    let (handle, _wallet_name, password) = match resolve_wallet_and_init(
-        &rt,
-        pipeline.kmd().expect("kmd configured above"),
-        &mut accounts,
-        args.wallet.as_deref(),
-    ) {
-        Ok(v) => v,
-        Err(()) => return ExitCode::from(1),
-    };
-
-    match sign_submit_confirm(
-        &rt,
-        &pipeline,
-        &txn,
-        &handle,
-        &password,
-        args.no_wait,
-        "mark-nonparticipating",
-        "error waiting for transaction to be committed: ",
-    ) {
+    match mark_nonparticipating(args, &cli_d, kmd_dir_flag) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("{e}");
+            if !e.is_empty() {
+                eprintln!("{e}");
+            }
             ExitCode::from(1)
         }
     }
+}
+
+fn mark_nonparticipating(
+    args: MarknonparticipatingArgs,
+    cli_d: &[PathBuf],
+    kmd_dir_flag: Option<PathBuf>,
+) -> Result<(), String> {
+    // go's `errorConstructingTX`.
+    let construct = |e: String| format!("Couldn't construct tx: {e}");
+    check_tx_validity_period_flags(args.valid_rounds, args.last_valid)?;
+    let data_dir_path = data_dir::ensure_single_data_dir(cli_d).map_err(|e| e.to_string())?;
+    // go: `ensureFullClient(dataDir)`, which starts kmd; the wallet handle
+    // comes later (`ensureWalletHandleMaybePassword`).
+    let _ = kmd_dir_flag;
+    let endpoint = crate::goal_client::ensure_algod_endpoint(
+        &data_dir_path,
+        crate::goal_client::ClientType::Full,
+    )
+    .map_err(|e| e.to_string())?;
+    let rt = build_runtime().map_err(|()| String::new())?;
+    let algod = algo_rest_client::AlgodClient::new(&endpoint.0, &endpoint.1);
+
+    // go's `client.ComputeValidityRounds(firstValid, lastValid,
+    // numValidRounds)`.
+    let params = crate::algod_txn::suggested_params(&rt, &algod).map_err(construct)?;
+    let max_txn_life =
+        crate::cmd::clerk::resolve_max_txn_life(&data_dir_path, &params.consensus_version)
+            .map_err(construct)?;
+    let (first, last) = crate::cmd::clerk::compute_validity(
+        args.first_valid,
+        args.last_valid,
+        args.valid_rounds,
+        params.last_round,
+        max_txn_life,
+    )
+    .map_err(construct)?;
+
+    // go's `MakeUnsignedBecomeNonparticipatingTx`.
+    let sender =
+        algo_avm::assembler::unmarshal_checksum_address(&args.address).map_err(construct)?;
+    let sender = algo_types::Address(sender.try_into().expect("32-byte address"));
+    let fee = args.fee.unwrap_or(0);
+    let mut txn = algo_txn_pipeline::KeyregBuilder::nonparticipating(sender)
+        .fee(fee)
+        .validity(first, last)
+        .genesis_hash(params.genesis_hash.0)
+        .build()
+        .map_err(|e| construct(e.to_string()))?;
+    if fee == 0 {
+        txn.fee = algo_txn_pipeline::estimate_fee(&txn, params.fee, params.min_fee);
+    }
+    // go: `utx.RekeyTo = parseRekey(rekeyToAddress)`, after the fee.
+    if !args.rekey_to.is_empty() {
+        let rekey = algo_avm::assembler::unmarshal_checksum_address(&args.rekey_to)?;
+        txn.rekey_to = Some(algo_types::Address(
+            rekey.try_into().expect("32-byte address"),
+        ));
+    }
+
+    finish_status_change(
+        &rt,
+        &algod,
+        &data_dir_path,
+        &StatusChangeOpts {
+            txfile: &args.txfile,
+            signer: &args.signer,
+            wallet: args.wallet.as_deref(),
+            no_wait: args.no_wait,
+            label: "mark-nonparticipating",
+            wait_prefix: "error waiting for transaction to be committed: ",
+        },
+        txn,
+        last,
+    )
 }
 
 /// go's `MakeUnsignedGoOnlineTx`: the go-online keyreg of `sender` with the

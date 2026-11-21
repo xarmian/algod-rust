@@ -1490,6 +1490,88 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
             },
         );
     }
+    // `account marknonparticipating` flags (issue #2509): go's
+    // `markNonparticipatingCmd` takes the same `--signer`, `--txfile`,
+    // `--validrounds` and `--rekey-to` as `changeonlinestatus`.
+    let mnp = |extra: &[&str]| -> Vec<String> {
+        ["account", "marknonparticipating"]
+            .iter()
+            .chain(extra)
+            .map(|s| s.to_string())
+            .collect()
+    };
+    let mnp_rows: Vec<(&str, Vec<String>)> = vec![
+        (
+            "--txfile",
+            mnp(&["-a", &a1, "-w", "sig", "--txfile", "mnp-txfile.tx"]),
+        ),
+        (
+            "--validrounds --rekey-to --txfile",
+            mnp(&[
+                "-a",
+                &a1,
+                "-w",
+                "sig",
+                "-v",
+                "10",
+                "--rekey-to",
+                &a2,
+                "-t",
+                "mnp-flags.tx",
+            ]),
+        ),
+        (
+            "--validrounds zero",
+            mnp(&["-a", &a1, "-v", "0", "-t", "x.tx"]),
+        ),
+        (
+            "--validrounds and --lastvalid",
+            mnp(&["-a", &a1, "-v", "10", "--lastvalid", "100", "-t", "x.tx"]),
+        ),
+        (
+            "--validrounds too large",
+            mnp(&["-a", &a1, "-v", "100000000", "-t", "x.tx"]),
+        ),
+        (
+            "--rekey-to unparsable",
+            mnp(&["-a", &a1, "--rekey-to", "NOTANADDRESS", "-t", "x.tx"]),
+        ),
+        (
+            "--signer --txfile",
+            mnp(&["-a", &a1, "-w", "sig", "-S", &a2, "-t", "mnp-signer.tx"]),
+        ),
+        (
+            "--signer unparsable --txfile",
+            mnp(&["-a", &a1, "-S", "NOTANADDRESS", "-t", "x.tx"]),
+        ),
+        (
+            "--signer is the sender --txfile",
+            mnp(&["-a", &a1, "-S", &a1, "-t", "x.tx"]),
+        ),
+        (
+            "--signer broadcast",
+            mnp(&["-a", &a1, "-w", "sig", "-S", &a2, "-N"]),
+        ),
+        (
+            "--signer unparsable broadcast",
+            mnp(&["-a", &a1, "-w", "sig", "-S", "NOTANADDRESS", "-N"]),
+        ),
+        (
+            "unparsable address",
+            mnp(&["-a", "NOTANADDRESS", "-t", "x.tx"]),
+        ),
+    ];
+    for (name, args) in &mnp_rows {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        step_env(
+            &format!("account marknonparticipating {name} pty"),
+            &args,
+            Stdin::Pty {
+                prompt: &e_sig,
+                line: "spw",
+            },
+        );
+    }
     // go's error when the suggested parameters cannot be fetched
     // (`ComputeValidityRounds` → `cachedSuggestedParams`), online and offline.
     for (name, online) in [("online", "-o=true"), ("offline", "-o=false")] {
@@ -1505,6 +1587,11 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
             Stdin::Null,
         );
     }
+    step_env(
+        "account marknonparticipating suggested params fail",
+        &["account", "marknonparticipating", "-a", &a1, "-N"],
+        Stdin::Null,
+    );
     algod.lock().unwrap().fail.clear();
     // What the signing commands broadcast and wrote, as `<file> <SHA-256>`
     // lines (kmd-rust signs for either goal, so the bytes must be equal).
@@ -1520,6 +1607,9 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
         "cos-partkey.tx",
         "cos-flags.tx",
         "cos-signer.tx",
+        "mnp-txfile.tx",
+        "mnp-flags.tx",
+        "mnp-signer.tx",
         "x.tx",
     ] {
         let sum = match std::fs::read(dd.join(f)) {
