@@ -49,7 +49,6 @@ use algo_codec::{
 use algo_kmd_client::KmdClient;
 use algo_rest_client::AlgodClient;
 use algo_types::{Address, SignedTransaction, StateSchema, TealValue, Transaction};
-use base64::Engine;
 
 use crate::accounts_list::AccountsList;
 use crate::cmd::app_state_json::{encode_teal_state_json, heuristic_format_entries, TealEntry};
