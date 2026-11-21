@@ -625,7 +625,9 @@ fn reason(status: u16) -> &'static str {
 
 /// A canned answer replacing `route`'s for the request paths starting with
 /// `prefix` (`""`: every path; a trailing `$`: that path only; a leading
-/// `<METHOD> `: requests of that method only).
+/// `<METHOD> `: requests of that method only). After the path, `?kv` needs
+/// the query parameter `kv` and `?!kv` its absence (issue #2510: algod's
+/// post-quantum address check runs unless `skip-pq-address-check=true`).
 #[derive(Clone)]
 struct Answer {
     prefix: &'static str,
@@ -914,7 +916,15 @@ fn route(method: &str, path: &str, mock: &Mock) -> (u16, &'static str, Vec<u8>) 
             Some((m, p)) => (Some(m), p),
             None => (None, a.prefix),
         };
+        let (prefix, cond) = match prefix.split_once('?') {
+            Some((p, c)) => (p, Some(c)),
+            None => (prefix, None),
+        };
         m.is_none_or(|m| m == method)
+            && cond.is_none_or(|c| match c.strip_prefix('!') {
+                Some(kv) => !query.split('&').any(|q| q == kv),
+                None => query.split('&').any(|q| q == c),
+            })
             && match prefix.strip_suffix('$') {
                 Some(exact) => path == exact,
                 None => path.starts_with(prefix),
@@ -2152,6 +2162,37 @@ fn txn_cases() -> Vec<Case> {
         r#"{"pool-error":"","txn":{}}"#,
     )];
     v.push(c);
+    // Issue #2510: `clerk rawsend`'s `--skip-pq-address-check` is the query
+    // parameter of the same name; algod refuses a group failing its
+    // post-quantum address check unless it is set.
+    let pq_refusal = answer(
+        "POST /v2/transactions$?!skip-pq-address-check=true",
+        400,
+        r#"{"message":"transaction 0: TEAL v13 LogicSig program hash is an Edwards25519 point and should not be used; set skip-pq-address-check=true to submit anyway if you understand the risks and know what you are doing"}"#,
+    );
+    for (what, extra) in [
+        ("without the flag", None),
+        ("with the flag", Some("--skip-pq-address-check")),
+    ] {
+        for no_wait in [true, false] {
+            let mut args = vec!["clerk", "rawsend", "-f", "raw.stx"];
+            args.extend(extra);
+            if no_wait {
+                args.push("-N");
+            }
+            let mut c = case(
+                &format!(
+                    "clerk rawsend pq check {what}{}",
+                    if no_wait { " no wait" } else { "" }
+                ),
+                &args,
+            );
+            c.accounts = true;
+            c.inputs = vec![("raw.stx", raw_signed_payment())];
+            c.answers = vec![pq_refusal.clone()];
+            v.push(c);
+        }
+    }
     v
 }
 

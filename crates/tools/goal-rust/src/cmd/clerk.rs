@@ -2557,7 +2557,8 @@ fn run_rawsend_inner(args: RawsendArgs, cli_d: Vec<PathBuf>) -> Result<ExitCode,
         for stxn in group {
             raw.extend_from_slice(&canonical_encode_signed_transaction(stxn));
         }
-        match crate::algod_txn::broadcast(&rt, &algod, &raw) {
+        match crate::algod_txn::broadcast_with_params(&rt, &algod, &raw, args.skip_pq_address_check)
+        {
             Ok(_) => {
                 for stxn in group {
                     let txid = compute_txn_id(&stxn.txn).to_string();

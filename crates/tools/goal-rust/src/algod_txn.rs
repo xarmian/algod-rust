@@ -80,11 +80,27 @@ pub fn broadcast(
     algod: &AlgodClient,
     signed: &[u8],
 ) -> Result<String, String> {
+    broadcast_with_params(rt, algod, signed, false)
+}
+
+/// go's `SendRawTransactionGroupWithParams(txgroup, skipPqAddressCheck)`:
+/// `?skip-pq-address-check=true` only when set (`rawTransactionQueryParams`).
+pub fn broadcast_with_params(
+    rt: &tokio::runtime::Runtime,
+    algod: &AlgodClient,
+    signed: &[u8],
+    skip_pq_address_check: bool,
+) -> Result<String, String> {
+    let query: &[(&str, &str)] = if skip_pq_address_check {
+        &[("skip-pq-address-check", "true")]
+    } else {
+        &[]
+    };
     let v = algod_rest::post_json(
         rt,
         &endpoint(algod),
         "/v2/transactions",
-        &[],
+        query,
         Some(signed),
         &go_codec_json::POST_TRANSACTIONS,
     )?;
