@@ -35,7 +35,6 @@
 //! one and the unknown-authority error otherwise.
 
 use crate::x509_leaf::{parse_time, tlv, validity_error};
-use rustls::pki_types::SignatureVerificationAlgorithm;
 
 /// What `Verify` reads of one certificate.
 #[derive(Debug)]
@@ -273,7 +272,8 @@ fn check_signature_from(
     parent: &Cert<'_>,
     algs: &rustls::crypto::WebPkiSupportedAlgorithms,
 ) -> Result<(), String> {
-    let violation = "x509: invalid signature: parent certificate cannot sign this kind of certificate";
+    let violation =
+        "x509: invalid signature: parent certificate cannot sign this kind of certificate";
     if (parent.version3 && !parent.bc_valid) || (parent.bc_valid && !parent.is_ca) {
         return Err(violation.to_string());
     }
@@ -282,9 +282,8 @@ fn check_signature_from(
     }
     // the provider's identifiers are the `AlgorithmIdentifier` contents or
     // the whole element, depending on the version
-    let same = |id: &[u8], der: &[u8]| {
-        id == der || tlv(der).is_some_and(|(_, content, _)| id == content)
-    };
+    let same =
+        |id: &[u8], der: &[u8]| id == der || tlv(der).is_some_and(|(_, content, _)| id == content);
     let alg = algs.all.iter().find(|a| {
         same(a.signature_alg_id().as_ref(), c.sig_alg)
             && same(a.public_key_alg_id().as_ref(), parent.spki_alg)
@@ -297,7 +296,9 @@ fn check_signature_from(
             // go's texts by public key algorithm
             const ECDSA: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
             const RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
-            let alg_oid = tlv(parent.spki_alg).and_then(|(_, b, _)| tlv(b)).map(|(_, o, _)| o);
+            let alg_oid = tlv(parent.spki_alg)
+                .and_then(|(_, b, _)| tlv(b))
+                .map(|(_, o, _)| o);
             match alg_oid {
                 Some(o) if o == ECDSA => "x509: ECDSA verification failure".to_string(),
                 Some(o) if o == RSA => "crypto/rsa: verification error".to_string(),
@@ -423,7 +424,15 @@ pub fn verify_ca_leaf(
         chains.push(vec![&leaf_cert]);
     } else {
         let mut chain = vec![&leaf_cert];
-        build(&mut chain, &roots, &inters, now, algs, &mut hint, &mut chains);
+        build(
+            &mut chain,
+            &roots,
+            &inters,
+            now,
+            algs,
+            &mut hint,
+            &mut chains,
+        );
     }
     if chains.is_empty() {
         return Err(ChainError::Unknown(hint));
