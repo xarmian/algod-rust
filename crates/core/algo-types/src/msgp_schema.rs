@@ -36,7 +36,7 @@ use algo_error::{AlgoError, Result};
 use crate::rmp_decode::bounds::{self, AllocBound};
 use crate::rmp_decode::{
     alloc_bounds_checked, no_matching_field_error, read_fixed_bytes_go_compat,
-    read_go_array_header, read_key_bytes, read_map_len, read_u64,
+    read_go_array_header, read_u64, struct_keys,
 };
 
 /// go's struct layout of a msgp value.
@@ -48,8 +48,9 @@ pub(crate) enum Sch {
     /// A fixed-size array `[N]T`: at most this many elements (go decodes
     /// fewer into the leading elements).
     ArrN(usize, &'static Sch),
-    /// A struct: exactly these keys.
-    Struct(&'static [(&'static str, Sch)]),
+    /// A struct of this go type (its positional order for the array form,
+    /// issue #2426): exactly these keys.
+    Struct(&'static str, &'static [(&'static str, Sch)]),
     /// A slice of at most this many elements (its `allocbound`, issue #2427).
     Arr(&'static AllocBound, &'static Sch),
     /// Another schema, by reference (statics cannot embed each other by value).
@@ -83,10 +84,9 @@ pub(crate) fn validate(rd: &mut &[u8], sch: &Sch) -> Result<()> {
             }
             Ok(())
         }
-        Sch::Struct(fields) => {
-            let n = read_map_len(rd)?;
-            for _ in 0..n {
-                let key = read_key_bytes(rd)?;
+        Sch::Struct(go_type, fields) => {
+            let mut keys = struct_keys(rd, &mut (), go_type)?;
+            while let Some(key) = keys.next(rd)? {
                 match fields.iter().find(|(k, _)| k.as_bytes() == key) {
                     Some((_, s)) => validate(rd, s)?,
                     None => return Err(no_matching_field_error(key)),
@@ -112,39 +112,57 @@ pub(crate) fn validate(rd: &mut &[u8], sch: &Sch) -> Result<()> {
     }
 }
 
-static PROPOSAL_VALUE: Sch = Sch::Struct(&[
-    ("dig", Sch::Fixed(32)),
-    ("encdig", Sch::Fixed(32)),
-    ("oper", Sch::Uint),
-    ("oprop", Sch::Fixed(32)),
-]);
-static CREDENTIAL: Sch = Sch::Struct(&[("pf", Sch::Fixed(80))]);
-static ONE_TIME_SIG: Sch = Sch::Struct(&[
-    ("p", Sch::Fixed(32)),
-    ("p1s", Sch::Fixed(64)),
-    ("p2", Sch::Fixed(32)),
-    ("p2s", Sch::Fixed(64)),
-    ("ps", Sch::Fixed(64)),
-    ("s", Sch::Fixed(64)),
-]);
-static VOTE_AUTH: Sch = Sch::Struct(&[
-    ("snd", Sch::Fixed(32)),
-    ("cred", Sch::Ref(&CREDENTIAL)),
-    ("sig", Sch::Ref(&ONE_TIME_SIG)),
-]);
-static EQV_AUTH: Sch = Sch::Struct(&[
-    ("snd", Sch::Fixed(32)),
-    ("cred", Sch::Ref(&CREDENTIAL)),
-    ("sig", Sch::ArrN(2, &ONE_TIME_SIG)),
-    ("props", Sch::ArrN(2, &PROPOSAL_VALUE)),
-]);
+static PROPOSAL_VALUE: Sch = Sch::Struct(
+    "agreement.proposalValue",
+    &[
+        ("dig", Sch::Fixed(32)),
+        ("encdig", Sch::Fixed(32)),
+        ("oper", Sch::Uint),
+        ("oprop", Sch::Fixed(32)),
+    ],
+);
+static CREDENTIAL: Sch = Sch::Struct(
+    "committee.UnauthenticatedCredential",
+    &[("pf", Sch::Fixed(80))],
+);
+static ONE_TIME_SIG: Sch = Sch::Struct(
+    "crypto.OneTimeSignature",
+    &[
+        ("p", Sch::Fixed(32)),
+        ("p1s", Sch::Fixed(64)),
+        ("p2", Sch::Fixed(32)),
+        ("p2s", Sch::Fixed(64)),
+        ("ps", Sch::Fixed(64)),
+        ("s", Sch::Fixed(64)),
+    ],
+);
+static VOTE_AUTH: Sch = Sch::Struct(
+    "agreement.voteAuthenticator",
+    &[
+        ("snd", Sch::Fixed(32)),
+        ("cred", Sch::Ref(&CREDENTIAL)),
+        ("sig", Sch::Ref(&ONE_TIME_SIG)),
+    ],
+);
+static EQV_AUTH: Sch = Sch::Struct(
+    "agreement.equivocationVoteAuthenticator",
+    &[
+        ("snd", Sch::Fixed(32)),
+        ("cred", Sch::Ref(&CREDENTIAL)),
+        ("sig", Sch::ArrN(2, &ONE_TIME_SIG)),
+        ("props", Sch::ArrN(2, &PROPOSAL_VALUE)),
+    ],
+);
 
 /// `agreement.Certificate` (= `unauthenticatedBundle`).
-pub(crate) static CERTIFICATE: Sch = Sch::Struct(&[
-    ("rnd", Sch::Uint),
-    ("per", Sch::Uint),
-    ("step", Sch::Uint),
-    ("prop", Sch::Ref(&PROPOSAL_VALUE)),
-    ("vote", Sch::Arr(&bounds::MAX_VOTE_THRESHOLD, &VOTE_AUTH)),
-    ("eqv", Sch::Arr(&bounds::MAX_VOTE_THRESHOLD, &EQV_AUTH)),
-]);
+pub(crate) static CERTIFICATE: Sch = Sch::Struct(
+    "agreement.Certificate",
+    &[
+        ("rnd", Sch::Uint),
+        ("per", Sch::Uint),
+        ("step", Sch::Uint),
+        ("prop", Sch::Ref(&PROPOSAL_VALUE)),
+        ("vote", Sch::Arr(&bounds::MAX_VOTE_THRESHOLD, &VOTE_AUTH)),
+        ("eqv", Sch::Arr(&bounds::MAX_VOTE_THRESHOLD, &EQV_AUTH)),
+    ],
+);

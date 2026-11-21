@@ -321,9 +321,21 @@ impl Block {
     /// top-level keys are skipped (the caller reads them); any other unknown
     /// key, at any level, is `msgp.ErrNoField` as in go (issue #2394).
     pub fn decode_with_extra_keys(rd: &mut &[u8], extra_keys: &[&[u8]]) -> DecodeResult<Self> {
+        Self::decode_as(rd, "bookkeeping.Block", extra_keys)
+    }
+
+    /// [`Self::decode_with_extra_keys`] of a message that is a go struct
+    /// embedding a block (`agreement.unauthenticatedProposal`,
+    /// `agreement.transmittedPayload`): `go_type` names it, so that the array
+    /// form reads the block's fields and then its own at go's positions.
+    pub fn decode_as(
+        rd: &mut &[u8],
+        go_type: &'static str,
+        extra_keys: &[&[u8]],
+    ) -> DecodeResult<Self> {
         let _session = rmp_decode::decode_session();
         let mut b = Self::default();
-        Self::decode_into(rd, &mut b, extra_keys)?;
+        Self::decode_into(rd, &mut b, go_type, extra_keys)?;
         Ok(b)
     }
 
@@ -332,9 +344,10 @@ impl Block {
     pub(crate) fn decode_into(
         rd: &mut &[u8],
         b: &mut Self,
+        go_type: &'static str,
         extra_keys: &[&[u8]],
     ) -> DecodeResult<()> {
-        let mut keys = rmp_decode::struct_keys(rd, b, "bookkeeping.Block")?;
+        let mut keys = rmp_decode::struct_keys(rd, b, go_type)?;
         while let Some(key) = keys.next(rd)? {
             crate::header::header_key_match!(b, key, rd, {
                 // go's `Payset` (`//msgp:allocbound Payset 100000`)
@@ -381,7 +394,9 @@ impl BlockResponse {
         let mut cert = None;
         while let Some(key) = keys.next(rd)? {
             match (key.len(), key.first().copied().unwrap_or(0)) {
-                (5, b'b') if key == b"block" => Block::decode_into(rd, &mut block, &[])?,
+                (5, b'b') if key == b"block" => {
+                    Block::decode_into(rd, &mut block, "bookkeeping.Block", &[])?
+                }
                 (4, b'c') if key == b"cert" => {
                     let v = rmp_decode::read_checked_optional_rmpv(
                         rd,

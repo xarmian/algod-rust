@@ -231,14 +231,17 @@ the last one lands): every transaction reader of `algo-types` (the signed
 transaction in its three go shapes, `Transaction`, `ApplyData`/`EvalDelta`
 and their value deltas, the multisig / LogicSig / PQ signature structs, the
 resource references, the heartbeat and state-proof structs), the block, its
-header and the block response (`rpcs.EncodedBlockCert`) read go's array
-form through `rmp_decode::struct_keys`, positionally in go's declaration
-order from `crates/core/algo-types/src/go_struct_order.json` (dumped from go's
-types by `tools/strict-decode-oracle`, checked against go's generated
-decoders), with `ErrTooManyArrayFields` on excess. Still map-form only: the
-agreement codec (votes, bundles, proposal payloads, the certificate),
-`msgp_schema`'s raw-subtree validator and the tx-sync response (go-codec's
-own array rules).
+header and the block response (`rpcs.EncodedBlockCert`), the agreement
+codec's network messages (votes, bundles, proposal payloads, the certificate,
+including `msgp_schema`'s raw-subtree validator of a block response's `cert`)
+read go's array form through `rmp_decode::struct_keys`, positionally in go's
+declaration order from `crates/core/algo-types/src/go_struct_order.json`
+(dumped from go's types by `tools/strict-decode-oracle`, checked against go's
+generated decoders), with `ErrTooManyArrayFields` on excess. Still map-form
+only: the tx-sync response (go-codec's own array rules), the identity-handshake
+and peer-meta readers, and the agreement codec's decoders of its own
+authenticated forms (`decode_authenticated_vote` and the like, which only read
+what our encoders write).
 
 Everything else about a struct decode is go's. Since #2424 every consensus
 reader (transactions, blocks, headers, the PQ and state-proof structs, the

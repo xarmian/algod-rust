@@ -36,22 +36,22 @@
    "go": "Votes",
    "key": "vote",
    "type": {
-    "k": "list",
     "e": {
      "k": "struct",
      "t": "agreement.voteAuthenticator"
-    }
+    },
+    "k": "list"
    }
   },
   {
    "go": "EquivocationVotes",
    "key": "eqv",
    "type": {
-    "k": "list",
     "e": {
      "k": "struct",
      "t": "agreement.equivocationVoteAuthenticator"
-    }
+    },
+    "k": "list"
    }
   }
  ],
@@ -76,22 +76,22 @@
    "go": "Sigs",
    "key": "sig",
    "type": {
-    "k": "list",
     "e": {
      "k": "struct",
      "t": "crypto.OneTimeSignature"
-    }
+    },
+    "k": "list"
    }
   },
   {
    "go": "Proposals",
    "key": "props",
    "type": {
-    "k": "list",
     "e": {
      "k": "struct",
      "t": "agreement.proposalValue"
-    }
+    },
+    "k": "list"
    }
   }
  ],
@@ -126,6 +126,774 @@
    "type": {
     "k": "leaf",
     "t": "bytes[32]"
+   }
+  }
+ ],
+ "agreement.rawVote": [
+  {
+   "go": "Sender",
+   "key": "snd",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Round",
+   "key": "rnd",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Period",
+   "key": "per",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Step",
+   "key": "step",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Proposal",
+   "key": "prop",
+   "type": {
+    "k": "struct",
+    "t": "agreement.proposalValue"
+   }
+  }
+ ],
+ "agreement.transmittedPayload": [
+  {
+   "go": "Round",
+   "key": "rnd",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Branch",
+   "key": "prev",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Branch512",
+   "key": "prev512",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  },
+  {
+   "go": "Seed",
+   "key": "seed",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "NativeSha512_256Commitment",
+   "key": "txn",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Sha256Commitment",
+   "key": "txn256",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Sha512Commitment",
+   "key": "txn512",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  },
+  {
+   "go": "TimeStamp",
+   "key": "ts",
+   "type": {
+    "k": "leaf",
+    "t": "int64"
+   }
+  },
+  {
+   "go": "GenesisID",
+   "key": "gen",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "GenesisHash",
+   "key": "gh",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Proposer",
+   "key": "prp",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "FeesCollected",
+   "key": "fc",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Bonus",
+   "key": "bi",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "ProposerPayout",
+   "key": "pp",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "FeeSink",
+   "key": "fees",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "RewardsPool",
+   "key": "rwd",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "RewardsLevel",
+   "key": "earn",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "RewardsRate",
+   "key": "rate",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "RewardsResidue",
+   "key": "frac",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "RewardsRecalculationRound",
+   "key": "rwcalr",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "CurrentProtocol",
+   "key": "proto",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "NextProtocol",
+   "key": "nextproto",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "NextProtocolApprovals",
+   "key": "nextyes",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "NextProtocolVoteBefore",
+   "key": "nextbefore",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "NextProtocolSwitchOn",
+   "key": "nextswitch",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "UpgradePropose",
+   "key": "upgradeprop",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "UpgradeDelay",
+   "key": "upgradedelay",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "UpgradeApprove",
+   "key": "upgradeyes",
+   "type": {
+    "k": "leaf",
+    "t": "bool"
+   }
+  },
+  {
+   "go": "TxnCounter",
+   "key": "tc",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "StateProofTracking",
+   "key": "spt",
+   "type": {
+    "e": {
+     "k": "struct",
+     "t": "bookkeeping.StateProofTrackingData"
+    },
+    "k": "map"
+   }
+  },
+  {
+   "go": "ExpiredParticipationAccounts",
+   "key": "partupdrmv",
+   "type": {
+    "e": {
+     "k": "leaf",
+     "t": "bytes[32]"
+    },
+    "k": "list"
+   }
+  },
+  {
+   "go": "AbsentParticipationAccounts",
+   "key": "partupdabs",
+   "type": {
+    "e": {
+     "k": "leaf",
+     "t": "bytes[32]"
+    },
+    "k": "list"
+   }
+  },
+  {
+   "go": "Load",
+   "key": "ld",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "CongestionTax",
+   "key": "ct",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Payset",
+   "key": "txns",
+   "type": {
+    "e": {
+     "k": "struct",
+     "t": "transactions.SignedTxnInBlock"
+    },
+    "k": "list"
+   }
+  },
+  {
+   "go": "SeedProof",
+   "key": "sdpf",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[80]"
+   }
+  },
+  {
+   "go": "OriginalPeriod",
+   "key": "oper",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "OriginalProposer",
+   "key": "oprop",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "PriorVote",
+   "key": "pv",
+   "type": {
+    "k": "struct",
+    "t": "agreement.unauthenticatedVote"
+   }
+  }
+ ],
+ "agreement.unauthenticatedBundle": [
+  {
+   "go": "Round",
+   "key": "rnd",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Period",
+   "key": "per",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Step",
+   "key": "step",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Proposal",
+   "key": "prop",
+   "type": {
+    "k": "struct",
+    "t": "agreement.proposalValue"
+   }
+  },
+  {
+   "go": "Votes",
+   "key": "vote",
+   "type": {
+    "e": {
+     "k": "struct",
+     "t": "agreement.voteAuthenticator"
+    },
+    "k": "list"
+   }
+  },
+  {
+   "go": "EquivocationVotes",
+   "key": "eqv",
+   "type": {
+    "e": {
+     "k": "struct",
+     "t": "agreement.equivocationVoteAuthenticator"
+    },
+    "k": "list"
+   }
+  }
+ ],
+ "agreement.unauthenticatedProposal": [
+  {
+   "go": "Round",
+   "key": "rnd",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Branch",
+   "key": "prev",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Branch512",
+   "key": "prev512",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  },
+  {
+   "go": "Seed",
+   "key": "seed",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "NativeSha512_256Commitment",
+   "key": "txn",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Sha256Commitment",
+   "key": "txn256",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Sha512Commitment",
+   "key": "txn512",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  },
+  {
+   "go": "TimeStamp",
+   "key": "ts",
+   "type": {
+    "k": "leaf",
+    "t": "int64"
+   }
+  },
+  {
+   "go": "GenesisID",
+   "key": "gen",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "GenesisHash",
+   "key": "gh",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Proposer",
+   "key": "prp",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "FeesCollected",
+   "key": "fc",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Bonus",
+   "key": "bi",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "ProposerPayout",
+   "key": "pp",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "FeeSink",
+   "key": "fees",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "RewardsPool",
+   "key": "rwd",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "RewardsLevel",
+   "key": "earn",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "RewardsRate",
+   "key": "rate",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "RewardsResidue",
+   "key": "frac",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "RewardsRecalculationRound",
+   "key": "rwcalr",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "CurrentProtocol",
+   "key": "proto",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "NextProtocol",
+   "key": "nextproto",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "NextProtocolApprovals",
+   "key": "nextyes",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "NextProtocolVoteBefore",
+   "key": "nextbefore",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "NextProtocolSwitchOn",
+   "key": "nextswitch",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "UpgradePropose",
+   "key": "upgradeprop",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "UpgradeDelay",
+   "key": "upgradedelay",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "UpgradeApprove",
+   "key": "upgradeyes",
+   "type": {
+    "k": "leaf",
+    "t": "bool"
+   }
+  },
+  {
+   "go": "TxnCounter",
+   "key": "tc",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "StateProofTracking",
+   "key": "spt",
+   "type": {
+    "e": {
+     "k": "struct",
+     "t": "bookkeeping.StateProofTrackingData"
+    },
+    "k": "map"
+   }
+  },
+  {
+   "go": "ExpiredParticipationAccounts",
+   "key": "partupdrmv",
+   "type": {
+    "e": {
+     "k": "leaf",
+     "t": "bytes[32]"
+    },
+    "k": "list"
+   }
+  },
+  {
+   "go": "AbsentParticipationAccounts",
+   "key": "partupdabs",
+   "type": {
+    "e": {
+     "k": "leaf",
+     "t": "bytes[32]"
+    },
+    "k": "list"
+   }
+  },
+  {
+   "go": "Load",
+   "key": "ld",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "CongestionTax",
+   "key": "ct",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Payset",
+   "key": "txns",
+   "type": {
+    "e": {
+     "k": "struct",
+     "t": "transactions.SignedTxnInBlock"
+    },
+    "k": "list"
+   }
+  },
+  {
+   "go": "SeedProof",
+   "key": "sdpf",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[80]"
+   }
+  },
+  {
+   "go": "OriginalPeriod",
+   "key": "oper",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "OriginalProposer",
+   "key": "oprop",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  }
+ ],
+ "agreement.unauthenticatedVote": [
+  {
+   "go": "R",
+   "key": "r",
+   "type": {
+    "k": "struct",
+    "t": "agreement.rawVote"
+   }
+  },
+  {
+   "go": "Cred",
+   "key": "cred",
+   "type": {
+    "k": "struct",
+    "t": "committee.UnauthenticatedCredential"
+   }
+  },
+  {
+   "go": "Sig",
+   "key": "sig",
+   "type": {
+    "k": "struct",
+    "t": "crypto.OneTimeSignature"
    }
   }
  ],
@@ -544,33 +1312,33 @@
    "go": "StateProofTracking",
    "key": "spt",
    "type": {
-    "k": "map",
     "e": {
      "k": "struct",
      "t": "bookkeeping.StateProofTrackingData"
-    }
+    },
+    "k": "map"
    }
   },
   {
    "go": "ExpiredParticipationAccounts",
    "key": "partupdrmv",
    "type": {
-    "k": "list",
     "e": {
      "k": "leaf",
      "t": "bytes[32]"
-    }
+    },
+    "k": "list"
    }
   },
   {
    "go": "AbsentParticipationAccounts",
    "key": "partupdabs",
    "type": {
-    "k": "list",
     "e": {
      "k": "leaf",
      "t": "bytes[32]"
-    }
+    },
+    "k": "list"
    }
   },
   {
@@ -593,11 +1361,11 @@
    "go": "Payset",
    "key": "txns",
    "type": {
-    "k": "list",
     "e": {
      "k": "struct",
      "t": "transactions.SignedTxnInBlock"
-    }
+    },
+    "k": "list"
    }
   }
  ],
@@ -838,33 +1606,33 @@
    "go": "StateProofTracking",
    "key": "spt",
    "type": {
-    "k": "map",
     "e": {
      "k": "struct",
      "t": "bookkeeping.StateProofTrackingData"
-    }
+    },
+    "k": "map"
    }
   },
   {
    "go": "ExpiredParticipationAccounts",
    "key": "partupdrmv",
    "type": {
-    "k": "list",
     "e": {
      "k": "leaf",
      "t": "bytes[32]"
-    }
+    },
+    "k": "list"
    }
   },
   {
    "go": "AbsentParticipationAccounts",
    "key": "partupdabs",
    "type": {
-    "k": "list",
     "e": {
      "k": "leaf",
      "t": "bytes[32]"
-    }
+    },
+    "k": "list"
    }
   },
   {
@@ -1003,11 +1771,11 @@
    "go": "Subsigs",
    "key": "subsig",
    "type": {
-    "k": "list",
     "e": {
      "k": "struct",
      "t": "crypto.MultisigSubsig"
-    }
+    },
+    "k": "list"
    }
   }
  ],
@@ -1084,11 +1852,11 @@
    "go": "Path",
    "key": "pth",
    "type": {
-    "k": "list",
     "e": {
      "k": "leaf",
      "t": "bytes"
-    }
+    },
+    "k": "list"
    }
   },
   {
@@ -1113,11 +1881,11 @@
    "go": "Path",
    "key": "pth",
    "type": {
-    "k": "list",
     "e": {
      "k": "leaf",
      "t": "bytes"
-    }
+    },
+    "k": "list"
    }
   },
   {
@@ -1270,22 +2038,22 @@
    "go": "Reveals",
    "key": "r",
    "type": {
-    "k": "map",
     "e": {
      "k": "struct",
      "t": "stateproof.Reveal"
-    }
+    },
+    "k": "map"
    }
   },
   {
    "go": "PositionsToReveal",
    "key": "pr",
    "type": {
-    "k": "list",
     "e": {
      "k": "leaf",
      "t": "uint64"
-    }
+    },
+    "k": "list"
    }
   }
  ],
@@ -1438,58 +2206,58 @@
    "go": "GlobalDelta",
    "key": "gd",
    "type": {
-    "k": "map",
     "e": {
      "k": "struct",
      "t": "basics.ValueDelta"
-    }
+    },
+    "k": "map"
    }
   },
   {
    "go": "LocalDeltas",
    "key": "ld",
    "type": {
-    "k": "map",
     "e": {
-     "k": "map",
      "e": {
       "k": "struct",
       "t": "basics.ValueDelta"
-     }
-    }
+     },
+     "k": "map"
+    },
+    "k": "map"
    }
   },
   {
    "go": "SharedAccts",
    "key": "sa",
    "type": {
-    "k": "list",
     "e": {
      "k": "leaf",
      "t": "bytes[32]"
-    }
+    },
+    "k": "list"
    }
   },
   {
    "go": "Logs",
    "key": "lg",
    "type": {
-    "k": "list",
     "e": {
      "k": "leaf",
      "t": "string"
-    }
+    },
+    "k": "list"
    }
   },
   {
    "go": "InnerTxns",
    "key": "itx",
    "type": {
-    "k": "list",
     "e": {
      "k": "struct",
      "t": "transactions.SignedTxnWithAD"
-    }
+    },
+    "k": "list"
    }
   }
  ],
@@ -1624,11 +2392,11 @@
    "go": "Args",
    "key": "arg",
    "type": {
-    "k": "list",
     "e": {
      "k": "leaf",
      "t": "bytes"
-    }
+    },
+    "k": "list"
    }
   }
  ],
@@ -2279,66 +3047,66 @@
    "go": "ApplicationArgs",
    "key": "apaa",
    "type": {
-    "k": "list",
     "e": {
      "k": "leaf",
      "t": "bytes"
-    }
+    },
+    "k": "list"
    }
   },
   {
    "go": "Accounts",
    "key": "apat",
    "type": {
-    "k": "list",
     "e": {
      "k": "leaf",
      "t": "bytes[32]"
-    }
+    },
+    "k": "list"
    }
   },
   {
    "go": "ForeignAssets",
    "key": "apas",
    "type": {
-    "k": "list",
     "e": {
      "k": "leaf",
      "t": "uint64"
-    }
+    },
+    "k": "list"
    }
   },
   {
    "go": "ForeignApps",
    "key": "apfa",
    "type": {
-    "k": "list",
     "e": {
      "k": "leaf",
      "t": "uint64"
-    }
+    },
+    "k": "list"
    }
   },
   {
    "go": "Access",
    "key": "al",
    "type": {
-    "k": "list",
     "e": {
      "k": "struct",
      "t": "transactions.ResourceRef"
-    }
+    },
+    "k": "list"
    }
   },
   {
    "go": "Boxes",
    "key": "apbx",
    "type": {
-    "k": "list",
     "e": {
      "k": "struct",
      "t": "transactions.BoxRef"
-    }
+    },
+    "k": "list"
    }
   },
   {

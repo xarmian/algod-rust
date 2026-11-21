@@ -1432,10 +1432,21 @@ pub fn struct_keys<T: Default>(
     s: &mut T,
     go_type: &'static str,
 ) -> Result<StructKeys> {
+    struct_keys_with(rd, s, T::default, go_type)
+}
+
+/// [`struct_keys`] for a struct whose zero value is not `Default`.
+#[inline]
+pub fn struct_keys_with<T>(
+    rd: &mut &[u8],
+    s: &mut T,
+    zero: impl FnOnce() -> T,
+    go_type: &'static str,
+) -> Result<StructKeys> {
     match rd.first() {
         Some(0xc0) => {
             *rd = &rd[1..];
-            *s = T::default();
+            *s = zero();
             Ok(StructKeys {
                 left: 0,
                 order: None,
