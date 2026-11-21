@@ -1336,6 +1336,21 @@ pub fn run_method(args: MethodArgs, wallet: Option<String>) -> ExitCode {
 }
 
 fn run_method_inner(args: MethodArgs, wallet: Option<String>) -> Result<ExitCode, String> {
+    // go's `getDataDirAndClient`, then `getAppInputs` (every non-empty
+    // `--app-arg` and the reference flags are parsed, in that order), then
+    // the mutual exclusion of `--arg` and `--app-arg`.
+    let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
+        .map_err(|e| e.to_string())?;
+    let _algod = build_full_algod_client_for_dir(&data_dir_path)?;
+    let mut app_args_parsed = 0usize;
+    for a in args.app_arg.iter().filter(|a| !a.is_empty()) {
+        parse_app_call_bytes(a)?;
+        app_args_parsed += 1;
+    }
+    build_ref_bundle_from_flags(&args.refs)?;
+    if app_args_parsed > 0 {
+        return Err("--arg and --app-arg are mutually exclusive, do not use --app-arg".into());
+    }
     let method = resolve_method(&args.method)?;
     let on_completion = parse_on_completion(&args.on_completion)?;
 

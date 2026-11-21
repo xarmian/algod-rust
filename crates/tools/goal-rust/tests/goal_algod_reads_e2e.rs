@@ -2170,6 +2170,42 @@ fn txn_cases() -> Vec<Case> {
         400,
         r#"{"message":"transaction 0: TEAL v13 LogicSig program hash is an Edwards25519 point and should not be used; set skip-pq-address-check=true to submit anyway if you understand the risks and know what you are doing"}"#,
     );
+    // Issue #2513: `app method` inherits `app`'s `--app-arg`, parses it and
+    // the reference flags (`getAppInputs`), then refuses it.
+    let method_base = [
+        "app",
+        "method",
+        "--from",
+        "<A1>",
+        "--app-id",
+        "7",
+        "--method",
+        "add(uint64,uint64)uint64",
+        "-w",
+        "a",
+    ];
+    let method_rows: [(&str, &[&str]); 7] = [
+        ("app-arg", &["--app-arg", "str:x"]),
+        ("malformed app-arg", &["--app-arg", "x"]),
+        ("undecodable app-arg", &["--app-arg", "b64:!!"]),
+        ("empty app-arg", &["--app-arg", ""]),
+        ("empty and real app-arg", &["--app-arg", "", "--app-arg", "int:1"]),
+        (
+            "app-arg and bad foreign-app",
+            &["--app-arg", "str:x", "--foreign-app", "zz"],
+        ),
+        (
+            "malformed app-arg and bad foreign-app",
+            &["--app-arg", "x", "--foreign-app", "zz"],
+        ),
+    ];
+    for (what, extra) in method_rows {
+        let mut args = method_base.to_vec();
+        args.extend(extra);
+        let mut c = case(&format!("app method {what}"), &args);
+        c.accounts = true;
+        v.push(c);
+    }
     for (what, extra) in [
         ("without the flag", None),
         ("with the flag", Some("--skip-pq-address-check")),
