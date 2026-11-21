@@ -867,26 +867,36 @@ _CONVERTED = None
 
 
 def converted_types():
-    """The go structs whose algod-rust reader has the array form: the type names
-    the readers pass to `rmp_decode::struct_keys` / `struct_keys_with` and the
-    raw-subtree validator's `Sch::Struct`. A struct outside this set stays a map in the array cases, so a case
-    is never about a reader that is not converted yet (issue #2426)."""
+    """The go structs whose algod-rust reader has the array form: the go type
+    names (`"pkg.Type"` string literals that are a key of the schema) in the
+    sources of the crates whose readers pass them to `rmp_decode::struct_keys` /
+    `struct_keys_with` / `Block::decode_as` or name them in `msgp_schema`'s
+    validator. A struct outside this set stays a map in the array cases, so a
+    case is never about a reader that is not converted yet (issue #2426)."""
     global _CONVERTED
     if _CONVERTED is None:
         import re
 
+        names = set(load_schema())
         found = set()
-        for base, _dirs, files in os.walk(os.path.join(ROOT, "crates")):
-            if "target" in base.split(os.sep):
-                continue
-            for f in files:
+        for crate in ("algo-types", "algo-agreement"):
+            src = os.path.join(ROOT, "crates", "core", crate, "src")
+            for f in sorted(os.listdir(src)):
                 if f.endswith(".rs"):
-                    txt = open(os.path.join(base, f), encoding="utf-8").read()
-                    found |= set(re.findall(r'struct_keys(?:_with)?\([^;]*?"([A-Za-z_][A-Za-z_0-9.]*)"', txt))
-                    # msgp_schema's raw-subtree validator
-                    found |= set(re.findall(r'Sch::Struct\("([A-Za-z_][A-Za-z_0-9.]*)"', txt))
+                    txt = open(os.path.join(src, f), encoding="utf-8").read()
+                    found |= {m for m in re.findall(r'"([a-z]+\.[A-Za-z_]+)"', txt) if m in names}
+        # structs read by another struct's reader: go's `SingleLeafProof` has
+        # `Proof`'s fields, and an `ApplyData` is read as the apply-data half
+        # of a `SignedTxnWithAD`
+        for alias, reader in (
+            ("merklearray.SingleLeafProof", "merklearray.Proof"),
+            ("transactions.ApplyData", "transactions.SignedTxnWithAD"),
+        ):
+            if reader in found:
+                found.add(alias)
         _CONVERTED = found
     return _CONVERTED
+
 
 # the go type each seed kind decodes
 ROOT_TYPES = {
