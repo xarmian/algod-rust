@@ -301,6 +301,9 @@ jobs:
           # errorRequestFail against a mock algod; fixtures/goal_algod_reads.jsonl
           # is go's output (a stale one fails goal_algod_reads_fixture_matches_go_goal).
           GOTOOLCHAIN=go1.25.3 MIXED_CLUSTER=1 cargo test -p goal-rust --test goal_algod_reads_e2e -- --nocapture
+          # #2512: `node create` / `node clone` (local disk only); the rows hold go's
+          # output and the files it left (fixtures/node_create_clone.jsonl).
+          GOTOOLCHAIN=go1.25.3 MIXED_CLUSTER=1 cargo test -p goal-rust --test node_create_clone_e2e -- --nocapture
           # #2466: its rows also hold go's request errors (a refused or
           # answer-less connection, a 401) and go-codec's decode of malformed
           # JSON answers. The go-codec port itself is checked against go's own
