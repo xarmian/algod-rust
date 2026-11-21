@@ -232,7 +232,12 @@ pub fn run_version(verbose: bool, cli_d: Vec<PathBuf>) -> ExitCode {
         if *b != BuildVersion::default() {
             crate::println_raw!(
                 "Build: {}.{}.{}.{} [{}] (commit #{})",
-                b.major, b.minor, b.build_number, b.channel, b.branch, b.commit_hash
+                b.major,
+                b.minor,
+                b.build_number,
+                b.channel,
+                b.branch,
+                b.commit_hash
             );
         }
     }

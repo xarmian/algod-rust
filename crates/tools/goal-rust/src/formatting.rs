@@ -171,6 +171,31 @@ pub fn printable(s: &str) -> String {
     unicode_printable(s).1
 }
 
+/// go's `fmt.Printf` of a string that kept the bytes of an algod answer
+/// (go-codec's `string`): written byte for byte, a text in the lossless form
+/// of [`algo_types::raw_text`] giving its original bytes back.
+pub fn print_raw(text: &str) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(&algo_types::raw_text::decode(text));
+}
+
+/// [`print_raw`] of a formatted text.
+#[macro_export]
+macro_rules! print_raw {
+    ($($arg:tt)*) => {
+        $crate::formatting::print_raw(&format!($($arg)*))
+    };
+}
+
+/// [`print_raw!`] and a newline (go's `fmt.Println`).
+#[macro_export]
+macro_rules! println_raw {
+    ($($arg:tt)*) => {
+        $crate::formatting::print_raw(&format!("{}\n", format!($($arg)*)))
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,29 +287,4 @@ mod tests {
             );
         }
     }
-}
-
-/// go's `fmt.Printf` of a string that kept the bytes of an algod answer
-/// (go-codec's `string`): written byte for byte, a text in the lossless form
-/// of [`algo_types::raw_text`] giving its original bytes back.
-pub fn print_raw(text: &str) {
-    use std::io::Write as _;
-    let mut out = std::io::stdout().lock();
-    let _ = out.write_all(&algo_types::raw_text::decode(text));
-}
-
-/// [`print_raw`] of a formatted text.
-#[macro_export]
-macro_rules! print_raw {
-    ($($arg:tt)*) => {
-        $crate::formatting::print_raw(&format!($($arg)*))
-    };
-}
-
-/// [`print_raw!`] and a newline (go's `fmt.Println`).
-#[macro_export]
-macro_rules! println_raw {
-    ($($arg:tt)*) => {
-        $crate::formatting::print_raw(&format!("{}\n", format!($($arg)*)))
-    };
 }
