@@ -1957,6 +1957,122 @@
    }
   }
  ],
+ "network.identityChallenge": [
+  {
+   "go": "Key",
+   "key": "pk",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Challenge",
+   "key": "c",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "PublicAddress",
+   "key": "a",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  }
+ ],
+ "network.identityChallengeResponse": [
+  {
+   "go": "Key",
+   "key": "pk",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Challenge",
+   "key": "c",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "ResponseChallenge",
+   "key": "rc",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  }
+ ],
+ "network.identityChallengeResponseSigned": [
+  {
+   "go": "Msg",
+   "key": "icr",
+   "type": {
+    "k": "struct",
+    "t": "network.identityChallengeResponse"
+   }
+  },
+  {
+   "go": "Signature",
+   "key": "sig",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  }
+ ],
+ "network.identityChallengeSigned": [
+  {
+   "go": "Msg",
+   "key": "ic",
+   "type": {
+    "k": "struct",
+    "t": "network.identityChallenge"
+   }
+  },
+  {
+   "go": "Signature",
+   "key": "sig",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  }
+ ],
+ "network.identityVerificationMessage": [
+  {
+   "go": "ResponseChallenge",
+   "key": "rc",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  }
+ ],
+ "network.identityVerificationMessageSigned": [
+  {
+   "go": "Msg",
+   "key": "ivm",
+   "type": {
+    "k": "struct",
+    "t": "network.identityVerificationMessage"
+   }
+  },
+  {
+   "go": "Signature",
+   "key": "sig",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  }
+ ],
  "rpcs.EncodedBlockCert": [
   {
    "go": "Block",

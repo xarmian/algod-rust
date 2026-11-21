@@ -40,9 +40,8 @@ fn codec_err(msg: impl Into<String>) -> AlgoError {
 #[inline]
 pub fn read_map_len(rd: &mut &[u8]) -> Result<u32> {
     // nil: go's ReadMapHeaderBytes decodes nil as an empty map / zeroed struct
-    // (issue #2065).
-    // DIVERGENCE DIV-004: only the map form is read; go's struct-from-array
-    // branch (ReadArrayHeaderBytes fallback) is intentionally not supported.
+    // (issue #2065). A map-typed field only: a go struct is read through
+    // `struct_keys`, which also reads go's array form (issue #2426).
     if let [0xc0, rest @ ..] = *rd {
         *rd = rest;
         return Ok(0);
@@ -1386,6 +1385,12 @@ fn go_struct_orders() -> &'static std::collections::HashMap<String, Vec<Vec<u8>>
     })
 }
 
+/// go's positional field order of the struct `go_type` (`"pkg.Type"`), or
+/// `None` for a type not in `go_struct_order.json`.
+pub fn go_struct_order(go_type: &str) -> Option<&'static [Vec<u8>]> {
+    go_struct_orders().get(go_type).map(Vec::as_slice)
+}
+
 /// The keys of one struct value being decoded: read from the stream for a map,
 /// positional (go's declaration order) for an array.
 pub struct StructKeys {
@@ -1453,9 +1458,12 @@ pub fn struct_keys_with<T>(
                 pos: 0,
             })
         }
-        // (go-codec's tx-sync decode keeps the map form only, until its own
-        // array form is ported)
-        Some(0x90..=0x9f | 0xdc | 0xdd) if !reflect_mode() => array_struct_keys(rd, go_type),
+        // go-codec's struct decode (`reflect_mode`, the tx-sync response)
+        // reads the array form the same way: positionally in the source
+        // order of the struct's encodable fields (`kStruct`, `sfiSrc`), a `nil`
+        // element zeroing the field like a `nil` map value does, and an
+        // element more than the fields an error (`ErrorIfNoField`)
+        Some(0x90..=0x9f | 0xdc | 0xdd) => array_struct_keys(rd, go_type),
         _ => Ok(StructKeys {
             left: rmp::decode::read_map_len(rd)
                 .map_err(|e| codec_err(format!("read_map_len: {e}")))?,

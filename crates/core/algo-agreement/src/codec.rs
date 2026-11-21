@@ -1435,6 +1435,14 @@ pub fn encode_credential(cred: &Credential) -> Vec<u8> {
 }
 
 /// Decode a `committee.Credential` from canonical wire-format msgpack bytes.
+///
+/// DIVERGENCE DIV-004: this and the other decoders of the codec's own
+/// authenticated forms (`decode_authenticated_vote`,
+/// `decode_authenticated_bundle` and the helpers under them) read the map
+/// form only, where go's generated decoders also read a struct sent as an
+/// array. They have no caller outside tests: go decodes these types only from
+/// its own persisted state, and the network messages (`decode_vote`,
+/// `decode_bundle`, `decode_compound_message`) read go's array form.
 pub fn decode_credential(bytes: &[u8]) -> Result<Credential, CodecError> {
     let mut cursor = Cursor::new(bytes);
     decode_credential_from_cursor(&mut cursor)
