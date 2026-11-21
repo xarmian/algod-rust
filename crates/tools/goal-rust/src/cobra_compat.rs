@@ -1088,6 +1088,7 @@ fn clap_arg(path: &str, long: &str) -> Option<(String, Option<bool>)> {
 const UNREAD: &[(&str, &[&str])] = &[
     ("account", &["wallet"]),
     ("account addpartkey", &["wallet"]),
+    ("account applicationdetails", &["wallet"]),
     ("account assetdetails", &["wallet"]),
     ("account balance", &["wallet"]),
     ("account deletepartkey", &["wallet"]),

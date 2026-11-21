@@ -1526,6 +1526,7 @@ fn cases() -> Vec<Case> {
     v.extend(followup_cases());
     v.extend(remaining_reader_cases());
     v.extend(raw_string_cases());
+    v.extend(application_details_cases());
     v.extend(transport_cases());
     v.extend(txn_cases());
     v.extend(read_cases_2489());
@@ -2419,6 +2420,151 @@ fn txn_cases() -> Vec<Case> {
     v
 }
 
+/// Issue #2530: `account applicationdetails`, the pages of `GET
+/// /v2/accounts/<addr>/applications`, with and without the application
+/// parameters, paginated and failing.
+fn application_details_cases() -> Vec<Case> {
+    let answer = |prefix: &'static str, status: u16, body: &[u8]| Answer {
+        prefix,
+        status,
+        body: body.to_vec(),
+    };
+    let full: &[u8] = b"{\"round\":5,\"application-resources\":[{\"id\":7,\"params\":{\"creator\":\"CREATOR\",\"approval-program\":\"BoEB\",\"clear-state-program\":\"BoEB\",\"global-state-schema\":{\"num-uint\":2,\"num-byte-slice\":3},\"global-state\":[{\"key\":\"a\",\"value\":{\"type\":1,\"bytes\":\"AQ==\",\"uint\":0}},{\"key\":\"b\",\"value\":{\"type\":2,\"uint\":9}},{\"key\":\"c\",\"value\":{\"type\":2,\"uint\":1}},{\"key\":\"d\",\"value\":{\"type\":0}}],\"extra-program-pages\":2},\"app-local-state\":{\"id\":7,\"schema\":{\"num-uint\":1,\"num-byte-slice\":4},\"key-value\":[{\"key\":\"k\",\"value\":{\"type\":2,\"uint\":3}},{\"key\":\"m\",\"value\":{\"type\":1,\"bytes\":\"AQ==\"}}]}},{\"id\":9,\"params\":{\"creator\":\"OTHER\",\"approval-program\":\"\",\"clear-state-program\":\"\",\"extra-program-pages\":0}},{\"id\":11,\"app-local-state\":{\"id\":11,\"schema\":{}},\"created-at-round\":3,\"deleted\":false}]}";
+    let ids_only: &[u8] = b"{\"round\":5,\"application-resources\":[{\"id\":7},{\"id\":9,\"deleted\":true,\"created-at-round\":4}]}";
+    let empty: &[u8] = b"{\"round\":5,\"application-resources\":[]}";
+    let page1: &[u8] =
+        b"{\"round\":5,\"next-token\":\"tok2\",\"application-resources\":[{\"id\":7}]}";
+    let page2: &[u8] = b"{\"round\":5,\"application-resources\":[{\"id\":9}]}";
+    let looping: &[u8] =
+        b"{\"round\":5,\"next-token\":\"a b\\u0001\",\"application-resources\":[{\"id\":7}]}";
+    let raw: &[u8] = b"{\"round\":5,\"application-resources\":[{\"id\":7,\"params\":{\"creator\":\"ap\xff\x01\",\"approval-program\":\"\",\"clear-state-program\":\"\"}}]}";
+    let rows: Vec<(&str, Vec<&str>, Vec<Answer>)> = vec![
+        (
+            "include params",
+            vec![
+                "account",
+                "applicationdetails",
+                "-a",
+                "<A1>",
+                "--include-params",
+            ],
+            vec![answer("/v2/accounts/", 200, full)],
+        ),
+        (
+            "without params",
+            vec!["account", "applicationdetails", "-a", "<A1>"],
+            vec![answer("/v2/accounts/", 200, ids_only)],
+        ),
+        (
+            "empty",
+            vec!["account", "applicationdetails", "-a", "<A1>"],
+            vec![answer("/v2/accounts/", 200, empty)],
+        ),
+        (
+            "pages",
+            vec!["account", "applicationdetails", "-a", "<A1>"],
+            vec![
+                answer("/v2/accounts/?!next=tok2", 200, page1),
+                answer("/v2/accounts/?next=tok2", 200, page2),
+            ],
+        ),
+        (
+            "limit stops after a page",
+            vec!["account", "applicationdetails", "-a", "<A1>", "-l", "1"],
+            vec![answer("/v2/accounts/", 200, looping)],
+        ),
+        (
+            "next stops after a page",
+            vec![
+                "account",
+                "applicationdetails",
+                "-a",
+                "<A1>",
+                "--next",
+                "tok2",
+            ],
+            vec![answer("/v2/accounts/", 200, looping)],
+        ),
+        (
+            "limit and include params",
+            vec![
+                "account",
+                "applicationdetails",
+                "-a",
+                "<A1>",
+                "--limit",
+                "2",
+                "--include-params",
+            ],
+            vec![answer("/v2/accounts/", 200, full)],
+        ),
+        (
+            "raw creator",
+            vec![
+                "account",
+                "applicationdetails",
+                "-a",
+                "<A1>",
+                "--include-params",
+            ],
+            vec![answer("/v2/accounts/", 200, raw)],
+        ),
+        (
+            "401",
+            vec!["account", "applicationdetails", "-a", "<A1>"],
+            vec![answer(
+                "/v2/accounts/",
+                401,
+                b"{\"message\":\"Invalid API Token\"}",
+            )],
+        ),
+        (
+            "400",
+            vec!["account", "applicationdetails", "-a", "<A1>"],
+            vec![answer(
+                "/v2/accounts/",
+                400,
+                b"{\"message\":\"bad \\u0001 thing\"}",
+            )],
+        ),
+        (
+            "malformed",
+            vec!["account", "applicationdetails", "-a", "<A1>"],
+            vec![answer("/v2/accounts/", 200, b"{\"round\":\"five\"}")],
+        ),
+        (
+            "unknown field",
+            vec!["account", "applicationdetails", "-a", "<A1>"],
+            vec![answer("/v2/accounts/", 200, b"{\"foo\":1}")],
+        ),
+        (
+            "second page fails",
+            vec!["account", "applicationdetails", "-a", "<A1>"],
+            vec![
+                answer("/v2/accounts/?!next=tok2", 200, page1),
+                answer("/v2/accounts/?next=tok2", 500, b"{\"message\":\"down\"}"),
+            ],
+        ),
+    ];
+    let mut v = Vec::new();
+    for (name, args, answers) in rows {
+        let mut c = case(&format!("account applicationdetails {name}"), &args);
+        c.answers = answers;
+        v.push(c);
+    }
+    let mut c = case(
+        "account applicationdetails refused",
+        &["account", "applicationdetails", "-a", "<A1>"],
+    );
+    c.refused = true;
+    v.push(c);
+    v.push(case(
+        "account applicationdetails no address",
+        &["account", "applicationdetails"],
+    ));
+    v
+}
+
 /// Issue #2506: go-codec keeps a decoded string as the raw bytes of the answer,
 /// so go prints invalid UTF-8 and control bytes unchanged wherever it does not
 /// filter the value (`unicodePrintable`). Each row's mock answers strings with
@@ -2438,8 +2584,16 @@ fn raw_string_cases() -> Vec<Case> {
     let error: &[u8] = b"{\"message\":\"bad \xff\x01 \xe2\x28 thing\"}";
     let mut v = Vec::new();
     let rows: Vec<(&str, Vec<&str>, Vec<Answer>)> = vec![
-        ("version", vec!["version"], vec![answer("/versions", 200, versions)]),
-        ("version -v", vec!["version", "-v"], vec![answer("/versions", 200, versions)]),
+        (
+            "version",
+            vec!["version"],
+            vec![answer("/versions", 200, versions)],
+        ),
+        (
+            "version -v",
+            vec!["version", "-v"],
+            vec![answer("/versions", 200, versions)],
+        ),
         (
             "app info",
             vec!["app", "info", "--app-id", "7"],
@@ -2450,7 +2604,11 @@ fn raw_string_cases() -> Vec<Case> {
             vec!["asset", "info", "--assetid", "12"],
             vec![answer("/v2/assets/12$", 200, asset)],
         ),
-        ("node status", vec!["node", "status"], vec![answer("/v2/status", 200, status)]),
+        (
+            "node status",
+            vec!["node", "status"],
+            vec![answer("/v2/status", 200, status)],
+        ),
         (
             "account listpartkeys",
             vec!["account", "listpartkeys"],
@@ -2469,9 +2627,17 @@ fn raw_string_cases() -> Vec<Case> {
         (
             "node catchup",
             vec!["node", "catchup", "5#AB"],
-            vec![answer("/v2/catchup/", 200, b"{\"catchup-message\":\"m\xff\x01\xc3\x28\"}")],
+            vec![answer(
+                "/v2/catchup/",
+                200,
+                b"{\"catchup-message\":\"m\xff\x01\xc3\x28\"}",
+            )],
         ),
-        ("version error", vec!["version"], vec![answer("/versions", 400, error)]),
+        (
+            "version error",
+            vec!["version"],
+            vec![answer("/versions", 400, error)],
+        ),
         (
             "node status error",
             vec!["node", "status"],

@@ -42,7 +42,7 @@
 
 use base64::Engine as _;
 use goal_rust::go_codec_json::{
-    decode, Ty, ACCOUNT, ACCOUNT_ASSET, ACCOUNT_ASSETS_INFORMATION, APPLICATION, ASSET,
+    decode, Ty, ACCOUNT, ACCOUNT_APPLICATIONS_INFORMATION, ACCOUNT_ASSET, ACCOUNT_ASSETS_INFORMATION, APPLICATION, ASSET,
     CATCHPOINT_RESPONSE, NODE_STATUS, PARTICIPATION_KEYS, PENDING_TRANSACTION, POST_PARTICIPATION,
     POST_TRANSACTIONS, SUPPLY, TRANSACTION_PARAMETERS, VERSION,
 };
@@ -58,6 +58,7 @@ fn ty(name: &str) -> &'static Ty {
         "asset" => &ASSET,
         "application" => &APPLICATION,
         "account-assets" => &ACCOUNT_ASSETS_INFORMATION,
+        "account-applications" => &ACCOUNT_APPLICATIONS_INFORMATION,
         "account-asset" => &ACCOUNT_ASSET,
         "participation-keys" => &PARTICIPATION_KEYS,
         "post-participation" => &POST_PARTICIPATION,
