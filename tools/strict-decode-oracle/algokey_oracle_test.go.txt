@@ -1,0 +1,251 @@
+// Copyright (C) 2019-2026 Algorand Foundation Ltd.
+// Modifications Copyright (C) 2026 Algod DAO
+// This file is part of algod-rust, a modified work based on go-algorand
+// (https://github.com/algorand/go-algorand).
+//
+// algod-rust is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// algod-rust is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with algod-rust.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// This file is NOT part of any Go module here: it is a template that
+// scripts/strict-decode/strict_decode_fixtures.py copies, as
+// zz_strict_decode_oracle_test.go, into the pinned go-algorand checkout's
+// cmd/algokey package (the key file types are unexported) and runs there.
+// Issue #2521.
+//
+// For every {"name","kind","hex"} row of $STRICT_IN it runs go's real decode of
+// a PQ private key file, `protocol.Decode` into `pqSigningMaterial`
+// (`decodePQPrivateKeyFileBytes` before its `validate()`), and writes
+// {"name","ok","err","enc"} to $STRICT_OUT (`enc`: the hex of go's re-encode of
+// the decoded value):
+//
+//	pqkey  protocol.Decode into pqSigningMaterial
+//
+// With $STRICT_SEEDS_OUT it writes fully populated random seeds, and with
+// $STRICT_SCHEMA_OUT the msgp field layout of the two key file structs (the
+// positional order of go's struct-from-array decode).
+
+package main
+
+import (
+	"bufio"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"math/rand"
+	"os"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/algorand/go-algorand/protocol"
+	"github.com/algorand/msgp/msgp"
+)
+
+func TestStrictDecodeOracleAlgokey(t *testing.T) {
+	in, err := os.Open(os.Getenv("STRICT_IN"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	out, err := os.Create(os.Getenv("STRICT_OUT"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+
+	type row struct {
+		Name string `json:"name"`
+		Kind string `json:"kind"`
+		Hex  string `json:"hex"`
+	}
+	type res struct {
+		Name string `json:"name"`
+		Ok   bool   `json:"ok"`
+		Err  string `json:"err"`
+		Enc  string `json:"enc,omitempty"`
+	}
+	sc := bufio.NewScanner(in)
+	sc.Buffer(make([]byte, 1<<20), 1<<28)
+	enc := json.NewEncoder(out)
+	for sc.Scan() {
+		var r row
+		if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
+			t.Fatal(err)
+		}
+		b, err := hex.DecodeString(r.Hex)
+		if err != nil {
+			t.Fatal(err)
+		}
+		func() {
+			o := res{Name: r.Name}
+			defer func() {
+				if x := recover(); x != nil {
+					o.Ok, o.Err = false, fmt.Sprintf("panic: %v", x)
+				}
+				enc.Encode(o)
+			}()
+			switch r.Kind {
+			case "pqkey":
+				var v pqSigningMaterial
+				if derr := protocol.Decode(b, &v); derr != nil {
+					o.Err = derr.Error()
+				} else {
+					o.Ok = true
+					// A nil []byte encodes as nil and an empty one as an empty bin; the
+					// decoder here cannot tell them apart (nothing reads the difference:
+					// validate() only checks the length), so the comparison folds them.
+					if v.PrivateKey == nil {
+						v.PrivateKey = []byte{}
+					}
+					if v.Public.PublicKey == nil {
+						v.Public.PublicKey = []byte{}
+					}
+					o.Enc = hex.EncodeToString(protocol.Encode(&v))
+				}
+			default:
+				t.Fatalf("unknown kind %q", r.Kind)
+			}
+		}()
+	}
+}
+
+// TestStrictDecodeSeedsAlgokey writes $STRICT_SEEDS_OUT: fully populated random
+// key files.
+func TestStrictDecodeSeedsAlgokey(t *testing.T) {
+	path := os.Getenv("STRICT_SEEDS_OUT")
+	if path == "" {
+		t.Skip("STRICT_SEEDS_OUT not set")
+	}
+	out, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	enc := json.NewEncoder(out)
+	rand.Seed(2521)
+	for i := 0; i < 6; i++ {
+		o, err := protocol.RandomizeObject(&pqSigningMaterial{}, protocol.RandomizeObjectWithMaxCollectionLen(40))
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, ok := o.(msgp.Marshaler)
+		if !ok {
+			t.Fatalf("%T is not a msgp.Marshaler", o)
+		}
+		enc.Encode(map[string]string{"name": fmt.Sprintf("pqkey_rand%d", i), "kind": "pqkey", "hex": hex.EncodeToString(protocol.Encode(m))})
+	}
+}
+
+// schemaType describes one field's value: a leaf (a scalar named by its Go
+// kind, "bytes", "bytes[N]", or a struct with a hand-written msgp codec), a
+// struct, or a list / map of those.
+type schemaType struct {
+	Kind string      `json:"k"`
+	Name string      `json:"t,omitempty"`
+	Elem *schemaType `json:"e,omitempty"`
+}
+
+type schemaField struct {
+	GoName string     `json:"go"`
+	Key    string     `json:"key"`
+	Type   schemaType `json:"type"`
+}
+
+// opaqueStructs are structs whose msgp codec is written by hand (`//msgp:ignore`
+// and custom marshalers): they are one value on the wire, not a map.
+var opaqueStructs = map[string]bool{"basics.MicroAlgos": true}
+
+func schemaOfType(rt reflect.Type, out map[string][]schemaField) schemaType {
+	for rt.Kind() == reflect.Ptr {
+		rt = rt.Elem()
+	}
+	switch rt.Kind() {
+	case reflect.Struct:
+		name := rt.String()
+		if opaqueStructs[name] {
+			return schemaType{Kind: "leaf", Name: "uint64"}
+		}
+		if _, done := out[name]; !done {
+			out[name] = nil // cut recursion
+			out[name] = schemaFields(rt, out)
+		}
+		return schemaType{Kind: "struct", Name: name}
+	case reflect.Slice, reflect.Array:
+		if rt.Elem().Kind() == reflect.Uint8 {
+			if rt.Kind() == reflect.Array {
+				return schemaType{Kind: "leaf", Name: fmt.Sprintf("bytes[%d]", rt.Len())}
+			}
+			return schemaType{Kind: "leaf", Name: "bytes"}
+		}
+		e := schemaOfType(rt.Elem(), out)
+		return schemaType{Kind: "list", Elem: &e}
+	case reflect.Map:
+		e := schemaOfType(rt.Elem(), out)
+		return schemaType{Kind: "map", Elem: &e}
+	}
+	// a scalar: its Go kind (uint64, bool, string, ...)
+	return schemaType{Kind: "leaf", Name: rt.Kind().String()}
+}
+
+// schemaFields lists a struct's msgp fields in declaration order: an embedded
+// struct without a codec name is flattened in place, a `codec:"-"` or
+// unexported field is skipped, and an empty codec name is the Go field name.
+func schemaFields(rt reflect.Type, out map[string][]schemaField) []schemaField {
+	var fs []schemaField
+	for i := 0; i < rt.NumField(); i++ {
+		f := rt.Field(i)
+		tag := f.Tag.Get("codec")
+		name := strings.Split(tag, ",")[0]
+		if name == "-" || f.Name == "_struct" || (f.PkgPath != "" && !f.Anonymous) {
+			continue
+		}
+		if f.Anonymous && name == "" {
+			ft := f.Type
+			for ft.Kind() == reflect.Ptr {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct {
+				fs = append(fs, schemaFields(ft, out)...)
+				continue
+			}
+		}
+		if name == "" {
+			name = f.Name
+		}
+		fs = append(fs, schemaField{GoName: f.Name, Key: name, Type: schemaOfType(f.Type, out)})
+	}
+	return fs
+}
+
+// TestStrictDecodeSchemaAlgokey writes $STRICT_SCHEMA_OUT.
+func TestStrictDecodeSchemaAlgokey(t *testing.T) {
+	path := os.Getenv("STRICT_SCHEMA_OUT")
+	if path == "" {
+		t.Skip("STRICT_SCHEMA_OUT not set")
+	}
+	out := map[string][]schemaField{}
+	for _, v := range []any{
+		pqSigningMaterial{}, pqPublicMaterial{},
+	} {
+		schemaOfType(reflect.TypeOf(v), out)
+	}
+	b, err := json.MarshalIndent(out, "", " ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(b, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

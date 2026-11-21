@@ -83,7 +83,7 @@ fn norm_port(g: &GoLogicSig) -> String {
 }
 
 /// Records the hand-written readers decode differently on purpose: struct-from-array
-/// and repeated keys (`docs/DIVERGENCES.md` DIV-004).
+/// and repeated keys (the retired `docs/DIVERGENCES.md` DIV-004).
 fn is_div004(name: &str) -> bool {
     name.contains("array form")
         || name.contains("as array")

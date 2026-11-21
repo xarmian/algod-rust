@@ -21,8 +21,9 @@ This script asserts the two never drift:
 
   * every marker id has a table row AND a section in the register;
   * every register id has a table row AND a section;
-  * every row whose status is not `reserved` has at least one marker
-    (`reserved` = id allocated, implementation not landed yet);
+  * every row whose status is not `reserved` or `retired` has at least one
+    marker (`reserved` = id allocated, implementation not landed yet;
+    `retired` = no longer differs, kept for history, its markers are gone);
   * ids are DIV-001, DIV-002, ... with no gaps;
   * every marker carries a description after the colon;
   * statuses are one of: reserved, in-progress, landed, retired.
@@ -116,7 +117,7 @@ def check(root, register_path):
             sites = ", ".join("{}:{}".format(p, n) for p, n in markers[did][:3])
             problems.append("{} is marked in source ({}) but not in the register".format(did, sites))
     for did, status in sorted(rows.items()):
-        if status != "reserved" and did not in markers:
+        if status not in ("reserved", "retired") and did not in markers:
             problems.append("{} ({}) has no source marker `DIVERGENCE {}: ...`".format(did, status, did))
 
     ids = sorted(set(rows) | set(sections))

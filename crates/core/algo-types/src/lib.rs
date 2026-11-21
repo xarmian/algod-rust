@@ -67,9 +67,9 @@ pub mod go_msgp {
         read_address_go_compat, read_bytes_go_compat, read_fixed_array_into,
         read_fixed_bytes_go_compat, read_fixed_bytes_into_go_compat, read_go_array_header,
         read_key_bytes, read_map_len, read_slice_into, read_str_bytes, read_string, read_u64,
-        skip_value, struct_keys, struct_keys_with, DecodeSession, StructKeys, EVAL_MAX_ARGS,
-        MAX_LOGIC_SIG_ARG_SIZE, MAX_LOGIC_SIG_MAX_SIZE, MAX_MULTISIG, MAX_PQ_PUBLIC_KEY_SIZE,
-        MAX_PQ_SIGNATURE_SIZE, MAX_VOTE_THRESHOLD,
+        read_u8_val, skip_value, struct_keys, struct_keys_with, DecodeSession, StructKeys,
+        EVAL_MAX_ARGS, MAX_LOGIC_SIG_ARG_SIZE, MAX_LOGIC_SIG_MAX_SIZE, MAX_MULTISIG,
+        MAX_PQ_PUBLIC_KEY_SIZE, MAX_PQ_SIGNATURE_SIZE, MAX_VOTE_THRESHOLD,
     };
 }
 pub use rmp_decode::{

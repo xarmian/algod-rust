@@ -234,7 +234,7 @@ key (`txn` twice) decodes *into* the already-populated struct (a merge), and a
 repeated fixed-size byte key with a shorter value keeps the earlier tail
 (`ReadExactBytes` copies `min(len, N)`). **Implemented** for every reader: the
 non-consensus ones by #2421, the consensus ones and tx-sync by #2424 (see
-"Issue #2424" below). Only the array form remains in `DIV-004`.
+"Issue #2424" below). Only the array form remained in `DIV-004` (retired by #2521, see "Issue #2521" below).
 
 ### 3. Local participation secrets
 
@@ -430,3 +430,30 @@ vote 16) and 8 of 593 network (tx-sync) cases; green after, plus the
 verdict and decoded value equal to go's). The real-chain corpus tests, the
 88k-case block differential test and the canonical re-encode of every
 committed real block are unchanged.
+
+## Issue #2521: DIV-004 retired
+
+The last readers that took only the map form are gone, so `DIV-004` is
+`retired` in `docs/DIVERGENCES.md`.
+
+* The agreement codec's decoders of its own authenticated forms
+  (`decode_credential`, `decode_authenticated_vote`,
+  `decode_authenticated_bundle`, the `AuthenticatedBundle` type, their
+  encoders and the cursor helpers) were deleted: nothing outside tests called
+  them, and go decodes `committee.Credential`, `agreement.vote` and
+  `agreement.bundle` only from its own persisted state. Their go-fixture and
+  proptest round-trip tests went with them.
+* algokey's PQ key-file reader (`decode_pq_signing_material`) has a real
+  caller (every `algokey pq` command that reads a key file), so it was
+  rebuilt on `rmp_decode::struct_keys` and is replayed against go's
+  `protocol.Decode` of `pqSigningMaterial`: the `algokey` fixture set of
+  `scripts/strict-decode/strict_decode_fixtures.py` (go-generated seeds and
+  cases from `tools/strict-decode-oracle/algokey_oracle_test.go.txt`, array
+  form, repeated keys and every mutated value) through the
+  `the_key_file_decoder_matches_go_on_every_mutated_file` test. A missing
+  field now decodes as zero and is rejected later by `validate()`, as in go,
+  and an unknown key is `ErrNoField`, where the old reader skipped it.
+* One invisible difference: go keeps a `[]byte` nil after a `nil` and empty
+  after an empty `bin` (the msgp encoder writes them differently); the
+  reader holds a `Vec` and nothing reads the distinction, so the oracle folds
+  the two before re-encoding.

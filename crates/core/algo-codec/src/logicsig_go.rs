@@ -28,8 +28,8 @@
 //! It exists for tools that must accept and reject exactly what go does
 //! (`goal clerk compile -D` falls back to disassembling the raw bytes when this
 //! decode fails). It is NOT used by the consensus path: that one has
-//! hand-written readers (`algo_types::*::decode_from_reader`) with the registered
-//! differences of `docs/DIVERGENCES.md` DIV-004. Both are compared on every
+//! hand-written readers (`algo_types::*::decode_from_reader`) whose former
+//! differences (`docs/DIVERGENCES.md` DIV-004, retired) are gone. Both are compared on every
 //! record of `tests/logicsig_go_decode_test.rs`.
 //!
 //! What the generated decoder really does, and this port keeps:
