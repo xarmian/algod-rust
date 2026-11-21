@@ -329,15 +329,24 @@ fn round_trip(
         return Err(format!("unsupported protocol scheme {:?}", url.scheme));
     }
     let host = url.host().to_string();
-    let proxy = if https { None } else { proxy_for(&host) };
+    let proxy = proxy_for(&host, https);
     let mut stream = match &proxy {
-        Some(p) => dial(p).map_err(|e| format!("proxyconnect tcp: {e}"))?,
+        Some(p) => dial(&p.addr).map_err(|e| format!("proxyconnect tcp: {e}"))?,
         None if https && !has_port(&host) => dial(&format!("{host}:443"))?,
         None => dial(&host)?,
     };
+    // an `https:` request through a proxy is tunnelled (`CONNECT host:port`)
+    if let (true, Some(p)) = (https, &proxy) {
+        let addr = if has_port(&host) {
+            host.clone()
+        } else {
+            format!("{host}:443")
+        };
+        connect_tunnel(&mut stream, &addr, p.auth.as_deref())?;
+    }
     let target = match proxy {
-        Some(_) => url.to_string(),
-        None => url.request_uri(),
+        Some(_) if !https => url.to_string(),
+        _ => url.request_uri(),
     };
     let mut req =
         format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Go-http-client/1.1\r\n");
@@ -369,6 +378,69 @@ fn round_trip(
     read_response(stream, local, peer, method, url)
 }
 
+/// go's `CONNECT` through a proxy (`Transport.dialConn`): the request, then
+/// the proxy's answer; anything but a 200 is its status text as the error
+/// (`unknown status code` when it has none).
+fn connect_tunnel(stream: &mut TcpStream, addr: &str, auth: Option<&str>) -> Result<(), String> {
+    let local = stream.local_addr().ok();
+    let peer = stream.peer_addr().ok();
+    let mut req = format!(
+        "CONNECT {addr} HTTP/1.1\r\nHost: {addr}\r\nUser-Agent: Go-http-client/1.1\r\n"
+    );
+    if let Some(a) = auth {
+        req.push_str(&format!("Proxy-Authorization: {a}\r\n"));
+    }
+    req.push_str("\r\n");
+    let _ = stream.write_all(req.as_bytes());
+    let _ = stream.flush();
+    let read_err = |e: &std::io::Error| match (local, peer) {
+        (Some(l), Some(p)) => format!("read tcp {l}->{p}: read: {}", errno_text(e)),
+        _ => errno_text(e),
+    };
+    let mut r = BufReader::new(&*stream);
+    let line = match read_line(&mut r) {
+        Ok(Some(l)) => l,
+        // `ReadResponse` turns the `io.EOF` of an empty answer into this
+        Ok(None) => return Err("unexpected EOF".to_string()),
+        Err(e) => return Err(read_err(&e)),
+    };
+    let (proto, status) = match line.iter().position(|&b| b == b' ') {
+        Some(i) => (&line[..i], &line[i + 1..]),
+        None => return Err(bad_string("malformed HTTP response", &line)),
+    };
+    let status_start = status
+        .iter()
+        .position(|&b| b != b' ')
+        .unwrap_or(status.len());
+    let status = &status[status_start..];
+    let code_text = match status.iter().position(|&b| b == b' ') {
+        Some(i) => &status[..i],
+        None => status,
+    };
+    if code_text.len() != 3 {
+        return Err(bad_string("malformed HTTP status code", code_text));
+    }
+    let code = std::str::from_utf8(code_text)
+        .ok()
+        .and_then(go_atoi)
+        .filter(|c| *c >= 0)
+        .ok_or_else(|| bad_string("malformed HTTP status code", code_text))?;
+    if parse_http_version(proto).is_none() {
+        return Err(bad_string("malformed HTTP version", proto));
+    }
+    read_mime_header(&mut r).map_err(|e| match e {
+        HeaderError::Io(e) => read_err(&e),
+        HeaderError::Text(t) => t,
+    })?;
+    if code != 200 {
+        return Err(match status.iter().position(|&b| b == b' ') {
+            Some(i) => algo_types::raw_text::encode(&status[i + 1..]).into_owned(),
+            None => "unknown status code".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Whether a `host[:port]` names its port.
 fn has_port(hostport: &str) -> bool {
     match hostport.strip_prefix('[') {
@@ -381,11 +453,36 @@ fn has_port(hostport: &str) -> bool {
     }
 }
 
-/// A connection that keeps the first bytes the server sent: what go's
-/// `tls.RecordHeaderError` holds of a record that is not TLS.
+/// A connection that keeps what go's TLS record layer knows of it: the first
+/// bytes (a `tls.RecordHeaderError` holds them), where the record being read
+/// stands (an EOF inside one is `unexpected EOF`, between two a bare `EOF`)
+/// and the length field of the latest record header.
 struct Recording {
     inner: TcpStream,
     first: Vec<u8>,
+    /// Header bytes of the record being read.
+    hdr: Vec<u8>,
+    /// Payload bytes of that record still to come.
+    remaining: usize,
+    /// The length field of the latest record header.
+    last_len: usize,
+}
+
+impl Recording {
+    fn new(inner: TcpStream) -> Self {
+        Self {
+            inner,
+            first: Vec::new(),
+            hdr: Vec::new(),
+            remaining: 0,
+            last_len: 0,
+        }
+    }
+
+    /// Whether the bytes read so far stop inside a record.
+    fn mid_record(&self) -> bool {
+        self.remaining > 0 || !self.hdr.is_empty()
+    }
 }
 
 impl Read for Recording {
@@ -393,6 +490,18 @@ impl Read for Recording {
         let n = self.inner.read(buf)?;
         let keep = (5 - self.first.len().min(5)).min(n);
         self.first.extend_from_slice(&buf[..keep]);
+        for &b in &buf[..n] {
+            if self.remaining > 0 {
+                self.remaining -= 1;
+            } else {
+                self.hdr.push(b);
+                if self.hdr.len() == 5 {
+                    self.last_len = usize::from(u16::from_be_bytes([self.hdr[3], self.hdr[4]]));
+                    self.remaining = self.last_len;
+                    self.hdr.clear();
+                }
+            }
+        }
         Ok(n)
     }
 }
@@ -406,9 +515,67 @@ impl Write for Recording {
     }
 }
 
+/// go's `Transport.TLSHandshakeTimeout`.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The checks of go's `x509.Certificate.Verify` that come before the chain
+/// (the validity period, then the host name), then the platform's verdict on
+/// the chain: what go reports for an untrusted certificate that is also
+/// expired, or for another name, is that and not the unknown authority.
+#[derive(Debug)]
+struct GoVerifier {
+    inner: std::sync::Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    host: String,
+}
+
+impl rustls::client::danger::ServerCertVerifier for GoVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if let Some(leaf) = crate::x509_leaf::parse_leaf(end_entity.as_ref()) {
+            let unix = i64::try_from(now.as_secs()).unwrap_or(i64::MAX);
+            if let Some(e) = crate::x509_leaf::validity_error(&leaf, unix) {
+                return Err(rustls::Error::General(e));
+            }
+            if let Some(e) = crate::x509_leaf::name_error(&leaf, &self.host) {
+                return Err(rustls::Error::General(e));
+            }
+        }
+        self.inner
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
 /// go's `tls.Client(conn, cfg).Handshake()` as the transport runs it (the
-/// system roots, the URL's host as the server name): the TLS stream, or
-/// go's error text.
+/// system roots, the URL's host as the server name, a 10 s timeout): the TLS
+/// stream, or go's error text.
 fn tls_connect(
     stream: TcpStream,
     host: &str,
@@ -416,57 +583,143 @@ fn tls_connect(
     let local = stream.local_addr().ok();
     let peer = stream.peer_addr().ok();
     let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let verifier = rustls_platform_verifier::Verifier::new(provider.clone())
+    let platform = rustls_platform_verifier::Verifier::new(provider.clone())
         .map_err(|e| format!("tls: {e}"))?;
+    let (name, _) = split_host_port(host);
+    let verifier = GoVerifier {
+        inner: std::sync::Arc::new(platform),
+        host: name.clone(),
+    };
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| format!("tls: {e}"))?
         .dangerous()
         .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
         .with_no_client_auth();
-    let (name, _) = split_host_port(host);
     let server_name = rustls::pki_types::ServerName::try_from(name.clone())
         .map_err(|_| format!("tls: invalid server name {name:?}"))?;
     let mut conn = rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
         .map_err(|e| format!("tls: {e}"))?;
-    let mut sock = Recording {
-        inner: stream,
-        first: Vec::new(),
-    };
+    let mut sock = Recording::new(stream);
+    let started = Instant::now();
     while conn.is_handshaking() {
+        let left = TLS_HANDSHAKE_TIMEOUT.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Err("net/http: TLS handshake timeout".to_string());
+        }
+        let _ = sock.inner.set_read_timeout(Some(left));
         if let Err(e) = conn.complete_io(&mut sock) {
-            return Err(tls_error(&e, &sock.first, local, peer));
+            return Err(tls_error(&e, &sock, local, peer));
         }
     }
+    let _ = sock.inner.set_read_timeout(None);
     Ok(rustls::StreamOwned::new(conn, sock))
+}
+
+/// go's names of the TLS alerts (`crypto/tls/alert.go`).
+fn go_alert(code: u8) -> String {
+    let name = match code {
+        0 => "close notify",
+        10 => "unexpected message",
+        20 => "bad record MAC",
+        21 => "decryption failed",
+        22 => "record overflow",
+        30 => "decompression failure",
+        40 => "handshake failure",
+        42 => "bad certificate",
+        43 => "unsupported certificate",
+        44 => "revoked certificate",
+        45 => "expired certificate",
+        46 => "unknown certificate",
+        47 => "illegal parameter",
+        48 => "unknown certificate authority",
+        49 => "access denied",
+        50 => "error decoding message",
+        51 => "error decrypting message",
+        60 => "export restriction",
+        70 => "protocol version not supported",
+        71 => "insufficient security level",
+        80 => "internal error",
+        86 => "inappropriate fallback",
+        90 => "user canceled",
+        100 => "no renegotiation",
+        109 => "missing extension",
+        110 => "unsupported extension",
+        111 => "certificate unobtainable",
+        112 => "unrecognized name",
+        113 => "bad certificate status response",
+        114 => "bad certificate hash value",
+        115 => "unknown PSK identity",
+        116 => "certificate required",
+        120 => "no application protocol",
+        _ => return format!("alert({code})"),
+    };
+    name.to_string()
 }
 
 /// go's text of a failed TLS handshake.
 fn tls_error(
     e: &std::io::Error,
-    first: &[u8],
+    sock: &Recording,
     local: Option<SocketAddr>,
     peer: Option<SocketAddr>,
 ) -> String {
     use rustls::{CertificateError, Error as TlsError};
+    let first = sock.first.as_slice();
     let tls = e.get_ref().and_then(|i| i.downcast_ref::<TlsError>());
+    // go's first record check: `typ` an alert or a handshake, `vers` below
+    // 0x1000, else `tls.RecordHeaderError`
+    let first_record_bad = first.len() == 5
+        && ((first[0] != 21 && first[0] != 22) || u16::from_be_bytes([first[1], first[2]]) >= 0x1000);
     match tls {
+        Some(TlsError::General(t)) if t.starts_with("x509: ") => {
+            format!("tls: failed to verify certificate: {t}")
+        }
         Some(TlsError::InvalidCertificate(CertificateError::UnknownIssuer)) => {
             "tls: failed to verify certificate: x509: certificate signed by unknown authority"
+                .to_string()
+        }
+        Some(TlsError::InvalidCertificate(
+            CertificateError::InvalidPurpose | CertificateError::InvalidPurposeContext { .. },
+        )) => "tls: failed to verify certificate: x509: certificate specifies an incompatible key usage"
+            .to_string(),
+        Some(TlsError::InvalidCertificate(CertificateError::Other(o)))
+            if format!("{o:?}").contains("EkuError") =>
+        {
+            "tls: failed to verify certificate: x509: certificate specifies an incompatible key usage"
                 .to_string()
         }
         Some(TlsError::InvalidCertificate(c)) => {
             format!("tls: failed to verify certificate: {c:?}")
         }
+        Some(TlsError::AlertReceived(d)) => {
+            format!("remote error: tls: {}", go_alert(u8::from(*d)))
+        }
         // go's transport: a `RecordHeaderError` whose bytes read like HTTP
         Some(_) if first.starts_with(b"HTTP/") => {
             "http: server gave HTTP response to HTTPS client".to_string()
         }
-        Some(TlsError::InvalidMessage(_)) if !first.is_empty() => {
+        Some(_) if first_record_bad => {
             "tls: first record does not look like a TLS handshake".to_string()
         }
+        Some(_) if sock.last_len > 16384 + 2048 => {
+            format!("tls: oversized record received with length {}", sock.last_len)
+        }
         Some(other) => format!("tls: {other}"),
-        None if e.kind() == std::io::ErrorKind::UnexpectedEof => "EOF".to_string(),
+        None if matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) =>
+        {
+            "net/http: TLS handshake timeout".to_string()
+        }
+        None if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            if sock.mid_record() {
+                "unexpected EOF".to_string()
+            } else {
+                "EOF".to_string()
+            }
+        }
         None => match (local, peer) {
             (Some(l), Some(p)) => format!("read tcp {l}->{p}: read: {}", errno_text(e)),
             _ => errno_text(e),
@@ -1054,13 +1307,17 @@ fn is_domain_name(s: &str) -> bool {
 
 /// go: `http.ProxyFromEnvironment` for an `http` request to `host`: the
 /// proxy's `host:port`, or `None` to dial directly.
-fn proxy_for(host: &str) -> Option<String> {
+fn proxy_for(host: &str, https: bool) -> Option<Proxy> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     // go ignores HTTP_PROXY when run as a CGI script
     if env("REQUEST_METHOD").is_some() {
         return None;
     }
-    let proxy = env("HTTP_PROXY").or_else(|| env("http_proxy"))?;
+    let proxy = if https {
+        env("HTTPS_PROXY").or_else(|| env("https_proxy"))?
+    } else {
+        env("HTTP_PROXY").or_else(|| env("http_proxy"))?
+    };
     let (name, _) = split_host_port(host);
     let name = name.to_ascii_lowercase();
     if name == "localhost" || name.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
@@ -1085,7 +1342,44 @@ fn proxy_for(host: &str) -> Option<String> {
     } else {
         GoUrl::parse(&format!("http://{proxy}"))
     };
-    Some(url.host().to_string())
+    // go's `Proxy-Authorization: Basic` of the proxy URL's user info
+    let auth = url.authority.rfind('@').map(|i| {
+        let info = &url.authority[..i];
+        let (user, pass) = info.split_once(':').unwrap_or((info, ""));
+        let credentials = format!("{}:{}", percent_decode(user), percent_decode(pass));
+        format!("Basic {}", data_encoding::BASE64.encode(credentials.as_bytes()))
+    });
+    Some(Proxy {
+        addr: url.host().to_string(),
+        auth,
+    })
+}
+
+/// The proxy of a request: where to dial and the `Proxy-Authorization` value.
+#[derive(Debug, PartialEq, Eq)]
+struct Proxy {
+    addr: String,
+    auth: Option<String>,
+}
+
+/// go's `url.PathUnescape` of user info, `%XX` only.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 3 <= b.len() {
+            let hex = std::str::from_utf8(&b[i + 1..i + 3]).ok();
+            if let Some(v) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]

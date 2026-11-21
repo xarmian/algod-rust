@@ -43,6 +43,7 @@ pub mod data_dir;
 pub mod formatting;
 pub mod go_codec_json;
 pub mod go_http;
+pub mod x509_leaf;
 pub mod go_json;
 pub mod goal_client;
 pub mod groups;
