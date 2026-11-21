@@ -37,6 +37,7 @@ on:
       - "scripts/teal-corpus/**"
       - "crates/tools/goal-rust/**"
       - "tools/go-codec-json-oracle/**"
+      - "tools/goal-cobra-oracle/**"
       - "crates/core/algo-codec/src/logicsig_go.rs"
       - "crates/core/algo-codec/tests/common/**"
       - "bin/kmd-rust/**"
@@ -68,6 +69,7 @@ on:
       - "scripts/teal-corpus/**"
       - "crates/tools/goal-rust/**"
       - "tools/go-codec-json-oracle/**"
+      - "tools/goal-cobra-oracle/**"
       - "crates/core/algo-codec/src/logicsig_go.rs"
       - "crates/core/algo-codec/tests/common/**"
       - "bin/kmd-rust/**"
@@ -277,6 +279,13 @@ jobs:
           # #2453: its rows also hold cobra's usage errors for extra arguments
           # to `account` / `wallet` and a `-f` before one of their subcommands.
           MIXED_CLUSTER=1 cargo test -p goal-rust --test default_flags_e2e -- --nocapture
+          # #2472: cobra's help, flag, Args and required-flag handling for every
+          # command of the trees goal-rust's cobra_compat parses;
+          # fixtures/cobra_cli.jsonl is go's output (a stale one fails
+          # cobra_cli_fixture_matches_go_goal), and src/cobra_tree.json must be
+          # exactly what tools/goal-cobra-oracle dumps from go's cmd/goal through
+          # `go test -overlay` (cobra_tree_matches_go).
+          GOTOOLCHAIN=go1.25.3 MIXED_CLUSTER=1 cargo test -p goal-rust --test cobra_cli_e2e -- --nocapture
           # #2454: go's client setup (ensureKmdClient / ensureAlgodClient /
           # ensureFullClient / getGoalClient): kmd started next to goal (go's
           # kmd, built from ../go-algorand/cmd/kmd, for go's goal), go's error

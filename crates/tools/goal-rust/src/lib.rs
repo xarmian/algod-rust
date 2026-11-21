@@ -38,7 +38,6 @@ pub mod balance_record;
 pub mod cli_state;
 pub mod cmd;
 pub mod cobra_compat;
-mod cobra_usage;
 pub mod consensus_json;
 pub mod data_dir;
 pub mod formatting;
@@ -228,9 +227,8 @@ pub enum RootCommand {
 /// cobra's no-`Run` fallback for command groups (e.g. `goal app` ⇒
 /// help). `path` is the slice walked from the root, e.g. `["app", "box"]`.
 pub fn print_group_help(path: &[&str]) -> ExitCode {
-    // go's own help text where it is captured (`account`, `wallet`,
-    // `account multisig`; issue #2464).
-    if let Some(help) = cobra_usage::help(&path.join(" ")) {
+    // go's own help text (cobra's tree, issues #2464, #2472).
+    if let Some(help) = cobra_compat::help(&path.join(" ")) {
         print!("{help}");
         return ExitCode::SUCCESS;
     }
@@ -297,7 +295,7 @@ fn in_argv_order(mut seen: Vec<String>, argv: &[String]) -> Vec<String> {
 /// this — keeping the dispatch table here lets integration tests
 /// reach the same code path without spawning a subprocess.
 pub fn run() -> ExitCode {
-    // cobra's lookup of `account` / `wallet` subcommands (issue #2453).
+    // cobra's command lookup and flag parsing (issues #2453, #2472).
     let args = match cobra_compat::preflight(std::env::args_os().collect()) {
         cobra_compat::Preflight::Run(args) => args,
         cobra_compat::Preflight::Exit(code) => return code,
