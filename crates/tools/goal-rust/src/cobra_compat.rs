@@ -1845,16 +1845,6 @@ mod tests {
     fn clap_takes_every_flag_of_gos() {
         // Flags go's command reads that goal-rust's does not have yet.
         const GAPS: &[&str] = &[
-            // issue #2512
-            "goal node clone --noledger",
-            "goal node clone --targetdir",
-            "goal node create --api",
-            "goal node create --archival",
-            "goal node create --destination",
-            "goal node create --full-config",
-            "goal node create --hosted",
-            "goal node create --network",
-            "goal node create --relay",
         ];
         let mut missing = Vec::new();
         for (cmd, _) in clap_commands() {
