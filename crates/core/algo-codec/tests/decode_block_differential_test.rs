@@ -31,7 +31,7 @@
 //! |---|---|---|---|
 //! | A non-UTF-8 `str` key inside `state_proof_tracking` | turns it into `bin` (changes the canonical re-encode, so the block hash) | keeps the `str` bytes (#2042) | keeps the `str` bytes |
 //! | B integer where a map key belongs | accepts, as a field index | rejects | rejects (`ReadMapKeyZC`) |
-//! | C struct sent as an array (map header replaced) | accepts a degenerate array | rejects (DIV-004) | decodes positionally |
+//! | C struct sent as an array (map header replaced) | accepts a degenerate array | decodes positionally like go (#2426), so the keys and values of the replaced map are read as fields and it fails on the first mistyped one | decodes positionally |
 //! | D transaction without `type` | accepts | rejects at decode | decodes, fails later |
 //! | E nil where an integer, boolean or struct belongs | rejects ("unit value") | zero value | zero value (DIV-004, #2065) |
 //! | F `[N]byte` field of another length | rejects ("expected N bytes") | `ReadExactBytes`: copies `min(len, N)` bytes | same (`docs/BYTES_DECODE_PARITY.md`) |

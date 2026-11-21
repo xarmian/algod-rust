@@ -1563,7 +1563,7 @@ impl StateSchema {
     decode_via_into!();
 
     /// Decode into an already decoded value, as go's generated `UnmarshalMsg`
-    /// does (issue #2424, see [`rmp_decode::read_struct_map_len`]).
+    /// does (issue #2424, see [`rmp_decode::struct_keys`]).
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
         let mut keys = rmp_decode::struct_keys(rd, s, "basics.StateSchema")?;
         while let Some(key) = keys.next(rd)? {

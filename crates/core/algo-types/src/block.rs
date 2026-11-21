@@ -334,9 +334,8 @@ impl Block {
         b: &mut Self,
         extra_keys: &[&[u8]],
     ) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, b)?;
-        for _ in 0..len {
-            let key = rmp_decode::read_key_bytes(rd)?;
+        let mut keys = rmp_decode::struct_keys(rd, b, "bookkeeping.Block")?;
+        while let Some(key) = keys.next(rd)? {
             crate::header::header_key_match!(b, key, rd, {
                 // go's `Payset` (`//msgp:allocbound Payset 100000`)
                 (4, b't') if key == b"txns" => {
@@ -375,11 +374,12 @@ impl BlockResponse {
     /// way go's `Certificate.UnmarshalMsg` does.
     pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
         let _session = rmp_decode::decode_session();
-        let len = rmp_decode::read_map_len(rd)?;
+        // go's `EncodedBlockCert`, a struct like any other: its array form is
+        // `[block, cert]` (a `nil` reads as the zero response)
+        let mut keys = rmp_decode::struct_keys(rd, &mut (), "rpcs.EncodedBlockCert")?;
         let mut block = Block::default();
         let mut cert = None;
-        for _ in 0..len {
-            let key = rmp_decode::read_key_bytes(rd)?;
+        while let Some(key) = keys.next(rd)? {
             match (key.len(), key.first().copied().unwrap_or(0)) {
                 (5, b'b') if key == b"block" => Block::decode_into(rd, &mut block, &[])?,
                 (4, b'c') if key == b"cert" => {
