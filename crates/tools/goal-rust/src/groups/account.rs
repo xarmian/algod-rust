@@ -35,6 +35,7 @@ pub enum AccountCmd {
     /// Retrieve information about the assets belonging to the specified
     /// account inclusive of asset metadata.
     #[command(name = "assetdetails")]
+    Applicationdetails(ApplicationdetailsArgs),
     Assetdetails(AssetdetailsArgs),
     /// Retrieve the balances for the specified account.
     Balance(AddressArgs),
@@ -167,6 +168,27 @@ pub struct InfoArgs {
     /// just wants the asset-id catalog.
     #[arg(long = "onlyShowAssetIDs", alias = "only-show-asset-ids")]
     pub only_show_asset_ids: bool,
+}
+
+/// `account applicationdetails -a <addr> [-l <n>] [-n <token>]
+/// [--include-params]`. Mirrors Go's `applicationDetailsCmd`
+/// (`cmd/goal/account.go`): the paginated
+/// `/v2/accounts/{addr}/applications` endpoint.
+#[derive(Args, Debug)]
+pub struct ApplicationdetailsArgs {
+    /// Account address to look up (Go `-a/--address`, required).
+    #[arg(short = 'a', long = "address")]
+    pub address: String,
+    /// The maximum number of applications to return (Go `-l/--limit`).
+    #[arg(short = 'l', long = "limit")]
+    pub limit: Option<u64>,
+    /// The next application index to use for pagination (Go `-n/--next`).
+    #[arg(short = 'n', long = "next")]
+    pub next: Option<String>,
+    /// Include application parameters (creator, global state schema, etc.)
+    /// (Go `--include-params`).
+    #[arg(long = "include-params")]
+    pub include_params: bool,
 }
 
 /// `account assetdetails -a <addr> [-l <n>] [-n <token>]`. Mirrors
@@ -535,6 +557,7 @@ pub fn run(cmd: AccountCmd) -> ExitCode {
     // Every account leaf is now implemented; each arm dispatches to its handler.
     match cmd {
         AccountCmd::Addpartkey(args) => h::run_addpartkey(args, datadirs()),
+        AccountCmd::Applicationdetails(args) => h::run_applicationdetails(args, datadirs()),
         AccountCmd::Assetdetails(args) => h::run_assetdetails(args, datadirs()),
         AccountCmd::Balance(args) => h::run_balance(args, datadirs()),
         AccountCmd::Changeonlinestatus(args) => {

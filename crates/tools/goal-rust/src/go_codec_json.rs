@@ -245,6 +245,26 @@ pub const ACCOUNT_ASSETS_INFORMATION: Ty = Ty::Struct(&[
     Field("round", ROUND),
 ]);
 
+/// `model.AccountApplicationsInformationResponse` (`GET
+/// /v2/accounts/{address}/applications`).
+pub const ACCOUNT_APPLICATIONS_INFORMATION: Ty = Ty::Struct(&[
+    Field(
+        "application-resources",
+        Ty::Ptr(&Ty::Slice(
+            &Ty::Struct(&[
+                Field("app-local-state", Ty::Ptr(&APPLICATION_LOCAL_STATE)),
+                Field("created-at-round", Ty::Ptr(&ROUND)),
+                Field("deleted", Ty::Ptr(&Ty::Bool)),
+                Field("id", Ty::U64),
+                Field("params", Ty::Ptr(&APPLICATION_PARAMS)),
+            ]),
+            "[]model.AccountApplicationResource",
+        )),
+    ),
+    Field("next-token", Ty::Ptr(&Ty::Str)),
+    Field("round", ROUND),
+]);
+
 /// `model.AccountAssetResponse` (`GET
 /// /v2/accounts/{address}/assets/{asset-id}`).
 pub const ACCOUNT_ASSET: Ty = Ty::Struct(&[

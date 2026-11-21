@@ -42,7 +42,7 @@ use algo_kmd_client::{KmdClient, KmdError};
 use crate::accounts_list::AccountsList;
 use crate::data_dir;
 use crate::groups::account::{
-    AddpartkeyArgs, AddressArgs, AssetdetailsArgs, ChangeonlinestatusArgs, DeleteArgs,
+    AddpartkeyArgs, AddressArgs, ApplicationdetailsArgs, AssetdetailsArgs, ChangeonlinestatusArgs, DeleteArgs,
     DeletepartkeyArgs, DumpArgs, ExportArgs, ImportArgs, ImportRootKeyArgs, InfoArgs,
     InstallpartkeyArgs, ListArgs, MarknonparticipatingArgs, MsigDeleteArgs, MsigInfoArgs,
     MsigNewArgs, NewArgs, RenameArgs, RenewallpartkeysArgs, RenewpartkeyArgs,
@@ -2917,6 +2917,158 @@ pub fn run_rewards(args: AddressArgs, cli_d: Vec<PathBuf>) -> ExitCode {
         }
         Err(()) => ExitCode::from(1),
     }
+}
+
+/// `account applicationdetails -a <addr> [-l <n>] [-n <token>]
+/// [--include-params]`: go's `applicationDetailsCmd`: the pages of `GET
+/// /v2/accounts/<addr>/applications` (`AccountApplicationsInformation`)
+/// printed by `printAccountApplicationsInformation`, one page only when
+/// `--limit` or `--next` is given.
+pub fn run_applicationdetails(args: ApplicationdetailsArgs, cli_d: Vec<PathBuf>) -> ExitCode {
+    let dd = match data_dir::ensure_single_data_dir(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let Ok(endpoint) = ensure_algod_endpoint(&dd) else {
+        return ExitCode::from(1);
+    };
+    let rt = match build_runtime() {
+        Ok(r) => r,
+        Err(()) => return ExitCode::from(1),
+    };
+    let limit = args.limit.unwrap_or(0);
+    let next = args.next.clone().unwrap_or_default();
+    let mut token = next.clone();
+    let mut out = format!("Account: {}\nApplications:\n", args.address);
+    let flush = |out: &mut String| {
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        // (go-codec's strings are raw bytes, printed unfiltered)
+        let _ = stdout.write_all(&algo_types::raw_text::decode(out));
+        let _ = stdout.flush();
+        out.clear();
+    };
+    loop {
+        let limit_text = limit.to_string();
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if !token.is_empty() {
+            query.push(("next", &token));
+        }
+        if limit > 0 {
+            query.push(("limit", &limit_text));
+        }
+        if args.include_params {
+            query.push(("include", "params"));
+        }
+        let response = match crate::algod_rest::get_json(
+            &rt,
+            &endpoint,
+            &format!("/v2/accounts/{}/applications", args.address),
+            &query,
+            &crate::go_codec_json::ACCOUNT_APPLICATIONS_INFORMATION,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                flush(&mut out);
+                eprintln!(
+                    "{}",
+                    crate::formatting::report_error_text(&format_message(
+                        ERROR_REQUEST_FAIL,
+                        &[&e]
+                    ))
+                );
+                return ExitCode::from(1);
+            }
+        };
+        // go dereferences `*response.ApplicationResources`: an answer without
+        // it is a nil-pointer panic
+        if response["application-resources"].is_null() {
+            flush(&mut out);
+            eprintln!("panic: runtime error: invalid memory address or nil pointer dereference");
+            return ExitCode::from(2);
+        }
+        out.push_str(&format_account_applications_information(&response));
+        token = response["next-token"].as_str().unwrap_or("").to_string();
+        if token.is_empty() {
+            break;
+        }
+        if limit > 0 || !next.is_empty() {
+            // go: `reportInfof("NextToken: %s", token)`
+            out.push_str(&crate::formatting::report_info_text(&format!(
+                "NextToken: {token}"
+            )));
+            break;
+        }
+    }
+    flush(&mut out);
+    ExitCode::SUCCESS
+}
+
+/// go's `printAccountApplicationsInformation`.
+fn format_account_applications_information(response: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let u = |v: &serde_json::Value| v.as_u64().unwrap_or(0);
+    // go counts a TEAL value of type 2 (uint) as used ints, every other one
+    // as used byte slices
+    let used = |store: &serde_json::Value| -> (u64, u64) {
+        let mut ints = 0;
+        let mut bytes = 0;
+        for kv in store.as_array().map(Vec::as_slice).unwrap_or(&[]) {
+            if kv["value"]["type"].as_u64() == Some(2) {
+                ints += 1;
+            } else {
+                bytes += 1;
+            }
+        }
+        (ints, bytes)
+    };
+    for app in response["application-resources"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
+        let _ = writeln!(out, "  Application ID: {}", u(&app["id"]));
+        let params = &app["params"];
+        if params.is_object() {
+            let _ = writeln!(out, "  Application Params:");
+            let _ = writeln!(
+                out,
+                "    Creator: {}",
+                params["creator"].as_str().unwrap_or("")
+            );
+            let schema = &params["global-state-schema"];
+            let (allocated_ints, allocated_bytes) = if schema.is_object() {
+                (u(&schema["num-uint"]), u(&schema["num-byte-slice"]))
+            } else {
+                (0, 0)
+            };
+            let (used_ints, used_bytes) = used(&params["global-state"]);
+            let _ = writeln!(
+                out,
+                "    Global State: {used_ints}/{allocated_ints} uints, {used_bytes}/{allocated_bytes} byte slices"
+            );
+            let pages = u(&params["extra-program-pages"]);
+            if pages != 0 {
+                let _ = writeln!(out, "    Extra Program Pages: {pages}");
+            }
+        }
+        let local = &app["app-local-state"];
+        if local.is_object() {
+            let schema = &local["schema"];
+            let (used_ints, used_bytes) = used(&local["key-value"]);
+            let _ = writeln!(
+                out,
+                "    Local State: {used_ints}/{} uints, {used_bytes}/{} byte slices",
+                u(&schema["num-uint"]),
+                u(&schema["num-byte-slice"])
+            );
+        }
+    }
+    out
 }
 
 /// `account assetdetails -a <addr> [-l <n>] [-n <token>]`: go's

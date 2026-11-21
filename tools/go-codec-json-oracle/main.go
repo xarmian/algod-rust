@@ -26,7 +26,7 @@
 // what that made of each.
 //
 // Input: JSON lines {"ty": "account"|"version"|"status"|"supply"|
-// "asset"|"application"|"account-assets"|"account-asset"|
+// "asset"|"application"|"account-assets"|"account-applications"|"account-asset"|
 // "participation-keys"|"post-participation"|"catchpoint" (issue #2476),
 // "params"|"post-transactions"|"pending" (issue #2489),
 // "body": <base64>}. Output: the same lines plus "err" (go-codec's error
@@ -101,6 +101,8 @@ func main() {
 			target = &model.Application{}
 		case "account-assets":
 			target = &model.AccountAssetsInformationResponse{}
+		case "account-applications":
+			target = &model.AccountApplicationsInformationResponse{}
 		case "account-asset":
 			target = &model.AccountAssetResponse{}
 		case "participation-keys":
