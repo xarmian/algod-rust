@@ -571,10 +571,13 @@ impl rustls::client::danger::ServerCertVerifier for GoVerifier {
                 return Err(rustls::Error::General(e));
             }
         }
-        match self
-            .inner
-            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
-        {
+        match self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
             // webpki refuses a certificate authority as the end entity, go
             // builds its chain: the same checks, by `x509_chain`
             Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Other(o)))
