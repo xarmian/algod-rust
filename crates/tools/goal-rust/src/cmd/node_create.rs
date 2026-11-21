@@ -267,7 +267,10 @@ fn remove_all(path: &Path) -> io::Result<()> {
 /// (`!os.IsExist(err)`).
 fn mkdir_like(path: &Path, source_mode: u32) -> Result<(), String> {
     use std::os::unix::fs::DirBuilderExt;
-    match std::fs::DirBuilder::new().mode(source_mode & 0o777).create(path) {
+    match std::fs::DirBuilder::new()
+        .mode(source_mode & 0o777)
+        .create(path)
+    {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
         Err(e) => Err(path_error("mkdir", path, &e)),
@@ -316,8 +319,12 @@ pub fn run_clone(args: CloneArgs, cli_d: Vec<PathBuf>) -> ExitCode {
 /// go's `NodeController.Clone(targetDir, copyLedger)`.
 fn clone_node(data_dir: &Path, target: &str, copy_ledger: bool) -> Result<(), String> {
     let target_dir = Path::new(target);
-    remove_all(target_dir)
-        .map_err(|e| format!("unable to delete directory '{target}' : {}", go_os_error(&e)))?;
+    remove_all(target_dir).map_err(|e| {
+        format!(
+            "unable to delete directory '{target}' : {}",
+            go_os_error(&e)
+        )
+    })?;
 
     let source_mode = {
         use std::os::unix::fs::PermissionsExt;

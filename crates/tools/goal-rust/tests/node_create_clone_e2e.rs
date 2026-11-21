@@ -224,58 +224,134 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
         ),
         (
             "--archival=false",
-            vec!["--network", "testnet", "--destination", "c3", "--archival=false"],
+            vec![
+                "--network",
+                "testnet",
+                "--destination",
+                "c3",
+                "--archival=false",
+            ],
             "c3",
         ),
         (
             "--relay",
-            vec!["--network", "testnet", "--destination", "c4", "--relay", "127.0.0.1:4161"],
+            vec![
+                "--network",
+                "testnet",
+                "--destination",
+                "c4",
+                "--relay",
+                "127.0.0.1:4161",
+            ],
             "c4",
         ),
         (
             "--relay ipv6",
-            vec!["--network", "testnet", "--destination", "c5", "--relay", "[::1]:4161"],
+            vec![
+                "--network",
+                "testnet",
+                "--destination",
+                "c5",
+                "--relay",
+                "[::1]:4161",
+            ],
             "c5",
         ),
         (
             "--relay no port",
-            vec!["--network", "testnet", "--destination", "c6", "--relay", "127.0.0.1"],
+            vec![
+                "--network",
+                "testnet",
+                "--destination",
+                "c6",
+                "--relay",
+                "127.0.0.1",
+            ],
             "c6",
         ),
         (
             "--relay hostname",
-            vec!["--network", "testnet", "--destination", "c7", "--relay", "localhost:4161"],
+            vec![
+                "--network",
+                "testnet",
+                "--destination",
+                "c7",
+                "--relay",
+                "localhost:4161",
+            ],
             "c7",
         ),
         (
             "--relay empty port",
-            vec!["--network", "testnet", "--destination", "c8", "--relay", "127.0.0.1:"],
+            vec![
+                "--network",
+                "testnet",
+                "--destination",
+                "c8",
+                "--relay",
+                "127.0.0.1:",
+            ],
             "c8",
         ),
         (
             "--relay empty host",
-            vec!["--network", "testnet", "--destination", "c9", "--relay", ":4161"],
+            vec![
+                "--network",
+                "testnet",
+                "--destination",
+                "c9",
+                "--relay",
+                ":4161",
+            ],
             "c9",
         ),
         (
             "--relay empty",
-            vec!["--network", "testnet", "--destination", "c10", "--relay", ""],
+            vec![
+                "--network",
+                "testnet",
+                "--destination",
+                "c10",
+                "--relay",
+                "",
+            ],
             "c10",
         ),
         (
             "--api",
-            vec!["--network", "testnet", "--destination", "c11", "--api", "127.0.0.1:8080"],
+            vec![
+                "--network",
+                "testnet",
+                "--destination",
+                "c11",
+                "--api",
+                "127.0.0.1:8080",
+            ],
             "c11",
         ),
         (
             "--api bad",
-            vec!["--network", "testnet", "--destination", "c12", "--api", "8080"],
+            vec![
+                "--network",
+                "testnet",
+                "--destination",
+                "c12",
+                "--api",
+                "8080",
+            ],
             "c12",
         ),
         (
             "--api and --relay bad",
             vec![
-                "--network", "testnet", "--destination", "c13", "--relay", "x", "--api", "y",
+                "--network",
+                "testnet",
+                "--destination",
+                "c13",
+                "--relay",
+                "x",
+                "--api",
+                "y",
             ],
             "c13",
         ),
@@ -291,7 +367,13 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
         ),
         (
             "--full-config",
-            vec!["--network", "testnet", "--destination", "c16", "--full-config"],
+            vec![
+                "--network",
+                "testnet",
+                "--destination",
+                "c16",
+                "--full-config",
+            ],
             "c16",
         ),
         (
@@ -361,7 +443,14 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
         ),
         (
             "bad relay and existing destination",
-            vec!["--network", "testnet", "--destination", "src", "--relay", "x"],
+            vec![
+                "--network",
+                "testnet",
+                "--destination",
+                "src",
+                "--relay",
+                "x",
+            ],
             "src",
         ),
         (
@@ -386,7 +475,11 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
 
     // node clone
     let clone: Vec<(&str, Vec<&str>, &str)> = vec![
-        ("with the ledger", vec!["-d", "src", "node", "clone", "-t", "k1"], "k1"),
+        (
+            "with the ledger",
+            vec!["-d", "src", "node", "clone", "-t", "k1"],
+            "k1",
+        ),
         (
             "--targetdir",
             vec!["-d", "src", "node", "clone", "--targetdir", "k2"],
@@ -397,7 +490,11 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
             vec!["-d", "src", "node", "clone", "-t", "k3", "--noledger"],
             "k3",
         ),
-        ("-n", vec!["-d", "src", "node", "clone", "-t", "k4", "-n"], "k4"),
+        (
+            "-n",
+            vec!["-d", "src", "node", "clone", "-t", "k4", "-n"],
+            "k4",
+        ),
         (
             "existing target is replaced",
             vec!["-d", "src", "node", "clone", "-t", "old"],
@@ -414,7 +511,11 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
             "no",
         ),
         ("no target", vec!["-d", "src", "node", "clone"], ""),
-        ("empty target", vec!["-d", "src", "node", "clone", "-t", ""], ""),
+        (
+            "empty target",
+            vec!["-d", "src", "node", "clone", "-t", ""],
+            "",
+        ),
         (
             "target is the source",
             vec!["-d", "src", "node", "clone", "-t", "src", "-n"],
@@ -425,11 +526,7 @@ fn sequence(bin: &Path) -> Vec<serde_json::Value> {
             vec!["-d", "nope", "node", "clone", "-t", "k5"],
             "k5",
         ),
-        (
-            "no data dir",
-            vec!["node", "clone", "-t", "k6"],
-            "k6",
-        ),
+        ("no data dir", vec!["node", "clone", "-t", "k6"], "k6"),
         (
             "incomplete ledger",
             vec!["-d", "partial", "node", "clone", "-t", "k7"],
