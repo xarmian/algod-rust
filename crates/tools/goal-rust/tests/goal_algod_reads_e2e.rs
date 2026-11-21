@@ -2432,14 +2432,22 @@ fn application_details_cases() -> Vec<Case> {
     let full: &[u8] = b"{\"round\":5,\"application-resources\":[{\"id\":7,\"params\":{\"creator\":\"CREATOR\",\"approval-program\":\"BoEB\",\"clear-state-program\":\"BoEB\",\"global-state-schema\":{\"num-uint\":2,\"num-byte-slice\":3},\"global-state\":[{\"key\":\"a\",\"value\":{\"type\":1,\"bytes\":\"AQ==\",\"uint\":0}},{\"key\":\"b\",\"value\":{\"type\":2,\"uint\":9}},{\"key\":\"c\",\"value\":{\"type\":2,\"uint\":1}},{\"key\":\"d\",\"value\":{\"type\":0}}],\"extra-program-pages\":2},\"app-local-state\":{\"id\":7,\"schema\":{\"num-uint\":1,\"num-byte-slice\":4},\"key-value\":[{\"key\":\"k\",\"value\":{\"type\":2,\"uint\":3}},{\"key\":\"m\",\"value\":{\"type\":1,\"bytes\":\"AQ==\"}}]}},{\"id\":9,\"params\":{\"creator\":\"OTHER\",\"approval-program\":\"\",\"clear-state-program\":\"\",\"extra-program-pages\":0}},{\"id\":11,\"app-local-state\":{\"id\":11,\"schema\":{}},\"created-at-round\":3,\"deleted\":false}]}";
     let ids_only: &[u8] = b"{\"round\":5,\"application-resources\":[{\"id\":7},{\"id\":9,\"deleted\":true,\"created-at-round\":4}]}";
     let empty: &[u8] = b"{\"round\":5,\"application-resources\":[]}";
-    let page1: &[u8] = b"{\"round\":5,\"next-token\":\"tok2\",\"application-resources\":[{\"id\":7}]}";
+    let page1: &[u8] =
+        b"{\"round\":5,\"next-token\":\"tok2\",\"application-resources\":[{\"id\":7}]}";
     let page2: &[u8] = b"{\"round\":5,\"application-resources\":[{\"id\":9}]}";
-    let looping: &[u8] = b"{\"round\":5,\"next-token\":\"a b\\u0001\",\"application-resources\":[{\"id\":7}]}";
+    let looping: &[u8] =
+        b"{\"round\":5,\"next-token\":\"a b\\u0001\",\"application-resources\":[{\"id\":7}]}";
     let raw: &[u8] = b"{\"round\":5,\"application-resources\":[{\"id\":7,\"params\":{\"creator\":\"ap\xff\x01\",\"approval-program\":\"\",\"clear-state-program\":\"\"}}]}";
     let rows: Vec<(&str, Vec<&str>, Vec<Answer>)> = vec![
         (
             "include params",
-            vec!["account", "applicationdetails", "-a", "<A1>", "--include-params"],
+            vec![
+                "account",
+                "applicationdetails",
+                "-a",
+                "<A1>",
+                "--include-params",
+            ],
             vec![answer("/v2/accounts/", 200, full)],
         ),
         (
@@ -2467,7 +2475,14 @@ fn application_details_cases() -> Vec<Case> {
         ),
         (
             "next stops after a page",
-            vec!["account", "applicationdetails", "-a", "<A1>", "--next", "tok2"],
+            vec![
+                "account",
+                "applicationdetails",
+                "-a",
+                "<A1>",
+                "--next",
+                "tok2",
+            ],
             vec![answer("/v2/accounts/", 200, looping)],
         ),
         (
@@ -2485,18 +2500,32 @@ fn application_details_cases() -> Vec<Case> {
         ),
         (
             "raw creator",
-            vec!["account", "applicationdetails", "-a", "<A1>", "--include-params"],
+            vec![
+                "account",
+                "applicationdetails",
+                "-a",
+                "<A1>",
+                "--include-params",
+            ],
             vec![answer("/v2/accounts/", 200, raw)],
         ),
         (
             "401",
             vec!["account", "applicationdetails", "-a", "<A1>"],
-            vec![answer("/v2/accounts/", 401, b"{\"message\":\"Invalid API Token\"}")],
+            vec![answer(
+                "/v2/accounts/",
+                401,
+                b"{\"message\":\"Invalid API Token\"}",
+            )],
         ),
         (
             "400",
             vec!["account", "applicationdetails", "-a", "<A1>"],
-            vec![answer("/v2/accounts/", 400, b"{\"message\":\"bad \\u0001 thing\"}")],
+            vec![answer(
+                "/v2/accounts/",
+                400,
+                b"{\"message\":\"bad \\u0001 thing\"}",
+            )],
         ),
         (
             "malformed",
@@ -2529,7 +2558,10 @@ fn application_details_cases() -> Vec<Case> {
     );
     c.refused = true;
     v.push(c);
-    v.push(case("account applicationdetails no address", &["account", "applicationdetails"]));
+    v.push(case(
+        "account applicationdetails no address",
+        &["account", "applicationdetails"],
+    ));
     v
 }
 
@@ -2552,8 +2584,16 @@ fn raw_string_cases() -> Vec<Case> {
     let error: &[u8] = b"{\"message\":\"bad \xff\x01 \xe2\x28 thing\"}";
     let mut v = Vec::new();
     let rows: Vec<(&str, Vec<&str>, Vec<Answer>)> = vec![
-        ("version", vec!["version"], vec![answer("/versions", 200, versions)]),
-        ("version -v", vec!["version", "-v"], vec![answer("/versions", 200, versions)]),
+        (
+            "version",
+            vec!["version"],
+            vec![answer("/versions", 200, versions)],
+        ),
+        (
+            "version -v",
+            vec!["version", "-v"],
+            vec![answer("/versions", 200, versions)],
+        ),
         (
             "app info",
             vec!["app", "info", "--app-id", "7"],
@@ -2564,7 +2604,11 @@ fn raw_string_cases() -> Vec<Case> {
             vec!["asset", "info", "--assetid", "12"],
             vec![answer("/v2/assets/12$", 200, asset)],
         ),
-        ("node status", vec!["node", "status"], vec![answer("/v2/status", 200, status)]),
+        (
+            "node status",
+            vec!["node", "status"],
+            vec![answer("/v2/status", 200, status)],
+        ),
         (
             "account listpartkeys",
             vec!["account", "listpartkeys"],
@@ -2583,9 +2627,17 @@ fn raw_string_cases() -> Vec<Case> {
         (
             "node catchup",
             vec!["node", "catchup", "5#AB"],
-            vec![answer("/v2/catchup/", 200, b"{\"catchup-message\":\"m\xff\x01\xc3\x28\"}")],
+            vec![answer(
+                "/v2/catchup/",
+                200,
+                b"{\"catchup-message\":\"m\xff\x01\xc3\x28\"}",
+            )],
         ),
-        ("version error", vec!["version"], vec![answer("/versions", 400, error)]),
+        (
+            "version error",
+            vec!["version"],
+            vec![answer("/versions", 400, error)],
+        ),
         (
             "node status error",
             vec!["node", "status"],
