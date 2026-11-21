@@ -1,0 +1,2425 @@
+{
+ "agreement.Certificate": [
+  {
+   "go": "Round",
+   "key": "rnd",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Period",
+   "key": "per",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Step",
+   "key": "step",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Proposal",
+   "key": "prop",
+   "type": {
+    "k": "struct",
+    "t": "agreement.proposalValue"
+   }
+  },
+  {
+   "go": "Votes",
+   "key": "vote",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "struct",
+     "t": "agreement.voteAuthenticator"
+    }
+   }
+  },
+  {
+   "go": "EquivocationVotes",
+   "key": "eqv",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "struct",
+     "t": "agreement.equivocationVoteAuthenticator"
+    }
+   }
+  }
+ ],
+ "agreement.equivocationVoteAuthenticator": [
+  {
+   "go": "Sender",
+   "key": "snd",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Cred",
+   "key": "cred",
+   "type": {
+    "k": "struct",
+    "t": "committee.UnauthenticatedCredential"
+   }
+  },
+  {
+   "go": "Sigs",
+   "key": "sig",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "struct",
+     "t": "crypto.OneTimeSignature"
+    }
+   }
+  },
+  {
+   "go": "Proposals",
+   "key": "props",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "struct",
+     "t": "agreement.proposalValue"
+    }
+   }
+  }
+ ],
+ "agreement.proposalValue": [
+  {
+   "go": "OriginalPeriod",
+   "key": "oper",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "OriginalProposer",
+   "key": "oprop",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "BlockDigest",
+   "key": "dig",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "EncodingDigest",
+   "key": "encdig",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  }
+ ],
+ "agreement.voteAuthenticator": [
+  {
+   "go": "Sender",
+   "key": "snd",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Cred",
+   "key": "cred",
+   "type": {
+    "k": "struct",
+    "t": "committee.UnauthenticatedCredential"
+   }
+  },
+  {
+   "go": "Sig",
+   "key": "sig",
+   "type": {
+    "k": "struct",
+    "t": "crypto.OneTimeSignature"
+   }
+  }
+ ],
+ "basics.AssetParams": [
+  {
+   "go": "Total",
+   "key": "t",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Decimals",
+   "key": "dc",
+   "type": {
+    "k": "leaf",
+    "t": "uint32"
+   }
+  },
+  {
+   "go": "DefaultFrozen",
+   "key": "df",
+   "type": {
+    "k": "leaf",
+    "t": "bool"
+   }
+  },
+  {
+   "go": "UnitName",
+   "key": "un",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "AssetName",
+   "key": "an",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "URL",
+   "key": "au",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "MetadataHash",
+   "key": "am",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Manager",
+   "key": "m",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Reserve",
+   "key": "r",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Freeze",
+   "key": "f",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Clawback",
+   "key": "c",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  }
+ ],
+ "basics.Participant": [
+  {
+   "go": "PK",
+   "key": "p",
+   "type": {
+    "k": "struct",
+    "t": "merklesignature.Verifier"
+   }
+  },
+  {
+   "go": "Weight",
+   "key": "w",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  }
+ ],
+ "basics.StateSchema": [
+  {
+   "go": "NumUint",
+   "key": "nui",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "NumByteSlice",
+   "key": "nbs",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  }
+ ],
+ "basics.ValueDelta": [
+  {
+   "go": "Action",
+   "key": "at",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Bytes",
+   "key": "bs",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "Uint",
+   "key": "ui",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  }
+ ],
+ "bookkeeping.Block": [
+  {
+   "go": "Round",
+   "key": "rnd",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Branch",
+   "key": "prev",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Branch512",
+   "key": "prev512",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  },
+  {
+   "go": "Seed",
+   "key": "seed",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "NativeSha512_256Commitment",
+   "key": "txn",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Sha256Commitment",
+   "key": "txn256",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Sha512Commitment",
+   "key": "txn512",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  },
+  {
+   "go": "TimeStamp",
+   "key": "ts",
+   "type": {
+    "k": "leaf",
+    "t": "int64"
+   }
+  },
+  {
+   "go": "GenesisID",
+   "key": "gen",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "GenesisHash",
+   "key": "gh",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Proposer",
+   "key": "prp",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "FeesCollected",
+   "key": "fc",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Bonus",
+   "key": "bi",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "ProposerPayout",
+   "key": "pp",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "FeeSink",
+   "key": "fees",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "RewardsPool",
+   "key": "rwd",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "RewardsLevel",
+   "key": "earn",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "RewardsRate",
+   "key": "rate",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "RewardsResidue",
+   "key": "frac",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "RewardsRecalculationRound",
+   "key": "rwcalr",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "CurrentProtocol",
+   "key": "proto",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "NextProtocol",
+   "key": "nextproto",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "NextProtocolApprovals",
+   "key": "nextyes",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "NextProtocolVoteBefore",
+   "key": "nextbefore",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "NextProtocolSwitchOn",
+   "key": "nextswitch",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "UpgradePropose",
+   "key": "upgradeprop",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "UpgradeDelay",
+   "key": "upgradedelay",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "UpgradeApprove",
+   "key": "upgradeyes",
+   "type": {
+    "k": "leaf",
+    "t": "bool"
+   }
+  },
+  {
+   "go": "TxnCounter",
+   "key": "tc",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "StateProofTracking",
+   "key": "spt",
+   "type": {
+    "k": "map",
+    "e": {
+     "k": "struct",
+     "t": "bookkeeping.StateProofTrackingData"
+    }
+   }
+  },
+  {
+   "go": "ExpiredParticipationAccounts",
+   "key": "partupdrmv",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "leaf",
+     "t": "bytes[32]"
+    }
+   }
+  },
+  {
+   "go": "AbsentParticipationAccounts",
+   "key": "partupdabs",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "leaf",
+     "t": "bytes[32]"
+    }
+   }
+  },
+  {
+   "go": "Load",
+   "key": "ld",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "CongestionTax",
+   "key": "ct",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Payset",
+   "key": "txns",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "struct",
+     "t": "transactions.SignedTxnInBlock"
+    }
+   }
+  }
+ ],
+ "bookkeeping.BlockHeader": [
+  {
+   "go": "Round",
+   "key": "rnd",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Branch",
+   "key": "prev",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Branch512",
+   "key": "prev512",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  },
+  {
+   "go": "Seed",
+   "key": "seed",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "NativeSha512_256Commitment",
+   "key": "txn",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Sha256Commitment",
+   "key": "txn256",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Sha512Commitment",
+   "key": "txn512",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  },
+  {
+   "go": "TimeStamp",
+   "key": "ts",
+   "type": {
+    "k": "leaf",
+    "t": "int64"
+   }
+  },
+  {
+   "go": "GenesisID",
+   "key": "gen",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "GenesisHash",
+   "key": "gh",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Proposer",
+   "key": "prp",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "FeesCollected",
+   "key": "fc",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Bonus",
+   "key": "bi",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "ProposerPayout",
+   "key": "pp",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "FeeSink",
+   "key": "fees",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "RewardsPool",
+   "key": "rwd",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "RewardsLevel",
+   "key": "earn",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "RewardsRate",
+   "key": "rate",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "RewardsResidue",
+   "key": "frac",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "RewardsRecalculationRound",
+   "key": "rwcalr",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "CurrentProtocol",
+   "key": "proto",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "NextProtocol",
+   "key": "nextproto",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "NextProtocolApprovals",
+   "key": "nextyes",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "NextProtocolVoteBefore",
+   "key": "nextbefore",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "NextProtocolSwitchOn",
+   "key": "nextswitch",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "UpgradePropose",
+   "key": "upgradeprop",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "UpgradeDelay",
+   "key": "upgradedelay",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "UpgradeApprove",
+   "key": "upgradeyes",
+   "type": {
+    "k": "leaf",
+    "t": "bool"
+   }
+  },
+  {
+   "go": "TxnCounter",
+   "key": "tc",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "StateProofTracking",
+   "key": "spt",
+   "type": {
+    "k": "map",
+    "e": {
+     "k": "struct",
+     "t": "bookkeeping.StateProofTrackingData"
+    }
+   }
+  },
+  {
+   "go": "ExpiredParticipationAccounts",
+   "key": "partupdrmv",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "leaf",
+     "t": "bytes[32]"
+    }
+   }
+  },
+  {
+   "go": "AbsentParticipationAccounts",
+   "key": "partupdabs",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "leaf",
+     "t": "bytes[32]"
+    }
+   }
+  },
+  {
+   "go": "Load",
+   "key": "ld",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "CongestionTax",
+   "key": "ct",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  }
+ ],
+ "bookkeeping.StateProofTrackingData": [
+  {
+   "go": "StateProofVotersCommitment",
+   "key": "v",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  },
+  {
+   "go": "StateProofOnlineTotalWeight",
+   "key": "t",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "StateProofNextRound",
+   "key": "n",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  }
+ ],
+ "committee.UnauthenticatedCredential": [
+  {
+   "go": "Proof",
+   "key": "pf",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[80]"
+   }
+  }
+ ],
+ "crypto.FalconVerifier": [
+  {
+   "go": "PublicKey",
+   "key": "k",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[1793]"
+   }
+  }
+ ],
+ "crypto.HashFactory": [
+  {
+   "go": "HashType",
+   "key": "t",
+   "type": {
+    "k": "leaf",
+    "t": "uint16"
+   }
+  }
+ ],
+ "crypto.HeartbeatProof": [
+  {
+   "go": "Sig",
+   "key": "s",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  },
+  {
+   "go": "PK",
+   "key": "p",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "PK2",
+   "key": "p2",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "PK1Sig",
+   "key": "p1s",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  },
+  {
+   "go": "PK2Sig",
+   "key": "p2s",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  }
+ ],
+ "crypto.MultisigSig": [
+  {
+   "go": "Version",
+   "key": "v",
+   "type": {
+    "k": "leaf",
+    "t": "uint8"
+   }
+  },
+  {
+   "go": "Threshold",
+   "key": "thr",
+   "type": {
+    "k": "leaf",
+    "t": "uint8"
+   }
+  },
+  {
+   "go": "Subsigs",
+   "key": "subsig",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "struct",
+     "t": "crypto.MultisigSubsig"
+    }
+   }
+  }
+ ],
+ "crypto.MultisigSubsig": [
+  {
+   "go": "Key",
+   "key": "pk",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Sig",
+   "key": "s",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  }
+ ],
+ "crypto.OneTimeSignature": [
+  {
+   "go": "Sig",
+   "key": "s",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  },
+  {
+   "go": "PK",
+   "key": "p",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "PKSigOld",
+   "key": "ps",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  },
+  {
+   "go": "PK2",
+   "key": "p2",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "PK1Sig",
+   "key": "p1s",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  },
+  {
+   "go": "PK2Sig",
+   "key": "p2s",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  }
+ ],
+ "merklearray.Proof": [
+  {
+   "go": "Path",
+   "key": "pth",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "leaf",
+     "t": "bytes"
+    }
+   }
+  },
+  {
+   "go": "HashFactory",
+   "key": "hsh",
+   "type": {
+    "k": "struct",
+    "t": "crypto.HashFactory"
+   }
+  },
+  {
+   "go": "TreeDepth",
+   "key": "td",
+   "type": {
+    "k": "leaf",
+    "t": "uint8"
+   }
+  }
+ ],
+ "merklearray.SingleLeafProof": [
+  {
+   "go": "Path",
+   "key": "pth",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "leaf",
+     "t": "bytes"
+    }
+   }
+  },
+  {
+   "go": "HashFactory",
+   "key": "hsh",
+   "type": {
+    "k": "struct",
+    "t": "crypto.HashFactory"
+   }
+  },
+  {
+   "go": "TreeDepth",
+   "key": "td",
+   "type": {
+    "k": "leaf",
+    "t": "uint8"
+   }
+  }
+ ],
+ "merklesignature.Signature": [
+  {
+   "go": "Signature",
+   "key": "sig",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  },
+  {
+   "go": "VectorCommitmentIndex",
+   "key": "idx",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Proof",
+   "key": "prf",
+   "type": {
+    "k": "struct",
+    "t": "merklearray.SingleLeafProof"
+   }
+  },
+  {
+   "go": "VerifyingKey",
+   "key": "vkey",
+   "type": {
+    "k": "struct",
+    "t": "crypto.FalconVerifier"
+   }
+  }
+ ],
+ "merklesignature.Verifier": [
+  {
+   "go": "Commitment",
+   "key": "cmt",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  },
+  {
+   "go": "KeyLifetime",
+   "key": "lf",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  }
+ ],
+ "rpcs.EncodedBlockCert": [
+  {
+   "go": "Block",
+   "key": "block",
+   "type": {
+    "k": "struct",
+    "t": "bookkeeping.Block"
+   }
+  },
+  {
+   "go": "Certificate",
+   "key": "cert",
+   "type": {
+    "k": "struct",
+    "t": "agreement.Certificate"
+   }
+  }
+ ],
+ "stateproof.Reveal": [
+  {
+   "go": "SigSlot",
+   "key": "s",
+   "type": {
+    "k": "struct",
+    "t": "stateproof.sigslotCommit"
+   }
+  },
+  {
+   "go": "Part",
+   "key": "p",
+   "type": {
+    "k": "struct",
+    "t": "basics.Participant"
+   }
+  }
+ ],
+ "stateproof.StateProof": [
+  {
+   "go": "SigCommit",
+   "key": "c",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  },
+  {
+   "go": "SignedWeight",
+   "key": "w",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "SigProofs",
+   "key": "S",
+   "type": {
+    "k": "struct",
+    "t": "merklearray.Proof"
+   }
+  },
+  {
+   "go": "PartProofs",
+   "key": "P",
+   "type": {
+    "k": "struct",
+    "t": "merklearray.Proof"
+   }
+  },
+  {
+   "go": "MerkleSignatureSaltVersion",
+   "key": "v",
+   "type": {
+    "k": "leaf",
+    "t": "uint8"
+   }
+  },
+  {
+   "go": "Reveals",
+   "key": "r",
+   "type": {
+    "k": "map",
+    "e": {
+     "k": "struct",
+     "t": "stateproof.Reveal"
+    }
+   }
+  },
+  {
+   "go": "PositionsToReveal",
+   "key": "pr",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "leaf",
+     "t": "uint64"
+    }
+   }
+  }
+ ],
+ "stateproof.sigslotCommit": [
+  {
+   "go": "Sig",
+   "key": "s",
+   "type": {
+    "k": "struct",
+    "t": "merklesignature.Signature"
+   }
+  },
+  {
+   "go": "L",
+   "key": "l",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  }
+ ],
+ "stateproofmsg.Message": [
+  {
+   "go": "BlockHeadersCommitment",
+   "key": "b",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  },
+  {
+   "go": "VotersCommitment",
+   "key": "v",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  },
+  {
+   "go": "LnProvenWeight",
+   "key": "P",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "FirstAttestedRound",
+   "key": "f",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "LastAttestedRound",
+   "key": "l",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  }
+ ],
+ "transactions.ApplyData": [
+  {
+   "go": "ClosingAmount",
+   "key": "ca",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "AssetClosingAmount",
+   "key": "aca",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "SenderRewards",
+   "key": "rs",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "ReceiverRewards",
+   "key": "rr",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "CloseRewards",
+   "key": "rc",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "EvalDelta",
+   "key": "dt",
+   "type": {
+    "k": "struct",
+    "t": "transactions.EvalDelta"
+   }
+  },
+  {
+   "go": "ConfigAsset",
+   "key": "caid",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "ApplicationID",
+   "key": "apid",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  }
+ ],
+ "transactions.BoxRef": [
+  {
+   "go": "Index",
+   "key": "i",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Name",
+   "key": "n",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  }
+ ],
+ "transactions.EvalDelta": [
+  {
+   "go": "GlobalDelta",
+   "key": "gd",
+   "type": {
+    "k": "map",
+    "e": {
+     "k": "struct",
+     "t": "basics.ValueDelta"
+    }
+   }
+  },
+  {
+   "go": "LocalDeltas",
+   "key": "ld",
+   "type": {
+    "k": "map",
+    "e": {
+     "k": "map",
+     "e": {
+      "k": "struct",
+      "t": "basics.ValueDelta"
+     }
+    }
+   }
+  },
+  {
+   "go": "SharedAccts",
+   "key": "sa",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "leaf",
+     "t": "bytes[32]"
+    }
+   }
+  },
+  {
+   "go": "Logs",
+   "key": "lg",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "leaf",
+     "t": "string"
+    }
+   }
+  },
+  {
+   "go": "InnerTxns",
+   "key": "itx",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "struct",
+     "t": "transactions.SignedTxnWithAD"
+    }
+   }
+  }
+ ],
+ "transactions.HeartbeatTxnFields": [
+  {
+   "go": "HbAddress",
+   "key": "a",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "HbProof",
+   "key": "prf",
+   "type": {
+    "k": "struct",
+    "t": "crypto.HeartbeatProof"
+   }
+  },
+  {
+   "go": "HbSeed",
+   "key": "sd",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "HbVoteID",
+   "key": "vid",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "HbKeyDilution",
+   "key": "kd",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "HbChallengeDiscount",
+   "key": "c",
+   "type": {
+    "k": "leaf",
+    "t": "bool"
+   }
+  }
+ ],
+ "transactions.HoldingRef": [
+  {
+   "go": "Address",
+   "key": "d",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Asset",
+   "key": "s",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  }
+ ],
+ "transactions.LocalsRef": [
+  {
+   "go": "Address",
+   "key": "d",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "App",
+   "key": "p",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  }
+ ],
+ "transactions.LogicSig": [
+  {
+   "go": "Logic",
+   "key": "l",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  },
+  {
+   "go": "Sig",
+   "key": "sig",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  },
+  {
+   "go": "Msig",
+   "key": "msig",
+   "type": {
+    "k": "struct",
+    "t": "crypto.MultisigSig"
+   }
+  },
+  {
+   "go": "LMsig",
+   "key": "lmsig",
+   "type": {
+    "k": "struct",
+    "t": "crypto.MultisigSig"
+   }
+  },
+  {
+   "go": "PQsig",
+   "key": "pqsig",
+   "type": {
+    "k": "struct",
+    "t": "transactions.PQSig"
+   }
+  },
+  {
+   "go": "Args",
+   "key": "arg",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "leaf",
+     "t": "bytes"
+    }
+   }
+  }
+ ],
+ "transactions.PQSig": [
+  {
+   "go": "Scheme",
+   "key": "sch",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[2]"
+   }
+  },
+  {
+   "go": "Salt",
+   "key": "slt",
+   "type": {
+    "k": "leaf",
+    "t": "uint8"
+   }
+  },
+  {
+   "go": "PublicKey",
+   "key": "pk",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  },
+  {
+   "go": "Signature",
+   "key": "sig",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  }
+ ],
+ "transactions.ResourceRef": [
+  {
+   "go": "Address",
+   "key": "d",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Asset",
+   "key": "s",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "App",
+   "key": "p",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Holding",
+   "key": "h",
+   "type": {
+    "k": "struct",
+    "t": "transactions.HoldingRef"
+   }
+  },
+  {
+   "go": "Locals",
+   "key": "l",
+   "type": {
+    "k": "struct",
+    "t": "transactions.LocalsRef"
+   }
+  },
+  {
+   "go": "Box",
+   "key": "b",
+   "type": {
+    "k": "struct",
+    "t": "transactions.BoxRef"
+   }
+  }
+ ],
+ "transactions.SignedTxn": [
+  {
+   "go": "Sig",
+   "key": "sig",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  },
+  {
+   "go": "Msig",
+   "key": "msig",
+   "type": {
+    "k": "struct",
+    "t": "crypto.MultisigSig"
+   }
+  },
+  {
+   "go": "Lsig",
+   "key": "lsig",
+   "type": {
+    "k": "struct",
+    "t": "transactions.LogicSig"
+   }
+  },
+  {
+   "go": "PQsig",
+   "key": "pqsig",
+   "type": {
+    "k": "struct",
+    "t": "transactions.PQSig"
+   }
+  },
+  {
+   "go": "Txn",
+   "key": "txn",
+   "type": {
+    "k": "struct",
+    "t": "transactions.Transaction"
+   }
+  },
+  {
+   "go": "AuthAddr",
+   "key": "sgnr",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  }
+ ],
+ "transactions.SignedTxnInBlock": [
+  {
+   "go": "Sig",
+   "key": "sig",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  },
+  {
+   "go": "Msig",
+   "key": "msig",
+   "type": {
+    "k": "struct",
+    "t": "crypto.MultisigSig"
+   }
+  },
+  {
+   "go": "Lsig",
+   "key": "lsig",
+   "type": {
+    "k": "struct",
+    "t": "transactions.LogicSig"
+   }
+  },
+  {
+   "go": "PQsig",
+   "key": "pqsig",
+   "type": {
+    "k": "struct",
+    "t": "transactions.PQSig"
+   }
+  },
+  {
+   "go": "Txn",
+   "key": "txn",
+   "type": {
+    "k": "struct",
+    "t": "transactions.Transaction"
+   }
+  },
+  {
+   "go": "AuthAddr",
+   "key": "sgnr",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "ClosingAmount",
+   "key": "ca",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "AssetClosingAmount",
+   "key": "aca",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "SenderRewards",
+   "key": "rs",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "ReceiverRewards",
+   "key": "rr",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "CloseRewards",
+   "key": "rc",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "EvalDelta",
+   "key": "dt",
+   "type": {
+    "k": "struct",
+    "t": "transactions.EvalDelta"
+   }
+  },
+  {
+   "go": "ConfigAsset",
+   "key": "caid",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "ApplicationID",
+   "key": "apid",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "HasGenesisID",
+   "key": "hgi",
+   "type": {
+    "k": "leaf",
+    "t": "bool"
+   }
+  },
+  {
+   "go": "HasGenesisHash",
+   "key": "hgh",
+   "type": {
+    "k": "leaf",
+    "t": "bool"
+   }
+  }
+ ],
+ "transactions.SignedTxnWithAD": [
+  {
+   "go": "Sig",
+   "key": "sig",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  },
+  {
+   "go": "Msig",
+   "key": "msig",
+   "type": {
+    "k": "struct",
+    "t": "crypto.MultisigSig"
+   }
+  },
+  {
+   "go": "Lsig",
+   "key": "lsig",
+   "type": {
+    "k": "struct",
+    "t": "transactions.LogicSig"
+   }
+  },
+  {
+   "go": "PQsig",
+   "key": "pqsig",
+   "type": {
+    "k": "struct",
+    "t": "transactions.PQSig"
+   }
+  },
+  {
+   "go": "Txn",
+   "key": "txn",
+   "type": {
+    "k": "struct",
+    "t": "transactions.Transaction"
+   }
+  },
+  {
+   "go": "AuthAddr",
+   "key": "sgnr",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "ClosingAmount",
+   "key": "ca",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "AssetClosingAmount",
+   "key": "aca",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "SenderRewards",
+   "key": "rs",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "ReceiverRewards",
+   "key": "rr",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "CloseRewards",
+   "key": "rc",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "EvalDelta",
+   "key": "dt",
+   "type": {
+    "k": "struct",
+    "t": "transactions.EvalDelta"
+   }
+  },
+  {
+   "go": "ConfigAsset",
+   "key": "caid",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "ApplicationID",
+   "key": "apid",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  }
+ ],
+ "transactions.Transaction": [
+  {
+   "go": "Type",
+   "key": "type",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "Sender",
+   "key": "snd",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Fee",
+   "key": "fee",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "FirstValid",
+   "key": "fv",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "LastValid",
+   "key": "lv",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Note",
+   "key": "note",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  },
+  {
+   "go": "GenesisID",
+   "key": "gen",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "GenesisHash",
+   "key": "gh",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Group",
+   "key": "grp",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Lease",
+   "key": "lx",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "RekeyTo",
+   "key": "rekey",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "VotePK",
+   "key": "votekey",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "SelectionPK",
+   "key": "selkey",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "StateProofPK",
+   "key": "sprfkey",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  },
+  {
+   "go": "VoteFirst",
+   "key": "votefst",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "VoteLast",
+   "key": "votelst",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "VoteKeyDilution",
+   "key": "votekd",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Nonparticipation",
+   "key": "nonpart",
+   "type": {
+    "k": "leaf",
+    "t": "bool"
+   }
+  },
+  {
+   "go": "Receiver",
+   "key": "rcv",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Amount",
+   "key": "amt",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "CloseRemainderTo",
+   "key": "close",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "ConfigAsset",
+   "key": "caid",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "AssetParams",
+   "key": "apar",
+   "type": {
+    "k": "struct",
+    "t": "basics.AssetParams"
+   }
+  },
+  {
+   "go": "XferAsset",
+   "key": "xaid",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "AssetAmount",
+   "key": "aamt",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "AssetSender",
+   "key": "asnd",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "AssetReceiver",
+   "key": "arcv",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "AssetCloseTo",
+   "key": "aclose",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "FreezeAccount",
+   "key": "fadd",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "FreezeAsset",
+   "key": "faid",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "AssetFrozen",
+   "key": "afrz",
+   "type": {
+    "k": "leaf",
+    "t": "bool"
+   }
+  },
+  {
+   "go": "ApplicationID",
+   "key": "apid",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "OnCompletion",
+   "key": "apan",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "ApplicationArgs",
+   "key": "apaa",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "leaf",
+     "t": "bytes"
+    }
+   }
+  },
+  {
+   "go": "Accounts",
+   "key": "apat",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "leaf",
+     "t": "bytes[32]"
+    }
+   }
+  },
+  {
+   "go": "ForeignAssets",
+   "key": "apas",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "leaf",
+     "t": "uint64"
+    }
+   }
+  },
+  {
+   "go": "ForeignApps",
+   "key": "apfa",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "leaf",
+     "t": "uint64"
+    }
+   }
+  },
+  {
+   "go": "Access",
+   "key": "al",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "struct",
+     "t": "transactions.ResourceRef"
+    }
+   }
+  },
+  {
+   "go": "Boxes",
+   "key": "apbx",
+   "type": {
+    "k": "list",
+    "e": {
+     "k": "struct",
+     "t": "transactions.BoxRef"
+    }
+   }
+  },
+  {
+   "go": "LocalStateSchema",
+   "key": "apls",
+   "type": {
+    "k": "struct",
+    "t": "basics.StateSchema"
+   }
+  },
+  {
+   "go": "GlobalStateSchema",
+   "key": "apgs",
+   "type": {
+    "k": "struct",
+    "t": "basics.StateSchema"
+   }
+  },
+  {
+   "go": "ApprovalProgram",
+   "key": "apap",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  },
+  {
+   "go": "ClearStateProgram",
+   "key": "apsu",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  },
+  {
+   "go": "ExtraProgramPages",
+   "key": "apep",
+   "type": {
+    "k": "leaf",
+    "t": "uint32"
+   }
+  },
+  {
+   "go": "RejectVersion",
+   "key": "aprv",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "StateProofType",
+   "key": "sptype",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "StateProof",
+   "key": "sp",
+   "type": {
+    "k": "struct",
+    "t": "stateproof.StateProof"
+   }
+  },
+  {
+   "go": "Message",
+   "key": "spmsg",
+   "type": {
+    "k": "struct",
+    "t": "stateproofmsg.Message"
+   }
+  },
+  {
+   "go": "HeartbeatTxnFields",
+   "key": "hb",
+   "type": {
+    "k": "struct",
+    "t": "transactions.HeartbeatTxnFields"
+   }
+  }
+ ]
+}

@@ -135,9 +135,9 @@ impl PQSig {
     /// Decode into an already decoded value, as go's generated `UnmarshalMsg`
     /// does (issue #2424): a repeated key decodes into the populated field.
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> Result<(), algo_error::AlgoError> {
-        let len = crate::rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match crate::rmp_decode::read_key_bytes(rd)? {
+        let mut keys = crate::rmp_decode::struct_keys(rd, s, "transactions.PQSig")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"sch" => crate::rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.scheme)?,
                 b"slt" => s.salt = PQAddressSalt(crate::rmp_decode::read_u8_val(rd)?),
                 // go's `allocbound=crypto.MaxPQPublicKeySize` / `MaxPQSignatureSize`.

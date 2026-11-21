@@ -1565,9 +1565,9 @@ impl StateSchema {
     /// Decode into an already decoded value, as go's generated `UnmarshalMsg`
     /// does (issue #2424, see [`rmp_decode::read_struct_map_len`]).
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "basics.StateSchema")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"nui" => s.num_uint = rmp_decode::read_u64(rd)?,
                 b"nbs" => s.num_byte_slice = rmp_decode::read_u64(rd)?,
                 other => rmp_decode::unknown_key(rd, other)?,
@@ -1581,9 +1581,9 @@ impl BoxRef {
     decode_via_into!();
 
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "transactions.BoxRef")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"i" => s.index = rmp_decode::read_u64(rd)?,
                 b"n" => {
                     rmp_decode::check_go_bytes_bound(
@@ -1604,9 +1604,9 @@ impl AssetParams {
     decode_via_into!();
 
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "basics.AssetParams")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"t" => s.total = rmp_decode::read_u64(rd)?,
                 b"dc" => s.decimals = rmp_decode::read_u32(rd)?,
                 b"df" => s.default_frozen = rmp_decode::read_bool(rd)?,
@@ -1647,9 +1647,9 @@ impl MultisigSubsig {
     decode_via_into!();
 
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "crypto.MultisigSubsig")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"pk" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.public_key)?,
                 b"s" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.signature)?,
                 other => rmp_decode::unknown_key(rd, other)?,
@@ -1668,9 +1668,9 @@ impl MultisigSig {
     decode_via_into!();
 
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "crypto.MultisigSig")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"v" => s.version = rmp_decode::read_u8_val(rd)?,
                 b"thr" => s.threshold = rmp_decode::read_u8_val(rd)?,
                 // go bounds `subsig` by `maxMultisig` (255) before reading it.
@@ -1752,9 +1752,9 @@ impl LogicSig {
     /// and is rejected later by `logicSigGroupSizeCheck` /
     /// `LogicSig.Logic empty` (issue #2041).
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "transactions.LogicSig")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 // The allocation bounds are go's (`allocbound` tags of
                 // `transactions.LogicSig`): a record over one never decodes (#2390).
                 b"l" => {
@@ -1797,9 +1797,9 @@ impl HeartbeatProof {
     decode_via_into!();
 
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "crypto.HeartbeatProof")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"s" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.sig)?,
                 b"p" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.pk)?,
                 b"p2" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.pk2)?,
@@ -1816,9 +1816,9 @@ impl HeartbeatTxnFields {
     decode_via_into!();
 
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "transactions.HeartbeatTxnFields")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"a" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.address.0)?,
                 b"prf" => {
                     rmp_decode::read_struct_into_opt(rd, &mut s.proof, HeartbeatProof::decode_into)?
@@ -1838,9 +1838,9 @@ impl HashFactory {
     decode_via_into!();
 
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "crypto.HashFactory")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"t" => s.hash_type = rmp_decode::read_u16(rd)?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
@@ -1904,9 +1904,9 @@ impl MerkleProof {
     decode_via_into!();
 
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "merklearray.Proof")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"pth" => rmp_decode::read_slice_into_opt(
                     rd,
                     &mut s.path,
@@ -1931,9 +1931,9 @@ impl FalconVerifier {
     decode_via_into!();
 
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "crypto.FalconVerifier")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"k" => read_falcon_public_key_into(rd, &mut s.public_key)?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
@@ -1946,9 +1946,9 @@ impl MerkleSignature {
     decode_via_into!();
 
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "merklesignature.Signature")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"sig" => {
                     s.signature =
                         rmp_decode::read_bounded_bytebuf(rd, rmp_decode::FALCON_MAX_SIGNATURE_SIZE)?
@@ -1973,9 +1973,9 @@ impl SigSlotCommit {
     decode_via_into!();
 
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "stateproof.sigslotCommit")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"s" => {
                     rmp_decode::read_struct_into_opt(rd, &mut s.sig, MerkleSignature::decode_into)?
                 }
@@ -1994,9 +1994,9 @@ impl MerkleSignatureVerifier {
     /// keeps the fields a repeated key's map does not mention (issue #2397,
     /// a duplicated `p` carrying `{}`), a map-header nil zeroes it.
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "merklesignature.Verifier")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"cmt" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.commitment)?,
                 b"lf" => s.key_lifetime = rmp_decode::read_u64(rd)?,
                 other => rmp_decode::unknown_key(rd, other)?,
@@ -2013,9 +2013,9 @@ impl Participant {
     /// [`MerkleSignatureVerifier::decode_into`]); the `required` check runs on
     /// the merged result, like go's.
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "basics.Participant")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"p" => rmp_decode::read_struct_into_opt(
                     rd,
                     &mut s.pk,
@@ -2046,9 +2046,9 @@ impl Reveal {
     decode_via_into!();
 
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "stateproof.Reveal")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"s" => rmp_decode::read_struct_into_opt(
                     rd,
                     &mut s.sig_slot,
@@ -2079,9 +2079,9 @@ impl StateProofBody {
     decode_via_into!();
 
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "stateproof.StateProof")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"c" => {
                     s.sig_commit =
                         rmp_decode::read_bounded_bytebuf(rd, rmp_decode::MAX_HASH_DIGEST_SIZE)?
@@ -2334,9 +2334,9 @@ impl StateProofMessage {
     decode_via_into!();
 
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "stateproofmsg.Message")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"b" => {
                     s.block_headers_commitment =
                         rmp_decode::read_bounded_bytebuf(rd, rmp_decode::SHA256_SIZE)?
@@ -2359,9 +2359,9 @@ impl HoldingRef {
     decode_via_into!();
 
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "transactions.HoldingRef")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"d" => s.address = rmp_decode::read_u64(rd)?,
                 b"s" => s.asset = rmp_decode::read_u64(rd)?,
                 other => rmp_decode::unknown_key(rd, other)?,
@@ -2375,9 +2375,9 @@ impl LocalsRef {
     decode_via_into!();
 
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "transactions.LocalsRef")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"d" => s.address = rmp_decode::read_u64(rd)?,
                 b"p" => s.app = rmp_decode::read_u64(rd)?,
                 other => rmp_decode::unknown_key(rd, other)?,
@@ -2391,9 +2391,9 @@ impl ResourceRef {
     decode_via_into!();
 
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "transactions.ResourceRef")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"d" => rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.address.0)?,
                 b"s" => s.asset = rmp_decode::read_u64(rd)?,
                 b"p" => s.app = rmp_decode::read_u64(rd)?,
@@ -2491,9 +2491,8 @@ impl Transaction {
     /// Uses two-level key dispatch: (key_len, first_byte) for O(1) routing
     /// instead of linear byte-slice comparison across all 49 fields.
     pub(crate) fn decode_into(rd: &mut &[u8], t: &mut Self) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, t)?;
-        for _ in 0..len {
-            let key = rmp_decode::read_key_bytes(rd)?;
+        let mut keys = rmp_decode::struct_keys(rd, t, "transactions.Transaction")?;
+        while let Some(key) = keys.next(rd)? {
             match (key.len(), key.first().copied().unwrap_or(0)) {
                 // ── 2-byte keys ──────────────────────────────────
                 (2, b'a') if key == b"al" => rmp_decode::read_slice_into_opt(
@@ -2737,9 +2736,19 @@ impl SignedTransaction {
         s: &mut Self,
         genesis_flags: bool,
     ) -> DecodeResult<()> {
-        let len = rmp_decode::read_struct_map_len(rd, s)?;
-        for _ in 0..len {
-            let key = rmp_decode::read_key_bytes(rd)?;
+        // go's type: the REST submit and gossip decode a `SignedTxn` (strict
+        // mode), a block a `SignedTxnInBlock`, an inner transaction of an eval
+        // delta a `SignedTxnWithAD`; they differ in which fields exist and so
+        // in the positional order of the array form.
+        let go_type = if rmp_decode::is_strict() {
+            "transactions.SignedTxn"
+        } else if genesis_flags {
+            "transactions.SignedTxnInBlock"
+        } else {
+            "transactions.SignedTxnWithAD"
+        };
+        let mut keys = rmp_decode::struct_keys(rd, s, go_type)?;
+        while let Some(key) = keys.next(rd)? {
             // Block-only keys (ApplyData and the genesis flags): go's SignedTxn
             // has no such field, so a REST submit carrying one is an unknown
             // key (strict mode only; blocks keep reading them). Keep this list

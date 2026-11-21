@@ -78,6 +78,15 @@ its bound and at bound + 1 elements / bytes, in a set's `bound_kinds`. go
 rejects the second with `msgp.ErrOverflow` on the length header; the tx-sync
 response (go-codec) checks no allocbound and accepts both.
 
+Struct-from-array cases (issue #2426) come last: go decodes a struct from an
+array too (elements are the fields in go's declaration order, embedded structs
+flattened, `ErrTooManyArrayFields` on one more, the fields past a shorter array
+left alone). A case carries its whole mutant in `hex` (`map` -2): some structs
+of a seed turned into arrays, type-directed by the field layout in
+crates/core/algo-types/src/go_struct_order.json (dumped from go's types by the
+rpcs oracle's `STRICT_SCHEMA_OUT`), for the structs whose algod-rust reader
+has the array form (`converted_types`). `--fuzz` writes more of them.
+
 Nil-element cases (issue #2430) come after them: `apaa`, a proof's `pth` and
 a LogicSig's `arg` again, as lists mixing `nil`, empty and one-byte elements,
 in a set's `nil_kinds`. go keeps a `nil` element nil and re-encodes it as
@@ -842,6 +851,272 @@ def dump(cases):
     )
 
 
+# ── struct-from-array cases (issue #2426) ─────────────────────────────────
+#
+# go decodes a struct from an ARRAY too: the elements are the fields in go's
+# declaration order (embedded structs flattened), `ErrTooManyArrayFields` on
+# an element more, the fields past a shorter array left alone. The cases turn
+# the maps of a seed into arrays, type-directed by the msgp field layout that
+# the oracle dumps from go's own types (crates/core/algo-types/src/
+# go_struct_order.json: `STRICT_SCHEMA_OUT`, checked against the generated
+# decoders), so the verdicts and decoded values come from go.
+
+SCHEMA_PATH = os.path.join(ROOT, "crates", "core", "algo-types", "src", "go_struct_order.json")
+
+_CONVERTED = None
+
+
+def converted_types():
+    """The go structs whose algod-rust reader has the array form: the type names
+    the readers pass to `rmp_decode::struct_keys` (and the agreement codec's
+    twin). A struct outside this set stays a map in the array cases, so a case
+    is never about a reader that is not converted yet (issue #2426)."""
+    global _CONVERTED
+    if _CONVERTED is None:
+        import re
+
+        found = set()
+        for base, _dirs, files in os.walk(os.path.join(ROOT, "crates")):
+            if "target" in base.split(os.sep):
+                continue
+            for f in files:
+                if f.endswith(".rs"):
+                    txt = open(os.path.join(base, f), encoding="utf-8").read()
+                    found |= set(re.findall(r'struct_keys\([^;]*?"([A-Za-z_][A-Za-z_0-9.]*)"', txt))
+        _CONVERTED = found
+    return _CONVERTED
+
+# the go type each seed kind decodes
+ROOT_TYPES = {
+    "blockcert": "rpcs.EncodedBlockCert",
+    "block": "bookkeeping.Block",
+    "header": "bookkeeping.BlockHeader",
+    "stxn": "transactions.SignedTxn",
+    "stxninblock": "transactions.SignedTxnInBlock",
+    "txn": "transactions.Transaction",
+    "applydata": "transactions.ApplyData",
+    "evaldelta": "transactions.EvalDelta",
+}
+
+_SCHEMA = None
+
+
+def load_schema():
+    global _SCHEMA
+    if _SCHEMA is None:
+        _SCHEMA = json.load(open(SCHEMA_PATH, encoding="utf-8"))
+    return _SCHEMA
+
+
+def array_form_allowed(tname):
+    return tname in load_schema() and tname in converted_types()
+
+
+def zero_encoding(t):
+    """go's zero value of a field of type `t`, as the encoder would write it;
+    a struct / list / map is nil."""
+    if t["k"] != "leaf":
+        return bytes([0xC0])
+    name = t.get("t", "")
+    if name == "bool":
+        return bytes([0xC2])
+    if name == "string":
+        return bytes([0xA0])
+    if name == "bytes":
+        return bytes([0xC0])
+    if name.startswith("bytes["):
+        n = int(name[6:-1])
+        return b"\xc4" + bytes([n]) + bytes(n) if n < 256 else b"\xc5" + n.to_bytes(2, "big") + bytes(n)
+    return bytes([0x00])  # an integer
+
+
+def struct_instances(b, i, t, out):
+    """Pre-order list of the array-capable struct maps under the value at b[i:]
+    of type `t`: [(start, struct type name)]."""
+    c = b[i]
+    if t["k"] == "struct":
+        mh = map_header(b, i)
+        if mh is None:
+            return
+        n, hl = mh
+        name = t["t"]
+        if array_form_allowed(name):
+            out.append((i, name))
+        fields = {f["key"]: f["type"] for f in load_schema()[name]}
+        j = i + hl
+        for _ in range(n):
+            ks = j
+            vs = skip(b, ks)
+            ve = skip(b, vs)
+            key = b[ks:vs]
+            if 0xA0 <= key[0] <= 0xBF and key[1:].decode("latin-1") in fields:
+                struct_instances(b, vs, fields[key[1:].decode("latin-1")], out)
+            j = ve
+    elif t["k"] == "list":
+        if 0x90 <= c <= 0x9F or c in (0xDC, 0xDD):
+            for it_start in array_item_starts(b, i):
+                struct_instances(b, it_start, t["e"], out)
+    elif t["k"] == "map":
+        mh = map_header(b, i)
+        if mh is not None:
+            n, hl = mh
+            j = i + hl
+            for _ in range(n):
+                vs = skip(b, j)
+                struct_instances(b, vs, t["e"], out)
+                j = skip(b, vs)
+
+
+def array_item_starts(b, i):
+    c = b[i]
+    if c <= 0x9F:
+        n, j = c & 0x0F, i + 1
+    elif c == 0xDC:
+        n, j = int.from_bytes(b[i + 1 : i + 3], "big"), i + 3
+    else:
+        n, j = int.from_bytes(b[i + 1 : i + 5], "big"), i + 5
+    out = []
+    for _ in range(n):
+        out.append(j)
+        j = skip(b, j)
+    return out
+
+
+def to_array_form(b, i, t, plan, state):
+    """The bytes of the value at b[i:] of type `t`, with the struct maps `plan`
+    selects turned into arrays. `plan(index, start, name)` -> None (keep the
+    map), or the array's variant ("full", "trim", "extra", or an int to cut to
+    that many elements); `state['n']` counts the struct maps seen (the
+    `index` of `struct_instances`)."""
+    end = skip(b, i)
+    c = b[i]
+    if t["k"] == "struct":
+        mh = map_header(b, i)
+        if mh is None:
+            return b[i:end]
+        n, hl = mh
+        name = t["t"]
+        idx = None
+        if array_form_allowed(name):
+            idx = state["n"]
+            state["n"] += 1
+        fields = load_schema()[name]
+        by_key = {f["key"]: f for f in fields}
+        entries = []
+        j = i + hl
+        for _ in range(n):
+            ks = j
+            vs = skip(b, ks)
+            ve = skip(b, vs)
+            entries.append((b[ks:vs], vs, ve))
+            j = ve
+        variant = plan(idx, i, name) if idx is not None else None
+        decodable = all(0xA0 <= k[0] <= 0xBF and k[1:].decode("latin-1") in by_key for k, _, _ in entries)
+        have = {k[1:].decode("latin-1"): (vs, ve) for k, vs, ve in entries if 0xA0 <= k[0] <= 0xBF}
+        if variant is None or not decodable:
+            body = b""
+            for k, vs, ve in entries:
+                f = by_key.get(k[1:].decode("latin-1")) if 0xA0 <= k[0] <= 0xBF else None
+                v = to_array_form(b, vs, f["type"], plan, state) if f else b[vs:ve]
+                body += k + v
+            return encode_map_len(n) + body
+        # children in stream order (the numbering of `struct_instances`)
+        child = {}
+        for k, vs, ve in entries:
+            kk = k[1:].decode("latin-1")
+            child[kk] = to_array_form(b, vs, by_key[kk]["type"], plan, state)
+        elems = [child[f["key"]] if f["key"] in child else zero_encoding(f["type"]) for f in fields]
+        last = max((k for k, f in enumerate(fields) if f["key"] in have), default=-1)
+        if variant == "trim":
+            elems = elems[: last + 1]
+        elif variant == "extra":
+            elems = elems + [bytes([0xC0])]
+        elif isinstance(variant, int):
+            elems = elems[: min(variant, len(elems))]
+        return encode_array_len(len(elems)) + b"".join(elems)
+    if t["k"] == "list" and (0x90 <= c <= 0x9F or c in (0xDC, 0xDD)):
+        items = [to_array_form(b, s, t["e"], plan, state) for s in array_item_starts(b, i)]
+        return encode_array_len(len(items)) + b"".join(items)
+    if t["k"] == "map":
+        mh = map_header(b, i)
+        if mh is not None:
+            n, hl = mh
+            out = []
+            j = i + hl
+            for _ in range(n):
+                ks = j
+                vs = skip(b, ks)
+                ve = skip(b, vs)
+                out.append(b[ks:vs] + to_array_form(b, vs, t["e"], plan, state))
+                j = ve
+            return encode_map_len(n) + b"".join(out)
+    return b[i:end]
+
+
+def make_array_cases(seeds, kinds, rng, per_type=5, cap=None):
+    """Array-form mutants of the seeds of `kinds`: per struct type some
+    instances turned into arrays (full / trimmed / cut / one element too many,
+    descendants kept as maps), and every seed once with every struct an array
+    ("all" and trimmed)."""
+    cases = []  # (seed, hex of the mutant)
+    by_type = {}
+    for s in seeds:
+        if s["kind"] not in kinds or s["kind"] not in ROOT_TYPES:
+            continue
+        b = bytes.fromhex(s["hex"])
+        root = {"k": "struct", "t": ROOT_TYPES[s["kind"]]}
+        inst = []
+        struct_instances(b, 0, root, inst)
+        for k, (start, name) in enumerate(inst):
+            by_type.setdefault(name, []).append((s, b, root, k))
+
+        def everywhere(variant):
+            return lambda idx, start, name: variant
+
+        for variant in ("full", "trim"):
+            m = to_array_form(b, 0, root, everywhere(variant), {"n": 0})
+            if m != b:
+                cases.append((s, m))
+    variants = ["full", "trim", "extra", "cut"]
+    for name, items in sorted(by_type.items()):
+        picks = items[:]
+        rng.shuffle(picks)
+        for n, (s, b, root, k) in enumerate(picks[:per_type]):
+            variant = variants[n % len(variants)]
+            if variant == "cut":
+                variant = rng.randint(0, 6)
+            m = to_array_form(b, 0, root, lambda idx, start, nm, k=k, v=variant: v if idx == k else None, {"n": 0})
+            if m != b:
+                cases.append((s, m))
+    # a struct whose array is full, plus one element: too many fields
+    rng.shuffle(cases)
+    if cap is not None:
+        cases = cases[:cap]
+    return cases
+
+
+def finish_hex_cases(cases, first_id):
+    """Cases given as (seed, mutant bytes): `map` -2 marks them for the replay
+    (the mutant is the case's own `hex`, not a key inserted into the seed)."""
+    out = []
+    for n, (s, mut) in enumerate(cases):
+        out.append(
+            {
+                "id": first_id + n,
+                "seed": s["name"],
+                "kind": s["kind"],
+                "map": -2,
+                "pos": 0,
+                "key": "",
+                "val": "",
+                "hex": mut.hex(),
+                "sha": hashlib.sha256(mut).hexdigest()[:16],
+                "_hex": mut.hex(),
+            }
+        )
+    return out
+
+
 # ── non-consensus real seeds (issue #2396) ────────────────────────────────
 
 
@@ -994,6 +1269,8 @@ SETS = {
         },
         # issue #2430: nil elements of []byte lists
         "nil_kinds": {"stxn", "block", "payload", "stxninblock", "txn", "applydata", "evaldelta"},
+        # issue #2426: structs read from arrays
+        "array_kinds": {"blockcert", "block", "header", "stxn", "stxninblock", "txn", "applydata", "evaldelta"},
     },
     "ledger": {
         "dir": fixture_dir("core", "algo-ledger"),
@@ -1080,6 +1357,8 @@ def run_set(name, st, go, a):
         cases += finish_cases(rep, first_id=len(cases))
         cases += finish_cases(make_bound_cases(seeds, st["bound_kinds"]), first_id=len(cases))
         cases += finish_cases(make_nil_elem_cases(seeds, st["nil_kinds"]), first_id=len(cases))
+        arr = make_array_cases(seeds, st.get("array_kinds", set()), rng, per_type=max(5, n // 400))
+        cases += finish_hex_cases(arr, first_id=len(cases))
         cases = attach_verdicts(go, cases)
         out = a.fuzz[1] if name == "consensus" else f"{a.fuzz[1]}.{name}"
         with open(out, "w", encoding="utf-8", newline="\n") as f:
@@ -1095,6 +1374,8 @@ def run_set(name, st, go, a):
     cases += finish_cases(rep, first_id=len(cases))
     cases += finish_cases(make_bound_cases(seeds, st["bound_kinds"]), first_id=len(cases))
     cases += finish_cases(make_nil_elem_cases(seeds, st["nil_kinds"]), first_id=len(cases))
+    arr = make_array_cases(seeds, st.get("array_kinds", set()), random.Random(st["rng"] ^ 0x2426))
+    cases += finish_hex_cases(arr, first_id=len(cases))
     cases = attach_verdicts(go, cases)
     text = dump(cases)
     path = cases_path(st)

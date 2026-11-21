@@ -45,8 +45,8 @@ use std::collections::BTreeMap;
 use algo_error::{AlgoError, Result};
 
 use crate::rmp_decode::{
-    self, bounds, read_bytes_go_compat, read_fixed_bytes_into_go_compat, read_key_bytes,
-    read_slice_into, read_struct_map_len, read_u64, unknown_key,
+    self, bounds, read_bytes_go_compat, read_fixed_bytes_into_go_compat, read_slice_into, read_u64,
+    unknown_key,
 };
 use crate::{Address, SignedTransaction};
 
@@ -121,9 +121,9 @@ struct ValueDelta {
 
 impl ValueDelta {
     fn decode_into(rd: &mut &[u8], v: &mut Self) -> Result<()> {
-        let n = read_struct_map_len(rd, v)?;
-        for _ in 0..n {
-            match read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, v, "basics.ValueDelta")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"at" => v.action = read_u64(rd)?,
                 b"bs" => v.bytes = read_bounded_string(rd, bounds::MAX_APP_BYTES_VALUE_LEN.get())?,
                 b"ui" => v.uint = read_u64(rd)?,
@@ -213,9 +213,9 @@ struct EvalDelta {
 
 impl EvalDelta {
     fn decode_into(rd: &mut &[u8], d: &mut Self) -> Result<()> {
-        let n = read_struct_map_len(rd, d)?;
-        for _ in 0..n {
-            match read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, d, "transactions.EvalDelta")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"gd" => state_delta_decode_into(rd, &mut d.global)?,
                 b"ld" => {
                     let (n, nil) = read_map_header(rd)?;
@@ -431,9 +431,9 @@ struct StateProofTrackingData {
 
 impl StateProofTrackingData {
     fn decode_into(rd: &mut &[u8], s: &mut Self) -> Result<()> {
-        let n = read_struct_map_len(rd, s)?;
-        for _ in 0..n {
-            match read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, s, "bookkeeping.StateProofTrackingData")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"v" => {
                     rmp_decode::check_go_bytes_bound(rd, MAX_HASH_DIGEST_SIZE)?;
                     s.voters_commitment = read_bytes_go_compat(rd)?;

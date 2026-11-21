@@ -225,7 +225,19 @@ calls `msgp.ReadMapHeaderBytes`; on a `TypeError` it retries
 order ("struct-from-array", `ErrTooManyArrayFields` on excess).
 
 **What algod-rust does instead.** The hand-written struct readers accept the
-map form (and nil, as go does, since #2065) but not the array form.
+map form (and nil, as go does, since #2065) but not the array form, except
+the ones converted by #2426 (done in steps; the remainder is listed here until
+the last one lands): every transaction reader of `algo-types` (the signed
+transaction in its three go shapes, `Transaction`, `ApplyData`/`EvalDelta`
+and their value deltas, the multisig / LogicSig / PQ signature structs, the
+resource references, the heartbeat and state-proof structs) reads go's array
+form through `rmp_decode::struct_keys`, positionally in go's declaration
+order from `crates/core/algo-types/src/go_struct_order.json` (dumped from go's
+types by `tools/strict-decode-oracle`, checked against go's generated
+decoders), with `ErrTooManyArrayFields` on excess. Still map-form only: the
+block and its header, the agreement codec (votes, bundles, proposal
+payloads), `msgp_schema`'s raw-subtree validator and the tx-sync response
+(go-codec's own array rules).
 
 Everything else about a struct decode is go's. Since #2424 every consensus
 reader (transactions, blocks, headers, the PQ and state-proof structs, the

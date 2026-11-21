@@ -15,7 +15,8 @@
 //! An entry point that also returns its decoded value, re-encoded the way go
 //! encodes it ([`valued`]), must match go's decoded value too: the case's
 //! `go_val` is the sha256 prefix of go's re-encode (issue #2421, what a
-//! repeated key decodes to).
+//! repeated key decodes to). A case with `map` -2 carries the whole mutant in
+//! its `hex` (a seed with structs turned into arrays, issue #2426).
 
 use std::collections::BTreeMap;
 
@@ -201,13 +202,19 @@ pub fn replay(
         let seed = &seeds[c["seed"].as_str().expect("seed")];
         let key = hex::decode(c["key"].as_str().expect("key")).expect("key hex");
         let val = hex::decode(c["val"].as_str().expect("val")).expect("val hex");
-        let mutant = mutate(
-            seed,
-            c["map"].as_i64().expect("map"),
-            c["pos"].as_u64().expect("pos") as usize,
-            &key,
-            &val,
-        );
+        // map -2: the case carries its mutant (a struct turned into an array,
+        // issue #2426), not a key to insert
+        let mutant = if c["map"].as_i64() == Some(-2) {
+            hex::decode(c["hex"].as_str().expect("hex")).expect("mutant hex")
+        } else {
+            mutate(
+                seed,
+                c["map"].as_i64().expect("map"),
+                c["pos"].as_u64().expect("pos") as usize,
+                &key,
+                &val,
+            )
+        };
         let sha = hex::encode(&Sha256::digest(&mutant)[..8]);
         assert_eq!(
             sha,

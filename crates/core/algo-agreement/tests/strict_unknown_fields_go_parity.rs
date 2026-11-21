@@ -102,6 +102,23 @@ fn entries(b: &[u8]) -> Option<Vec<(&[u8], &[u8])>> {
     Some(out)
 }
 
+/// The elements of the array at the start of `b`, if it is one.
+fn array_items(b: &[u8]) -> Option<Vec<&[u8]>> {
+    let (mut j, n) = match b[0] {
+        c @ 0x90..=0x9f => (1, (c & 0x0f) as usize),
+        0xdc => (3, be(b, 1, 2)),
+        0xdd => (5, be(b, 1, 4)),
+        _ => return None,
+    };
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let e = skip(b, j);
+        out.push(&b[j..e]);
+        j = e;
+    }
+    Some(out)
+}
+
 fn map_len_header(n: usize) -> Vec<u8> {
     if n < 16 {
         vec![0x80 | n as u8]
@@ -115,6 +132,8 @@ fn map_len_header(n: usize) -> Vec<u8> {
 // ── the entry points under test ───────────────────────────────────────────
 
 const APPLY_DATA_KEYS: [&[u8]; 8] = [b"ca", b"dt", b"rs", b"rr", b"rc", b"aca", b"apid", b"caid"];
+/// go's `ApplyData` fields in declaration (positional) order.
+const APPLY_DATA_ORDER: [&[u8]; 8] = [b"ca", b"aca", b"rs", b"rr", b"rc", b"dt", b"caid", b"apid"];
 
 /// `applydata` / `evaldelta` have no standalone reader in algod-rust (they
 /// only occur inside a block's `SignedTxnInBlock`): embed the value in a
@@ -128,6 +147,23 @@ fn wrap_in_stxn(kind: &str, b: &[u8], txn: &[u8]) -> Option<Vec<u8>> {
         stxn.extend_from_slice(txn);
         stxn.extend_from_slice(b"\xa2dt");
         stxn.extend_from_slice(b);
+        return Some(stxn);
+    }
+    if let Some(fields) = array_items(b) {
+        // go's `ApplyData` as an array (issue #2426): element `i` is field
+        // `i` of go's order (`APPLY_DATA_ORDER`); one past the eighth is go's
+        // `ErrTooManyArrayFields`. The same fields as map entries.
+        if fields.len() > APPLY_DATA_ORDER.len() {
+            return None;
+        }
+        stxn.extend(map_len_header(fields.len() + 1));
+        stxn.extend_from_slice(b"\xa3txn");
+        stxn.extend_from_slice(txn);
+        for (key, f) in APPLY_DATA_ORDER.iter().zip(fields) {
+            stxn.push(0xa0 | key.len() as u8);
+            stxn.extend_from_slice(key);
+            stxn.extend_from_slice(f);
+        }
         return Some(stxn);
     }
     let ad = entries(b)?;

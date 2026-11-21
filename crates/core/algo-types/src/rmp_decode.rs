@@ -506,6 +506,13 @@ pub fn no_matching_field_error(key: &[u8]) -> AlgoError {
     }
 }
 
+/// Whether the decode in progress is a strict one (a REST submit or gossip
+/// `SignedTxn`: [`strict_unknown_fields`](crate::strict_unknown_fields)).
+#[inline]
+pub fn is_strict() -> bool {
+    STRICT_BASE.with(Cell::get).is_some()
+}
+
 /// For keys a reader understands only because blocks carry them (go's
 /// `SignedTxn` has no such field): an error in strict mode, otherwise `Ok`.
 #[inline]
@@ -1362,6 +1369,113 @@ pub fn read_struct_map_len<T: Default>(rd: &mut &[u8], s: &mut T) -> Result<u32>
         return Ok(0);
     }
     rmp::decode::read_map_len(rd).map_err(|e| codec_err(format!("read_map_len: {e}")))
+}
+
+// ── Struct from array (issue #2426) ──────────────────────────────────
+//
+// go's generated `UnmarshalMsgWithState` reads a struct from either a map or,
+// when the value is not a map, an ARRAY whose elements are the fields in go's
+// declaration order (embedded structs flattened in place); more elements than
+// fields is `ErrTooManyArrayFields`, fewer leave the remaining fields alone.
+// `go_struct_order.json` holds that order of every struct (dumped from go's
+// types by `tools/strict-decode-oracle`, checked against the generated
+// decoders), and [`struct_keys`] yields a struct's keys the same way for both
+// forms, so a reader's `match key { ... }` serves both.
+
+/// `type name -> keys in go's positional order` of `go_struct_order.json`.
+fn go_struct_orders() -> &'static std::collections::HashMap<String, Vec<Vec<u8>>> {
+    static ORDERS: std::sync::OnceLock<std::collections::HashMap<String, Vec<Vec<u8>>>> =
+        std::sync::OnceLock::new();
+    ORDERS.get_or_init(|| {
+        #[derive(serde::Deserialize)]
+        struct Field {
+            key: String,
+        }
+        let all: std::collections::HashMap<String, Vec<Field>> =
+            serde_json::from_str(include_str!("go_struct_order.json"))
+                .expect("go_struct_order.json is the field layout of go's structs");
+        all.into_iter()
+            .map(|(t, fs)| (t, fs.into_iter().map(|f| f.key.into_bytes()).collect()))
+            .collect()
+    })
+}
+
+/// The keys of one struct value being decoded: read from the stream for a map,
+/// positional (go's declaration order) for an array.
+pub struct StructKeys {
+    left: u32,
+    /// The positional order and the next position, for the array form.
+    order: Option<(&'static [Vec<u8>], usize)>,
+}
+
+impl StructKeys {
+    /// The next field's key, or `None` when the struct is done. In the array
+    /// form no key is on the stream: the field's value is next.
+    #[inline]
+    pub fn next<'a>(&mut self, rd: &mut &'a [u8]) -> Result<Option<&'a [u8]>> {
+        if self.left == 0 {
+            return Ok(None);
+        }
+        self.left -= 1;
+        match &mut self.order {
+            None => read_key_bytes(rd).map(Some),
+            Some((order, i)) => {
+                let key = &order[*i][..];
+                *i += 1;
+                Ok(Some(key))
+            }
+        }
+    }
+}
+
+/// The header of a struct value of go type `go_type` decoded into `s`: a
+/// `nil` resets `s` to its zero value and reads as no fields (go
+/// `(*z) = T{}`), a map yields its keys, an array yields go's positional
+/// field order. go falls back to the array form when the value is not a map
+/// (`msgp.ReadMapHeaderBytes` fails with a `TypeError`).
+#[inline]
+pub fn struct_keys<T: Default>(
+    rd: &mut &[u8],
+    s: &mut T,
+    go_type: &'static str,
+) -> Result<StructKeys> {
+    match rd.first() {
+        Some(0xc0) => {
+            *rd = &rd[1..];
+            *s = T::default();
+            Ok(StructKeys {
+                left: 0,
+                order: None,
+            })
+        }
+        // (go-codec's tx-sync decode keeps the map form only, until its own
+        // array form is ported)
+        Some(0x90..=0x9f | 0xdc | 0xdd) if !reflect_mode() => array_struct_keys(rd, go_type),
+        _ => Ok(StructKeys {
+            left: rmp::decode::read_map_len(rd)
+                .map_err(|e| codec_err(format!("read_map_len: {e}")))?,
+            order: None,
+        }),
+    }
+}
+
+#[cold]
+fn array_struct_keys(rd: &mut &[u8], go_type: &'static str) -> Result<StructKeys> {
+    let n =
+        rmp::decode::read_array_len(rd).map_err(|e| codec_err(format!("read_array_len: {e}")))?;
+    let order = go_struct_orders()
+        .get(go_type)
+        .unwrap_or_else(|| panic!("go_struct_order.json has no struct {go_type}"));
+    if n as usize > order.len() {
+        return Err(codec_err(format!(
+            "{go_type}: too many array fields: {n} > {}",
+            order.len()
+        )));
+    }
+    Ok(StructKeys {
+        left: n,
+        order: Some((order, 0)),
+    })
 }
 
 /// A go value-typed struct field kept as an `Option` (`None` is its zero
