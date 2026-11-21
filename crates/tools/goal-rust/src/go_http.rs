@@ -692,6 +692,8 @@ fn tls_error(
         Some(TlsError::InvalidCertificate(c)) => {
             format!("tls: failed to verify certificate: {c:?}")
         }
+        // a `close_notify` is go's `io.EOF`
+        Some(TlsError::AlertReceived(d)) if u8::from(*d) == 0 => "EOF".to_string(),
         Some(TlsError::AlertReceived(d)) => {
             format!("remote error: tls: {}", go_alert(u8::from(*d)))
         }

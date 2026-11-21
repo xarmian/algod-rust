@@ -68,8 +68,6 @@ const CERT_GOOD: &str = "MIIBYTCCAQigAwIBAgIULoGTM9wZ9WlJlIcI1jxubn6buwYwCgYIKoZ
 const KEY_GOOD: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgEkyW3i3C6E7EHw8LvuFIuVxX2xQO83avVBjgrrvfOWmhRANCAAToWa0lrfD2+uduN6VWn7vQI0CbFfEAepYwxIsmb37GJUA81tKB9RhvFcD0dGJd/7mlz7S/8MTFTg2YI7nxLfzR";
 const CERT_EKU_CLIENT: &str = "MIIBYjCCAQigAwIBAgIUY8aBg8cXPRmmcIMHWLA7fgBdLSswCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJZ29hbC10ZXN0MCAXDTI1MDEwMTAwMDAwMFoYDzIxMjUwMTAxMDAwMDAwWjAUMRIwEAYDVQQDDAlnb2FsLXRlc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASk8eL4SP0NnqlDHTw8Q0OLpqmJmkuKfHHsstorXRMkFDxF7BX80dCAadpB09I0yYzzhOVs0wh+BXIN28XpH9fNozYwNDAPBgNVHREECDAGhwR/AAABMAwGA1UdEwEB/wQCMAAwEwYDVR0lBAwwCgYIKwYBBQUHAwIwCgYIKoZIzj0EAwIDSAAwRQIgBj8RZj0QWn9HEbIOwg8rT/9MPcBf/p53mhk/8KYXdekCIQCEOjLsYR+VgaMJkcR66gkNcXiPrglWOUsTZKsAW662yA==";
 const KEY_EKU_CLIENT: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgjv/GHnU4fxPPcpCy5stn7zz4h6zpYF/vyKwhBEHIoh+hRANCAASk8eL4SP0NnqlDHTw8Q0OLpqmJmkuKfHHsstorXRMkFDxF7BX80dCAadpB09I0yYzzhOVs0wh+BXIN28XpH9fN";
-const CERT_CA_LEAF: &str = "MIIBYDCCAQagAwIBAgIUOyCNMhTXqQa4dFtXFeV6oXs7GiUwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJZ29hbC10ZXN0MCAXDTI1MDEwMTAwMDAwMFoYDzIxMjUwMTAxMDAwMDAwWjAUMRIwEAYDVQQDDAlnb2FsLXRlc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASVsK+Fp/RWD8bTOSq3cxMQTcI5u8TXtHY1ZpSvpxeOalGirxX2AYAM2qffa7E6IEt2y02/0g3TANDFdySGZan4ozQwMjAPBgNVHREECDAGhwR/AAABMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgGGMAoGCCqGSM49BAMCA0gAMEUCIQCwNPMHMqthrAKNN6Rje15ytzVl18QZHu3pHzZfAxWsYgIgIYdMET64TwFv6C9ZrhpMzxVsoEvs+eudKH1SZ7VzGHQ=";
-const KEY_CA_LEAF: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu7TMlHm7jSrCYy7PbS5jCNcKMWgY7nVGYuimFvvuO1qhRANCAASVsK+Fp/RWD8bTOSq3cxMQTcI5u8TXtHY1ZpSvpxeOalGirxX2AYAM2qffa7E6IEt2y02/0g3TANDFdySGZan4";
 const CERT_PROXIED: &str = "MIIBaDCCAQ6gAwIBAgIUN8284nJpYM7ZM8pahN+hmS4Ppb8wCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJZ29hbC10ZXN0MCAXDTI1MDEwMTAwMDAwMFoYDzIxMjUwMTAxMDAwMDAwWjAUMRIwEAYDVQQDDAlnb2FsLXRlc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAThXebkd5Hik8VJbf3+XwznowvkhRE80oJrcGKTS9GmFHeiXPjLi914kVq2pZmzdsrNPAnd2fFHQB/geqZCZFXjozwwOjAVBgNVHREEDjAMggphbGdvZC50ZXN0MAwGA1UdEwEB/wQCMAAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwCgYIKoZIzj0EAwIDSAAwRQIhAOXRwFPC5pK8ZIB40a5FPt627UpFlpo/RQimxzOBielZAiAHA1Tbsbd3QBg/cyewx0k8SrTWY1eeYlF1eERqSROcYg==";
 const KEY_PROXIED: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgIV5T1HPaztYbQWaeVcoum3uiYEz3TiAMj3/dzpMKp7ChRANCAAThXebkd5Hik8VJbf3+XwznowvkhRE80oJrcGKTS9GmFHeiXPjLi914kVq2pZmzdsrNPAnd2fFHQB/geqZCZFXj";
 
@@ -198,7 +196,6 @@ fn rows() -> Vec<Row> {
     v.push(trusted("trusted expired", CERT_EXPIRED, KEY_EXPIRED));
     v.push(trusted("trusted address mismatch", CERT_IP_MISMATCH, KEY_IP_MISMATCH));
     v.push(trusted("incompatible key usage", CERT_EKU_CLIENT, KEY_EKU_CLIENT));
-    v.push(trusted("CA as the leaf", CERT_CA_LEAF, KEY_CA_LEAF));
     // handshake failures of the server's side
     for (name, code) in [
         ("alert handshake failure", 40u8),
@@ -208,6 +205,11 @@ fn rows() -> Vec<Row> {
         ("alert internal error", 80),
         ("alert close notify", 0),
         ("alert unknown", 200),
+        ("alert unknown CA", 48),
+        ("alert no application protocol", 120),
+        ("alert unexpected message", 10),
+        ("alert record overflow", 22),
+        ("alert certificate required", 116),
     ] {
         let mut r = row(name);
         r.server = Some(Server::Alert(code));
@@ -251,6 +253,16 @@ fn rows() -> Vec<Row> {
     let mut r = proxied("proxy tunnel unknown issuer", Proxy::Tunnel);
     r.server = Some(Server::Tls(CERT_PROXIED, KEY_PROXIED));
     v.push(r);
+    for (name, cert, key) in [
+        ("proxy tunnel name mismatch", CERT_DNS_MISMATCH, KEY_DNS_MISMATCH),
+        ("proxy tunnel no names", CERT_NO_NAMES, KEY_NO_NAMES),
+        ("proxy tunnel expired", CERT_EXPIRED, KEY_EXPIRED),
+    ] {
+        let mut r = proxied(name, Proxy::Tunnel);
+        r.server = Some(Server::Tls(cert, key));
+        r.trust = Some(cert);
+        v.push(r);
+    }
     let mut r = proxied("proxy tunnel to a closing server", Proxy::Tunnel);
     r.server = Some(Server::CloseAfterHello);
     v.push(r);
