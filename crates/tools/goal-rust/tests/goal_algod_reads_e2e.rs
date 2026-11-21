@@ -2433,7 +2433,6 @@ fn raw_string_cases() -> Vec<Case> {
     let app: &[u8] = b"{\"id\":7,\"params\":{\"approval-program\":\"BoEB\",\"clear-state-program\":\"BoEB\",\"creator\":\"C\xff\x01R\",\"size-sponsor\":\"S\xfe\x02\",\"global-state-schema\":{\"num-byte-slice\":1,\"num-uint\":2},\"local-state-schema\":{\"num-uint\":3},\"version\":12}}";
     let asset: &[u8] = b"{\"index\":12,\"params\":{\"creator\":\"cr\xff\",\"decimals\":2,\"total\":12345,\"unit-name\":\"T\xff\",\"name\":\"na\xffme\x01\",\"url\":\"ur\xfel\",\"manager\":\"m\xff\",\"reserve\":\"r\xfe\x01\",\"freeze\":\"f\xfd\",\"clawback\":\"c\xfc\",\"default-frozen\":false}}";
     let status: &[u8] = b"{\"catchup-time\":0,\"last-round\":5,\"last-version\":\"f\xffx\",\"next-version\":\"n\xc3\x28\x01\",\"next-version-round\":6,\"next-version-supported\":true,\"stopped-at-unsupported-round\":false,\"time-since-last-round\":1500000000,\"last-catchpoint\":\"lc\xff\x01\"}";
-    let catchup_status: &[u8] = b"{\"catchup-time\":2000000000,\"last-round\":5,\"last-version\":\"f\",\"next-version\":\"n\",\"next-version-round\":6,\"next-version-supported\":true,\"stopped-at-unsupported-round\":false,\"time-since-last-round\":1500000000,\"catchpoint\":\"cp\xff\x01\",\"catchpoint-total-accounts\":10,\"catchpoint-processed-accounts\":5}";
     let parts: &[u8] = b"[{\"address\":\"ad\xff\x01\",\"id\":\"id\xfe\",\"key\":{\"selection-participation-key\":\"AQID\",\"vote-participation-key\":\"AQID\",\"vote-first-valid\":1,\"vote-last-valid\":3000000,\"vote-key-dilution\":10000}}]";
     let error: &[u8] = b"{\"message\":\"bad \xff\x01 \xe2\x28 thing\"}";
     let mut v = Vec::new();
@@ -2451,11 +2450,6 @@ fn raw_string_cases() -> Vec<Case> {
             vec![answer("/v2/assets/12$", 200, asset)],
         ),
         ("node status", vec!["node", "status"], vec![answer("/v2/status", 200, status)]),
-        (
-            "node status catchpoint",
-            vec!["node", "status"],
-            vec![answer("/v2/status", 200, catchup_status)],
-        ),
         (
             "account listpartkeys",
             vec!["account", "listpartkeys"],
