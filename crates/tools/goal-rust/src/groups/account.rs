@@ -32,10 +32,13 @@ pub enum AccountCmd {
     /// Generate and install participation key for the specified account.
     #[command(name = "addpartkey")]
     Addpartkey(AddpartkeyArgs),
+    /// Retrieve information about the applications created or opted-into by
+    /// the specified account, possibly including application metadata.
+    #[command(name = "applicationdetails")]
+    Applicationdetails(ApplicationdetailsArgs),
     /// Retrieve information about the assets belonging to the specified
     /// account inclusive of asset metadata.
     #[command(name = "assetdetails")]
-    Applicationdetails(ApplicationdetailsArgs),
     Assetdetails(AssetdetailsArgs),
     /// Retrieve the balances for the specified account.
     Balance(AddressArgs),
