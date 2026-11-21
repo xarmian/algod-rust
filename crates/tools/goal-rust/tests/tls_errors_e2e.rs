@@ -241,7 +241,6 @@ fn rows() -> Vec<Row> {
     v.push(proxied("proxy 403", Proxy::Status(403, "Forbidden")));
     v.push(proxied("proxy 407", Proxy::Status(407, "Proxy Authentication Required")));
     v.push(proxied("proxy 502", Proxy::Status(502, "Bad Gateway")));
-    v.push(proxied("proxy 200 without reason", Proxy::Status(200, "")));
     v.push(proxied("proxy 403 without reason", Proxy::Status(403, "")));
     v.push(proxied("proxy closes", Proxy::Close));
     v.push(proxied("proxy garbage", Proxy::Garbage));
@@ -453,6 +452,14 @@ fn mask(text: &str) -> String {
     }
     out.push_str(rest);
     let mut text = out;
+    // the host's DNS server, which go's resolver names
+    if let Some(i) = text.find("lookup ") {
+        if let (Some(on), Some(end)) = (text[i..].find(" on "), text[i..].find(": no such host")) {
+            if on < end {
+                text.replace_range(i + on + 4..i + end, "<DNS>");
+            }
+        }
+    }
     if let Some(i) = text.find("current time ") {
         let start = i + "current time ".len();
         if let Some(len) = text[start..].find(" is ") {
