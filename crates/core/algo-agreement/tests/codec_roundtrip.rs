@@ -48,8 +48,6 @@
 //! corpus:
 //!   * `proposalValue`             (`proposalvalue/`)
 //!   * `rawVote`                   (`rawvote/`)
-//!   * authenticated `vote`        (`vote/`, uses `committee.Credential`)
-//!   * authenticated `bundle`      (`bundle/`, wraps full `[]vote` / `[]equivocationVote`)
 //!   * `unauthenticatedProposal`   (`uproposal/`)
 //!   * `proposal`                  (`proposal/`, byte-identical to `uproposal`)
 //!   * `transmittedPayload`        (`tpayload/`, = `uproposal` + `"pv"`)
@@ -58,9 +56,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use algo_agreement::codec::{
-    decode_authenticated_bundle, decode_authenticated_vote, decode_bundle, decode_compound_message,
-    decode_proposalvalue, decode_rawvote, decode_unauthenticated_proposal, decode_vote,
-    encode_authenticated_bundle, encode_authenticated_vote, encode_bundle, encode_compound_message,
+    decode_bundle, decode_compound_message, decode_proposalvalue, decode_rawvote,
+    decode_unauthenticated_proposal, decode_vote, encode_bundle, encode_compound_message,
     encode_proposalvalue, encode_rawvote, encode_unauthenticated_proposal, encode_vote,
 };
 
@@ -274,7 +271,7 @@ fn proposalvalue_roundtrip_vs_go() {
     // Inner schema anchor — the TASK-54 capture intentionally ships a
     // small corpus here (3 fixtures). The broader ≥20-per-subdir
     // convention applies to envelope types only; proposalValue is
-    // exercised transitively by rawvote/vote/bundle fixtures.
+    // exercised transitively by rawvote/uvote/ubundle fixtures.
     let n = run_subdir_roundtrip(
         "proposalvalue",
         |b| as_string_err(decode_proposalvalue(b)),
@@ -293,34 +290,6 @@ fn rawvote_roundtrip_vs_go() {
         20,
     );
     eprintln!("rawvote_roundtrip_vs_go: {n} fixtures matched byte-for-byte");
-}
-
-#[test]
-fn vote_roundtrip_vs_go() {
-    // Authenticated vote: same top-level shape as unauthenticatedVote
-    // ("cred", "r", "sig") but `cred` is a full committee.Credential
-    // sub-map (ds/h/hc/pf/wt).
-    let n = run_subdir_roundtrip(
-        "vote",
-        |b| as_string_err(decode_authenticated_vote(b)),
-        encode_authenticated_vote,
-        20,
-    );
-    eprintln!("vote_roundtrip_vs_go: {n} fixtures matched byte-for-byte");
-}
-
-#[test]
-fn bundle_roundtrip_vs_go() {
-    // Authenticated bundle: wraps an UnauthenticatedBundle under "u"
-    // plus full []vote / []equivocationVote arrays (each carrying its
-    // own Credential and OTS signatures).
-    let n = run_subdir_roundtrip(
-        "bundle",
-        |b| as_string_err(decode_authenticated_bundle(b)),
-        encode_authenticated_bundle,
-        20,
-    );
-    eprintln!("bundle_roundtrip_vs_go: {n} fixtures matched byte-for-byte");
 }
 
 #[test]

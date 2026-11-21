@@ -24,7 +24,7 @@
 //! On every canonical block, on every truncation and on trailing bytes the two
 //! must agree exactly. On mutated input they may differ, but only in the
 //! classes below, each of which the hand reader (go-algorand's msgp decoder is
-//! the reference) gets right and serde gets wrong or approximates; DIV-004
+//! the reference) gets right and serde gets wrong or approximates; this table
 //! lists them. Any other disagreement fails this test.
 //!
 //! | class | serde | hand reader | go |
@@ -33,7 +33,7 @@
 //! | B integer where a map key belongs | accepts, as a field index | rejects | rejects (`ReadMapKeyZC`) |
 //! | C struct sent as an array (map header replaced) | accepts a degenerate array | decodes positionally like go (#2426), so the keys and values of the replaced map are read as fields and it fails on the first mistyped one | decodes positionally |
 //! | D transaction without `type` | accepts | rejects at decode | decodes, fails later |
-//! | E nil where an integer, boolean or struct belongs | rejects ("unit value") | zero value | zero value (DIV-004, #2065) |
+//! | E nil where an integer, boolean or struct belongs | rejects ("unit value") | zero value | zero value (#2065) |
 //! | F `[N]byte` field of another length | rejects ("expected N bytes") | `ReadExactBytes`: copies `min(len, N)` bytes | same (`docs/BYTES_DECODE_PARITY.md`) |
 //! | G a repeated key | rejects (`duplicate field`) | decodes into the populated field (#2424) | decodes into the populated field |
 //! | H a key the struct lacks (a substitution renames a key) | ignores it | rejects (issue #2394) | rejects (`msgp.ErrNoField`) |

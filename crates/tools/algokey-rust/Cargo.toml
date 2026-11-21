@@ -22,6 +22,7 @@ falcon-c-backend = ["algo-falcon/c-backend"]
 [dependencies]
 clap = { workspace = true }
 algo-codec.workspace = true
+algo-error.workspace = true
 algo-consensus-crypto.workspace = true
 algo-falcon.workspace = true
 algo-ledger.workspace = true

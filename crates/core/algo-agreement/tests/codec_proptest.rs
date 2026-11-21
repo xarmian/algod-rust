@@ -45,8 +45,8 @@
 //!
 //! Byte-equality is strictly stronger than value-equality here, and
 //! lets us avoid bolting `PartialEq` onto a dozen wire types (many
-//! of which don't derive it today — `UnauthenticatedVote`, `Vote`,
-//! `UnauthenticatedBundle`, `AuthenticatedBundle`, etc.).
+//! of which don't derive it today — `UnauthenticatedVote`,
+//! `UnauthenticatedBundle`, etc.).
 //!
 //! ## Scope
 //!
@@ -55,9 +55,7 @@
 //!   * `ProposalValue`
 //!   * `RawVote`
 //!   * `UnauthenticatedVote`
-//!   * `Vote` (authenticated, with `committee.Credential`)
 //!   * `UnauthenticatedBundle` (also covers `Certificate` — same wire bytes)
-//!   * `AuthenticatedBundle`
 //!
 //! `UnauthenticatedProposal` and `TransmittedPayload` are deferred —
 //! generating arbitrary `Block` values is a rabbit hole, and the
@@ -66,14 +64,12 @@
 //! `codec_roundtrip.rs`) already anchor those against the Go oracle.
 
 use algo_agreement::codec::{
-    decode_authenticated_bundle, decode_authenticated_vote, decode_bundle, decode_proposalvalue,
-    decode_rawvote, decode_vote, encode_authenticated_bundle, encode_authenticated_vote,
-    encode_bundle, encode_proposalvalue, encode_rawvote, encode_vote, AuthenticatedBundle,
+    decode_bundle, decode_proposalvalue, decode_rawvote, decode_vote, encode_bundle,
+    encode_proposalvalue, encode_rawvote, encode_vote,
 };
 use algo_agreement::{
-    Credential, EquivocationVote, EquivocationVoteAuthenticator, HashableCredential, Period,
-    ProposalValue, RawVote, Step, UnauthenticatedBundle, UnauthenticatedCredential,
-    UnauthenticatedVote, Vote, VoteAuthenticator,
+    EquivocationVoteAuthenticator, Period, ProposalValue, RawVote, Step, UnauthenticatedBundle,
+    UnauthenticatedCredential, UnauthenticatedVote, VoteAuthenticator,
 };
 use algo_consensus_crypto::OneTimeSignature;
 use algo_types::{Address, Digest, Round};
@@ -121,33 +117,6 @@ fn arb_uauth_credential() -> impl Strategy<Value = UnauthenticatedCredential> {
     any::<[u8; 80]>().prop_map(UnauthenticatedCredential::new)
 }
 
-fn arb_hashable_credential() -> impl Strategy<Value = HashableCredential> {
-    (any::<[u8; 64]>(), arb_address(), any::<u64>()).prop_map(|(raw_out, member, iter)| {
-        HashableCredential {
-            raw_out,
-            member,
-            iter,
-        }
-    })
-}
-
-fn arb_credential() -> impl Strategy<Value = Credential> {
-    (
-        any::<u64>(),
-        arb_digest(),
-        any::<bool>(),
-        arb_hashable_credential(),
-        any::<[u8; 80]>(),
-    )
-        .prop_map(|(weight, vrf_out, ds, hashable, proof)| Credential {
-            weight,
-            vrf_out,
-            domain_separation_enabled: ds,
-            hashable,
-            proof,
-        })
-}
-
 fn arb_ots() -> impl Strategy<Value = OneTimeSignature> {
     (
         any::<[u8; 64]>(),
@@ -176,15 +145,6 @@ fn arb_unauthenticated_vote() -> impl Strategy<Value = UnauthenticatedVote> {
             cred,
             sig,
         }
-    })
-}
-
-fn arb_authenticated_vote() -> impl Strategy<Value = Vote> {
-    (arb_raw_vote(), arb_credential(), arb_ots()).prop_map(|(raw_vote, cred, sig)| Vote {
-        raw_vote,
-        cred,
-        sig,
-        validated_at: std::time::Duration::ZERO,
     })
 }
 
@@ -231,46 +191,10 @@ fn arb_unauthenticated_bundle() -> impl Strategy<Value = UnauthenticatedBundle> 
         })
 }
 
-fn arb_equivocation_vote() -> impl Strategy<Value = EquivocationVote> {
-    (
-        arb_address(),
-        any::<u64>(),
-        any::<u64>(),
-        any::<u64>(),
-        arb_credential(),
-        [arb_proposal_value(), arb_proposal_value()],
-        [arb_ots(), arb_ots()],
-    )
-        .prop_map(
-            |(sender, rnd, per, step, cred, proposals, sigs)| EquivocationVote {
-                sender,
-                round: Round(rnd),
-                period: Period(per),
-                step: Step(step),
-                cred,
-                proposals,
-                sigs,
-            },
-        )
-}
-
-fn arb_authenticated_bundle() -> impl Strategy<Value = AuthenticatedBundle> {
-    (
-        arb_unauthenticated_bundle(),
-        prop::collection::vec(arb_authenticated_vote(), 0..4),
-        prop::collection::vec(arb_equivocation_vote(), 0..2),
-    )
-        .prop_map(|(u, votes, equivocation_votes)| AuthenticatedBundle {
-            u,
-            votes,
-            equivocation_votes,
-        })
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────
 
 proptest! {
-    // 256 cases per test, 6 tests = 1,536 total codec roundtrips per
+    // 256 cases per test, 4 tests = 1,024 total codec roundtrips per
     // `cargo test` run. We're not coverage-guided, just sampling a
     // distribution the fixed corpus doesn't reach, so an order of
     // magnitude more than the default helps pick up rare
@@ -326,18 +250,6 @@ proptest! {
     }
 
     #[test]
-    fn authenticated_vote_canonical(v in arb_authenticated_vote()) {
-        let encoded = encode_authenticated_vote(&v);
-        let decoded = decode_authenticated_vote(&encoded)
-            .expect("decode_authenticated_vote on canonical encode must succeed");
-        let re_encoded = encode_authenticated_vote(&decoded);
-        prop_assert_eq!(
-            re_encoded, encoded,
-            "encode(decode(encode(v))) != encode(v) for Vote (authenticated)"
-        );
-    }
-
-    #[test]
     fn unauthenticated_bundle_canonical(ub in arb_unauthenticated_bundle()) {
         let encoded = encode_bundle(&ub);
         let decoded = decode_bundle(&encoded)
@@ -346,18 +258,6 @@ proptest! {
         prop_assert_eq!(
             re_encoded, encoded,
             "encode(decode(encode(v))) != encode(v) for UnauthenticatedBundle"
-        );
-    }
-
-    #[test]
-    fn authenticated_bundle_canonical(b in arb_authenticated_bundle()) {
-        let encoded = encode_authenticated_bundle(&b);
-        let decoded = decode_authenticated_bundle(&encoded)
-            .expect("decode_authenticated_bundle on canonical encode must succeed");
-        let re_encoded = encode_authenticated_bundle(&decoded);
-        prop_assert_eq!(
-            re_encoded, encoded,
-            "encode(decode(encode(v))) != encode(v) for AuthenticatedBundle"
         );
     }
 }

@@ -111,6 +111,7 @@ TEMPLATES = {
     "rpcs": ("rpcs_oracle_test.go.txt", "Rpcs"),
     "ledger": ("ledger_oracle_test.go.txt", "Ledger"),
     "network": ("network_oracle_test.go.txt", "Network"),
+    "cmd/algokey": ("algokey_oracle_test.go.txt", "Algokey"),
 }
 # kind -> go package whose oracle decodes it
 KIND_PKG = {
@@ -121,6 +122,7 @@ KIND_PKG = {
     },
     **{k: "ledger" for k in ("cpheader", "cpchunk", "cpspver")},
     **{k: "network" for k in ("idchal", "idresp", "idverify", "peermeta")},
+    "pqkey": "cmd/algokey",
 }
 DST = "zz_strict_decode_oracle_test.go"
 
@@ -394,7 +396,7 @@ def run_go(go_algorand, rows, seeds_out=None, seed_tests=None):
             sub = [r for r in rows if KIND_PKG[r["kind"]] == pkg]
             want_seeds = seeds_out is not None and pkg in seed_tests
             dst = os.path.join(go_algorand, pkg, DST)
-            inp, outp, sd = (os.path.join(tmp, f"{pkg}.{x}") for x in ("in", "out", "seeds"))
+            inp, outp, sd = (os.path.join(tmp, f"{pkg.replace(chr(47), chr(95))}.{x}") for x in ("in", "out", "seeds"))
             with open(inp, "w", encoding="utf-8") as f:
                 for r in sub:
                     f.write(json.dumps({"name": r["name"], "kind": r["kind"], "hex": r["hex"]}) + "\n")
@@ -419,8 +421,7 @@ def run_go(go_algorand, rows, seeds_out=None, seed_tests=None):
 # ── cases ─────────────────────────────────────────────────────────────────
 
 # No empty array: go decodes a struct from an array (positionally), so `[]` is
-# accepted wherever a struct value is expected; algod-rust reads the map form
-# only (DIV-004), a documented difference this fixture is not about.
+# accepted wherever a struct value is expected (the array form has its own cases).
 VALUES = [
     bytes([0xC0]),  # nil
     bytes([0x01]),  # uint 1
@@ -449,7 +450,7 @@ def donor_entries(b):
     for start, hl, entries, end in walk_maps(b):
         for ks, vs, ve in entries:
             # An array-valued entry is left out: go decodes a struct from an
-            # array (DIV-004), so a dict of structs accepts it under any key.
+            # array, so a dict of structs accepts it under any key.
             if 0xA0 <= b[ks] <= 0xBF and not (0x90 <= b[vs] <= 0x9F or b[vs] in (0xDC, 0xDD)):
                 out.append((b[ks:vs], b[vs:ve]))
     return out
@@ -879,12 +880,18 @@ def converted_types():
 
         names = set(load_schema())
         found = set()
-        for crate_dir in (("core", "algo-types"), ("core", "algo-agreement"), ("node", "algo-network")):
+        for crate_dir in (
+            ("core", "algo-types"),
+            ("core", "algo-agreement"),
+            ("node", "algo-network"),
+            ("tools", "algokey-rust"),
+        ):
             src = os.path.join(ROOT, "crates", *crate_dir, "src")
-            for f in sorted(os.listdir(src)):
-                if f.endswith(".rs"):
-                    txt = open(os.path.join(src, f), encoding="utf-8").read()
-                    found |= {m for m in re.findall(r'"([a-z]+\.[A-Za-z_]+)"', txt) if m in names}
+            for base, _dirs, files in sorted(os.walk(src)):
+                for f in sorted(files):
+                    if f.endswith(".rs"):
+                        txt = open(os.path.join(base, f), encoding="utf-8").read()
+                        found |= {m for m in re.findall(r'"([a-z]+\.[A-Za-z_]+)"', txt) if m in names}
         # structs read by another struct's reader: go's `SingleLeafProof` has
         # `Proof`'s fields, and an `ApplyData` is read as the apply-data half
         # of a `SignedTxnWithAD`
@@ -917,6 +924,7 @@ ROOT_TYPES = {
     "idverify": "network.identityVerificationMessageSigned",
     # the tx-sync response: a list of signed transactions (go-codec)
     "txsync": ("list", "transactions.SignedTxn"),
+    "pqkey": "main.pqSigningMaterial",
 }
 
 
@@ -942,9 +950,9 @@ def schema_text(go_algorand):
     merged = {}
     with tempfile.TemporaryDirectory() as tmp:
         for pkg, (template, suffix) in sorted(TEMPLATES.items()):
-            if pkg not in ("rpcs", "agreement", "network"):
+            if pkg not in ("rpcs", "agreement", "network", "cmd/algokey"):
                 continue
-            out = os.path.join(tmp, pkg + ".json")
+            out = os.path.join(tmp, pkg.replace("/", "_") + ".json")
             dst = os.path.join(go_algorand, pkg, DST)
             shutil.copyfile(os.path.join(ORACLE, template), dst)
             try:
@@ -1414,6 +1422,21 @@ SETS = {
         "bound_kinds": {"txsync"},
         # issue #2430: nil elements of []byte lists (go-codec)
         "nil_kinds": {"txsync"},
+    },
+    "algokey": {
+        "dir": fixture_dir("tools", "algokey-rust"),
+        "kinds": {"pqkey"},
+        "seed_tests": {"cmd/algokey": "TestStrictDecodeSeedsAlgokey"},
+        "real": lambda: [],
+        "rng": 25211,
+        "fuzz_xor": 25211,
+        "pinned": (),
+        "fresh": True,
+        "repeat_kinds": {"pqkey"},
+        "bound_kinds": set(),
+        "nil_kinds": set(),
+        # issue #2521: a key file is a struct, read from an array too
+        "array_kinds": {"pqkey"},
     },
     "p2p": {
         "dir": fixture_dir("node", "algo-p2p"),

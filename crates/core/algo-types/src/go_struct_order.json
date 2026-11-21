@@ -1847,6 +1847,50 @@
    }
   }
  ],
+ "main.pqPublicMaterial": [
+  {
+   "go": "Scheme",
+   "key": "scheme",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[2]"
+   }
+  },
+  {
+   "go": "Salt",
+   "key": "salt",
+   "type": {
+    "k": "leaf",
+    "t": "uint8"
+   }
+  },
+  {
+   "go": "PublicKey",
+   "key": "public-key",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  }
+ ],
+ "main.pqSigningMaterial": [
+  {
+   "go": "Public",
+   "key": "public",
+   "type": {
+    "k": "struct",
+    "t": "main.pqPublicMaterial"
+   }
+  },
+  {
+   "go": "PrivateKey",
+   "key": "private-key",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  }
+ ],
  "merklearray.Proof": [
   {
    "go": "Path",

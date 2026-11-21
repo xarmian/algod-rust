@@ -162,7 +162,7 @@ pub fn decode_block_response_serde(bytes: &[u8]) -> Result<BlockResponse> {
 /// canonical re-encode and so the block hash), refuses an integer where a map
 /// key belongs (serde used it as a field index), and decodes a nil struct as go
 /// does. `tests/decode_block_differential_test.rs` pins every class of
-/// difference; DIV-004 lists them. [`decode_block_serde`] is the old path.
+/// difference; its module docs list them. [`decode_block_serde`] is the old path.
 pub fn decode_block(bytes: &[u8]) -> Result<Block> {
     check_msgpack_depth(bytes)?;
     Block::decode_from_bytes(bytes)

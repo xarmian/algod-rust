@@ -30,13 +30,13 @@
 
 use std::path::Path;
 
-use algo_types::{pq_address, Address, PQAddressSalt, PQ_SCHEME_FALCON1024};
+use algo_types::{go_msgp, pq_address, Address, PQAddressSalt, PQ_SCHEME_FALCON1024};
 
 use crate::common::write_with_mode_0600;
 
 /// A PQ public key with its address salt (Go: `pqPublicMaterial`,
 /// `pq_key.go:35-41`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PqPublicMaterial {
     pub scheme: [u8; 2],
     pub salt: PQAddressSalt,
@@ -77,7 +77,7 @@ impl PqPublicMaterial {
 /// A PQ private key with its public envelope (Go: `pqSigningMaterial`,
 /// `pq_key.go:64-69`). Key files hold the scheme's working keys, never the
 /// mnemonic entropy they were derived from.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PqSigningMaterial {
     pub public: PqPublicMaterial,
     pub private_key: Vec<u8>,
@@ -125,155 +125,58 @@ fn encode_pq_public_material(out: &mut Vec<u8>, p: &PqPublicMaterial) {
 
 /// Decode a `PqSigningMaterial` previously produced by
 /// [`encode_pq_signing_material`] (or by real go-algorand `algokey pq
-/// generate`/`import`). Tolerant of map key order (reads by name, not
-/// position) since msgpack maps aren't required to preserve encode order
-/// on read, matching Go's `msgp`-generated unmarshal loop.
-// DIVERGENCE DIV-004: a local key file written by go's `algokey`, read as a
-// map only (go also decodes a struct sent as an array); go's encoder never
-// writes the array form.
+/// generate`/`import`), exactly as go's `protocol.Decode` of a
+/// `pqSigningMaterial` does (`decodePQPrivateKeyFileBytes` before its
+/// `validate()`, issue #2521): its generated msgp decoder reads a map, a
+/// `nil` (a zero struct) or an array (the fields positionally: `public`, then
+/// `private-key`; `public`'s are `scheme`, `salt`, `public-key`), fails on a
+/// key the struct lacks (`msgp.ErrNoField`) or an element more than its fields,
+/// decodes a repeated key into the populated field, leaves a missing field
+/// zero (`validate` rejects it later) and ignores the bytes after the value.
 pub fn decode_pq_signing_material(data: &[u8]) -> Result<PqSigningMaterial, String> {
-    let mut cur = data;
-    let len = rmp::decode::read_map_len(&mut cur)
-        .map_err(|e| format!("pq key file is malformed: {e}"))?;
-    let mut private_key: Option<Vec<u8>> = None;
-    let mut public: Option<PqPublicMaterial> = None;
-    for _ in 0..len {
-        let key = read_str(&mut cur)?;
-        match key.as_str() {
-            "private-key" => private_key = Some(read_bin(&mut cur)?),
-            "public" => public = Some(decode_pq_public_material(&mut cur)?),
-            _ => skip_value(&mut cur)?,
+    let _session = go_msgp::decode_session();
+    let mut rd = data;
+    let mut m = PqSigningMaterial::default();
+    read_signing_into(&mut rd, &mut m).map_err(|e| malformed(&e))?;
+    Ok(m)
+}
+
+/// go's `fmt.Errorf("%w: %w", errPQKeyMalformed, err)`, `err` rendered with
+/// its chain (`AlgoError`'s `Display` alone only names its context).
+fn malformed(e: &algo_error::AlgoError) -> String {
+    let mut out = format!("pq key file is malformed: {e}");
+    let mut cur: &(dyn std::error::Error + 'static) = e;
+    while let Some(next) = cur.source() {
+        out.push_str(": ");
+        out.push_str(&next.to_string());
+        cur = next;
+    }
+    out
+}
+
+fn read_signing_into(rd: &mut &[u8], m: &mut PqSigningMaterial) -> algo_error::Result<()> {
+    let mut keys = go_msgp::struct_keys(rd, m, "main.pqSigningMaterial")?;
+    while let Some(key) = keys.next(rd)? {
+        match key {
+            b"public" => read_public_into(rd, &mut m.public)?,
+            b"private-key" => m.private_key = go_msgp::read_bytes_go_compat(rd)?,
+            other => return Err(go_msgp::no_matching_field_error(other)),
         }
     }
-    Ok(PqSigningMaterial {
-        public: public.ok_or("pq key file is malformed: missing \"public\" field")?,
-        private_key: private_key
-            .ok_or("pq key file is malformed: missing \"private-key\" field")?,
-    })
+    Ok(())
 }
 
-fn decode_pq_public_material(cur: &mut &[u8]) -> Result<PqPublicMaterial, String> {
-    let len =
-        rmp::decode::read_map_len(cur).map_err(|e| format!("pq key file is malformed: {e}"))?;
-    let mut public_key: Option<Vec<u8>> = None;
-    let mut salt: Option<u8> = None;
-    let mut scheme: Option<[u8; 2]> = None;
-    for _ in 0..len {
-        let key = read_str(cur)?;
-        match key.as_str() {
-            "public-key" => public_key = Some(read_bin(cur)?),
-            "salt" => {
-                salt = Some(
-                    rmp::decode::read_int(cur)
-                        .map_err(|e| format!("pq key file is malformed: {e}"))?,
-                )
-            }
-            "scheme" => {
-                let bytes = read_bin(cur)?;
-                if bytes.len() != 2 {
-                    return Err(format!(
-                        "pq key file is malformed: scheme field is {} bytes, want 2",
-                        bytes.len()
-                    ));
-                }
-                scheme = Some([bytes[0], bytes[1]]);
-            }
-            _ => skip_value(cur)?,
+fn read_public_into(rd: &mut &[u8], p: &mut PqPublicMaterial) -> algo_error::Result<()> {
+    let mut keys = go_msgp::struct_keys(rd, p, "main.pqPublicMaterial")?;
+    while let Some(key) = keys.next(rd)? {
+        match key {
+            // `protocol.PQScheme` is a `[2]byte`: `msgp.ReadExactBytes`
+            b"scheme" => go_msgp::read_fixed_bytes_into_go_compat(rd, &mut p.scheme)?,
+            b"salt" => p.salt = PQAddressSalt(go_msgp::read_u8_val(rd)?),
+            b"public-key" => p.public_key = go_msgp::read_bytes_go_compat(rd)?,
+            other => return Err(go_msgp::no_matching_field_error(other)),
         }
     }
-    Ok(PqPublicMaterial {
-        scheme: scheme.ok_or("pq key file is malformed: missing \"scheme\" field")?,
-        salt: PQAddressSalt(salt.ok_or("pq key file is malformed: missing \"salt\" field")?),
-        public_key: public_key.ok_or("pq key file is malformed: missing \"public-key\" field")?,
-    })
-}
-
-fn read_str(cur: &mut &[u8]) -> Result<String, String> {
-    rmp::decode::read_str_from_slice(*cur)
-        .map(|(s, rest)| {
-            let owned = s.to_string();
-            *cur = rest;
-            owned
-        })
-        .map_err(|e| format!("pq key file is malformed: {e:?}"))
-}
-
-fn read_bin(cur: &mut &[u8]) -> Result<Vec<u8>, String> {
-    let len =
-        rmp::decode::read_bin_len(cur).map_err(|e| format!("pq key file is malformed: {e}"))?;
-    let len = len as usize;
-    if cur.len() < len {
-        return Err("pq key file is malformed: truncated binary field".to_string());
-    }
-    let (bytes, rest) = cur.split_at(len);
-    *cur = rest;
-    Ok(bytes.to_vec())
-}
-
-/// Skip one arbitrary scalar/string/binary msgpack value (used to tolerate
-/// unknown fields, as `msgp`-generated decoders do). The pq key file format
-/// only ever nests one level (handled explicitly by the caller before
-/// falling through to this), so only leaf marker kinds need handling.
-fn skip_value(cur: &mut &[u8]) -> Result<(), String> {
-    use rmp::Marker;
-    let marker = rmp::decode::read_marker(cur).map_err(|e| format!("{e:?}"))?;
-    match marker {
-        Marker::FixPos(_) | Marker::FixNeg(_) | Marker::Null | Marker::True | Marker::False => {
-            Ok(())
-        }
-        Marker::U8 | Marker::I8 => skip_bytes(cur, 1),
-        Marker::U16 | Marker::I16 => skip_bytes(cur, 2),
-        Marker::U32 | Marker::I32 | Marker::F32 => skip_bytes(cur, 4),
-        Marker::U64 | Marker::I64 | Marker::F64 => skip_bytes(cur, 8),
-        Marker::FixStr(n) => skip_bytes(cur, n as usize),
-        Marker::Str8 | Marker::Bin8 => {
-            let n = read_u8(cur)?;
-            skip_bytes(cur, n as usize)
-        }
-        Marker::Str16 | Marker::Bin16 => {
-            let n = read_u16(cur)?;
-            skip_bytes(cur, n as usize)
-        }
-        Marker::Str32 | Marker::Bin32 => {
-            let n = read_u32(cur)?;
-            skip_bytes(cur, n as usize)
-        }
-        _ => Err("pq key file is malformed: unsupported field type".to_string()),
-    }
-}
-
-fn read_u8(cur: &mut &[u8]) -> Result<u8, String> {
-    if cur.is_empty() {
-        return Err("pq key file is malformed: truncated field".to_string());
-    }
-    let v = cur[0];
-    *cur = &cur[1..];
-    Ok(v)
-}
-
-fn read_u16(cur: &mut &[u8]) -> Result<u16, String> {
-    if cur.len() < 2 {
-        return Err("pq key file is malformed: truncated field".to_string());
-    }
-    let v = u16::from_be_bytes([cur[0], cur[1]]);
-    *cur = &cur[2..];
-    Ok(v)
-}
-
-fn read_u32(cur: &mut &[u8]) -> Result<u32, String> {
-    if cur.len() < 4 {
-        return Err("pq key file is malformed: truncated field".to_string());
-    }
-    let v = u32::from_be_bytes([cur[0], cur[1], cur[2], cur[3]]);
-    *cur = &cur[4..];
-    Ok(v)
-}
-
-fn skip_bytes(cur: &mut &[u8], n: usize) -> Result<(), String> {
-    if cur.len() < n {
-        return Err("pq key file is malformed: truncated field".to_string());
-    }
-    *cur = &cur[n..];
     Ok(())
 }
 
@@ -291,6 +194,27 @@ pub fn read_pq_signing_material(path: &Path) -> Result<PqSigningMaterial, String
     let signing = decode_pq_signing_material(&data)?;
     signing.validate()?;
     Ok(signing)
+}
+
+/// go-generated rows for the key file decoder (issue #2521): a go-encoded key
+/// file and its mutants (structs turned into arrays, keys added or repeated,
+/// `nil`s), with go's `protocol.Decode` verdict and decoded value
+/// (`tests/fixtures/strict_decode`, `scripts/strict-decode/strict_decode_fixtures.py
+/// --set algokey`); every case must decode like go.
+#[cfg(test)]
+#[path = "../../../../../../scripts/strict-decode/replay.rs"]
+mod replay;
+
+#[cfg(test)]
+#[test]
+fn the_key_file_decoder_matches_go_on_every_mutated_file() {
+    replay::replay_committed_and_fuzz(env!("CARGO_MANIFEST_DIR"), "algokey", |kind, b| {
+        assert_eq!(kind, "pqkey");
+        vec![(
+            "decode_pq_signing_material",
+            replay::valued(decode_pq_signing_material(b), encode_pq_signing_material),
+        )]
+    });
 }
 
 #[cfg(test)]
