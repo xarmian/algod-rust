@@ -60,7 +60,9 @@ use serde::Deserialize;
 /// The top-level commands whose trees are parsed here (issue #2472 moves
 /// them over one tree at a time); a command line naming any other one goes
 /// to clap as it is.
-const TREES: &[&str] = &["account", "clerk", "wallet"];
+const TREES: &[&str] = &[
+    "account", "app", "asset", "clerk", "ledger", "node", "wallet",
+];
 
 /// What [`preflight`] decided.
 pub enum Preflight {
@@ -251,8 +253,8 @@ enum ArgsRule {
     Exact(usize),
     Range(usize, usize),
     Min(usize),
-    /// A validator of goal's own (`node catchup`'s
-    /// `catchpointCmdArgument`), left to the command.
+    /// A validator of goal's own: `node catchup`'s `catchpointCmdArgument`,
+    /// ported in [`validate_args`].
     Custom,
 }
 
@@ -957,7 +959,12 @@ fn parse(args: &[&str], flags: &[&'static Flag]) -> Result<Parsed, String> {
 fn validate_args(path: &str, rule: ArgsRule, args: &[String]) -> Result<(), String> {
     let n = args.len();
     match rule {
-        ArgsRule::Arbitrary | ArgsRule::Custom => Ok(()),
+        ArgsRule::Arbitrary => Ok(()),
+        // `node catchup`'s `catchpointCmdArgument` (`cmd/goal/node.go`).
+        ArgsRule::Custom if path == "node catchup" => {
+            crate::cmd::node::validate_catchpoint_args(args).map(drop)
+        }
+        ArgsRule::Custom => Ok(()),
         ArgsRule::No if n > 0 => Err(format!(
             "unknown command {} for {}",
             go_quote(&args[0]),
@@ -1028,25 +1035,114 @@ fn clap_arg(path: &str, long: &str) -> Option<(String, Option<bool>)> {
 
 /// Flags go's command accepts (inherited from its parent) but never reads,
 /// which goal-rust's clap command does not declare: cobra parses them and
-/// clap gets nothing. `account`'s persistent `-w/--wallet` is read only by
-/// `new`, `delete`, `list`, `import`, `export`, `importrootkey`,
-/// `changeonlinestatus`, `marknonparticipating`, `renewpartkey`,
-/// `renewallpartkeys` and `multisig new/delete/info` (`cmd/goal/account.go`).
-const UNREAD: &[(&str, &str)] = &[
-    ("account", "wallet"),
-    ("account addpartkey", "wallet"),
-    ("account assetdetails", "wallet"),
-    ("account balance", "wallet"),
-    ("account deletepartkey", "wallet"),
-    ("account dump", "wallet"),
-    ("account info", "wallet"),
-    ("account installpartkey", "wallet"),
-    ("account listpartkeys", "wallet"),
-    ("account multisig", "wallet"),
-    ("account partkeyinfo", "wallet"),
-    ("account rename", "wallet"),
-    ("account rewards", "wallet"),
+/// clap gets nothing.
+///
+/// - `account`'s persistent `-w/--wallet` is read only by `new`, `delete`,
+///   `list`, `import`, `export`, `importrootkey`, `changeonlinestatus`,
+///   `marknonparticipating`, `renewpartkey`, `renewallpartkeys` and
+///   `multisig new/delete/info` (`cmd/goal/account.go`).
+/// - `app`'s persistent transaction inputs (`--app-arg`, the reference
+///   flags, `--access`, `--empty-refs`) are read through `getAppInputs` by
+///   `create`, `update`, `optin`, `closeout`, `clear`, `call`, `delete` and
+///   `method`, its program files through `mustParseProgArgs` by `create`,
+///   `update` and `method`, and `--reject-version` by all of those but
+///   `create` (`cmd/goal/application.go`); `app box`'s persistent
+///   `--app-id` by `box info` and `box list` (`cmd/goal/box.go`).
+const UNREAD: &[(&str, &[&str])] = &[
+    ("account", &["wallet"]),
+    ("account addpartkey", &["wallet"]),
+    ("account assetdetails", &["wallet"]),
+    ("account balance", &["wallet"]),
+    ("account deletepartkey", &["wallet"]),
+    ("account dump", &["wallet"]),
+    ("account info", &["wallet"]),
+    ("account installpartkey", &["wallet"]),
+    ("account listpartkeys", &["wallet"]),
+    ("account multisig", &["wallet"]),
+    ("account partkeyinfo", &["wallet"]),
+    ("account rename", &["wallet"]),
+    ("account rewards", &["wallet"]),
+    ("app", APP_INPUTS),
+    ("app box", APP_BOX_GROUP),
+    ("app box info", APP_INPUTS),
+    ("app box list", APP_INPUTS),
+    ("app info", APP_INPUTS),
+    // `app read`'s own `--local` (a bool) shadows the inherited one.
+    ("app read", APP_INPUTS_BUT_LOCAL),
+    ("app call", APP_PROGRAMS),
+    ("app clear", APP_PROGRAMS),
+    ("app closeout", APP_PROGRAMS),
+    ("app delete", APP_PROGRAMS),
+    ("app optin", APP_PROGRAMS),
+    ("app create", &["reject-version"]),
 ];
+
+/// `app`'s persistent flags but `-w/--wallet`.
+const APP_INPUTS: &[&str] = &[
+    "access",
+    "app-account",
+    "app-arg",
+    "approval-prog",
+    "approval-prog-raw",
+    "box",
+    "clear-prog",
+    "clear-prog-raw",
+    "empty-refs",
+    "foreign-app",
+    "foreign-asset",
+    "holding",
+    "local",
+    "reject-version",
+];
+
+const APP_INPUTS_BUT_LOCAL: &[&str] = &[
+    "access",
+    "app-account",
+    "app-arg",
+    "approval-prog",
+    "approval-prog-raw",
+    "box",
+    "clear-prog",
+    "clear-prog-raw",
+    "empty-refs",
+    "foreign-app",
+    "foreign-asset",
+    "holding",
+    "reject-version",
+];
+
+/// `app box` itself: `app`'s inputs and its own `--app-id`.
+const APP_BOX_GROUP: &[&str] = &[
+    "access",
+    "app-account",
+    "app-arg",
+    "app-id",
+    "approval-prog",
+    "approval-prog-raw",
+    "box",
+    "clear-prog",
+    "clear-prog-raw",
+    "empty-refs",
+    "foreign-app",
+    "foreign-asset",
+    "holding",
+    "local",
+    "reject-version",
+];
+
+const APP_PROGRAMS: &[&str] = &[
+    "approval-prog",
+    "approval-prog-raw",
+    "clear-prog",
+    "clear-prog-raw",
+];
+
+/// Whether go's command `path` never reads its flag `long` ([`UNREAD`]).
+fn unread(path: &str, long: &str) -> bool {
+    UNREAD
+        .iter()
+        .any(|(p, flags)| *p == path && flags.contains(&long))
+}
 
 fn val_text(v: &Val) -> Vec<String> {
     match v {
@@ -1082,7 +1178,7 @@ fn canonical(argv0: &str, cmd: &Cmd, parsed: &Parsed) -> Vec<String> {
             Kind::StrArray | Kind::StrSlice => values,
             _ => values.last().copied().into_iter().collect(),
         };
-        if UNREAD.contains(&(cmd.path.as_str(), f.long.as_str())) {
+        if unread(&cmd.path, &f.long) {
             continue;
         }
         match clap_arg(&cmd.path, &f.long) {
@@ -1291,7 +1387,7 @@ mod tests {
             d(&["account", "list", "--info"]),
             run(&["account", "list", "--info"])
         );
-        assert_eq!(d(&["app", "extra"]), Outcome::Unchanged);
+        assert_eq!(d(&["kmd", "extra"]), Outcome::Unchanged);
         assert_eq!(d(&["-v"]), Outcome::Unchanged);
         assert_eq!(d(&[]), Outcome::Unchanged);
     }
@@ -1630,13 +1726,25 @@ mod tests {
             "goal account marknonparticipating --signer",
             "goal account marknonparticipating --txfile",
             "goal account marknonparticipating --validrounds",
+            // issue #2513
+            "goal app method --app-arg",
             // issue #2510
             "goal clerk rawsend --skip-pq-address-check",
+            // issue #2512
+            "goal node clone --noledger",
+            "goal node clone --targetdir",
+            "goal node create --api",
+            "goal node create --archival",
+            "goal node create --destination",
+            "goal node create --full-config",
+            "goal node create --hosted",
+            "goal node create --network",
+            "goal node create --relay",
         ];
         let mut missing = Vec::new();
         for (cmd, _) in clap_commands() {
             for f in flags_of(cmd, false) {
-                if UNREAD.contains(&(cmd.path.as_str(), f.long.as_str())) {
+                if unread(&cmd.path, &f.long) {
                     assert!(
                         clap_arg(&cmd.path, &f.long).is_none(),
                         "goal-rust's goal {} declares --{} now: drop it from UNREAD",
@@ -1707,6 +1815,21 @@ mod tests {
             .map(|c| c.path.as_str())
             .collect();
         assert_eq!(custom, ["node catchup"]);
+        // The port of its validator gives go's errors for the probe's
+        // arguments.
+        let catchup = file
+            .commands
+            .iter()
+            .find(|d| d.path == "node catchup")
+            .unwrap();
+        let args: Vec<String> = (1..=6).map(|i| format!("a{i}")).collect();
+        for (n, want) in catchup.args_probe.as_ref().unwrap().iter().enumerate() {
+            assert_eq!(
+                validate_args("node catchup", ArgsRule::Custom, &args[..n]).err(),
+                *want,
+                "{n} arguments"
+            );
+        }
         assert_eq!(command("wallet new").unwrap().args, ArgsRule::Exact(1));
         assert_eq!(command("account new").unwrap().args, ArgsRule::Range(0, 1));
         assert_eq!(

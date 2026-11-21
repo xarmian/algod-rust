@@ -39,8 +39,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use algo_abi::{
-    encode_method_args, method_selector, parse_method_signature, AbiType, Contract, Interface,
-    Method, MethodArgType, ReferenceType, TransactionType,
+    encode_method_args, method_selector, parse_method_signature, AbiType, Method, MethodArgType,
+    ReferenceType, TransactionType,
 };
 use algo_codec::{
     canonical_encode_signed_transaction, canonical_encode_transaction, compute_group_id,
@@ -1210,28 +1210,8 @@ fn raw_account_application(
 /// `--abi`, `--method` must be a full inline ARC-4 signature (Go's actual
 /// behavior). With `--abi <contract.json>`, `--method` is a bare name looked
 /// up in the file (goal-rust extension — see [`MethodArgs`] docs).
-fn resolve_method(method: &str, abi: Option<&Path>) -> Result<Method, String> {
-    let Some(path) = abi else {
-        return parse_method_signature(method)
-            .map_err(|e| format!("cannot parse method signature: {e}"));
-    };
-    let data = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if let Ok(contract) = serde_json::from_str::<Contract>(&data) {
-        return contract
-            .find_method(method)
-            .and_then(|m| m.to_method())
-            .map_err(|e| format!("{}: {e}", path.display()));
-    }
-    let iface: Interface = serde_json::from_str(&data).map_err(|e| {
-        format!(
-            "{}: not a valid ARC-4 Contract/Interface JSON: {e}",
-            path.display()
-        )
-    })?;
-    iface
-        .find_method(method)
-        .and_then(|m| m.to_method())
-        .map_err(|e| format!("{}: {e}", path.display()))
+fn resolve_method(method: &str) -> Result<Method, String> {
+    parse_method_signature(method).map_err(|e| format!("cannot parse method signature: {e}"))
 }
 
 /// Resolve `account`/`asset`/`application` reference-type method args into
@@ -1356,7 +1336,7 @@ pub fn run_method(args: MethodArgs, wallet: Option<String>) -> ExitCode {
 }
 
 fn run_method_inner(args: MethodArgs, wallet: Option<String>) -> Result<ExitCode, String> {
-    let method = resolve_method(&args.method, args.abi.as_deref())?;
+    let method = resolve_method(&args.method)?;
     let on_completion = parse_on_completion(&args.on_completion)?;
 
     let local_schema = StateSchema {
@@ -2148,7 +2128,7 @@ mod tests {
 
     #[test]
     fn resolve_method_inline_signature() {
-        let m = resolve_method("add(uint64,uint64)uint64", None).unwrap();
+        let m = resolve_method("add(uint64,uint64)uint64").unwrap();
         assert_eq!(m.name, "add");
         assert_eq!(m.signature(), "add(uint64,uint64)uint64");
     }
@@ -2156,7 +2136,7 @@ mod tests {
     #[test]
     fn resolve_method_matches_direct_parse() {
         let direct = parse_method_signature("empty()void").unwrap();
-        let via_resolve = resolve_method("empty()void", None).unwrap();
+        let via_resolve = resolve_method("empty()void").unwrap();
         assert_eq!(direct, via_resolve);
     }
 

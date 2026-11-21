@@ -28,7 +28,8 @@
 //! many or too few positional arguments for its `Args` rule, and none of
 //! its required flags, plus a few hand-picked lines. None of them gets as
 //! far as running the command. `fixtures/cobra_cli.jsonl` holds what go
-//! v5.0.5-stable's `goal` printed for each (exit code, stdout, stderr);
+//! v5.0.5-stable's `goal` printed for each (exit code, stdout, stderr; a
+//! usage or help text exactly as the tree holds it is named, not repeated);
 //! goal-rust must print the same (a default test, no go needed). A
 //! `MIXED_CLUSTER=1` run re-checks the file against a real go `goal`
 //! (`GOAL_GO` names a prebuilt one), and `REGEN_COBRA_CLI_FIXTURE=1`
@@ -57,7 +58,9 @@ const FIXTURE: &str = "tests/fixtures/cobra_cli.jsonl";
 const TREE: &str = include_str!("../src/cobra_tree.json");
 
 /// The trees `cobra_compat` parses (its `TREES`).
-const TREES: &[&str] = &["account", "clerk", "wallet"];
+const TREES: &[&str] = &[
+    "account", "app", "asset", "clerk", "ledger", "node", "wallet",
+];
 
 fn mixed_cluster_enabled() -> bool {
     matches!(std::env::var("MIXED_CLUSTER").as_deref(), Ok(v) if !v.is_empty() && v != "0")
@@ -217,6 +220,26 @@ fn command_lines() -> Vec<Vec<String>> {
         &["clerk", "compile", "-D", "-sz"],
         &["clerk", "sign", "--argb64", "a,\"b\nc"],
         &["clerk", "send", "--argb64", "\"a\nb"],
+        &["app", "-w", "w", "call", "--nosuch"],
+        &["app", "--app-arg", "x", "box", "info", "-z"],
+        &["app", "box", "--app-id", "x", "list"],
+        &["app", "box", "list", "--app-id=0x_1", "extra"],
+        &["app", "read", "--local", "--nosuch"],
+        &["app", "read", "--local=x"],
+        &["app", "call", "--foreign-app", "a\"b"],
+        &["app", "method", "--arg", "x", "--nosuch"],
+        &["app", "create", "--extra-pages", "-1"],
+        &["asset", "-w"],
+        &["asset", "send", "-a", "x"],
+        &["asset", "create", "--decimals", "4294967296"],
+        &["node", "wait", "-w", "x"],
+        &["node", "catchup", "1#AAAA", "2#AAAA"],
+        &["node", "catchup", "x", "y"],
+        &["node", "catchup", "1#AAAA", "-z"],
+        &["node", "status", "-w", "1", "extra"],
+        &["ledger", "block"],
+        &["ledger", "block", "1", "2"],
+        &["ledger", "-z", "supply"],
     ] {
         lines.push(l.iter().map(|a| a.to_string()).collect());
     }
@@ -260,8 +283,40 @@ fn run(bin: &Path, dir: &Path, args: &[String]) -> Ran {
     }
 }
 
+/// go's usage and help texts of every command (`src/cobra_tree.json`,
+/// itself checked against go by `cobra_tree_matches_go`), longest first.
+fn texts() -> Vec<(String, String, String)> {
+    let tree: Value = serde_json::from_str(TREE).expect("cobra_tree.json");
+    let mut out: Vec<(String, String, String)> = tree["commands"]
+        .as_array()
+        .expect("commands")
+        .iter()
+        .map(|c| (s(c, "path"), s(c, "usage"), s(c, "help")))
+        .collect();
+    out.sort_by_key(|(_, usage, _)| std::cmp::Reverse(usage.len()));
+    out
+}
+
+/// A row's output with each of go's texts (exactly as the tree holds it)
+/// written as `<usage of PATH>` / `<help of PATH>`, which keeps the fixture
+/// small: any other text, a usage that differs from go's included, stays
+/// as it is.
+fn named(out: &str, texts: &[(String, String, String)]) -> String {
+    if let Some((path, _, _)) = texts.iter().find(|(_, _, help)| help == out) {
+        return format!("<help of {path:?}>");
+    }
+    let mut out = out.to_string();
+    for (path, usage, _) in texts {
+        if out.contains(usage.as_str()) {
+            out = out.replace(usage.as_str(), &format!("<usage of {path:?}>"));
+        }
+    }
+    out
+}
+
 fn rows(bin: &Path) -> Vec<Value> {
     let tmp = tempfile::tempdir().expect("tempdir");
+    let texts = texts();
     command_lines()
         .iter()
         .map(|args| {
@@ -269,8 +324,8 @@ fn rows(bin: &Path) -> Vec<Value> {
             serde_json::json!({
                 "args": args,
                 "code": ran.code,
-                "stdout": String::from_utf8_lossy(&ran.stdout),
-                "stderr": String::from_utf8_lossy(&ran.stderr),
+                "stdout": named(&String::from_utf8_lossy(&ran.stdout), &texts),
+                "stderr": named(&String::from_utf8_lossy(&ran.stderr), &texts),
             })
         })
         .collect()

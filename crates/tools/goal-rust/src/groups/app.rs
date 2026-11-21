@@ -428,16 +428,6 @@ pub struct CallArgs {
 /// arguments into the atomic group ahead of the app call, sign, submit, and
 /// report the decoded return value the way Go's
 /// `"method %s succeeded with output: %s"` does.
-///
-/// **goal-rust extension beyond Go's actual `v5.0.5-stable` flag surface:**
-/// Go's `methodAppCmd` only accepts an inline `--method "name(t1,t2)ret"`
-/// signature — it has no `--abi` flag (verified against the pinned
-/// `cmd/goal/application.go`; no `abi`/`--abi` token appears anywhere in the
-/// file). `algo-abi`'s `Contract`/`Interface` JSON parsing was built for
-/// exactly this though (see its module docs, "for a future `--abi <file>`
-/// flag"), so `goal-rust` adds `--abi <contract.json>` as a small, clearly
-/// documented convenience: when given, `--method` is treated as a bare
-/// method *name* looked up in the file instead of a full signature.
 #[derive(Args, Debug)]
 pub struct MethodArgs {
     /// Account to call the method from (Go `-f/--from`). Required.
@@ -446,15 +436,10 @@ pub struct MethodArgs {
     /// Application ID (Go `--app-id`). Required unless `--create`.
     #[arg(long = "app-id")]
     pub app_id: Option<u64>,
-    /// Method to call: an inline ARC-4 signature (`"add(uint64,uint64)uint64"`)
-    /// or, with `--abi`, a bare method name to look up (Go `--method`).
-    /// Required.
+    /// Method to call: an inline ARC-4 signature (`"add(uint64,uint64)uint64"`,
+    /// Go `--method`). Required.
     #[arg(long = "method")]
     pub method: String,
-    /// ARC-4 Contract/Interface JSON file to resolve a bare `--method` name
-    /// against (goal-rust extension; see the struct docs).
-    #[arg(long = "abi")]
-    pub abi: Option<PathBuf>,
     /// Args to pass for calling the method, one per method argument, in
     /// order (Go `--arg`, repeatable). ABI-typed args are JSON values
     /// (`5`, `"hello"`, `["QQ==","asdf"]`, ...); `account`/`asset`/
