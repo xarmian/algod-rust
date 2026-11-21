@@ -2146,12 +2146,16 @@ fn unaddressable() -> algo_error::AlgoError {
     }
 }
 
-/// A struct inside an unaddressable map entry: `nil` cannot be set.
-fn unaddr_struct_len(rd: &mut &[u8]) -> DecodeResult<u32> {
+/// The keys of a struct inside an unaddressable map entry (a map, or go-codec's
+/// positional array form, issue #2426): `nil` cannot be set.
+fn unaddr_struct_keys(
+    rd: &mut &[u8],
+    go_type: &'static str,
+) -> DecodeResult<rmp_decode::StructKeys> {
     if rmp_decode::is_nil(rd) {
         return Err(unaddressable());
     }
-    rmp_decode::read_map_len(rd)
+    rmp_decode::struct_keys(rd, &mut (), go_type)
 }
 
 /// An integer inside an unaddressable map entry (`nil` cannot be set).
@@ -2217,12 +2221,14 @@ impl Reveal {
     /// go-codec's decode of a repeated `Reveals` entry into the existing
     /// (unaddressable) one; see the section comment.
     fn decode_into_map_entry(rd: &mut &[u8], r: &mut Self) -> DecodeResult<()> {
-        for _ in 0..rmp_decode::read_map_len(rd)? {
-            match rmp_decode::read_key_bytes(rd)? {
+        let mut keys = rmp_decode::struct_keys(rd, &mut (), "stateproof.Reveal")?;
+        while let Some(key) = keys.next(rd)? {
+            match key {
                 b"s" => {
                     let slot = r.sig_slot.get_or_insert_with(SigSlotCommit::default);
-                    for _ in 0..unaddr_struct_len(rd)? {
-                        match rmp_decode::read_key_bytes(rd)? {
+                    let mut keys = unaddr_struct_keys(rd, "stateproof.sigslotCommit")?;
+                    while let Some(key) = keys.next(rd)? {
+                        match key {
                             b"s" => {
                                 let sig = slot.sig.get_or_insert_with(MerkleSignature::default);
                                 merkle_signature_into_map_entry(rd, sig)?;
@@ -2234,13 +2240,15 @@ impl Reveal {
                 }
                 b"p" => {
                     let part = r.part.get_or_insert_with(Participant::default);
-                    for _ in 0..unaddr_struct_len(rd)? {
-                        match rmp_decode::read_key_bytes(rd)? {
+                    let mut keys = unaddr_struct_keys(rd, "basics.Participant")?;
+                    while let Some(key) = keys.next(rd)? {
+                        match key {
                             b"p" => {
                                 let pk =
                                     part.pk.get_or_insert_with(MerkleSignatureVerifier::default);
-                                for _ in 0..unaddr_struct_len(rd)? {
-                                    match rmp_decode::read_key_bytes(rd)? {
+                                let mut keys = unaddr_struct_keys(rd, "merklesignature.Verifier")?;
+                                while let Some(key) = keys.next(rd)? {
+                                    match key {
                                         b"cmt" => return Err(unaddr_array(rd)),
                                         b"lf" => pk.key_lifetime = unaddr_u64(rd)?,
                                         other => rmp_decode::unknown_key(rd, other)?,
@@ -2261,14 +2269,16 @@ impl Reveal {
 
 /// [`Reveal::decode_into_map_entry`] for the entry's `MerkleSignature`.
 fn merkle_signature_into_map_entry(rd: &mut &[u8], sig: &mut MerkleSignature) -> DecodeResult<()> {
-    for _ in 0..unaddr_struct_len(rd)? {
-        match rmp_decode::read_key_bytes(rd)? {
+    let mut keys = unaddr_struct_keys(rd, "merklesignature.Signature")?;
+    while let Some(key) = keys.next(rd)? {
+        match key {
             b"sig" => unaddr_bytes(rd, &mut sig.signature)?,
             b"idx" => sig.vector_commitment_index = unaddr_u64(rd)?,
             b"prf" => {
                 let prf = sig.proof.get_or_insert_with(MerkleProof::default);
-                for _ in 0..unaddr_struct_len(rd)? {
-                    match rmp_decode::read_key_bytes(rd)? {
+                let mut keys = unaddr_struct_keys(rd, "merklearray.SingleLeafProof")?;
+                while let Some(key) = keys.next(rd)? {
+                    match key {
                         // a slice it cannot grow: at most its length, each
                         // element (addressable) decoded as usual
                         b"pth" => {
@@ -2289,8 +2299,9 @@ fn merkle_signature_into_map_entry(rd: &mut &[u8], sig: &mut MerkleSignature) ->
                         }
                         b"hsh" => {
                             let hf = prf.hash_factory.get_or_insert_with(HashFactory::default);
-                            for _ in 0..unaddr_struct_len(rd)? {
-                                match rmp_decode::read_key_bytes(rd)? {
+                            let mut keys = unaddr_struct_keys(rd, "crypto.HashFactory")?;
+                            while let Some(key) = keys.next(rd)? {
+                                match key {
                                     b"t" => {
                                         let v = unaddr_u64(rd)?;
                                         hf.hash_type = u16::try_from(v).map_err(|_| {
@@ -2317,8 +2328,9 @@ fn merkle_signature_into_map_entry(rd: &mut &[u8], sig: &mut MerkleSignature) ->
                 }
             }
             b"vkey" => {
-                for _ in 0..unaddr_struct_len(rd)? {
-                    match rmp_decode::read_key_bytes(rd)? {
+                let mut keys = unaddr_struct_keys(rd, "crypto.FalconVerifier")?;
+                while let Some(key) = keys.next(rd)? {
+                    match key {
                         b"k" => return Err(unaddr_array(rd)),
                         other => rmp_decode::unknown_key(rd, other)?,
                     }

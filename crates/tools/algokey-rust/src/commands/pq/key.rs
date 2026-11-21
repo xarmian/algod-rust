@@ -128,6 +128,9 @@ fn encode_pq_public_material(out: &mut Vec<u8>, p: &PqPublicMaterial) {
 /// generate`/`import`). Tolerant of map key order (reads by name, not
 /// position) since msgpack maps aren't required to preserve encode order
 /// on read, matching Go's `msgp`-generated unmarshal loop.
+// DIVERGENCE DIV-004: a local key file written by go's `algokey`, read as a
+// map only (go also decodes a struct sent as an array); go's encoder never
+// writes the array form.
 pub fn decode_pq_signing_material(data: &[u8]) -> Result<PqSigningMaterial, String> {
     let mut cur = data;
     let len = rmp::decode::read_map_len(&mut cur)

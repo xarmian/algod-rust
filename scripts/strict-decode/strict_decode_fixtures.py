@@ -879,8 +879,8 @@ def converted_types():
 
         names = set(load_schema())
         found = set()
-        for crate in ("algo-types", "algo-agreement"):
-            src = os.path.join(ROOT, "crates", "core", crate, "src")
+        for crate_dir in (("core", "algo-types"), ("core", "algo-agreement"), ("node", "algo-network")):
+            src = os.path.join(ROOT, "crates", *crate_dir, "src")
             for f in sorted(os.listdir(src)):
                 if f.endswith(".rs"):
                     txt = open(os.path.join(src, f), encoding="utf-8").read()
@@ -912,7 +912,19 @@ ROOT_TYPES = {
     "vote": "agreement.unauthenticatedVote",
     "bundle": "agreement.unauthenticatedBundle",
     "cert": "agreement.Certificate",
+    "idchal": "network.identityChallengeSigned",
+    "idresp": "network.identityChallengeResponseSigned",
+    "idverify": "network.identityVerificationMessageSigned",
+    # the tx-sync response: a list of signed transactions (go-codec)
+    "txsync": ("list", "transactions.SignedTxn"),
 }
+
+
+def root_descriptor(kind):
+    t = ROOT_TYPES[kind]
+    if isinstance(t, tuple):
+        return {"k": "list", "e": {"k": "struct", "t": t[1]}}
+    return {"k": "struct", "t": t}
 
 _SCHEMA = None
 
@@ -930,7 +942,7 @@ def schema_text(go_algorand):
     merged = {}
     with tempfile.TemporaryDirectory() as tmp:
         for pkg, (template, suffix) in sorted(TEMPLATES.items()):
-            if pkg not in ("rpcs", "agreement"):
+            if pkg not in ("rpcs", "agreement", "network"):
                 continue
             out = os.path.join(tmp, pkg + ".json")
             dst = os.path.join(go_algorand, pkg, DST)
@@ -1106,7 +1118,7 @@ def make_array_cases(seeds, kinds, rng, per_type=5, cap=None):
         if s["kind"] not in kinds or s["kind"] not in ROOT_TYPES:
             continue
         b = bytes.fromhex(s["hex"])
-        root = {"k": "struct", "t": ROOT_TYPES[s["kind"]]}
+        root = root_descriptor(s["kind"])
         inst = []
         struct_instances(b, 0, root, inst)
         for k, (start, name) in enumerate(inst):
@@ -1135,6 +1147,52 @@ def make_array_cases(seeds, kinds, rng, per_type=5, cap=None):
     if cap is not None:
         cases = cases[:cap]
     return cases
+
+
+def make_repeat_array_cases(seeds, kinds, rng, cap=None):
+    """A key a map already has again, its value a state-proof `Reveal` turned
+    into an array (the structs below it as maps, or all as arrays): go-codec
+    decodes a repeated entry of a `map[uint64]Reveal` INTO the existing
+    (unaddressable) value, a path of its own (issue #2426). Returns
+    `finish_cases` tuples (a key inserted into the seed's n-th map)."""
+    out = []
+    for s in seeds:
+        if s["kind"] not in kinds or s["kind"] not in ROOT_TYPES:
+            continue
+        b = bytes.fromhex(s["hex"])
+        inst = []
+        struct_instances(b, 0, root_descriptor(s["kind"]), inst)
+        maps = walk_maps(b)
+        for start, name in inst:
+            if name != "stateproof.Reveal":
+                continue
+            for m, (mstart, hl, entries, mend) in enumerate(maps):
+                for e, (ks, vs, ve) in enumerate(entries):
+                    if vs != start:
+                        continue
+                    for deep in (False, True):
+                        arr = to_array_form(
+                            b,
+                            vs,
+                            {"k": "struct", "t": name},
+                            (lambda idx, st, nm, deep=deep: "full" if (deep or idx == 0) else None),
+                            {"n": 0},
+                        )
+                        out.append((s, m, e + 1, b[ks:vs], arr))
+                    # arrays go-codec can decode INTO the unaddressable entry:
+                    # empty ones (nothing to set) and integers
+                    A = encode_array_len
+                    for canned in (
+                        A(0),
+                        A(1) + A(0),
+                        A(1) + A(2) + A(0) + bytes([7]),
+                        A(2) + A(0) + A(0),
+                        A(2) + A(2) + A(0) + bytes([7]) + A(2) + A(0) + bytes([9]),
+                        A(1) + A(1) + A(0),
+                    ):
+                        out.append((s, m, e + 1, b[ks:vs], canned))
+    rng.shuffle(out)
+    return out[:cap] if cap is not None else out
 
 
 def finish_hex_cases(cases, first_id):
@@ -1350,6 +1408,8 @@ SETS = {
         "pinned": (),
         "fresh": True,
         "repeat_kinds": {"idchal", "idresp", "idverify", "txsync"},
+        # issue #2426: structs read from arrays (go-codec for the tx-sync response)
+        "array_kinds": {"idchal", "idresp", "idverify", "txsync"},
         # go-codec: no allocbound is checked, both mutants are accepted
         "bound_kinds": {"txsync"},
         # issue #2430: nil elements of []byte lists (go-codec)
@@ -1414,6 +1474,8 @@ def run_set(name, st, go, a):
         cases += finish_cases(make_nil_elem_cases(seeds, st["nil_kinds"]), first_id=len(cases))
         arr = make_array_cases(seeds, st.get("array_kinds", set()), rng, per_type=max(5, n // 400))
         cases += finish_hex_cases(arr, first_id=len(cases))
+        rarr = make_repeat_array_cases(seeds, st.get("array_kinds", set()), rng, cap=max(200, n // 400))
+        cases += finish_cases(rarr, first_id=len(cases))
         cases = attach_verdicts(go, cases)
         out = a.fuzz[1] if name == "consensus" else f"{a.fuzz[1]}.{name}"
         with open(out, "w", encoding="utf-8", newline="\n") as f:
@@ -1431,6 +1493,8 @@ def run_set(name, st, go, a):
     cases += finish_cases(make_nil_elem_cases(seeds, st["nil_kinds"]), first_id=len(cases))
     arr = make_array_cases(seeds, st.get("array_kinds", set()), random.Random(st["rng"] ^ 0x2426))
     cases += finish_hex_cases(arr, first_id=len(cases))
+    rarr = make_repeat_array_cases(seeds, st.get("array_kinds", set()), random.Random(st["rng"] ^ 0x2427), cap=200)
+    cases += finish_cases(rarr, first_id=len(cases))
     cases = attach_verdicts(go, cases)
     text = dump(cases)
     path = cases_path(st)

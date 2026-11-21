@@ -622,13 +622,15 @@ fn wire_err(msg: impl std::fmt::Display) -> IdentityError {
     IdentityError::MsgpackDecode(rmp_serde::decode::Error::Syntax(msg.to_string()))
 }
 
-/// Read one go msgp struct from `rd`: map form (each key handed to `field`,
-/// which returns `false` for a key the struct lacks) or positional array form
-/// (element `i` read as `names[i]`, more elements than fields is an error).
+/// Read one go msgp struct of go type `what` (`"network.identityChallenge"`)
+/// from `rd`: map form (each key handed to `field`, which returns `false` for
+/// a key the struct lacks) or positional array form (element `i` read as the
+/// struct's `i`-th field in go's declaration order, from
+/// `algo-types`' `go_struct_order.json`; more elements than fields is an
+/// error, issue #2426).
 fn read_go_struct(
     rd: &mut &[u8],
     what: &str,
-    names: &[&str],
     mut field: impl FnMut(&[u8], &mut &[u8]) -> Result<bool, IdentityError>,
 ) -> Result<(), IdentityError> {
     let marker = *rd
@@ -655,11 +657,13 @@ fn read_go_struct(
         0x90..=0x9f | 0xdc | 0xdd => {
             let n = rmp::decode::read_array_len(rd).map_err(|e| wire_err(format!("{what}: {e}")))?
                 as usize;
+            let names = algo_types::go_msgp::go_struct_order(what)
+                .unwrap_or_else(|| panic!("go_struct_order.json has no struct {what}"));
             if n > names.len() {
                 return Err(wire_err(format!("{what}: too many array fields: {n}")));
             }
             for name in &names[..n] {
-                field(name.as_bytes(), rd)?;
+                field(name, rd)?;
             }
             Ok(())
         }
@@ -721,7 +725,7 @@ fn read_challenge(rd: &mut &[u8], v: &mut IdentityChallenge) -> Result<(), Ident
     if take_nil_reset(rd, v) {
         return Ok(());
     }
-    read_go_struct(rd, "identityChallenge", &["pk", "c", "a"], |k, rd| {
+    read_go_struct(rd, "network.identityChallenge", |k, rd| {
         match k {
             b"pk" => read_exact_into::<32>(rd, &mut v.key)?,
             b"c" => read_exact_into::<CHALLENGE_SIZE>(rd, &mut v.challenge)?,
@@ -743,20 +747,15 @@ fn read_challenge_response(
     if take_nil_reset(rd, v) {
         return Ok(());
     }
-    read_go_struct(
-        rd,
-        "identityChallengeResponse",
-        &["pk", "c", "rc"],
-        |k, rd| {
-            match k {
-                b"pk" => read_exact_into::<32>(rd, &mut v.key)?,
-                b"c" => read_exact_into::<CHALLENGE_SIZE>(rd, &mut v.challenge)?,
-                b"rc" => read_exact_into::<CHALLENGE_SIZE>(rd, &mut v.response_challenge)?,
-                _ => return Ok(false),
-            }
-            Ok(true)
-        },
-    )
+    read_go_struct(rd, "network.identityChallengeResponse", |k, rd| {
+        match k {
+            b"pk" => read_exact_into::<32>(rd, &mut v.key)?,
+            b"c" => read_exact_into::<CHALLENGE_SIZE>(rd, &mut v.challenge)?,
+            b"rc" => read_exact_into::<CHALLENGE_SIZE>(rd, &mut v.response_challenge)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })
 }
 
 fn read_verification_message(
@@ -766,7 +765,7 @@ fn read_verification_message(
     if take_nil_reset(rd, v) {
         return Ok(());
     }
-    read_go_struct(rd, "identityVerificationMessage", &["rc"], |k, rd| {
+    read_go_struct(rd, "network.identityVerificationMessage", |k, rd| {
         match k {
             b"rc" => read_exact_into::<CHALLENGE_SIZE>(rd, &mut v.response_challenge)?,
             _ => return Ok(false),
@@ -784,19 +783,14 @@ pub fn decode_identity_challenge_signed(
     let mut rd = b;
     let mut msg = IdentityChallenge::default();
     let mut signature = Vec::new();
-    read_go_struct(
-        &mut rd,
-        "identityChallengeSigned",
-        &["ic", "sig"],
-        |k, rd| {
-            match k {
-                b"ic" => read_challenge(rd, &mut msg)?,
-                b"sig" => read_exact_into::<64>(rd, &mut signature)?,
-                _ => return Ok(false),
-            }
-            Ok(true)
-        },
-    )?;
+    read_go_struct(&mut rd, "network.identityChallengeSigned", |k, rd| {
+        match k {
+            b"ic" => read_challenge(rd, &mut msg)?,
+            b"sig" => read_exact_into::<64>(rd, &mut signature)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
     Ok(IdentityChallengeSigned { msg, signature })
 }
 
@@ -810,8 +804,7 @@ pub fn decode_identity_challenge_response_signed(
     let mut signature = Vec::new();
     read_go_struct(
         &mut rd,
-        "identityChallengeResponseSigned",
-        &["icr", "sig"],
+        "network.identityChallengeResponseSigned",
         |k, rd| {
             match k {
                 b"icr" => read_challenge_response(rd, &mut msg)?,
@@ -835,8 +828,7 @@ pub fn decode_identity_verification_message_signed(
     let mut signature = Vec::new();
     read_go_struct(
         &mut rd,
-        "identityVerificationMessageSigned",
-        &["ivm", "sig"],
+        "network.identityVerificationMessageSigned",
         |k, rd| {
             match k {
                 b"ivm" => read_verification_message(rd, &mut msg)?,
