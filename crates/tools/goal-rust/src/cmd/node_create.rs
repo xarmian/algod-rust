@@ -91,29 +91,28 @@ pub fn run_create(args: CreateArgs) -> ExitCode {
         )
     };
 
-    let mut cfg = algo_config::Local::default();
-    // `NetAddress` is not a field of `algo_config::Local` (a CLI flag of
-    // `relay`/`participate`); config.json carries it, so it is kept apart and
-    // written where go's struct has it.
-    let mut net_address = String::new();
+    let mut net_address = "";
     if !args.relay.is_empty() {
         if is_valid_ip(&args.relay) {
-            net_address = args.relay.clone();
+            net_address = &args.relay;
         } else {
             return fail(&ip_failure(&args.relay));
         }
     }
+    let mut endpoint_address = None;
     if !args.api.is_empty() {
         if is_valid_ip(&args.api) {
-            cfg.endpoint_address = args.api.clone();
+            endpoint_address = Some(args.api.as_str());
         } else {
             return fail(&ip_failure(&args.api));
         }
     }
-    cfg.archival = args.archival || !args.relay.is_empty();
-    cfg.run_hosted = args.hosted;
-    cfg.enable_ledger_service = cfg.archival;
-    cfg.enable_block_service = cfg.archival;
+    let choices = ConfigChoices {
+        archival: args.archival || !args.relay.is_empty(),
+        net_address,
+        endpoint_address,
+        run_hosted: args.hosted,
+    };
 
     // the destination must not exist (a file counts), and is created with
     // go's `os.MkdirAll(dest, 0766)`
@@ -130,76 +129,81 @@ pub fn run_create(args: CreateArgs) -> ExitCode {
             path_error("open", &dest.join("genesis.json"), &e)
         ));
     }
-    let json = config_text(&cfg, &net_address, args.full_config);
-    let saved = json.and_then(|json| {
-        std::fs::write(dest.join("config.json"), json).map_err(|e| {
-            path_error("open", &dest.join("config.json"), &e)
-        })
-    });
+    let saved = std::fs::write(
+        dest.join("config.json"),
+        config_text(&choices, args.full_config),
+    )
+    .map_err(|e| path_error("open", &dest.join("config.json"), &e));
     match saved {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(&format!("Error during node creation: {e}")),
     }
 }
 
+/// go's `config.GetDefaultLocal()` as `Local.SaveAllToDisk` writes it (go
+/// v5.0.5-stable, config version 38): tab indented, in the order of go's
+/// struct. `node create` only ever changes the fields of [`ConfigChoices`], so
+/// its config.json is this text with those values replaced.
+const LOCAL_DEFAULT: &str = include_str!("../genesis/local_default.json");
+
+/// What `node create` sets on go's default `Local`.
+struct ConfigChoices<'a> {
+    archival: bool,
+    net_address: &'a str,
+    endpoint_address: Option<&'a str>,
+    run_hosted: bool,
+}
+
 /// The config.json go's `Local.SaveAllToDisk` (`full`: every field, one more
 /// newline) or `SaveToDisk` (`codecs.WriteNonDefaultValues`: the lines of the
-/// fields that differ from the defaults, `Version` always) writes: tab
-/// indented, in the order of go's struct.
-fn config_text(cfg: &algo_config::Local, net_address: &str, full: bool) -> Result<String, String> {
-    use serde::Serialize as _;
-    let mut buf = Vec::new();
-    {
-        let fmt = serde_json::ser::PrettyFormatter::with_indent(b"\t");
-        let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
-        cfg.serialize(&mut ser).map_err(|e| e.to_string())?;
-    }
-    let text = String::from_utf8(buf).map_err(|e| e.to_string())?;
-    // go's `NetAddress` sits right after `GossipFanout`
+/// fields that differ from the defaults, `Version` always) writes.
+fn config_text(c: &ConfigChoices<'_>, full: bool) -> String {
+    let json = |s: &str| serde_json::to_string(s).expect("a string is JSON");
+    let endpoint = c.endpoint_address.map(json);
+    let overrides: [(&str, String); 6] = [
+        ("Archival", c.archival.to_string()),
+        ("NetAddress", json(c.net_address)),
+        ("RunHosted", c.run_hosted.to_string()),
+        ("EnableLedgerService", c.archival.to_string()),
+        ("EnableBlockService", c.archival.to_string()),
+        ("EndpointAddress", endpoint.unwrap_or_default()),
+    ];
     let mut lines: Vec<String> = Vec::new();
-    for line in text.lines() {
-        lines.push(line.to_string());
-        if line.starts_with("\t\"GossipFanout\":") {
-            let net = serde_json::to_string(net_address).map_err(|e| e.to_string())?;
-            lines.push(format!("\t\"NetAddress\": {net},"));
+    for line in LOCAL_DEFAULT.lines() {
+        let key = line
+            .strip_prefix("\t\"")
+            .and_then(|l| l.split_once("\": "))
+            .map(|(k, v)| (k, v.trim_end_matches(',')));
+        let Some((key, default_value)) = key else {
+            lines.push(line.to_string());
+            continue;
+        };
+        let comma = if line.ends_with(',') { "," } else { "" };
+        let new_value = overrides
+            .iter()
+            .find(|(k, v)| *k == key && !(key == "EndpointAddress" && v.is_empty()))
+            .map(|(_, v)| v.as_str());
+        match new_value {
+            Some(v) => {
+                if full || v != default_value {
+                    lines.push(format!("\t\"{key}\": {v}{comma}"));
+                }
+            }
+            None if full || key == "Version" => lines.push(line.to_string()),
+            None => {}
         }
     }
     if full {
-        return Ok(lines.join("\n") + "\n");
-    }
-    let value_of = |c: &algo_config::Local, net: &str| -> Result<serde_json::Value, String> {
-        let mut v = serde_json::to_value(c).map_err(|e| e.to_string())?;
-        v.as_object_mut()
-            .expect("Local is an object")
-            .insert("NetAddress".to_string(), net.into());
-        Ok(v)
-    };
-    let object = value_of(cfg, net_address)?;
-    let defaults = value_of(&algo_config::Local::default(), "")?;
-    let mut kept: Vec<String> = Vec::new();
-    for line in &lines {
-        let name = line
-            .find('"')
-            .zip(line.find("\":"))
-            .filter(|(a, b)| b > a)
-            .map(|(a, b)| &line[a + 1..b]);
-        match name {
-            Some("Version") => kept.push(line.clone()),
-            Some(n) if object.get(n) == defaults.get(n) => {}
-            _ => kept.push(line.clone()),
-        }
+        return lines.join("\n") + "\n";
     }
     // the last value line carries no comma
-    if kept.len() > 2 {
-        let i = kept.len() - 2;
-        if kept[i].ends_with(',') {
-            kept[i].pop();
+    if lines.len() > 2 {
+        let i = lines.len() - 2;
+        if lines[i].ends_with(',') {
+            lines[i].pop();
         }
     }
-    Ok(kept
-        .join("\n")
-        .trim_end_matches(['\r', '\n', ' '])
-        .to_string())
+    lines.join("\n")
 }
 
 /// go's `os.MkdirAll(path, perm)`: every missing component gets `perm`.
