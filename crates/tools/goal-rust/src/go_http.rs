@@ -543,6 +543,7 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 struct GoVerifier {
     inner: std::sync::Arc<dyn rustls::client::danger::ServerCertVerifier>,
     host: String,
+    algs: rustls::crypto::WebPkiSupportedAlgorithms,
 }
 
 impl rustls::client::danger::ServerCertVerifier for GoVerifier {
@@ -563,8 +564,32 @@ impl rustls::client::danger::ServerCertVerifier for GoVerifier {
                 return Err(rustls::Error::General(e));
             }
         }
-        self.inner
+        match self
+            .inner
             .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+        {
+            // webpki refuses a certificate authority as the end entity, go
+            // builds its chain: the same checks, by `x509_chain`
+            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Other(o)))
+                if format!("{o:?}").contains("CaUsedAsEndEntity") =>
+            {
+                let unix = i64::try_from(now.as_secs()).unwrap_or(i64::MAX);
+                let roots = rustls_native_certs::load_native_certs().certs;
+                let roots: Vec<&[u8]> = roots.iter().map(AsRef::as_ref).collect();
+                let inters: Vec<&[u8]> = intermediates.iter().map(AsRef::as_ref).collect();
+                match crate::x509_chain::verify_ca_leaf(
+                    end_entity.as_ref(),
+                    &inters,
+                    &roots,
+                    unix,
+                    &self.algs,
+                ) {
+                    Ok(()) => Ok(rustls::client::danger::ServerCertVerified::assertion()),
+                    Err(e) => Err(rustls::Error::General(e.text())),
+                }
+            }
+            other => other,
+        }
     }
 
     fn verify_tls12_signature(
@@ -606,6 +631,7 @@ fn tls_connect(
     let verifier = GoVerifier {
         inner: std::sync::Arc::new(platform),
         host: name.clone(),
+        algs: provider.signature_verification_algorithms,
     };
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
