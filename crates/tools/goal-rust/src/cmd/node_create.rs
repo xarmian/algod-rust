@@ -92,9 +92,13 @@ pub fn run_create(args: CreateArgs) -> ExitCode {
     };
 
     let mut cfg = algo_config::Local::default();
+    // `NetAddress` is not a field of `algo_config::Local` (a CLI flag of
+    // `relay`/`participate`); config.json carries it, so it is kept apart and
+    // written where go's struct has it.
+    let mut net_address = String::new();
     if !args.relay.is_empty() {
         if is_valid_ip(&args.relay) {
-            cfg.net_address = args.relay.clone();
+            net_address = args.relay.clone();
         } else {
             return fail(&ip_failure(&args.relay));
         }
@@ -126,12 +130,8 @@ pub fn run_create(args: CreateArgs) -> ExitCode {
             path_error("open", &dest.join("genesis.json"), &e)
         ));
     }
-    let json = if args.full_config {
-        cfg.to_json_full()
-    } else {
-        cfg.to_json_minimized()
-    };
-    let saved = json.map_err(|e| e.to_string()).and_then(|json| {
+    let json = config_text(&cfg, &net_address, args.full_config);
+    let saved = json.and_then(|json| {
         std::fs::write(dest.join("config.json"), json).map_err(|e| {
             path_error("open", &dest.join("config.json"), &e)
         })
@@ -140,6 +140,67 @@ pub fn run_create(args: CreateArgs) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(&format!("Error during node creation: {e}")),
     }
+}
+
+/// The config.json go's `Local.SaveAllToDisk` (`full`: every field, one more
+/// newline) or `SaveToDisk` (`codecs.WriteNonDefaultValues`: the lines of the
+/// fields that differ from the defaults, `Version` always) writes: tab
+/// indented, in the order of go's struct.
+fn config_text(cfg: &algo_config::Local, net_address: &str, full: bool) -> Result<String, String> {
+    use serde::Serialize as _;
+    let mut buf = Vec::new();
+    {
+        let fmt = serde_json::ser::PrettyFormatter::with_indent(b"	");
+        let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
+        cfg.serialize(&mut ser).map_err(|e| e.to_string())?;
+    }
+    let text = String::from_utf8(buf).map_err(|e| e.to_string())?;
+    // go's `NetAddress` sits right after `GossipFanout`
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        lines.push(line.to_string());
+        if line.starts_with("	\"GossipFanout\":") {
+            let net = serde_json::to_string(net_address).map_err(|e| e.to_string())?;
+            lines.push(format!("	\"NetAddress\": {net},"));
+        }
+    }
+    if full {
+        return Ok(lines.join("
+") + "
+");
+    }
+    let value_of = |c: &algo_config::Local, net: &str| -> Result<serde_json::Value, String> {
+        let mut v = serde_json::to_value(c).map_err(|e| e.to_string())?;
+        v.as_object_mut()
+            .expect("Local is an object")
+            .insert("NetAddress".to_string(), net.into());
+        Ok(v)
+    };
+    let object = value_of(cfg, net_address)?;
+    let defaults = value_of(&algo_config::Local::default(), "")?;
+    let mut kept: Vec<String> = Vec::new();
+    for line in &lines {
+        let name = line
+            .find('"')
+            .zip(line.find("\":"))
+            .filter(|(a, b)| b > a)
+            .map(|(a, b)| &line[a + 1..b]);
+        match name {
+            Some("Version") => kept.push(line.clone()),
+            Some(n) if object.get(n) == defaults.get(n) => {}
+            _ => kept.push(line.clone()),
+        }
+    }
+    // the last value line carries no comma
+    if kept.len() > 2 {
+        let i = kept.len() - 2;
+        if kept[i].ends_with(',') {
+            kept[i].pop();
+        }
+    }
+    Ok(kept.join("
+").trim_end_matches(['', '
+', ' ']).to_string())
 }
 
 /// go's `os.MkdirAll(path, perm)`: every missing component gets `perm`.
