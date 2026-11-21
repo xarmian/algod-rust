@@ -1346,7 +1346,7 @@ pub fn run_partkeyinfo(cli_d: Vec<PathBuf>) -> ExitCode {
                 );
             }
         }
-        print!("{out}");
+        crate::formatting::print_raw(&out);
     }
     ExitCode::SUCCESS
 }
@@ -2945,7 +2945,8 @@ pub fn run_assetdetails(args: AssetdetailsArgs, cli_d: Vec<PathBuf>) -> ExitCode
     let flush = |out: &mut String| {
         use std::io::Write as _;
         let mut stdout = std::io::stdout().lock();
-        let _ = stdout.write_all(out.as_bytes());
+        // (go-codec's strings are raw bytes, printed unfiltered)
+        let _ = stdout.write_all(&algo_types::raw_text::decode(out));
         let _ = stdout.flush();
         out.clear();
     };

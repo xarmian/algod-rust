@@ -252,6 +252,11 @@ struct Dec<'a> {
     c: Container,
     /// A read went past the end of the body.
     hit_end: bool,
+    /// Keep a decoded string's bytes as they are (the lossless
+    /// [`algo_types::raw_text`] form), as go's `string` does and `fmt` prints
+    /// unfiltered: only the REST client's decode ([`Mode::Io`]); the
+    /// request decoding of the node keeps its lossy strings.
+    raw_strings: bool,
 }
 
 fn is_ws(b: u8) -> bool {
@@ -283,6 +288,7 @@ impl<'a> Dec<'a> {
             tok: 0,
             c: Container::None,
             hit_end: false,
+            raw_strings: mode == Mode::Io,
         }
     }
 
@@ -852,7 +858,12 @@ impl<'a> Dec<'a> {
     }
 
     fn decode_string(&mut self) -> Result<String, Error> {
-        Ok(lossy(&self.append_string_as_bytes()?.0))
+        let bytes = self.append_string_as_bytes()?.0;
+        Ok(if self.raw_strings {
+            algo_types::raw_text::encode(&bytes).into_owned()
+        } else {
+            lossy(&bytes)
+        })
     }
 
     /// `DecodeBytes`: a base64 string (`null` is a nil slice).

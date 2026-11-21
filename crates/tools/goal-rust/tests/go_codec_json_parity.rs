@@ -69,6 +69,44 @@ fn ty(name: &str) -> &'static Ty {
     }
 }
 
+/// The decoded value as `encoding/json` prints go's: a string keeps its bytes
+/// in the lossless `raw_text` form here, and prints each invalid byte as
+/// U+FFFD.
+fn go_printed(v: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => Value::String(algo_types::raw_text::go_lossy(
+            &algo_types::raw_text::decode(s),
+        )),
+        Value::Array(a) => Value::Array(a.iter().map(go_printed).collect()),
+        Value::Object(m) => Value::Object(
+            m.iter()
+                .map(|(k, v)| (k.clone(), go_printed(v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// A decoded string keeps the answer's bytes (go-codec's `string`), where
+/// go's `goal` prints them unfiltered (issue #2506).
+#[test]
+fn decoded_strings_keep_their_bytes() {
+    let body = b"{\"genesis_id\":\"aÿbâ\",\"versions\":[\"Ã(\"]}";
+    let v = decode(body, &VERSION).expect("decodes");
+    assert_eq!(
+        algo_types::raw_text::decode(v["genesis_id"].as_str().unwrap()).as_ref(),
+        b"aÿbâ"
+    );
+    assert_eq!(
+        algo_types::raw_text::decode(v["versions"][0].as_str().unwrap()).as_ref(),
+        b"Ã("
+    );
+    // valid text is unchanged
+    let v = decode(br#"{"genesis_id":"main-v1.0"}"#, &VERSION).expect("decodes");
+    assert_eq!(v["genesis_id"], "main-v1.0");
+}
+
 #[test]
 fn go_codec_json_decode_matches_go() {
     let mut mismatches = Vec::new();
@@ -82,7 +120,7 @@ fn go_codec_json_decode_matches_go() {
         let got = decode(&body, ty(row["ty"].as_str().expect("ty")));
         let ok = match (&got, row["err"].as_str()) {
             (Err(e), Some(want)) => e.to_string() == want,
-            (Ok(v), None) => *v == row["value"],
+            (Ok(v), None) => go_printed(v) == row["value"],
             _ => false,
         };
         if !ok {

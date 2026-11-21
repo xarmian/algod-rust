@@ -41,6 +41,15 @@
 /// `unicode.IsPrint`), and `is_printable` is `false` iff at least one
 /// `char` was dropped.
 pub fn unicode_printable(s: &str) -> (bool, String) {
+    // go ranges over the runes of the bytes it kept: each invalid byte of a
+    // text in the lossless `raw_text` form is a `RuneError`, which is printable
+    let lossy;
+    let s = if algo_types::raw_text::has_raw(s) {
+        lossy = algo_types::raw_text::go_lossy(&algo_types::raw_text::decode(s));
+        lossy.as_str()
+    } else {
+        s
+    };
     let mut is_printable = true;
     let mut printable_string = String::with_capacity(s.len());
     for c in s.chars() {
@@ -253,4 +262,31 @@ mod tests {
             );
         }
     }
+}
+
+/// go's `fmt.Printf` of a string that kept the bytes of an algod answer
+/// (go-codec's `string`): written byte for byte, a text in the lossless form
+/// of [`algo_types::raw_text`] giving its original bytes back.
+pub fn print_raw(text: &str) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(&algo_types::raw_text::decode(text));
+}
+
+/// [`print_raw`] of a formatted text.
+#[macro_export]
+macro_rules! print_raw {
+    ($($arg:tt)*) => {
+        $crate::formatting::print_raw(&format!($($arg)*))
+    };
+}
+
+/// [`print_raw!`] and a newline (go's `fmt.Println` / `Printf("...
+")`).
+#[macro_export]
+macro_rules! println_raw {
+    ($($arg:tt)*) => {
+        $crate::formatting::print_raw(&format!("{}
+", format!($($arg)*)))
+    };
 }
