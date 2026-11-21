@@ -1845,8 +1845,6 @@ mod tests {
     fn clap_takes_every_flag_of_gos() {
         // Flags go's command reads that goal-rust's does not have yet.
         const GAPS: &[&str] = &[
-            // issue #2513
-            "goal app method --app-arg",
             // issue #2512
             "goal node clone --noledger",
             "goal node clone --targetdir",

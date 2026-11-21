@@ -448,6 +448,11 @@ pub struct MethodArgs {
     /// `SignedTxn` file.
     #[arg(long = "arg")]
     pub arg: Vec<String>,
+    /// `app`'s persistent `--app-arg`, which go's `method` inherits: it
+    /// parses each non-empty one, then refuses the command when any is
+    /// given (`--arg` carries the method's arguments).
+    #[arg(long = "app-arg")]
+    pub app_arg: Vec<String>,
     /// On-completion action for the application transaction (Go
     /// `--on-completion`).
     #[arg(long = "on-completion", default_value = "NoOp")]
