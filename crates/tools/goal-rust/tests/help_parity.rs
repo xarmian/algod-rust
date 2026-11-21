@@ -294,9 +294,8 @@ fn unimplemented_leaf_exits_with_code_two_and_message() {
         // group is now complete (TASK-292: simulate + multisig). Spot-check
         // still-stubbed leaves in other groups.
         (&["node", "generate-p2pid"], "node generate-p2pid"),
-        // All `wallet` leaves are implemented (TASK-226/227/228);
-        // use a still-stubbed `node` leaf as the spot check.
-        (&["node", "clone"], "node clone"),
+        // All `wallet` leaves are implemented (TASK-226/227/228), and so
+        // are `node create` / `node clone` (issue #2512).
     ];
     for (argv, expected) in cases {
         let out = Command::new(GOAL_RUST_BIN)

@@ -39,10 +39,15 @@ pub enum NodeCmd {
     /// algorand-catchpoints.s3.us-east-2.amazonaws.com.
     Catchup(CatchupArgs),
     /// Clone the specified node to create another node.
-    Clone,
+    ///
+    /// Optionally you can control whether the clone includes the current
+    /// ledger, or if it starts with an uninitialized one. The default is to
+    /// clone the ledger as well. Specify -n or --noledger to start with an
+    /// uninitialized ledger.
+    Clone(CloneArgs),
     /// Create a node at the desired data directory for the desired
     /// network.
-    Create,
+    Create(CreateArgs),
     /// Generate a new p2p private key.
     #[command(name = "generate-p2pid")]
     GenerateP2pid,
@@ -104,6 +109,43 @@ pub struct CatchupArgs {
     pub min: u64,
 }
 
+/// `cloneCmd` flags (`cmd/goal/node.go`).
+#[derive(Args, Debug)]
+pub struct CloneArgs {
+    /// Target directory for the clone.
+    #[arg(short = 't', long = "targetdir", default_value = "")]
+    pub targetdir: String,
+    /// Don't include ledger when copying (No Ledger).
+    #[arg(short = 'n', long = "noledger")]
+    pub noledger: bool,
+}
+
+/// `createCmd` flags (`cmd/goal/node.go`).
+#[derive(Args, Debug)]
+pub struct CreateArgs {
+    /// Network the new node should point to.
+    #[arg(long = "network", default_value = "")]
+    pub network: String,
+    /// Destination path for the new node.
+    #[arg(long = "destination", default_value = "")]
+    pub destination: String,
+    /// Make the new node archival, storing all blocks.
+    #[arg(short = 'a', long = "archival")]
+    pub archival: bool,
+    /// Configure the new node to run hosted by algoh.
+    #[arg(short = 'H', long = "hosted")]
+    pub hosted: bool,
+    /// Configure as a relay with specified listening address (NetAddress).
+    #[arg(long = "relay", default_value = "")]
+    pub relay: String,
+    /// REST API Endpoint.
+    #[arg(long = "api", default_value = "")]
+    pub api: String,
+    /// Store full config file.
+    #[arg(long = "full-config")]
+    pub full_config: bool,
+}
+
 /// `pendingTxnsCmd` flags (`cmd/goal/node.go:113`).
 #[derive(Args, Debug, Default)]
 pub struct PendingTxnsArgs {
@@ -133,8 +175,8 @@ pub struct StatusArgs {
 pub fn run(cmd: NodeCmd) -> ExitCode {
     match cmd {
         NodeCmd::Catchup(a) => crate::cmd::node::run_catchup(a, datadirs_from_cli()),
-        NodeCmd::Clone => unimplemented("node", "clone"),
-        NodeCmd::Create => unimplemented("node", "create"),
+        NodeCmd::Clone(a) => crate::cmd::node_create::run_clone(a, datadirs_from_cli()),
+        NodeCmd::Create(a) => crate::cmd::node_create::run_create(a),
         NodeCmd::GenerateP2pid => unimplemented("node", "generate-p2pid"),
         NodeCmd::Generatetoken => crate::cmd::node::run_generate_token(datadirs_from_cli()),
         NodeCmd::Lastround => crate::cmd::node::run_lastround(datadirs_from_cli()),

@@ -99,3 +99,6 @@ benchmarks/corpus/** -text
 
 # git apply inside a Linux build container needs the exact LF bytes (#2400).
 ops/mixed-cluster/upgradeprop-inject/inject.patch text eol=lf
+
+# Genesis files embedded verbatim into `goal node create` (compared byte-for-byte with go goal's bundle).
+crates/tools/goal-rust/src/genesis/*.json text eol=lf
