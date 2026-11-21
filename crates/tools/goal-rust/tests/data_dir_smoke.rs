@@ -41,8 +41,9 @@ fn root_help_works_with_no_datadir_env_or_flag() {
         .expect("run goal-rust --help");
     assert!(out.status.success(), "exit={:?}", out.status.code());
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // go's cobra help of `goal` (issue #2472).
     assert!(
-        stdout.contains("Usage: goal-rust"),
+        stdout.contains("Usage:\n  goal [flags]\n"),
         "no Usage line: {stdout:?}"
     );
 }

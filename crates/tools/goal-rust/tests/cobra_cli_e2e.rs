@@ -57,11 +57,6 @@ const FIXTURE: &str = "tests/fixtures/cobra_cli.jsonl";
 
 const TREE: &str = include_str!("../src/cobra_tree.json");
 
-/// The trees `cobra_compat` parses (its `TREES`).
-const TREES: &[&str] = &[
-    "account", "app", "asset", "clerk", "ledger", "node", "wallet",
-];
-
 fn mixed_cluster_enabled() -> bool {
     matches!(std::env::var("MIXED_CLUSTER").as_deref(), Ok(v) if !v.is_empty() && v != "0")
 }
@@ -123,10 +118,11 @@ fn command_lines() -> Vec<Vec<String>> {
     let mut lines: Vec<Vec<String>> = Vec::new();
     for c in cmds {
         let path = s(c, "path");
-        if !TREES.contains(&path.split(' ').next().unwrap_or("")) {
-            continue;
-        }
-        let words: Vec<String> = path.split(' ').map(str::to_string).collect();
+        let words: Vec<String> = path
+            .split(' ')
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect();
         let line = |extra: &[&str]| -> Vec<String> {
             let mut v = words.clone();
             v.extend(extra.iter().map(|e| e.to_string()));
@@ -140,7 +136,7 @@ fn command_lines() -> Vec<Vec<String>> {
         // (the root's at the top of each tree).
         let mut flags: Vec<&Value> = c["local"].as_array().unwrap().iter().collect();
         flags.extend(c["persistent"].as_array().unwrap());
-        if !path.contains(' ') {
+        if !path.is_empty() && !path.contains(' ') {
             flags.extend(by_path[""]["persistent"].as_array().unwrap());
         }
         for f in flags {
@@ -240,6 +236,42 @@ fn command_lines() -> Vec<Vec<String>> {
         &["ledger", "block"],
         &["ledger", "block", "1", "2"],
         &["ledger", "-z", "supply"],
+        // The root, cobra's help command and goal's `helptest`.
+        &[],
+        &["extra"],
+        &["lsit", "-d", "x"],
+        &["-d", "x", "extra", "-k", "y"],
+        &["-h", "clerk"],
+        &["--help=x"],
+        &["-v=maybe"],
+        &["-vz"],
+        &["--", "clerk"],
+        &["help"],
+        &["help", "clerk", "send"],
+        &["help", "clerk", "nosuch"],
+        &["help", "nosuch", "more"],
+        &["help", "help"],
+        &["-d", "x", "help", "app", "box", "list"],
+        &["help", "-z"],
+        &["help", "--", "-x"],
+        &["helptest"],
+        &["helptest", "x"],
+        &["kmd", "-t", "x", "start"],
+        &["network", "-r"],
+        &["network", "create", "-r", "x", "--nosuch"],
+        &["completion", "zsh", "extra"],
+        &["version", "-v", "extra"],
+        &["license", "-d"],
+        // strconv.Quote of runes go does not print.
+        &["x\u{200b}"],
+        &["\u{2028}\u{2029}"],
+        &["\u{feff}y"],
+        &["\u{a0}\u{ad}\u{85}\u{3000}"],
+        &["\u{e000}\u{e0001}\u{10ffff}"],
+        &["é日本😀\u{301}"],
+        &["account", "info", "-a", "A", "\u{7}\u{1b}\u{7f}"],
+        &["clerk", "send", "--fee", "\u{200b}1"],
+        &["clerk", "send", "--argb64", "\u{2028}\"x"],
     ] {
         lines.push(l.iter().map(|a| a.to_string()).collect());
     }

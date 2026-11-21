@@ -25,7 +25,8 @@
 // whether it is hidden or runnable; its local and persistent flags (name,
 // shorthand, pflag type, NoOptDefVal, MarkFlagRequired, hidden,
 // deprecated); its `Args` rule, probed with 0 to 6 positional arguments;
-// and its usage (`UsageString()`) and help (`HelpFunc()`) texts.
+// and its usage (`UsageString()`) and help (`HelpFunc()`) texts. It also
+// writes the runes `strconv.IsPrint` rejects, which `%q` escapes.
 //
 // It is compiled into go-algorand's `cmd/goal` through `go test -overlay`,
 // so the go-algorand checkout is not changed (its crypto package needs
@@ -48,6 +49,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -209,7 +211,21 @@ func TestGoalCobraDump(t *testing.T) {
 		list = append(list, dumps[c])
 	}
 	sort.SliceStable(list, func(i, j int) bool { return list[i].Path < list[j].Path })
+	// The runes strconv.IsPrint rejects, which `%q` (strconv.Quote) escapes
+	// in cobra's and pflag's errors: hex ranges "lo-hi", comma-separated.
+	var notPrintable []string
+	for r := rune(0); r <= 0x10ffff; r++ {
+		if strconv.IsPrint(r) {
+			continue
+		}
+		lo := r
+		for r+1 <= 0x10ffff && !strconv.IsPrint(r+1) {
+			r++
+		}
+		notPrintable = append(notPrintable, fmt.Sprintf("%x-%x", lo, r))
+	}
 	root := map[string]any{
+		"not_printable":                strings.Join(notPrintable, ","),
 		"disable_suggestions":          rootCmd.DisableSuggestions,
 		"suggestions_minimum_distance": rootCmd.SuggestionsMinimumDistance,
 		"commands":                     list,
