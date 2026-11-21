@@ -868,8 +868,8 @@ _CONVERTED = None
 
 def converted_types():
     """The go structs whose algod-rust reader has the array form: the type names
-    the readers pass to `rmp_decode::struct_keys` (and the agreement codec's
-    twin). A struct outside this set stays a map in the array cases, so a case
+    the readers pass to `rmp_decode::struct_keys` / `struct_keys_with` and the
+    raw-subtree validator's `Sch::Struct`. A struct outside this set stays a map in the array cases, so a case
     is never about a reader that is not converted yet (issue #2426)."""
     global _CONVERTED
     if _CONVERTED is None:
@@ -882,7 +882,9 @@ def converted_types():
             for f in files:
                 if f.endswith(".rs"):
                     txt = open(os.path.join(base, f), encoding="utf-8").read()
-                    found |= set(re.findall(r'struct_keys\([^;]*?"([A-Za-z_][A-Za-z_0-9.]*)"', txt))
+                    found |= set(re.findall(r'struct_keys(?:_with)?\([^;]*?"([A-Za-z_][A-Za-z_0-9.]*)"', txt))
+                    # msgp_schema's raw-subtree validator
+                    found |= set(re.findall(r'Sch::Struct\("([A-Za-z_][A-Za-z_0-9.]*)"', txt))
         _CONVERTED = found
     return _CONVERTED
 
@@ -896,6 +898,10 @@ ROOT_TYPES = {
     "txn": "transactions.Transaction",
     "applydata": "transactions.ApplyData",
     "evaldelta": "transactions.EvalDelta",
+    "payload": "agreement.transmittedPayload",
+    "vote": "agreement.unauthenticatedVote",
+    "bundle": "agreement.unauthenticatedBundle",
+    "cert": "agreement.Certificate",
 }
 
 _SCHEMA = None
@@ -906,6 +912,32 @@ def load_schema():
     if _SCHEMA is None:
         _SCHEMA = json.load(open(SCHEMA_PATH, encoding="utf-8"))
     return _SCHEMA
+
+
+def schema_text(go_algorand):
+    """The msgp field layout (go_struct_order.json) as the oracles dump it from go's
+    types, the rpcs and agreement packages merged."""
+    merged = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        for pkg, (template, suffix) in sorted(TEMPLATES.items()):
+            if pkg not in ("rpcs", "agreement"):
+                continue
+            out = os.path.join(tmp, pkg + ".json")
+            dst = os.path.join(go_algorand, pkg, DST)
+            shutil.copyfile(os.path.join(ORACLE, template), dst)
+            try:
+                env = dict(os.environ, STRICT_SCHEMA_OUT=out)
+                subprocess.run(
+                    ["go", "test", "-count=1", "-run", f"^TestStrictDecodeSchema{suffix}$", "./" + pkg],
+                    cwd=go_algorand,
+                    env=env,
+                    check=True,
+                )
+            finally:
+                os.remove(dst)
+            for name, fields in json.load(open(out, encoding="utf-8")).items():
+                assert merged.setdefault(name, fields) == fields, f"{name} differs between oracles"
+    return json.dumps(merged, indent=1, sort_keys=True) + "\n"
 
 
 def array_form_allowed(tname):
@@ -1270,7 +1302,20 @@ SETS = {
         # issue #2430: nil elements of []byte lists
         "nil_kinds": {"stxn", "block", "payload", "stxninblock", "txn", "applydata", "evaldelta"},
         # issue #2426: structs read from arrays
-        "array_kinds": {"blockcert", "block", "header", "stxn", "stxninblock", "txn", "applydata", "evaldelta"},
+        "array_kinds": {
+            "blockcert",
+            "block",
+            "header",
+            "stxn",
+            "stxninblock",
+            "txn",
+            "applydata",
+            "evaldelta",
+            "payload",
+            "vote",
+            "bundle",
+            "cert",
+        },
     },
     "ledger": {
         "dir": fixture_dir("core", "algo-ledger"),
@@ -1400,6 +1445,11 @@ def main():
         metavar=("N", "OUT"),
         help="write N extra random cases per set with go verdicts to OUT (consensus) and OUT.<set>",
     )
+    ap.add_argument(
+        "--regen-schema",
+        action="store_true",
+        help="rewrite crates/core/algo-types/src/go_struct_order.json from go's types (--check: fail when stale)",
+    )
     ap.add_argument("--set", action="append", choices=sorted(SETS), help="fixture set(s); default: all")
     ap.add_argument("--per-map", type=int, default=2)
     ap.add_argument("--cap", type=int, default=4000)
@@ -1409,6 +1459,17 @@ def main():
     if not a.go_algorand:
         sys.exit("set GO_ALGORAND_DIR or pass --go-algorand (a v5.0.5-stable checkout with libsodium built)")
     go = os.path.abspath(a.go_algorand)
+    if a.regen_schema:
+        text = schema_text(go)
+        if a.check:
+            if open(SCHEMA_PATH, encoding="utf-8", newline="").read() != text:
+                sys.exit(f"{SCHEMA_PATH} is stale; rerun with --regen-schema")
+            print("go_struct_order.json: up to date")
+        else:
+            with open(SCHEMA_PATH, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            print(f"wrote {SCHEMA_PATH}")
+        return
     for name in a.set or list(SETS):
         run_set(name, SETS[name], go, a)
 

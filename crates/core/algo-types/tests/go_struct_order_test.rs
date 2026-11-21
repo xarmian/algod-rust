@@ -42,23 +42,42 @@ fn schema() -> BTreeMap<String, Vec<String>> {
         .collect()
 }
 
-/// Every `struct_keys(.., .., "<go type>")` call in this crate's sources.
+/// Every go type the readers of this crate and of `algo-agreement` name: the
+/// last string literal of a `struct_keys(..)` / `struct_keys_with(..)` call and
+/// the one of a `Sch::Struct("<go type>", ..)`.
 fn named_types() -> Vec<String> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src")).unwrap() {
-        let path = entry.unwrap().path();
-        // (`rmp_decode.rs` defines `struct_keys`; the readers call it)
-        if path.extension().is_none_or(|e| e != "rs") || path.ends_with("rmp_decode.rs") {
-            continue;
-        }
-        let text = std::fs::read_to_string(&path).unwrap();
-        let mut rest = text.as_str();
-        while let Some(i) = rest.find("struct_keys(") {
-            rest = &rest[i + "struct_keys(".len()..];
-            let call: String = rest.chars().take_while(|c| *c != ';').collect();
-            if let Some(q) = call.find('"') {
-                if let Some(end) = call[q + 1..].find('"') {
-                    out.push(call[q + 1..q + 1 + end].to_string());
+    for dir in ["/src", "/../algo-agreement/src"] {
+        for entry in std::fs::read_dir(format!("{}{dir}", env!("CARGO_MANIFEST_DIR"))).unwrap() {
+            let path = entry.unwrap().path();
+            // (`rmp_decode.rs` defines `struct_keys`; the readers call it)
+            if path.extension().is_none_or(|e| e != "rs") || path.ends_with("rmp_decode.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (needle, until) in [
+                ("struct_keys(", ';'),
+                ("struct_keys_with(", ';'),
+                ("Sch::Struct(\"", ','),
+            ] {
+                let mut rest = text.as_str();
+                while let Some(i) = rest.find(needle) {
+                    rest = &rest[i + needle.len()..];
+                    let call: String = rest.chars().take_while(|c| *c != until).collect();
+                    let from = if needle.starts_with("Sch") {
+                        // the literal ends at the quote before the comma
+                        call.trim_end_matches('"').to_string()
+                    } else {
+                        // the last string literal of the call
+                        match call.rfind('"') {
+                            Some(end) => match call[..end].rfind('"') {
+                                Some(start) => call[start + 1..end].to_string(),
+                                None => continue,
+                            },
+                            None => continue,
+                        }
+                    };
+                    out.push(from);
                 }
             }
         }
@@ -70,7 +89,7 @@ fn named_types() -> Vec<String> {
 fn every_named_go_type_is_in_the_schema() {
     let schema = schema();
     let named = named_types();
-    assert!(named.len() >= 20, "found only {} readers", named.len());
+    assert!(named.len() >= 30, "found only {} readers", named.len());
     for t in named {
         assert!(
             schema.contains_key(&t),

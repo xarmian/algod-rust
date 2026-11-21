@@ -34,6 +34,9 @@
 //	cert     protocol.Decode into Certificate             (the block DB's cert)
 //
 // The handlers' wellFormed() checks run after the decode and are not part of it.
+// With $STRICT_SCHEMA_OUT it writes the msgp field layout of those types (keys
+// in go's declaration order, embedded structs flattened: the positional order
+// of go's struct-from-array decode, issue #2426).
 
 package agreement
 
@@ -44,6 +47,8 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/algorand/go-algorand/protocol"
@@ -162,5 +167,107 @@ func TestStrictDecodeSeedsAgreement(t *testing.T) {
 		emit("vote", i, &unauthenticatedVote{})
 		emit("bundle", i, &unauthenticatedBundle{})
 		emit("cert", i, &Certificate{})
+	}
+}
+
+// schemaType describes one field's value: a leaf (a scalar named by its Go
+// kind, "bytes", "bytes[N]", or a struct with a hand-written msgp codec), a
+// struct, or a list / map of those.
+type schemaType struct {
+	Kind string      `json:"k"`
+	Name string      `json:"t,omitempty"`
+	Elem *schemaType `json:"e,omitempty"`
+}
+
+type schemaField struct {
+	GoName string     `json:"go"`
+	Key    string     `json:"key"`
+	Type   schemaType `json:"type"`
+}
+
+// opaqueStructs are structs whose msgp codec is written by hand (`//msgp:ignore`
+// and custom marshalers): they are one value on the wire, not a map.
+var opaqueStructs = map[string]bool{"basics.MicroAlgos": true}
+
+func schemaOfType(rt reflect.Type, out map[string][]schemaField) schemaType {
+	for rt.Kind() == reflect.Ptr {
+		rt = rt.Elem()
+	}
+	switch rt.Kind() {
+	case reflect.Struct:
+		name := rt.String()
+		if opaqueStructs[name] {
+			return schemaType{Kind: "leaf", Name: "uint64"}
+		}
+		if _, done := out[name]; !done {
+			out[name] = nil // cut recursion
+			out[name] = schemaFields(rt, out)
+		}
+		return schemaType{Kind: "struct", Name: name}
+	case reflect.Slice, reflect.Array:
+		if rt.Elem().Kind() == reflect.Uint8 {
+			if rt.Kind() == reflect.Array {
+				return schemaType{Kind: "leaf", Name: fmt.Sprintf("bytes[%d]", rt.Len())}
+			}
+			return schemaType{Kind: "leaf", Name: "bytes"}
+		}
+		e := schemaOfType(rt.Elem(), out)
+		return schemaType{Kind: "list", Elem: &e}
+	case reflect.Map:
+		e := schemaOfType(rt.Elem(), out)
+		return schemaType{Kind: "map", Elem: &e}
+	}
+	// a scalar: its Go kind (uint64, bool, string, ...)
+	return schemaType{Kind: "leaf", Name: rt.Kind().String()}
+}
+
+// schemaFields lists a struct's msgp fields in declaration order: an embedded
+// struct without a codec name is flattened in place, a `codec:"-"` or
+// unexported field is skipped, and an empty codec name is the Go field name.
+func schemaFields(rt reflect.Type, out map[string][]schemaField) []schemaField {
+	var fs []schemaField
+	for i := 0; i < rt.NumField(); i++ {
+		f := rt.Field(i)
+		tag := f.Tag.Get("codec")
+		name := strings.Split(tag, ",")[0]
+		if name == "-" || f.Name == "_struct" || (f.PkgPath != "" && !f.Anonymous) {
+			continue
+		}
+		if f.Anonymous && name == "" {
+			ft := f.Type
+			for ft.Kind() == reflect.Ptr {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct {
+				fs = append(fs, schemaFields(ft, out)...)
+				continue
+			}
+		}
+		if name == "" {
+			name = f.Name
+		}
+		fs = append(fs, schemaField{GoName: f.Name, Key: name, Type: schemaOfType(f.Type, out)})
+	}
+	return fs
+}
+
+// TestStrictDecodeSchemaAgreement writes $STRICT_SCHEMA_OUT.
+func TestStrictDecodeSchemaAgreement(t *testing.T) {
+	path := os.Getenv("STRICT_SCHEMA_OUT")
+	if path == "" {
+		t.Skip("STRICT_SCHEMA_OUT not set")
+	}
+	out := map[string][]schemaField{}
+	for _, v := range []any{
+		transmittedPayload{}, unauthenticatedProposal{}, unauthenticatedVote{}, unauthenticatedBundle{}, Certificate{},
+	} {
+		schemaOfType(reflect.TypeOf(v), out)
+	}
+	b, err := json.MarshalIndent(out, "", " ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(b, '\n'), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

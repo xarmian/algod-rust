@@ -582,7 +582,11 @@ pub fn decode_compound_message(bytes: &[u8]) -> Result<CompoundMessage, CodecErr
     // Step 1: Decode block fields (skips unknown keys). Use the
     // rnd-tolerant wrapper so transmittedPayload fixtures with
     // round=0 (which omit the `rnd` key via omitempty) still parse.
-    let block = decode_block_allowing_missing_rnd(bytes, &[b"oper", b"oprop", b"sdpf", b"pv"])?;
+    let block = decode_block_allowing_missing_rnd(
+        bytes,
+        "agreement.transmittedPayload",
+        &[b"oper", b"oprop", b"sdpf", b"pv"],
+    )?;
 
     // Step 2: Scan the map to extract proposal-specific fields and prior vote.
     let mut proposal = UnauthenticatedProposal {
@@ -607,13 +611,16 @@ fn proposal_fields_into(
     p: &mut UnauthenticatedProposal,
     mut prior_vote: Option<&mut UnauthenticatedVote>,
 ) -> GoResult<()> {
-    if let [0xc0, rest @ ..] = *rd {
-        // go: a nil message is the zero value (the block decoder agreed)
-        *rd = rest;
-        return Ok(());
-    }
-    for _ in 0..go_msgp::read_map_len(rd)? {
-        match go_msgp::read_key_bytes(rd)? {
+    // go's type of the message: the array form reads the block's fields, then
+    // these, at go's positions (issue #2426)
+    let go_type = if prior_vote.is_some() {
+        "agreement.transmittedPayload"
+    } else {
+        "agreement.unauthenticatedProposal"
+    };
+    let mut keys = go_msgp::struct_keys(rd, &mut (), go_type)?;
+    while let Some(key) = keys.next(rd)? {
+        match key {
             b"oper" => p.original_period = Period(go_msgp::read_u64(rd)?),
             b"oprop" => fixed_into(rd, &mut p.original_proposer.0)?,
             b"sdpf" => fixed_into(rd, &mut p.seed_proof)?,
@@ -1020,24 +1027,11 @@ fn zero_equivocation_vote_authenticator() -> EquivocationVoteAuthenticator {
     }
 }
 
-/// A struct's map header: `nil` resets the value to `zero` (go
-/// `(*z) = T{}`) and reads as no entries.
-#[inline]
-fn struct_map_len<T>(rd: &mut &[u8], s: &mut T, zero: impl FnOnce() -> T) -> GoResult<u32> {
-    if let [0xc0, rest @ ..] = *rd {
-        *rd = rest;
-        *s = zero();
-        return Ok(0);
-    }
-    // DIVERGENCE DIV-004: only the map form is read; go's struct-from-array
-    // branch (ReadArrayHeaderBytes fallback) is intentionally not supported.
-    go_msgp::read_map_len(rd)
-}
-
 /// `proposalValue` decoded into `pv`.
 fn proposal_value_into(rd: &mut &[u8], pv: &mut ProposalValue) -> GoResult<()> {
-    for _ in 0..struct_map_len(rd, pv, || BOTTOM)? {
-        match go_msgp::read_key_bytes(rd)? {
+    let mut keys = go_msgp::struct_keys_with(rd, pv, || BOTTOM, "agreement.proposalValue")?;
+    while let Some(key) = keys.next(rd)? {
+        match key {
             b"dig" => fixed_into(rd, &mut pv.block_digest.0)?,
             b"encdig" => fixed_into(rd, &mut pv.encoding_digest.0)?,
             b"oper" => pv.original_period = Period(go_msgp::read_u64(rd)?),
@@ -1050,8 +1044,9 @@ fn proposal_value_into(rd: &mut &[u8], pv: &mut ProposalValue) -> GoResult<()> {
 
 /// `rawVote` decoded into `rv`.
 fn raw_vote_into(rd: &mut &[u8], rv: &mut RawVote) -> GoResult<()> {
-    for _ in 0..struct_map_len(rd, rv, zero_raw_vote)? {
-        match go_msgp::read_key_bytes(rd)? {
+    let mut keys = go_msgp::struct_keys_with(rd, rv, zero_raw_vote, "agreement.rawVote")?;
+    while let Some(key) = keys.next(rd)? {
+        match key {
             b"per" => rv.period = Period(go_msgp::read_u64(rd)?),
             b"prop" => proposal_value_into(rd, &mut rv.proposal)?,
             b"rnd" => rv.round = Round(go_msgp::read_u64(rd)?),
@@ -1065,10 +1060,14 @@ fn raw_vote_into(rd: &mut &[u8], rv: &mut RawVote) -> GoResult<()> {
 
 /// `committee.UnauthenticatedCredential` decoded into `c`.
 fn credential_into(rd: &mut &[u8], c: &mut UnauthenticatedCredential) -> GoResult<()> {
-    for _ in 0..struct_map_len(rd, c, || {
-        UnauthenticatedCredential::new([0u8; VRF_PROOF_SIZE])
-    })? {
-        match go_msgp::read_key_bytes(rd)? {
+    let mut keys = go_msgp::struct_keys_with(
+        rd,
+        c,
+        || UnauthenticatedCredential::new([0u8; VRF_PROOF_SIZE]),
+        "committee.UnauthenticatedCredential",
+    )?;
+    while let Some(key) = keys.next(rd)? {
+        match key {
             b"pf" => fixed_into(rd, &mut c.proof)?,
             key => return Err(go_msgp::no_matching_field_error(key)),
         }
@@ -1078,8 +1077,9 @@ fn credential_into(rd: &mut &[u8], c: &mut UnauthenticatedCredential) -> GoResul
 
 /// `crypto.OneTimeSignature` decoded into `sig`.
 fn one_time_signature_into(rd: &mut &[u8], sig: &mut OneTimeSignature) -> GoResult<()> {
-    for _ in 0..struct_map_len(rd, sig, zero_ots)? {
-        match go_msgp::read_key_bytes(rd)? {
+    let mut keys = go_msgp::struct_keys_with(rd, sig, zero_ots, "crypto.OneTimeSignature")?;
+    while let Some(key) = keys.next(rd)? {
+        match key {
             b"p" => fixed_into(rd, &mut sig.pk)?,
             b"p1s" => fixed_into(rd, &mut sig.pk1_sig)?,
             b"p2" => fixed_into(rd, &mut sig.pk2)?,
@@ -1094,8 +1094,14 @@ fn one_time_signature_into(rd: &mut &[u8], sig: &mut OneTimeSignature) -> GoResu
 
 /// `unauthenticatedVote` decoded into `vote`.
 fn vote_into(rd: &mut &[u8], vote: &mut UnauthenticatedVote) -> GoResult<()> {
-    for _ in 0..struct_map_len(rd, vote, UnauthenticatedVote::default)? {
-        match go_msgp::read_key_bytes(rd)? {
+    let mut keys = go_msgp::struct_keys_with(
+        rd,
+        vote,
+        UnauthenticatedVote::default,
+        "agreement.unauthenticatedVote",
+    )?;
+    while let Some(key) = keys.next(rd)? {
+        match key {
             b"cred" => credential_into(rd, &mut vote.cred)?,
             b"r" => raw_vote_into(rd, &mut vote.raw_vote)?,
             b"sig" => one_time_signature_into(rd, &mut vote.sig)?,
@@ -1107,8 +1113,14 @@ fn vote_into(rd: &mut &[u8], vote: &mut UnauthenticatedVote) -> GoResult<()> {
 
 /// `voteAuthenticator` decoded into `auth`.
 fn vote_authenticator_into(rd: &mut &[u8], auth: &mut VoteAuthenticator) -> GoResult<()> {
-    for _ in 0..struct_map_len(rd, auth, zero_vote_authenticator)? {
-        match go_msgp::read_key_bytes(rd)? {
+    let mut keys = go_msgp::struct_keys_with(
+        rd,
+        auth,
+        zero_vote_authenticator,
+        "agreement.voteAuthenticator",
+    )?;
+    while let Some(key) = keys.next(rd)? {
+        match key {
             b"cred" => credential_into(rd, &mut auth.cred)?,
             b"sig" => one_time_signature_into(rd, &mut auth.sig)?,
             b"snd" => fixed_into(rd, &mut auth.sender.0)?,
@@ -1125,8 +1137,14 @@ fn equivocation_vote_authenticator_into(
     rd: &mut &[u8],
     auth: &mut EquivocationVoteAuthenticator,
 ) -> GoResult<()> {
-    for _ in 0..struct_map_len(rd, auth, zero_equivocation_vote_authenticator)? {
-        match go_msgp::read_key_bytes(rd)? {
+    let mut keys = go_msgp::struct_keys_with(
+        rd,
+        auth,
+        zero_equivocation_vote_authenticator,
+        "agreement.equivocationVoteAuthenticator",
+    )?;
+    while let Some(key) = keys.next(rd)? {
+        match key {
             b"cred" => credential_into(rd, &mut auth.cred)?,
             b"props" => {
                 go_msgp::read_fixed_array_into(rd, &mut auth.proposals, proposal_value_into)?
@@ -1141,8 +1159,14 @@ fn equivocation_vote_authenticator_into(
 
 /// `unauthenticatedBundle` decoded into `bundle`.
 fn bundle_into(rd: &mut &[u8], bundle: &mut UnauthenticatedBundle) -> GoResult<()> {
-    for _ in 0..struct_map_len(rd, bundle, UnauthenticatedBundle::default)? {
-        match go_msgp::read_key_bytes(rd)? {
+    let mut keys = go_msgp::struct_keys_with(
+        rd,
+        bundle,
+        UnauthenticatedBundle::default,
+        "agreement.unauthenticatedBundle",
+    )?;
+    while let Some(key) = keys.next(rd)? {
+        match key {
             b"eqv" => {
                 go_msgp::read_slice_into(
                     rd,
@@ -1854,7 +1878,11 @@ pub fn decode_unauthenticated_proposal(
     // uproposal fixtures where round=0 omit that key via Go's
     // `omitempty`. Synthesize `rnd: 0` when the key is absent so the
     // block decoder can complete — round stays Round(0) either way.
-    let block = decode_block_allowing_missing_rnd(bytes, &[b"oper", b"oprop", b"sdpf"])?;
+    let block = decode_block_allowing_missing_rnd(
+        bytes,
+        "agreement.unauthenticatedProposal",
+        &[b"oper", b"oprop", b"sdpf"],
+    )?;
 
     // Step 2: the proposal's own fields.
     let mut proposal = UnauthenticatedProposal {
@@ -1879,9 +1907,10 @@ pub fn decode_unauthenticated_proposal(
 /// map would add per-packet CPU and amplify proposal-spam.
 fn decode_block_allowing_missing_rnd(
     bytes: &[u8],
+    go_type: &'static str,
     extra_keys: &[&[u8]],
 ) -> Result<Block, CodecError> {
-    let decode = |b: &[u8]| Block::decode_with_extra_keys(&mut &b[..], extra_keys);
+    let decode = |b: &[u8]| Block::decode_as(&mut &b[..], go_type, extra_keys);
     match decode(bytes) {
         Ok(block) => Ok(block),
         Err(first_err) => {
