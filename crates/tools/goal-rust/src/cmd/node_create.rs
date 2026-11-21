@@ -150,7 +150,7 @@ fn config_text(cfg: &algo_config::Local, net_address: &str, full: bool) -> Resul
     use serde::Serialize as _;
     let mut buf = Vec::new();
     {
-        let fmt = serde_json::ser::PrettyFormatter::with_indent(b"	");
+        let fmt = serde_json::ser::PrettyFormatter::with_indent(b"\t");
         let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
         cfg.serialize(&mut ser).map_err(|e| e.to_string())?;
     }
@@ -159,15 +159,13 @@ fn config_text(cfg: &algo_config::Local, net_address: &str, full: bool) -> Resul
     let mut lines: Vec<String> = Vec::new();
     for line in text.lines() {
         lines.push(line.to_string());
-        if line.starts_with("	\"GossipFanout\":") {
+        if line.starts_with("\t\"GossipFanout\":") {
             let net = serde_json::to_string(net_address).map_err(|e| e.to_string())?;
-            lines.push(format!("	\"NetAddress\": {net},"));
+            lines.push(format!("\t\"NetAddress\": {net},"));
         }
     }
     if full {
-        return Ok(lines.join("
-") + "
-");
+        return Ok(lines.join("\n") + "\n");
     }
     let value_of = |c: &algo_config::Local, net: &str| -> Result<serde_json::Value, String> {
         let mut v = serde_json::to_value(c).map_err(|e| e.to_string())?;
@@ -198,9 +196,10 @@ fn config_text(cfg: &algo_config::Local, net_address: &str, full: bool) -> Resul
             kept[i].pop();
         }
     }
-    Ok(kept.join("
-").trim_end_matches(['', '
-', ' ']).to_string())
+    Ok(kept
+        .join("\n")
+        .trim_end_matches(['\r', '\n', ' '])
+        .to_string())
 }
 
 /// go's `os.MkdirAll(path, perm)`: every missing component gets `perm`.
