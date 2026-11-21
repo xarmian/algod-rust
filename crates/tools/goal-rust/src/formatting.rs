@@ -281,12 +281,10 @@ macro_rules! print_raw {
     };
 }
 
-/// [`print_raw!`] and a newline (go's `fmt.Println` / `Printf("...
-")`).
+/// [`print_raw!`] and a newline (go's `fmt.Println`).
 #[macro_export]
 macro_rules! println_raw {
     ($($arg:tt)*) => {
-        $crate::formatting::print_raw(&format!("{}
-", format!($($arg)*)))
+        $crate::formatting::print_raw(&format!("{}\n", format!($($arg)*)))
     };
 }

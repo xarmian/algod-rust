@@ -92,15 +92,15 @@ fn go_printed(v: &serde_json::Value) -> serde_json::Value {
 /// go's `goal` prints them unfiltered (issue #2506).
 #[test]
 fn decoded_strings_keep_their_bytes() {
-    let body = b"{\"genesis_id\":\"aÿbâ\",\"versions\":[\"Ã(\"]}";
+    let body = b"{\"genesis_id\":\"a\xffb\x01\xe2\x82\",\"versions\":[\"\xc3\x28\"]}";
     let v = decode(body, &VERSION).expect("decodes");
     assert_eq!(
         algo_types::raw_text::decode(v["genesis_id"].as_str().unwrap()).as_ref(),
-        b"aÿbâ"
+        b"a\xffb\x01\xe2\x82"
     );
     assert_eq!(
         algo_types::raw_text::decode(v["versions"][0].as_str().unwrap()).as_ref(),
-        b"Ã("
+        b"\xc3\x28"
     );
     // valid text is unchanged
     let v = decode(br#"{"genesis_id":"main-v1.0"}"#, &VERSION).expect("decodes");
