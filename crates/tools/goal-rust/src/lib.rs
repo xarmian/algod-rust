@@ -324,10 +324,9 @@ pub fn run() -> ExitCode {
         return cmd::info::run_version_check();
     }
     let Some(command) = cli.command else {
-        let mut cmd = <Cli as clap::CommandFactory>::command();
-        let _ = cmd.print_help();
-        println!();
-        return ExitCode::SUCCESS;
+        // go's root `Run`: "If no arguments passed, we should fallback to
+        // help" (`cmd.HelpFunc()(cmd, args)`).
+        return print_group_help(&[]);
     };
     match command {
         RootCommand::Account { cmd: Some(c), .. } => groups::account::run(c),

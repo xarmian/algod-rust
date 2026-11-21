@@ -1,3 +1,16 @@
+{"args":["--help"],"code":0,"stderr":"","stdout":"<help of \"\">"}
+{"args":["-h"],"code":0,"stderr":"","stdout":"<help of \"\">"}
+{"args":["--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"\">\n","stdout":"unknown flag: --nosuchflag\n"}
+{"args":["-%"],"code":1,"stderr":"Error: unknown shorthand flag: '%' in -%\n<usage of \"\">\n","stdout":"unknown shorthand flag: '%' in -%\n"}
+{"args":["--version=maybe"],"code":1,"stderr":"Error: invalid argument \"maybe\" for \"-v, --version\" flag: strconv.ParseBool: parsing \"maybe\": invalid syntax\n<usage of \"\">\n","stdout":"invalid argument \"maybe\" for \"-v, --version\" flag: strconv.ParseBool: parsing \"maybe\": invalid syntax\n"}
+{"args":["--version="],"code":1,"stderr":"Error: invalid argument \"\" for \"-v, --version\" flag: strconv.ParseBool: parsing \"\": invalid syntax\n<usage of \"\">\n","stdout":"invalid argument \"\" for \"-v, --version\" flag: strconv.ParseBool: parsing \"\": invalid syntax\n"}
+{"args":["--datadir"],"code":1,"stderr":"Error: flag needs an argument: --datadir\n<usage of \"\">\n","stdout":"flag needs an argument: --datadir\n"}
+{"args":["-d"],"code":1,"stderr":"Error: flag needs an argument: 'd' in -d\n<usage of \"\">\n","stdout":"flag needs an argument: 'd' in -d\n"}
+{"args":["--kmddir"],"code":1,"stderr":"Error: flag needs an argument: --kmddir\n<usage of \"\">\n","stdout":"flag needs an argument: --kmddir\n"}
+{"args":["-k"],"code":1,"stderr":"Error: flag needs an argument: 'k' in -k\n<usage of \"\">\n","stdout":"flag needs an argument: 'k' in -k\n"}
+{"args":["a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal\"\n<usage of \"\">\n","stdout":"unknown command \"a1\" for \"goal\"\n"}
+{"args":["a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal\"\n<usage of \"\">\n","stdout":"unknown command \"a1\" for \"goal\"\n"}
+{"args":["a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal\"\n<usage of \"\">\n","stdout":"unknown command \"a1\" for \"goal\"\n"}
 {"args":["account","--help"],"code":0,"stderr":"","stdout":"<help of \"account\">"}
 {"args":["account","-h"],"code":0,"stderr":"","stdout":"<help of \"account\">"}
 {"args":["account","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"account\">\n","stdout":"unknown flag: --nosuchflag\n"}
@@ -1627,6 +1640,71 @@
 {"args":["clerk","tealsign","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal clerk tealsign\"\n<usage of \"clerk tealsign\">\n","stdout":"unknown command \"a1\" for \"goal clerk tealsign\"\n"}
 {"args":["clerk","tealsign","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal clerk tealsign\"\n<usage of \"clerk tealsign\">\n","stdout":"unknown command \"a1\" for \"goal clerk tealsign\"\n"}
 {"args":["clerk","tealsign","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal clerk tealsign\"\n<usage of \"clerk tealsign\">\n","stdout":"unknown command \"a1\" for \"goal clerk tealsign\"\n"}
+{"args":["completion","--help"],"code":0,"stderr":"","stdout":"<help of \"completion\">"}
+{"args":["completion","-h"],"code":0,"stderr":"","stdout":"<help of \"completion\">"}
+{"args":["completion","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"completion\">\n","stdout":"unknown flag: --nosuchflag\n"}
+{"args":["completion","-%"],"code":1,"stderr":"Error: unknown shorthand flag: '%' in -%\n<usage of \"completion\">\n","stdout":"unknown shorthand flag: '%' in -%\n"}
+{"args":["completion","--datadir"],"code":1,"stderr":"Error: flag needs an argument: --datadir\n<usage of \"completion\">\n","stdout":"flag needs an argument: --datadir\n"}
+{"args":["completion","-d"],"code":1,"stderr":"Error: flag needs an argument: 'd' in -d\n<usage of \"completion\">\n","stdout":"flag needs an argument: 'd' in -d\n"}
+{"args":["completion","--kmddir"],"code":1,"stderr":"Error: flag needs an argument: --kmddir\n<usage of \"completion\">\n","stdout":"flag needs an argument: --kmddir\n"}
+{"args":["completion","-k"],"code":1,"stderr":"Error: flag needs an argument: 'k' in -k\n<usage of \"completion\">\n","stdout":"flag needs an argument: 'k' in -k\n"}
+{"args":["completion","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal completion\"\n<usage of \"completion\">\n","stdout":"unknown command \"a1\" for \"goal completion\"\n"}
+{"args":["completion","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal completion\"\n<usage of \"completion\">\n","stdout":"unknown command \"a1\" for \"goal completion\"\n"}
+{"args":["completion","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal completion\"\n<usage of \"completion\">\n","stdout":"unknown command \"a1\" for \"goal completion\"\n"}
+{"args":["completion","bash","--help"],"code":0,"stderr":"","stdout":"<help of \"completion bash\">"}
+{"args":["completion","bash","-h"],"code":0,"stderr":"","stdout":"<help of \"completion bash\">"}
+{"args":["completion","bash","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"completion bash\">\n","stdout":"unknown flag: --nosuchflag\n"}
+{"args":["completion","bash","-%"],"code":1,"stderr":"Error: unknown shorthand flag: '%' in -%\n<usage of \"completion bash\">\n","stdout":"unknown shorthand flag: '%' in -%\n"}
+{"args":["completion","bash","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal completion bash\"\n<usage of \"completion bash\">\n","stdout":"unknown command \"a1\" for \"goal completion bash\"\n"}
+{"args":["completion","bash","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal completion bash\"\n<usage of \"completion bash\">\n","stdout":"unknown command \"a1\" for \"goal completion bash\"\n"}
+{"args":["completion","bash","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal completion bash\"\n<usage of \"completion bash\">\n","stdout":"unknown command \"a1\" for \"goal completion bash\"\n"}
+{"args":["completion","zsh","--help"],"code":0,"stderr":"","stdout":"<help of \"completion zsh\">"}
+{"args":["completion","zsh","-h"],"code":0,"stderr":"","stdout":"<help of \"completion zsh\">"}
+{"args":["completion","zsh","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"completion zsh\">\n","stdout":"unknown flag: --nosuchflag\n"}
+{"args":["completion","zsh","-%"],"code":1,"stderr":"Error: unknown shorthand flag: '%' in -%\n<usage of \"completion zsh\">\n","stdout":"unknown shorthand flag: '%' in -%\n"}
+{"args":["completion","zsh","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal completion zsh\"\n<usage of \"completion zsh\">\n","stdout":"unknown command \"a1\" for \"goal completion zsh\"\n"}
+{"args":["completion","zsh","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal completion zsh\"\n<usage of \"completion zsh\">\n","stdout":"unknown command \"a1\" for \"goal completion zsh\"\n"}
+{"args":["completion","zsh","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal completion zsh\"\n<usage of \"completion zsh\">\n","stdout":"unknown command \"a1\" for \"goal completion zsh\"\n"}
+{"args":["help","--help"],"code":0,"stderr":"","stdout":"<help of \"help\">"}
+{"args":["help","-h"],"code":0,"stderr":"","stdout":"<help of \"help\">"}
+{"args":["help","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"help\">\n","stdout":"unknown flag: --nosuchflag\n"}
+{"args":["help","-%"],"code":1,"stderr":"Error: unknown shorthand flag: '%' in -%\n<usage of \"help\">\n","stdout":"unknown shorthand flag: '%' in -%\n"}
+{"args":["help","--datadir"],"code":1,"stderr":"Error: flag needs an argument: --datadir\n<usage of \"help\">\n","stdout":"flag needs an argument: --datadir\n"}
+{"args":["help","-d"],"code":1,"stderr":"Error: flag needs an argument: 'd' in -d\n<usage of \"help\">\n","stdout":"flag needs an argument: 'd' in -d\n"}
+{"args":["help","--kmddir"],"code":1,"stderr":"Error: flag needs an argument: --kmddir\n<usage of \"help\">\n","stdout":"flag needs an argument: --kmddir\n"}
+{"args":["help","-k"],"code":1,"stderr":"Error: flag needs an argument: 'k' in -k\n<usage of \"help\">\n","stdout":"flag needs an argument: 'k' in -k\n"}
+{"args":["kmd","--help"],"code":0,"stderr":"","stdout":"<help of \"kmd\">"}
+{"args":["kmd","-h"],"code":0,"stderr":"","stdout":"<help of \"kmd\">"}
+{"args":["kmd","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"kmd\">\n","stdout":"unknown flag: --nosuchflag\n"}
+{"args":["kmd","-%"],"code":1,"stderr":"Error: unknown shorthand flag: '%' in -%\n<usage of \"kmd\">\n","stdout":"unknown shorthand flag: '%' in -%\n"}
+{"args":["kmd","--datadir"],"code":1,"stderr":"Error: flag needs an argument: --datadir\n<usage of \"kmd\">\n","stdout":"flag needs an argument: --datadir\n"}
+{"args":["kmd","-d"],"code":1,"stderr":"Error: flag needs an argument: 'd' in -d\n<usage of \"kmd\">\n","stdout":"flag needs an argument: 'd' in -d\n"}
+{"args":["kmd","--kmddir"],"code":1,"stderr":"Error: flag needs an argument: --kmddir\n<usage of \"kmd\">\n","stdout":"flag needs an argument: --kmddir\n"}
+{"args":["kmd","-k"],"code":1,"stderr":"Error: flag needs an argument: 'k' in -k\n<usage of \"kmd\">\n","stdout":"flag needs an argument: 'k' in -k\n"}
+{"args":["kmd","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal kmd\"\n<usage of \"kmd\">\n","stdout":"unknown command \"a1\" for \"goal kmd\"\n"}
+{"args":["kmd","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal kmd\"\n<usage of \"kmd\">\n","stdout":"unknown command \"a1\" for \"goal kmd\"\n"}
+{"args":["kmd","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal kmd\"\n<usage of \"kmd\">\n","stdout":"unknown command \"a1\" for \"goal kmd\"\n"}
+{"args":["kmd","start","--help"],"code":0,"stderr":"","stdout":"<help of \"kmd start\">"}
+{"args":["kmd","start","-h"],"code":0,"stderr":"","stdout":"<help of \"kmd start\">"}
+{"args":["kmd","start","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"kmd start\">\n","stdout":"unknown flag: --nosuchflag\n"}
+{"args":["kmd","start","-%"],"code":1,"stderr":"Error: unknown shorthand flag: '%' in -%\n<usage of \"kmd start\">\n","stdout":"unknown shorthand flag: '%' in -%\n"}
+{"args":["kmd","start","--timeout"],"code":1,"stderr":"Error: flag needs an argument: --timeout\n<usage of \"kmd start\">\n","stdout":"flag needs an argument: --timeout\n"}
+{"args":["kmd","start","-t"],"code":1,"stderr":"Error: flag needs an argument: 't' in -t\n<usage of \"kmd start\">\n","stdout":"flag needs an argument: 't' in -t\n"}
+{"args":["kmd","start","--timeout=x"],"code":1,"stderr":"Error: invalid argument \"x\" for \"-t, --timeout\" flag: strconv.ParseUint: parsing \"x\": invalid syntax\n<usage of \"kmd start\">\n","stdout":"invalid argument \"x\" for \"-t, --timeout\" flag: strconv.ParseUint: parsing \"x\": invalid syntax\n"}
+{"args":["kmd","start","-t","x"],"code":1,"stderr":"Error: invalid argument \"x\" for \"-t, --timeout\" flag: strconv.ParseUint: parsing \"x\": invalid syntax\n<usage of \"kmd start\">\n","stdout":"invalid argument \"x\" for \"-t, --timeout\" flag: strconv.ParseUint: parsing \"x\": invalid syntax\n"}
+{"args":["kmd","start","--timeout=-1"],"code":1,"stderr":"Error: invalid argument \"-1\" for \"-t, --timeout\" flag: strconv.ParseUint: parsing \"-1\": invalid syntax\n<usage of \"kmd start\">\n","stdout":"invalid argument \"-1\" for \"-t, --timeout\" flag: strconv.ParseUint: parsing \"-1\": invalid syntax\n"}
+{"args":["kmd","start","--timeout=18446744073709551616"],"code":1,"stderr":"Error: invalid argument \"18446744073709551616\" for \"-t, --timeout\" flag: strconv.ParseUint: parsing \"18446744073709551616\": value out of range\n<usage of \"kmd start\">\n","stdout":"invalid argument \"18446744073709551616\" for \"-t, --timeout\" flag: strconv.ParseUint: parsing \"18446744073709551616\": value out of range\n"}
+{"args":["kmd","start","--timeout=1__0"],"code":1,"stderr":"Error: invalid argument \"1__0\" for \"-t, --timeout\" flag: strconv.ParseUint: parsing \"1__0\": invalid syntax\n<usage of \"kmd start\">\n","stdout":"invalid argument \"1__0\" for \"-t, --timeout\" flag: strconv.ParseUint: parsing \"1__0\": invalid syntax\n"}
+{"args":["kmd","start","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal kmd start\"\n<usage of \"kmd start\">\n","stdout":"unknown command \"a1\" for \"goal kmd start\"\n"}
+{"args":["kmd","start","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal kmd start\"\n<usage of \"kmd start\">\n","stdout":"unknown command \"a1\" for \"goal kmd start\"\n"}
+{"args":["kmd","start","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal kmd start\"\n<usage of \"kmd start\">\n","stdout":"unknown command \"a1\" for \"goal kmd start\"\n"}
+{"args":["kmd","stop","--help"],"code":0,"stderr":"","stdout":"<help of \"kmd stop\">"}
+{"args":["kmd","stop","-h"],"code":0,"stderr":"","stdout":"<help of \"kmd stop\">"}
+{"args":["kmd","stop","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"kmd stop\">\n","stdout":"unknown flag: --nosuchflag\n"}
+{"args":["kmd","stop","-%"],"code":1,"stderr":"Error: unknown shorthand flag: '%' in -%\n<usage of \"kmd stop\">\n","stdout":"unknown shorthand flag: '%' in -%\n"}
+{"args":["kmd","stop","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal kmd stop\"\n<usage of \"kmd stop\">\n","stdout":"unknown command \"a1\" for \"goal kmd stop\"\n"}
+{"args":["kmd","stop","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal kmd stop\"\n<usage of \"kmd stop\">\n","stdout":"unknown command \"a1\" for \"goal kmd stop\"\n"}
+{"args":["kmd","stop","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal kmd stop\"\n<usage of \"kmd stop\">\n","stdout":"unknown command \"a1\" for \"goal kmd stop\"\n"}
 {"args":["ledger","--help"],"code":0,"stderr":"","stdout":"<help of \"ledger\">"}
 {"args":["ledger","-h"],"code":0,"stderr":"","stdout":"<help of \"ledger\">"}
 {"args":["ledger","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"ledger\">\n","stdout":"unknown flag: --nosuchflag\n"}
@@ -1660,6 +1738,100 @@
 {"args":["ledger","supply","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal ledger supply\"\n<usage of \"ledger supply\">\n","stdout":"unknown command \"a1\" for \"goal ledger supply\"\n"}
 {"args":["ledger","supply","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal ledger supply\"\n<usage of \"ledger supply\">\n","stdout":"unknown command \"a1\" for \"goal ledger supply\"\n"}
 {"args":["ledger","supply","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal ledger supply\"\n<usage of \"ledger supply\">\n","stdout":"unknown command \"a1\" for \"goal ledger supply\"\n"}
+{"args":["license","--help"],"code":0,"stderr":"","stdout":"<help of \"license\">"}
+{"args":["license","-h"],"code":0,"stderr":"","stdout":"<help of \"license\">"}
+{"args":["license","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"license\">\n","stdout":"unknown flag: --nosuchflag\n"}
+{"args":["license","-%"],"code":1,"stderr":"Error: unknown shorthand flag: '%' in -%\n<usage of \"license\">\n","stdout":"unknown shorthand flag: '%' in -%\n"}
+{"args":["license","--datadir"],"code":1,"stderr":"Error: flag needs an argument: --datadir\n<usage of \"license\">\n","stdout":"flag needs an argument: --datadir\n"}
+{"args":["license","-d"],"code":1,"stderr":"Error: flag needs an argument: 'd' in -d\n<usage of \"license\">\n","stdout":"flag needs an argument: 'd' in -d\n"}
+{"args":["license","--kmddir"],"code":1,"stderr":"Error: flag needs an argument: --kmddir\n<usage of \"license\">\n","stdout":"flag needs an argument: --kmddir\n"}
+{"args":["license","-k"],"code":1,"stderr":"Error: flag needs an argument: 'k' in -k\n<usage of \"license\">\n","stdout":"flag needs an argument: 'k' in -k\n"}
+{"args":["license","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal license\"\n<usage of \"license\">\n","stdout":"unknown command \"a1\" for \"goal license\"\n"}
+{"args":["license","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal license\"\n<usage of \"license\">\n","stdout":"unknown command \"a1\" for \"goal license\"\n"}
+{"args":["license","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal license\"\n<usage of \"license\">\n","stdout":"unknown command \"a1\" for \"goal license\"\n"}
+{"args":["network","--help"],"code":0,"stderr":"","stdout":"<help of \"network\">"}
+{"args":["network","-h"],"code":0,"stderr":"","stdout":"<help of \"network\">"}
+{"args":["network","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"network\">\n","stdout":"unknown flag: --nosuchflag\n"}
+{"args":["network","-%"],"code":1,"stderr":"Error: unknown shorthand flag: '%' in -%\n<usage of \"network\">\n","stdout":"unknown shorthand flag: '%' in -%\n"}
+{"args":["network","--rootdir"],"code":1,"stderr":"Error: flag needs an argument: --rootdir\n<usage of \"network\">\n","stdout":"flag needs an argument: --rootdir\n"}
+{"args":["network","-r"],"code":1,"stderr":"Error: flag needs an argument: 'r' in -r\n<usage of \"network\">\n","stdout":"flag needs an argument: 'r' in -r\n"}
+{"args":["network","--datadir"],"code":1,"stderr":"Error: flag needs an argument: --datadir\n<usage of \"network\">\n","stdout":"flag needs an argument: --datadir\n"}
+{"args":["network","-d"],"code":1,"stderr":"Error: flag needs an argument: 'd' in -d\n<usage of \"network\">\n","stdout":"flag needs an argument: 'd' in -d\n"}
+{"args":["network","--kmddir"],"code":1,"stderr":"Error: flag needs an argument: --kmddir\n<usage of \"network\">\n","stdout":"flag needs an argument: --kmddir\n"}
+{"args":["network","-k"],"code":1,"stderr":"Error: flag needs an argument: 'k' in -k\n<usage of \"network\">\n","stdout":"flag needs an argument: 'k' in -k\n"}
+{"args":["network","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network\"\n<usage of \"network\">\n","stdout":"unknown command \"a1\" for \"goal network\"\n"}
+{"args":["network","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network\"\n<usage of \"network\">\n","stdout":"unknown command \"a1\" for \"goal network\"\n"}
+{"args":["network","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network\"\n<usage of \"network\">\n","stdout":"unknown command \"a1\" for \"goal network\"\n"}
+{"args":["network","create","--help"],"code":0,"stderr":"","stdout":"<help of \"network create\">"}
+{"args":["network","create","-h"],"code":0,"stderr":"","stdout":"<help of \"network create\">"}
+{"args":["network","create","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"network create\">\n","stdout":"unknown flag: --nosuchflag\n"}
+{"args":["network","create","-%"],"code":1,"stderr":"Error: unknown shorthand flag: '%' in -%\n<usage of \"network create\">\n","stdout":"unknown shorthand flag: '%' in -%\n"}
+{"args":["network","create","--devMode=maybe"],"code":1,"stderr":"Error: invalid argument \"maybe\" for \"--devMode\" flag: strconv.ParseBool: parsing \"maybe\": invalid syntax\n<usage of \"network create\">\n","stdout":"invalid argument \"maybe\" for \"--devMode\" flag: strconv.ParseBool: parsing \"maybe\": invalid syntax\n"}
+{"args":["network","create","--devMode="],"code":1,"stderr":"Error: invalid argument \"\" for \"--devMode\" flag: strconv.ParseBool: parsing \"\": invalid syntax\n<usage of \"network create\">\n","stdout":"invalid argument \"\" for \"--devMode\" flag: strconv.ParseBool: parsing \"\": invalid syntax\n"}
+{"args":["network","create","--network"],"code":1,"stderr":"Error: flag needs an argument: --network\n<usage of \"network create\">\n","stdout":"flag needs an argument: --network\n"}
+{"args":["network","create","-n"],"code":1,"stderr":"Error: flag needs an argument: 'n' in -n\n<usage of \"network create\">\n","stdout":"flag needs an argument: 'n' in -n\n"}
+{"args":["network","create","--noclean=maybe"],"code":1,"stderr":"Error: invalid argument \"maybe\" for \"--noclean\" flag: strconv.ParseBool: parsing \"maybe\": invalid syntax\n<usage of \"network create\">\n","stdout":"invalid argument \"maybe\" for \"--noclean\" flag: strconv.ParseBool: parsing \"maybe\": invalid syntax\n"}
+{"args":["network","create","--noclean="],"code":1,"stderr":"Error: invalid argument \"\" for \"--noclean\" flag: strconv.ParseBool: parsing \"\": invalid syntax\n<usage of \"network create\">\n","stdout":"invalid argument \"\" for \"--noclean\" flag: strconv.ParseBool: parsing \"\": invalid syntax\n"}
+{"args":["network","create","--noimportkeys=maybe"],"code":1,"stderr":"Error: invalid argument \"maybe\" for \"-K, --noimportkeys\" flag: strconv.ParseBool: parsing \"maybe\": invalid syntax\n<usage of \"network create\">\n","stdout":"invalid argument \"maybe\" for \"-K, --noimportkeys\" flag: strconv.ParseBool: parsing \"maybe\": invalid syntax\n"}
+{"args":["network","create","--noimportkeys="],"code":1,"stderr":"Error: invalid argument \"\" for \"-K, --noimportkeys\" flag: strconv.ParseBool: parsing \"\": invalid syntax\n<usage of \"network create\">\n","stdout":"invalid argument \"\" for \"-K, --noimportkeys\" flag: strconv.ParseBool: parsing \"\": invalid syntax\n"}
+{"args":["network","create","--pregendir"],"code":1,"stderr":"Error: flag needs an argument: --pregendir\n<usage of \"network create\">\n","stdout":"flag needs an argument: --pregendir\n"}
+{"args":["network","create","-p"],"code":1,"stderr":"Error: flag needs an argument: 'p' in -p\n<usage of \"network create\">\n","stdout":"flag needs an argument: 'p' in -p\n"}
+{"args":["network","create","--start=maybe"],"code":1,"stderr":"Error: invalid argument \"maybe\" for \"-s, --start\" flag: strconv.ParseBool: parsing \"maybe\": invalid syntax\n<usage of \"network create\">\n","stdout":"invalid argument \"maybe\" for \"-s, --start\" flag: strconv.ParseBool: parsing \"maybe\": invalid syntax\n"}
+{"args":["network","create","--start="],"code":1,"stderr":"Error: invalid argument \"\" for \"-s, --start\" flag: strconv.ParseBool: parsing \"\": invalid syntax\n<usage of \"network create\">\n","stdout":"invalid argument \"\" for \"-s, --start\" flag: strconv.ParseBool: parsing \"\": invalid syntax\n"}
+{"args":["network","create","--template"],"code":1,"stderr":"Error: flag needs an argument: --template\n<usage of \"network create\">\n","stdout":"flag needs an argument: --template\n"}
+{"args":["network","create","-t"],"code":1,"stderr":"Error: flag needs an argument: 't' in -t\n<usage of \"network create\">\n","stdout":"flag needs an argument: 't' in -t\n"}
+{"args":["network","create","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network create\"\n<usage of \"network create\">\n","stdout":"unknown command \"a1\" for \"goal network create\"\n"}
+{"args":["network","create","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network create\"\n<usage of \"network create\">\n","stdout":"unknown command \"a1\" for \"goal network create\"\n"}
+{"args":["network","create","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network create\"\n<usage of \"network create\">\n","stdout":"unknown command \"a1\" for \"goal network create\"\n"}
+{"args":["network","delete","--help"],"code":0,"stderr":"","stdout":"<help of \"network delete\">"}
+{"args":["network","delete","-h"],"code":0,"stderr":"","stdout":"<help of \"network delete\">"}
+{"args":["network","delete","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"network delete\">\n","stdout":"unknown flag: --nosuchflag\n"}
+{"args":["network","delete","-%"],"code":1,"stderr":"Error: unknown shorthand flag: '%' in -%\n<usage of \"network delete\">\n","stdout":"unknown shorthand flag: '%' in -%\n"}
+{"args":["network","delete","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network delete\"\n<usage of \"network delete\">\n","stdout":"unknown command \"a1\" for \"goal network delete\"\n"}
+{"args":["network","delete","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network delete\"\n<usage of \"network delete\">\n","stdout":"unknown command \"a1\" for \"goal network delete\"\n"}
+{"args":["network","delete","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network delete\"\n<usage of \"network delete\">\n","stdout":"unknown command \"a1\" for \"goal network delete\"\n"}
+{"args":["network","pregen","--help"],"code":0,"stderr":"","stdout":"<help of \"network pregen\">"}
+{"args":["network","pregen","-h"],"code":0,"stderr":"","stdout":"<help of \"network pregen\">"}
+{"args":["network","pregen","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"network pregen\">\n","stdout":"unknown flag: --nosuchflag\n"}
+{"args":["network","pregen","-%"],"code":1,"stderr":"Error: unknown shorthand flag: '%' in -%\n<usage of \"network pregen\">\n","stdout":"unknown shorthand flag: '%' in -%\n"}
+{"args":["network","pregen","--pregendir"],"code":1,"stderr":"Error: flag needs an argument: --pregendir\n<usage of \"network pregen\">\n","stdout":"flag needs an argument: --pregendir\n"}
+{"args":["network","pregen","-p"],"code":1,"stderr":"Error: flag needs an argument: 'p' in -p\n<usage of \"network pregen\">\n","stdout":"flag needs an argument: 'p' in -p\n"}
+{"args":["network","pregen","--template"],"code":1,"stderr":"Error: flag needs an argument: --template\n<usage of \"network pregen\">\n","stdout":"flag needs an argument: --template\n"}
+{"args":["network","pregen","-t"],"code":1,"stderr":"Error: flag needs an argument: 't' in -t\n<usage of \"network pregen\">\n","stdout":"flag needs an argument: 't' in -t\n"}
+{"args":["network","pregen","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network pregen\"\n<usage of \"network pregen\">\n","stdout":"unknown command \"a1\" for \"goal network pregen\"\n"}
+{"args":["network","pregen","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network pregen\"\n<usage of \"network pregen\">\n","stdout":"unknown command \"a1\" for \"goal network pregen\"\n"}
+{"args":["network","pregen","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network pregen\"\n<usage of \"network pregen\">\n","stdout":"unknown command \"a1\" for \"goal network pregen\"\n"}
+{"args":["network","pregen"],"code":1,"stderr":"Error: required flag(s) \"pregendir\" not set\n<usage of \"network pregen\">\n","stdout":"required flag(s) \"pregendir\" not set\n"}
+{"args":["network","restart","--help"],"code":0,"stderr":"","stdout":"<help of \"network restart\">"}
+{"args":["network","restart","-h"],"code":0,"stderr":"","stdout":"<help of \"network restart\">"}
+{"args":["network","restart","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"network restart\">\n","stdout":"unknown flag: --nosuchflag\n"}
+{"args":["network","restart","-%"],"code":1,"stderr":"Error: unknown shorthand flag: '%' in -%\n<usage of \"network restart\">\n","stdout":"unknown shorthand flag: '%' in -%\n"}
+{"args":["network","restart","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network restart\"\n<usage of \"network restart\">\n","stdout":"unknown command \"a1\" for \"goal network restart\"\n"}
+{"args":["network","restart","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network restart\"\n<usage of \"network restart\">\n","stdout":"unknown command \"a1\" for \"goal network restart\"\n"}
+{"args":["network","restart","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network restart\"\n<usage of \"network restart\">\n","stdout":"unknown command \"a1\" for \"goal network restart\"\n"}
+{"args":["network","start","--help"],"code":0,"stderr":"","stdout":"<help of \"network start\">"}
+{"args":["network","start","-h"],"code":0,"stderr":"","stdout":"<help of \"network start\">"}
+{"args":["network","start","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"network start\">\n","stdout":"unknown flag: --nosuchflag\n"}
+{"args":["network","start","-%"],"code":1,"stderr":"Error: unknown shorthand flag: '%' in -%\n<usage of \"network start\">\n","stdout":"unknown shorthand flag: '%' in -%\n"}
+{"args":["network","start","--node"],"code":1,"stderr":"Error: flag needs an argument: --node\n<usage of \"network start\">\n","stdout":"flag needs an argument: --node\n"}
+{"args":["network","start","-n"],"code":1,"stderr":"Error: flag needs an argument: 'n' in -n\n<usage of \"network start\">\n","stdout":"flag needs an argument: 'n' in -n\n"}
+{"args":["network","start","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network start\"\n<usage of \"network start\">\n","stdout":"unknown command \"a1\" for \"goal network start\"\n"}
+{"args":["network","start","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network start\"\n<usage of \"network start\">\n","stdout":"unknown command \"a1\" for \"goal network start\"\n"}
+{"args":["network","start","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network start\"\n<usage of \"network start\">\n","stdout":"unknown command \"a1\" for \"goal network start\"\n"}
+{"args":["network","status","--help"],"code":0,"stderr":"","stdout":"<help of \"network status\">"}
+{"args":["network","status","-h"],"code":0,"stderr":"","stdout":"<help of \"network status\">"}
+{"args":["network","status","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"network status\">\n","stdout":"unknown flag: --nosuchflag\n"}
+{"args":["network","status","-%"],"code":1,"stderr":"Error: unknown shorthand flag: '%' in -%\n<usage of \"network status\">\n","stdout":"unknown shorthand flag: '%' in -%\n"}
+{"args":["network","status","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network status\"\n<usage of \"network status\">\n","stdout":"unknown command \"a1\" for \"goal network status\"\n"}
+{"args":["network","status","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network status\"\n<usage of \"network status\">\n","stdout":"unknown command \"a1\" for \"goal network status\"\n"}
+{"args":["network","status","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network status\"\n<usage of \"network status\">\n","stdout":"unknown command \"a1\" for \"goal network status\"\n"}
+{"args":["network","stop","--help"],"code":0,"stderr":"","stdout":"<help of \"network stop\">"}
+{"args":["network","stop","-h"],"code":0,"stderr":"","stdout":"<help of \"network stop\">"}
+{"args":["network","stop","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"network stop\">\n","stdout":"unknown flag: --nosuchflag\n"}
+{"args":["network","stop","-%"],"code":1,"stderr":"Error: unknown shorthand flag: '%' in -%\n<usage of \"network stop\">\n","stdout":"unknown shorthand flag: '%' in -%\n"}
+{"args":["network","stop","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network stop\"\n<usage of \"network stop\">\n","stdout":"unknown command \"a1\" for \"goal network stop\"\n"}
+{"args":["network","stop","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network stop\"\n<usage of \"network stop\">\n","stdout":"unknown command \"a1\" for \"goal network stop\"\n"}
+{"args":["network","stop","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal network stop\"\n<usage of \"network stop\">\n","stdout":"unknown command \"a1\" for \"goal network stop\"\n"}
 {"args":["node","--help"],"code":0,"stderr":"","stdout":"<help of \"node\">"}
 {"args":["node","-h"],"code":0,"stderr":"","stdout":"<help of \"node\">"}
 {"args":["node","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"node\">\n","stdout":"unknown flag: --nosuchflag\n"}
@@ -1823,6 +1995,41 @@
 {"args":["node","wait","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal node wait\"\n<usage of \"node wait\">\n","stdout":"unknown command \"a1\" for \"goal node wait\"\n"}
 {"args":["node","wait","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal node wait\"\n<usage of \"node wait\">\n","stdout":"unknown command \"a1\" for \"goal node wait\"\n"}
 {"args":["node","wait","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal node wait\"\n<usage of \"node wait\">\n","stdout":"unknown command \"a1\" for \"goal node wait\"\n"}
+{"args":["protocols","--help"],"code":0,"stderr":"","stdout":"<help of \"protocols\">"}
+{"args":["protocols","-h"],"code":0,"stderr":"","stdout":"<help of \"protocols\">"}
+{"args":["protocols","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"protocols\">\n","stdout":"unknown flag: --nosuchflag\n"}
+{"args":["protocols","-%"],"code":1,"stderr":"Error: unknown shorthand flag: '%' in -%\n<usage of \"protocols\">\n","stdout":"unknown shorthand flag: '%' in -%\n"}
+{"args":["protocols","--datadir"],"code":1,"stderr":"Error: flag needs an argument: --datadir\n<usage of \"protocols\">\n","stdout":"flag needs an argument: --datadir\n"}
+{"args":["protocols","-d"],"code":1,"stderr":"Error: flag needs an argument: 'd' in -d\n<usage of \"protocols\">\n","stdout":"flag needs an argument: 'd' in -d\n"}
+{"args":["protocols","--kmddir"],"code":1,"stderr":"Error: flag needs an argument: --kmddir\n<usage of \"protocols\">\n","stdout":"flag needs an argument: --kmddir\n"}
+{"args":["protocols","-k"],"code":1,"stderr":"Error: flag needs an argument: 'k' in -k\n<usage of \"protocols\">\n","stdout":"flag needs an argument: 'k' in -k\n"}
+{"args":["protocols","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal protocols\"\n<usage of \"protocols\">\n","stdout":"unknown command \"a1\" for \"goal protocols\"\n"}
+{"args":["protocols","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal protocols\"\n<usage of \"protocols\">\n","stdout":"unknown command \"a1\" for \"goal protocols\"\n"}
+{"args":["protocols","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal protocols\"\n<usage of \"protocols\">\n","stdout":"unknown command \"a1\" for \"goal protocols\"\n"}
+{"args":["report","--help"],"code":0,"stderr":"","stdout":"<help of \"report\">"}
+{"args":["report","-h"],"code":0,"stderr":"","stdout":"<help of \"report\">"}
+{"args":["report","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"report\">\n","stdout":"unknown flag: --nosuchflag\n"}
+{"args":["report","-%"],"code":1,"stderr":"Error: unknown shorthand flag: '%' in -%\n<usage of \"report\">\n","stdout":"unknown shorthand flag: '%' in -%\n"}
+{"args":["report","--datadir"],"code":1,"stderr":"Error: flag needs an argument: --datadir\n<usage of \"report\">\n","stdout":"flag needs an argument: --datadir\n"}
+{"args":["report","-d"],"code":1,"stderr":"Error: flag needs an argument: 'd' in -d\n<usage of \"report\">\n","stdout":"flag needs an argument: 'd' in -d\n"}
+{"args":["report","--kmddir"],"code":1,"stderr":"Error: flag needs an argument: --kmddir\n<usage of \"report\">\n","stdout":"flag needs an argument: --kmddir\n"}
+{"args":["report","-k"],"code":1,"stderr":"Error: flag needs an argument: 'k' in -k\n<usage of \"report\">\n","stdout":"flag needs an argument: 'k' in -k\n"}
+{"args":["report","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal report\"\n<usage of \"report\">\n","stdout":"unknown command \"a1\" for \"goal report\"\n"}
+{"args":["report","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal report\"\n<usage of \"report\">\n","stdout":"unknown command \"a1\" for \"goal report\"\n"}
+{"args":["report","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal report\"\n<usage of \"report\">\n","stdout":"unknown command \"a1\" for \"goal report\"\n"}
+{"args":["version","--help"],"code":0,"stderr":"","stdout":"<help of \"version\">"}
+{"args":["version","-h"],"code":0,"stderr":"","stdout":"<help of \"version\">"}
+{"args":["version","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"version\">\n","stdout":"unknown flag: --nosuchflag\n"}
+{"args":["version","-%"],"code":1,"stderr":"Error: unknown shorthand flag: '%' in -%\n<usage of \"version\">\n","stdout":"unknown shorthand flag: '%' in -%\n"}
+{"args":["version","--verbose=maybe"],"code":1,"stderr":"Error: invalid argument \"maybe\" for \"-v, --verbose\" flag: strconv.ParseBool: parsing \"maybe\": invalid syntax\n<usage of \"version\">\n","stdout":"invalid argument \"maybe\" for \"-v, --verbose\" flag: strconv.ParseBool: parsing \"maybe\": invalid syntax\n"}
+{"args":["version","--verbose="],"code":1,"stderr":"Error: invalid argument \"\" for \"-v, --verbose\" flag: strconv.ParseBool: parsing \"\": invalid syntax\n<usage of \"version\">\n","stdout":"invalid argument \"\" for \"-v, --verbose\" flag: strconv.ParseBool: parsing \"\": invalid syntax\n"}
+{"args":["version","--datadir"],"code":1,"stderr":"Error: flag needs an argument: --datadir\n<usage of \"version\">\n","stdout":"flag needs an argument: --datadir\n"}
+{"args":["version","-d"],"code":1,"stderr":"Error: flag needs an argument: 'd' in -d\n<usage of \"version\">\n","stdout":"flag needs an argument: 'd' in -d\n"}
+{"args":["version","--kmddir"],"code":1,"stderr":"Error: flag needs an argument: --kmddir\n<usage of \"version\">\n","stdout":"flag needs an argument: --kmddir\n"}
+{"args":["version","-k"],"code":1,"stderr":"Error: flag needs an argument: 'k' in -k\n<usage of \"version\">\n","stdout":"flag needs an argument: 'k' in -k\n"}
+{"args":["version","a1"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal version\"\n<usage of \"version\">\n","stdout":"unknown command \"a1\" for \"goal version\"\n"}
+{"args":["version","a1","a2"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal version\"\n<usage of \"version\">\n","stdout":"unknown command \"a1\" for \"goal version\"\n"}
+{"args":["version","a1","a2","a3"],"code":1,"stderr":"Error: unknown command \"a1\" for \"goal version\"\n<usage of \"version\">\n","stdout":"unknown command \"a1\" for \"goal version\"\n"}
 {"args":["wallet","--help"],"code":0,"stderr":"","stdout":"<help of \"wallet\">"}
 {"args":["wallet","-h"],"code":0,"stderr":"","stdout":"<help of \"wallet\">"}
 {"args":["wallet","--nosuchflag"],"code":1,"stderr":"Error: unknown flag: --nosuchflag\n<usage of \"wallet\">\n","stdout":"unknown flag: --nosuchflag\n"}
@@ -1906,3 +2113,37 @@
 {"args":["ledger","block"],"code":1,"stderr":"Error: accepts 1 arg(s), received 0\n<usage of \"ledger block\">\n","stdout":"accepts 1 arg(s), received 0\n"}
 {"args":["ledger","block","1","2"],"code":1,"stderr":"Error: accepts 1 arg(s), received 2\n<usage of \"ledger block\">\n","stdout":"accepts 1 arg(s), received 2\n"}
 {"args":["ledger","-z","supply"],"code":1,"stderr":"Error: unknown shorthand flag: 'z' in -z\n<usage of \"ledger\">\n","stdout":"unknown shorthand flag: 'z' in -z\n"}
+{"args":[],"code":0,"stderr":"","stdout":"<help of \"\">"}
+{"args":["extra"],"code":1,"stderr":"Error: unknown command \"extra\" for \"goal\"\n<usage of \"\">\n","stdout":"unknown command \"extra\" for \"goal\"\n"}
+{"args":["lsit","-d","x"],"code":1,"stderr":"Error: unknown command \"lsit\" for \"goal\"\n<usage of \"\">\n","stdout":"unknown command \"lsit\" for \"goal\"\n"}
+{"args":["-d","x","extra","-k","y"],"code":1,"stderr":"Error: unknown command \"extra\" for \"goal\"\n<usage of \"\">\n","stdout":"unknown command \"extra\" for \"goal\"\n"}
+{"args":["-h","clerk"],"code":0,"stderr":"","stdout":"<help of \"\">"}
+{"args":["--help=x"],"code":1,"stderr":"Error: invalid argument \"x\" for \"-h, --help\" flag: strconv.ParseBool: parsing \"x\": invalid syntax\n<usage of \"\">\n","stdout":"invalid argument \"x\" for \"-h, --help\" flag: strconv.ParseBool: parsing \"x\": invalid syntax\n"}
+{"args":["-v=maybe"],"code":1,"stderr":"Error: invalid argument \"maybe\" for \"-v, --version\" flag: strconv.ParseBool: parsing \"maybe\": invalid syntax\n<usage of \"\">\n","stdout":"invalid argument \"maybe\" for \"-v, --version\" flag: strconv.ParseBool: parsing \"maybe\": invalid syntax\n"}
+{"args":["-vz"],"code":1,"stderr":"Error: unknown shorthand flag: 'z' in -z\n<usage of \"\">\n","stdout":"unknown shorthand flag: 'z' in -z\n"}
+{"args":["--","clerk"],"code":1,"stderr":"Error: unknown command \"clerk\" for \"goal\"\n<usage of \"\">\n","stdout":"unknown command \"clerk\" for \"goal\"\n"}
+{"args":["help"],"code":0,"stderr":"","stdout":"<help of \"\">"}
+{"args":["help","clerk","send"],"code":0,"stderr":"","stdout":"<help of \"clerk send\">"}
+{"args":["help","clerk","nosuch"],"code":0,"stderr":"","stdout":"<help of \"clerk\">"}
+{"args":["help","nosuch","more"],"code":0,"stderr":"","stdout":"<help of \"\">"}
+{"args":["help","help"],"code":0,"stderr":"","stdout":"<help of \"help\">"}
+{"args":["-d","x","help","app","box","list"],"code":0,"stderr":"","stdout":"<help of \"app box list\">"}
+{"args":["help","-z"],"code":1,"stderr":"Error: unknown shorthand flag: 'z' in -z\n<usage of \"help\">\n","stdout":"unknown shorthand flag: 'z' in -z\n"}
+{"args":["help","--","-x"],"code":0,"stderr":"","stdout":"<help of \"\">"}
+{"args":["helptest"],"code":0,"stderr":"","stdout":"goal -h\ngoal account -h\ngoal account addpartkey -h\ngoal account applicationdetails -h\ngoal account assetdetails -h\ngoal account balance -h\ngoal account changeonlinestatus -h\ngoal account delete -h\ngoal account deletepartkey -h\ngoal account dump -h\ngoal account export -h\ngoal account import -h\ngoal account importrootkey -h\ngoal account info -h\ngoal account installpartkey -h\ngoal account list -h\ngoal account listpartkeys -h\ngoal account marknonparticipating -h\ngoal account multisig -h\ngoal account multisig delete -h\ngoal account multisig info -h\ngoal account multisig new -h\ngoal account new -h\ngoal account partkeyinfo -h\ngoal account rename -h\ngoal account renewallpartkeys -h\ngoal account renewpartkey -h\ngoal account rewards -h\ngoal app -h\ngoal app box -h\ngoal app box info -h\ngoal app box list -h\ngoal app call -h\ngoal app clear -h\ngoal app closeout -h\ngoal app create -h\ngoal app delete -h\ngoal app info -h\ngoal app method -h\ngoal app optin -h\ngoal app read -h\ngoal app update -h\ngoal asset -h\ngoal asset config -h\ngoal asset create -h\ngoal asset destroy -h\ngoal asset freeze -h\ngoal asset info -h\ngoal asset optin -h\ngoal asset send -h\ngoal clerk -h\ngoal clerk compile -h\ngoal clerk group -h\ngoal clerk inspect -h\ngoal clerk multisig -h\ngoal clerk multisig merge -h\ngoal clerk multisig sign -h\ngoal clerk multisig signprogram -h\ngoal clerk rawsend -h\ngoal clerk send -h\ngoal clerk sign -h\ngoal clerk simulate -h\ngoal clerk split -h\ngoal clerk tealsign -h\ngoal completion -h\ngoal completion bash -h\ngoal completion zsh -h\ngoal kmd -h\ngoal kmd start -h\ngoal kmd stop -h\ngoal ledger -h\ngoal ledger block -h\ngoal ledger supply -h\ngoal license -h\ngoal network -h\ngoal network create -h\ngoal network delete -h\ngoal network pregen -h\ngoal network restart -h\ngoal network start -h\ngoal network status -h\ngoal network stop -h\ngoal node -h\ngoal node catchup -h\ngoal node clone -h\ngoal node create -h\ngoal node generate-p2pid -h\ngoal node generatetoken -h\ngoal node lastround -h\ngoal node peers -h\ngoal node pendingtxns -h\ngoal node restart -h\ngoal node start -h\ngoal node status -h\ngoal node stop -h\ngoal node wait -h\ngoal protocols -h\ngoal report -h\ngoal version -h\ngoal wallet -h\ngoal wallet list -h\ngoal wallet new -h\ngoal wallet rename -h\n"}
+{"args":["helptest","x"],"code":1,"stderr":"Error: unknown command \"helptest\" for \"goal\"\n<usage of \"\">\n","stdout":"unknown command \"helptest\" for \"goal\"\n"}
+{"args":["kmd","-t","x","start"],"code":1,"stderr":"Error: invalid argument \"x\" for \"-t, --timeout\" flag: strconv.ParseUint: parsing \"x\": invalid syntax\n<usage of \"kmd start\">\n","stdout":"invalid argument \"x\" for \"-t, --timeout\" flag: strconv.ParseUint: parsing \"x\": invalid syntax\n"}
+{"args":["network","-r"],"code":1,"stderr":"Error: flag needs an argument: 'r' in -r\n<usage of \"network\">\n","stdout":"flag needs an argument: 'r' in -r\n"}
+{"args":["network","create","-r","x","--nosuch"],"code":1,"stderr":"Error: unknown flag: --nosuch\n<usage of \"network create\">\n","stdout":"unknown flag: --nosuch\n"}
+{"args":["completion","zsh","extra"],"code":1,"stderr":"Error: unknown command \"extra\" for \"goal completion zsh\"\n<usage of \"completion zsh\">\n","stdout":"unknown command \"extra\" for \"goal completion zsh\"\n"}
+{"args":["version","-v","extra"],"code":1,"stderr":"Error: unknown command \"extra\" for \"goal version\"\n<usage of \"version\">\n","stdout":"unknown command \"extra\" for \"goal version\"\n"}
+{"args":["license","-d"],"code":1,"stderr":"Error: flag needs an argument: 'd' in -d\n<usage of \"license\">\n","stdout":"flag needs an argument: 'd' in -d\n"}
+{"args":["x​"],"code":1,"stderr":"Error: unknown command \"x\\u200b\" for \"goal\"\n<usage of \"\">\n","stdout":"unknown command \"x\\u200b\" for \"goal\"\n"}
+{"args":["  "],"code":1,"stderr":"Error: unknown command \"\\u2028\\u2029\" for \"goal\"\n<usage of \"\">\n","stdout":"unknown command \"\\u2028\\u2029\" for \"goal\"\n"}
+{"args":["﻿y"],"code":1,"stderr":"Error: unknown command \"\\ufeffy\" for \"goal\"\n<usage of \"\">\n","stdout":"unknown command \"\\ufeffy\" for \"goal\"\n"}
+{"args":[" ­　"],"code":1,"stderr":"Error: unknown command \"\\u00a0\\u00ad\\u0085\\u3000\" for \"goal\"\n<usage of \"\">\n","stdout":"unknown command \"\\u00a0\\u00ad\\u0085\\u3000\" for \"goal\"\n"}
+{"args":["󠀁􏿿"],"code":1,"stderr":"Error: unknown command \"\\ue000\\U000e0001\\U0010ffff\" for \"goal\"\n<usage of \"\">\n","stdout":"unknown command \"\\ue000\\U000e0001\\U0010ffff\" for \"goal\"\n"}
+{"args":["é日本😀́"],"code":1,"stderr":"Error: unknown command \"é日本😀́\" for \"goal\"\n<usage of \"\">\n","stdout":"unknown command \"é日本😀́\" for \"goal\"\n"}
+{"args":["account","info","-a","A","\u0007\u001b"],"code":1,"stderr":"Error: unknown command \"\\a\\x1b\\x7f\" for \"goal account info\"\n<usage of \"account info\">\n","stdout":"unknown command \"\\a\\x1b\\x7f\" for \"goal account info\"\n"}
+{"args":["clerk","send","--fee","​1"],"code":1,"stderr":"Error: invalid argument \"\\u200b1\" for \"--fee\" flag: strconv.ParseUint: parsing \"\\u200b1\": invalid syntax\n<usage of \"clerk send\">\n","stdout":"invalid argument \"\\u200b1\" for \"--fee\" flag: strconv.ParseUint: parsing \"\\u200b1\": invalid syntax\n"}
+{"args":["clerk","send","--argb64"," \"x"],"code":1,"stderr":"Error: invalid argument \"\\u2028\\\"x\" for \"--argb64\" flag: parse error on line 1, column 4: bare \" in non-quoted-field\n<usage of \"clerk send\">\n","stdout":"invalid argument \"\\u2028\\\"x\" for \"--argb64\" flag: parse error on line 1, column 4: bare \" in non-quoted-field\n"}

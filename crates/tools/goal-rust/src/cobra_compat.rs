@@ -42,9 +42,11 @@
 //!
 //! The command table is go's own: `cobra_tree.json`, which
 //! `tools/goal-cobra-oracle` dumps from go `goal` v5.0.5-stable's cobra tree
-//! (every command's flags, `Args` rule, usage and help texts). [`preflight`]
-//! runs the steps above on the raw arguments for a command of the trees in
-//! [`TREES`]; a command line that passes them all goes to clap rewritten
+//! (every command's flags, `Args` rule, usage and help texts, and the runes
+//! `strconv.IsPrint` rejects). [`preflight`] runs the steps above on the raw
+//! arguments, for every command line but the two goal's `main` handles
+//! before cobra (`goal helptest`, `goal generate-docs <dir>`); one that
+//! passes them all goes to clap rewritten
 //! into one canonical form: the command names, then each flag cobra set as
 //! `--<long>=<value>` (numbers as go parsed them, a bool flag as clap's
 //! switch), then the positional arguments. So every flag reaches the
@@ -56,13 +58,6 @@ use std::process::ExitCode;
 use std::sync::OnceLock;
 
 use serde::Deserialize;
-
-/// The top-level commands whose trees are parsed here (issue #2472 moves
-/// them over one tree at a time); a command line naming any other one goes
-/// to clap as it is.
-const TREES: &[&str] = &[
-    "account", "app", "asset", "clerk", "ledger", "node", "wallet",
-];
 
 /// What [`preflight`] decided.
 pub enum Preflight {
@@ -89,6 +84,10 @@ pub fn preflight(args: Vec<OsString>) -> Preflight {
         Outcome::Help(path) => {
             // cobra's default help function writes to `OutOrStdout()`.
             print!("{}", help(&path).unwrap_or_default());
+            Preflight::Exit(ExitCode::SUCCESS)
+        }
+        Outcome::Print(text) => {
+            print!("{text}");
             Preflight::Exit(ExitCode::SUCCESS)
         }
         Outcome::Fail { msg, usage_path } => {
@@ -123,6 +122,8 @@ pub(crate) enum Outcome {
     Run(Vec<String>),
     /// `-h/--help`: go's help of the command `path`.
     Help(String),
+    /// Print this on stdout and exit 0 (`goal helptest`).
+    Print(String),
     /// cobra's usage error: `msg`, then the usage of the command `usage_path`.
     Fail { msg: String, usage_path: String },
 }
@@ -133,6 +134,8 @@ pub(crate) enum Outcome {
 #[derive(Deserialize)]
 struct TreeFile {
     commands: Vec<CmdData>,
+    /// `strconv.IsPrint`'s false runes: hex `lo-hi` ranges, comma-separated.
+    not_printable: String,
 }
 
 // The fields only the tests read state what this port assumes of the tree.
@@ -275,12 +278,21 @@ struct Cmd {
     help_text: String,
 }
 
+fn tree_file() -> &'static TreeFile {
+    static FILE: OnceLock<TreeFile> = OnceLock::new();
+    FILE.get_or_init(|| {
+        serde_json::from_str(include_str!("cobra_tree.json"))
+            .expect("cobra_tree.json is go goal's cobra tree")
+    })
+}
+
 fn tree() -> &'static [Cmd] {
     static TREE: OnceLock<Vec<Cmd>> = OnceLock::new();
     TREE.get_or_init(|| {
-        let file: TreeFile = serde_json::from_str(include_str!("cobra_tree.json"))
-            .expect("cobra_tree.json is go goal's cobra tree");
-        file.commands
+        // `args_rule` quotes arguments, which asks `is_print` for the ranges:
+        // they live in their own cell, not in this one.
+        tree_file()
+            .commands
             .iter()
             .map(|d| Cmd {
                 path: d.path.clone(),
@@ -296,6 +308,32 @@ fn tree() -> &'static [Cmd] {
             })
             .collect()
     })
+}
+
+/// `strconv.IsPrint`'s false ranges, sorted.
+fn not_printable() -> &'static [(u32, u32)] {
+    static RANGES: OnceLock<Vec<(u32, u32)>> = OnceLock::new();
+    RANGES.get_or_init(|| {
+        tree_file()
+            .not_printable
+            .split(',')
+            .filter_map(|r| {
+                let (lo, hi) = r.split_once('-')?;
+                Some((
+                    u32::from_str_radix(lo, 16).ok()?,
+                    u32::from_str_radix(hi, 16).ok()?,
+                ))
+            })
+            .collect()
+    })
+}
+
+/// go's `strconv.IsPrint`.
+fn is_print(c: char) -> bool {
+    let c = c as u32;
+    let ranges = not_printable();
+    let i = ranges.partition_point(|&(_, hi)| hi < c);
+    !ranges.get(i).is_some_and(|&(lo, _)| lo <= c)
 }
 
 /// `goal` and the command path.
@@ -337,11 +375,9 @@ fn command(path: &str) -> Option<&'static Cmd> {
     tree().iter().find(|c| c.path == path)
 }
 
-/// `findNext`: the subcommand `name` (or alias) of `parent`. Of the root's
-/// commands only those of [`TREES`] are known here; any other one is left
-/// to clap.
+/// `findNext`: the subcommand `name` (or alias) of `parent`.
 fn child(parent: &Cmd, name: &str) -> Option<&'static Cmd> {
-    if name.is_empty() || (parent.path.is_empty() && !TREES.contains(&name)) {
+    if name.is_empty() {
         return None;
     }
     tree().iter().find(|c| {
@@ -495,8 +531,13 @@ fn go_quote_byte(b: u8) -> String {
     out
 }
 
-/// strconv's escaping of one rune that is not the quote character.
+/// strconv's `appendEscapedRune` for a rune that is not the quote
+/// character or a backslash: a printable one as it is, else its escape.
 fn push_escaped(out: &mut String, c: char) {
+    if is_print(c) {
+        out.push(c);
+        return;
+    }
     match c {
         '\u{07}' => out.push_str("\\a"),
         '\u{08}' => out.push_str("\\b"),
@@ -508,12 +549,8 @@ fn push_escaped(out: &mut String, c: char) {
         c if (c as u32) < 0x20 || c == '\u{7f}' => {
             out.push_str(&format!("\\x{:02x}", c as u32));
         }
-        // Latin-1's non-printing runes (C1 controls, no-break space, soft
-        // hyphen); other non-ASCII runes are printed as they are.
-        c if (0x80..=0xa0).contains(&(c as u32)) || c == '\u{ad}' => {
-            out.push_str(&format!("\\u{:04x}", c as u32));
-        }
-        c => out.push(c),
+        c if (c as u32) < 0x10000 => out.push_str(&format!("\\u{:04x}", c as u32)),
+        c => out.push_str(&format!("\\U{:08x}", c as u32)),
     }
 }
 
@@ -1160,7 +1197,12 @@ fn val_text(v: &Val) -> Vec<String> {
 /// positional arguments, after `--` when one of them starts with `-`.
 fn canonical(argv0: &str, cmd: &Cmd, parsed: &Parsed) -> Vec<String> {
     let mut out = vec![argv0.to_string()];
-    out.extend(cmd.path.split(' ').map(str::to_string));
+    out.extend(
+        cmd.path
+            .split(' ')
+            .filter(|w| !w.is_empty())
+            .map(str::to_string),
+    );
     let mut order: Vec<&'static Flag> = Vec::new();
     for (f, _) in &parsed.sets {
         if !order.iter().any(|o| std::ptr::eq(*o, *f)) && f.long != "help" {
@@ -1211,10 +1253,10 @@ fn canonical(argv0: &str, cmd: &Cmd, parsed: &Parsed) -> Vec<String> {
     out
 }
 
-pub(crate) fn decide(args: &[String]) -> Outcome {
-    // Find: walk down from the root.
+/// cobra's `Find` from the root: the deepest command `args` (after the
+/// program name, at the positions `idx`) name, and the positions left.
+fn find(args: &[String], mut idx: Vec<usize>) -> (&'static Cmd, Vec<usize>) {
     let mut cmd = command("").expect("the root is in the table");
-    let mut idx: Vec<usize> = (1..args.len()).collect();
     loop {
         let flags = flags_of(cmd, false);
         let Some(&next) = strip_flags(args, &idx, &flags).first() else {
@@ -1226,9 +1268,34 @@ pub(crate) fn decide(args: &[String]) -> Outcome {
         idx = args_minus_first_x(args, &idx, &args[next], &flags);
         cmd = sub;
     }
-    if cmd.path.is_empty() {
+    (cmd, idx)
+}
+
+/// goal's `helptest` (`runAllHelps`): `<path> -h` for every runnable
+/// command, in cobra's (sorted) order. It runs before cobra's `Execute`
+/// adds the `help` command, which is not listed.
+fn help_test() -> String {
+    let mut paths: Vec<&str> = tree()
+        .iter()
+        .filter(|c| c.runnable && c.path != "help")
+        .map(|c| c.path.as_str())
+        .collect();
+    paths.sort_unstable();
+    paths
+        .iter()
+        .map(|p| format!("{} -h\n", command_path(p)))
+        .collect()
+}
+
+pub(crate) fn decide(args: &[String]) -> Outcome {
+    // goal's `main`, before cobra.
+    if args.len() == 3 && args[1] == "generate-docs" {
         return Outcome::Unchanged;
     }
+    if args.len() == 2 && args[1] == "helptest" {
+        return Outcome::Print(help_test());
+    }
+    let (cmd, idx) = find(args, (1..args.len()).collect());
 
     // execute: flags, help, `Args`, required flags.
     let flags = flags_of(cmd, true);
@@ -1249,6 +1316,14 @@ pub(crate) fn decide(args: &[String]) -> Outcome {
     }
     if let Err(msg) = validate_required(&flags, &parsed) {
         return fail(msg);
+    }
+    if cmd.path == "help" {
+        // cobra's help command: `c.Root().Find(args)` and that command's
+        // help (the root's for a name it does not know).
+        let mut words = vec![args[0].clone()];
+        words.extend(parsed.positional.iter().cloned());
+        let (topic, _) = find(&words, (1..words.len()).collect());
+        return Outcome::Help(topic.path.clone());
     }
     Outcome::Run(canonical(&args[0], cmd, &parsed))
 }
@@ -1387,9 +1462,60 @@ mod tests {
             d(&["account", "list", "--info"]),
             run(&["account", "list", "--info"])
         );
-        assert_eq!(d(&["kmd", "extra"]), Outcome::Unchanged);
-        assert_eq!(d(&["-v"]), Outcome::Unchanged);
-        assert_eq!(d(&[]), Outcome::Unchanged);
+        assert_eq!(d(&["-v"]), run(&["--version"]));
+        assert_eq!(d(&[]), run(&[]));
+    }
+
+    #[test]
+    fn the_root_is_a_command_too() {
+        assert_eq!(
+            d(&["extra"]),
+            fail(r#"unknown command "extra" for "goal""#, "")
+        );
+        assert_eq!(
+            d(&["lsit", "-d", "x"]),
+            fail(r#"unknown command "lsit" for "goal""#, "")
+        );
+        assert_eq!(d(&["--help"]), help(""));
+        assert_eq!(d(&["-h", "clerk"]), help(""));
+        assert_eq!(d(&["-z"]), fail("unknown shorthand flag: 'z' in -z", ""));
+        assert_eq!(
+            d(&["-d", "x", "-k", "y", "-v"]),
+            run(&["--datadir=x", "--kmddir=y", "--version"])
+        );
+        assert_eq!(
+            d(&["kmd", "extra"]),
+            fail(r#"unknown command "extra" for "goal kmd""#, "kmd")
+        );
+        assert_eq!(d(&["version", "-v"]), run(&["version", "--verbose"]));
+        // goal's `main` handles these two before cobra.
+        assert_eq!(d(&["generate-docs", "x"]), Outcome::Unchanged);
+        let Outcome::Print(text) = d(&["helptest"]) else {
+            panic!("helptest");
+        };
+        assert!(text.starts_with("goal -h\ngoal account -h\n"), "{text}");
+        assert!(!text.contains("goal help"), "{text}");
+        assert!(text.ends_with("goal wallet rename -h\n"), "{text}");
+        assert_eq!(
+            d(&["helptest", "x"]),
+            fail(r#"unknown command "helptest" for "goal""#, "")
+        );
+    }
+
+    #[test]
+    fn the_help_command_is_cobras() {
+        assert_eq!(d(&["help"]), help(""));
+        assert_eq!(d(&["help", "clerk", "send"]), help("clerk send"));
+        assert_eq!(d(&["help", "clerk", "nosuch"]), help("clerk"));
+        assert_eq!(d(&["help", "nosuch"]), help(""));
+        assert_eq!(d(&["help", "help"]), help("help"));
+        assert_eq!(d(&["help", "-h"]), help("help"));
+        assert_eq!(d(&["-d", "x", "help", "app", "box"]), help("app box"));
+        assert_eq!(
+            d(&["help", "-z"]),
+            fail("unknown shorthand flag: 'z' in -z", "help")
+        );
+        assert_eq!(d(&["help", "--", "-x"]), help(""));
     }
 
     #[test]
@@ -1675,16 +1801,14 @@ mod tests {
         );
     }
 
-    /// The goal-rust clap commands of every tree parsed here.
+    /// The goal-rust clap command of every go command (cobra's `help`
+    /// command has none: the preflight answers it).
     fn clap_commands() -> Vec<(&'static Cmd, clap::Command)> {
         let mut out = Vec::new();
-        for cmd in tree()
-            .iter()
-            .filter(|c| TREES.contains(&c.path.split(' ').next().unwrap_or("")))
-        {
+        for cmd in tree() {
             let mut c = <crate::Cli as clap::CommandFactory>::command();
-            let mut found = true;
-            for name in cmd.path.split(' ') {
+            let mut found = cmd.path != "help";
+            for name in cmd.path.split(' ').filter(|n| !n.is_empty()) {
                 match c.find_subcommand(name) {
                     Some(sub) => c = sub.clone(),
                     None => found = false,
@@ -1941,6 +2065,22 @@ mod tests {
         assert_eq!(go_quote_byte(0xc3), "'Ã'");
         assert_eq!(go_quote_byte(0x85), r"'\u0085'");
         assert_eq!(go_quote("a\"b\n"), r#""a\"b\n""#);
+        // strconv.IsPrint: every rune go does not print is escaped, a
+        // printable one (letters, marks, numbers, punctuation, symbols,
+        // ASCII space) is not.
+        assert_eq!(go_quote("\u{200b}"), "\"\\u200b\"");
+        assert_eq!(go_quote("\u{2028}\u{2029}"), "\"\\u2028\\u2029\"");
+        assert_eq!(go_quote("\u{feff}"), "\"\\ufeff\"");
+        assert_eq!(go_quote("\u{a0}\u{ad}\u{85}"), "\"\\u00a0\\u00ad\\u0085\"");
+        assert_eq!(go_quote("\u{e000}"), "\"\\ue000\"");
+        assert_eq!(
+            go_quote("\u{e0001}\u{10ffff}"),
+            "\"\\U000e0001\\U0010ffff\""
+        );
+        assert_eq!(go_quote("\u{3000}"), "\"\\u3000\"");
+        assert_eq!(go_quote("é日本😀 ~"), "\"é日本😀 ~\"");
+        assert_eq!(go_quote("\u{301}"), "\"\u{301}\"");
+        assert!(is_print(' ') && !is_print('\u{2000}') && !is_print('\u{10fffd}'));
     }
 
     /// The help of every command is its `Long` (or `Short`) text above its
