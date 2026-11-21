@@ -3281,6 +3281,14 @@ fn go_base32_decode(s: &[u8], pad: Option<u8>) -> Result<Vec<u8>, DecodeError> {
     Ok(out)
 }
 
+/// go's `base32.StdEncoding.DecodeString` (`padded`) or
+/// `StdEncoding.WithPadding(NoPadding).DecodeString`, with go's error text
+/// (`illegal base32 data at input byte N`).
+pub fn go_base32_decode_string(s: &str, padded: bool) -> Result<Vec<u8>, String> {
+    go_base32_decode(s.as_bytes(), padded.then_some(b'='))
+        .map_err(|e| e.to_string())
+}
+
 /// go's `base32DecodeAnyPadding` (assembler.go:664): unpadded first, then
 /// padded; the unpadded attempt's error when both fail.
 fn go_base32_decode_any_padding(s: &[u8]) -> Result<Vec<u8>, DecodeError> {
