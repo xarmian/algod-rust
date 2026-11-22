@@ -21,7 +21,7 @@
 //! The Go answer types goal decodes with go-codec's JSON decoder (issue
 //! #2466); the decoder itself is [`algo_codec::go_codec_json`].
 
-pub use algo_codec::go_codec_json::{decode, decode_reading, Error, Field, Ty};
+pub use algo_codec::go_codec_json::{decode, decode_guarded, decode_reading, Error, Field, Ty};
 
 // ---- the Go types goal reads ----------------------------------------------
 
@@ -423,15 +423,21 @@ mod tests {
             "json decode error [pos 4]: runtime error: index out of range [0] with length 0"
         );
         // go-codec never returns from these (the slice grows until the
-        // process runs out of memory)
-        assert_eq!(err(r#"{"versions":[1,"#, &VERSION), "EOF");
-        assert_eq!(
-            err(
-                r#"{"created-apps":[{"id":1,"params":{"approval-program":[1,"#,
-                &ACCOUNT
-            ),
-            "EOF"
-        );
+        // process runs out of memory); the guarded decode reports the loop
+        // instead of hanging the test (see tests/go_codec_json_endless.rs)
+        for body in [
+            r#"{"versions":[1,"#,
+            r#"{"created-apps":[{"id":1,"params":{"approval-program":[1,"#,
+        ] {
+            let ty = if body.contains("versions") { &VERSION } else { &ACCOUNT };
+            assert!(
+                matches!(
+                    super::decode_guarded(body.as_bytes(), ty, 1000),
+                    Err(super::Error::Endless { .. })
+                ),
+                "{body}"
+            );
+        }
     }
 
     #[test]

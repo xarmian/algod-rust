@@ -46,7 +46,10 @@
 // A body go-codec never finishes decoding (an array cut after a comma:
 // each element reads the comma again, the slice grows until the process
 // runs out of memory) makes the oracle hang; keep such bodies out of the
-// corpus.
+// corpus. They are listed apart, in
+// crates/tools/goal-rust/tests/fixtures/go_codec_json_endless.jsonl (issue
+// #2537: found by running the oracle under `timeout -s KILL 1.5`), where
+// goal-rust is tested to loop as well.
 package main
 
 import (
