@@ -36,18 +36,18 @@
 // (empty when none); the tracker ports each by hand and a test keeps that
 // list in sync with this dump.
 //
-// Regenerate (go-algorand pin v5.0.5-stable, deterministic):
+// Regenerate (go-algorand pin v5.1.1-stable, deterministic):
 //
 //	cd tools/avm-op-types && go run . > ../../crates/core/algo-avm/tests/fixtures/go_op_types.jsonl
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"reflect"
-	"crypto/sha256"
-	"encoding/hex"
 	"runtime"
 	"sort"
 	"strings"

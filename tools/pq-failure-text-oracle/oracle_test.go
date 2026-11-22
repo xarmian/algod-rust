@@ -19,7 +19,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // Parity oracle for algod-rust issue #2438: the post-quantum (Falcon-1024)
-// signature failure texts of go-algorand v5.0.5-stable's PQSig.Verify,
+// signature failure texts of go-algorand v5.1.1-stable's PQSig.Verify,
 // VerifyFalcon1024 and the simulator, on the pool path (verify.TxnGroup,
 // whose TxGroupError text is what BroadcastSignedTxGroup and the REST
 // handler return) and in simulate (Simulator.Simulate).

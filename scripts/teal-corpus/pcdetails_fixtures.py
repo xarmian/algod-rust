@@ -195,7 +195,7 @@ def main():
     ap.add_argument("--go-algorand", default=os.environ.get("GO_ALGORAND_DIR"))
     a = ap.parse_args()
     if not a.go_algorand:
-        sys.exit("set GO_ALGORAND_DIR or pass --go-algorand (a v5.0.5-stable checkout with libsodium built)")
+        sys.exit("set GO_ALGORAND_DIR or pass --go-algorand (a v5.1.1-stable checkout with libsodium built)")
     text = build(os.path.abspath(a.go_algorand))
     if a.check:
         cur = open(OUT, encoding="utf-8", newline="").read()

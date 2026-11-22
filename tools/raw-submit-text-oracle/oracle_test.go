@@ -18,7 +18,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Parity oracle for algod-rust issue #2492: go-algorand v5.0.5-stable's HTTP
+// Parity oracle for algod-rust issue #2492: go-algorand v5.1.1-stable's HTTP
 // status and response body for raw transaction submits (POST /v2/transactions,
 // Handlers.RawTransaction, and POST /v2/transactions/async,
 // Handlers.RawTransactionAsync, in daemon/algod/api/server/v2/handlers.go).

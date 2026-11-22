@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: MIT
 # See the LICENSE-MIT file in the repository root for the full license text.
 
-# run-in-docker.sh — regenerate the go-algorand v5.0.5-stable oracle for the
+# run-in-docker.sh — regenerate the go-algorand v5.1.1-stable oracle for the
 # post-quantum (Falcon-1024) signature failure texts (issue #2438).
 #
 # `oracle_test.go` is staged into `ledger/simulation/` of a clean in-container
@@ -23,7 +23,7 @@ REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 GO_ALGORAND_DIR="${GO_ALGORAND_DIR:-$(cd "$REPO_ROOT/../go-algorand" 2>/dev/null && pwd || true)}"
 FIXTURE="$REPO_ROOT/crates/core/algo-validate/tests/fixtures/pq_failure_texts.jsonl"
 
-GO_ALGORAND_PIN="v5.0.5-stable"
+GO_ALGORAND_PIN="v5.1.1-stable"
 BUILDER_IMAGE="${BUILDER_IMAGE:-golang:1.27-bookworm}"
 SRC_VOLUME="${SRC_VOLUME:-algod-rust-goalgo-src}"
 MOD_VOLUME="${MOD_VOLUME:-algod-rust-gomod}"

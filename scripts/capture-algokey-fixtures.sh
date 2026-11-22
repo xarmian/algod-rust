@@ -14,7 +14,7 @@
 #   cd ../go-algorand && go build -o /tmp/algokey-go ./cmd/algokey
 #   ALGOKEY=/tmp/algokey-go bash scripts/capture-algokey-fixtures.sh
 #
-# Requires go-algorand pinned to v5.0.5-stable (the version this repo
+# Requires go-algorand pinned to v5.1.1-stable (the version this repo
 # tracks). The script regenerates every file under
 # crates/tools/algokey-rust/tests/fixtures/algokey/ from scratch.
 #

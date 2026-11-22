@@ -571,7 +571,7 @@ func wellFormedRows(e wfEnv) []wfRow {
 			return merklearray.SingleLeafProof{Proof: merklearray.Proof{TreeDepth: depth, HashFactory: hash, Path: path}}
 		}
 		revealSig := func(proof merklearray.SingleLeafProof) merklesignature.Signature {
-			s := merklesignature.Signature{Signature: make(crypto.FalconSignature, 2), Proof: proof}
+			s := merklesignature.Signature{Signature: make(crypto.Falcon1024Signature, 2), Proof: proof}
 			s.Signature[0] = 1
 			return s
 		}
@@ -595,7 +595,7 @@ func wellFormedRows(e wfEnv) []wfRow {
 			s.Reveals = oneReveal(merklesignature.Signature{})
 		}))
 		add("stpf_reveal_short_signature", spp("sp-rss", func(s *stateproof.StateProof) {
-			s.Reveals = oneReveal(merklesignature.Signature{Signature: crypto.FalconSignature{1}})
+			s.Reveals = oneReveal(merklesignature.Signature{Signature: crypto.Falcon1024Signature{1}})
 		}))
 		add("stpf_reveal_depth_over_path", spp("sp-rdp", func(s *stateproof.StateProof) {
 			s.Reveals = oneReveal(revealSig(leaf(1, sumhash)))
@@ -620,7 +620,7 @@ func wellFormedRows(e wfEnv) []wfRow {
 			s.SigCommit = make(crypto.GenericDigest, 64)
 		}))
 		add("stpf_reveal_all_zero_signature_bytes", spp("sp-rz2", func(s *stateproof.StateProof) {
-			sig := merklesignature.Signature{Signature: make(crypto.FalconSignature, 2), Proof: leaf(1, sumhash, digest(64))}
+			sig := merklesignature.Signature{Signature: make(crypto.Falcon1024Signature, 2), Proof: leaf(1, sumhash, digest(64))}
 			s.Reveals = oneReveal(sig)
 		}))
 		add("stpf_order_commit_before_proofs", spp("sp-oc", func(s *stateproof.StateProof) {
@@ -633,7 +633,7 @@ func wellFormedRows(e wfEnv) []wfRow {
 		}))
 		add("stpf_order_proofs_before_reveals", spp("sp-op", func(s *stateproof.StateProof) {
 			s.PartProofs.Path = []crypto.GenericDigest{digest(5)}
-			s.Reveals = oneReveal(merklesignature.Signature{Signature: crypto.FalconSignature{1}})
+			s.Reveals = oneReveal(merklesignature.Signature{Signature: crypto.Falcon1024Signature{1}})
 		}))
 		add("stpf_order_type_before_payload", sp("sp-ot", func(t *transactions.Transaction) {
 			t.StateProofType = 1
