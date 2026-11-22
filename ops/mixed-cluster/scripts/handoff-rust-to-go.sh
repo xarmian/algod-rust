@@ -47,7 +47,7 @@ _handoff_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$_handoff_dir/ports.sh"  # issue #1956
 GO_NODE_REST="${GO_NODE_REST:-http://localhost:$PHASE6_GO1_PORT}"
 GO_NODE_TOKEN="${GO_NODE_TOKEN:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
-ALGOD_IMG="${ALGOD_IMG:-algorand/algod:5.0.5-stable}"
+ALGOD_IMG="${ALGOD_IMG:-algorand/algod:5.1.1-stable}"
 KEEP_HANDOFF="${KEEP_HANDOFF:-0}"
 SKIP_CLUSTER_START="${SKIP_CLUSTER_START:-0}"
 

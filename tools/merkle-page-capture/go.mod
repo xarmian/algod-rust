@@ -1,6 +1,6 @@
 module github.com/xarmian/algod-rust/tools/merkle-page-capture
 
-go 1.25.0
+go 1.27.0
 
 // go-algorand is pinned to v4.5.1-stable (commit a8c16ecc, 2026-02-09)
 // via the `replace` directive below. The `v0.0.0` placeholder matches

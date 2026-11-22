@@ -1,8 +1,8 @@
 module github.com/xarmian/algod-rust/tools/cert-authenticate
 
-go 1.25.0
+go 1.27.0
 
-// go-algorand is pinned to v5.0.5-stable via the `replace` directive below.
+// go-algorand is pinned to v5.1.1-stable via the `replace` directive below.
 // The `v0.0.0` placeholder matches the pattern used by the sibling capture
 // tools (avm-opcode-capture, go-trie-replay-bench, …) and has no effect once
 // the replace fires.

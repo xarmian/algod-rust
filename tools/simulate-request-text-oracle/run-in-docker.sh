@@ -25,7 +25,7 @@ FIXTURE="$REPO_ROOT/crates/node/algo-rest-api/tests/fixtures/simulate_request_te
 SCHEMA="$REPO_ROOT/crates/node/algo-rest-api/src/simulate_request_schema.rs"
 
 GO_ALGORAND_PIN="v5.0.5-stable"
-BUILDER_IMAGE="${BUILDER_IMAGE:-golang:1.25-bookworm}"
+BUILDER_IMAGE="${BUILDER_IMAGE:-golang:1.27-bookworm}"
 SRC_VOLUME="${SRC_VOLUME:-algod-rust-goalgo-src}"
 MOD_VOLUME="${MOD_VOLUME:-algod-rust-gomod}"
 CACHE_VOLUME="${CACHE_VOLUME:-algod-rust-gocache}"

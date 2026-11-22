@@ -1,6 +1,6 @@
 module github.com/xarmian/algod-rust/tools/kmd-crypto-vector-capture
 
-go 1.25.0
+go 1.27.0
 
 require (
 	github.com/algorand/go-codec/codec v1.1.10

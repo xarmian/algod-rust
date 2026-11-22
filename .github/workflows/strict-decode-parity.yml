@@ -43,7 +43,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_ALGORAND_REV: "v5.0.5-stable"
+  GO_ALGORAND_REV: "v5.1.1-stable"
 
 jobs:
   go-oracle:

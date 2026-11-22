@@ -1,6 +1,6 @@
 module github.com/xarmian/algod-rust/tools/merkle-trie-root-capture
 
-go 1.25.0
+go 1.27.0
 
 // go-algorand is pinned to v4.5.1-stable via the `replace` directive below.
 // The `v0.0.0` placeholder matches the pattern used by sibling capture tools

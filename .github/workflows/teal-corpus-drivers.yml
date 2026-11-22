@@ -5,7 +5,7 @@
 name: TEAL corpus drivers
 
 # Issue #2366 (epic #2364, Phase 25). Builds the Go driver (tools/teal-corpus)
-# against the pinned go-algorand v5.0.5-stable through go-algorand's own
+# against the pinned go-algorand v5.1.1-stable through go-algorand's own
 # libsodium entry point (`make libsodium`, see CLAUDE.md), runs its Go tests,
 # checks that the committed expected/go.*.jsonl fixture rows are not stale, and
 # diffs the Go and Rust drivers on the small fixture corpus. The Rust half's own
@@ -82,7 +82,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_ALGORAND_REV: "v5.0.5-stable"
+  GO_ALGORAND_REV: "v5.1.1-stable"
 
 jobs:
   go-and-rust-drivers:
@@ -285,28 +285,28 @@ jobs:
           # cobra_cli_fixture_matches_go_goal), and src/cobra_tree.json must be
           # exactly what tools/goal-cobra-oracle dumps from go's cmd/goal through
           # `go test -overlay` (cobra_tree_matches_go).
-          GOTOOLCHAIN=go1.25.3 MIXED_CLUSTER=1 cargo test -p goal-rust --test cobra_cli_e2e -- --nocapture
+          GOTOOLCHAIN=go1.27.4 MIXED_CLUSTER=1 cargo test -p goal-rust --test cobra_cli_e2e -- --nocapture
           # #2454: go's client setup (ensureKmdClient / ensureAlgodClient /
           # ensureFullClient / getGoalClient): kmd started next to goal (go's
           # kmd, built from ../go-algorand/cmd/kmd, for go's goal), go's error
           # texts without kmd or algod, and consensus.json decoded by go's
           # encoding/json; fixtures/goal_client.jsonl is go's output (a stale
           # one fails goal_client_fixture_matches_go_goal). GOTOOLCHAIN pins
-          # the toolchain of go-algorand v5.0.5-stable's go.mod for go's goal and kmd
-          # (go1.25.3, as released): a newer `stable` go changes
+          # the toolchain of go-algorand v5.1.1-stable's go.mod for go's goal and kmd
+          # (go1.27.4, as released): a newer `stable` go changes
           # encoding/json's error texts.
-          GOTOOLCHAIN=go1.25.3 MIXED_CLUSTER=1 cargo test -p goal-rust --test goal_client_e2e -- --nocapture
+          GOTOOLCHAIN=go1.27.4 MIXED_CLUSTER=1 cargo test -p goal-rust --test goal_client_e2e -- --nocapture
           # #2460: `ledger block` (go's msgpack-to-JSON transcode), `version`,
           # `account list` (the one wallet ensureWalletHandle picks) and
           # errorRequestFail against a mock algod; fixtures/goal_algod_reads.jsonl
           # is go's output (a stale one fails goal_algod_reads_fixture_matches_go_goal).
-          GOTOOLCHAIN=go1.25.3 MIXED_CLUSTER=1 cargo test -p goal-rust --test goal_algod_reads_e2e -- --nocapture
+          GOTOOLCHAIN=go1.27.4 MIXED_CLUSTER=1 cargo test -p goal-rust --test goal_algod_reads_e2e -- --nocapture
           # #2512: `node create` / `node clone` (local disk only); the rows hold go's
           # output and the files it left (fixtures/node_create_clone.jsonl).
-          GOTOOLCHAIN=go1.25.3 MIXED_CLUSTER=1 cargo test -p goal-rust --test node_create_clone_e2e -- --nocapture
+          GOTOOLCHAIN=go1.27.4 MIXED_CLUSTER=1 cargo test -p goal-rust --test node_create_clone_e2e -- --nocapture
           # #2507: the TLS and HTTPS_PROXY failures of an `https:` algod; the rows hold
           # go's text and the CONNECT its proxy saw (fixtures/tls_errors.jsonl).
-          GOTOOLCHAIN=go1.25.3 MIXED_CLUSTER=1 cargo test -p goal-rust --test tls_errors_e2e -- --nocapture
+          GOTOOLCHAIN=go1.27.4 MIXED_CLUSTER=1 cargo test -p goal-rust --test tls_errors_e2e -- --nocapture
           # #2466: its rows also hold go's request errors (a refused or
           # answer-less connection, a 401) and go-codec's decode of malformed
           # JSON answers. The go-codec port itself is checked against go's own
@@ -315,7 +315,7 @@ jobs:
           GO_ALGORAND="$(dirname "$GITHUB_WORKSPACE")/go-algorand"
           mkdir -p "$GO_ALGORAND/cmd/go-codec-json-oracle"
           cp tools/go-codec-json-oracle/main.go "$GO_ALGORAND/cmd/go-codec-json-oracle/"
-          (cd "$GO_ALGORAND" && GOTOOLCHAIN=go1.25.3 go build -o "$RUNNER_TEMP/go-codec-json-oracle" ./cmd/go-codec-json-oracle)
+          (cd "$GO_ALGORAND" && GOTOOLCHAIN=go1.27.4 go build -o "$RUNNER_TEMP/go-codec-json-oracle" ./cmd/go-codec-json-oracle)
           "$RUNNER_TEMP/go-codec-json-oracle" \
             < crates/tools/goal-rust/tests/fixtures/go_codec_json_decode.jsonl \
             > "$RUNNER_TEMP/go_codec_json_decode.jsonl"

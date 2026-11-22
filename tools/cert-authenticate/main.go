@@ -25,7 +25,7 @@
 // already verifies Go-produced certificates under algod-rust's verifier.
 // This tool closes the loop: it takes the certificates committed by the
 // mixed cluster during rounds where the **Rust** node was voting and runs
-// them through go-algorand v5.0.5-stable's verifier, so a certificate
+// them through go-algorand v5.1.1-stable's verifier, so a certificate
 // containing Rust votes is proven to authenticate under both
 // implementations.
 //
@@ -73,7 +73,7 @@
 // cgo, so `go build` needs `make libsodium` to have been run in the
 // go-algorand checkout first (same constraint as every other Go helper
 // in `tools/`). `run-in-docker.sh` next to this file does that inside a
-// `golang:1.25-bookworm` container, which is also what CI does — see
+// `golang:1.27-bookworm` container, which is also what CI does — see
 // `.github/workflows/algokey-e2e.yml` for the apt packages required.
 package main
 
@@ -160,7 +160,7 @@ type report struct {
 // to be built against; it is recorded in the report so a stale build is
 // visible in the artifact. The pin is enforced by the caller (the docker
 // runner checks out this tag).
-const expectedGoAlgorandPin = "v5.0.5-stable"
+const expectedGoAlgorandPin = "v5.1.1-stable"
 
 // ── the LedgerReader Go's verifier will consult ─────────────────────────
 

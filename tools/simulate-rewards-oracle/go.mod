@@ -1,6 +1,6 @@
 module github.com/xarmian/algod-rust/tools/simulate-rewards-oracle
 
-go 1.25.0
+go 1.27.0
 
 require github.com/algorand/go-algorand v0.0.0
 
