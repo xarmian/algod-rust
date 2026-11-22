@@ -58,7 +58,7 @@ pub use pq::{
     canonical_pq_address_salt, pq_address, PQAddressSalt, PQDelegatedProgram, PQSig,
     PQ_SCHEME_FALCON1024,
 };
-pub use rmp_decode::{check_msgpack_depth, msgpack_value_len};
+pub use rmp_decode::{check_block_msgpack_depth, check_msgpack_depth, msgpack_value_len};
 /// go-msgp-compatible byte readers (`ReadBytesBytes` / `ReadExactBytes`) for
 /// wire decoders in other crates (issue #2063); see `docs/BYTES_DECODE_PARITY.md`.
 pub mod go_msgp {

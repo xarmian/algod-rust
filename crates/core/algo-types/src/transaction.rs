@@ -857,12 +857,17 @@ mod serde_eval_delta {
     use rmpv::Value;
     use serde::{Deserialize, Deserializer};
 
-    /// go bounds inner-transaction depth (`MaxInnerTransactionsDepth`) far
-    /// below this, so no valid `dt` reaches it; the cap is only a stack guard
-    /// for hostile nesting. Past it the subtree is left exactly as decoded
-    /// (never an error): this deserializer is shared by gossip / REST /
-    /// persistence and must not reject input that decoded before.
-    const MAX_DEPTH: u32 = 64;
+    /// How many inner-transaction levels are re-typed. go decodes a `dt`
+    /// nested up to 124 inner levels deep (`msgp`'s 255 allowable depth is
+    /// spent twice per level, by `EvalDelta` and `SignedTxnWithAD`) and
+    /// rejects 125 (`algo_codec::decode_block`, which pre-scans for exactly
+    /// that, issue #2539), so a value this deserializer can be handed nests
+    /// no deeper than that, and it re-types every level of it as go does. The
+    /// cap is only a stack guard for input that did not come through that
+    /// pre-scan: past it the subtree is left exactly as decoded (never an
+    /// error): this deserializer is shared by gossip / REST / persistence and
+    /// must not reject input that decoded before.
+    const MAX_DEPTH: u32 = 255;
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
         let mut v = Option::<Value>::deserialize(d)?;
@@ -1035,6 +1040,29 @@ mod serde_eval_delta {
             };
             let igd = map_of(get(get(&itx[0], "dt"), "gd"));
             assert!(is_raw_str(&igd[0].0, 0xfd), "itx dt gd key");
+        }
+
+        /// A `dt` nested as deep as go accepts (124 inner levels) is re-typed
+        /// at every level (issue #2539; a cap of 64 left the levels below it
+        /// as `bin`, so a restored block re-encoded to other bytes than go's).
+        #[test]
+        fn retyping_reaches_every_level_go_decodes() {
+            let mut dt = Value::Map(vec![(
+                s("gd"),
+                Value::Map(vec![(
+                    raw_str(&[0xff]),
+                    Value::Map(vec![(s("at"), Value::from(1u64))]),
+                )]),
+            )]);
+            for _ in 0..124 {
+                dt = Value::Map(vec![(
+                    s("itx"),
+                    Value::Array(vec![Value::Map(vec![(s("dt"), dt)])]),
+                )]);
+            }
+            let bytes = rmp_serde::to_vec_named(&stx_with(dt.clone())).unwrap();
+            let back: SignedTransaction = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(back.eval_delta, Some(dt));
         }
 
         /// The serde form is lossless: str-typed non-UTF-8 content survives
