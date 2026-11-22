@@ -162,39 +162,6 @@ pub fn fee_for_usage(base: u64, usage: u64, multiplier: u64, residue: u64) -> (u
     (quo + 1, (FEE_RESIDUE_SCALE - (rem - residue)) as u64, false)
 }
 
-/// The hard cap on `Note` byte length used by well-formedness checks. Mirrors
-/// the *effective* value of go's `MaxAbsoluteTxnNoteBytes`: go's
-/// `checkSetMax(p.MaxAbsoluteTxnNoteBytes, &bounds.MaxTxnNoteBytes)`
-/// (`config/consensus.go`) clamps the absolute cap to at least the free/soft
-/// cap (`MaxTxnNoteBytes`) at config-load time for every protocol version, so
-/// upstream's `WellFormed` check (`len(tx.Note) > proto.MaxAbsoluteTxnNoteBytes`)
-/// is unconditional and always at least as strict as the old soft cap.
-/// Every built-in protocol sets it (go's v7 base: 1024, the soft cap); a
-/// `0` (a `consensus.json` entry that leaves it out) falls back to the soft
-/// cap.
-pub fn effective_max_note_bytes(params: &ConsensusParams) -> usize {
-    if params.max_absolute_txn_note_bytes > 0 {
-        params.max_absolute_txn_note_bytes
-    } else {
-        params.max_txn_note_bytes
-    }
-}
-
-/// The hard cap on the summed length of `ApplicationArgs` used by
-/// well-formedness checks. Mirrors the *effective* value of go's
-/// `MaxAbsoluteTotalArgLen`, analogous to [`effective_max_note_bytes`]: go's
-/// `checkSetMax(p.MaxAbsoluteTotalArgLen, &bounds.MaxAppTotalArgLen)` clamps it
-/// to at least the free/soft cap (`MaxAppTotalArgLen`) at config-load time, so
-/// this falls back to the soft cap when `max_absolute_total_arg_len` is `0`
-/// (go sets it from v24, to the soft cap 2048).
-pub fn effective_max_total_arg_len(params: &ConsensusParams) -> usize {
-    if params.max_absolute_total_arg_len > 0 {
-        params.max_absolute_total_arg_len
-    } else {
-        params.max_app_total_arg_len
-    }
-}
-
 /// Mirrors go's `Header.FeeContribution(proto)` (`data/transactions/transaction.go`):
 /// the fee-factor surcharge (in `Micros`) for `Note` bytes beyond the old
 /// free/soft cap (`MaxTxnNoteBytes`), saturating.

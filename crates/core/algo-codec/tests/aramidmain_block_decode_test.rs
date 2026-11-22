@@ -24,12 +24,14 @@
 //! https://algod.aramidmain.a-wallet.net (go-algorand v4.7.3), byte for byte.
 //!
 //! go's msgp `allocbound` of `note` is `bounds.MaxTxnNoteBytes`, the maximum
-//! over every LOADED consensus protocol (`config.checkSetAllocBounds`, run
-//! again by `SetConfigurableConsensusProtocols` for a `consensus.json`). With
-//! only the built-in table it is 4096 and go v5.0.5-stable rejects this block
-//! (`msgp: length overflow: 8535 > 4096 at Txn at 0 at Payset at Block`); once
-//! the network's protocols are loaded the bound covers them. algod-rust's
-//! bounds were constants (#2427), so the aramidmain node halted here.
+//! of `MaxAbsoluteTxnNoteBytes` over every LOADED consensus protocol
+//! (`config.checkSetAllocBounds`, run again by
+//! `SetConfigurableConsensusProtocols` for a `consensus.json`). The vendored
+//! `consensus.json` was written for go v4.7.3 and leaves that field out (0), so
+//! the bound stays 4096 and go v5.0.5-stable rejects this block, loaded or not
+//! (`msgp: length overflow: 8535 > 4096 at Txn at 0 at Payset at Block`);
+//! algod-rust matches go (issue #2441; before it, the bound followed
+//! `MaxTxnNoteBytes`, as go v4.7.3 does, and the block decoded).
 //!
 //! `install_consensus_overrides` is a process-global write-once: this test
 //! binary holds this one test only.
@@ -63,8 +65,8 @@ fn block_bytes(body: &[u8]) -> &[u8] {
 }
 
 #[test]
-fn aramidmain_block_with_a_large_note_decodes_once_the_network_protocols_are_loaded() {
-    // Built-in table only: go's verdict too (bounds.MaxTxnNoteBytes = 4096).
+fn aramidmain_block_with_a_large_note_is_refused_even_with_the_network_protocols_loaded() {
+    // Built-in table only: go's verdict (bounds.MaxTxnNoteBytes = 4096).
     let err = decode_block_response(BLOCK_23132701).expect_err("4096-byte note bound");
     assert!(
         format!("{err:?}").contains("8535"),
@@ -75,18 +77,25 @@ fn aramidmain_block_with_a_large_note_decodes_once_the_network_protocols_are_loa
         preload_consensus_protocols_with_bundle(None, built_in_consensus_protocols(), Some(BUNDLE))
             .unwrap();
     install_consensus_overrides(&merged);
-    assert_eq!(
-        algo_types::go_msgp::bounds::MAX_TXN_NOTE_BYTES.get(),
-        131_072
+    // `MaxAbsoluteTxnNoteBytes` is unset (0) in the file: no bound is raised.
+    assert_eq!(algo_types::go_msgp::bounds::MAX_TXN_NOTE_BYTES.get(), 4096);
+    let err = decode_block_response(BLOCK_23132701).expect_err("still the 4096-byte bound");
+    assert!(
+        format!("{err:?}").contains("8535"),
+        "the note's length header is what is refused: {err:?}"
     );
 
+    // go wrote it canonically, and its hash is the next block's `prev`: the
+    // block is fine under the bound go v4.7.3 used, which a protocol that sets
+    // `MaxAbsoluteTxnNoteBytes` brings back.
+    let mut p = algo_types::consensus::consensus_params_for_version("future").unwrap();
+    p.max_absolute_txn_note_bytes = 131_072;
+    algo_types::consensus::check_set_alloc_bounds(&p);
     let resp = decode_block_response(BLOCK_23132701).expect("aramidmain block decodes");
     assert_eq!(resp.block.round.0, 23_132_701);
     assert_eq!(resp.block.payset.len(), 1);
     assert_eq!(resp.block.payset[0].txn.note.len(), 8535);
     assert!(resp.cert.is_some());
-
-    // go wrote it canonically, and its hash is the next block's `prev`.
     let raw = block_bytes(BLOCK_23132701);
     let blk = decode_block(raw).unwrap();
     assert!(canonical_encode_block(&blk) == raw, "canonical re-encode");

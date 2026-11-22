@@ -680,7 +680,7 @@ pub fn validate_transaction_wellformed_in_mode(
     // protocol version). Bytes between the old free/soft cap
     // (max_txn_note_bytes) and this hard cap are well-formed but billable via
     // `fee::header_fee_contribution` (v42+ size pricing).
-    let max_note_bytes = crate::fee::effective_max_note_bytes(params);
+    let max_note_bytes = params.max_absolute_txn_note_bytes;
     if txn.note.len() > max_note_bytes {
         return Err(AlgoError::Validation {
             message: format!(
@@ -1337,7 +1337,7 @@ fn validate_application_call_wellformed(
                 .sum()
         })
         .unwrap_or(0);
-    let max_total_arg_len = crate::fee::effective_max_total_arg_len(params);
+    let max_total_arg_len = params.max_absolute_total_arg_len;
     if total_arg_bytes > max_total_arg_len {
         return Err(AlgoError::Validation {
             message: format!(
@@ -4067,6 +4067,99 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("ApplicationArgs total length is too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // -- A consensus.json that leaves the MaxAbsolute* caps out (issue #2441) --
+    //
+    // go v5.0.5-stable decodes a protocol entry into a zero struct, so an
+    // unset `MaxAbsoluteTxnNoteBytes` / `MaxAbsoluteLogicSigProgramSize` /
+    // `MaxAbsoluteExtraProgramPages` / `MaxAbsoluteTotalArgLen` is 0 and
+    // `WellFormed` enforces 0 (no fallback to the soft caps). The verdicts
+    // below are what a go program printed for the vendored aramidmain
+    // `consensus.json` (go v4.7.3's file) loaded with
+    // `config.PreloadConfigurableConsensusProtocols`:
+    //
+    //   proto note 131072 0 lsig 1000 0 epp 3 0 arg 2048 0
+    //   note 0 <nil>
+    //   note 1 transaction note too big: 1 > 0
+    //   epp 0 <nil>
+    //   epp 1 tx.ExtraProgramPages exceeds MaxAbsoluteExtraProgramPages = 0
+    //   args 1 tx.ApplicationArgs total length is too long. 1 > 0
+
+    fn aramidmain_params() -> ConsensusParams {
+        let merged = algo_types::consensus::preload_consensus_protocols_with_bundle(
+            None,
+            algo_types::consensus::built_in_consensus_protocols(),
+            Some(include_str!(
+                "../../../../bin/algod-rust/consensus/aramidmain-consensus.json"
+            )),
+        )
+        .expect("the bundled aramidmain consensus.json loads");
+        merged
+            .get("aramidmain-v1.0/3")
+            .expect("aramidmain-v1.0/3 is bundled")
+            .clone()
+    }
+
+    #[test]
+    fn test_unset_max_absolute_caps_are_zero_like_go() {
+        let p = aramidmain_params();
+        assert_eq!(
+            (
+                p.max_txn_note_bytes,
+                p.max_absolute_txn_note_bytes,
+                p.logic_sig_max_size,
+                p.max_absolute_logic_sig_program_size,
+                p.max_extra_app_program_pages,
+                p.max_absolute_extra_program_pages,
+                p.max_app_total_arg_len,
+                p.max_absolute_total_arg_len,
+            ),
+            (131_072, 0, 1000, 0, 3, 0, 2048, 0)
+        );
+    }
+
+    #[test]
+    fn test_unset_max_absolute_note_cap_rejects_any_note_like_go() {
+        let params = aramidmain_params();
+        let mut txn = make_valid_txn();
+        txn.fee = u64::MAX / 2;
+        txn.note = ByteBuf::from(Vec::new());
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+        for len in [1usize, 1024, 8535] {
+            txn.note = ByteBuf::from(vec![0u8; len]);
+            let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("transaction note too big: {len} > 0")),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unset_max_absolute_extra_pages_and_arg_caps_reject_like_go() {
+        let params = aramidmain_params();
+        let mut txn = make_appl_txn();
+        txn.application_id = 0;
+        set_min_programs(&mut txn);
+        txn.fee = u64::MAX / 2;
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+        txn.extra_program_pages = 1;
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("tx.ExtraProgramPages exceeds MaxAbsoluteExtraProgramPages = 0"),
+            "unexpected error: {err}"
+        );
+        txn.extra_program_pages = 0;
+        txn.app_arguments = Some(vec![Some(ByteBuf::from(vec![0u8; 1]))]);
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("tx.ApplicationArgs total length is too long. 1 > 0"),
             "unexpected error: {err}"
         );
     }

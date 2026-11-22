@@ -21,10 +21,12 @@
 //! go's `config.checkSetAllocBounds` (issue #2439). The values are go
 //! v5.0.5-stable's `bounds.*`, printed by a go program after `config.init`
 //! (built-in table) and after `config.LoadConfigurableConsensusProtocols`
-//! with the aramidmain `consensus.json` (its `MaxAbsoluteTxnNoteBytes` set to
-//! its `MaxTxnNoteBytes`, the value algod-rust's `WellFormed` uses for a file
-//! that leaves it unset). The bounds are process-global and only grow, so
-//! this binary holds one test that runs the steps in order.
+//! with the vendored aramidmain `consensus.json` as it is: it leaves the v5
+//! `MaxAbsolute*` fields out, go reads them as 0 and `MaxTxnNoteBytes` stays
+//! at 4096 (issue #2441; go: `bounds MaxTxnNoteBytes 4096 MaxAppTotalArgLen
+//! 16384 MaxExtraAppProgramLen 7 MaxLogicSigMaxSize 16000`). The bounds are
+//! process-global and only grow, so this binary holds one test that runs the
+//! steps in order.
 
 use algo_types::consensus::{
     built_in_consensus_protocols, check_set_alloc_bounds, consensus_params_for_version,
@@ -78,15 +80,15 @@ fn alloc_bounds_follow_every_loaded_protocol_like_go() {
     }
     assert_eq!(bounds::snapshot(), expect(&[]));
 
-    // The aramidmain protocols raise only the note bound (go: `abs ...
-    // MaxTxnNoteBytes=131072`, every other bound unchanged).
+    // The aramidmain protocols raise nothing: their `MaxAbsoluteTxnNoteBytes`
+    // is 0 and go does not fall back to `MaxTxnNoteBytes` (131072).
     let merged =
         preload_consensus_protocols_with_bundle(None, built_in_consensus_protocols(), Some(BUNDLE))
             .unwrap();
     for p in merged.values() {
         check_set_alloc_bounds(p);
     }
-    assert_eq!(bounds::snapshot(), expect(&[("MaxTxnNoteBytes", 131_072)]));
+    assert_eq!(bounds::snapshot(), expect(&[]));
 
     // A protocol above every bound raises each one; the available program
     // length is recomputed from the two maxima it is made of.

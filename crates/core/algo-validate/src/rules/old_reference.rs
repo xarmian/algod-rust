@@ -237,7 +237,7 @@ pub fn old_validate_transaction_wellformed(
     // protocol version). Bytes between the old free/soft cap
     // (max_txn_note_bytes) and this hard cap are well-formed but billable via
     // `fee::header_fee_contribution` (v42+ size pricing).
-    let max_note_bytes = crate::fee::effective_max_note_bytes(params);
+    let max_note_bytes = params.max_absolute_txn_note_bytes;
     if txn.note.len() > max_note_bytes {
         return Err(AlgoError::Validation {
             message: format!(
