@@ -20,6 +20,10 @@ Every issue goes through these nine steps, in order. Do not skip a step because 
 - For consensus/ledger/network issues, decide up front whether a live multi-node repro is needed (`ops/mixed-cluster/`, `docker/scripts/bench-stress.sh`) to actually observe the bug, rather than guessing from code reading alone.
 - **Check `docs/DIVERGENCES.md` first.** If the issue's area is a registered intended divergence (`DIV-NNN`, see CLAUDE.md "Intended divergences"), the fix must keep that divergence (re-verify its proof instead of restoring the go-algorand shape), and if the fix itself introduces a new deliberate difference, the register row + section and `DIVERGENCE DIV-NNN:` markers are part of this PR (`python3 scripts/check_divergences.py` must stay green).
 
+> Parity rules (no new DIV entries, match go on pathological input, go oracles
+> and fixtures, `decode_guarded`, depth rules, harness pitfalls): see CLAUDE.md
+> "Parity working rules".
+
 ### 2. TDD: write a failing test first
 
 - Write the test(s) that pin the *correct* behavior before touching the fix. The test must fail for the right reason against the current code (verify this — a test that passes by accident proves nothing).
