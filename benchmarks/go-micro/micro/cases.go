@@ -609,7 +609,7 @@ func lsig(file string) builder {
 		return &Case{
 			Op: func() {
 				ep := logic.NewSigEvalParams(group, &proto, logic.NoHeaderLedger{})
-				pass, err := logic.EvalSignatureProgram(group[0].Lsig.Logic, group[0].Lsig.Args, 0, ep)
+				pass, _, err := logic.EvalSignatureProgram(group[0].Lsig.Logic, group[0].Lsig.Args, 0, ep)
 				mustNoErr(err)
 				if !pass {
 					panic("logicsig rejected")

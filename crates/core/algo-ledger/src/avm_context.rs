@@ -6971,16 +6971,16 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // inner group, ClearState included, before any sibling runs. An
         // earlier sibling may therefore spend budget that a later sibling
         // contributes (mainnet round 67137517, issue #2493).
+        let inner_apps = txns.iter().filter(|s| s.txn.txn_type == "appl").count();
         if self.consensus.enable_app_cost_pooling {
-            let inner_apps = txns.iter().filter(|s| s.txn.txn_type == "appl").count() as i64;
-            self.opcode_budget += inner_apps * self.consensus.max_app_program_cost as i64;
+            self.opcode_budget += inner_apps as i64 * self.consensus.max_app_program_cost as i64;
         }
 
         // Notify tracer of the inner transaction group.
         if let Some(p) = self.tracer_ptr {
             // SAFETY: tracer_ptr is valid for the duration of this context
             // and only one mutable ref is live at a time.
-            unsafe { &mut *p }.before_txn_group(txns.len());
+            unsafe { &mut *p }.before_txn_group(txns.len(), inner_apps);
         }
 
         // Shared across every member of *this* inner group so `gload`/

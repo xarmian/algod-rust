@@ -117,7 +117,7 @@ pub trait EvalTracer {
     fn after_block(&mut self, _round: u64) {}
 
     /// Called before a transaction group is executed (top-level or inner).
-    fn before_txn_group(&mut self, _group_size: usize) {}
+    fn before_txn_group(&mut self, _group_size: usize, _app_calls: usize) {}
 
     /// Called after a transaction group has been executed.
     fn after_txn_group(&mut self, _error: Option<&str>) {}
