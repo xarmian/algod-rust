@@ -1688,7 +1688,7 @@
    }
   }
  ],
- "crypto.FalconVerifier": [
+ "crypto.Falcon1024Verifier": [
   {
    "go": "PublicKey",
    "key": "k",
@@ -1847,7 +1847,7 @@
    }
   }
  ],
- "main.pqPublicMaterial": [
+ "main.saltedPublicMaterial": [
   {
    "go": "Scheme",
    "key": "scheme",
@@ -1873,13 +1873,13 @@
    }
   }
  ],
- "main.pqSigningMaterial": [
+ "main.saltedSigningMaterial": [
   {
    "go": "Public",
    "key": "public",
    "type": {
     "k": "struct",
-    "t": "main.pqPublicMaterial"
+    "t": "main.saltedPublicMaterial"
    }
   },
   {
@@ -1979,7 +1979,7 @@
    "key": "vkey",
    "type": {
     "k": "struct",
-    "t": "crypto.FalconVerifier"
+    "t": "crypto.Falcon1024Verifier"
    }
   }
  ],
@@ -2541,11 +2541,11 @@
    }
   },
   {
-   "go": "PQsig",
+   "go": "SKsig",
    "key": "pqsig",
    "type": {
     "k": "struct",
-    "t": "transactions.PQSig"
+    "t": "transactions.SaltedKeySig"
    }
   },
   {
@@ -2557,40 +2557,6 @@
      "t": "bytes"
     },
     "k": "list"
-   }
-  }
- ],
- "transactions.PQSig": [
-  {
-   "go": "Scheme",
-   "key": "sch",
-   "type": {
-    "k": "leaf",
-    "t": "bytes[2]"
-   }
-  },
-  {
-   "go": "Salt",
-   "key": "slt",
-   "type": {
-    "k": "leaf",
-    "t": "uint8"
-   }
-  },
-  {
-   "go": "PublicKey",
-   "key": "pk",
-   "type": {
-    "k": "leaf",
-    "t": "bytes"
-   }
-  },
-  {
-   "go": "Signature",
-   "key": "sig",
-   "type": {
-    "k": "leaf",
-    "t": "bytes"
    }
   }
  ],
@@ -2644,6 +2610,40 @@
    }
   }
  ],
+ "transactions.SaltedKeySig": [
+  {
+   "go": "Scheme",
+   "key": "sch",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[2]"
+   }
+  },
+  {
+   "go": "Salt",
+   "key": "slt",
+   "type": {
+    "k": "leaf",
+    "t": "uint8"
+   }
+  },
+  {
+   "go": "PublicKey",
+   "key": "pk",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  },
+  {
+   "go": "Signature",
+   "key": "sig",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  }
+ ],
  "transactions.SignedTxn": [
   {
    "go": "Sig",
@@ -2670,11 +2670,11 @@
    }
   },
   {
-   "go": "PQsig",
+   "go": "SKsig",
    "key": "pqsig",
    "type": {
     "k": "struct",
-    "t": "transactions.PQSig"
+    "t": "transactions.SaltedKeySig"
    }
   },
   {
@@ -2720,11 +2720,11 @@
    }
   },
   {
-   "go": "PQsig",
+   "go": "SKsig",
    "key": "pqsig",
    "type": {
     "k": "struct",
-    "t": "transactions.PQSig"
+    "t": "transactions.SaltedKeySig"
    }
   },
   {
@@ -2850,11 +2850,11 @@
    }
   },
   {
-   "go": "PQsig",
+   "go": "SKsig",
    "key": "pqsig",
    "type": {
     "k": "struct",
-    "t": "transactions.PQSig"
+    "t": "transactions.SaltedKeySig"
    }
   },
   {
