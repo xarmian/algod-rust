@@ -323,6 +323,53 @@ Full Rust reimplementation of go-algorand — a production-grade Algorand node. 
   `--no-verify`, etc.), and it does not extend to merges requested ad hoc
   outside these skills' flow — those still confirm as normal.
 
+## Parity working rules (lessons of #2441 / #2537 / #2539)
+
+- **No new `DIV-` entries.** Do not add to the register: where algod-rust
+  differs from go, fix algod-rust (existing entries stay; DIV-004 is retired).
+- **Match go even for pathological input** (truncated, hostile, absurdly deep).
+  Never return a "nicer" result than go, never add a fallback. Prove it with a
+  go-generated row, not by reading code. Bound only what the harness must (below).
+- **Go oracles** are small programs in `tools/*-oracle/` (`go-codec-json-oracle`,
+  `dt-nesting-oracle`, `strict-decode-oracle`, ...): copy `main.go` into a
+  `../go-algorand/cmd/<name>/`, `make libsodium` first, build, run it on the
+  fixture inputs; the header comment of each states the exact command. Keep the
+  go output as a committed fixture and compare the Rust port to it in a test.
+  goal-rust fixtures are regenerated with `MIXED_CLUSTER=1 REGEN_<NAME>_FIXTURE=1`
+  (e.g. `REGEN_GOAL_ALGOD_READS_FIXTURE`, `REGEN_COBRA_CLI_FIXTURE`) on a Linux/WSL
+  clone with go, never on a Windows checkout (CRLF).
+- **MaxAbsolute\* in a `consensus.json`**: a key left out is `0` and is enforced
+  as `0`, as go v5.0.5 does (checked with a go program). aramidmain's v4.7.3
+  `consensus.json` is rejected by go v5.0.5 too, so aramidmain cannot be
+  followed and gets no fallback (allocbound stays 4096).
+- **go-codec never finishes a JSON array cut after a comma (`[1,`)**; goal-rust
+  reproduces that (`go_codec_json::decode` loops). Tests use
+  `decode_guarded(body, ty, max_loop_iterations)` -> `Error::Endless`; never call
+  the unguarded `decode` on such a body in a test. Fixtures:
+  `go_codec_json_endless.jsonl` (go-verified with `timeout -s KILL` and
+  `ulimit -v`) next to `go_codec_json_decode.jsonl`. A test asserting the old
+  `EOF` for such a body hangs CI (nextest 45 min timeout): grep for it.
+- **Block/`dt` decode**: go's msgp depth cap (255) is spent by struct decoders;
+  the `itx` array costs nothing (124 inner levels accepted, 125 rejected), so block
+  entry points use `check_block_msgpack_depth`, other decoders
+  `check_msgpack_depth`. A scan that is followed by a full decode of the same
+  bytes must not nest (`go_eval_delta::SCANNING`): that made a non-canonical
+  `dt` cost 2^depth. Look for the same shape (try-fast-path then redo) in any
+  recursive decoder; test depth 20+ in debug.
+- **Soak/nightly status**: #2493 / #2515 (mainnet / voimain halts) stay open
+  until a nightly run after the fix is green; do not close on local evidence.
+- **Harness pitfalls**: foreground builds with `timeout`; a background `cargo`
+  next to another build deadlocks on the target lock (kill stray cargo/test
+  processes); WSL `bash -c` breaks on a `$PATH` containing parentheses (use a
+  script file); never `cargo fmt --all` (pre-existing fmt diffs in
+  `goal-rust/src/cmd/{asset,clerk}.rs` are not ours); CRLF fixtures fail only
+  golden tests; a new dependency needs its hand-edited `Cargo.lock` entry (MSRV
+  `--locked` check); `cargo-deny` RUSTSEC failures are fixed by bumping the
+  locked crate (e.g. `url` 2.5.9); the "strict unknown-field parity" 403 clone
+  failure is a GitHub flake: `gh run rerun <id> --failed`.
+- **Waiting on CI**: `scripts/wait_for_pr_checks.sh <pr>` in the foreground
+  with `timeout`, then no polling (see the section above).
+
 ## Common Commands
 
 ```bash
