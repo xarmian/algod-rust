@@ -460,7 +460,7 @@ func main() {
 	}
 	w.put("vrf.frames", micro.EncodeFrames(vrfPK[:], proof[:], alpha))
 
-	falconSigner, err := crypto.GenerateFalconSigner(crypto.FalconSeed(stream(crypto.FalconSeedSize)))
+	falconSigner, err := crypto.GenerateFalcon1024Signer(crypto.FalconSeed(stream(crypto.FalconSeedSize)))
 	if err != nil {
 		log.Fatal(err)
 	}
