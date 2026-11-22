@@ -1,6 +1,6 @@
 module canonical-extract
 
-go 1.25.0
+go 1.27.0
 
 require (
 	github.com/algorand/go-algorand-sdk/v2 v2.6.0

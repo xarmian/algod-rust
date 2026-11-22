@@ -179,9 +179,9 @@ func negatives(sig, msg, otherPubkey []byte) []negative {
 }
 
 func verifyOK(pubkey, sig, msg []byte) bool {
-	var fv crypto.FalconVerifier
+	var fv crypto.Falcon1024Verifier
 	copy(fv.PublicKey[:], pubkey)
-	return fv.VerifyBytes(msg, crypto.FalconSignature(sig)) == nil
+	return fv.VerifyBytes(msg, crypto.Falcon1024Signature(sig)) == nil
 }
 
 type negInput struct {
@@ -197,11 +197,11 @@ func generate() []byte {
 	for si, sd := range seeds() {
 		var seed crypto.FalconSeed
 		copy(seed[:], sd.data)
-		signer, err := crypto.GenerateFalconSigner(seed)
+		signer, err := crypto.GenerateFalcon1024Signer(seed)
 		if err != nil {
 			panic(fmt.Sprintf("%s: keygen: %v", sd.name, err))
 		}
-		again, _ := crypto.GenerateFalconSigner(seed)
+		again, _ := crypto.GenerateFalcon1024Signer(seed)
 		if again.PublicKey != signer.PublicKey || again.PrivateKey != signer.PrivateKey {
 			panic(fmt.Sprintf("%s: keygen is not deterministic", sd.name))
 		}
