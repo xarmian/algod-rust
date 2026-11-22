@@ -21,7 +21,7 @@
 //! The Go answer types goal decodes with go-codec's JSON decoder (issue
 //! #2466); the decoder itself is [`algo_codec::go_codec_json`].
 
-pub use algo_codec::go_codec_json::{decode, decode_reading, Error, Field, Ty};
+pub use algo_codec::go_codec_json::{decode, decode_guarded, decode_reading, Error, Field, Ty};
 
 // ---- the Go types goal reads ----------------------------------------------
 

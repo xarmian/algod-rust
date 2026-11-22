@@ -103,6 +103,10 @@ pub enum Error {
     /// `json decode error [pos <pos>]: <msg>`; `msg` is bytes, as go's
     /// `%s` of a source token that is not UTF-8 is.
     At(usize, Vec<u8>),
+    /// Only from [`decode_guarded`]: a container loop went round more than the
+    /// guard allows (go's never ends, issue #2537). `elements` is the size
+    /// the container being filled had grown to.
+    Endless { iterations: u64, elements: usize },
 }
 
 impl Error {
@@ -113,6 +117,13 @@ impl Error {
             Self::At(pos, msg) => {
                 cat(&[format!("json decode error [pos {pos}]: ").as_bytes(), msg])
             }
+            Self::Endless {
+                iterations,
+                elements,
+            } => format!(
+                "go-codec does not finish decoding this (guard: {iterations} rounds of one loop, {elements} elements)"
+            )
+            .into_bytes(),
         }
     }
 }
@@ -131,6 +142,20 @@ fn cat(parts: &[&[u8]]) -> Vec<u8> {
 /// pointer to `ty`: the decoded value, or go-codec's error.
 pub fn decode(body: &[u8], ty: &'static Ty) -> Result<Value, Error> {
     decode_reading(body, ty).0
+}
+
+/// [`decode`] with a guard: a container loop that goes round more than
+/// `max_loop_iterations` times fails with [`Error::Endless`]. go's decoder
+/// loops for ever on an array cut after a comma (issue #2537) and so does
+/// [`decode`]; this entry point lets a test observe that without hanging.
+pub fn decode_guarded(
+    body: &[u8],
+    ty: &'static Ty,
+    max_loop_iterations: u64,
+) -> Result<Value, Error> {
+    let mut d = Dec::new(body, Mode::Io);
+    d.guard = Some(max_loop_iterations);
+    decode_with(&mut d, ty)
 }
 
 /// [`decode`], and whether it read past the end of `body`: on a body that
@@ -221,16 +246,6 @@ enum Container {
 /// string is first read.
 const SCRATCH: usize = 64;
 
-#[derive(PartialEq, Eq)]
-struct LoopState {
-    n: usize,
-    off: usize,
-    tok: u8,
-    last: u8,
-    ls: LastByte,
-    c: Container,
-}
-
 /// Which go-codec reader feeds the decoder.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -252,6 +267,10 @@ struct Dec<'a> {
     c: Container,
     /// A read went past the end of the body.
     hit_end: bool,
+    /// Rounds of one container loop after which the decode gives up with
+    /// [`Error::Endless`]; `None` (every production entry point) never does,
+    /// as go's does not.
+    guard: Option<u64>,
     /// Keep a decoded string's bytes as they are (the lossless
     /// [`algo_types::raw_text`] form), as go's `string` does and `fmt` prints
     /// unfiltered: only the REST client's decode ([`Mode::Io`]); the
@@ -289,6 +308,7 @@ impl<'a> Dec<'a> {
             c: Container::None,
             hit_end: false,
             raw_strings: mode == Mode::Io,
+            guard: None,
         }
     }
 
@@ -502,24 +522,25 @@ impl<'a> Dec<'a> {
         Ok(self.tok == b'}' || self.tok == b']')
     }
 
-    /// `!CheckBreak()` of a container loop. A loop that starts again in
-    /// exactly the state it last started in would go round forever: go-codec
-    /// does, on an array cut after a comma (`[1,`: each element reads the
-    /// comma back through `unreadn1`), growing the slice until the process
-    /// runs out of memory. That is reported as the `EOF` it never gets to.
-    fn more(&mut self, seen: &mut Option<LoopState>) -> Result<bool, Error> {
-        let now = LoopState {
-            n: self.n,
-            off: self.off,
-            tok: self.tok,
-            last: self.last,
-            ls: self.ls,
-            c: self.c,
-        };
-        if seen.as_ref() == Some(&now) {
-            return Err(Error::Eof);
+    /// `!CheckBreak()` of a container loop, one round.
+    ///
+    /// A loop that starts again in exactly the state it last started in goes
+    /// round forever: go-codec does, on an array cut after a comma (`[1,`:
+    /// each element reads the comma back through `unreadn1`), growing the
+    /// slice until the process runs out of memory (issue #2537). So does this
+    /// decoder; only a decoder given a guard ([`decode_guarded`]) stops, with
+    /// [`Error::Endless`], after that many rounds of one loop. `elements` is
+    /// the size of the container being filled.
+    fn more(&mut self, rounds: &mut u64, elements: usize) -> Result<bool, Error> {
+        *rounds += 1;
+        if let Some(max) = self.guard {
+            if *rounds > max {
+                return Err(Error::Endless {
+                    iterations: *rounds,
+                    elements,
+                });
+            }
         }
-        *seen = Some(now);
         Ok(!self.check_break()?)
     }
 
@@ -932,8 +953,8 @@ impl<'a> Dec<'a> {
             b'{' => {
                 self.read_map_start()?;
                 let mut m = Map::new();
-                let mut seen = None;
-                while self.more(&mut seen)? {
+                let mut rounds = 0u64;
+                while self.more(&mut rounds, m.len())? {
                     // a `map[interface{}]interface{}`: the key is naked too
                     self.read_map_elem_key()?;
                     let k = match self.decode_naked()? {
@@ -950,8 +971,8 @@ impl<'a> Dec<'a> {
             b'[' => {
                 self.read_array_start()?;
                 let mut items = Vec::new();
-                let mut seen = None;
-                while self.more(&mut seen)? {
+                let mut rounds = 0u64;
+                while self.more(&mut rounds, items.len())? {
                     self.read_array_elem()?;
                     items.push(self.decode_naked()?);
                 }
@@ -1035,8 +1056,8 @@ impl<'a> Dec<'a> {
         }
         let array = self.slice_start()?;
         let mut j = 0;
-        let mut seen = None;
-        while self.more(&mut seen)? {
+        let mut rounds = 0u64;
+        while self.more(&mut rounds, j)? {
             self.slice_elem(array, j)?;
             let nil = self.try_decode_as_nil()?;
             if j >= n {
@@ -1061,8 +1082,8 @@ impl<'a> Dec<'a> {
         let array = self.slice_start()?;
         let mut items = Vec::new();
         let mut j = 0;
-        let mut seen = None;
-        while self.more(&mut seen)? {
+        let mut rounds = 0u64;
+        while self.more(&mut rounds, items.len())? {
             self.slice_elem(array, j)?;
             let mut item = zero(elem);
             if !self.try_decode_as_nil()? {
@@ -1088,8 +1109,8 @@ impl<'a> Dec<'a> {
             Value::Object(m) => m,
             _ => Map::new(),
         };
-        let mut seen = None;
-        while self.more(&mut seen)? {
+        let mut rounds = 0u64;
+        while self.more(&mut rounds, m.len())? {
             self.read_map_elem_key()?;
             let mut k = zero(key);
             self.decode_value(key, &mut k)?;
@@ -1114,8 +1135,8 @@ impl<'a> Dec<'a> {
         let ctyp = self.container_type()?;
         if ctyp == VALUE_TYPE_MAP {
             self.read_map_start()?;
-            let mut seen = None;
-            while self.more(&mut seen)? {
+            let mut rounds = 0u64;
+            while self.more(&mut rounds, 0)? {
                 self.read_map_elem_key()?;
                 let (key, _) = self.append_string_as_bytes()?;
                 self.read_map_elem_value()?;
@@ -1226,8 +1247,8 @@ impl<'a> Dec<'a> {
             _ => Vec::new(),
         };
         let mut j = 0;
-        let mut seen = None;
-        while self.more(&mut seen)? {
+        let mut rounds = 0u64;
+        while self.more(&mut rounds, items.len())? {
             self.slice_elem(array, j)?;
             if j >= items.len() {
                 items.push(zero(elem));
@@ -1249,8 +1270,8 @@ impl<'a> Dec<'a> {
         let array = self.slice_start()?;
         let mut items = Vec::new();
         let mut j = 0;
-        let mut seen = None;
-        while self.more(&mut seen)? {
+        let mut rounds = 0u64;
+        while self.more(&mut rounds, items.len())? {
             self.slice_elem(array, j)?;
             let s = if self.try_decode_as_nil()? {
                 String::new()
@@ -1278,8 +1299,8 @@ impl<'a> Dec<'a> {
             _ => Vec::new(),
         };
         let mut j = 0;
-        let mut seen = None;
-        while self.more(&mut seen)? {
+        let mut rounds = 0u64;
+        while self.more(&mut rounds, old.len())? {
             self.slice_elem(array, j)?;
             if j >= old.len() {
                 old.push(0);
