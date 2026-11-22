@@ -17,6 +17,7 @@ algo-rest-client = { workspace = true }
 algo-rest-api = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
 rustls-platform-verifier = "0.7"
+rustls-native-certs = "0.8"
 algo-kmd-client = { workspace = true }
 algo-kmd-api-types = { workspace = true }
 algo-txn-pipeline = { workspace = true }

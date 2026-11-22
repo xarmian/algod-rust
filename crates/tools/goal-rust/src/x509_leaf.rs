@@ -42,7 +42,7 @@ pub struct Leaf {
 }
 
 /// One DER element: its tag, its content and what follows it.
-fn tlv(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+pub(crate) fn tlv(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
     let tag = *b.first()?;
     let first = *b.get(1)?;
     let (len, hdr) = if first < 0x80 {
@@ -133,7 +133,7 @@ pub fn parse_leaf(der: &[u8]) -> Option<Leaf> {
 }
 
 /// A `UTCTime` (`YYMMDDHHMMSSZ`) or `GeneralizedTime` (`YYYYMMDDHHMMSSZ`).
-fn parse_time(tag: u8, b: &[u8]) -> Option<i64> {
+pub(crate) fn parse_time(tag: u8, b: &[u8]) -> Option<i64> {
     let s = std::str::from_utf8(b).ok()?;
     let s = s.strip_suffix('Z')?;
     let (year, rest) = match tag {

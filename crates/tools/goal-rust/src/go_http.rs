@@ -57,9 +57,16 @@
 //! its REST API (`TLSCertFile` / `TLSKeyFile` are the websocket network's), so
 //! an `https:` algod is a TLS-terminating front end, and whether it picks h2
 //! depends on that software; HTTP/1.1 is what a plain algod behind it speaks
-//! and what goal-rust negotiates. A certificate authority used as the leaf is
-//! accepted by go and refused by webpki (`CaUsedAsEndEntity`); goal-rust keeps
-//! the stricter verdict.
+//! and what goal-rust negotiates.
+//!
+//! A certificate authority used as the leaf is accepted by go when it chains
+//! to a trusted root and refused by webpki (`CaUsedAsEndEntity`); since issue
+//! #2532 [`crate::x509_chain`] repeats go's chain building for exactly that
+//! case (every signature, validity period, CA flag, path length and key usage
+//! checked, anything it cannot judge refused). The trust stores of macOS and
+//! Windows are not read the way go reads them (go: Keychain, CryptoAPI; here:
+//! `rustls-platform-verifier` and `rustls-native-certs`); their error texts
+//! cannot be compared on the Linux rows, a documented limit.
 //!
 //! Every error is `<Op> "<url>": <err>` (`*url.Error`). Texts are in the
 //! lossless form of [`algo_types::raw_text`]: a reason phrase that is not
@@ -543,6 +550,7 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 struct GoVerifier {
     inner: std::sync::Arc<dyn rustls::client::danger::ServerCertVerifier>,
     host: String,
+    algs: rustls::crypto::WebPkiSupportedAlgorithms,
 }
 
 impl rustls::client::danger::ServerCertVerifier for GoVerifier {
@@ -563,8 +571,35 @@ impl rustls::client::danger::ServerCertVerifier for GoVerifier {
                 return Err(rustls::Error::General(e));
             }
         }
-        self.inner
-            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+        match self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            // webpki refuses a certificate authority as the end entity, go
+            // builds its chain: the same checks, by `x509_chain`
+            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Other(o)))
+                if format!("{o:?}").contains("CaUsedAsEndEntity") =>
+            {
+                let unix = i64::try_from(now.as_secs()).unwrap_or(i64::MAX);
+                let roots = rustls_native_certs::load_native_certs().certs;
+                let roots: Vec<&[u8]> = roots.iter().map(AsRef::as_ref).collect();
+                let inters: Vec<&[u8]> = intermediates.iter().map(AsRef::as_ref).collect();
+                match crate::x509_chain::verify_ca_leaf(
+                    end_entity.as_ref(),
+                    &inters,
+                    &roots,
+                    unix,
+                    &self.algs,
+                ) {
+                    Ok(()) => Ok(rustls::client::danger::ServerCertVerified::assertion()),
+                    Err(e) => Err(rustls::Error::General(e.text())),
+                }
+            }
+            other => other,
+        }
     }
 
     fn verify_tls12_signature(
@@ -606,6 +641,7 @@ fn tls_connect(
     let verifier = GoVerifier {
         inner: std::sync::Arc::new(platform),
         host: name.clone(),
+        algs: provider.signature_verification_algorithms,
     };
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()

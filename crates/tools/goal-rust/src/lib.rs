@@ -52,6 +52,7 @@ pub mod protocols_json;
 pub mod resource_resolution;
 pub mod transcode;
 pub mod wallet_token;
+pub mod x509_chain;
 pub mod x509_leaf;
 
 /// goal-rust — CLI for interacting with Algorand.
