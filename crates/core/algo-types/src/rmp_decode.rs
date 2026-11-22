@@ -537,6 +537,35 @@ pub fn reject_when_strict(rd: &[u8], key: &[u8]) -> Result<()> {
 /// catchable error instead.
 #[inline]
 pub fn skip_value(rd: &mut &[u8]) -> Result<()> {
+    skip_value_impl::<false>(rd)
+}
+
+/// [`check_msgpack_depth`] for a block (or block response, payset blob) as go
+/// counts it: go's cap (`msgp.DefaultUnmarshalState.AllowableDepth`) is spent
+/// by every generated struct decoder, not by every container, and a block
+/// nests `EvalDelta` -> `itx` -> `SignedTxnWithAD` -> `dt` -> ... : two
+/// struct decoders per inner-transaction level, the `itx` array between them
+/// has none. So this scan does not count an array that is the value of an
+/// `itx` key (issue #2539); go accepts a `dt` nested 124 inner levels deep
+/// and rejects 125, where the plain container count stopped at 84. Every
+/// other container counts, as in [`check_msgpack_depth`].
+pub fn check_block_msgpack_depth(bytes: &[u8]) -> Result<()> {
+    let mut rd = bytes;
+    skip_value_impl::<true>(&mut rd)
+}
+
+/// A level opened by `skip_value_impl`'s scan, for the go-depth count.
+const LEVEL_ARRAY: u8 = 0;
+const LEVEL_MAP: u8 = 1;
+/// An array that is the value of an `itx` key: no struct decoder, no depth.
+const LEVEL_ITX: u8 = 2;
+
+#[inline]
+fn skip_value_impl<const GO: bool>(rd: &mut &[u8]) -> Result<()> {
+    // `GO`: the level kinds, and how many of the open levels do not count.
+    let mut kinds: Vec<u8> = Vec::new();
+    let mut uncounted = 0usize;
+    let mut pending_itx = false;
     // Values still to read per nesting level. The outermost level (the one
     // value being skipped) lives in `outer`, so skipping a scalar, the common
     // case, does not allocate (issue #2317); `remaining` holds the levels
@@ -552,10 +581,15 @@ pub fn skip_value(rd: &mut &[u8]) -> Result<()> {
             if remaining.pop().is_none() {
                 break;
             }
+            if GO && kinds.pop() == Some(LEVEL_ITX) {
+                uncounted -= 1;
+            }
             continue;
         }
         *count -= 1;
-        if remaining.len() + 1 > MAX_MSGPACK_DECODE_DEPTH {
+        // an element of a map is a key when an even number was left before it
+        let key_position = GO && kinds.last() == Some(&LEVEL_MAP) && *count % 2 == 1;
+        if remaining.len() + 1 - uncounted > MAX_MSGPACK_DECODE_DEPTH {
             return Err(codec_err(format!(
                 "skip_value: nesting depth exceeds {MAX_MSGPACK_DECODE_DEPTH}"
             )));
@@ -565,6 +599,15 @@ pub fn skip_value(rd: &mut &[u8]) -> Result<()> {
         }
         let b = rd[0];
         *rd = &rd[1..];
+        let levels = remaining.len();
+        let was_itx = GO && std::mem::take(&mut pending_itx);
+        if GO && key_position {
+            pending_itx = match b {
+                0xa0..=0xbf => rd.get(..(b & 0x1f) as usize),
+                0xd9 => rd.get(1..).and_then(|r| r.get(..*rd.first()? as usize)),
+                _ => None,
+            } == Some(b"itx".as_slice());
+        }
         match b {
             // positive fixint (0x00..=0x7f) — no data bytes
             0x00..=0x7f => {}
@@ -677,6 +720,17 @@ pub fn skip_value(rd: &mut &[u8]) -> Result<()> {
             }
             // negative fixint (0xe0..=0xff) — no data bytes
             0xe0..=0xff => {}
+        }
+        if GO && remaining.len() > levels {
+            let array = matches!(b, 0x90..=0x9f | 0xdc | 0xdd);
+            kinds.push(match (array, was_itx) {
+                (true, true) => {
+                    uncounted += 1;
+                    LEVEL_ITX
+                }
+                (true, false) => LEVEL_ARRAY,
+                (false, _) => LEVEL_MAP,
+            });
         }
     }
     Ok(())

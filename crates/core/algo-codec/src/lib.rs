@@ -61,8 +61,8 @@ pub use digest::{
 
 use algo_error::{AlgoError, Result};
 use algo_types::{
-    check_msgpack_depth, msgpack_value_len, Block, BlockResponse, LogicSig, MultisigSig,
-    SignedTransaction,
+    check_block_msgpack_depth, check_msgpack_depth, msgpack_value_len, Block, BlockResponse,
+    LogicSig, MultisigSig, SignedTransaction,
 };
 
 /// Decode a single msgpack-encoded `LogicSig`, as produced by `goal clerk
@@ -136,7 +136,7 @@ pub fn decode_signed_txn_stream(mut bytes: &[u8]) -> Result<Vec<SignedTransactio
 /// as go's `msgp.ErrNoField` does (the derived-serde decoder this used to be
 /// skipped them, issue #2394). [`decode_block_response_serde`] is the old path.
 pub fn decode_block_response(bytes: &[u8]) -> Result<BlockResponse> {
-    check_msgpack_depth(bytes)?;
+    check_block_msgpack_depth(bytes)?;
     BlockResponse::decode_from_bytes(bytes)
 }
 
@@ -164,7 +164,7 @@ pub fn decode_block_response_serde(bytes: &[u8]) -> Result<BlockResponse> {
 /// does. `tests/decode_block_differential_test.rs` pins every class of
 /// difference; its module docs list them. [`decode_block_serde`] is the old path.
 pub fn decode_block(bytes: &[u8]) -> Result<Block> {
-    check_msgpack_depth(bytes)?;
+    check_block_msgpack_depth(bytes)?;
     Block::decode_from_bytes(bytes)
 }
 
@@ -252,7 +252,7 @@ pub fn decode_raw(bytes: &[u8]) -> Result<rmpv::Value> {
 pub fn extract_raw_payset_blobs(response_bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
     use std::io::Cursor;
 
-    check_msgpack_depth(response_bytes)?;
+    check_block_msgpack_depth(response_bytes)?;
 
     let mut cursor = Cursor::new(response_bytes);
 
@@ -310,7 +310,7 @@ pub fn extract_raw_payset_blobs(response_bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
 ///
 /// Returns an empty Vec if the block has no `txns` field.
 pub fn extract_raw_payset_blobs_from_block(block_bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
-    check_msgpack_depth(block_bytes)?;
+    check_block_msgpack_depth(block_bytes)?;
     extract_txns_from_block_map(block_bytes, block_bytes)
 }
 

@@ -322,6 +322,14 @@ impl EvalDelta {
 }
 
 thread_local! {
+    /// Set while `canonical::eval_delta_len` decodes the inner transactions
+    /// of a delta to compare their re-encode: a `dt` met there is decoded
+    /// without its own canonical scan (issue #2539). A scan that fails is
+    /// followed by the full decode of the same bytes, so a scan at every
+    /// level made each level decode its subtree twice: a `dt` nested N levels
+    /// took 2^N, not N, steps (go's msgp decodes it in one pass).
+    static SCANNING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
     /// Eval deltas whose slices hold hidden capacity (see the module docs),
     /// keyed by the buffer of the `rmpv` map that represents them; emptied
     /// with the slice records when the decode session ends.
@@ -376,7 +384,7 @@ pub(crate) fn read_eval_delta_into(rd: &mut &[u8], slot: &mut Option<rmpv::Value
     // The common case: the first `dt`, already in go's canonical form (every
     // honest block). Its bytes are then exactly go's re-encode of what go
     // decodes, so they are kept as they are, as before #2424.
-    if slot.is_none() {
+    if slot.is_none() && !SCANNING.with(std::cell::Cell::get) {
         if let Some(len) = canonical::eval_delta_len(rd) {
             let (raw, rest) = rd.split_at(len);
             *rd = rest;
@@ -662,7 +670,10 @@ mod canonical {
                     for _ in 0..m {
                         let mut rd = &b[j..];
                         let mut t = SignedTransaction::default();
-                        SignedTransaction::decode_into(&mut rd, &mut t, false).ok()?;
+                        let outer = super::SCANNING.with(|f| f.replace(true));
+                        let decoded = SignedTransaction::decode_into(&mut rd, &mut t, false);
+                        super::SCANNING.with(|f| f.set(outer));
+                        decoded.ok()?;
                         let end = b.len() - rd.len();
                         if crate::canonical::canonical_encode_signed_txn_with_ad(&t) != b[j..end] {
                             return None;
