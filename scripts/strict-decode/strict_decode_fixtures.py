@@ -924,7 +924,7 @@ ROOT_TYPES = {
     "idverify": "network.identityVerificationMessageSigned",
     # the tx-sync response: a list of signed transactions (go-codec)
     "txsync": ("list", "transactions.SignedTxn"),
-    "pqkey": "main.pqSigningMaterial",
+    "pqkey": "main.saltedSigningMaterial",
 }
 
 
