@@ -2488,14 +2488,13 @@ pub fn install_consensus_overrides(merged: &HashMap<String, ConsensusParams>) {
 /// consensus-derived msgp allocbounds ([`crate::rmp_decode::bounds`]) to
 /// cover `p`. Bounds only grow, as in go.
 ///
-/// `MaxTxnNoteBytes` is raised to the note cap this node's `WellFormed`
-/// enforces for `p` (`MaxAbsoluteTxnNoteBytes`, or `MaxTxnNoteBytes` when a
-/// `consensus.json` written for go before v5.0.0 leaves it unset, as
-/// `algo_validate::fee::effective_max_note_bytes` does): a transaction the
-/// node accepts as well-formed must also decode. Before v5.0.0 go raised this
-/// bound with `MaxTxnNoteBytes` itself (v4.7.3-stable `checkSetAllocBounds`),
-/// which is what the aramidmain network runs; for every built-in protocol the
-/// two are the same.
+/// `MaxTxnNoteBytes` is raised to `MaxAbsoluteTxnNoteBytes`, exactly as go
+/// v5.0.5-stable does (`checkSetMax(p.MaxAbsoluteTxnNoteBytes,
+/// &bounds.MaxTxnNoteBytes)`): a protocol of a `consensus.json` that leaves
+/// it out has 0 there and raises nothing (issue #2441; go v4.7.3 raised it with
+/// `MaxTxnNoteBytes`, which is why aramidmain's 131072-byte notes do not
+/// decode in v5.0.5, issue #2439). For every built-in protocol the cap is the
+/// soft cap or above.
 pub fn check_set_alloc_bounds(p: &ConsensusParams) {
     use crate::rmp_decode::bounds as b;
     let to_usize = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
@@ -2515,12 +2514,7 @@ pub fn check_set_alloc_bounds(p: &ConsensusParams) {
     b::MAX_LOGIC_SIG_MAX_SIZE
         .raise(to_usize(p.logic_sig_max_size).saturating_mul(p.max_tx_group_size));
     b::MAX_LOGIC_SIG_MAX_SIZE.raise(to_usize(p.max_absolute_logic_sig_program_size));
-    let note_cap = if p.max_absolute_txn_note_bytes > 0 {
-        p.max_absolute_txn_note_bytes
-    } else {
-        p.max_txn_note_bytes
-    };
-    b::MAX_TXN_NOTE_BYTES.raise(note_cap);
+    b::MAX_TXN_NOTE_BYTES.raise(p.max_absolute_txn_note_bytes);
     b::MAX_BYTES_KEY_VALUE_LEN.raise(p.max_app_key_len);
     b::MAX_BYTES_KEY_VALUE_LEN.raise(p.max_app_bytes_value_len);
     b::MAX_EXTRA_APP_PROGRAM_LEN.raise(p.max_absolute_extra_program_pages as usize);

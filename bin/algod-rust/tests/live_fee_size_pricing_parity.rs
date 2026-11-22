@@ -424,7 +424,7 @@ async fn note_bytes_size_pricing_boundaries_match_live() {
     let sk = dev_signing_key();
     let params = v42_params();
     let soft = params.max_txn_note_bytes;
-    let hard = algo_validate::effective_max_note_bytes(&params);
+    let hard = params.max_absolute_txn_note_bytes;
     let mut failures = Vec::new();
 
     let note_txn = |len: usize| -> Transaction {
@@ -587,7 +587,7 @@ async fn app_args_size_pricing_boundaries_match_live() {
     let sk = dev_signing_key();
     let params = v42_params();
     let soft = params.max_app_total_arg_len;
-    let hard = algo_validate::effective_max_total_arg_len(&params);
+    let hard = params.max_absolute_total_arg_len;
     let mut failures = Vec::new();
 
     // A trivial always-approving app, created fresh per node, to call NoOp

@@ -388,11 +388,25 @@ like go; every field they set is modelled or is permanently on in algod-rust
 (`ApplyData`, `TxnCounter`, and fields go itself no longer has). The standard
 protocols the file also lists are never used by the aramidmain chain.
 
+**The file is a go v4.7.3 file, and go v5.0.5 rejects it too.** It leaves the
+v5.0.0 `MaxAbsoluteTxnNoteBytes`, `MaxAbsoluteLogicSigProgramSize`,
+`MaxAbsoluteExtraProgramPages` and `MaxAbsoluteTotalArgLen` out. go v5.0.5
+decodes an entry into a zero struct, so they are 0 and are enforced as 0
+(`WellFormed`: any note, any extra page, any application argument and any
+LogicSig program is refused; `checkSetAllocBounds` raises no bound, so the
+8535-byte note of aramidmain block 23132701 fails to decode at
+`MaxTxnNoteBytes` 4096). algod-rust does exactly the same, with no fallback to
+the soft caps (issue #2441; a go v5.0.5 program loading this file printed the
+verdicts pinned in `algo-validate`'s `rules.rs` tests). Neither implementation
+can follow the aramidmain chain past its first such transaction; this is parity
+with go v5.0.5, not a divergence.
+
 **Why.** Replacing `future` with a years-old definition would silently
 downgrade this node's own `future` protocol for no benefit.
 
-**How parity is proven.** `aramidmain_consensus_test.rs` plus live catchup and
-follow against the public aramidmain network with zero apply failures.
+**How parity is proven.** `aramidmain_consensus_test.rs` (the file loads
+field for field) and the unset-cap tests above. A live follow of the public
+aramidmain network is limited by the file as described.
 
 **How to switch back.** Drop the `!base.contains_key` filter in
 `preload_consensus_protocols_with_bundle`.

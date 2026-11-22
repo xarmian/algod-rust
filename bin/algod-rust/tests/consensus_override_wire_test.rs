@@ -105,6 +105,14 @@ fn write_consensus_override(dir: &Path, overridden_min_fee: u64) {
     let mut value: serde_json::Value = serde_json::from_str(FIXTURE)
         .expect("docker/config/vfuture-consensus.json must be valid JSON");
     value["future"]["MinTxnFee"] = serde_json::Value::from(overridden_min_fee);
+    // The fixture predates go v5.0.0's `MaxAbsolute*` caps; a protocol entry
+    // that leaves one out has 0 there and go (and this node) enforce 0 (issue
+    // #2441), so the transactions of this test, which carry notes, need it.
+    let future = built_in_consensus_protocols()
+        .get(CONSENSUS_FUTURE)
+        .expect("\"future\" must be a known built-in protocol version")
+        .max_absolute_txn_note_bytes;
+    value["future"]["MaxAbsoluteTxnNoteBytes"] = serde_json::Value::from(future);
     let encoded = serde_json::to_vec_pretty(&value).expect("re-encode consensus.json");
     std::fs::write(dir.join("consensus.json"), encoded).expect("write consensus.json");
 }

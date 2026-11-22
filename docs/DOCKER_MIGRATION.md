@@ -114,7 +114,10 @@ curl -H "X-Algo-API-Token: <token>" localhost:8080/v2/status
 `ghcr.io/xarmian/algod-rust:<tag>-aramidmain` (`latest-aramidmain`, `stable-aramidmain`,
 `5.0.5-stable-aramidmain`, `nightly-aramidmain`, ...; multi-arch) is the same construction as
 `-voimain` for Aramid mainnet (`aramidmain-v1.0`): `NETWORK=aramidmain`, the vendored genesis
-(`/node/run/genesis/aramidmain/genesis.json`), `FAST_CATCHUP=1`. The custom consensus
+(`/node/run/genesis/aramidmain/genesis.json`), `FAST_CATCHUP=1`. Note: the network's
+`consensus.json` (go v4.7.3) leaves the v5 `MaxAbsolute*` caps unset; go v5.0.5 and algod-rust
+both enforce them as 0 (DIV-006), so this image stops at the first transaction with a note,
+LogicSig, extra pages or application arguments. The custom consensus
 protocols (`aramidmain-v1.0/1..3`, DIV-006) and `DNSBootstrapID: aramidmain.a-wallet.net` are
 part of the `aramidmain` preset compiled into the binary, so the image needs no
 `consensus.json` or `config.json` mount (a `<data>/consensus.json` is still merged on top).

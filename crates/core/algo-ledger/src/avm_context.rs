@@ -441,9 +441,10 @@ impl InnerTxnBuilder {
             // Note
             5 => {
                 if let TealValue::Bytes(b) = value {
-                    // The "effective" helper, as for ApplicationArgs below
-                    // (issue #1299).
-                    let max = algo_validate::fee::effective_max_note_bytes(consensus);
+                    // go: `len(sv.Bytes) > cx.Proto.MaxAbsoluteTxnNoteBytes`,
+                    // a value a `consensus.json` leaves out is 0 and is
+                    // enforced as 0 (issue #2441).
+                    let max = consensus.max_absolute_txn_note_bytes;
                     if b.len() > max {
                         return Err(AlgoError::Avm {
                             message: format!("Note may not exceed {max} bytes"),
@@ -494,11 +495,9 @@ impl InnerTxnBuilder {
                 };
                 let existing = self.array_fields.get(&26).map(Vec::as_slice).unwrap_or(&[]);
                 let total = array_bytes_len(existing) + b.len();
-                // The "effective" helper: `max_absolute_total_arg_len`, or
-                // the soft cap `max_app_total_arg_len` when it is 0 (before
-                // v24, or a `consensus.json` entry leaving it out; issue
-                // #1299).
-                if total > algo_validate::fee::effective_max_total_arg_len(consensus) {
+                // go: `total > cx.Proto.MaxAbsoluteTotalArgLen`, enforced as
+                // is when a `consensus.json` leaves it out (issue #2441).
+                if total > consensus.max_absolute_total_arg_len {
                     return Err(AlgoError::Avm {
                         message: "total application args length too long".to_string(),
                     });
@@ -16206,7 +16205,7 @@ mod tests {
         // missed by #1297's initial pass.
         let mut store = LedgerState::new();
         let mut ctx = make_itxn_bounds_ctx(&mut store);
-        let max = algo_validate::fee::effective_max_note_bytes(&ctx.consensus);
+        let max = ctx.consensus.max_absolute_txn_note_bytes;
         let err = ctx
             .itxn_field(5, TealValue::Bytes(vec![0u8; max + 1])) // Note
             .unwrap_err();
@@ -16410,7 +16409,7 @@ mod tests {
     fn itxn_field_application_args_total_length_over_max_rejected() {
         let mut store = LedgerState::new();
         let mut ctx = make_itxn_bounds_ctx(&mut store);
-        let max = algo_validate::fee::effective_max_total_arg_len(&ctx.consensus);
+        let max = ctx.consensus.max_absolute_total_arg_len;
         let err = ctx
             .itxn_field(26, TealValue::Bytes(vec![0u8; max + 1])) // ApplicationArgs
             .unwrap_err();
