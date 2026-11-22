@@ -29,6 +29,17 @@
 //!   `protocol.NewJSONDecoder(resp.Body).Decode(&response)`, reading the body
 //!   one byte at a time through its unbuffered `ioDecReader`, into an `any`
 //!   holding a pointer to the answer (`model.Account`, `common.Version`, ...).
+//! * [`decode_guarded`]: [`decode`] that gives up with [`Error::Endless`] after
+//!   a number of rounds of one container loop. go-codec never finishes an
+//!   array cut after a comma (`["a",`, `[1,`): the comma is handed back and read
+//!   again, the loop starts in the state it was in, a slice grows by one
+//!   element per round until the process runs out of memory. [`decode`] does
+//!   the same (issue #2537, user decision: match go for pathological input),
+//!   so a test needs the guard to see it. Reproduced: non-termination and the
+//!   growth; checked against go for the bodies of
+//!   `goal-rust/tests/fixtures/go_codec_json_endless.jsonl` (go's decoder does
+//!   not return) and the corpus of `go_codec_json_decode.jsonl` (it does, with
+//!   the value ours has). Not checkable: the out-of-memory death.
 //! * [`decode_slice`]: `codec.NewDecoderBytes(body, h).Decode(&v)` with `v`
 //!   a struct, through its `bytesDecReader`, as algod's REST handlers decode
 //!   a request body (`POST /v2/transactions/simulate`, issue #2477). This
