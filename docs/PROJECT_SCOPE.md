@@ -563,3 +563,5 @@ Algod-Rust is complete when:
 - The Rust **operator toolchain** (`goal-rust`, `kmd-rust`, `algokey-rust`, `tealdbg-rust`) is at functional parity with the Go equivalents and **interoperates bidirectionally** with go-algorand binaries
 
 At that point the ecosystem benefits from **two independent end-to-end stacks** — node and operator toolchain — increasing decentralization, resilience, and operator choice.
+
+The `v5.0.5-stable → v5.1.1-stable` sweep (Phase 26) is the first minor release since 5.0 and has no protocol upgrade: post-quantum account schemes (Falcon-512, salted keys, `ed`, `ls`), AVM v14 (`mldsa_verify`, `bmodexp`, length-based costs), `RequireLogicSigArgAccess`, grouped heartbeats, agreement/network/DNSSEC hardening — all new consensus rules `vFuture`-gated. It also re-maps 3,397 Go tests (294 added, 91 removed, 234 body-changed). See `docs/PHASE26_PROPOSAL.md` and epic issue [#2559](https://github.com/xarmian/algod-rust/issues/2559).
