@@ -1432,7 +1432,7 @@ mod tests {
         assert_eq!(err(b""), "msgp: too few bytes left to read object");
         assert_eq!(
             err(br#"{"a":1}"#),
-            "msgp: attempted to decode type \"int\" with method for \"array\""
+            "msgp: attempted to decode type \"int\" with method for \"map\""
         );
         assert_eq!(
             err(&[0x81, 0xa3, b'f', b'o', b'o', 0x01]),
@@ -1443,8 +1443,9 @@ mod tests {
             "Unknown field: \u{fffd}\u{fffd}\u{fffd}"
         );
         assert_eq!(
+            // go v5.1 generated decoders read maps only: an array is a type error
             err(&[0x91, 0xa1, b'x']),
-            "msgp: attempted to decode type \"str\" with method for \"uint\" at struct-from-array/Status"
+            "msgp: attempted to decode type \"array\" with method for \"map\""
         );
         assert_eq!(err(&[0xc1]), "msgp: unrecognized type prefix 0xc1");
     }

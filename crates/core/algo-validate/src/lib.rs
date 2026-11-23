@@ -60,7 +60,8 @@ pub use rules::{
 };
 pub use signature::{
     hash_program, logic_sig_group_size_check, logic_sig_group_size_check_indexed,
-    logicsig_sanity_check, validate_pqsig_envelope, validate_pqsig_scheme,
+    logicsig_sanity_check, sksig_logicsig_sanity_check, validate_pqsig_envelope,
+    validate_pqsig_scheme,
     check_heartbeat_proofs, verify_auth_addr_sender_diff, verify_group_logicsig_size,
     verify_heartbeat_proof, verify_member_heartbeat_proof,
     verify_rekeying_supported, verify_single_sig, verify_transaction_signature,
