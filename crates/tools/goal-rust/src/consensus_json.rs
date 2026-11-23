@@ -581,8 +581,6 @@ enum Kind {
 }
 
 struct StructType {
-    /// `reflect.Type.Name()`.
-    name: &'static str,
     /// `reflect.Type.String()`.
     type_name: &'static str,
     fields: &'static [(&'static str, Kind)],
@@ -859,19 +857,16 @@ fn unquote(raw: &[u8]) -> String {
 }
 
 static CONSENSUS_PARAMS: StructType = StructType {
-    name: "ConsensusParams",
     type_name: "config.ConsensusParams",
     fields: &CONSENSUS_PARAMS_FIELDS,
 };
 
 static PAYOUTS: StructType = StructType {
-    name: "ProposerPayoutRules",
     type_name: "config.ProposerPayoutRules",
     fields: &PAYOUTS_FIELDS,
 };
 
 static BONUS: StructType = StructType {
-    name: "BonusPlan",
     type_name: "config.BonusPlan",
     fields: &BONUS_FIELDS,
 };

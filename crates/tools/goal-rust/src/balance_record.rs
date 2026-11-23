@@ -30,8 +30,8 @@
 //! (the msgp-generated `MarshalMsg`).
 //!
 //! The decoder mirrors the generated code's shape: a struct is a map of its
-//! codec names or, if the value is not a map, an array of its fields in
-//! source order (`struct-from-array`); a nested struct is decoded either by
+//! codec names (go v5.1's generated decoders read no array form, msgp 1.1.66,
+//! #6774); a nested struct is decoded either by
 //! its own `UnmarshalMsgWithState` (its error then wrapped by the caller) or
 //! inline (the caller's context prefixed), which shows in how errors read.
 
@@ -661,28 +661,11 @@ type FieldFn<T> = fn(&mut Rd<'_>, &mut T, &[String]) -> R<()>;
 /// A struct field: `(codec name, Go name, decoder)`, in source order.
 type Field<T> = (&'static str, &'static str, FieldFn<T>);
 
-/// A msgp-generated struct decoder: the map form or, when the value is no
-/// map, the array form. `ctx` is empty for a struct's own
+/// A msgp-generated struct decoder: the map form only (go v5.1's generated code,
+/// msgp 1.1.66, no longer reads the positional array form: #6774). `ctx` is empty for a struct's own
 /// `UnmarshalMsgWithState`, the caller's context for one decoded inline.
 fn de_struct<T: Default>(r: &mut Rd<'_>, z: &mut T, ctx: &[String], fields: &[Field<T>]) -> R<()> {
     match r.map_header() {
-        Err(e) if encoded_type(&e).is_some() => {
-            let mut n = r.array_header().map_err(|e| wrap(e, ctx))?;
-            for (_, go, de) in fields {
-                if n == 0 {
-                    break;
-                }
-                n -= 1;
-                de(r, z, &with(ctx, &["struct-from-array", go]))?;
-            }
-            if n > 0 {
-                let e = MErr::Plain(format!(
-                    "Too many array fields when decoding into struct: {n} left"
-                ));
-                return Err(wrap(e, &with(ctx, &["struct-from-array"])));
-            }
-            Ok(())
-        }
         Err(e) => Err(wrap(e, ctx)),
         Ok((n, nil)) => {
             if nil {
