@@ -56,7 +56,7 @@ pub use header::BlockHeader;
 pub use networks::{resolve_genesis_hash, Network, ResolveGenesisError, UnknownNetwork};
 pub use pq::{
     canonical_address_salt, salted_address, AddressSalt, SKsigDelegatedProgram, SaltedKeySig,
-    SIG_SCHEME_FALCON1024,
+    SIG_SCHEME_ED25519, SIG_SCHEME_FALCON1024, SIG_SCHEME_FALCON512, SIG_SCHEME_LOGIC_SIG,
 };
 pub use rmp_decode::{check_block_msgpack_depth, check_msgpack_depth, msgpack_value_len};
 /// go-msgp-compatible byte readers (`ReadBytesBytes` / `ReadExactBytes`) for

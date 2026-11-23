@@ -53,6 +53,13 @@ const PQ_DELEGATED_PROGRAM_HASH_PREFIX: &[u8] = b"PQProgram";
 /// (`"f2"`) tag is a known scheme constant upstream but has no registered
 /// verifier and is never enabled.
 pub const SIG_SCHEME_FALCON1024: [u8; 2] = *b"f1";
+/// `protocol.SigSchemeFalcon512` (`f5`): Falcon-512, deterministic signing profile.
+pub const SIG_SCHEME_FALCON512: [u8; 2] = *b"f5";
+/// `protocol.SigSchemeEd25519` (`ed`): Ed25519 with a salted-address profile.
+pub const SIG_SCHEME_ED25519: [u8; 2] = *b"ed";
+/// `protocol.SigSchemeLogicSig` (`ls`): a LogicSig account; the program takes the
+/// place of the public key and its evaluation is the authorization.
+pub const SIG_SCHEME_LOGIC_SIG: [u8; 2] = *b"ls";
 
 /// A 1-byte salt that selects an address for a post-quantum public key when
 /// deriving a 32-byte address; it is public and included in the address

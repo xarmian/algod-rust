@@ -1571,7 +1571,15 @@ fn run_compile_inner(
             hasher.update(b"Program");
             hasher.update(program);
             let digest: [u8; 32] = hasher.finalize().into();
-            println!("{fname_str}: {}", Address(digest).to_algorand_string());
+            // go v5.1 appends the `ls` address to this line rather than printing it on
+            // one of its own, so scripts reading the first address keep working.
+            let (_, salted) = algo_types::canonical_address_salt(algo_types::SIG_SCHEME_LOGIC_SIG, program)
+                .ok_or_else(|| "Could not derive salted address: no canonical salt exists for this public key and scheme".to_string())?;
+            println!(
+                "{fname_str}: {} (salted: {})",
+                Address(digest).to_algorand_string(),
+                salted.to_algorand_string()
+            );
         }
     }
     Ok(())
