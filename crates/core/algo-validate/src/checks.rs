@@ -109,10 +109,8 @@ fn check_basic_state_proof(sp: &StateProofBody) -> Result<(), AlgoError> {
     check_basic_state_proof_path(sp.sig_proofs.as_ref(), HASH_TYPE, hash_size)?;
     check_basic_state_proof_path(sp.part_proofs.as_ref(), HASH_TYPE, hash_size)?;
 
-    let Some(ref reveals) = sp.reveals else {
-        return Ok(());
-    };
-    for reveal in reveals.values() {
+    let reveals = sp.reveals.as_ref();
+    for reveal in reveals.into_iter().flat_map(|r| r.values()) {
         let Some(ref sig_slot) = reveal.sig_slot else {
             continue;
         };
@@ -143,6 +141,59 @@ fn check_basic_state_proof(sp: &StateProofBody) -> Result<(), AlgoError> {
         // this repo) root size constant, matching go's use of a separate
         // named constant rather than reusing `stateproof.HashSize`.
         check_basic_state_proof_path(proof, HashType::Sumhash, MERKLE_SIGNATURE_SCHEME_ROOT_SIZE)?;
+    }
+    check_merkle_path_lengths(sp)
+}
+
+/// `unexpected number of Merkle path elements` (`stateproof.ErrUnexpectedPathLength`).
+const UNEXPECTED_PATH_LENGTH: &str = "unexpected number of Merkle path elements";
+
+/// Mirrors Go's `StateProof.CheckMerklePathLengths`
+/// (`crypto/stateproof/proofPathLength.go`, v5.1.0-beta, run at the end of
+/// `checkBasicStateProof`): a multi-leaf proof (`SigProofs`, `PartProofs`) may
+/// not carry more path elements than `reveals * TreeDepth`, and the Merkle
+/// signature proof of every reveal (zero or not) is bounded by
+/// `MaxEncodedTreeDepth` on both its depth and its path length, with a path no
+/// shorter than its depth.
+fn check_merkle_path_lengths(sp: &StateProofBody) -> Result<(), AlgoError> {
+    let num_leaves = sp.reveals.as_ref().map_or(0, |r| r.len()) as u64;
+    for (name, proof) in [("SigProofs", &sp.sig_proofs), ("PartProofs", &sp.part_proofs)] {
+        let path_len = proof
+            .as_ref()
+            .and_then(|p| p.path.as_ref())
+            .map_or(0, |p| p.len()) as u64;
+        let depth = proof.as_ref().map_or(0, |p| p.tree_depth) as u64;
+        if path_len > num_leaves * depth {
+            return Err(err(format!(
+                "{name}: {UNEXPECTED_PATH_LENGTH}: {path_len} path elements for {num_leaves} leaves at TreeDepth {depth}"
+            )));
+        }
+    }
+    for (pos, reveal) in sp.reveals.iter().flatten() {
+        let proof = reveal
+            .sig_slot
+            .as_ref()
+            .and_then(|s| s.sig.as_ref())
+            .and_then(|s| s.proof.as_ref());
+        let depth = proof.map_or(0, |p| p.tree_depth) as usize;
+        let path_len = proof
+            .and_then(|p| p.path.as_ref())
+            .map_or(0, |p| p.len());
+        if depth > MAX_ENCODED_TREE_DEPTH {
+            return Err(err(format!(
+                "reveal {pos}: tree depth is too large: signature proof TreeDepth {depth}, maximum {MAX_ENCODED_TREE_DEPTH}"
+            )));
+        }
+        if path_len > MAX_ENCODED_TREE_DEPTH {
+            return Err(err(format!(
+                "reveal {pos}: {UNEXPECTED_PATH_LENGTH}: signature proof has {path_len} path elements, maximum {MAX_ENCODED_TREE_DEPTH}"
+            )));
+        }
+        if depth > path_len {
+            return Err(err(format!(
+                "reveal {pos}: {UNEXPECTED_PATH_LENGTH}: signature proof has {path_len} path elements for TreeDepth {depth}"
+            )));
+        }
     }
     Ok(())
 }
@@ -452,6 +503,42 @@ mod tests {
         let txn = stpf_txn_with_reveal(reveal_with(2, 5, 3));
         let err = check_state_proof_payload(&txn).unwrap_err();
         assert!(err.to_string().contains("proof"), "got: {err}");
+    }
+
+    #[test]
+    fn a_multi_leaf_proof_longer_than_reveals_times_depth_is_rejected_like_go() {
+        // go v5.1 `CheckMerklePathLengths`: `SigProofs` with 2 path elements,
+        // no reveals (0 leaves) at TreeDepth 0.
+        let mut body = well_formed_state_proof_body();
+        body.sig_proofs.as_mut().unwrap().path = Some(vec![
+            Some(ByteBuf::from(vec![
+                0u8;
+                HashType::Sumhash.digest_size()
+            ]));
+            2
+        ]);
+        let mut txn = base_txn("stpf");
+        txn.state_proof = Some(body.clone());
+        assert_eq!(
+            check_state_proof_payload(&txn).unwrap_err().to_string(),
+            "validation error: SigProofs: unexpected number of Merkle path elements: 2 path elements for 0 leaves at TreeDepth 0"
+        );
+        // One reveal at TreeDepth 2 allows up to two elements, not three.
+        let mut reveals = BTreeMap::new();
+        reveals.insert(5u64, reveal_with(2, 0, 0));
+        body.reveals = Some(reveals);
+        let elem = || Some(ByteBuf::from(vec![0u8; HashType::Sumhash.digest_size()]));
+        body.part_proofs.as_mut().unwrap().tree_depth = 2;
+        body.part_proofs.as_mut().unwrap().path = Some(vec![elem(), elem()]);
+        body.sig_proofs.as_mut().unwrap().path = None;
+        txn.state_proof = Some(body.clone());
+        check_state_proof_payload(&txn).unwrap();
+        body.part_proofs.as_mut().unwrap().path = Some(vec![elem(), elem(), elem()]);
+        txn.state_proof = Some(body);
+        assert_eq!(
+            check_state_proof_payload(&txn).unwrap_err().to_string(),
+            "validation error: PartProofs: unexpected number of Merkle path elements: 3 path elements for 1 leaves at TreeDepth 2"
+        );
     }
 
     #[test]

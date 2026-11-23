@@ -1720,7 +1720,7 @@ pub fn validate_transaction_group_strict(txns: &[SignedTransaction]) -> Result<(
     let Some(first) = txns.first() else {
         return Ok(());
     };
-    let mut ids = GroupIdChecker::new(&first.txn, txns.len());
+    let mut ids = GroupIdChecker::new(&first.txn, txns.len()).rejecting_duplicates();
     for (index, stx) in txns.iter().enumerate() {
         ids.check_member(index, &stx.txn)
             .map_err(|message| AlgoError::Validation { message })?;
@@ -1742,6 +1742,7 @@ pub struct GroupIdChecker {
     size: usize,
     group_id: [u8; 32],
     hashes: Vec<Digest>,
+    reject_duplicates: bool,
 }
 
 impl GroupIdChecker {
@@ -1751,7 +1752,18 @@ impl GroupIdChecker {
             size,
             group_id: first.group,
             hashes: Vec::new(),
+            reject_duplicates: false,
         }
+    }
+
+    /// Also refuse a transaction that appears twice, as go v5.1's
+    /// `checkTxnGroupID` does (`CheckTxnGroup` / `CheckPaysetGroup`: the
+    /// `verify.TxnGroup` path, block validation and simulate). The gossip test
+    /// stage (`TestTransactionGroup`) has no such rule: a repeat there is found
+    /// later, as `transaction already in ledger`.
+    pub fn rejecting_duplicates(mut self) -> Self {
+        self.reject_duplicates = true;
+        self
     }
 
     /// Check member `index` (in group order) against the first member's group.
@@ -1769,7 +1781,11 @@ impl GroupIdChecker {
             let txid = algo_codec::compute_txn_id_without_group(txn);
             // go v5.1: a transaction may not appear twice (permanent: the
             // VerifiedTransactionCache is keyed by txid).
-            if let Some(j) = self.hashes.iter().position(|h| *h == txid) {
+            if let Some(j) = self
+                .reject_duplicates
+                .then(|| self.hashes.iter().position(|h| *h == txid))
+                .flatten()
+            {
                 return Err(format!(
                     "transactionGroup: duplicate transaction: [{index}] repeats [{j}]"
                 ));
@@ -1833,7 +1849,7 @@ fn validate_transaction_group_inner(
         // Verify the group ID commits to exactly these members, with go's
         // `checkTxnGroupID` text (every member here carries the same,
         // non-zero group ID: the group was collected by it).
-        let mut ids = GroupIdChecker::new(&group_members[0].txn, size);
+        let mut ids = GroupIdChecker::new(&group_members[0].txn, size).rejecting_duplicates();
         for (index, stx) in group_members.iter().enumerate() {
             ids.check_member(index, &stx.txn)
                 .map_err(|message| AlgoError::Validation { message })?;

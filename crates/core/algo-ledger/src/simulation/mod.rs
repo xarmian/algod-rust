@@ -1649,7 +1649,9 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // incomplete group (`GroupIndex: -1`) the request error. go's
         // texts, unprefixed.
         if let Some(first) = verify_group.first() {
-            let mut ids = algo_validate::GroupIdChecker::new(&first.txn, verify_group.len());
+            let mut ids =
+                algo_validate::GroupIdChecker::new(&first.txn, verify_group.len())
+                    .rejecting_duplicates();
             for (i, stx) in verify_group.iter().enumerate() {
                 if let Err(message) = ids.check_member(i, &stx.txn) {
                     return Ok(CheckOutcome::RecoverableFailure {
