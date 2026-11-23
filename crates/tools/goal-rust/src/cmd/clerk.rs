@@ -2839,6 +2839,7 @@ mod tests {
     /// ... -f ... -t ...` invocation.
     fn bare_send_args(from: Option<&str>, to: &str) -> SendArgs {
         SendArgs {
+            salted: false,
             amount: 100_000,
             from: from.map(str::to_string),
             to: to.to_string(),
