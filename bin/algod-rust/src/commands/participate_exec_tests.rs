@@ -3044,11 +3044,6 @@ fn rest_error_text(e: &algo_error::AlgoError) -> (String, Option<algo_error::Ver
     }
 }
 
-/// go's oracle masks a heartbeat's pointer address; mask the Rust text alike.
-fn mask_heartbeat_pointer(text: &str) -> String {
-    algo_validate::mask_heartbeat_pointer(text)
-}
-
 /// The two texts from shortly before their first differing byte, for a
 /// readable mismatch report of two multi-kilobyte frames.
 fn first_difference(go: &str, rust: &str) -> (String, String) {
@@ -3071,8 +3066,12 @@ fn first_difference(go: &str, rust: &str) -> (String, String) {
 
 /// Splits go's `transaction <dump> invalid : <reason>` into (framed, reason).
 fn split_frame(text: &str) -> (bool, &str) {
-    match (text.starts_with("transaction {"), text.find("} invalid : ")) {
-        (true, Some(at)) => (true, &text[at + "} invalid : ".len()..]),
+    // go v5.1: `transaction <SignedTxn.Summary()> invalid : <reason>`.
+    const TAIL: &str = " invalid : ";
+    match text.find(TAIL) {
+        Some(at) if text.starts_with("transaction ") && text[..at].contains(" from ") => {
+            (true, &text[at + TAIL.len()..])
+        }
         _ => (false, text),
     }
 }
@@ -3139,8 +3138,7 @@ fn wellformed_and_group_error_texts_match_go() {
                 // and `verify_logicsig_errors`): go prints the AVM's own error
                 // and the byte offset `pc` of its `EvalError` (`err=/ 0.
                 // Details: pc=5`, issue #2200).
-                let text = mask_heartbeat_pointer(&text);
-                let rust_framed = split_frame(&text).0;
+                                let rust_framed = split_frame(&text).0;
                 if text != want || rust_framed != row.verify_framed {
                     mismatches.push(format!(
                         "{} (REST path)\n  go:   {}\n  rust: {}",

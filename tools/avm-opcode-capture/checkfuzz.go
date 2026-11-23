@@ -73,7 +73,7 @@ func checkProgram(program []byte, app bool) string {
 		var txn transactions.SignedTxn
 		txn.Lsig.Logic = program
 		ep := logic.NewSigEvalParams([]transactions.SignedTxn{txn}, &proto, &logic.NoHeaderLedger{})
-		err = logic.CheckSignature(0, ep)
+		err = logic.CheckSignature(program, ep)
 	}
 	if err != nil {
 		return err.Error()

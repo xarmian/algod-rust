@@ -205,7 +205,7 @@ impl InnerTxnBuilder {
     fn validate_field_type(field: u8, value: &TealValue, version: u8) -> Result<(), AlgoError> {
         fn not_a_uint64(b: &[u8]) -> AlgoError {
             AlgoError::Avm {
-                message: format!("{} is not a uint64", go_bytes_literal(b)),
+                message: format!("{} is not a uint64", algo_avm::limited_bytes::limited_bytes(b)),
             }
         }
         fn not_an_address() -> AlgoError {
@@ -339,7 +339,10 @@ impl InnerTxnBuilder {
                     Ok(())
                 } else {
                     Err(AlgoError::Avm {
-                        message: format!("{name} is not a valid Type for itxn_field"),
+                        message: format!(
+                            "{} is not a valid Type for itxn_field",
+                            algo_avm::limited_bytes::limited_bytes(b)
+                        ),
                     })
                 }
             }
@@ -5311,13 +5314,6 @@ use txn_fields::check_available_round;
 // ---------------------------------------------------------------------------
 // Helpers for reading transaction fields
 // ---------------------------------------------------------------------------
-
-/// go's `%#v` of a `[]byte`: `[]byte{0x78, 0x79}` (`[]byte{}` when empty), as
-/// in `stackValue.uint`'s `%#v is not a uint64`.
-fn go_bytes_literal(b: &[u8]) -> String {
-    let items: Vec<String> = b.iter().map(|x| format!("0x{x:02x}")).collect();
-    format!("[]byte{{{}}}", items.join(", "))
-}
 
 /// Read a transaction field from a `SignedTransaction`.
 ///

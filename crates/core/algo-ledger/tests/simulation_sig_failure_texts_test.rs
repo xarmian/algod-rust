@@ -161,9 +161,7 @@ fn simulate_reports_every_verify_failure_like_go() {
                     .collect();
                 format!(
                     "failure at {at:?}: {}",
-                    algo_validate::mask_heartbeat_pointer(
-                        g.failure_message.as_deref().unwrap_or_default()
-                    )
+                    g.failure_message.as_deref().unwrap_or_default()
                 )
             }
         };

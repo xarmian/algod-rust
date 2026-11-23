@@ -18,9 +18,9 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! go's `transaction %+v invalid : <err>` frame, byte for byte (issue #2451).
+//! go's `transaction <Summary> invalid : <err>` frame, byte for byte (issues #2451, #2551).
 //!
-//! Every framed `verify.TxnGroup` text go-algorand v5.0.5-stable produced in
+//! Every framed `verify.TxnGroup` text go-algorand v5.1.1-stable produced in
 //! the two oracles, against `algo_validate::frame_invalid_txn` of the
 //! `SignedTxn` decoded from go's own bytes:
 //!
@@ -30,12 +30,11 @@
 //! - `fixtures/pq_failure_texts.jsonl` (`tools/pq-failure-text-oracle`): the
 //!   top-level and delegated Falcon-1024 envelopes.
 //!
-//! go prints a heartbeat's embedded `*HeartbeatTxnFields` as its address,
-//! which differs from run to run; the oracle masks it (`0xPTR`) and so does
-//! `mask_heartbeat_pointer` here. Nothing else is masked.
+//! Since go v5.1 the frame is `SignedTxn.Summary()` (no pointer address), so
+//! nothing is masked.
 
 use algo_types::SignedTransaction;
-use algo_validate::{frame_invalid_txn, mask_heartbeat_pointer as mask};
+use algo_validate::frame_invalid_txn;
 
 const PQ_FIXTURE: &str = include_str!("fixtures/pq_failure_texts.jsonl");
 const WF_FIXTURE: &str =
@@ -43,11 +42,12 @@ const WF_FIXTURE: &str =
 
 /// The reason after go's frame, for a text that carries it.
 fn reason(text: &str) -> Option<&str> {
-    const TAIL: &str = "} invalid : ";
-    if !text.starts_with("transaction {") {
+    const TAIL: &str = " invalid : ";
+    let at = text.find(TAIL)?;
+    if !text.starts_with("transaction ") || !text[..at].contains(" from ") {
         return None;
     }
-    text.find(TAIL).map(|at| &text[at + TAIL.len()..])
+    Some(&text[at + TAIL.len()..])
 }
 
 /// Whether some member of `group` framed with `reason` is exactly `want`.
@@ -55,7 +55,7 @@ fn framed_by_a_member(group: &[SignedTransaction], want: &str) -> Result<(), Str
     let reason = reason(want).ok_or("not framed")?;
     let mut last = String::new();
     for stx in group {
-        let got = mask(&frame_invalid_txn(stx, reason));
+        let got = frame_invalid_txn(stx, reason);
         if got == want {
             return Ok(());
         }

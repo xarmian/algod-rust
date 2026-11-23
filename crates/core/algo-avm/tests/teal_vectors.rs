@@ -2708,7 +2708,7 @@ fn the_gate_runs_before_the_cost_is_charged() {
     code.push(0x08);
     assert_eq!(
         first_error_with_budget(&code, 2).0,
-        "AVM: dynamic cost budget exceeded, executing +: local program cost was 2"
+        "AVM: dynamic cost budget exceeded, executing + (1): local program cost was 2"
     );
 }
 

@@ -44,8 +44,8 @@ pub use fee::{
     FEE_RESIDUE_SCALE, ONE_MICROS,
 };
 pub use go_dump::{
-    frame_invalid_txn, go_signed_txn_dump, mask_heartbeat_pointer, simulate_member_reason,
-    verify_failure_is_framed, verify_member_reason,
+    frame_invalid_txn, signed_txn_summary, simulate_member_reason, verify_failure_is_framed,
+    verify_member_reason,
 };
 pub use rules::{
     compute_group_id, consensus_params_for_version, has_heartbeat, is_free_heartbeat,

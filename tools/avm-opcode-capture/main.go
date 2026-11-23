@@ -171,7 +171,7 @@ func evalSig(program []byte, args [][]byte) (bool, string, []stackEntry) {
 	txn.Lsig.Args = args
 	ep := logic.NewSigEvalParams([]transactions.SignedTxn{txn}, &proto, &logic.NoHeaderLedger{})
 
-	pass, cx, err := logic.EvalSignatureFull(0, ep)
+	pass, cx, err := logic.EvalSignatureProgram(program, args, 0, ep)
 	errStr := ""
 	if err != nil {
 		errStr = err.Error()
@@ -196,7 +196,7 @@ func checkSig(program []byte) string {
 	var txn transactions.SignedTxn
 	txn.Lsig.Logic = program
 	ep := logic.NewSigEvalParams([]transactions.SignedTxn{txn}, &proto, &logic.NoHeaderLedger{})
-	if err := logic.CheckSignature(0, ep); err != nil {
+	if err := logic.CheckSignature(program, ep); err != nil {
 		return err.Error()
 	}
 	return ""

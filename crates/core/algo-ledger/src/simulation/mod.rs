@@ -1747,9 +1747,11 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // go's `txnGroupBatchPrep` preps every member, then verifies the
             // ed25519 batch. A member's prep failure is its `TxGroupError`
             // (`GroupIndex: i`), which `Simulate` reports as the group's
-            // `FailureMessage` with the member's `transaction %+v invalid : `
-            // frame (`prepErr.err` is re-wrapped in place), of the copy it
-            // verified (issue #2451): no signature or two kinds, a malformed
+            // `FailureMessage`. go v5.1 wraps it as `transaction <Summary>
+            // invalid : %w` for `verify.TxnGroup`, but simulate recovers the
+            // inner `*TxGroupError` (`errors.As`) and prints its own text, so
+            // the frame is not part of simulate's message (issues #2451,
+            // #2551): no signature or two kinds, a malformed
             // multisig, a PQ envelope or signature, every LogicSig verdict --
             // a delegated LogicSig's signature too, checked by its own batch
             // inside the prep. The batch's failure has no index: a request
@@ -1759,10 +1761,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 if algo_validate::verify_failure_is_framed(stx, &e) {
                     return Ok(CheckOutcome::RecoverableFailure {
                         index: i,
-                        message: algo_validate::frame_invalid_txn(
-                            stx,
-                            &algo_validate::simulate_member_reason(stx, &e),
-                        ),
+                        message: algo_validate::simulate_member_reason(stx, &e),
                         logicsig_traces,
                         logicsig_budgets,
                     });

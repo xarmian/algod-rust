@@ -123,9 +123,7 @@ fn pq_failure_texts_match_go_in_simulate() {
                 let group = &result.txn_groups[0];
                 format!(
                     "failure {:?} at {:?}",
-                    algo_validate::mask_heartbeat_pointer(
-                        group.failure_message.as_deref().unwrap_or_default()
-                    ),
+                    group.failure_message.as_deref().unwrap_or_default(),
                     group.failed_at.clone().unwrap_or_default()
                 )
             }
