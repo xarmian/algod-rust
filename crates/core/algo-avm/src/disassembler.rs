@@ -476,6 +476,14 @@ impl<'a> Dis<'a> {
                         if n <= 0 {
                             return Err(format!("could not decode label for {}", spec.name));
                         }
+                        // go v5.1: an offset longer than the program is refused outright.
+                        let len = program.len() as i64;
+                        if v > len || v < -len {
+                            return Err(format!(
+                                "branch offset {v} outside of program for {}",
+                                spec.name
+                            ));
+                        }
                         (v, n as usize)
                     } else {
                         if pc + 2 > program.len() {
