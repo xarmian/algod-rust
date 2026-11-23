@@ -55,8 +55,8 @@ pub use digest::Digest;
 pub use header::BlockHeader;
 pub use networks::{resolve_genesis_hash, Network, ResolveGenesisError, UnknownNetwork};
 pub use pq::{
-    canonical_pq_address_salt, pq_address, PQAddressSalt, PQDelegatedProgram, PQSig,
-    PQ_SCHEME_FALCON1024,
+    canonical_address_salt, salted_address, AddressSalt, SKsigDelegatedProgram, SaltedKeySig,
+    SIG_SCHEME_FALCON1024,
 };
 pub use rmp_decode::{check_block_msgpack_depth, check_msgpack_depth, msgpack_value_len};
 /// go-msgp-compatible byte readers (`ReadBytesBytes` / `ReadExactBytes`) for
@@ -69,7 +69,10 @@ pub mod go_msgp {
         read_key_bytes, read_map_len, read_slice_into, read_str_bytes, read_string, read_u64,
         read_u8_val, skip_value, struct_keys, struct_keys_with, DecodeSession, StructKeys,
         EVAL_MAX_ARGS, MAX_LOGIC_SIG_ARG_SIZE, MAX_LOGIC_SIG_MAX_SIZE, MAX_MULTISIG,
-        MAX_PQ_PUBLIC_KEY_SIZE, MAX_PQ_SIGNATURE_SIZE, MAX_VOTE_THRESHOLD,
+        max_sig_scheme_public_key_size, max_sig_scheme_signature_size, ls_max_signature_size,
+        ED25519_PUBLIC_KEY_SIZE, ED25519_SIGNATURE_SIZE, FALCON1024_MAX_SIGNATURE_SIZE,
+        FALCON1024_PUBLIC_KEY_SIZE, FALCON512_MAX_SIGNATURE_SIZE, FALCON512_PUBLIC_KEY_SIZE,
+        MAX_VOTE_THRESHOLD,
     };
 }
 pub use rmp_decode::{

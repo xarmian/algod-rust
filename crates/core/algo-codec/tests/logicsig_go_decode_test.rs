@@ -107,8 +107,9 @@ fn go_decode_accepts_and_rejects_what_go_does() {
     assert!(ok(&arg(255, 1)) && !ok(&arg(256, 1)));
     assert!(ok(&arg(1, 4096)) && !ok(&arg(1, 4097)));
     let pq = |k: &str, n: usize| mp::rec(&[("pqsig", mp::rec(&[(k, mp::bin(&vec![1u8; n]))]))]);
-    assert!(ok(&pq("pk", 1793)) && !ok(&pq("pk", 1794)));
-    assert!(ok(&pq("sig", 1538)) && !ok(&pq("sig", 1539)));
+    // go v5.1 bounds: the largest key/signature over all schemes (`ls`).
+    assert!(ok(&pq("pk", 16_000)) && !ok(&pq("pk", 16_001)));
+    assert!(ok(&pq("sig", 17_280)) && !ok(&pq("sig", 17_281)));
     // `msig` needs v, thr and subsig; an unknown key fails anywhere.
     let by_name: std::collections::HashMap<_, _> = lsig_decode_cases().into_iter().collect();
     for rejected in [
@@ -158,7 +159,6 @@ fn go_decode_accepts_and_rejects_what_go_does() {
 /// on the value wherever both decode a canonical (map form, unique keys)
 /// record.
 #[test]
-#[ignore = "Phase 26 carve-out: array-form LogicSig/SaltedKeySig decode follows the SigScheme registry (#2546, go v5.1.0-beta)"]
 fn consensus_reader_never_accepts_what_go_rejects() {
     let named = lsig_decode_cases();
     let mutants = lsig_mutant_cases();
@@ -224,8 +224,8 @@ fn signed_txn_carrying_such_a_logicsig_is_rejected() {
         "l 16001 bytes",
         "arg 256 elements",
         "arg element 4097",
-        "pqsig pk 1794",
-        "pqsig sig 1539",
+        "pqsig pk 16001",
+        "pqsig sig 17281",
     ] {
         assert!(!decode(&by_name[rejected]), "{rejected} must be rejected");
     }
@@ -261,11 +261,11 @@ fn rejections_carry_go_msgp_error_text() {
         ),
         // an `UintBelowZero` replaces it
         ("msig v negative", "msgp: attempted to cast int -1 to unsigned at Msig"),
-        ("pqsig salt negative", "msgp: attempted to cast int -1 to unsigned at PQsig"),
+        ("pqsig salt negative", "msgp: attempted to cast int -1 to unsigned at SKsig"),
         // `ErrShortBytes` never gets one
         ("l truncated", "msgp: too few bytes left to read object"),
         ("reserved marker", "msgp: unrecognized type prefix 0xc1"),
-        ("pqsig pk 1794", "msgp: length overflow: 1794 > 1793 at PQsig"),
+        ("pqsig pk 16001", "msgp: length overflow: 16001 > 16000 at SKsig"),
     ] {
         assert_eq!(String::from_utf8(text(name)).unwrap(), want, "{name}");
     }

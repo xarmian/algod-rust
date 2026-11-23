@@ -32,8 +32,8 @@ use algo_ledger::simulation::{SimulationRequest, Simulator, SimulatorError};
 use algo_ledger::{LedgerState, LedgerStore};
 use algo_types::consensus::CONSENSUS_V42;
 use algo_types::{
-    canonical_pq_address_salt, AccountData, Address, LogicSig, PQAddressSalt, PQSig,
-    SignedTransaction, Transaction, PQ_SCHEME_FALCON1024,
+    canonical_address_salt, AccountData, Address, LogicSig, AddressSalt, SaltedKeySig,
+    SignedTransaction, Transaction, SIG_SCHEME_FALCON1024,
 };
 
 // ---------------------------------------------------------------------------
@@ -45,7 +45,7 @@ const FEE_SINK: Address = Address([0xFE; 32]);
 /// Falcon-1024's public key size (`algo_falcon::FALCON_DET1024_PUBKEY_SIZE`).
 /// Hardcoded here rather than pulling in the `algo-falcon` crate: placeholder
 /// envelope validation only hashes the public key bytes for address
-/// derivation (`PQSig::address`) and never verifies a signature over them, so
+/// derivation (`SaltedKeySig::address`) and never verifies a signature over them, so
 /// these tests need a correctly-*sized* key, not a real Falcon-1024 keypair.
 const FALCON_DET1024_PUBKEY_SIZE: usize = 1793;
 
@@ -73,17 +73,17 @@ fn setup_state(sender: Address) -> LedgerState {
 }
 
 /// A dummy but correctly-sized "public key" and its canonical PQ address.
-fn dummy_pq_identity(fill_byte: u8) -> (Vec<u8>, PQAddressSalt, Address) {
+fn dummy_pq_identity(fill_byte: u8) -> (Vec<u8>, AddressSalt, Address) {
     let pk = vec![fill_byte; FALCON_DET1024_PUBKEY_SIZE];
     let (salt, addr) =
-        canonical_pq_address_salt(PQ_SCHEME_FALCON1024, &pk).expect("a canonical salt exists");
+        canonical_address_salt(SIG_SCHEME_FALCON1024, &pk).expect("a canonical salt exists");
     (pk, salt, addr)
 }
 
 /// Fee for a Falcon-1024 (placeholder or real) signed payment: 1.0 base fee
 /// factor + 2.0 Falcon-1024 surcharge. go's `eval.CheckGroupFees` (issue
 /// #2040) requires 3 * MinTxnFee even for placeholder PQ sigs
-/// (`PQSig.Blank()` is false once a scheme is set).
+/// (`SaltedKeySig.Blank()` is false once a scheme is set).
 const FALCON_PAY_FEE: u64 = 3000;
 
 fn make_pay_txn(sender: Address, receiver: Address, fee: u64) -> Transaction {
@@ -108,7 +108,7 @@ fn simulate(
 }
 
 // ---------------------------------------------------------------------------
-// Top-level placeholder PQSig
+// Top-level placeholder SaltedKeySig
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -121,9 +121,9 @@ fn scheme_only_placeholder_pqsig_accepted() {
 
     let stx = SignedTransaction {
         txn: make_pay_txn(sender, receiver, FALCON_PAY_FEE),
-        pqsig: Some(PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
-            salt: PQAddressSalt(0),
+        pqsig: Some(SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
+            salt: AddressSalt(0),
             public_key: ByteBuf::new(),
             signature: ByteBuf::new(),
         }),
@@ -156,8 +156,8 @@ fn full_placeholder_pqsig_matching_authorizer_accepted() {
 
     let stx = SignedTransaction {
         txn: make_pay_txn(addr, receiver, FALCON_PAY_FEE),
-        pqsig: Some(PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
+        pqsig: Some(SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
             salt,
             public_key: ByteBuf::from(pk),
             signature: ByteBuf::new(),
@@ -181,7 +181,6 @@ fn full_placeholder_pqsig_matching_authorizer_accepted() {
 }
 
 #[test]
-#[ignore = "Phase 26 carve-out: expects the PQSig-era frame and texts; rewritten with the SaltedKeySig texts in #2546 (go v5.1.0-beta)"]
 fn full_placeholder_pqsig_mismatched_authorizer_rejected() {
     // The public key derives a *different* address than the sender: the
     // placeholder envelope must fail validation (real verification is then
@@ -193,8 +192,8 @@ fn full_placeholder_pqsig_mismatched_authorizer_rejected() {
 
     let stx = SignedTransaction {
         txn: make_pay_txn(sender, receiver, FALCON_PAY_FEE),
-        pqsig: Some(PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
+        pqsig: Some(SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
             salt,
             public_key: ByteBuf::from(pk),
             signature: ByteBuf::new(),
@@ -218,22 +217,21 @@ fn full_placeholder_pqsig_mismatched_authorizer_rejected() {
     assert_eq!(group.failed_at, Some(vec![0]));
     let message = group.failure_message.as_deref().unwrap_or_default();
     assert!(
-        // go's `transaction %+v invalid : ` frame of the member (issue #2451).
-        message.starts_with("transaction {")
-            && message.contains(
-                "} invalid : pq signature validation failed: pq signature authorizer mismatch: "
-            ),
+        // go v5.1 simulate prints the member's `TxGroupError` unframed (#2451, #2551).
+        message.starts_with(
+            "salted-key signature validation failed: salted-key signature authorizer mismatch: "
+        ),
         "{message}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Delegated (LogicSig-nested) placeholder PQSig
+// Delegated (LogicSig-nested) placeholder SaltedKeySig
 // ---------------------------------------------------------------------------
 
 #[test]
 fn delegated_placeholder_pqsig_matching_authorizer_accepted() {
-    // A LogicSig whose delegation is a placeholder PQSig: the escrow
+    // A LogicSig whose delegation is a placeholder SaltedKeySig: the escrow
     // fallback authorizes via the program hash once the placeholder
     // validates, without needing a real Falcon signature over the program.
     let (pk, salt, addr) = dummy_pq_identity(0x33);
@@ -247,8 +245,8 @@ fn delegated_placeholder_pqsig_matching_authorizer_accepted() {
         txn: make_pay_txn(addr, receiver, FALCON_PAY_FEE),
         lsig: Some(LogicSig {
             logic: ByteBuf::from(program),
-            pqsig: Some(PQSig {
-                scheme: PQ_SCHEME_FALCON1024,
+            pqsig: Some(SaltedKeySig {
+                scheme: SIG_SCHEME_FALCON1024,
                 salt,
                 public_key: ByteBuf::from(pk),
                 signature: ByteBuf::new(),
@@ -274,7 +272,6 @@ fn delegated_placeholder_pqsig_matching_authorizer_accepted() {
 }
 
 #[test]
-#[ignore = "Phase 26 carve-out: expects the PQSig-era frame and texts; rewritten with the SaltedKeySig texts in #2546 (go v5.1.0-beta)"]
 fn delegated_placeholder_pqsig_mismatched_authorizer_rejected() {
     let (pk, salt, _addr) = dummy_pq_identity(0x44);
     let sender = Address([0xDD; 32]); // does NOT match the derived PQ address
@@ -287,8 +284,8 @@ fn delegated_placeholder_pqsig_mismatched_authorizer_rejected() {
         txn: make_pay_txn(sender, receiver, FALCON_PAY_FEE),
         lsig: Some(LogicSig {
             logic: ByteBuf::from(program),
-            pqsig: Some(PQSig {
-                scheme: PQ_SCHEME_FALCON1024,
+            pqsig: Some(SaltedKeySig {
+                scheme: SIG_SCHEME_FALCON1024,
                 salt,
                 public_key: ByteBuf::from(pk),
                 signature: ByteBuf::new(),
@@ -309,21 +306,19 @@ fn delegated_placeholder_pqsig_mismatched_authorizer_rejected() {
     assert_eq!(group.failed_at, Some(vec![0]));
     let message = group.failure_message.as_deref().unwrap_or_default();
     assert!(
-        // go's `transaction %+v invalid : ` frame of the member (issue #2451).
-        message.starts_with("transaction {")
-            && message.contains(
-                "} invalid : pq delegated logic signature validation failed: pq signature authorizer mismatch: "
-            ),
+        // go v5.1 simulate prints the member's `TxGroupError` unframed (#2451, #2551).
+        message.starts_with(
+            "salted-key signature delegation validation failed: salted-key signature authorizer mismatch: "
+        ),
         "{message}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// A real (non-placeholder) PQSig must not be clobbered by proxy-signing
+// A real (non-placeholder) SaltedKeySig must not be clobbered by proxy-signing
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "Phase 26 carve-out: expects the PQSig-era frame and texts; rewritten with the SaltedKeySig texts in #2546 (go v5.1.0-beta)"]
 fn non_placeholder_pqsig_with_wrong_authorizer_is_not_silently_proxy_signed() {
     // Regression guard: before issue #835, `check()`'s "no signature at
     // all" branch didn't check for a present `pqsig` field, so a
@@ -339,8 +334,8 @@ fn non_placeholder_pqsig_with_wrong_authorizer_is_not_silently_proxy_signed() {
 
     let stx = SignedTransaction {
         txn: make_pay_txn(sender, receiver, FALCON_PAY_FEE),
-        pqsig: Some(PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
+        pqsig: Some(SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
             salt,
             public_key: ByteBuf::from(pk),
             signature: ByteBuf::from(vec![0u8; 10]), // non-empty, but bogus
@@ -365,11 +360,10 @@ fn non_placeholder_pqsig_with_wrong_authorizer_is_not_silently_proxy_signed() {
     );
     let message = group.failure_message.as_deref().unwrap_or_default();
     assert!(
-        // go's `transaction %+v invalid : ` frame of the member (issue #2451).
-        message.starts_with("transaction {")
-            && message.contains(
-                "} invalid : pq signature validation failed: pq signature authorizer mismatch: "
-            ),
+        // go v5.1 simulate prints the member's `TxGroupError` unframed (#2451, #2551).
+        message.starts_with(
+            "salted-key signature validation failed: salted-key signature authorizer mismatch: "
+        ),
         "{message}"
     );
 }
@@ -381,7 +375,7 @@ fn non_placeholder_pqsig_with_wrong_authorizer_is_not_silently_proxy_signed() {
 #[test]
 fn pqsig_with_flat_min_fee_fails_check_group_fees() {
     // The fee check MUST use the original submitted group: in `check()` the
-    // placeholder PQSig is stripped (`pqsig = None`) and replaced by a proxy
+    // placeholder SaltedKeySig is stripped (`pqsig = None`) and replaced by a proxy
     // Ed25519 signature, so a fee check over the post-swap group would see a
     // plain payment and accept fee 1000. This test fails if that regresses.
     //
@@ -395,9 +389,9 @@ fn pqsig_with_flat_min_fee_fails_check_group_fees() {
     let txn = make_pay_txn(sender, receiver, 1000);
     let stx = SignedTransaction {
         txn,
-        pqsig: Some(PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
-            salt: PQAddressSalt(0),
+        pqsig: Some(SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
+            salt: AddressSalt(0),
             public_key: ByteBuf::new(),
             signature: ByteBuf::new(),
         }),
@@ -434,8 +428,8 @@ fn delegated_placeholder_pqsig_with_flat_min_fee_fails_check_group_fees() {
         txn: make_pay_txn(addr, receiver, 1000),
         lsig: Some(LogicSig {
             logic: ByteBuf::from(vec![0x06, 0x81, 0x01, 0x43]),
-            pqsig: Some(PQSig {
-                scheme: PQ_SCHEME_FALCON1024,
+            pqsig: Some(SaltedKeySig {
+                scheme: SIG_SCHEME_FALCON1024,
                 salt,
                 public_key: ByteBuf::from(pk),
                 signature: ByteBuf::new(),

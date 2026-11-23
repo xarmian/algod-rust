@@ -41,7 +41,7 @@ use serde_bytes::ByteBuf;
 use crate::{
     Address, AssetParams, BoxRef, FalconVerifier, HashFactory, HeartbeatProof, HeartbeatTxnFields,
     HoldingRef, LocalsRef, LogicSig, MerkleProof, MerkleSignature, MerkleSignatureVerifier,
-    MultisigSig, MultisigSubsig, PQSig, Participant, ResourceRef, Reveal, SigSlotCommit,
+    MultisigSig, MultisigSubsig, SaltedKeySig, Participant, ResourceRef, Reveal, SigSlotCommit,
     SignedTransaction, StateProofBody, StateProofMessage, StateSchema, Transaction,
 };
 
@@ -954,11 +954,11 @@ pub fn canonical_encode_logicsig(lsig: &LogicSig) -> Vec<u8> {
     m.encode()
 }
 
-/// Canonically encode a PQSig as a nested msgpack map.
+/// Canonically encode a SaltedKeySig as a nested msgpack map.
 /// Sorted fields: "pk", "sch", "sig", "slt" (alphabetical).
-/// Only includes non-empty/non-zero fields (Go: `PQSig`'s
+/// Only includes non-empty/non-zero fields (Go: `SaltedKeySig`'s
 /// `_struct codec:",omitempty,omitemptyarray"`).
-pub fn canonical_encode_pqsig(pqsig: &PQSig) -> Vec<u8> {
+pub fn canonical_encode_pqsig(pqsig: &SaltedKeySig) -> Vec<u8> {
     let mut m = CanonicalMap::new();
 
     // go: `PublicKey` / `Signature` are `[]byte`: length-only omitempty

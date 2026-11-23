@@ -1571,7 +1571,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     stx.auth_addr = Some(Address(proxy_pub));
                 }
             } else if allow_empty_signatures && is_placeholder_pqsig(stx) {
-                // Full or scheme-only top-level PQSig placeholder (issue
+                // Full or scheme-only top-level SaltedKeySig placeholder (issue
                 // #835): if it validates, proxy-sign the same way as the
                 // fully-unsigned case above (mirrors go's
                 // `stxn.Txn.Sign(proxySignerSecrets)`, which discards the
@@ -1598,7 +1598,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     }
                 }
             } else if allow_empty_signatures && is_placeholder_delegated_pqsig(stx) {
-                // Delegated (LogicSig-nested) PQSig placeholder (issue #835):
+                // Delegated (LogicSig-nested) SaltedKeySig placeholder (issue #835):
                 // unlike the top-level cases, the LogicSig's program must
                 // still be evaluated and traced, so it cannot be swapped for
                 // a proxy-signed bare transaction. If the placeholder
@@ -1803,7 +1803,7 @@ fn txn_has_no_signature(stx: &SignedTransaction) -> bool {
     !stx.has_signature()
 }
 
-/// Whether `stx` carries a placeholder top-level `PQSig`: a non-blank PQ
+/// Whether `stx` carries a placeholder top-level `SaltedKeySig`: a non-blank PQ
 /// envelope with an empty signature and no other signature category set.
 /// Matches go-algorand's `isPlaceholderPQSig` (`ledger/simulation/
 /// simulator.go`, issue #835) -- used for fee/budget-estimation simulation
@@ -1875,7 +1875,7 @@ fn validate_fixed_placeholder_pq_envelopes(
                 validate_pqsig_envelope(pqsig, &authorizer, consensus).map_err(|e| {
                     (
                         i,
-                        format!("pq signature validation failed: {}", go_error_text(&e)),
+                        format!("salted-key signature validation failed: {}", go_error_text(&e)),
                     )
                 })?;
             }
@@ -1891,7 +1891,7 @@ fn validate_fixed_placeholder_pq_envelopes(
                     (
                         i,
                         format!(
-                            "pq delegated logic signature validation failed: {}",
+                            "salted-key signature delegation validation failed: {}",
                             go_error_text(&e)
                         ),
                     )
@@ -1911,14 +1911,14 @@ fn go_error_text(e: &AlgoError) -> String {
     }
 }
 
-/// Validate a placeholder `PQSig` envelope, matching go-algorand's
+/// Validate a placeholder `SaltedKeySig` envelope, matching go-algorand's
 /// `validatePlaceholderPQSig` (`ledger/simulation/simulator.go`): a
 /// scheme-only placeholder (empty public key) or a `fix_signers` request
 /// (whose `authorizer` isn't final yet) only needs the scheme validated;
 /// a full placeholder (public key set) needs the whole envelope, including
 /// the public-key-derived authorizer address, validated.
 fn validate_placeholder_pqsig(
-    pqsig: &algo_types::PQSig,
+    pqsig: &algo_types::SaltedKeySig,
     authorizer: &Address,
     consensus: &ConsensusParams,
     fix_signers: bool,
@@ -2068,10 +2068,10 @@ mod tests {
         }
     }
 
-    fn placeholder_pqsig() -> algo_types::PQSig {
-        algo_types::PQSig {
-            scheme: algo_types::PQ_SCHEME_FALCON1024,
-            salt: algo_types::PQAddressSalt(0),
+    fn placeholder_pqsig() -> algo_types::SaltedKeySig {
+        algo_types::SaltedKeySig {
+            scheme: algo_types::SIG_SCHEME_FALCON1024,
+            salt: algo_types::AddressSalt(0),
             public_key: serde_bytes::ByteBuf::new(),
             signature: serde_bytes::ByteBuf::new(),
         }

@@ -18,7 +18,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Byte-exact conformance tests for `PQSig`-bearing `SignedTransaction`/
+//! Byte-exact conformance tests for `SaltedKeySig`-bearing `SignedTransaction`/
 //! `LogicSig` canonical msgpack encoding, against fixtures captured from a
 //! **real go-algorand v5.0.0-stable `algokey pq` run** (issue #707).
 //!

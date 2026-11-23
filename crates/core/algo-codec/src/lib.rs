@@ -26,7 +26,10 @@ pub mod hash;
 mod json_escape;
 mod logicsig_go;
 pub use json_escape::escape_json_like_go;
-pub use logicsig_go::{decode_logicsig_go, decode_multisig_go, GoLogicSig};
+pub use logicsig_go::{
+    decode_logic_sig_args, decode_logicsig_go, decode_multisig_go, encode_logic_sig_args, GoLogicSig,
+    LogicSigArgsError,
+};
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub use canonical::payset_txid_hash_runs;

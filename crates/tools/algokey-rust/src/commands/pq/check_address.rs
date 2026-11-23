@@ -43,7 +43,7 @@ pub fn run_with_io<O: Write, E: Write>(
             return ExitCode::from(1);
         }
     };
-    if !addr.is_pq_compliant() {
+    if !addr.is_off_ed25519_curve() {
         let _ = writeln!(stderr, "address {addr} is not PQ compliant");
         return ExitCode::from(1);
     }
@@ -58,11 +58,11 @@ pub fn run_with_io<O: Write, E: Write>(
 mod tests {
     use super::*;
     use crate::commands::pq::scheme::generate_pq_signing_material;
-    use algo_types::PQ_SCHEME_FALCON1024;
+    use algo_types::SIG_SCHEME_FALCON1024;
 
     #[test]
     fn check_address_accepts_pq_compliant_address() {
-        let (_, signing) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
+        let (_, signing) = generate_pq_signing_material(SIG_SCHEME_FALCON1024).unwrap();
         let addr = signing.public.address();
         let mut out = Vec::new();
         let mut err = Vec::new();

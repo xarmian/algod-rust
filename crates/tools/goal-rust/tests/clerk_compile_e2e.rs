@@ -548,9 +548,9 @@ fn lsig_files() -> Vec<(String, Vec<u8>)> {
         (
             "pqsig".into(),
             enc(&algo_types::LogicSig {
-                pqsig: Some(algo_types::PQSig {
+                pqsig: Some(algo_types::SaltedKeySig {
                     scheme: *b"fn",
-                    salt: algo_types::PQAddressSalt(3),
+                    salt: algo_types::AddressSalt(3),
                     public_key: serde_bytes::ByteBuf::from((0..20).collect::<Vec<u8>>()),
                     signature: serde_bytes::ByteBuf::from((0..30).collect::<Vec<u8>>()),
                 }),

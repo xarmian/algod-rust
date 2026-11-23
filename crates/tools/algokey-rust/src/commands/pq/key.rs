@@ -30,7 +30,7 @@
 
 use std::path::Path;
 
-use algo_types::{go_msgp, pq_address, Address, PQAddressSalt, PQ_SCHEME_FALCON1024};
+use algo_types::{go_msgp, salted_address, Address, AddressSalt, SIG_SCHEME_FALCON1024};
 
 use crate::common::write_with_mode_0600;
 
@@ -39,19 +39,19 @@ use crate::common::write_with_mode_0600;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PqPublicMaterial {
     pub scheme: [u8; 2],
-    pub salt: PQAddressSalt,
+    pub salt: AddressSalt,
     pub public_key: Vec<u8>,
 }
 
 impl PqPublicMaterial {
     /// Mirrors `pqPublicMaterial.address()` (`pq_key.go:43-45`).
     pub fn address(&self) -> Address {
-        pq_address(self.scheme, self.salt, &self.public_key)
+        salted_address(self.scheme, self.salt, &self.public_key)
     }
 
     /// Mirrors `pqPublicMaterial.validate()` (`pq_key.go:47-59`).
     pub fn validate(&self) -> Result<(), String> {
-        if self.scheme != PQ_SCHEME_FALCON1024 {
+        if self.scheme != SIG_SCHEME_FALCON1024 {
             return Err(format!(
                 "pq scheme not supported: {:?}",
                 String::from_utf8_lossy(&self.scheme)
@@ -64,7 +64,7 @@ impl PqPublicMaterial {
                 algo_falcon::FALCON_DET1024_PUBKEY_SIZE
             ));
         }
-        if !self.address().is_pq_compliant() {
+        if !self.address().is_off_ed25519_curve() {
             return Err(format!(
                 "pq address salt is not compliant: address {}",
                 self.address()
@@ -172,7 +172,7 @@ fn read_public_into(rd: &mut &[u8], p: &mut PqPublicMaterial) -> algo_error::Res
         match key {
             // `protocol.PQScheme` is a `[2]byte`: `msgp.ReadExactBytes`
             b"scheme" => go_msgp::read_fixed_bytes_into_go_compat(rd, &mut p.scheme)?,
-            b"salt" => p.salt = PQAddressSalt(go_msgp::read_u8_val(rd)?),
+            b"salt" => p.salt = AddressSalt(go_msgp::read_u8_val(rd)?),
             b"public-key" => p.public_key = go_msgp::read_bytes_go_compat(rd)?,
             other => return Err(go_msgp::no_matching_field_error(other)),
         }
@@ -224,10 +224,10 @@ mod tests {
     /// Builds a `PqSigningMaterial` with a real *canonical* (PQ-compliant)
     /// salt for the given public key pattern — `salt` is ignored other than
     /// as documentation of intent; the actual salt is computed via
-    /// `canonical_pq_address_salt` so `validate()` passes.
+    /// `canonical_address_salt` so `validate()` passes.
     fn sample(scheme: [u8; 2], _salt: u8, pk_byte: u8, sk_byte: u8) -> PqSigningMaterial {
         let public_key = vec![pk_byte; algo_falcon::FALCON_DET1024_PUBKEY_SIZE];
-        let (salt, _addr) = algo_types::canonical_pq_address_salt(scheme, &public_key)
+        let (salt, _addr) = algo_types::canonical_address_salt(scheme, &public_key)
             .expect("a compliant salt must exist");
         PqSigningMaterial {
             public: PqPublicMaterial {
@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn encode_matches_go_field_order_and_headers() {
-        let m = sample(PQ_SCHEME_FALCON1024, 3, 0x11, 0x22);
+        let m = sample(SIG_SCHEME_FALCON1024, 3, 0x11, 0x22);
         let bytes = encode_pq_signing_material(&m);
         // Outer map header: fixmap with 2 entries = 0x82.
         assert_eq!(bytes[0], 0x82);
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn encode_decode_round_trips() {
-        let m = sample(PQ_SCHEME_FALCON1024, 7, 0xAB, 0xCD);
+        let m = sample(SIG_SCHEME_FALCON1024, 7, 0xAB, 0xCD);
         let bytes = encode_pq_signing_material(&m);
         let decoded = decode_pq_signing_material(&bytes).expect("decode");
         assert_eq!(decoded, m);
@@ -279,7 +279,7 @@ mod tests {
             rng.fill_bytes(&mut public_key);
             let mut private_key = vec![0u8; algo_falcon::FALCON_DET1024_PRIVKEY_SIZE];
             rng.fill_bytes(&mut private_key);
-            let salt = PQAddressSalt((rng.next_u32() % 256) as u8);
+            let salt = AddressSalt((rng.next_u32() % 256) as u8);
             // Randomize the scheme tag bytes too (decode/encode round-trip
             // doesn't require a registered scheme — that's `validate()`'s
             // job, exercised separately).
@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_wrong_sized_public_key() {
-        let mut m = sample(PQ_SCHEME_FALCON1024, 7, 1, 1);
+        let mut m = sample(SIG_SCHEME_FALCON1024, 7, 1, 1);
         m.public.public_key.truncate(10);
         let err = m.validate().unwrap_err();
         assert!(err.contains("malformed"), "{err}");
@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_wrong_sized_private_key() {
-        let mut m = sample(PQ_SCHEME_FALCON1024, 7, 1, 1);
+        let mut m = sample(SIG_SCHEME_FALCON1024, 7, 1, 1);
         m.private_key.truncate(10);
         let err = m.validate().unwrap_err();
         assert!(err.contains("malformed"), "{err}");
@@ -333,8 +333,8 @@ mod tests {
         // independently know is not PQ-compliant by scanning for one).
         let mut bad_salt = None;
         for s in 0..=255u8 {
-            let addr = pq_address(PQ_SCHEME_FALCON1024, PQAddressSalt(s), &pk);
-            if !addr.is_pq_compliant() {
+            let addr = salted_address(SIG_SCHEME_FALCON1024, AddressSalt(s), &pk);
+            if !addr.is_off_ed25519_curve() {
                 bad_salt = Some(s);
                 break;
             }
@@ -342,8 +342,8 @@ mod tests {
         let bad_salt = bad_salt.expect("at least one non-compliant salt must exist");
         let m = PqSigningMaterial {
             public: PqPublicMaterial {
-                scheme: PQ_SCHEME_FALCON1024,
-                salt: PQAddressSalt(bad_salt),
+                scheme: SIG_SCHEME_FALCON1024,
+                salt: AddressSalt(bad_salt),
                 public_key: pk,
             },
             private_key: vec![1u8; algo_falcon::FALCON_DET1024_PRIVKEY_SIZE],
@@ -369,7 +369,7 @@ mod tests {
     fn write_then_read_round_trips_through_disk() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pqkey");
-        let m = sample(PQ_SCHEME_FALCON1024, 7, 0x33, 0x44);
+        let m = sample(SIG_SCHEME_FALCON1024, 7, 0x33, 0x44);
         write_pq_private_key_file(&path, &m).unwrap();
         let read_back = read_pq_signing_material(&path).unwrap();
         assert_eq!(read_back, m);

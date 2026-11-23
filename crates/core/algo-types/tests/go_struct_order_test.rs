@@ -86,7 +86,6 @@ fn named_types() -> Vec<String> {
 }
 
 #[test]
-#[ignore = "Phase 26 carve-out: transactions.PQSig became SaltedKeySig; the decoders move with the SigScheme registry (#2546, go v5.1.0-beta)"]
 fn every_named_go_type_is_in_the_schema() {
     let schema = schema();
     let named = named_types();

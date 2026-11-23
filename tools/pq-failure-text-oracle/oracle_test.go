@@ -19,7 +19,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // Parity oracle for algod-rust issue #2438: the post-quantum (Falcon-1024)
-// signature failure texts of go-algorand v5.1.1-stable's PQSig.Verify,
+// signature failure texts of go-algorand v5.1.1-stable's SaltedKeySig.Verify,
 // VerifyFalcon1024 and the simulator, on the pool path (verify.TxnGroup,
 // whose TxGroupError text is what BroadcastSignedTxGroup and the REST
 // handler return) and in simulate (Simulator.Simulate).
@@ -33,7 +33,7 @@
 //   - "simulate" cases carry the PQ envelope, sender and request flags, and
 //     go's Simulate outcome (request error, group FailureMessage, FailedAt).
 //
-// verify.TxnGroup frames a member's error as "transaction %+v invalid : <err>"
+// verify.TxnGroup frames a member's error as "transaction %s invalid : <err>"
 // (a Go struct dump of the whole SignedTxn, data/transactions/verify/txn.go);
 // the texts are recorded in full (issue #2451) with "framed": true when they
 // carry that frame. A simulate case also carries the SignedTxn go submitted.
@@ -99,19 +99,19 @@ type simulateCase struct {
 }
 
 type oracleKey struct {
-	signer crypto.FalconSigner
+	signer crypto.Falcon1024Signer
 	pk     []byte
-	salt   basics.PQAddressSalt
+	salt   basics.AddressSalt
 	addr   basics.Address
 }
 
 func makeOracleKey(t *testing.T, seedByte byte) oracleKey {
 	var seed crypto.FalconSeed
 	seed[0] = seedByte
-	signer, err := crypto.GenerateFalconSigner(seed)
+	signer, err := crypto.GenerateFalcon1024Signer(seed)
 	require.NoError(t, err)
 	pk := slices.Clone(signer.PublicKey[:])
-	salt, addr, err := basics.CanonicalPQAddressSalt(protocol.PQSchemeFalcon1024, pk)
+	salt, addr, err := basics.CanonicalAddressSalt(protocol.SigSchemeFalcon1024, pk)
 	require.NoError(t, err)
 	return oracleKey{signer: signer, pk: pk, salt: salt, addr: addr}
 }
@@ -123,10 +123,12 @@ func errText(err error) string {
 	return err.Error()
 }
 
-// framed reports whether s carries verify.TxnGroup's "transaction %+v
+// framed reports whether s carries verify.TxnGroup's "transaction %s
 // invalid : " frame.
 func framed(s string) bool {
-	return strings.HasPrefix(s, "transaction {") && strings.Contains(s, "} invalid : ")
+	// go v5.1: `transaction <SignedTxn.Summary()> invalid : <reason>`.
+	at := strings.Index(s, " invalid : ")
+	return at > 0 && strings.HasPrefix(s, "transaction ") && strings.Contains(s[:at], " from ")
 }
 
 func TestAlgodRustPQFailureTextOracle(t *testing.T) {
@@ -171,36 +173,40 @@ func TestAlgodRustPQFailureTextOracle(t *testing.T) {
 	// signing; tamper edits the finished envelope after signing.
 	type variant struct {
 		name   string
-		mutate func(p *transactions.PQSig, sender *basics.Address)
-		tamper func(p *transactions.PQSig)
+		mutate func(p *transactions.SaltedKeySig, sender *basics.Address)
+		tamper func(p *transactions.SaltedKeySig)
 	}
-	shortKey := func(p *transactions.PQSig, sender *basics.Address) {
+	shortKey := func(p *transactions.SaltedKeySig, sender *basics.Address) {
 		p.PublicKey = slices.Clone(p.PublicKey[:len(p.PublicKey)-1])
 		*sender = p.Address()
 	}
 	variants := []variant{
 		{name: "valid"},
 		{name: "public key one byte short, authorizer derived from it", mutate: shortKey},
-		{name: "public key one byte short, authorizer from the full key", mutate: func(p *transactions.PQSig, _ *basics.Address) {
+		{name: "public key one byte short, authorizer from the full key", mutate: func(p *transactions.SaltedKeySig, _ *basics.Address) {
 			p.PublicKey = slices.Clone(p.PublicKey[:len(p.PublicKey)-1])
 		}},
-		{name: "public key empty, authorizer derived from it", mutate: func(p *transactions.PQSig, sender *basics.Address) {
+		{name: "public key empty, authorizer derived from it", mutate: func(p *transactions.SaltedKeySig, sender *basics.Address) {
 			p.PublicKey = nil
 			*sender = p.Address()
 		}},
-		{name: "wrong salt", mutate: func(p *transactions.PQSig, _ *basics.Address) { p.Salt ^= 1 }},
-		{name: "another key's envelope", mutate: func(p *transactions.PQSig, _ *basics.Address) {
+		{name: "wrong salt", mutate: func(p *transactions.SaltedKeySig, _ *basics.Address) { p.Salt ^= 1 }},
+		{name: "another key's envelope", mutate: func(p *transactions.SaltedKeySig, _ *basics.Address) {
 			p.Salt, p.PublicKey = other.salt, slices.Clone(other.pk)
 		}},
-		{name: "unsupported scheme", mutate: func(p *transactions.PQSig, _ *basics.Address) { p.Scheme = protocol.PQScheme{'f', '2'} }},
-		{name: "signature header byte flipped", tamper: func(p *transactions.PQSig) { p.Signature[0] ^= 1 }},
-		{name: "signature body byte flipped", tamper: func(p *transactions.PQSig) { p.Signature[len(p.Signature)/2] ^= 0xff }},
-		{name: "signature last byte flipped", tamper: func(p *transactions.PQSig) { p.Signature[len(p.Signature)-1] ^= 0x55 }},
-		{name: "signature truncated to 41 bytes", tamper: func(p *transactions.PQSig) { p.Signature = p.Signature[:41] }},
-		{name: "signature one byte", tamper: func(p *transactions.PQSig) { p.Signature = p.Signature[:1] }},
-		{name: "signature empty", tamper: func(p *transactions.PQSig) { p.Signature = nil }},
-		{name: "signature by another key", tamper: func(p *transactions.PQSig) {
-			var sig crypto.FalconSignature
+		{name: "unsupported scheme", mutate: func(p *transactions.SaltedKeySig, _ *basics.Address) { p.Scheme = protocol.SigScheme{'f', '2'} }},
+		// go v5.1: f5, ed and ls are known schemes that the current protocol does not enable.
+		{name: "falcon-512 scheme not enabled", mutate: func(p *transactions.SaltedKeySig, _ *basics.Address) { p.Scheme = protocol.SigSchemeFalcon512 }},
+		{name: "ed25519 scheme not enabled", mutate: func(p *transactions.SaltedKeySig, _ *basics.Address) { p.Scheme = protocol.SigSchemeEd25519 }},
+		{name: "logicsig scheme not enabled", mutate: func(p *transactions.SaltedKeySig, _ *basics.Address) { p.Scheme = protocol.SigSchemeLogicSig }},
+		{name: "signature header byte flipped", tamper: func(p *transactions.SaltedKeySig) { p.Signature[0] ^= 1 }},
+		{name: "signature body byte flipped", tamper: func(p *transactions.SaltedKeySig) { p.Signature[len(p.Signature)/2] ^= 0xff }},
+		{name: "signature last byte flipped", tamper: func(p *transactions.SaltedKeySig) { p.Signature[len(p.Signature)-1] ^= 0x55 }},
+		{name: "signature truncated to 41 bytes", tamper: func(p *transactions.SaltedKeySig) { p.Signature = p.Signature[:41] }},
+		{name: "signature one byte", tamper: func(p *transactions.SaltedKeySig) { p.Signature = p.Signature[:1] }},
+		{name: "signature empty", tamper: func(p *transactions.SaltedKeySig) { p.Signature = nil }},
+		{name: "signature by another key", tamper: func(p *transactions.SaltedKeySig) {
+			var sig crypto.Falcon1024Signature
 			var err error
 			sig, err = other.signer.SignBytes([]byte("not the message"))
 			require.NoError(t, err)
@@ -211,17 +217,17 @@ func TestAlgodRustPQFailureTextOracle(t *testing.T) {
 	for _, kind := range []string{"pqsig", "lsig"} {
 		for _, v := range variants {
 			sender := key.addr
-			pq := transactions.PQSig{Scheme: protocol.PQSchemeFalcon1024, Salt: key.salt, PublicKey: slices.Clone(key.pk)}
+			pq := transactions.SaltedKeySig{Scheme: protocol.SigSchemeFalcon1024, Salt: key.salt, PublicKey: slices.Clone(key.pk)}
 			if v.mutate != nil {
 				v.mutate(&pq, &sender)
 			}
 			txn := baseTxn(sender)
 			stxn := transactions.SignedTxn{Txn: txn}
-			var sig crypto.FalconSignature
+			var sig crypto.Falcon1024Signature
 			if kind == "pqsig" {
 				sig, err = key.signer.Sign(txn)
 			} else {
-				sig, err = key.signer.Sign(logic.PQDelegatedProgram{Addr: txn.Sender, Program: oracleProgram})
+				sig, err = key.signer.Sign(logic.SKsigDelegatedProgram{Addr: txn.Sender, Program: oracleProgram})
 			}
 			require.NoError(t, err)
 			pq.Signature = sig
@@ -229,9 +235,9 @@ func TestAlgodRustPQFailureTextOracle(t *testing.T) {
 				v.tamper(&pq)
 			}
 			if kind == "pqsig" {
-				stxn.PQsig = pq
+				stxn.SKsig = pq
 			} else {
-				stxn.Lsig = transactions.LogicSig{Logic: oracleProgram, PQsig: pq}
+				stxn.Lsig = transactions.LogicSig{Logic: oracleProgram, SKsig: pq}
 			}
 			_, verr := verify.TxnGroup([]transactions.SignedTxn{stxn}, &hdr, nil, ledger)
 			want := errText(verr)
@@ -254,15 +260,15 @@ func TestAlgodRustPQFailureTextOracle(t *testing.T) {
 		// placeholder leaves the signature empty; otherwise a real one is
 		// made and tamper (if any) applied.
 		placeholder bool
-		mutate      func(p *transactions.PQSig, sender *basics.Address)
-		tamper      func(p *transactions.PQSig)
+		mutate      func(p *transactions.SaltedKeySig, sender *basics.Address)
+		tamper      func(p *transactions.SaltedKeySig)
 	}
 	simVariants := []simVariant{
-		{name: "placeholder, wrong salt", placeholder: true, mutate: func(p *transactions.PQSig, _ *basics.Address) { p.Salt ^= 1 }},
-		{name: "placeholder, wrong salt, fix signers", placeholder: true, fixSigners: true, mutate: func(p *transactions.PQSig, _ *basics.Address) { p.Salt ^= 1 }},
+		{name: "placeholder, wrong salt", placeholder: true, mutate: func(p *transactions.SaltedKeySig, _ *basics.Address) { p.Salt ^= 1 }},
+		{name: "placeholder, wrong salt, fix signers", placeholder: true, fixSigners: true, mutate: func(p *transactions.SaltedKeySig, _ *basics.Address) { p.Salt ^= 1 }},
 		{name: "placeholder, public key one byte short", placeholder: true, mutate: shortKey},
 		{name: "placeholder, public key one byte short, fix signers", placeholder: true, fixSigners: true, mutate: shortKey},
-		{name: "signature header byte flipped", tamper: func(p *transactions.PQSig) { p.Signature[0] ^= 1 }},
+		{name: "signature header byte flipped", tamper: func(p *transactions.SaltedKeySig) { p.Signature[0] ^= 1 }},
 		{name: "public key one byte short, real signature", mutate: shortKey},
 	}
 
@@ -270,7 +276,7 @@ func TestAlgodRustPQFailureTextOracle(t *testing.T) {
 		for _, v := range simVariants {
 			env := simulationtesting.PrepareSimulatorTest(t)
 			sender := key.addr
-			pq := transactions.PQSig{Scheme: protocol.PQSchemeFalcon1024, Salt: key.salt, PublicKey: slices.Clone(key.pk)}
+			pq := transactions.SaltedKeySig{Scheme: protocol.SigSchemeFalcon1024, Salt: key.salt, PublicKey: slices.Clone(key.pk)}
 			if v.mutate != nil {
 				v.mutate(&pq, &sender)
 			}
@@ -289,11 +295,11 @@ func TestAlgodRustPQFailureTextOracle(t *testing.T) {
 			// the encoded transaction (and its signature) is reproducible.
 			txn.FirstValid, txn.LastValid = 1, 1001
 			if !v.placeholder {
-				var sig crypto.FalconSignature
+				var sig crypto.Falcon1024Signature
 				if kind == "pqsig" {
 					sig, err = key.signer.Sign(txn)
 				} else {
-					sig, err = key.signer.Sign(logic.PQDelegatedProgram{Addr: txn.Sender, Program: oracleProgram})
+					sig, err = key.signer.Sign(logic.SKsigDelegatedProgram{Addr: txn.Sender, Program: oracleProgram})
 				}
 				require.NoError(t, err)
 				pq.Signature = sig
@@ -315,9 +321,9 @@ func TestAlgodRustPQFailureTextOracle(t *testing.T) {
 				FailedAt:   []int{},
 			}
 			if kind == "pqsig" {
-				stxn.PQsig = pq
+				stxn.SKsig = pq
 			} else {
-				stxn.Lsig = transactions.LogicSig{Logic: oracleProgram, PQsig: pq}
+				stxn.Lsig = transactions.LogicSig{Logic: oracleProgram, SKsig: pq}
 				c.Program = hex.EncodeToString(oracleProgram)
 			}
 			c.Stxn = hex.EncodeToString(protocol.Encode(&stxn))

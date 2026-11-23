@@ -837,8 +837,8 @@ fn v42() -> ConsensusParams {
 #[test]
 fn group_size_check_rejects_programless_lsig_with_only_pqsig() {
     let lsig = LogicSig {
-        pqsig: Some(algo_types::pq::PQSig {
-            scheme: algo_types::pq::PQ_SCHEME_FALCON1024,
+        pqsig: Some(algo_types::pq::SaltedKeySig {
+            scheme: algo_types::pq::SIG_SCHEME_FALCON1024,
             ..Default::default()
         }),
         ..Default::default()
@@ -859,7 +859,7 @@ fn group_size_check_rejects_programless_lsig_with_only_pqsig() {
 fn group_size_check_accepts_blank_lsig_with_empty_args_list() {
     let lsig = LogicSig {
         args: Some(Vec::new()),
-        pqsig: Some(algo_types::pq::PQSig::default()),
+        pqsig: Some(algo_types::pq::SaltedKeySig::default()),
         ..Default::default()
     };
     let group = vec![orphan_lsig_txn(lsig)];

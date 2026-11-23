@@ -91,9 +91,9 @@ fn hand_decoder_keeps_every_pqsig_field_including_a_non_zero_salt() {
     let mut stx = SignedTransaction::default();
     stx.txn.txn_type = "pay".into();
     stx.txn.sender = algo_types::Address([1u8; 32]);
-    stx.pqsig = Some(algo_types::PQSig {
+    stx.pqsig = Some(algo_types::SaltedKeySig {
         scheme: *b"f1",
-        salt: algo_types::PQAddressSalt(7),
+        salt: algo_types::AddressSalt(7),
         public_key: serde_bytes::ByteBuf::from(vec![0xAA; 33]),
         signature: serde_bytes::ByteBuf::from(vec![0xBB; 65]),
     });
@@ -104,7 +104,7 @@ fn hand_decoder_keeps_every_pqsig_field_including_a_non_zero_salt() {
     assert_eq!(hand, oracle);
 }
 
-/// A pqsig map with an extra key is rejected, as go's generated `PQSig`
+/// A pqsig map with an extra key is rejected, as go's generated `SaltedKeySig`
 /// decoder does (`msgp.ErrNoField`; issue #2394).
 #[test]
 fn hand_decoder_pqsig_rejects_an_unknown_key() {
@@ -115,7 +115,7 @@ fn hand_decoder_pqsig_rejects_an_unknown_key() {
     raw.extend_from_slice(b"\xa3sig\xc4\x01\x09");
     raw.extend_from_slice(b"\xa3zzz\x01");
     let mut rd: &[u8] = &raw;
-    let err = algo_types::PQSig::decode_from_reader(&mut rd).expect_err("unknown key");
+    let err = algo_types::SaltedKeySig::decode_from_reader(&mut rd).expect_err("unknown key");
     assert!(
         format!("{err:?}").contains("no matching struct field found"),
         "{err:?}"

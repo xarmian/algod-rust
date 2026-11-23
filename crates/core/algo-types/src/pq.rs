@@ -22,9 +22,9 @@
 //! address derivation.
 //!
 //! Mirrors go-algorand v5.0.1-stable:
-//! - `data/transactions/pqsig.go` (`PQSig`)
-//! - `data/basics/pq_address.go` (`PQAddressSalt`, `pqAddressPreimage`, `PQAddress`, `CanonicalPQAddressSalt`)
-//! - `data/transactions/logic/program.go` (`PQDelegatedProgram`, added by commit `ef838f4e9`)
+//! - `data/transactions/pqsig.go` (`SaltedKeySig`)
+//! - `data/basics/salted_address.go` (`AddressSalt`, `pqAddressPreimage`, `PQAddress`, `CanonicalPQAddressSalt`)
+//! - `data/transactions/logic/program.go` (`SKsigDelegatedProgram`, added by commit `ef838f4e9`)
 //! - `protocol/hash.go` (`PostQuantumAddress = "PQA"`, `PostQuantumDelegatedProgram = "PQProgram"`)
 //!
 //! Scheme-specific signature verification (Falcon-1024) is NOT implemented
@@ -52,41 +52,41 @@ const PQ_DELEGATED_PROGRAM_HASH_PREFIX: &[u8] = b"PQProgram";
 /// currently supported/enabled; the reserved-but-unwired Falcon-512
 /// (`"f2"`) tag is a known scheme constant upstream but has no registered
 /// verifier and is never enabled.
-pub const PQ_SCHEME_FALCON1024: [u8; 2] = *b"f1";
+pub const SIG_SCHEME_FALCON1024: [u8; 2] = *b"f1";
 
 /// A 1-byte salt that selects an address for a post-quantum public key when
 /// deriving a 32-byte address; it is public and included in the address
-/// derivation. Mirrors go's `basics.PQAddressSalt uint8`
-/// (`data/basics/pq_address.go`).
+/// derivation. Mirrors go's `basics.AddressSalt uint8`
+/// (`data/basics/salted_address.go`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PQAddressSalt(pub u8);
+pub struct AddressSalt(pub u8);
 
-impl Serialize for PQAddressSalt {
+impl Serialize for AddressSalt {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_u8(self.0)
     }
 }
 
-impl<'de> Deserialize<'de> for PQAddressSalt {
+impl<'de> Deserialize<'de> for AddressSalt {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(PQAddressSalt(u8::deserialize(deserializer)?))
+        Ok(AddressSalt(u8::deserialize(deserializer)?))
     }
 }
 
-/// A post-quantum transaction authorization proof (Go: `transactions.PQSig`,
+/// A post-quantum transaction authorization proof (Go: `transactions.SaltedKeySig`,
 /// `data/transactions/pqsig.go`). Carried as the `pqsig` field on both
-/// `SignedTransaction` and `LogicSig` (`Option<PQSig>`, matching this repo's
+/// `SignedTransaction` and `LogicSig` (`Option<SaltedKeySig>`, matching this repo's
 /// convention for optional nested-struct wire fields — `None` corresponds to
-/// Go's `PQSig.Blank()`).
+/// Go's `SaltedKeySig.Blank()`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct PQSig {
+pub struct SaltedKeySig {
     /// The PQ scheme tag (Go: `protocol.PQScheme`, `codec:"sch"`).
     #[serde(rename = "sch", default, skip_serializing_if = "is_zero_scheme")]
     pub scheme: [u8; 2],
 
     /// The salt used in PQ address derivation (`codec:"slt"`).
     #[serde(rename = "slt", default, skip_serializing_if = "is_zero_salt")]
-    pub salt: PQAddressSalt,
+    pub salt: AddressSalt,
 
     /// The PQ public key (`codec:"pk"`).
     #[serde(rename = "pk", default, skip_serializing_if = "bytebuf_is_empty")]
@@ -101,7 +101,7 @@ fn is_zero_scheme(s: &[u8; 2]) -> bool {
     *s == [0u8; 2]
 }
 
-fn is_zero_salt(s: &PQAddressSalt) -> bool {
+fn is_zero_salt(s: &AddressSalt) -> bool {
     s.0 == 0
 }
 
@@ -109,8 +109,8 @@ fn bytebuf_is_empty(b: &ByteBuf) -> bool {
     b.as_slice().is_empty()
 }
 
-impl PQSig {
-    /// Mirrors go's `PQSig.Blank()`: true when every field is at its zero
+impl SaltedKeySig {
+    /// Mirrors go's `SaltedKeySig.Blank()`: true when every field is at its zero
     /// value (no PQ authorization envelope present at all).
     pub fn blank(&self) -> bool {
         self.scheme == [0u8; 2]
@@ -135,23 +135,23 @@ impl PQSig {
     /// Decode into an already decoded value, as go's generated `UnmarshalMsg`
     /// does (issue #2424): a repeated key decodes into the populated field.
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> Result<(), algo_error::AlgoError> {
-        let mut keys = crate::rmp_decode::struct_keys(rd, s, "transactions.PQSig")?;
+        let mut keys = crate::rmp_decode::struct_keys(rd, s, "transactions.SaltedKeySig")?;
         while let Some(key) = keys.next(rd)? {
             match key {
                 b"sch" => crate::rmp_decode::read_fixed_bytes_into_go_compat(rd, &mut s.scheme)?,
-                b"slt" => s.salt = PQAddressSalt(crate::rmp_decode::read_u8_val(rd)?),
-                // go's `allocbound=crypto.MaxPQPublicKeySize` / `MaxPQSignatureSize`.
+                b"slt" => s.salt = AddressSalt(crate::rmp_decode::read_u8_val(rd)?),
+                // go's `allocbound=maxSigSchemePublicKeySize()` / `maxSigSchemeSignatureSize()`.
                 b"pk" => {
                     crate::rmp_decode::check_go_bytes_bound(
                         rd,
-                        crate::rmp_decode::MAX_PQ_PUBLIC_KEY_SIZE,
+                        crate::rmp_decode::max_sig_scheme_public_key_size(),
                     )?;
                     s.public_key = crate::rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?
                 }
                 b"sig" => {
                     crate::rmp_decode::check_go_bytes_bound(
                         rd,
-                        crate::rmp_decode::MAX_PQ_SIGNATURE_SIZE,
+                        crate::rmp_decode::max_sig_scheme_signature_size(),
                     )?;
                     s.signature = crate::rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?
                 }
@@ -161,23 +161,23 @@ impl PQSig {
         Ok(())
     }
 
-    /// Mirrors go's `PQSig.Address()`: the authorizer address derived from
-    /// this PQSig's scheme, salt, and public key.
+    /// Mirrors go's `SaltedKeySig.Address()`: the authorizer address derived from
+    /// this SaltedKeySig's scheme, salt, and public key.
     pub fn address(&self) -> Address {
-        pq_address(self.scheme, self.salt, &self.public_key)
+        salted_address(self.scheme, self.salt, &self.public_key)
     }
 }
 
-/// `PQDelegatedProgram{Addr, Program}` (Go: `data/transactions/logic/program.go`,
+/// `SKsigDelegatedProgram{Addr, Program}` (Go: `data/transactions/logic/program.go`,
 /// added by commit `ef838f4e9`) is what a PQ-delegated LogicSig signs: the
 /// hash preimage `Addr || Program` under the `"PQProgram"` domain tag.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PQDelegatedProgram {
+pub struct SKsigDelegatedProgram {
     pub addr: Address,
     pub program: Vec<u8>,
 }
 
-impl PQDelegatedProgram {
+impl SKsigDelegatedProgram {
     /// The raw bytes a PQ-delegated LogicSig's Falcon signature is computed
     /// over: `"PQProgram" || Addr || Program` (Go's `HashRep`, which prepends
     /// the `protocol.HashID` domain tag but does NOT hash — Falcon signs the
@@ -195,8 +195,8 @@ impl PQDelegatedProgram {
 /// Returns the address derived from a PQ signature scheme, an explicit salt,
 /// and a scheme-canonical public key: `SHA512/256("PQA" || scheme || salt ||
 /// pk)`. Mirrors go's `basics.PQAddress(scheme, salt, pk)`
-/// (`data/basics/pq_address.go`).
-pub fn pq_address(scheme: [u8; 2], salt: PQAddressSalt, pk: &[u8]) -> Address {
+/// (`data/basics/salted_address.go`).
+pub fn salted_address(scheme: [u8; 2], salt: AddressSalt, pk: &[u8]) -> Address {
     let mut payload = Vec::with_capacity(2 + 1 + pk.len());
     payload.extend_from_slice(&scheme);
     payload.push(salt.0);
@@ -213,17 +213,17 @@ pub fn pq_address(scheme: [u8; 2], salt: PQAddressSalt, pk: &[u8]) -> Address {
 /// for a `scheme`/`publicKey` pair is `IsPQCompliant()` (not a valid
 /// ed25519 curve point), and that address. Mirrors go's
 /// `basics.CanonicalPQAddressSalt(scheme, publicKey)`
-/// (`data/basics/pq_address.go`). Returns `None` in the (probability
+/// (`data/basics/salted_address.go`). Returns `None` in the (probability
 /// ~2^-256) event that no compliant salt exists in range, matching
 /// upstream's `errNoCanonicalPQAddressSalt`.
-pub fn canonical_pq_address_salt(
+pub fn canonical_address_salt(
     scheme: [u8; 2],
     public_key: &[u8],
-) -> Option<(PQAddressSalt, Address)> {
+) -> Option<(AddressSalt, Address)> {
     for salt in 0..=u8::MAX {
-        let addr = pq_address(scheme, PQAddressSalt(salt), public_key);
-        if addr.is_pq_compliant() {
-            return Some((PQAddressSalt(salt), addr));
+        let addr = salted_address(scheme, AddressSalt(salt), public_key);
+        if addr.is_off_ed25519_curve() {
+            return Some((AddressSalt(salt), addr));
         }
     }
     None
@@ -235,13 +235,13 @@ mod tests {
 
     #[test]
     fn pqsig_blank_matches_default() {
-        assert!(PQSig::default().blank());
+        assert!(SaltedKeySig::default().blank());
     }
 
     #[test]
     fn pqsig_nonblank_when_any_field_set() {
-        let sig = PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
+        let sig = SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
             ..Default::default()
         };
         assert!(!sig.blank());
@@ -250,7 +250,7 @@ mod tests {
     /// go: `TestPQSchemes` (`protocol/pq_scheme_test.go`) checks every
     /// registered `PQScheme` wire literal is printable ASCII and that no two
     /// schemes collide. go registers two schemes (`PQSchemeFalcon1024`,
-    /// `PQSchemeFalcon512`); algod-rust models only `PQ_SCHEME_FALCON1024`
+    /// `PQSchemeFalcon512`); algod-rust models only `SIG_SCHEME_FALCON1024`
     /// (no Falcon-512 wire scheme exists here — see this module's doc
     /// comment), so the uniqueness half of the invariant is trivial over a
     /// single element, but the printable-ASCII invariant is real and worth
@@ -258,7 +258,7 @@ mod tests {
     /// non-printable byte.
     #[test]
     fn pq_scheme_falcon1024_literal_is_printable_ascii() {
-        for &b in &PQ_SCHEME_FALCON1024 {
+        for &b in &SIG_SCHEME_FALCON1024 {
             assert!(
                 (0x20..0x7f).contains(&b),
                 "PQScheme byte {b:#x} must be printable ASCII"
@@ -269,11 +269,11 @@ mod tests {
     #[test]
     fn canonical_pq_address_salt_is_deterministic_and_pq_compliant() {
         let pk = vec![0x42u8; 1793];
-        let (salt, addr) = canonical_pq_address_salt(PQ_SCHEME_FALCON1024, &pk)
+        let (salt, addr) = canonical_address_salt(SIG_SCHEME_FALCON1024, &pk)
             .expect("a compliant salt must exist within 0..=255 with overwhelming probability");
-        assert!(addr.is_pq_compliant());
+        assert!(addr.is_off_ed25519_curve());
         // Re-deriving with the same salt must reproduce the same address.
-        assert_eq!(pq_address(PQ_SCHEME_FALCON1024, salt, &pk), addr);
+        assert_eq!(salted_address(SIG_SCHEME_FALCON1024, salt, &pk), addr);
     }
 
     #[test]
@@ -282,11 +282,11 @@ mod tests {
         // PQ-compliant must be returned — verify by checking every salt
         // strictly below the returned one was NOT compliant.
         let pk = vec![0x7fu8; 64];
-        let (salt, _) = canonical_pq_address_salt(PQ_SCHEME_FALCON1024, &pk).unwrap();
+        let (salt, _) = canonical_address_salt(SIG_SCHEME_FALCON1024, &pk).unwrap();
         for s in 0..salt.0 {
-            let addr = pq_address(PQ_SCHEME_FALCON1024, PQAddressSalt(s), &pk);
+            let addr = salted_address(SIG_SCHEME_FALCON1024, AddressSalt(s), &pk);
             assert!(
-                !addr.is_pq_compliant(),
+                !addr.is_off_ed25519_curve(),
                 "salt {s} was PQ-compliant but a smaller salt than the returned {} was found",
                 salt.0
             );
@@ -296,38 +296,38 @@ mod tests {
     #[test]
     fn pq_address_changes_with_scheme_salt_or_pk() {
         let pk = vec![1u8; 8];
-        let base = pq_address(PQ_SCHEME_FALCON1024, PQAddressSalt(0), &pk);
+        let base = salted_address(SIG_SCHEME_FALCON1024, AddressSalt(0), &pk);
         assert_ne!(
             base,
-            pq_address(PQ_SCHEME_FALCON1024, PQAddressSalt(1), &pk)
+            salted_address(SIG_SCHEME_FALCON1024, AddressSalt(1), &pk)
         );
-        assert_ne!(base, pq_address(*b"f2", PQAddressSalt(0), &pk));
+        assert_ne!(base, salted_address(*b"f2", AddressSalt(0), &pk));
         assert_ne!(
             base,
-            pq_address(PQ_SCHEME_FALCON1024, PQAddressSalt(0), &[2u8; 8])
+            salted_address(SIG_SCHEME_FALCON1024, AddressSalt(0), &[2u8; 8])
         );
     }
 
     /// Mirrors go's `TestPQSigAuthorizerAddress` (`data/transactions/pqsig_test.go:160`):
-    /// `PQSig::address()` derives the same address as calling
-    /// `pq_address(scheme, salt, public_key)` directly.
+    /// `SaltedKeySig::address()` derives the same address as calling
+    /// `salted_address(scheme, salt, public_key)` directly.
     #[test]
     fn pqsig_address_matches_pq_address_derivation() {
-        let sig = PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
-            salt: PQAddressSalt(7),
+        let sig = SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
+            salt: AddressSalt(7),
             public_key: ByteBuf::from(vec![0x11u8; 32]),
             signature: ByteBuf::from(vec![0x22u8; 16]),
         };
         assert_eq!(
             sig.address(),
-            pq_address(sig.scheme, sig.salt, &sig.public_key)
+            salted_address(sig.scheme, sig.salt, &sig.public_key)
         );
     }
 
     #[test]
     fn pq_delegated_program_to_be_signed_uses_pqprogram_domain_tag() {
-        let dp = PQDelegatedProgram {
+        let dp = SKsigDelegatedProgram {
             addr: Address([9u8; 32]),
             program: vec![1, 2, 3],
         };

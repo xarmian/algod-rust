@@ -2426,18 +2426,18 @@ mod tests {
         );
     }
 
-    // ── PQSig canonical msgpack encoding (issue #660) ──────────────────────
+    // ── SaltedKeySig canonical msgpack encoding (issue #660) ──────────────────────
 
-    /// Byte-level oracle test: a fully-populated `PQSig` must encode as the
+    /// Byte-level oracle test: a fully-populated `SaltedKeySig` must encode as the
     /// exact msgpack bytes go-algorand's canonical (sorted-key, omitempty,
     /// compact-int) codec would produce for the same field values. Fields
     /// sort alphabetically as "pk" < "sch" < "sig" < "slt", each carried as
     /// msgpack `bin` except `slt` (a plain small uint → positive fixint).
     #[test]
     fn canonical_encode_pqsig_matches_expected_bytes() {
-        let pqsig = PQSig {
+        let pqsig = SaltedKeySig {
             scheme: *b"f1",
-            salt: algo_types::PQAddressSalt(5),
+            salt: algo_types::AddressSalt(5),
             public_key: serde_bytes::ByteBuf::from(vec![0xAA, 0xAA, 0xAA]),
             signature: serde_bytes::ByteBuf::from(vec![0xBB, 0xBB]),
         };
@@ -2461,11 +2461,11 @@ mod tests {
 
     #[test]
     fn canonical_encode_pqsig_omits_zero_fields() {
-        // A PQSig with only `scheme` set omits pk/sig/slt (all zero-valued),
-        // matching go's per-field omitempty on the PQSig struct itself.
-        let pqsig = PQSig {
+        // A SaltedKeySig with only `scheme` set omits pk/sig/slt (all zero-valued),
+        // matching go's per-field omitempty on the SaltedKeySig struct itself.
+        let pqsig = SaltedKeySig {
             scheme: *b"f1",
-            salt: algo_types::PQAddressSalt(0),
+            salt: algo_types::AddressSalt(0),
             public_key: serde_bytes::ByteBuf::new(),
             signature: serde_bytes::ByteBuf::new(),
         };
@@ -2485,9 +2485,9 @@ mod tests {
         // intact. This exercises the `#[serde(...)]` wiring on
         // `SignedTransaction.pqsig` end to end, independent of the
         // hand-rolled `CanonicalMap` encoder tested above.
-        let pqsig = PQSig {
+        let pqsig = SaltedKeySig {
             scheme: *b"f1",
-            salt: algo_types::PQAddressSalt(7),
+            salt: algo_types::AddressSalt(7),
             public_key: serde_bytes::ByteBuf::from(vec![0x01; 1793]),
             signature: serde_bytes::ByteBuf::from(vec![0x02; 42]),
         };
@@ -2525,9 +2525,9 @@ mod tests {
 
     #[test]
     fn logicsig_with_pqsig_round_trips_through_rmp_serde() {
-        let pqsig = PQSig {
+        let pqsig = SaltedKeySig {
             scheme: *b"f1",
-            salt: algo_types::PQAddressSalt(1),
+            salt: algo_types::AddressSalt(1),
             public_key: serde_bytes::ByteBuf::from(vec![0x03; 1793]),
             signature: serde_bytes::ByteBuf::from(vec![0x04; 20]),
         };
@@ -2565,9 +2565,9 @@ mod tests {
                 ..LogicSig::default()
             },
             LogicSig {
-                pqsig: Some(PQSig {
+                pqsig: Some(SaltedKeySig {
                     scheme: *b"f1",
-                    salt: algo_types::PQAddressSalt(1),
+                    salt: algo_types::AddressSalt(1),
                     public_key: serde_bytes::ByteBuf::from(vec![0x03; 8]),
                     signature: serde_bytes::ByteBuf::new(),
                 }),
@@ -2928,7 +2928,7 @@ mod tests {
         }
     }
 
-    // ── Randomized round-trip: PQSig / LogicSig / TxGroup (Phase 17
+    // ── Randomized round-trip: SaltedKeySig / LogicSig / TxGroup (Phase 17
     // txn_core sweep, issue #1474) ──────────────────────────────────────
     //
     // Mirrors go's `TestRandomizedEncodingPQSig`, `TestRandomizedEncodingLogicSig`,
@@ -2937,19 +2937,19 @@ mod tests {
     // These follow the same `assert_state_proof_roundtrip`-style pattern used
     // for the state-proof wire types above (issue #956).
 
-    fn gen_pqsig(rng: &mut ChaCha20Rng) -> PQSig {
+    fn gen_pqsig(rng: &mut ChaCha20Rng) -> SaltedKeySig {
         let mut scheme = [0u8; 2];
         rng.fill_bytes(&mut scheme);
         // "sch" is the only always-encoded scalar field aside from the
-        // byte/salt ones; keep it non-zero so this PQSig's own encoding
+        // byte/salt ones; keep it non-zero so this SaltedKeySig's own encoding
         // never collapses to the empty map (matches the module's general
         // non-collapsing-generator convention above).
         if scheme == [0u8; 2] {
             scheme = *b"f1";
         }
-        PQSig {
+        SaltedKeySig {
             scheme,
-            salt: algo_types::PQAddressSalt(rng.random_range(1..=u8::MAX)),
+            salt: algo_types::AddressSalt(rng.random_range(1..=u8::MAX)),
             public_key: ByteBuf::from(gen_nonzero_bytes(rng, 1, 1793)),
             signature: ByteBuf::from(gen_nonzero_bytes(rng, 1, 64)),
         }

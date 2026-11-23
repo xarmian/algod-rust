@@ -28,7 +28,7 @@
 //! matching Go's two-stage `parsePQScheme` (format only) /
 //! `pqSchemeOpsByScheme` lookup (registration) split.
 
-use algo_types::{canonical_pq_address_salt, PQ_SCHEME_FALCON1024};
+use algo_types::{canonical_address_salt, SIG_SCHEME_FALCON1024};
 use sha2::{Digest, Sha512_256};
 
 use crate::cli::PQ_SCHEME_FALCON1024_NAME;
@@ -43,7 +43,7 @@ const PQK_PREFIX: &[u8] = b"PQK";
 pub fn parse_pq_scheme(value: &str) -> Result<[u8; 2], String> {
     let trimmed = value.trim();
     if trimmed.eq_ignore_ascii_case(PQ_SCHEME_FALCON1024_NAME) {
-        return Ok(PQ_SCHEME_FALCON1024);
+        return Ok(SIG_SCHEME_FALCON1024);
     }
     let bytes = trimmed.as_bytes();
     if bytes.len() != 2 {
@@ -54,7 +54,7 @@ pub fn parse_pq_scheme(value: &str) -> Result<[u8; 2], String> {
 
 /// Mirrors `formatPQScheme` (`pq_scheme.go:62-67`).
 pub fn format_pq_scheme(scheme: &[u8; 2]) -> String {
-    if *scheme == PQ_SCHEME_FALCON1024 {
+    if *scheme == SIG_SCHEME_FALCON1024 {
         PQ_SCHEME_FALCON1024_NAME.to_string()
     } else {
         String::from_utf8_lossy(scheme).to_string()
@@ -78,7 +78,7 @@ pub fn derive_pq_signing_material_from_entropy(
     scheme: [u8; 2],
     entropy: &[u8; 32],
 ) -> Result<PqSigningMaterial, String> {
-    if scheme != PQ_SCHEME_FALCON1024 {
+    if scheme != SIG_SCHEME_FALCON1024 {
         return Err(format!(
             "pq scheme not supported: {:?}",
             String::from_utf8_lossy(&scheme)
@@ -87,7 +87,7 @@ pub fn derive_pq_signing_material_from_entropy(
     let seed = derive_pq_key_seed(scheme, entropy);
     let (public_key, private_key) =
         algo_falcon::falcon_keygen(&seed).map_err(|e| format!("cannot generate PQ key: {e}"))?;
-    let (salt, _addr) = canonical_pq_address_salt(scheme, &public_key)
+    let (salt, _addr) = canonical_address_salt(scheme, &public_key)
         .ok_or_else(|| "cannot generate PQ key: no compliant PQ address salt found".to_string())?;
     Ok(PqSigningMaterial {
         public: PqPublicMaterial {
@@ -119,15 +119,15 @@ mod tests {
     fn parse_pq_scheme_accepts_named_falcon1024_case_insensitively() {
         assert_eq!(
             parse_pq_scheme("falcon-1024").unwrap(),
-            PQ_SCHEME_FALCON1024
+            SIG_SCHEME_FALCON1024
         );
         assert_eq!(
             parse_pq_scheme("FALCON-1024").unwrap(),
-            PQ_SCHEME_FALCON1024
+            SIG_SCHEME_FALCON1024
         );
         assert_eq!(
             parse_pq_scheme("  falcon-1024  ").unwrap(),
-            PQ_SCHEME_FALCON1024
+            SIG_SCHEME_FALCON1024
         );
     }
 
@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn format_pq_scheme_round_trips_falcon1024_name() {
-        assert_eq!(format_pq_scheme(&PQ_SCHEME_FALCON1024), "falcon-1024");
+        assert_eq!(format_pq_scheme(&SIG_SCHEME_FALCON1024), "falcon-1024");
     }
 
     #[test]
@@ -155,20 +155,20 @@ mod tests {
     #[test]
     fn derive_pq_key_seed_is_deterministic_and_scheme_and_entropy_sensitive() {
         let entropy = [7u8; 32];
-        let a = derive_pq_key_seed(PQ_SCHEME_FALCON1024, &entropy);
-        let b = derive_pq_key_seed(PQ_SCHEME_FALCON1024, &entropy);
+        let a = derive_pq_key_seed(SIG_SCHEME_FALCON1024, &entropy);
+        let b = derive_pq_key_seed(SIG_SCHEME_FALCON1024, &entropy);
         assert_eq!(a, b);
         let c = derive_pq_key_seed(*b"f2", &entropy);
         assert_ne!(a, c);
-        let d = derive_pq_key_seed(PQ_SCHEME_FALCON1024, &[8u8; 32]);
+        let d = derive_pq_key_seed(SIG_SCHEME_FALCON1024, &[8u8; 32]);
         assert_ne!(a, d);
     }
 
     #[test]
     fn derive_pq_signing_material_from_entropy_is_deterministic() {
         let entropy = [3u8; 32];
-        let a = derive_pq_signing_material_from_entropy(PQ_SCHEME_FALCON1024, &entropy).unwrap();
-        let b = derive_pq_signing_material_from_entropy(PQ_SCHEME_FALCON1024, &entropy).unwrap();
+        let a = derive_pq_signing_material_from_entropy(SIG_SCHEME_FALCON1024, &entropy).unwrap();
+        let b = derive_pq_signing_material_from_entropy(SIG_SCHEME_FALCON1024, &entropy).unwrap();
         assert_eq!(a, b);
         a.validate().expect("derived key must validate");
     }
@@ -199,9 +199,11 @@ mod tests {
     fn pq_scheme_registries_consistent() {
         // Every scheme algokey's signing-material derivation supports must
         // resolve in the independent crypto-package verifier registry.
-        for scheme in [PQ_SCHEME_FALCON1024] {
+        for scheme in [SIG_SCHEME_FALCON1024] {
             assert!(
-                algo_consensus_crypto::pq_scheme::lookup_pq_scheme(scheme).is_some(),
+                algo_types::consensus::consensus_params_for_version(algo_types::consensus::CONSENSUS_FUTURE)
+                    .expect("vFuture")
+                    .sig_scheme_enabled(scheme),
                 "algokey scheme {:?} missing from crypto registry",
                 String::from_utf8_lossy(&scheme)
             );
@@ -211,7 +213,7 @@ mod tests {
         // supports must be one algokey can actually derive signing material
         // for (only Falcon-1024 today, matching upstream's own hardcoded
         // reverse-direction check).
-        for scheme in [PQ_SCHEME_FALCON1024] {
+        for scheme in [SIG_SCHEME_FALCON1024] {
             let entropy = [0u8; 32];
             assert!(
                 derive_pq_signing_material_from_entropy(scheme, &entropy).is_ok(),
@@ -223,8 +225,8 @@ mod tests {
 
     #[test]
     fn generate_pq_signing_material_produces_valid_material_each_call() {
-        let (entropy1, m1) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
-        let (entropy2, m2) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
+        let (entropy1, m1) = generate_pq_signing_material(SIG_SCHEME_FALCON1024).unwrap();
+        let (entropy2, m2) = generate_pq_signing_material(SIG_SCHEME_FALCON1024).unwrap();
         assert_ne!(entropy1, entropy2, "OS RNG must not repeat");
         assert_ne!(m1.public.public_key, m2.public.public_key);
         m1.validate().unwrap();

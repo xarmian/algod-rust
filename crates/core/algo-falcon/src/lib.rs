@@ -286,6 +286,65 @@ pub fn falcon_verify_code_with(
     Ok(verify_code_unchecked(backend, pubkey, sig, data))
 }
 
+
+// ---------------------------------------------------------------------------
+// Falcon-512 (go-algorand falcon v0.2.0, `Det512*`): the same deterministic
+// layer at n = 512, used by the `f5` signature scheme (#2546, go v5.1.0-beta).
+// Pure Rust only: the vendored C is falcon v0.1.0, which has no det512.
+// ---------------------------------------------------------------------------
+
+/// Size of a Falcon-512 public key in bytes (`cfalcon.Det512PublicKeySize`).
+pub const FALCON_DET512_PUBKEY_SIZE: usize = rs::det512::PUBKEY_SIZE;
+/// Size of a Falcon-512 private key in bytes (`cfalcon.Det512PrivateKeySize`).
+pub const FALCON_DET512_PRIVKEY_SIZE: usize = rs::det512::PRIVKEY_SIZE;
+/// Maximum size of a compressed Falcon-512 signature
+/// (`cfalcon.Det512SignatureMaxSize`).
+pub const FALCON_DET512_SIG_COMPRESSED_MAXSIZE: usize = rs::det512::SIG_COMPRESSED_MAXSIZE;
+/// Size of a Falcon-512 signature in constant-time format
+/// (`cfalcon.Det512CTSignatureSize`).
+pub const FALCON_DET512_SIG_CT_SIZE: usize = rs::det512::SIG_CT_SIZE;
+
+/// [`falcon_verify_code`] for Falcon-512: `0` when the signature is valid,
+/// else its negative `FALCON_ERR_*` code; a wrong-size public key is an `Err`.
+pub fn falcon512_verify_code(pubkey: &[u8], sig: &[u8], data: &[u8]) -> Result<i32, FalconError> {
+    if pubkey.len() != FALCON_DET512_PUBKEY_SIZE {
+        return Err(FalconError::InvalidPubkeySize(pubkey.len()));
+    }
+    if sig.len() < 2 || sig.len() > FALCON_DET512_SIG_COMPRESSED_MAXSIZE {
+        return Ok(FALCON_ERR_BADSIG);
+    }
+    Ok(rs::det512::verify_compressed_det(sig, pubkey, data))
+}
+
+/// Generate a Falcon-512 keypair `(pubkey, privkey)` from `seed`
+/// (`cfalcon.Det512GenerateKey`).
+pub fn falcon512_keygen(seed: &[u8]) -> Result<(Vec<u8>, Vec<u8>), FalconError> {
+    let mut rng = rs::shake256::Shake256::prng_from_seed(seed);
+    let mut pubkey = vec![0u8; FALCON_DET512_PUBKEY_SIZE];
+    let mut privkey = vec![0u8; FALCON_DET512_PRIVKEY_SIZE];
+    let rc = rs::det512::keygen(&mut rng, &mut privkey, &mut pubkey);
+    if rc != 0 {
+        return Err(FalconError::KeygenFailed(rc));
+    }
+    Ok((pubkey, privkey))
+}
+
+/// Sign `data` with a Falcon-512 private key, producing a compressed-format
+/// signature (`Det512PrivateKey.SignCompressed`).
+pub fn falcon512_sign(privkey: &[u8], data: &[u8]) -> Result<Vec<u8>, FalconError> {
+    if privkey.len() != FALCON_DET512_PRIVKEY_SIZE {
+        return Err(FalconError::InvalidPrivkeySize(privkey.len()));
+    }
+    let mut sig = vec![0u8; FALCON_DET512_SIG_COMPRESSED_MAXSIZE];
+    let mut sig_len = FALCON_DET512_SIG_COMPRESSED_MAXSIZE;
+    let rc = rs::det512::sign_compressed(&mut sig, &mut sig_len, privkey, data);
+    if rc != 0 {
+        return Err(FalconError::SignFailed(rc));
+    }
+    sig.truncate(sig_len);
+    Ok(sig)
+}
+
 /// Dispatch a size-checked verification to `backend`.
 fn verify_code_unchecked(backend: FalconBackend, pubkey: &[u8], sig: &[u8], data: &[u8]) -> i32 {
     match backend {

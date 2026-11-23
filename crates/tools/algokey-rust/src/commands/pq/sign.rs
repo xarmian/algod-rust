@@ -150,7 +150,7 @@ pub fn run_with_io<O: Write, E: Write>(
 mod tests {
     use super::*;
     use crate::commands::pq::scheme::generate_pq_signing_material;
-    use algo_types::{Address, Round, Transaction, TxnType, PQ_SCHEME_FALCON1024};
+    use algo_types::{Address, Round, Transaction, TxnType, SIG_SCHEME_FALCON1024};
 
     fn build_unsigned_txn(sender: Address) -> SignedTransaction {
         SignedTransaction {
@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn sign_populates_pqsig_and_verifies() {
-        let (_, signing) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
+        let (_, signing) = generate_pq_signing_material(SIG_SCHEME_FALCON1024).unwrap();
         let sender = signing.public.address();
         let dir = tempfile::tempdir().unwrap();
         let kf = dir.path().join("k");
@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn sign_sets_auth_addr_when_sender_differs_from_signer() {
-        let (_, signing) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
+        let (_, signing) = generate_pq_signing_material(SIG_SCHEME_FALCON1024).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let kf = dir.path().join("k");
         super::super::key::write_pq_private_key_file(&kf, &signing).unwrap();
@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn sign_rejects_already_signed_txn_without_overwrite() {
-        let (_, signing) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
+        let (_, signing) = generate_pq_signing_material(SIG_SCHEME_FALCON1024).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let kf = dir.path().join("k");
         super::super::key::write_pq_private_key_file(&kf, &signing).unwrap();
@@ -293,7 +293,7 @@ mod tests {
 
     #[test]
     fn sign_with_overwrite_replaces_existing_signature() {
-        let (_, signing) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
+        let (_, signing) = generate_pq_signing_material(SIG_SCHEME_FALCON1024).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let kf = dir.path().join("k");
         super::super::key::write_pq_private_key_file(&kf, &signing).unwrap();
@@ -332,7 +332,7 @@ mod tests {
     /// `resolve_from_mnemonic_matches_generate`).
     #[test]
     fn sign_accepts_mnemonic() {
-        let (entropy, signing) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
+        let (entropy, signing) = generate_pq_signing_material(SIG_SCHEME_FALCON1024).unwrap();
         let mnemonic = algo_consensus_crypto::key_to_mnemonic(&entropy).unwrap();
         let sender = signing.public.address();
 
@@ -381,7 +381,7 @@ mod tests {
     /// just the shared registry-check helper in isolation.
     #[test]
     fn sign_rejects_unsupported_mnemonic_scheme() {
-        let (entropy, signing) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
+        let (entropy, signing) = generate_pq_signing_material(SIG_SCHEME_FALCON1024).unwrap();
         let mnemonic = algo_consensus_crypto::key_to_mnemonic(&entropy).unwrap();
         let sender = signing.public.address();
 
@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     fn sign_rejects_empty_txfile() {
-        let (_, signing) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
+        let (_, signing) = generate_pq_signing_material(SIG_SCHEME_FALCON1024).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let kf = dir.path().join("k");
         super::super::key::write_pq_private_key_file(&kf, &signing).unwrap();

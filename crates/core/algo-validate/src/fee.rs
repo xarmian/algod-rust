@@ -293,7 +293,17 @@ pub fn logic_sig_program_fee_contribution(
 ) -> u64 {
     let program_bytes: usize = group
         .iter()
-        .map(|stx| stx.lsig.as_ref().map(|l| l.logic.len()).unwrap_or(0))
+        .map(|stx| {
+            let lsig = stx.lsig.as_ref().map(|l| l.logic.len()).unwrap_or(0);
+            // go v5.1: an `ls`-scheme SaltedKeySig carries its program in place of
+            // a public key; those bytes are priced like any other program's.
+            let ls = stx
+                .pqsig
+                .as_ref()
+                .filter(|p| p.scheme == *b"ls")
+                .map_or(0, |p| p.public_key.len());
+            lsig + ls
+        })
         .sum();
     let free_program_bytes = group.len() * params.logic_sig_max_size as usize;
     let (surcharge, _) = micros_mul_int(
@@ -325,13 +335,13 @@ pub fn logic_sig_program_fee_contribution(
 pub fn signature_fee_contribution(stx: &SignedTransaction, params: &ConsensusParams) -> u64 {
     if let Some(pqsig) = &stx.pqsig {
         if !pqsig.blank() {
-            return params.pq_scheme_fee_contribution(pqsig.scheme);
+            return params.sig_scheme_fee_contribution(pqsig.scheme);
         }
     }
     if let Some(lsig) = &stx.lsig {
         if let Some(pqsig) = &lsig.pqsig {
             if !pqsig.blank() {
-                return params.pq_scheme_fee_contribution(pqsig.scheme);
+                return params.sig_scheme_fee_contribution(pqsig.scheme);
             }
         }
     }
@@ -927,15 +937,15 @@ mod tests {
         let mut stx = make_stxn("pay", 1000);
         stx.lsig = Some(algo_types::LogicSig {
             args: Some(vec![Some(serde_bytes::ByteBuf::from(vec![9u8; 5000]))]),
-            pqsig: Some(algo_types::pq::PQSig {
-                scheme: algo_types::pq::PQ_SCHEME_FALCON1024,
+            pqsig: Some(algo_types::pq::SaltedKeySig {
+                scheme: algo_types::pq::SIG_SCHEME_FALCON1024,
                 ..Default::default()
             }),
             ..Default::default()
         });
         assert_eq!(
             signature_fee_contribution(&stx, &p),
-            p.pq_scheme_fee_contribution(algo_types::pq::PQ_SCHEME_FALCON1024)
+            p.sig_scheme_fee_contribution(algo_types::pq::SIG_SCHEME_FALCON1024)
         );
         // program_bytes (0) - free allowance (1 * LogicSigMaxSize) is negative;
         // the args do not enter the program-byte surcharge.
@@ -955,7 +965,7 @@ mod tests {
         let mut blank = make_stxn("pay", 1000);
         blank.lsig = Some(algo_types::LogicSig {
             args: Some(Vec::new()),
-            pqsig: Some(algo_types::pq::PQSig::default()),
+            pqsig: Some(algo_types::pq::SaltedKeySig::default()),
             ..Default::default()
         });
         assert_eq!(summarize_fees(&[&blank], &p), summarize_fees(&[&plain], &p));
@@ -965,7 +975,7 @@ mod tests {
     fn signature_fee_contribution_unknown_pq_scheme_is_zero() {
         let p = v42();
         let mut stx = make_stxn("pay", 1000);
-        stx.pqsig = Some(algo_types::pq::PQSig {
+        stx.pqsig = Some(algo_types::pq::SaltedKeySig {
             scheme: *b"x1",
             ..Default::default()
         });
@@ -976,13 +986,13 @@ mod tests {
     fn signature_fee_contribution_top_level_pqsig_charges_known_scheme() {
         let p = v42();
         let mut stx = make_stxn("pay", 1000);
-        stx.pqsig = Some(algo_types::pq::PQSig {
-            scheme: algo_types::pq::PQ_SCHEME_FALCON1024,
+        stx.pqsig = Some(algo_types::pq::SaltedKeySig {
+            scheme: algo_types::pq::SIG_SCHEME_FALCON1024,
             ..Default::default()
         });
         assert_eq!(
             signature_fee_contribution(&stx, &p),
-            p.pq_scheme_fee_contribution(algo_types::pq::PQ_SCHEME_FALCON1024)
+            p.sig_scheme_fee_contribution(algo_types::pq::SIG_SCHEME_FALCON1024)
         );
     }
 
@@ -992,15 +1002,15 @@ mod tests {
         let mut stx = make_stxn("pay", 1000);
         stx.lsig = Some(algo_types::LogicSig {
             logic: serde_bytes::ByteBuf::from(vec![1u8]),
-            pqsig: Some(algo_types::pq::PQSig {
-                scheme: algo_types::pq::PQ_SCHEME_FALCON1024,
+            pqsig: Some(algo_types::pq::SaltedKeySig {
+                scheme: algo_types::pq::SIG_SCHEME_FALCON1024,
                 ..Default::default()
             }),
             ..Default::default()
         });
         assert_eq!(
             signature_fee_contribution(&stx, &p),
-            p.pq_scheme_fee_contribution(algo_types::pq::PQ_SCHEME_FALCON1024)
+            p.sig_scheme_fee_contribution(algo_types::pq::SIG_SCHEME_FALCON1024)
         );
     }
 
@@ -1010,7 +1020,7 @@ mod tests {
         let mut stx = make_stxn("pay", 1000);
         stx.lsig = Some(algo_types::LogicSig {
             logic: serde_bytes::ByteBuf::from(vec![1u8]),
-            pqsig: Some(algo_types::pq::PQSig {
+            pqsig: Some(algo_types::pq::SaltedKeySig {
                 scheme: *b"x1",
                 ..Default::default()
             }),
@@ -1026,13 +1036,13 @@ mod tests {
         let p = v42();
         let mut stx = make_stxn("pay", 1000);
         stx.sig[0] = 1;
-        stx.pqsig = Some(algo_types::pq::PQSig {
-            scheme: algo_types::pq::PQ_SCHEME_FALCON1024,
+        stx.pqsig = Some(algo_types::pq::SaltedKeySig {
+            scheme: algo_types::pq::SIG_SCHEME_FALCON1024,
             ..Default::default()
         });
         assert_eq!(
             signature_fee_contribution(&stx, &p),
-            p.pq_scheme_fee_contribution(algo_types::pq::PQ_SCHEME_FALCON1024)
+            p.sig_scheme_fee_contribution(algo_types::pq::SIG_SCHEME_FALCON1024)
         );
     }
 

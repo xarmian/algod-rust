@@ -43,8 +43,8 @@ use algo_ledger::{
 };
 use algo_types::consensus::{consensus_params_for_version, CONSENSUS_V42};
 use algo_types::{
-    canonical_pq_address_salt, AccountStatus, Address, Block, PQSig, Round, SignedTransaction,
-    PQ_SCHEME_FALCON1024,
+    canonical_address_salt, AccountStatus, Address, Block, SaltedKeySig, Round, SignedTransaction,
+    SIG_SCHEME_FALCON1024,
 };
 use algo_validate::block::validate_block;
 use algo_validate::fee::{required_fee_for_txn, required_fee_for_usage, summarize_fees};
@@ -53,7 +53,7 @@ use serde_bytes::ByteBuf;
 
 /// Domain-separation prefix for the top-level transaction signing message
 /// (`"TX" || canonical_encode(txn)`) — the same message ed25519 single-sig,
-/// multisig, and top-level `PQSig` all authenticate. Mirrors go-algorand's
+/// multisig, and top-level `SaltedKeySig` all authenticate. Mirrors go-algorand's
 /// `protocol.Transaction` `HashID` and duplicates the private
 /// `algo_validate::signature::TX_PREFIX` constant, the same way
 /// `algo_ledger::heartbeat_builder` already duplicates the heartbeat-proof
@@ -178,7 +178,7 @@ fn pq_rekeyed_address_authorization_full_e2e_succeeds() {
     // Real Falcon-1024 identity to rekey to.
     let seed = [0x07u8; algo_falcon::FALCON_SEED_SIZE];
     let (falcon_pk, falcon_sk) = algo_falcon::falcon_keygen(&seed).expect("falcon keygen");
-    let (falcon_salt, falcon_addr) = canonical_pq_address_salt(PQ_SCHEME_FALCON1024, &falcon_pk)
+    let (falcon_salt, falcon_addr) = canonical_address_salt(SIG_SCHEME_FALCON1024, &falcon_pk)
         .expect("a canonical PQ salt must exist");
 
     let mut state = algo_ledger::apply::pool_fixtures::funded_ledger_state();
@@ -233,8 +233,8 @@ fn pq_rekeyed_address_authorization_full_e2e_succeeds() {
         genesis_hash,
         ..Default::default()
     };
-    let placeholder_pqsig = PQSig {
-        scheme: PQ_SCHEME_FALCON1024,
+    let placeholder_pqsig = SaltedKeySig {
+        scheme: SIG_SCHEME_FALCON1024,
         salt: falcon_salt,
         public_key: ByteBuf::from(falcon_pk.clone()),
         signature: ByteBuf::new(),
@@ -255,7 +255,7 @@ fn pq_rekeyed_address_authorization_full_e2e_succeeds() {
     let spend_stx = SignedTransaction {
         txn: spend_txn,
         auth_addr: Some(falcon_addr),
-        pqsig: Some(PQSig {
+        pqsig: Some(SaltedKeySig {
             signature: ByteBuf::from(falcon_sig),
             ..placeholder_pqsig
         }),
@@ -294,7 +294,7 @@ fn pq_rekeyed_address_stale_ed25519_authorizer_rejected_full_e2e() {
 
     let seed = [0x07u8; algo_falcon::FALCON_SEED_SIZE];
     let (falcon_pk, _falcon_sk) = algo_falcon::falcon_keygen(&seed).expect("falcon keygen");
-    let (_falcon_salt, falcon_addr) = canonical_pq_address_salt(PQ_SCHEME_FALCON1024, &falcon_pk)
+    let (_falcon_salt, falcon_addr) = canonical_address_salt(SIG_SCHEME_FALCON1024, &falcon_pk)
         .expect("a canonical PQ salt must exist");
 
     let mut state = algo_ledger::apply::pool_fixtures::funded_ledger_state();
@@ -400,7 +400,7 @@ fn pq_challenged_falcon_address_can_heartbeat_for_zero_fee_full_e2e() {
     // Real Falcon-1024 identity for the challenged/heartbeated account.
     let seed = [0x0Au8; algo_falcon::FALCON_SEED_SIZE];
     let (falcon_pk, _falcon_sk) = algo_falcon::falcon_keygen(&seed).expect("falcon keygen");
-    let (_falcon_salt, pq_target) = canonical_pq_address_salt(PQ_SCHEME_FALCON1024, &falcon_pk)
+    let (_falcon_salt, pq_target) = canonical_address_salt(SIG_SCHEME_FALCON1024, &falcon_pk)
         .expect("a canonical PQ salt must exist");
 
     let key_dilution = 10u64;

@@ -896,38 +896,30 @@ impl ConsensusParams {
         self.per_byte_txn_surcharge != 0
     }
 
-    /// Mirrors go's `ConsensusParams.PQSchemeEnabled(scheme)` (`config/consensus.go`,
-    /// v42+): whether the given post-quantum signature scheme is enabled under
-    /// these consensus parameters. Only Falcon-1024 (`"f1"`) is currently
-    /// recognized; any other scheme tag (including the reserved-but-unwired
-    /// Falcon-512 `"f2"`) is not enabled.
-    pub fn pq_scheme_enabled(&self, scheme: [u8; 2]) -> bool {
+    /// go v5.1's `SigSchemeEnabled(proto, scheme)` (`data/transactions/sig_scheme.go`):
+    /// whether `scheme` is a known SaltedKeySig scheme enabled under these
+    /// parameters. Each scheme has its own flag, which stays in the (versioned,
+    /// `consensus.json`-overridable) parameters.
+    pub fn sig_scheme_enabled(&self, scheme: [u8; 2]) -> bool {
         match &scheme {
             b"f1" => self.enable_pq_scheme_falcon1024,
+            b"f5" => self.enable_sig_scheme_falcon512,
+            b"ed" => self.enable_sig_scheme_ed25519,
+            b"ls" => self.enable_sig_scheme_logic_sig,
             _ => false,
         }
     }
 
-    /// Mirrors go's `ConsensusParams.PQSigEnabled()` (`config/consensus.go`,
-    /// v42+): whether *any* post-quantum signature scheme is enabled. Used by
-    /// the pre-activation gate (`data/transactions/verify/txn.go`'s
-    /// `stxnCoreChecks`) to hard-reject a non-blank `PQsig` before any scheme
-    /// is even known to be supported.
-    pub fn pq_sig_enabled(&self) -> bool {
-        self.enable_pq_scheme_falcon1024
-    }
-
-    /// Mirrors go's `ConsensusParams.PQSchemeFeeContribution(scheme)`
-    /// (`config/consensus.go`, v42+): the additional fee-factor surcharge (in
-    /// fixed-point `Micros`, `1_000_000` == one `MinTxnFee`) charged for a
-    /// transaction authorized with the given PQ scheme. Falcon-1024 costs 2x
-    /// the base min fee; any other/unknown scheme (including the
-    /// reserved-but-unwired Falcon-512) contributes zero, matching upstream's
-    /// "an unknown PQ scheme contributes zero, which is safe because the
-    /// transaction will be rejected during verification" comment.
-    pub fn pq_scheme_fee_contribution(&self, scheme: [u8; 2]) -> u64 {
+    /// go v5.1's `SigSchemeFeeContribution` (`data/transactions/sig_scheme.go`):
+    /// the additional fee factor (fixed-point `Micros`, `1_000_000` == one
+    /// `MinTxnFee`) charged for a transaction authorized with `scheme`.
+    /// Falcon-1024 costs 2x, Falcon-512 1x; `ed` and `ls` are part of the min
+    /// fee. An unknown scheme contributes zero, which is safe because the
+    /// transaction is rejected during verification.
+    pub fn sig_scheme_fee_contribution(&self, scheme: [u8; 2]) -> u64 {
         match &scheme {
             b"f1" => 2_000_000,
+            b"f5" => 1_000_000,
             _ => 0,
         }
     }

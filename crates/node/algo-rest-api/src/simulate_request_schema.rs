@@ -42,7 +42,7 @@ pub const CRYPTO_MULTISIGSIG: Ty = Ty::Struct(&[
     Field("subsig", Ty::Slice(&CRYPTO_MULTISIGSUBSIG, "[]crypto.MultisigSubsig")),
 ]);
 
-/// `transactions.PQSig`.
+/// `transactions.SaltedKeySig`.
 pub const TRANSACTIONS_PQSIG: Ty = Ty::Struct(&[
     Field("sch", Ty::ByteArray(2)),
     Field("slt", Ty::U8),

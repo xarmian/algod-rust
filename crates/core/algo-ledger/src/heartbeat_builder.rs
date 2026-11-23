@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn accepting_sender_is_pq_compliant() {
         assert!(
-            accepting_sender().is_pq_compliant(),
+            accepting_sender().is_off_ed25519_curve(),
             "heartbeat accepting LogicSig sender must be PQ compliant"
         );
     }

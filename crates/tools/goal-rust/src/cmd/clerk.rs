@@ -2773,7 +2773,7 @@ mod tests {
         s.msig = Some(Default::default());
         assert!(!group_input_already_signed(&s), "blank msig is not a sig");
         // Go rejects a top-level PQsig as already signed.
-        s.pqsig = Some(algo_types::pq::PQSig {
+        s.pqsig = Some(algo_types::pq::SaltedKeySig {
             scheme: *b"f1",
             ..Default::default()
         });

@@ -19,15 +19,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Post-quantum (Falcon-1024) signature failure texts on the pool path,
-//! pinned to go-algorand v5.0.5-stable (issue #2438).
+//! pinned to go-algorand v5.1.1-stable (issues #2438, #2546).
 //!
 //! `fixtures/pq_failure_texts.jsonl` is produced by
 //! `tools/pq-failure-text-oracle/run-in-docker.sh`: go builds each
 //! `SignedTxn` (top-level `pqsig` and PQ-delegated LogicSig) and runs it
-//! through `verify.TxnGroup`, recording the error text of `PQSig.Verify` /
+//! through `verify.TxnGroup`, recording the error text of `SaltedKeySig.Verify` /
 //! `VerifyFalcon1024` as wrapped by `stxnCoreChecks` /
-//! `logicSigSanityCheckBatchPrep`, in full: go's `transaction %+v invalid : `
-//! struct-dump frame is stripped here and compared in `go_dump_test`. Each
+//! `logicSigSanityCheckBatchPrep`, in full: go's `transaction <Summary> invalid : `
+//! frame is stripped here and compared in `go_dump_test`. Each
 //! case is decoded here from go's own bytes and verified the way the pool
 //! does.
 
@@ -59,7 +59,7 @@ fn text(e: AlgoError) -> String {
 #[test]
 fn pq_failure_texts_match_go_on_the_pool_path() {
     let cases = pool_cases();
-    assert_eq!(cases.len(), 28, "fixture must carry every pool case");
+    assert_eq!(cases.len(), 34, "fixture must carry every pool case");
     let mut mismatches = Vec::new();
     for case in &cases {
         let name = format!(
@@ -76,8 +76,11 @@ fn pq_failure_texts_match_go_on_the_pool_path() {
         // inside go's `transaction %+v invalid : ` frame, which the REST path
         // adds (`go_dump_test` pins the frame itself, issue #2451).
         let full = case["want"].as_str().unwrap();
-        let want = match full.find("} invalid : ") {
-            Some(at) if full.starts_with("transaction {") => &full[at + "} invalid : ".len()..],
+        // go v5.1's frame is `transaction <SignedTxn.Summary()> invalid : `.
+        let want = match full.find(" invalid : ") {
+            Some(at) if full.starts_with("transaction ") && full[..at].contains(" from ") => {
+                &full[at + " invalid : ".len()..]
+            }
             _ => full,
         };
         assert_eq!(
@@ -104,7 +107,17 @@ fn pq_failure_texts_match_go_on_the_pool_path() {
             .map(text)
             .unwrap_or_default();
 
-        if got != want || cached != want {
+        // go runs `logicSigGroupSizeCheck` for the whole group before any member's
+        // signature: an `ls`-scheme proof's arguments are decoded there, so go's
+        // text for such a case is the group check's. The member-level function
+        // (`got`) reaches the scheme check first, as `saltedKeySigLogicSigVerify`
+        // does; the group path (`cached`) is go's text.
+        let member_text = if case["name"].as_str().unwrap() == "logicsig scheme not enabled" {
+            "signature scheme not enabled"
+        } else {
+            want
+        };
+        if got != member_text || cached != want {
             mismatches.push(format!(
                 "{name}:\n    go:     {want:?}\n    rust:   {got:?}\n    cached: {cached:?}"
             ));
@@ -112,7 +125,7 @@ fn pq_failure_texts_match_go_on_the_pool_path() {
     }
     assert!(
         mismatches.is_empty(),
-        "PQ failure texts differ from go v5.0.5:\n{}",
+        "PQ failure texts differ from go v5.1.1:\n{}",
         mismatches.join("\n")
     );
 }
