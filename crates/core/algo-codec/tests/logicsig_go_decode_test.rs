@@ -124,6 +124,8 @@ fn go_decode_accepts_and_rejects_what_go_does() {
         "key upper case",
         "pqsig unknown key",
         "pqsig salt 256",
+        // go v5.1's generated decoders read maps only (msgp 1.1.66, #6774).
+        "array form all six",
     ] {
         assert!(!ok(&by_name[rejected]), "{rejected} must be rejected");
     }
@@ -135,7 +137,6 @@ fn go_decode_accepts_and_rejects_what_go_does() {
         "subsig pk short",
         "sig str",
         "duplicate l",
-        "array form all six",
     ] {
         assert!(ok(&by_name[accepted]), "{accepted} must be accepted");
     }
@@ -248,11 +249,15 @@ fn rejections_carry_go_msgp_error_text() {
         // an `errWrapped` wraps again: one " at " per level
         ("subsig unknown key", "Unknown field: zzz at Subsigs/0 at Msig"),
         ("msig 256 subsigs", "msgp: length overflow: 256 > 255 at Subsigs at Msig"),
+        // go v5.1: a struct is a map; an array is `ReadMapHeaderBytes`'s TypeError
         (
             "subsig as array of three",
-            "Too many array fields when decoding into struct: 1 left at struct-from-array at Subsigs/0 at Msig",
+            "msgp: attempted to decode type \"array\" with method for \"map\" at Msig/Subsigs/0",
         ),
-        ("array form nil fields", "missing required field: v at struct-from-array/Msig"),
+        (
+            "array form nil fields",
+            "msgp: attempted to decode type \"array\" with method for \"map\"",
+        ),
         // a `TypeError` / `UintOverflow` prepends to its context
         ("msig v 256", "msgp: 256 overflows uint8 at Msig/Version"),
         (

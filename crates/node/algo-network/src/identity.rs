@@ -623,11 +623,10 @@ fn wire_err(msg: impl std::fmt::Display) -> IdentityError {
 }
 
 /// Read one go msgp struct of go type `what` (`"network.identityChallenge"`)
-/// from `rd`: map form (each key handed to `field`, which returns `false` for
-/// a key the struct lacks) or positional array form (element `i` read as the
-/// struct's `i`-th field in go's declaration order, from
-/// `algo-types`' `go_struct_order.json`; more elements than fields is an
-/// error, issue #2426).
+/// from `rd`: map form only (each key handed to `field`, which returns `false`
+/// for a key the struct lacks). go v5.1's generated decoders (msgp 1.1.66,
+/// #6774) no longer read the positional array form: an array is a type error
+/// like any other non-map.
 fn read_go_struct(
     rd: &mut &[u8],
     what: &str,
@@ -651,19 +650,6 @@ fn read_go_struct(
                         String::from_utf8_lossy(key)
                     )));
                 }
-            }
-            Ok(())
-        }
-        0x90..=0x9f | 0xdc | 0xdd => {
-            let n = rmp::decode::read_array_len(rd).map_err(|e| wire_err(format!("{what}: {e}")))?
-                as usize;
-            let names = algo_types::go_msgp::go_struct_order(what)
-                .unwrap_or_else(|| panic!("go_struct_order.json has no struct {what}"));
-            if n > names.len() {
-                return Err(wire_err(format!("{what}: too many array fields: {n}")));
-            }
-            for name in &names[..n] {
-                field(name, rd)?;
             }
             Ok(())
         }
