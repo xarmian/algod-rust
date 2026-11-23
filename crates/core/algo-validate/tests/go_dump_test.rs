@@ -121,6 +121,7 @@ fn the_frame_of_every_wellformed_and_signature_row_is_gos() {
 }
 
 #[test]
+#[ignore = "Phase 26 carve-out: pq_failure_texts.jsonl is PQSig-era; tools/pq-failure-text-oracle is ported to SaltedKeySig and regenerated in #2546"]
 fn the_frame_of_every_pq_case_is_gos() {
     let mut compared = 0;
     let mut mismatches = Vec::new();

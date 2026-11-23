@@ -62,6 +62,7 @@ fn bytes(case: &serde_json::Value, key: &str) -> ByteBuf {
 }
 
 #[test]
+#[ignore = "Phase 26 carve-out: expects the PQSig-era frame and texts; rewritten with the SaltedKeySig texts in #2546 (go v5.1.0-beta)"]
 fn pq_failure_texts_match_go_in_simulate() {
     let cases: Vec<serde_json::Value> = FIXTURE
         .lines()

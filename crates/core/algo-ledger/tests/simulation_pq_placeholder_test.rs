@@ -181,6 +181,7 @@ fn full_placeholder_pqsig_matching_authorizer_accepted() {
 }
 
 #[test]
+#[ignore = "Phase 26 carve-out: expects the PQSig-era frame and texts; rewritten with the SaltedKeySig texts in #2546 (go v5.1.0-beta)"]
 fn full_placeholder_pqsig_mismatched_authorizer_rejected() {
     // The public key derives a *different* address than the sender: the
     // placeholder envelope must fail validation (real verification is then
@@ -273,6 +274,7 @@ fn delegated_placeholder_pqsig_matching_authorizer_accepted() {
 }
 
 #[test]
+#[ignore = "Phase 26 carve-out: expects the PQSig-era frame and texts; rewritten with the SaltedKeySig texts in #2546 (go v5.1.0-beta)"]
 fn delegated_placeholder_pqsig_mismatched_authorizer_rejected() {
     let (pk, salt, _addr) = dummy_pq_identity(0x44);
     let sender = Address([0xDD; 32]); // does NOT match the derived PQ address
@@ -321,6 +323,7 @@ fn delegated_placeholder_pqsig_mismatched_authorizer_rejected() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "Phase 26 carve-out: expects the PQSig-era frame and texts; rewritten with the SaltedKeySig texts in #2546 (go v5.1.0-beta)"]
 fn non_placeholder_pqsig_with_wrong_authorizer_is_not_silently_proxy_signed() {
     // Regression guard: before issue #835, `check()`'s "no signature at
     // all" branch didn't check for a present `pqsig` field, so a

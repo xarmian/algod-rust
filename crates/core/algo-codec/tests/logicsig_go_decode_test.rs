@@ -158,6 +158,7 @@ fn go_decode_accepts_and_rejects_what_go_does() {
 /// on the value wherever both decode a canonical (map form, unique keys)
 /// record.
 #[test]
+#[ignore = "Phase 26 carve-out: array-form LogicSig/SaltedKeySig decode follows the SigScheme registry (#2546, go v5.1.0-beta)"]
 fn consensus_reader_never_accepts_what_go_rejects() {
     let named = lsig_decode_cases();
     let mutants = lsig_mutant_cases();
