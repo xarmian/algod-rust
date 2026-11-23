@@ -112,7 +112,9 @@ fn pq_failure_texts_match_go_on_the_pool_path() {
         // text for such a case is the group check's. The member-level function
         // (`got`) reaches the scheme check first, as `saltedKeySigLogicSigVerify`
         // does; the group path (`cached`) is go's text.
-        let member_text = if case["name"].as_str().unwrap() == "logicsig scheme not enabled" {
+        let member_text = if case["kind"] == "pqsig"
+            && case["name"].as_str().unwrap() == "logicsig scheme not enabled"
+        {
             "signature scheme not enabled"
         } else {
             want

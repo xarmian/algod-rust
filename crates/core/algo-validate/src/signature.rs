@@ -2021,7 +2021,7 @@ mod tests {
         });
         assert_eq!(
             check(signer, &pq, &current),
-            "pq delegated logic signature validation failed: pq signature scheme not supported"
+            "salted-key signature delegation validation failed: signature scheme not supported"
         );
     }
 
@@ -4039,7 +4039,7 @@ mod tests {
             );
         assert!(
             err.to_string().contains(
-                "pq signature validation failed: invalid falcon-1024 signature: error code "
+                "salted-key signature validation failed: falcon-1024 invalid signature: error code "
             ),
             "{err}"
         );
@@ -4086,7 +4086,7 @@ mod tests {
             .expect_err("a SaltedKeySig must not verify against a transaction it wasn't signed over");
         assert!(
             err.to_string().contains(
-                "pq signature validation failed: invalid falcon-1024 signature: error code "
+                "salted-key signature validation failed: falcon-1024 invalid signature: error code "
             ),
             "expected a signature-verification failure, got: {err}"
         );
@@ -4132,7 +4132,7 @@ mod tests {
             .expect_err("a tampered SaltedKeySig signature must not verify");
         assert!(
             err.to_string().contains(
-                "pq signature validation failed: invalid falcon-1024 signature: error code "
+                "salted-key signature validation failed: falcon-1024 invalid signature: error code "
             ),
             "expected a signature-verification failure, got: {err}"
         );
@@ -4551,7 +4551,7 @@ mod tests {
         let err = verify_logicsig(&stx, &lsig, &group, 0, &mut budget, &consensus)
             .expect_err("a PQ-delegated LogicSig with a tampered program must be rejected");
         assert!(
-            err.to_string().contains("pq delegated logic signature"),
+            err.to_string().contains("salted-key signature delegation"),
             "expected a pq-delegated-logic-signature error, got: {err}"
         );
     }
@@ -4612,7 +4612,7 @@ mod tests {
              rather than the raw HashRep preimage, must be rejected",
         );
         assert!(
-            err.to_string().contains("pq delegated logic signature"),
+            err.to_string().contains("salted-key signature delegation"),
             "expected a pq-delegated-logic-signature error, got: {err}"
         );
     }
