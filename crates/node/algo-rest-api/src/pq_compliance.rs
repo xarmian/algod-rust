@@ -139,7 +139,7 @@ pub fn enforce_pq_authorizer_compliance(txgroup: &[SignedTransaction]) -> Result
         let authorizer = pq_sig.address();
         if !authorizer.is_off_ed25519_curve() {
             return Err(format!(
-                "transaction {i}: pq signature authorizer address {authorizer} is an Edwards25519 curve point (non PQ-compliant)"
+                "transaction {i}: salted-key signature authorizer address {authorizer} is an Edwards25519 curve point"
             ));
         }
     }

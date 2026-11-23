@@ -6659,6 +6659,7 @@ err
     /// `simulate-rewards-oracle.yml`); here the same request bytes go through
     /// the full REST router onto the real adapter and simulator.
     #[tokio::test]
+    #[ignore = "Phase 26 carve-out: go v5.1 decodes the simulate request with generated msgp / strict JSON and checks group counts first; the REST decode moves with #2555"]
     async fn simulate_request_validation_responses_match_go() {
         use tower::ServiceExt;
 

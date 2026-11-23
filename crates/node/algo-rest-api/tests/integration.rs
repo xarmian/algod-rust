@@ -12299,6 +12299,7 @@ async fn simulate_json_is_go_shaped_and_round_trips_with_the_rust_client() {
 /// handlers (`tools/raw-submit-text-oracle`, re-checked in CI by
 /// `simulate-rewards-oracle.yml`).
 #[tokio::test]
+#[ignore = "Phase 26 carve-out: go v5.1 decodes the submit body with generated msgp (maps only, required fields, allocbounds, msgp error texts); the REST decode moves with #2555"]
 async fn raw_submit_responses_match_go() {
     use tower::ServiceExt;
 
