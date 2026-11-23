@@ -340,7 +340,7 @@
           "group_msgpack": "gaN0eG6KpGFwYW4DpGFwaWQDo2ZlZc0D6KJmdgGjZ2Vu2SNzaW11bGF0ZS1jbGVhcnN0YXRlLXBvb2wtb3JhY2xlLXYzMKJnaMQgNr90TQmxgOJDblynlvmzqQkPdPZ97ZlyuXldlk8WNQ+ibHbNA+ikbm90ZcQPY3NwX2lubmVyX3BheS0wo3NuZMQgLbeXY24yPtV26bDgPifLkhcaiWtj6RhvDUpDucfTgtGkdHlwZaRhcHBs",
           "failure_message": "",
           "failed_at": [],
-          "app_budget_added": 1400,
+          "app_budget_added": 700,
           "app_budget_consumed": 10,
           "txns": [
             {
@@ -355,7 +355,7 @@
           "group_msgpack": "gaN0eG6LpGFwYW4DpGFwaWQEo2ZlZc0D6KJmdgGjZ2Vu2SNzaW11bGF0ZS1jbGVhcnN0YXRlLXBvb2wtb3JhY2xlLXYzMKJnaMQgNr90TQmxgOJDblynlvmzqQkPdPZ97ZlyuXldlk8WNQ+jZ3JwxCAyybuWFdpHVd9P5TtCMI7RqFchH6vjEWyYjBtTKd8znqJsds0D6KRub3RlxB5jc3BfcGF5X3JlamVjdF90aGVuX2JhbGFuY2VzLTCjc25kxCAtt5djbjI+1XbpsOA+J8uSFxqJa2PpGG8NSkO5x9OC0aR0eXBlpGFwcGyBo3R4boqkYXBpZASjZmVlzQPoomZ2AaNnZW7ZI3NpbXVsYXRlLWNsZWFyc3RhdGUtcG9vbC1vcmFjbGUtdjMwomdoxCA2v3RNCbGA4kNuXKeW+bOpCQ909n3tmXK5eV2WTxY1D6NncnDEIDLJu5YV2kdV30/lO0IwjtGoVyEfq+MRbJiMG1Mp3zOeomx2zQPopG5vdGXEHmNzcF9wYXlfcmVqZWN0X3RoZW5fYmFsYW5jZXMtMaNzbmTEIC23l2NuMj7Vdumw4D4ny5IXGolrY+kYbw1KQ7nH04LRpHR5cGWkYXBwbA==",
           "failure_message": "",
           "failed_at": [],
-          "app_budget_added": 2100,
+          "app_budget_added": 1400,
           "app_budget_consumed": 18,
           "txns": [
             {

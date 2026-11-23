@@ -285,6 +285,11 @@ pub fn static_check(program: &[u8], mode: ExecMode) -> Option<String> {
             if used < 0 {
                 return fail(pc, "branch offset varint overflows int64".to_string());
             }
+            // go v5.1 `branchTargetVarint`: reject offsets outside the program
+            // before computing the target (also guards a 32-bit `int`).
+            if offset > len as i64 || offset < -(len as i64) {
+                return fail(pc, format!("branch offset {offset} outside of program"));
+            }
             let instr_size = 1 + used as usize;
             let target = if offset < 0 {
                 pc as i64 + offset
@@ -424,6 +429,21 @@ mod tests {
         // b +1: one byte past the end.
         assert_eq!(
             logicsig_static_check(&[8, 0x42, 0, 1]).as_deref(),
+            Some("pc=  1 branch target 5 outside of program")
+        );
+    }
+
+    #[test]
+    fn a_varint_branch_offset_longer_than_the_program_is_rejected_by_offset() {
+        // v13 `b` with varint offset +10 (zigzag 0x14) in a 3-byte program:
+        // go v5.1 reports the offset, not the computed target.
+        assert_eq!(
+            logicsig_static_check(&[13, 0x42, 0x14]).as_deref(),
+            Some("pc=  1 branch offset 10 outside of program")
+        );
+        // Within the length bound the target message is unchanged.
+        assert_eq!(
+            logicsig_static_check(&[13, 0x42, 0x04]).as_deref(),
             Some("pc=  1 branch target 5 outside of program")
         );
     }

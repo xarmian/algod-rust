@@ -124,14 +124,14 @@ func TestOutputIsDeterministicAcrossJobs(t *testing.T) {
 }
 
 func TestHeaderNamesImplementationPinAndOperation(t *testing.T) {
-	out := renderOutput("assemble", nil, header{Impl: "go-algorand", GoAlgorandTag: "v5.0.5-stable", GoAlgorandCommit: "abc"})
+	out := renderOutput("assemble", nil, header{Impl: "go-algorand", GoAlgorandTag: "v5.1.1-stable", GoAlgorandCommit: "abc"})
 	var h struct {
 		Header map[string]any `json:"header"`
 	}
 	if err := json.Unmarshal(bytes.SplitN(out, []byte("\n"), 2)[0], &h); err != nil {
 		t.Fatal(err)
 	}
-	if h.Header["impl"] != "go-algorand" || h.Header["operation"] != "assemble" || h.Header["go_algorand_tag"] != "v5.0.5-stable" || h.Header["go_algorand_commit"] != "abc" || h.Header["schema"].(float64) != 1 || h.Header["count"].(float64) != 0 {
+	if h.Header["impl"] != "go-algorand" || h.Header["operation"] != "assemble" || h.Header["go_algorand_tag"] != "v5.1.1-stable" || h.Header["go_algorand_commit"] != "abc" || h.Header["schema"].(float64) != 1 || h.Header["count"].(float64) != 0 {
 		t.Fatalf("header: %v", h.Header)
 	}
 }

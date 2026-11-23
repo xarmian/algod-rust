@@ -54,6 +54,7 @@
 pub(crate) mod codec;
 pub(crate) mod common;
 pub(crate) mod det1024;
+pub(crate) mod det512;
 pub(crate) mod falcon;
 pub(crate) mod fft;
 pub(crate) mod fpr;

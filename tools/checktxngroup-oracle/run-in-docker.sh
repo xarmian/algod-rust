@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # run-in-docker.sh — build + run `tools/checktxngroup-oracle`
-# against go-algorand v5.0.5-stable inside a Linux container.
+# against go-algorand v5.1.1-stable inside a Linux container.
 #
 # Issue #617. Mirrors tools/required-field-decode-oracle/run-in-docker.sh:
 # a Go program importing `data/transactions` pulls in `crypto` (cgo,
@@ -20,8 +20,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 GO_ALGORAND_DIR="${GO_ALGORAND_DIR:-$(cd "$REPO_ROOT/../go-algorand" 2>/dev/null && pwd || true)}"
 
-GO_ALGORAND_PIN="v5.0.5-stable"
-BUILDER_IMAGE="${BUILDER_IMAGE:-golang:1.25-bookworm}"
+GO_ALGORAND_PIN="v5.1.1-stable"
+BUILDER_IMAGE="${BUILDER_IMAGE:-golang:1.27-bookworm}"
 SRC_VOLUME="${SRC_VOLUME:-algod-rust-goalgo-src}"
 MOD_VOLUME="${MOD_VOLUME:-algod-rust-gomod}"
 CACHE_VOLUME="${CACHE_VOLUME:-algod-rust-gocache}"

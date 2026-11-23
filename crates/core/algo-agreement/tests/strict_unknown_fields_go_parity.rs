@@ -132,8 +132,6 @@ fn map_len_header(n: usize) -> Vec<u8> {
 // ── the entry points under test ───────────────────────────────────────────
 
 const APPLY_DATA_KEYS: [&[u8]; 8] = [b"ca", b"dt", b"rs", b"rr", b"rc", b"aca", b"apid", b"caid"];
-/// go's `ApplyData` fields in declaration (positional) order.
-const APPLY_DATA_ORDER: [&[u8]; 8] = [b"ca", b"aca", b"rs", b"rr", b"rc", b"dt", b"caid", b"apid"];
 
 /// `applydata` / `evaldelta` have no standalone reader in algod-rust (they
 /// only occur inside a block's `SignedTxnInBlock`): embed the value in a
@@ -149,22 +147,10 @@ fn wrap_in_stxn(kind: &str, b: &[u8], txn: &[u8]) -> Option<Vec<u8>> {
         stxn.extend_from_slice(b);
         return Some(stxn);
     }
-    if let Some(fields) = array_items(b) {
-        // go's `ApplyData` as an array (issue #2426): element `i` is field
-        // `i` of go's order (`APPLY_DATA_ORDER`); one past the eighth is go's
-        // `ErrTooManyArrayFields`. The same fields as map entries.
-        if fields.len() > APPLY_DATA_ORDER.len() {
-            return None;
-        }
-        stxn.extend(map_len_header(fields.len() + 1));
-        stxn.extend_from_slice(b"\xa3txn");
-        stxn.extend_from_slice(txn);
-        for (key, f) in APPLY_DATA_ORDER.iter().zip(fields) {
-            stxn.push(0xa0 | key.len() as u8);
-            stxn.extend_from_slice(key);
-            stxn.extend_from_slice(f);
-        }
-        return Some(stxn);
+    if array_items(b).is_some() {
+        // go v5.1 (msgp 1.1.66, #6774) decodes a struct from a map only: `ApplyData`
+        // as an array is `ReadMapHeaderBytes`'s TypeError, whatever it holds.
+        return None;
     }
     let ad = entries(b)?;
     for (key, _) in &ad {

@@ -1571,7 +1571,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     stx.auth_addr = Some(Address(proxy_pub));
                 }
             } else if allow_empty_signatures && is_placeholder_pqsig(stx) {
-                // Full or scheme-only top-level PQSig placeholder (issue
+                // Full or scheme-only top-level SaltedKeySig placeholder (issue
                 // #835): if it validates, proxy-sign the same way as the
                 // fully-unsigned case above (mirrors go's
                 // `stxn.Txn.Sign(proxySignerSecrets)`, which discards the
@@ -1598,7 +1598,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     }
                 }
             } else if allow_empty_signatures && is_placeholder_delegated_pqsig(stx) {
-                // Delegated (LogicSig-nested) PQSig placeholder (issue #835):
+                // Delegated (LogicSig-nested) SaltedKeySig placeholder (issue #835):
                 // unlike the top-level cases, the LogicSig's program must
                 // still be evaluated and traced, so it cannot be swapped for
                 // a proxy-signed bare transaction. If the placeholder
@@ -1649,7 +1649,9 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // incomplete group (`GroupIndex: -1`) the request error. go's
         // texts, unprefixed.
         if let Some(first) = verify_group.first() {
-            let mut ids = algo_validate::GroupIdChecker::new(&first.txn, verify_group.len());
+            let mut ids =
+                algo_validate::GroupIdChecker::new(&first.txn, verify_group.len())
+                    .rejecting_duplicates();
             for (i, stx) in verify_group.iter().enumerate() {
                 if let Err(message) = ids.check_member(i, &stx.txn) {
                     return Ok(CheckOutcome::RecoverableFailure {
@@ -1747,9 +1749,11 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // go's `txnGroupBatchPrep` preps every member, then verifies the
             // ed25519 batch. A member's prep failure is its `TxGroupError`
             // (`GroupIndex: i`), which `Simulate` reports as the group's
-            // `FailureMessage` with the member's `transaction %+v invalid : `
-            // frame (`prepErr.err` is re-wrapped in place), of the copy it
-            // verified (issue #2451): no signature or two kinds, a malformed
+            // `FailureMessage`. go v5.1 wraps it as `transaction <Summary>
+            // invalid : %w` for `verify.TxnGroup`, but simulate recovers the
+            // inner `*TxGroupError` (`errors.As`) and prints its own text, so
+            // the frame is not part of simulate's message (issues #2451,
+            // #2551): no signature or two kinds, a malformed
             // multisig, a PQ envelope or signature, every LogicSig verdict --
             // a delegated LogicSig's signature too, checked by its own batch
             // inside the prep. The batch's failure has no index: a request
@@ -1759,10 +1763,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 if algo_validate::verify_failure_is_framed(stx, &e) {
                     return Ok(CheckOutcome::RecoverableFailure {
                         index: i,
-                        message: algo_validate::frame_invalid_txn(
-                            stx,
-                            &algo_validate::simulate_member_reason(stx, &e),
-                        ),
+                        message: algo_validate::simulate_member_reason(stx, &e),
                         logicsig_traces,
                         logicsig_budgets,
                     });
@@ -1802,7 +1803,7 @@ fn txn_has_no_signature(stx: &SignedTransaction) -> bool {
     !stx.has_signature()
 }
 
-/// Whether `stx` carries a placeholder top-level `PQSig`: a non-blank PQ
+/// Whether `stx` carries a placeholder top-level `SaltedKeySig`: a non-blank PQ
 /// envelope with an empty signature and no other signature category set.
 /// Matches go-algorand's `isPlaceholderPQSig` (`ledger/simulation/
 /// simulator.go`, issue #835) -- used for fee/budget-estimation simulation
@@ -1874,7 +1875,7 @@ fn validate_fixed_placeholder_pq_envelopes(
                 validate_pqsig_envelope(pqsig, &authorizer, consensus).map_err(|e| {
                     (
                         i,
-                        format!("pq signature validation failed: {}", go_error_text(&e)),
+                        format!("salted-key signature validation failed: {}", go_error_text(&e)),
                     )
                 })?;
             }
@@ -1890,7 +1891,7 @@ fn validate_fixed_placeholder_pq_envelopes(
                     (
                         i,
                         format!(
-                            "pq delegated logic signature validation failed: {}",
+                            "salted-key signature delegation validation failed: {}",
                             go_error_text(&e)
                         ),
                     )
@@ -1910,14 +1911,14 @@ fn go_error_text(e: &AlgoError) -> String {
     }
 }
 
-/// Validate a placeholder `PQSig` envelope, matching go-algorand's
+/// Validate a placeholder `SaltedKeySig` envelope, matching go-algorand's
 /// `validatePlaceholderPQSig` (`ledger/simulation/simulator.go`): a
 /// scheme-only placeholder (empty public key) or a `fix_signers` request
 /// (whose `authorizer` isn't final yet) only needs the scheme validated;
 /// a full placeholder (public key set) needs the whole envelope, including
 /// the public-key-derived authorizer address, validated.
 fn validate_placeholder_pqsig(
-    pqsig: &algo_types::PQSig,
+    pqsig: &algo_types::SaltedKeySig,
     authorizer: &Address,
     consensus: &ConsensusParams,
     fix_signers: bool,
@@ -2067,10 +2068,10 @@ mod tests {
         }
     }
 
-    fn placeholder_pqsig() -> algo_types::PQSig {
-        algo_types::PQSig {
-            scheme: algo_types::PQ_SCHEME_FALCON1024,
-            salt: algo_types::PQAddressSalt(0),
+    fn placeholder_pqsig() -> algo_types::SaltedKeySig {
+        algo_types::SaltedKeySig {
+            scheme: algo_types::SIG_SCHEME_FALCON1024,
+            salt: algo_types::AddressSalt(0),
             public_key: serde_bytes::ByteBuf::new(),
             signature: serde_bytes::ByteBuf::new(),
         }

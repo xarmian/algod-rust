@@ -183,6 +183,10 @@ pub struct MultisigMergeArgs {
 /// shared [`crate::cmd::clerk_sign`] helpers (TASK-295).
 #[derive(Args, Debug)]
 pub struct SendArgs {
+    /// Authorize from the program's salted address, which no Ed25519 key can
+    /// claim, rather than its program hash (Go `--salted`, v5.1).
+    #[arg(long = "salted")]
+    pub salted: bool,
     /// Amount to transfer, in microAlgos. Required (Go `-a/--amount`).
     #[arg(short = 'a', long = "amount")]
     pub amount: u64,
@@ -422,6 +426,10 @@ pub struct SimulateArgs {
 ///   `-S/--signer` selecting the spending key when the sender was rekeyed.
 #[derive(Args, Debug)]
 pub struct SignArgs {
+    /// Authorize from the program's salted address, which no Ed25519 key can
+    /// claim, rather than its program hash (Go `--salted`, v5.1).
+    #[arg(long = "salted")]
+    pub salted: bool,
     /// Partially-signed transaction file to add a signature to
     /// (Go `-i/--infile`). Required.
     #[arg(short = 'i', long = "infile")]

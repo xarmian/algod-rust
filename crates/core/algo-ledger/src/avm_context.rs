@@ -205,7 +205,7 @@ impl InnerTxnBuilder {
     fn validate_field_type(field: u8, value: &TealValue, version: u8) -> Result<(), AlgoError> {
         fn not_a_uint64(b: &[u8]) -> AlgoError {
             AlgoError::Avm {
-                message: format!("{} is not a uint64", go_bytes_literal(b)),
+                message: format!("{} is not a uint64", algo_avm::limited_bytes::limited_bytes(b)),
             }
         }
         fn not_an_address() -> AlgoError {
@@ -339,7 +339,10 @@ impl InnerTxnBuilder {
                     Ok(())
                 } else {
                     Err(AlgoError::Avm {
-                        message: format!("{name} is not a valid Type for itxn_field"),
+                        message: format!(
+                            "{} is not a valid Type for itxn_field",
+                            algo_avm::limited_bytes::limited_bytes(b)
+                        ),
                     })
                 }
             }
@@ -5312,13 +5315,6 @@ use txn_fields::check_available_round;
 // Helpers for reading transaction fields
 // ---------------------------------------------------------------------------
 
-/// go's `%#v` of a `[]byte`: `[]byte{0x78, 0x79}` (`[]byte{}` when empty), as
-/// in `stackValue.uint`'s `%#v is not a uint64`.
-fn go_bytes_literal(b: &[u8]) -> String {
-    let items: Vec<String> = b.iter().map(|x| format!("0x{x:02x}")).collect();
-    format!("[]byte{{{}}}", items.join(", "))
-}
-
 /// Read a transaction field from a `SignedTransaction`.
 ///
 /// Delegates to the shared `algo_avm::txn_fields::read_txn_field` for most
@@ -6971,16 +6967,16 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // inner group, ClearState included, before any sibling runs. An
         // earlier sibling may therefore spend budget that a later sibling
         // contributes (mainnet round 67137517, issue #2493).
+        let inner_apps = txns.iter().filter(|s| s.txn.txn_type == "appl").count();
         if self.consensus.enable_app_cost_pooling {
-            let inner_apps = txns.iter().filter(|s| s.txn.txn_type == "appl").count() as i64;
-            self.opcode_budget += inner_apps * self.consensus.max_app_program_cost as i64;
+            self.opcode_budget += inner_apps as i64 * self.consensus.max_app_program_cost as i64;
         }
 
         // Notify tracer of the inner transaction group.
         if let Some(p) = self.tracer_ptr {
             // SAFETY: tracer_ptr is valid for the duration of this context
             // and only one mutable ref is live at a time.
-            unsafe { &mut *p }.before_txn_group(txns.len());
+            unsafe { &mut *p }.before_txn_group(txns.len(), inner_apps);
         }
 
         // Shared across every member of *this* inner group so `gload`/

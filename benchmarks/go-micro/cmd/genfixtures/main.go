@@ -399,7 +399,7 @@ func lsigProgram(w *writer, name, tmpl string) {
 	proto := micro.CurrentProto()
 	probe := assemble(strings.Replace(tmpl, "CHECK", "int 1", 1))
 	ep := logic.NewSigEvalParams(micro.LsigGroup(probe), &proto, logic.NoHeaderLedger{})
-	pass, cx, err := logic.EvalSignatureFull(0, ep)
+	pass, cx, err := logic.EvalSignatureProgram(probe, nil, 0, ep)
 	if err != nil || !pass {
 		log.Fatalf("%s probe: pass=%v err=%v", name, pass, err)
 	}
@@ -460,7 +460,7 @@ func main() {
 	}
 	w.put("vrf.frames", micro.EncodeFrames(vrfPK[:], proof[:], alpha))
 
-	falconSigner, err := crypto.GenerateFalconSigner(crypto.FalconSeed(stream(crypto.FalconSeedSize)))
+	falconSigner, err := crypto.GenerateFalcon1024Signer(crypto.FalconSeed(stream(crypto.FalconSeedSize)))
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -107,8 +107,9 @@ fn go_decode_accepts_and_rejects_what_go_does() {
     assert!(ok(&arg(255, 1)) && !ok(&arg(256, 1)));
     assert!(ok(&arg(1, 4096)) && !ok(&arg(1, 4097)));
     let pq = |k: &str, n: usize| mp::rec(&[("pqsig", mp::rec(&[(k, mp::bin(&vec![1u8; n]))]))]);
-    assert!(ok(&pq("pk", 1793)) && !ok(&pq("pk", 1794)));
-    assert!(ok(&pq("sig", 1538)) && !ok(&pq("sig", 1539)));
+    // go v5.1 bounds: the largest key/signature over all schemes (`ls`).
+    assert!(ok(&pq("pk", 16_000)) && !ok(&pq("pk", 16_001)));
+    assert!(ok(&pq("sig", 17_280)) && !ok(&pq("sig", 17_281)));
     // `msig` needs v, thr and subsig; an unknown key fails anywhere.
     let by_name: std::collections::HashMap<_, _> = lsig_decode_cases().into_iter().collect();
     for rejected in [
@@ -123,6 +124,8 @@ fn go_decode_accepts_and_rejects_what_go_does() {
         "key upper case",
         "pqsig unknown key",
         "pqsig salt 256",
+        // go v5.1's generated decoders read maps only (msgp 1.1.66, #6774).
+        "array form all six",
     ] {
         assert!(!ok(&by_name[rejected]), "{rejected} must be rejected");
     }
@@ -134,7 +137,6 @@ fn go_decode_accepts_and_rejects_what_go_does() {
         "subsig pk short",
         "sig str",
         "duplicate l",
-        "array form all six",
     ] {
         assert!(ok(&by_name[accepted]), "{accepted} must be accepted");
     }
@@ -223,8 +225,8 @@ fn signed_txn_carrying_such_a_logicsig_is_rejected() {
         "l 16001 bytes",
         "arg 256 elements",
         "arg element 4097",
-        "pqsig pk 1794",
-        "pqsig sig 1539",
+        "pqsig pk 16001",
+        "pqsig sig 17281",
     ] {
         assert!(!decode(&by_name[rejected]), "{rejected} must be rejected");
     }
@@ -247,24 +249,28 @@ fn rejections_carry_go_msgp_error_text() {
         // an `errWrapped` wraps again: one " at " per level
         ("subsig unknown key", "Unknown field: zzz at Subsigs/0 at Msig"),
         ("msig 256 subsigs", "msgp: length overflow: 256 > 255 at Subsigs at Msig"),
+        // go v5.1: a struct is a map; an array is `ReadMapHeaderBytes`'s TypeError
         (
             "subsig as array of three",
-            "Too many array fields when decoding into struct: 1 left at struct-from-array at Subsigs/0 at Msig",
+            "msgp: attempted to decode type \"array\" with method for \"map\" at Msig/Subsigs/0",
         ),
-        ("array form nil fields", "missing required field: v at struct-from-array/Msig"),
+        (
+            "array form nil fields",
+            "msgp: attempted to decode type \"array\" with method for \"map\"",
+        ),
         // a `TypeError` / `UintOverflow` prepends to its context
         ("msig v 256", "msgp: 256 overflows uint8 at Msig/Version"),
         (
             "msig subsig as map",
-            "msgp: attempted to decode type \"str\" with method for \"array\" at Msig/Subsigs/0",
+            "msgp: attempted to decode type \"str\" with method for \"map\" at Msig/Subsigs/0",
         ),
         // an `UintBelowZero` replaces it
         ("msig v negative", "msgp: attempted to cast int -1 to unsigned at Msig"),
-        ("pqsig salt negative", "msgp: attempted to cast int -1 to unsigned at PQsig"),
+        ("pqsig salt negative", "msgp: attempted to cast int -1 to unsigned at SKsig"),
         // `ErrShortBytes` never gets one
         ("l truncated", "msgp: too few bytes left to read object"),
         ("reserved marker", "msgp: unrecognized type prefix 0xc1"),
-        ("pqsig pk 1794", "msgp: length overflow: 1794 > 1793 at PQsig"),
+        ("pqsig pk 16001", "msgp: length overflow: 16001 > 16000 at SKsig"),
     ] {
         assert_eq!(String::from_utf8(text(name)).unwrap(), want, "{name}");
     }

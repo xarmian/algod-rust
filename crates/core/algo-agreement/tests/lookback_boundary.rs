@@ -115,6 +115,7 @@ const EXCLUDED_VERSIONS: &[&str] = &[
     algo_types::consensus::CONSENSUS_VFNET2,
     algo_types::consensus::CONSENSUS_VFNET3,
     algo_types::consensus::CONSENSUS_VFNET4,
+    algo_types::consensus::CONSENSUS_VFNET5,
 ];
 
 /// The set of consensus versions the parity harness must cover,

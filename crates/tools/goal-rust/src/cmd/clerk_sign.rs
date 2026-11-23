@@ -67,6 +67,71 @@ pub fn program_address(program: &[u8]) -> Address {
     Address(hash_program(program))
 }
 
+/// go v5.1's `saltedProgramAuthorizer`: the salt and address a program
+/// authorizes from under the `ls` scheme, whose salt makes it an address no
+/// Ed25519 key can ever claim.
+pub fn salted_program_authorizer(
+    program: &[u8],
+) -> Result<(algo_types::AddressSalt, Address), String> {
+    algo_types::canonical_address_salt(algo_types::SIG_SCHEME_LOGIC_SIG, program).ok_or_else(|| {
+        "Could not derive salted address for program: no canonical salt exists for this public key and scheme"
+            .to_string()
+    })
+}
+
+/// go v5.1's `programAuthorizer`: the address a program authorizes from, in
+/// whichever of its two forms was asked for.
+pub fn program_authorizer(program: &[u8], salted: bool) -> Result<Address, String> {
+    if salted {
+        salted_program_authorizer(program).map(|(_, addr)| addr)
+    } else {
+        Ok(program_address(program))
+    }
+}
+
+/// go v5.1's `authorizeWithProgram`: attach a program and its arguments to
+/// `stx`. A program has two account addresses, so which form to use is settled
+/// in this order: `--salted` if given, otherwise whichever address the
+/// transaction's authorizer already matches, otherwise the legacy program hash,
+/// so that uses predating the salted form keep the address they had. The
+/// authorizer has to be settled before the program is attached.
+pub fn authorize_with_program(
+    stx: &mut algo_types::SignedTransaction,
+    lsig: algo_types::LogicSig,
+    salted: bool,
+) -> Result<(), String> {
+    let (salt, addr) = salted_program_authorizer(&lsig.logic)?;
+    let authorizer = stx.auth_addr.unwrap_or(stx.txn.sender);
+    let salted = salted || authorizer == addr;
+    if !salted {
+        stx.pqsig = None;
+        stx.lsig = Some(lsig);
+        return Ok(());
+    }
+    if authorizer != addr {
+        return Err(format!(
+            "program authorizes {addr}, but the transaction is authorized by {authorizer}"
+        ));
+    }
+    let args: Vec<Option<Vec<u8>>> = lsig
+        .args
+        .as_ref()
+        .map(|a| {
+            a.iter()
+                .map(|e| e.as_ref().map(|b| b.to_vec()))
+                .collect()
+        })
+        .unwrap_or_default();
+    stx.lsig = None;
+    stx.pqsig = Some(algo_types::SaltedKeySig {
+        scheme: algo_types::SIG_SCHEME_LOGIC_SIG,
+        salt,
+        public_key: lsig.logic.clone(),
+        signature: serde_bytes::ByteBuf::from(algo_codec::encode_logic_sig_args(&args)),
+    });
+    Ok(())
+}
+
 /// `logic.HashProgram(program)` — the raw 32-byte digest of `"Program" ||
 /// program`.
 pub fn hash_program(program: &[u8]) -> [u8; 32] {

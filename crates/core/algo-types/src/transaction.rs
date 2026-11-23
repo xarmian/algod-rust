@@ -166,7 +166,7 @@ pub struct SignedTransaction {
     /// Post-quantum (Falcon-1024) transaction authorization proof (Go:
     /// `PQsig`, `data/transactions/pqsig.go`, added by commit `569ae3d4b`).
     #[serde(rename = "pqsig", default, skip_serializing_if = "Option::is_none")]
-    pub pqsig: Option<crate::pq::PQSig>,
+    pub pqsig: Option<crate::pq::SaltedKeySig>,
 
     /// Auth address for rekeyed accounts.
     #[serde(rename = "sgnr", default, skip_serializing_if = "Option::is_none")]
@@ -638,10 +638,10 @@ pub struct LogicSig {
     /// Post-quantum (Falcon-1024) delegated LogicSig authorization proof
     /// (Go: `LogicSig.PQsig`, `data/transactions/logicsig.go`, added by
     /// commit `ef838f4e9`). Verified in-place against
-    /// `PQDelegatedProgram{Addr: authorizer, Program: Logic}` — see
+    /// `SKsigDelegatedProgram{Addr: authorizer, Program: Logic}` — see
     /// `algo-validate::signature::logicsig_sanity_check`.
     #[serde(rename = "pqsig", default, skip_serializing_if = "Option::is_none")]
-    pub pqsig: Option<crate::pq::PQSig>,
+    pub pqsig: Option<crate::pq::SaltedKeySig>,
 }
 
 impl Default for LogicSig {
@@ -1812,7 +1812,7 @@ impl LogicSig {
                 b"pqsig" => rmp_decode::read_struct_into_opt(
                     rd,
                     &mut s.pqsig,
-                    crate::pq::PQSig::decode_into,
+                    crate::pq::SaltedKeySig::decode_into,
                 )?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
@@ -1959,7 +1959,7 @@ impl FalconVerifier {
     decode_via_into!();
 
     pub(crate) fn decode_into(rd: &mut &[u8], s: &mut Self) -> DecodeResult<()> {
-        let mut keys = rmp_decode::struct_keys(rd, s, "crypto.FalconVerifier")?;
+        let mut keys = rmp_decode::struct_keys(rd, s, "crypto.Falcon1024Verifier")?;
         while let Some(key) = keys.next(rd)? {
             match key {
                 b"k" => read_falcon_public_key_into(rd, &mut s.public_key)?,
@@ -2356,7 +2356,7 @@ fn merkle_signature_into_map_entry(rd: &mut &[u8], sig: &mut MerkleSignature) ->
                 }
             }
             b"vkey" => {
-                let mut keys = unaddr_struct_keys(rd, "crypto.FalconVerifier")?;
+                let mut keys = unaddr_struct_keys(rd, "crypto.Falcon1024Verifier")?;
                 while let Some(key) = keys.next(rd)? {
                     match key {
                         b"k" => return Err(unaddr_array(rd)),
@@ -2846,7 +2846,7 @@ impl SignedTransaction {
                 (5, b'p') if key == b"pqsig" => rmp_decode::read_struct_into_opt(
                     rd,
                     &mut s.pqsig,
-                    crate::pq::PQSig::decode_into,
+                    crate::pq::SaltedKeySig::decode_into,
                 )?,
                 (4, b's') if key == b"sgnr" => {
                     rmp_decode::read_address_into_opt(rd, &mut s.auth_addr)?
@@ -3333,12 +3333,12 @@ mod logicsig_blank_tests {
                 ..Default::default()
             },
             LogicSig {
-                pqsig: Some(crate::pq::PQSig::default()),
+                pqsig: Some(crate::pq::SaltedKeySig::default()),
                 ..Default::default()
             },
             LogicSig {
-                pqsig: Some(crate::pq::PQSig {
-                    scheme: crate::pq::PQ_SCHEME_FALCON1024,
+                pqsig: Some(crate::pq::SaltedKeySig {
+                    scheme: crate::pq::SIG_SCHEME_FALCON1024,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -3366,15 +3366,15 @@ mod logicsig_blank_tests {
     #[test]
     fn logicsig_blank_pqsig_non_blank_is_not_blank_blank_pqsig_is() {
         let non_blank = LogicSig {
-            pqsig: Some(crate::pq::PQSig {
-                scheme: crate::pq::PQ_SCHEME_FALCON1024,
+            pqsig: Some(crate::pq::SaltedKeySig {
+                scheme: crate::pq::SIG_SCHEME_FALCON1024,
                 ..Default::default()
             }),
             ..Default::default()
         };
         assert!(!non_blank.is_blank());
         let blank = LogicSig {
-            pqsig: Some(crate::pq::PQSig::default()),
+            pqsig: Some(crate::pq::SaltedKeySig::default()),
             ..Default::default()
         };
         assert!(blank.is_blank());
@@ -3466,8 +3466,8 @@ mod logicsig_blank_tests {
     #[test]
     fn logicsig_blank_and_has_program_pqsig_alone_is_not_blank_no_program() {
         let lsig = LogicSig {
-            pqsig: Some(crate::pq::PQSig {
-                scheme: crate::pq::PQ_SCHEME_FALCON1024,
+            pqsig: Some(crate::pq::SaltedKeySig {
+                scheme: crate::pq::SIG_SCHEME_FALCON1024,
                 ..Default::default()
             }),
             ..Default::default()
@@ -3544,8 +3544,8 @@ mod signed_txn_has_signature_tests {
     #[test]
     fn has_signature_pqsig_is_true() {
         let stx = SignedTransaction {
-            pqsig: Some(crate::pq::PQSig {
-                scheme: crate::pq::PQ_SCHEME_FALCON1024,
+            pqsig: Some(crate::pq::SaltedKeySig {
+                scheme: crate::pq::SIG_SCHEME_FALCON1024,
                 ..Default::default()
             }),
             ..Default::default()
@@ -3569,8 +3569,8 @@ mod signed_txn_has_signature_tests {
     fn has_signature_lsig_nested_pqsig_only_is_true() {
         let stx = SignedTransaction {
             lsig: Some(LogicSig {
-                pqsig: Some(crate::pq::PQSig {
-                    scheme: crate::pq::PQ_SCHEME_FALCON1024,
+                pqsig: Some(crate::pq::SaltedKeySig {
+                    scheme: crate::pq::SIG_SCHEME_FALCON1024,
                     ..Default::default()
                 }),
                 ..Default::default()

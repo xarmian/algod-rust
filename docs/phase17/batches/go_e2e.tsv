@@ -182,8 +182,8 @@ test/e2e-go/restAPI/stateproof	TestStateProofInParticipationInfo	test/e2e-go/res
 test/e2e-go/restAPI/stateproof	TestStateProofParticipationKeysAPI	test/e2e-go/restAPI/stateproof/stateproofRestAPI_test.go	115
 test/e2e-go/restAPI/stateproof	TestNilStateProofInParticipationInfo	test/e2e-go/restAPI/stateproof/stateproofRestAPI_test.go	143
 test/e2e-go/stress/transactions	TestManyAccountsCanGoOnline	test/e2e-go/stress/transactions/createManyAndGoOnline_test.go	52
-test/e2e-go/upgrades	TestApplicationsUpgradeOverREST	test/e2e-go/upgrades/application_support_test.go	74
-test/e2e-go/upgrades	TestApplicationsUpgradeOverGossip	test/e2e-go/upgrades/application_support_test.go	301
+test/e2e-go/upgrades	TestApplicationsUpgradeOverREST	test/e2e-go/upgrades/application_support_test.go	78
+test/e2e-go/upgrades	TestApplicationsUpgradeOverGossip	test/e2e-go/upgrades/application_support_test.go	305
 test/e2e-go/upgrades	TestRekeyUpgrade	test/e2e-go/upgrades/rekey_support_test.go	34
 test/e2e-go/upgrades	TestAccountsCanSendMoneyAcrossUpgradeV15toV16	test/e2e-go/upgrades/send_receive_upgrade_test.go	47
 test/e2e-go/upgrades	TestAccountsCanSendMoneyAcrossUpgradeV21toV22	test/e2e-go/upgrades/send_receive_upgrade_test.go	54

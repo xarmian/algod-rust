@@ -56,13 +56,13 @@ mod tests {
     use super::*;
     use crate::commands::pq::key::write_pq_private_key_file;
     use crate::commands::pq::scheme::generate_pq_signing_material;
-    use algo_types::PQ_SCHEME_FALCON1024;
+    use algo_types::SIG_SCHEME_FALCON1024;
 
     #[test]
     fn info_prints_key_info_for_valid_keyfile() {
         let dir = tempfile::tempdir().unwrap();
         let kf = dir.path().join("k");
-        let (_, signing) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
+        let (_, signing) = generate_pq_signing_material(SIG_SCHEME_FALCON1024).unwrap();
         write_pq_private_key_file(&kf, &signing).unwrap();
 
         let mut out = Vec::new();

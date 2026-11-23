@@ -77,7 +77,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  GO_ALGORAND_REV: "v5.0.5-stable"
+  GO_ALGORAND_REV: "v5.1.1-stable"
   # Registry commit PR runs use (the one docs/teal-corpus/history.csv last recorded).
   PR_REGISTRY_SHA: "e75e509cf2452fea5b0726e064f7445dedbeac07"
   REGISTRY_REPO: "https://github.com/scholtz/ARC56Registry.git"

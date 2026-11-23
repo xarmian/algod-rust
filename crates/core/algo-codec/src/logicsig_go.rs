@@ -22,7 +22,7 @@
 //! does for a `transactions.LogicSig` (issue #2390): the msgp-generated
 //! `LogicSig.UnmarshalMsgWithState` (`data/transactions/msgp_gen.go`) with its
 //! members `crypto.MultisigSig` / `MultisigSubsig` (`crypto/msgp_gen.go`) and
-//! `transactions.PQSig`, on top of algorand/msgp's read primitives
+//! `transactions.SaltedKeySig`, on top of algorand/msgp's read primitives
 //! (`msgp/read_bytes.go`).
 //!
 //! It exists for tools that must accept and reject exactly what go does
@@ -58,10 +58,10 @@
 //! `... at struct-from-array/Msig`).
 
 use algo_types::go_msgp::{
-    bounds, EVAL_MAX_ARGS, MAX_LOGIC_SIG_ARG_SIZE, MAX_MULTISIG, MAX_PQ_PUBLIC_KEY_SIZE,
-    MAX_PQ_SIGNATURE_SIZE,
+    bounds, max_sig_scheme_public_key_size, max_sig_scheme_signature_size, EVAL_MAX_ARGS,
+    MAX_LOGIC_SIG_ARG_SIZE, MAX_MULTISIG,
 };
-use algo_types::{LogicSig, MultisigSig, MultisigSubsig, PQAddressSalt, PQSig};
+use algo_types::{LogicSig, MultisigSig, MultisigSubsig, AddressSalt, SaltedKeySig};
 use serde_bytes::ByteBuf;
 
 /// A `transactions.LogicSig` as go's generated decoder leaves it.
@@ -80,7 +80,7 @@ pub struct GoLogicSig {
     /// `LMsig` (`lmsig`).
     pub lmsig: MultisigSig,
     /// `PQsig` (`pqsig`); a zero value when the record has none.
-    pub pqsig: PQSig,
+    pub pqsig: SaltedKeySig,
     /// `Args` (`arg`); `None` is a `nil` element (go's JSON prints it as `null`).
     pub args: Vec<Option<Vec<u8>>>,
 }
@@ -112,6 +112,161 @@ pub fn decode_logicsig_go(bytes: &[u8]) -> Result<GoLogicSig, GoMsgpError> {
     let mut z = LsigState::default();
     z.decode(&mut b).map_err(GoMsgpError)?;
     Ok(z.finish())
+}
+
+/// Why go's `DecodeLogicSigArgs` refuses `encoded`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogicSigArgsError {
+    /// The generated msgp decoder's error (`protocol.Decode`), its text as go prints it.
+    Msgp(GoMsgpError),
+    /// `errLogicSigArgsNotCanonical`: the bytes decode, but not as
+    /// [`encode_logic_sig_args`] would encode what they decode to.
+    NotCanonical,
+}
+
+impl std::fmt::Display for LogicSigArgsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogicSigArgsError::Msgp(e) => e.fmt(f),
+            LogicSigArgsError::NotCanonical => {
+                f.write_str("logicsig args are not canonically encoded")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LogicSigArgsError {}
+
+/// go's `transactions.EncodeLogicSigArgs`: program arguments as bytes, for a
+/// place with room only for bytes (an `ls`-scheme `SaltedKeySig`'s signature).
+/// No arguments encode to no bytes, so "absent" and "present but empty" have
+/// one representation. A `nil` argument stays `nil`, an empty one is `bin 8`
+/// of length 0 (go's `msgp.AppendBytes`).
+pub fn encode_logic_sig_args(args: &[Option<Vec<u8>>]) -> Vec<u8> {
+    if args.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    // `msgp.AppendArrayHeader`: fixarray, array16, array32.
+    match args.len() {
+        n if n <= 15 => out.push(0x90 | n as u8),
+        n if n <= 0xffff => {
+            out.push(0xdc);
+            out.extend_from_slice(&(n as u16).to_be_bytes());
+        }
+        n => {
+            out.push(0xdd);
+            out.extend_from_slice(&(n as u32).to_be_bytes());
+        }
+    }
+    for a in args {
+        let Some(a) = a else {
+            out.push(0xc0);
+            continue;
+        };
+        // `msgp.AppendBytes`: bin8, bin16, bin32.
+        match a.len() {
+            n if n <= 0xff => {
+                out.push(0xc4);
+                out.push(n as u8);
+            }
+            n if n <= 0xffff => {
+                out.push(0xc5);
+                out.extend_from_slice(&(n as u16).to_be_bytes());
+            }
+            n => {
+                out.push(0xc6);
+                out.extend_from_slice(&(n as u32).to_be_bytes());
+            }
+        }
+        out.extend_from_slice(a);
+    }
+    out
+}
+
+/// go's `transactions.DecodeLogicSigArgs`: `LogicSigArgs.UnmarshalMsg` (at most
+/// `EvalMaxArgs` elements of at most `MaxLogicSigArgSize` bytes; trailing bytes
+/// are left unread, as go-codec's `DecodeMsgp` allows) and then the exact
+/// encoding [`encode_logic_sig_args`] would write, which nothing signs and so
+/// nothing else may be accepted. No bytes decode to no arguments.
+pub fn decode_logic_sig_args(encoded: &[u8]) -> Result<Vec<Option<Vec<u8>>>, LogicSigArgsError> {
+    if encoded.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut b = encoded;
+    let decode = |b: &mut &[u8]| -> R<Vec<Option<Vec<u8>>>> {
+        let (n, nil) = w(read_array_header(b, true), "")?;
+        if n > EVAL_MAX_ARGS {
+            return Err(overflow(n, EVAL_MAX_ARGS).wrap(""));
+        }
+        let mut args = Vec::with_capacity(if nil { 0 } else { n });
+        for i in 0..n {
+            let (v, nil) = read_bounded_bytes(b, MAX_LOGIC_SIG_ARG_SIZE, &i.to_string())?;
+            args.push((!nil).then_some(v));
+        }
+        Ok(args)
+    };
+    let args = decode(&mut b).map_err(|e| LogicSigArgsError::Msgp(GoMsgpError(e)))?;
+    if encode_logic_sig_args(&args) != encoded {
+        return Err(LogicSigArgsError::NotCanonical);
+    }
+    Ok(args)
+}
+
+#[cfg(test)]
+mod logic_sig_args_tests {
+    use super::*;
+
+    fn some(v: &[u8]) -> Option<Vec<u8>> {
+        Some(v.to_vec())
+    }
+
+    /// go's `TestLogicSigArgsRoundTrip`.
+    #[test]
+    fn round_trips_and_no_arguments_are_no_bytes() {
+        for args in [
+            vec![some(&[])],
+            vec![some(&[1])],
+            vec![some(&[1, 2, 3]), some(&[]), some(&[4])],
+            vec![some(&[0u8; 4096])],
+            vec![some(&[]); 255],
+            vec![None, some(&[9])],
+        ] {
+            assert_eq!(decode_logic_sig_args(&encode_logic_sig_args(&args)).unwrap(), args);
+        }
+        assert!(encode_logic_sig_args(&[]).is_empty());
+        assert!(decode_logic_sig_args(&[]).unwrap().is_empty());
+    }
+
+    /// go's `TestLogicSigArgsRejectsNonCanonical`.
+    #[test]
+    fn insists_on_the_exact_encoding() {
+        let canonical = encode_logic_sig_args(&[some(&[1, 2, 3])]);
+        assert_eq!(decode_logic_sig_args(&canonical).unwrap(), vec![some(&[1, 2, 3])]);
+        // An empty array spells no arguments, which must be spelled as no bytes.
+        assert_eq!(decode_logic_sig_args(&[0x90]), Err(LogicSigArgsError::NotCanonical));
+        // Trailing bytes are not part of the arguments either.
+        let mut trailing = canonical.clone();
+        trailing.push(0);
+        assert_eq!(decode_logic_sig_args(&trailing), Err(LogicSigArgsError::NotCanonical));
+        // array16 spelling of a length that fits in a fixarray.
+        let mut wide = vec![0xdc, 0x00, 0x01];
+        wide.extend_from_slice(&canonical[1..]);
+        assert_eq!(decode_logic_sig_args(&wide), Err(LogicSigArgsError::NotCanonical));
+        assert!(matches!(
+            decode_logic_sig_args(&[0xc1]),
+            Err(LogicSigArgsError::Msgp(_))
+        ));
+    }
+
+    /// go's `TestLogicSigArgsDecodeBounds`.
+    #[test]
+    fn bounds_are_the_logicsig_arg_limits() {
+        let too_many = encode_logic_sig_args(&vec![some(&[]); 256]);
+        assert!(matches!(decode_logic_sig_args(&too_many), Err(LogicSigArgsError::Msgp(_))));
+        let too_big = encode_logic_sig_args(&[some(&[0u8; 4097])]);
+        assert!(matches!(decode_logic_sig_args(&too_big), Err(LogicSigArgsError::Msgp(_))));
+    }
 }
 
 /// Decode `bytes` as go's `protocol.Decode(bytes, &msig)` does for a
@@ -227,8 +382,6 @@ enum E {
     Overflow { l: u64, bound: u64 },
     /// `ErrNoField`: the raw key bytes.
     NoField(Vec<u8>),
-    /// `ErrTooManyArrayFields`.
-    TooManyArrayFields(usize),
     /// `errors.New("missing required field: <key>")`.
     Required(&'static str),
     /// `errWrapped`: any other error after `WrapError`; wrapping it again wraps
@@ -323,9 +476,6 @@ impl E {
                 let mut v = b"Unknown field: ".to_vec();
                 v.extend_from_slice(key);
                 v
-            }
-            E::TooManyArrayFields(n) => {
-                format!("Too many array fields when decoding into struct: {n} left").into_bytes()
             }
             E::Required(text) => text.as_bytes().to_vec(),
             E::Wrapped { cause, ctx } => {
@@ -626,12 +776,11 @@ fn read_map_key(b: &mut &[u8]) -> R<Vec<u8>> {
     }
 }
 
-/// The fields of one generated decoder: a map (or `nil`) is a key loop, an array
-/// is positional.
+/// The fields of one generated decoder: a map (or `nil`) is a key loop. (go v5.1's
+/// decoders no longer read the positional array form.)
 enum Form {
     /// Number of keys, and whether the header was `nil` (the struct is zeroed).
     Map(usize, bool),
-    Array(usize),
 }
 
 /// Open a struct and report how it is laid out; a failure is wrapped with an
@@ -639,7 +788,9 @@ enum Form {
 fn open_struct(b: &mut &[u8]) -> R<Form> {
     let form = match read_map_header(b) {
         Ok(Some((n, nil))) => Ok(Form::Map(n, nil)),
-        Ok(None) => read_array_header(b, true).map(|(n, _)| Form::Array(n)),
+        // go v5.1 (msgp 1.1.66, #6774): the generated decoder reads maps only, an
+        // array is `ReadMapHeaderBytes`'s TypeError.
+        Ok(None) => lead(b).and_then(|l| Err(bad_prefix(Ty::Map, l))),
         Err(e) => Err(e),
     };
     w(form, "")
@@ -648,19 +799,6 @@ fn open_struct(b: &mut &[u8]) -> R<Form> {
 /// An unknown map key: `msgp.WrapError(msgp.ErrNoField(string(field)))`.
 fn no_field<T>(key: Vec<u8>) -> R<T> {
     Err(E::NoField(key).wrap(""))
-}
-
-/// The context of an array-form field: `"struct-from-array", <field>`.
-fn sfa(field: &str) -> String {
-    format!("struct-from-array/{field}")
-}
-
-/// The array-form `ErrTooManyArrayFields` check.
-fn too_many(n: usize) -> R<()> {
-    if n > 0 {
-        return Err(E::TooManyArrayFields(n).wrap("struct-from-array"));
-    }
-    Ok(())
 }
 
 #[derive(Clone)]
@@ -692,17 +830,6 @@ impl SubsigState {
                         other => return no_field(other.to_vec()),
                     }
                 }
-            }
-            Form::Array(mut n) => {
-                if n > 0 {
-                    n -= 1;
-                    w(read_exact(b, &mut self.key), &sfa("Key"))?;
-                }
-                if n > 0 {
-                    n -= 1;
-                    w(read_exact(b, &mut self.sig), &sfa("Sig"))?;
-                }
-                too_many(n)?;
             }
         }
         Ok(())
@@ -755,21 +882,6 @@ impl MsigState {
                     }
                 }
             }
-            Form::Array(mut n) => {
-                if n > 0 {
-                    n -= 1;
-                    self.version = w(read_u8(b), &sfa("Version"))?;
-                }
-                if n > 0 {
-                    n -= 1;
-                    self.threshold = w(read_u8(b), &sfa("Threshold"))?;
-                }
-                if n > 0 {
-                    n -= 1;
-                    self.decode_subsigs(b, &sfa("Subsigs"))?;
-                }
-                too_many(n)?;
-            }
         }
         // `codec:",required"`: the zero value fails, whether or not the key was there.
         let missing = if self.version == 0 {
@@ -817,7 +929,7 @@ struct PqState {
 }
 
 impl PqState {
-    /// `PQScheme.UnmarshalMsg` / `PQAddressSalt.UnmarshalMsg` wrap their own
+    /// `PQScheme.UnmarshalMsg` / `AddressSalt.UnmarshalMsg` wrap their own
     /// failure with an empty context before the field context is added.
     fn decode(&mut self, b: &mut &[u8]) -> R<()> {
         let scheme =
@@ -834,45 +946,24 @@ impl PqState {
                         b"slt" => self.salt = salt(b, "Salt")?,
                         b"pk" => {
                             self.public_key =
-                                read_bounded_bytes(b, MAX_PQ_PUBLIC_KEY_SIZE, "PublicKey")?.0
+                                read_bounded_bytes(b, max_sig_scheme_public_key_size(), "PublicKey")?.0
                         }
                         b"sig" => {
                             self.signature =
-                                read_bounded_bytes(b, MAX_PQ_SIGNATURE_SIZE, "Signature")?.0
+                                read_bounded_bytes(b, max_sig_scheme_signature_size(), "Signature")?.0
                         }
                         other => return no_field(other.to_vec()),
                     }
                 }
             }
-            Form::Array(mut n) => {
-                if n > 0 {
-                    n -= 1;
-                    scheme(b, &mut self.scheme, &sfa("Scheme"))?;
-                }
-                if n > 0 {
-                    n -= 1;
-                    self.salt = salt(b, &sfa("Salt"))?;
-                }
-                if n > 0 {
-                    n -= 1;
-                    self.public_key =
-                        read_bounded_bytes(b, MAX_PQ_PUBLIC_KEY_SIZE, &sfa("PublicKey"))?.0;
-                }
-                if n > 0 {
-                    n -= 1;
-                    self.signature =
-                        read_bounded_bytes(b, MAX_PQ_SIGNATURE_SIZE, &sfa("Signature"))?.0;
-                }
-                too_many(n)?;
-            }
         }
         Ok(())
     }
 
-    fn finish(self) -> PQSig {
-        PQSig {
+    fn finish(self) -> SaltedKeySig {
+        SaltedKeySig {
             scheme: self.scheme,
-            salt: PQAddressSalt(self.salt),
+            salt: AddressSalt(self.salt),
             public_key: ByteBuf::from(self.public_key),
             signature: ByteBuf::from(self.signature),
         }
@@ -943,38 +1034,11 @@ impl LsigState {
                         b"sig" => self.decode_sig(b, "Sig")?,
                         b"msig" => w(self.msig.decode(b), "Msig")?,
                         b"lmsig" => w(self.lmsig.decode(b), "LMsig")?,
-                        b"pqsig" => w(self.pqsig.decode(b), "PQsig")?,
+                        b"pqsig" => w(self.pqsig.decode(b), "SKsig")?,
                         b"arg" => self.decode_args(b, "Args")?,
                         other => return no_field(other.to_vec()),
                     }
                 }
-            }
-            Form::Array(mut n) => {
-                if n > 0 {
-                    n -= 1;
-                    self.decode_logic(b, &sfa("Logic"))?;
-                }
-                if n > 0 {
-                    n -= 1;
-                    self.decode_sig(b, &sfa("Sig"))?;
-                }
-                if n > 0 {
-                    n -= 1;
-                    w(self.msig.decode(b), &sfa("Msig"))?;
-                }
-                if n > 0 {
-                    n -= 1;
-                    w(self.lmsig.decode(b), &sfa("LMsig"))?;
-                }
-                if n > 0 {
-                    n -= 1;
-                    w(self.pqsig.decode(b), &sfa("PQsig"))?;
-                }
-                if n > 0 {
-                    n -= 1;
-                    self.decode_args(b, &sfa("Args"))?;
-                }
-                too_many(n)?;
             }
         }
         Ok(())

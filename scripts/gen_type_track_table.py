@@ -115,14 +115,17 @@ def build():
         out.append("];\n\n")
     out.append("/// Every opcode, sorted by name; see [`OpEntry`].\n")
     out.append("pub(crate) static OPS: &[OpEntry] = &[\n")
-    for r in sorted(ops, key=lambda r: r["name"]):
-        imms = ", ".join(
+    def imm_list(items):
+        return ", ".join(
             f"ImmEntry {{ name: \"{i['name']}\", group: "
             + (f"Some(GROUP_{ident(i['group'])})" if i.get("group") else "None")
             + " }"
-            for i in r.get("imms", [])
+            for i in items
         )
-        out.append(f'    OpEntry {{ name: "{r["name"]}", version: {r["version"]}, ')
+
+    for r in sorted(ops, key=lambda r: r["name"]):
+        imms = imm_list(r.get("imms", []))
+        out.append(f'    OpEntry {{ name: "{r["name"]}", version: {r["version"]}, latest_version: {r["latest_version"]}, ')
         out.append(f"deadens: {str(r.get('deadens', False)).lower()}, imms: &[{imms}], variants: &[\n")
         for v in r["variants"]:
             refine = v.get("refine", "")
@@ -132,7 +135,8 @@ def build():
                 refine = f"typeByteMath:{mx}"
             out.append(
                 f'        Variant {{ from: {v["from"]}, args: {tylist(v["args"])}, '
-                f'returns: {tylist(v["returns"])}, refine: "{refine}" }},\n'
+                f'returns: {tylist(v["returns"])}, refine: "{refine}", '
+                f'imms: &[{imm_list(v.get("imms", []))}] }},\n'
             )
         out.append("    ] },\n")
     out.append("];\n")

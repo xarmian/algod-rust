@@ -35,6 +35,7 @@ pub mod eval;
 pub mod fields;
 pub mod group;
 pub mod itxn;
+pub mod limited_bytes;
 pub mod logicsig_context;
 pub mod machine;
 pub mod opcode;

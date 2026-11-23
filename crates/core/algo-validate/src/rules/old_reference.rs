@@ -24,7 +24,9 @@
 //! text) with the current ones. The block-validation path is consensus
 //! critical: the rule order, texts and group checks changed, the set of
 //! accepted transactions and groups must not (beyond the deliberate
-//! go-parity deltas named in `classify_wellformed_delta`).
+//! go-parity deltas named in `classify_wellformed_delta`, and go v5.1's
+//! `checkTxnGroupID` refusal of a repeated transaction, which these copies
+//! apply too).
 
 #![allow(clippy::all)]
 
@@ -716,7 +718,7 @@ pub fn old_validate_transaction_group_strict(txns: &[SignedTransaction]) -> Resu
     let Some(first) = txns.first() else {
         return Ok(());
     };
-    let mut ids = GroupIdChecker::new(&first.txn, txns.len());
+    let mut ids = GroupIdChecker::new(&first.txn, txns.len()).rejecting_duplicates();
     for (index, stx) in txns.iter().enumerate() {
         ids.check_member(index, &stx.txn)
             .map_err(|message| AlgoError::Validation { message })?;
@@ -1175,9 +1177,21 @@ fn rand_group(rng: &mut Rng) -> Vec<SignedTransaction> {
         .collect()
 }
 
+/// go v5.1's `checkTxnGroupID` refuses a repeated transaction: the one
+/// deliberate verdict delta of the group validators (the old copies above
+/// predate it).
+fn is_duplicate_delta<T>(new: &Result<T, AlgoError>) -> bool {
+    matches!(new, Err(AlgoError::Validation { message })
+        if message.starts_with("transactionGroup: duplicate transaction: "))
+}
+
 fn group_verdicts_agree(group: &[SignedTransaction], what: &str) {
     let old_len = old_validate_transaction_group_inner(group, false);
     let new_len = validate_transaction_group(group);
+    if is_duplicate_delta(&new_len) {
+        assert!(new_len.is_err() && is_duplicate_delta(&validate_transaction_group_strict(group)));
+        return;
+    }
     assert_eq!(
         verdict(&old_len),
         verdict(&new_len),

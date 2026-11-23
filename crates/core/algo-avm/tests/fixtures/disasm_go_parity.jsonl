@@ -51,7 +51,7 @@
 {"class": "field-group", "error": "invalid immediate f for gtxnsa: 0", "name": "imm_gtxnsa_scalar_field_rejected", "ok": false, "program_hex": "08390000"}
 {"class": "field-group", "error": "invalid immediate f for itxn: 28", "name": "imm_itxn_array_field_rejected", "ok": false, "program_hex": "08b41c"}
 {"class": "field-group", "name": "imm_itxn_field_accepts_array_field", "ok": true, "program_hex": "08b21c43", "text": "#pragma version 8\nitxn_field Accounts\nreturn\n"}
-{"class": "field-group", "name": "imm_gitxn_accepts_array_field", "ok": true, "program_hex": "08b7001c43", "text": "#pragma version 8\ngitxn 0 Accounts\nreturn\n"}
+{"class": "field-group", "error": "invalid immediate f for gitxn: 28", "name": "imm_gitxn_accepts_array_field", "ok": false, "program_hex": "08b7001c43"}
 {"class": "field-group", "name": "imm_app_params_set_box_field", "ok": true, "program_hex": "0d760b43", "text": "#pragma version 13\napp_params_set AppForeignBoxReads\nreturn\n"}
 {"class": "field-group", "error": "invalid immediate f for app_params_set: 0", "name": "imm_app_params_set_low_field_rejected", "ok": false, "program_hex": "0d7600"}
 {"class": "immediate", "name": "imm_gtxna_three", "ok": true, "program_hex": "0837001c0243", "text": "#pragma version 8\ngtxna 0 Accounts 2\nreturn\n"}

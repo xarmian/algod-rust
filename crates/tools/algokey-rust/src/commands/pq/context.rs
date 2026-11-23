@@ -25,7 +25,7 @@
 use std::path::Path;
 
 use algo_consensus_crypto::mnemonic_to_key;
-use algo_types::{PQSig, PQ_SCHEME_FALCON1024};
+use algo_types::{SaltedKeySig, SIG_SCHEME_FALCON1024};
 use serde_bytes::ByteBuf;
 
 use super::key::{read_pq_signing_material, PqSigningMaterial};
@@ -54,7 +54,7 @@ pub fn resolve_pq_signing_context(
             let entropy = mnemonic_to_key(m)
                 .map_err(|e| format!("cannot recover PQ key entropy from mnemonic: {e}"))?;
             let scheme = if scheme_name.is_empty() {
-                PQ_SCHEME_FALCON1024
+                SIG_SCHEME_FALCON1024
             } else {
                 parse_pq_scheme(scheme_name)?
             };
@@ -69,13 +69,13 @@ pub fn resolve_pq_signing_context(
 
 /// Mirrors `signPQ` (`pq.go:350-362`): sign `message` (the raw
 /// domain-tag-prefixed bytes — `"TX" || canonical_encode(txn)` for `pq
-/// sign`, `PQDelegatedProgram::to_be_signed()` for `pq sign-program`) with
-/// the context's Falcon-1024 private key and wrap the result as a `PQSig`
+/// sign`, `SKsigDelegatedProgram::to_be_signed()` for `pq sign-program`) with
+/// the context's Falcon-1024 private key and wrap the result as a `SaltedKeySig`
 /// authorization envelope.
-pub fn sign_pq(ctx: &PqSigningContext, message: &[u8]) -> Result<PQSig, String> {
+pub fn sign_pq(ctx: &PqSigningContext, message: &[u8]) -> Result<SaltedKeySig, String> {
     let signature = algo_falcon::falcon_sign(&ctx.signing.private_key, message)
         .map_err(|e| format!("cannot sign: {e}"))?;
-    Ok(PQSig {
+    Ok(SaltedKeySig {
         scheme: ctx.signing.public.scheme,
         salt: ctx.signing.public.salt,
         public_key: ByteBuf::from(ctx.signing.public.public_key.clone()),
@@ -106,7 +106,7 @@ mod tests {
 
     #[test]
     fn resolve_from_mnemonic_matches_generate() {
-        let (entropy, signing) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
+        let (entropy, signing) = generate_pq_signing_material(SIG_SCHEME_FALCON1024).unwrap();
         let mnemonic = key_to_mnemonic(&entropy).unwrap();
         let ctx = resolve_pq_signing_context(None, Some(&mnemonic), "falcon-1024").unwrap();
         assert_eq!(ctx.signing, signing);
@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn resolve_from_keyfile_reads_back_written_material() {
-        let (_, signing) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
+        let (_, signing) = generate_pq_signing_material(SIG_SCHEME_FALCON1024).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let kf = dir.path().join("k");
         super::super::key::write_pq_private_key_file(&kf, &signing).unwrap();
@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn sign_pq_produces_falcon_signature_that_verifies() {
-        let (_, signing) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
+        let (_, signing) = generate_pq_signing_material(SIG_SCHEME_FALCON1024).unwrap();
         let ctx = PqSigningContext { signing };
         let message = b"hello pq";
         let pqsig = sign_pq(&ctx, message).unwrap();

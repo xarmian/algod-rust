@@ -42,7 +42,7 @@ CATCHUP_FAILED = "catchup_failed"
 
 DEFAULT_NETWORK = "mainnet"
 DEDUP_LABEL = "mainnet-soak"
-ISSUE_LABELS = ["bug", "sync", "conformance", "mainnet-soak", "algod:v5.0.5-stable", "effort:medium"]
+ISSUE_LABELS = ["bug", "sync", "conformance", "mainnet-soak", "algod:v5.1.1-stable", "effort:medium"]
 
 
 def dedup_label(network: str = DEFAULT_NETWORK) -> str:

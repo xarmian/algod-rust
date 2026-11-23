@@ -52,7 +52,7 @@ import (
 	"github.com/algorand/go-algorand/crypto"
 )
 
-const expectedGoAlgorandPin = "v5.0.5-stable"
+const expectedGoAlgorandPin = "v5.1.1-stable"
 
 // go-algorand data/transactions/logic/crypto_test.go, BenchmarkVerify,
 // "falcon_verify" case. The Go source's comments label the second and third
@@ -179,9 +179,9 @@ func negatives(sig, msg, otherPubkey []byte) []negative {
 }
 
 func verifyOK(pubkey, sig, msg []byte) bool {
-	var fv crypto.FalconVerifier
+	var fv crypto.Falcon1024Verifier
 	copy(fv.PublicKey[:], pubkey)
-	return fv.VerifyBytes(msg, crypto.FalconSignature(sig)) == nil
+	return fv.VerifyBytes(msg, crypto.Falcon1024Signature(sig)) == nil
 }
 
 type negInput struct {
@@ -197,11 +197,11 @@ func generate() []byte {
 	for si, sd := range seeds() {
 		var seed crypto.FalconSeed
 		copy(seed[:], sd.data)
-		signer, err := crypto.GenerateFalconSigner(seed)
+		signer, err := crypto.GenerateFalcon1024Signer(seed)
 		if err != nil {
 			panic(fmt.Sprintf("%s: keygen: %v", sd.name, err))
 		}
-		again, _ := crypto.GenerateFalconSigner(seed)
+		again, _ := crypto.GenerateFalcon1024Signer(seed)
 		if again.PublicKey != signer.PublicKey || again.PrivateKey != signer.PrivateKey {
 			panic(fmt.Sprintf("%s: keygen is not deterministic", sd.name))
 		}
@@ -271,6 +271,10 @@ func defaultOutPath() string {
 	return filepath.Join(repoRoot(), "crates", "core", "algo-falcon", "tests", "fixtures", "falcon", "vectors.jsonl")
 }
 
+func defaultOut512Path() string {
+	return filepath.Join(repoRoot(), "crates", "core", "algo-falcon", "tests", "fixtures", "falcon", "vectors512.jsonl")
+}
+
 func goAlgorandPath() string {
 	return filepath.Clean(filepath.Join(repoRoot(), "..", "go-algorand"))
 }
@@ -299,8 +303,53 @@ func verifyGoAlgorandPin(path string) error {
 	return nil
 }
 
+// generate512 is the Falcon-512 (det512, falcon v0.2.0) corpus the `f5`
+// signature scheme needs (issue #2546): for each seed the public key and, per
+// message, the deterministic signature, plus a verify verdict for a wrong
+// message. One JSON object per line, fixed field order, lowercase hex.
+func generate512() []byte {
+	var sb strings.Builder
+	msgs := messages()
+	for _, sd := range seeds() {
+		var seed crypto.FalconSeed
+		copy(seed[:], sd.data)
+		signer, err := crypto.GenerateFalcon512Signer(seed)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Fprintf(&sb, `{"kind":"key","name":%q,"seed":"%s","pubkey":"%s"}`+"\n",
+			sd.name, hex.EncodeToString(sd.data), hex.EncodeToString(signer.PublicKey[:]))
+		for _, m := range msgs {
+			sig, err := signer.SignBytes(m.data)
+			if err != nil {
+				panic(err)
+			}
+			v := signer.GetVerifyingKey()
+			okRight := v.VerifyBytes(m.data, sig) == nil
+			wrong := append(clone(m.data), 0x01)
+			okWrong := v.VerifyBytes(wrong, sig) == nil
+			fmt.Fprintf(&sb, `{"kind":"sig","key":%q,"msg":%q,"msg_hex":"%s","sig":"%s","verifies":%t,"verifies_with_appended_byte":%t}`+"\n",
+				sd.name, m.name, hex.EncodeToString(m.data), hex.EncodeToString(sig), okRight, okWrong)
+		}
+	}
+	return []byte(sb.String())
+}
+
+func writeFile(path string, data []byte) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stderr, "wrote %s (%d bytes)\n", path, len(data))
+}
+
 func main() {
 	outPath := flag.String("out", defaultOutPath(), "fixture path to write")
+	out512 := flag.String("out512", defaultOut512Path(), "Falcon-512 fixture path to write")
 	allowUnpinned := flag.Bool("allow-unpinned", false, "skip the go-algorand pin/clean-tree check")
 	flag.Parse()
 
@@ -331,4 +380,5 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "wrote %s (%d bytes)\n", *outPath, len(data))
+	writeFile(*out512, generate512())
 }

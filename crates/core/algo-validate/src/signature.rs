@@ -78,7 +78,7 @@ use algo_codec::canonical_encode_transaction;
 use algo_error::AlgoError;
 use algo_types::consensus::ConsensusParams;
 use algo_types::{
-    Address, HeartbeatProof, LogicSig, MultisigSig, PQDelegatedProgram, PQSig, SignedTransaction,
+    Address, HeartbeatProof, LogicSig, MultisigSig, SKsigDelegatedProgram, SaltedKeySig, SignedTransaction,
 };
 use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
 use curve25519_dalek::scalar::Scalar;
@@ -274,137 +274,227 @@ pub fn verify_single_sig(stx: &SignedTransaction) -> Result<(), AlgoError> {
     }
 }
 
-/// Verify a post-quantum (Falcon-1024) authorization proof over raw
-/// to-be-signed `message` bytes, mirroring go's `PQSig.Verify(proto,
-/// message, authorizer)` (`data/transactions/pqsig.go`):
-/// 1. the envelope is non-blank;
-/// 2. the carried scheme is a *known* scheme (only Falcon-1024 is
-///    registered; an unregistered-but-defined tag like the reserved
-///    Falcon-512 is rejected here, matching go's `LookupPQScheme` miss);
-/// 3. the scheme is *enabled* under `consensus` (`PQSchemeEnabled`);
-/// 4. the address derived from `{scheme, salt, public_key}` equals
-///    `authorizer`;
-/// 5. the signature bytes are non-empty;
-/// 6. the Falcon-1024 signature verifies over `message`.
-///
-/// `message` must already be the raw domain-tag-prefixed bytes Falcon signs
-/// (go's `crypto.HashRep(message)` — NOT a hash of them; the tag is
-/// prepended, not hashed in). Callers build this via
-/// [`canonical_encode_transaction`] prefixed with `"TX"` (top-level PQSig)
-/// or [`PQDelegatedProgram::to_be_signed`] (PQ-delegated LogicSig).
-/// Validate that a `PQSig` carries a known, consensus-enabled scheme,
-/// without checking the public-key-derived authorizer or signature bytes.
-/// Mirrors go's `PQSig.ValidateScheme` (`data/transactions/pqsig.go`) —
-/// used for the simulation "scheme-only" placeholder (see issue #835).
-pub fn validate_pqsig_scheme(pqsig: &PQSig, consensus: &ConsensusParams) -> Result<(), AlgoError> {
-    if pqsig.blank() {
-        return Err(AlgoError::Validation {
-            message: "pq signature is blank".into(),
-        });
-    }
-    // Reject any scheme tag not in the registered dispatch table (Go:
-    // `LookupPQScheme` miss → `ErrPQSchemeNotSupported`) before checking
-    // whether it's consensus-enabled -- an unregistered tag has no verifier
-    // to dispatch to regardless of what the consensus params say.
-    // go's `crypto.ErrPQSchemeNotSupported`, which names no scheme.
-    if algo_consensus_crypto::lookup_pq_scheme(pqsig.scheme).is_none() {
-        return Err(AlgoError::Validation {
-            message: "pq signature scheme not supported".into(),
-        });
-    }
-    if !consensus.pq_scheme_enabled(pqsig.scheme) {
-        return Err(AlgoError::Validation {
-            message: "pq signature scheme not enabled".into(),
-        });
-    }
-    Ok(())
+/// One entry of go v5.1's `sigSchemes` registry
+/// (`data/transactions/sig_scheme.go`): everything the protocol knows about a
+/// `SaltedKeySig` scheme besides its consensus flag and fee (those live in
+/// `ConsensusParams::sig_scheme_enabled` / `sig_scheme_fee_contribution`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigScheme {
+    /// `f1`: Falcon-1024.
+    Falcon1024,
+    /// `f5`: Falcon-512.
+    Falcon512,
+    /// `ed`: Ed25519 with a salted address.
+    Ed25519,
+    /// `ls`: a LogicSig; the program is the key, its encoded arguments the
+    /// signature, and authorization is the program's own evaluation.
+    LogicSig,
 }
 
-/// Validate the stateless, consensus-relevant PQ authorization envelope
-/// (scheme + public-key-derived authorizer address), excluding the
-/// signature bytes. Mirrors go's `PQSig.ValidateEnvelope`
-/// (`data/transactions/pqsig.go`) — used for the simulation "full"
-/// placeholder (public key set, signature empty; see issue #835).
-pub fn validate_pqsig_envelope(
-    pqsig: &PQSig,
-    authorizer: &Address,
-    consensus: &ConsensusParams,
-) -> Result<(), AlgoError> {
-    validate_pqsig_scheme(pqsig, consensus)?;
-
-    // go derives the address from whatever key the envelope carries and
-    // leaves a wrong-size key to `VerifyFalcon1024`, after the authorizer
-    // check (issue #2438): a short key that derives the authorizer is a valid
-    // envelope (a simulate placeholder accepts it) and fails only signature
-    // verification. Hashing stays bounded because the public key is decoded
-    // under go's `allocbound=crypto.MaxPQPublicKeySize` (`PQSig::decode_into`,
-    // `algo-codec`'s LogicSig decoder). A longer key can only come from a
-    // caller-built value; it is refused unhashed with go's key-size text,
-    // which go never reaches since its decoder rejects such a key first.
-    if pqsig.public_key.len() > algo_consensus_crypto::MAX_PQ_PUBLIC_KEY_SIZE {
-        return Err(AlgoError::Validation {
-            message: algo_consensus_crypto::PQVerifyError::PublicKeySize(pqsig.public_key.len())
-                .to_string(),
-        });
+impl SigScheme {
+    /// go's `sigSchemes[scheme]`: `None` for a tag that is no scheme.
+    pub fn lookup(scheme: [u8; 2]) -> Option<Self> {
+        match &scheme {
+            b"f1" => Some(Self::Falcon1024),
+            b"f5" => Some(Self::Falcon512),
+            b"ed" => Some(Self::Ed25519),
+            b"ls" => Some(Self::LogicSig),
+            _ => None,
+        }
     }
 
-    let derived = pqsig.address();
+    /// go's `maxPublicKeySize()`: the scheme's own limit on `PublicKey`.
+    pub fn max_public_key_size(self) -> usize {
+        use algo_types::go_msgp as g;
+        match self {
+            Self::Falcon1024 => g::FALCON1024_PUBLIC_KEY_SIZE,
+            Self::Falcon512 => g::FALCON512_PUBLIC_KEY_SIZE,
+            Self::Ed25519 => g::ED25519_PUBLIC_KEY_SIZE,
+            Self::LogicSig => g::bounds::MAX_LOGIC_SIG_MAX_SIZE.get(),
+        }
+    }
+
+    /// go's `maxSignatureSize()`: the scheme's own limit on `Signature`.
+    pub fn max_signature_size(self) -> usize {
+        use algo_types::go_msgp as g;
+        match self {
+            Self::Falcon1024 => g::FALCON1024_MAX_SIGNATURE_SIZE,
+            Self::Falcon512 => g::FALCON512_MAX_SIGNATURE_SIZE,
+            Self::Ed25519 => g::ED25519_SIGNATURE_SIZE,
+            Self::LogicSig => g::ls_max_signature_size(),
+        }
+    }
+}
+
+/// go's `SaltedKeySig.validateScheme` (`data/transactions/sksig.go`): the
+/// envelope is not blank, the scheme is known, and it is enabled under
+/// `consensus`. It checks no key, authorizer or signature bytes (the
+/// simulation "scheme-only" placeholder, issue #835).
+fn validate_sksig_scheme(
+    sksig: &SaltedKeySig,
+    consensus: &ConsensusParams,
+) -> Result<SigScheme, AlgoError> {
+    let fail = |message: &str| AlgoError::Validation {
+        message: message.into(),
+    };
+    if sksig.blank() {
+        return Err(fail("salted-key signature is blank"));
+    }
+    let Some(scheme) = SigScheme::lookup(sksig.scheme) else {
+        return Err(fail("signature scheme not supported"));
+    };
+    if !consensus.sig_scheme_enabled(sksig.scheme) {
+        return Err(fail("signature scheme not enabled"));
+    }
+    Ok(scheme)
+}
+
+/// [`validate_sksig_scheme`] for callers that need only the verdict (go's
+/// `SaltedKeySig.ValidateScheme`).
+pub fn validate_pqsig_scheme(
+    sksig: &SaltedKeySig,
+    consensus: &ConsensusParams,
+) -> Result<(), AlgoError> {
+    validate_sksig_scheme(sksig, consensus).map(|_| ())
+}
+
+/// go's `SaltedKeySig.validateEnvelope`: the scheme, the scheme's own size
+/// limits (the wire bound is the largest over all schemes), and the derived
+/// salted address against `authorizer`. No signature bytes are checked
+/// (the simulation "full" placeholder, issue #835).
+fn validate_sksig_envelope(
+    sksig: &SaltedKeySig,
+    authorizer: &Address,
+    consensus: &ConsensusParams,
+) -> Result<SigScheme, AlgoError> {
+    let scheme = validate_sksig_scheme(sksig, consensus)?;
+    let too_large = |what: &str, got: usize, max: usize| AlgoError::Validation {
+        message: format!(
+            "salted-key signature field too large for scheme: {what} size {got}, max {max}"
+        ),
+    };
+    let pk_max = scheme.max_public_key_size();
+    if sksig.public_key.len() > pk_max {
+        return Err(too_large("public key", sksig.public_key.len(), pk_max));
+    }
+    let sig_max = scheme.max_signature_size();
+    if sksig.signature.len() > sig_max {
+        return Err(too_large("signature", sksig.signature.len(), sig_max));
+    }
+    let derived = sksig.address();
     if derived != *authorizer {
         return Err(AlgoError::Validation {
             message: format!(
-                "pq signature authorizer mismatch: derived {derived}, expected {authorizer}"
+                "salted-key signature authorizer mismatch: derived {derived}, expected {authorizer}"
             ),
         });
     }
-
-    Ok(())
+    Ok(scheme)
 }
 
-fn verify_pqsig_bytes(
-    pqsig: &PQSig,
-    message: &[u8],
+/// [`validate_sksig_envelope`] for callers that need only the verdict (go's
+/// `SaltedKeySig.ValidateEnvelope`).
+pub fn validate_pqsig_envelope(
+    sksig: &SaltedKeySig,
     authorizer: &Address,
     consensus: &ConsensusParams,
 ) -> Result<(), AlgoError> {
-    validate_pqsig_envelope(pqsig, authorizer, consensus)?;
-
-    if pqsig.signature.is_empty() {
-        return Err(AlgoError::Validation {
-            message: "pq signature is empty".into(),
-        });
-    }
-
-    // `validate_pqsig_envelope` above already confirmed `pqsig.scheme` is a
-    // registered scheme, so this lookup cannot miss -- dispatch through it
-    // (rather than calling `algo_falcon::falcon_verify` directly) so this is
-    // the single place scheme-specific PQ verification is chosen, mirroring
-    // go's `stxnCoreChecks`'s use of `LookupPQScheme` at the call site.
-    let verifier = algo_consensus_crypto::lookup_pq_scheme(pqsig.scheme).ok_or_else(|| {
-        AlgoError::Validation {
-            message: "pq signature scheme not supported".into(),
-        }
-    })?;
-    // go returns the scheme verifier's error as is (`VerifyFalcon1024`'s
-    // wrapped `ErrPQFalcon1024SigInvalid`, issue #2438).
-    verifier
-        .verify(message, &pqsig.public_key, &pqsig.signature)
-        .map_err(|e| AlgoError::Validation {
-            message: e.to_string(),
-        })?;
-
-    Ok(())
+    validate_sksig_envelope(sksig, authorizer, consensus).map(|_| ())
 }
 
-/// Verify a top-level `PQSig` transaction authorization proof, mirroring
-/// go's `stxnCoreChecks`'s `case pqSig:` branch
-/// (`data/transactions/verify/txn.go`): `PQsig.Verify(proto, s.Txn,
-/// s.Authorizer())`, where the signed message is `"TX" ||
-/// canonical_encode(txn)` — the exact same message ed25519 single-sig signs
-/// (see [`verify_single_sig`]), just authorized by a different signature
-/// scheme.
+/// Why a `SaltedKeySig`'s signature bytes did not verify: at prep time (go
+/// wraps these with the frame text), or in the ed25519 batch (go reports its
+/// bare [`algo_error::BATCH_HAS_FAILED_SIGS`]).
+enum SksigFailure {
+    Prep(AlgoError),
+    Batch,
+}
+
+/// go's `SaltedKeySig.validateForVerification` then the scheme's `Verify` /
+/// `BatchPrep` over raw to-be-signed `message` bytes (go's
+/// `crypto.HashRep(message)`: the domain tag prepended, NOT hashed in).
+fn verify_sksig_bytes(
+    sksig: &SaltedKeySig,
+    message: &[u8],
+    authorizer: &Address,
+    consensus: &ConsensusParams,
+) -> Result<(), SksigFailure> {
+    let scheme =
+        validate_sksig_envelope(sksig, authorizer, consensus).map_err(SksigFailure::Prep)?;
+    let prep = |message: &str| {
+        SksigFailure::Prep(AlgoError::Validation {
+            message: message.into(),
+        })
+    };
+    if scheme == SigScheme::LogicSig {
+        return Err(prep(
+            "logic signature must be verified by evaluating its program, not by checking signature bytes",
+        ));
+    }
+    if sksig.signature.is_empty() {
+        return Err(prep("salted-key signature is empty"));
+    }
+    let falcon = |r: Result<(), algo_consensus_crypto::SigVerifyError>| {
+        r.map_err(|e| prep(&e.to_string()))
+    };
+    match scheme {
+        SigScheme::Falcon1024 => falcon(algo_consensus_crypto::verify_falcon1024(
+            message,
+            &sksig.public_key,
+            &sksig.signature,
+        )),
+        SigScheme::Falcon512 => falcon(algo_consensus_crypto::verify_falcon512(
+            message,
+            &sksig.public_key,
+            &sksig.signature,
+        )),
+        SigScheme::Ed25519 => {
+            // go's `parseEd25519Signature`: sizes at prep, the signature in the batch.
+            use algo_types::go_msgp as g;
+            if sksig.public_key.len() != g::ED25519_PUBLIC_KEY_SIZE {
+                return Err(prep(&format!(
+                    "ed25519 invalid signature: public key size {}, want {}",
+                    sksig.public_key.len(),
+                    g::ED25519_PUBLIC_KEY_SIZE
+                )));
+            }
+            if sksig.signature.len() != g::ED25519_SIGNATURE_SIZE {
+                return Err(prep(&format!(
+                    "ed25519 invalid signature: signature size {}, want {}",
+                    sksig.signature.len(),
+                    g::ED25519_SIGNATURE_SIZE
+                )));
+            }
+            let pk: &[u8; 32] = sksig.public_key.as_slice().try_into().expect("size checked");
+            let sig: &[u8; 64] = sksig.signature.as_slice().try_into().expect("size checked");
+            if ed25519_bv_compatible_verify(pk, message, sig) {
+                Ok(())
+            } else {
+                Err(SksigFailure::Batch)
+            }
+        }
+        SigScheme::LogicSig => unreachable!("handled above"),
+    }
+}
+
+fn batch_failure() -> AlgoError {
+    AlgoError::Validation {
+        message: algo_error::BATCH_HAS_FAILED_SIGS.into(),
+    }
+}
+
+/// Verify a top-level `SaltedKeySig` transaction authorization proof, mirroring
+/// go's `stxnCoreChecks`'s `case saltedKeySig:` branch
+/// (`data/transactions/verify/txn.go`): `SKsig.BatchPrep(proto, s.Txn,
+/// s.Authorizer(), batch)`, where the signed message is `"TX" ||
+/// canonical_encode(txn)` -- the same message an ed25519 single signature
+/// signs -- authorized by the scheme's signature.
+///
+/// An `ls`-scheme proof carries no signature bytes: it is authorized by
+/// evaluating its program, never by this function.
 pub fn verify_pqsig(
     stx: &SignedTransaction,
-    pqsig: &PQSig,
+    sksig: &SaltedKeySig,
     consensus: &ConsensusParams,
 ) -> Result<(), AlgoError> {
     let canonical = canonical_encode_transaction(&stx.txn);
@@ -417,40 +507,133 @@ pub fn verify_pqsig(
         None => &stx.txn.sender,
     };
 
-    // go: `TxGroupError{err: fmt.Errorf("pq signature validation failed: %w", err)}`.
-    verify_pqsig_bytes(pqsig, &msg, authorizer, consensus).map_err(|e| AlgoError::Validation {
-        message: format!("pq signature validation failed: {}", validation_text(e)),
-    })
+    // go: `TxGroupError{err: fmt.Errorf("salted-key signature validation failed: %w", err)}`.
+    match verify_sksig_bytes(sksig, &msg, authorizer, consensus) {
+        Ok(()) => Ok(()),
+        Err(SksigFailure::Batch) => Err(batch_failure()),
+        Err(SksigFailure::Prep(e)) => Err(AlgoError::Validation {
+            message: format!(
+                "salted-key signature validation failed: {}",
+                validation_text(e)
+            ),
+        }),
+    }
 }
 
-/// Verify a PQ-delegated LogicSig's authorization proof, mirroring go's
-/// `logicSigSanityCheckBatchPrep`'s PQ-delegated branch
-/// (`data/transactions/verify/txn.go`, added by commit `ef838f4e9`): the
-/// signed message is `PQDelegatedProgram{Addr: authorizer, Program:
-/// lsig.Logic}.ToBeHashed()`'s `HashRep`, i.e. `"PQProgram" || authorizer ||
-/// logic`. Verified in-place (never batched) — PQ (Falcon) signatures are
-/// not ed25519-batchable, matching upstream's explicit carve-out. This
-/// crate has no ed25519 batch verifier to carve PQSig out of in the first
-/// place (every signature path here already verifies eagerly/in-place), so
-/// no additional plumbing is needed to satisfy that constraint.
+/// Verify a salted-key delegated LogicSig's authorization proof, mirroring
+/// go's `logicSigSanityCheckBatchPrep`'s SKsig branch
+/// (`data/transactions/verify/txn.go`): the signed message is
+/// `SKsigDelegatedProgram{Addr: authorizer, Program: lsig.Logic}`'s `HashRep`,
+/// i.e. `"PQProgram" || authorizer || logic`; failures read
+/// `salted-key signature delegation validation failed: ...`.
 fn verify_pq_delegated_logicsig(
     lsig: &LogicSig,
-    pqsig: &PQSig,
+    sksig: &SaltedKeySig,
     authorizer: &Address,
     consensus: &ConsensusParams,
 ) -> Result<(), AlgoError> {
-    let program = PQDelegatedProgram {
+    let program = SKsigDelegatedProgram {
         addr: *authorizer,
         program: lsig.logic.to_vec(),
     };
-    verify_pqsig_bytes(pqsig, &program.to_be_signed(), authorizer, consensus).map_err(|e| {
-        AlgoError::Validation {
+    match verify_sksig_bytes(sksig, &program.to_be_signed(), authorizer, consensus) {
+        Ok(()) => Ok(()),
+        Err(SksigFailure::Batch) => Err(batch_failure()),
+        Err(SksigFailure::Prep(e)) => Err(AlgoError::Validation {
             message: format!(
-                "pq delegated logic signature validation failed: {}",
+                "salted-key signature delegation validation failed: {}",
                 validation_text(e)
             ),
-        }
+        }),
+    }
+}
+
+/// go's `SaltedKeySig.Lsig()`: the LogicSig an `ls`-scheme proof carries, its
+/// program standing in for the public key and its encoded arguments for the
+/// signature, so it can be measured and evaluated like one in `SignedTxn.Lsig`.
+pub fn logicsig_from_sksig(
+    sksig: &SaltedKeySig,
+) -> Result<LogicSig, algo_codec::LogicSigArgsError> {
+    let args = algo_codec::decode_logic_sig_args(&sksig.signature)?;
+    Ok(LogicSig {
+        logic: sksig.public_key.clone(),
+        args: (!args.is_empty()).then(|| {
+            args.into_iter()
+                .map(|a| a.map(serde_bytes::ByteBuf::from))
+                .collect()
+        }),
+        ..LogicSig::default()
     })
+}
+
+/// go's `sigProgramSanityCheck`: a program that authorizes by being evaluated is
+/// present, within the per-program size cap, of a version this protocol runs
+/// and statically valid. `name` says where the program came from.
+fn sig_program_sanity_check(
+    program: &[u8],
+    name: &str,
+    consensus: &ConsensusParams,
+) -> Result<(), String> {
+    if program.is_empty() {
+        return Err(format!("{name} empty"));
+    }
+    if program.len() as u64 > consensus.max_absolute_logic_sig_program_size {
+        return Err(format!(
+            "{name} too long. max size is {} bytes",
+            consensus.max_absolute_logic_sig_program_size
+        ));
+    }
+    let (version, vlen) = algo_avm::check::uvarint(program);
+    if vlen <= 0 {
+        return Err(format!("{name} bad version"));
+    }
+    if version > consensus.logic_sig_version {
+        return Err(format!("{name} version too new"));
+    }
+    match algo_avm::check::logicsig_static_check(program) {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
+}
+
+/// go's `saltedKeySigLogicSigSanityCheckPrep` / `LogicSigSanityCheck` for an
+/// `ls`-scheme proof: LogicSigs are enabled, the envelope holds (scheme, sizes,
+/// the salted address commits to this program), the arguments decode, and the
+/// program is well formed. The errors are go's bare texts.
+pub fn sksig_logicsig_sanity_check(
+    stx: &SignedTransaction,
+    sksig: &SaltedKeySig,
+    consensus: &ConsensusParams,
+) -> Result<LogicSig, String> {
+    if consensus.logic_sig_version == 0 {
+        return Err("LogicSig not enabled".into());
+    }
+    let authorizer = stx.auth_addr.unwrap_or(stx.txn.sender);
+    validate_sksig_envelope(sksig, &authorizer, consensus).map_err(validation_text)?;
+    let lsig = logicsig_from_sksig(sksig).map_err(|e| e.to_string())?;
+    sig_program_sanity_check(&lsig.logic, "SKsig LogicSig", consensus)?;
+    Ok(lsig)
+}
+
+/// go's `saltedKeySigLogicSigVerify`: the address commits to the program, so once
+/// the envelope establishes that the authorizer is that program's address,
+/// evaluating it is the whole authorization (there are no signature bytes).
+#[allow(clippy::too_many_arguments)]
+pub fn verify_sksig_logicsig_with_tracer(
+    stx: &SignedTransaction,
+    sksig: &SaltedKeySig,
+    group: &[SignedTransaction],
+    group_index: usize,
+    budget: &mut GroupBudget,
+    consensus: &ConsensusParams,
+    tracer: Option<&mut dyn EvalTracer>,
+    sig_ledger: Option<&dyn SigBlockSource>,
+) -> Result<(), AlgoError> {
+    let lsig = sksig_logicsig_sanity_check(stx, sksig, consensus)
+        .map_err(|message| AlgoError::Validation { message })?;
+    evaluate_logicsig_program(
+        &lsig, group, group_index, budget, consensus, tracer, sig_ledger,
+    )
 }
 
 /// Compute the multisig address from the multisig parameters.
@@ -721,6 +904,24 @@ pub fn verify_logicsig_with_tracer(
     logicsig_sanity_check(stx, lsig, consensus)
         .map_err(|message| AlgoError::Validation { message })?;
 
+    evaluate_logicsig_program(
+        lsig, group, group_index, budget, consensus, tracer, sig_ledger,
+    )
+}
+
+/// go's `evalSigProgram` (`data/transactions/verify/txn.go`): evaluate the
+/// program of `lsig` (a LogicSig's, or the one an `ls`-scheme `SaltedKeySig`
+/// carries) for member `group_index`, and report whether it approved.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_logicsig_program(
+    lsig: &LogicSig,
+    group: &[SignedTransaction],
+    group_index: usize,
+    budget: &mut GroupBudget,
+    consensus: &ConsensusParams,
+    tracer: Option<&mut dyn EvalTracer>,
+    sig_ledger: Option<&dyn SigBlockSource>,
+) -> Result<(), AlgoError> {
     // ── TEAL program execution ──
     // Build LogicSig arguments from the lsig.args field.
     let args: Vec<Vec<u8>> = lsig.arg_bytes().map(<[u8]>::to_vec).collect();
@@ -1067,22 +1268,9 @@ pub fn verify_transaction_signature_with_tracer(
     tracer: Option<&mut dyn EvalTracer>,
     sig_ledger: Option<&dyn SigBlockSource>,
 ) -> Result<(), AlgoError> {
-    // Pre-activation gate (mirrors go's `stxnCoreChecks`, commit `fc46c74ef`
-    // "transactions: disallow empty pq signatures"): hard-reject BEFORE any
-    // sig-type-count dispatch if PQ signatures are not enabled under
-    // consensus but either the top-level `SignedTxn.pqsig` or the
-    // LogicSig-delegated `Lsig.pqsig` is non-blank.
+    // go v5.1 dropped the blanket pq signature not enabled gate: each scheme
+    // is checked against its own flag by SaltedKeySig.validateScheme.
     let stx_pqsig_present = stx.pqsig.as_ref().is_some_and(|p| !p.blank());
-    let lsig_pqsig_present = stx
-        .lsig
-        .as_ref()
-        .and_then(|l| l.pqsig.as_ref())
-        .is_some_and(|p| !p.blank());
-    if !consensus.pq_sig_enabled() && (stx_pqsig_present || lsig_pqsig_present) {
-        return Err(AlgoError::Validation {
-            message: "pq signature not enabled".into(),
-        });
-    }
 
     // Go-algorand requires exactly one of sig/msig/lsig/pqsig — a 5th
     // mutually-exclusive signature category alongside sig/msig/lsig/
@@ -1147,6 +1335,20 @@ pub fn verify_transaction_signature_with_tracer(
 
     if has_pqsig {
         let pqsig = stx.pqsig.as_ref().expect("has_pqsig implies Some");
+        if pqsig.scheme == *b"ls" {
+            // go's `saltedKeySig` case: an `ls` proof authorizes by evaluating its
+            // program, not by checking signature bytes.
+            return verify_sksig_logicsig_with_tracer(
+                stx,
+                pqsig,
+                group,
+                group_index,
+                lsig_budget,
+                consensus,
+                tracer,
+                sig_ledger,
+            );
+        }
         return verify_pqsig(stx, pqsig, consensus);
     }
 
@@ -1248,6 +1450,7 @@ pub fn logic_sig_group_size_check_indexed(
         let has_program = lsig.is_some_and(|l| l.has_program());
         // Go: `lsig.Blank()` (includes `PQsig.Blank()` and `len(Args) == 0`).
         let is_blank = lsig.is_none_or(|l| l.is_blank());
+        let mut count_lsig = true;
 
         if !has_program {
             if !is_blank && reject_orphan_lsig_content {
@@ -1256,15 +1459,34 @@ pub fn logic_sig_group_size_check_indexed(
                     message: "LogicSig fields without LogicSig program".into(),
                 });
             }
-            if !pool_orphan_lsig_args {
-                continue;
-            }
+            count_lsig = pool_orphan_lsig_args;
         }
 
-        let logic_len = lsig.map(|l| l.logic.len() as u64).unwrap_or(0);
-        let args_len: u64 = lsig
-            .map(|l| l.arg_bytes().map(|a| a.len() as u64).sum())
-            .unwrap_or(0);
+        let mut logic_len = if count_lsig {
+            lsig.map(|l| l.logic.len() as u64).unwrap_or(0)
+        } else {
+            0
+        };
+        let mut args_len: u64 = if count_lsig {
+            lsig.map(|l| l.arg_bytes().map(|a| a.len() as u64).sum())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        // go v5.1: a program authorizing from an `ls`-scheme SaltedKeySig costs the
+        // group what one in a LogicSig costs. Malformed args are rejected here
+        // rather than counted, since there is no honest size to charge for them.
+        if let Some(sksig) = stx.pqsig.as_ref().filter(|p| p.scheme == *b"ls") {
+            let carried = logicsig_from_sksig(sksig).map_err(|e| LogicSigGroupSizeError {
+                group_index: Some(i),
+                message: e.to_string(),
+            })?;
+            logic_len += carried.logic.len() as u64;
+            args_len += carried
+                .arg_bytes()
+                .map(|a| a.len() as u64)
+                .sum::<u64>();
+        }
 
         lsig_pooled_size += logic_len + args_len;
         lsig_args_size += args_len;
@@ -1381,7 +1603,7 @@ mod tests {
     use algo_avm::group::GroupBudget;
     use algo_error::AvmDiagnosticValue;
     use algo_types::{
-        Address, MultisigSubsig, PQAddressSalt, Round, Transaction, PQ_SCHEME_FALCON1024,
+        Address, MultisigSubsig, AddressSalt, Round, Transaction, SIG_SCHEME_FALCON1024,
     };
     use ed25519_dalek::SigningKey;
     use serde_bytes::ByteBuf;
@@ -1791,15 +2013,15 @@ mod tests {
             algo_error::BATCH_HAS_FAILED_SIGS
         );
         let mut pq = lsig_of(program.clone());
-        pq.pqsig = Some(PQSig {
+        pq.pqsig = Some(SaltedKeySig {
             scheme: *b"fn",
-            salt: PQAddressSalt(3),
+            salt: AddressSalt(3),
             public_key: ByteBuf::from((0..20).collect::<Vec<u8>>()),
             signature: ByteBuf::from((0..30).collect::<Vec<u8>>()),
         });
         assert_eq!(
             check(signer, &pq, &current),
-            "pq delegated logic signature validation failed: pq signature scheme not supported"
+            "salted-key signature delegation validation failed: signature scheme not supported"
         );
     }
 
@@ -2428,7 +2650,7 @@ mod tests {
             msig: None,
             args: None,
             lmsig: None,
-            pqsig: Some(PQSig::default()), // present but blank
+            pqsig: Some(SaltedKeySig::default()), // present but blank
         };
 
         let stx = SignedTransaction {
@@ -3703,7 +3925,7 @@ mod tests {
         assert_eq!(encoded[14], 0x2a);
     }
 
-    // ── Post-quantum (PQSig) signature tests (issue #660) ──────────────────
+    // ── Post-quantum (SaltedKeySig) signature tests (issue #660) ──────────────────
     //
     // Adversarial coverage for the native PQ (Falcon-1024) account
     // authorization path added by go-algorand commits `569ae3d4b` (native PQ
@@ -3714,10 +3936,10 @@ mod tests {
     /// given deterministic seed byte, for use by the tests below. Exercises
     /// the actual `algo-falcon` primitive end-to-end (keygen + sign +
     /// verify), not a stub.
-    fn falcon_identity(seed_byte: u8) -> (Vec<u8>, Vec<u8>, PQAddressSalt, Address) {
+    fn falcon_identity(seed_byte: u8) -> (Vec<u8>, Vec<u8>, AddressSalt, Address) {
         let seed = [seed_byte; algo_falcon::FALCON_SEED_SIZE];
         let (pk, sk) = algo_falcon::falcon_keygen(&seed).expect("falcon keygen");
-        let (salt, addr) = algo_types::canonical_pq_address_salt(PQ_SCHEME_FALCON1024, &pk)
+        let (salt, addr) = algo_types::canonical_address_salt(SIG_SCHEME_FALCON1024, &pk)
             .expect("a canonical PQ salt must exist");
         (pk, sk, salt, addr)
     }
@@ -3747,8 +3969,8 @@ mod tests {
         msg.extend_from_slice(&canonical);
         let sig = algo_falcon::falcon_sign(&sk, &msg).expect("falcon sign");
 
-        let pqsig = PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
+        let pqsig = SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
             salt,
             public_key: ByteBuf::from(pk),
             signature: ByteBuf::from(sig),
@@ -3782,7 +4004,7 @@ mod tests {
         let (pk, sk, salt, addr) = falcon_identity(2);
         let txn = minimal_pay_txn(addr);
 
-        // The raw message PQSig.Verify actually authenticates.
+        // The raw message SaltedKeySig.Verify actually authenticates.
         let canonical = canonical_encode_transaction(&txn);
         let mut raw_msg = Vec::with_capacity(TX_PREFIX.len() + canonical.len());
         raw_msg.extend_from_slice(TX_PREFIX);
@@ -3795,8 +4017,8 @@ mod tests {
         let txid_sig =
             algo_falcon::falcon_sign(&sk, txid.as_bytes()).expect("falcon sign over txid");
 
-        let pqsig = PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
+        let pqsig = SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
             salt,
             public_key: ByteBuf::from(pk),
             signature: ByteBuf::from(txid_sig),
@@ -3817,7 +4039,7 @@ mod tests {
             );
         assert!(
             err.to_string().contains(
-                "pq signature validation failed: invalid falcon-1024 signature: error code "
+                "salted-key signature validation failed: falcon-1024 invalid signature: error code "
             ),
             "{err}"
         );
@@ -3827,7 +4049,7 @@ mod tests {
     /// (`data/transactions/pqsig_test.go:332`), at the pqsig-over-Transaction
     /// wiring level (`verify_transaction_signature`) rather than just the
     /// Falcon crypto-primitive level (`test_verify_wrong_message` in
-    /// `algo-falcon`): a valid PQSig signed over one transaction must be
+    /// `algo-falcon`): a valid SaltedKeySig signed over one transaction must be
     /// rejected once the transaction it accompanies is mutated afterward
     /// (the signed message is derived from the transaction's own canonical
     /// encoding, so it must change too).
@@ -3842,8 +4064,8 @@ mod tests {
         msg.extend_from_slice(&canonical);
         let sig = algo_falcon::falcon_sign(&sk, &msg).expect("falcon sign");
 
-        let pqsig = PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
+        let pqsig = SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
             salt,
             public_key: ByteBuf::from(pk),
             signature: ByteBuf::from(sig),
@@ -3861,10 +4083,10 @@ mod tests {
         let group = [stx.clone()];
         let mut budget = GroupBudget::for_logicsig(1);
         let err = verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus)
-            .expect_err("a PQSig must not verify against a transaction it wasn't signed over");
+            .expect_err("a SaltedKeySig must not verify against a transaction it wasn't signed over");
         assert!(
             err.to_string().contains(
-                "pq signature validation failed: invalid falcon-1024 signature: error code "
+                "salted-key signature validation failed: falcon-1024 invalid signature: error code "
             ),
             "expected a signature-verification failure, got: {err}"
         );
@@ -3891,8 +4113,8 @@ mod tests {
         // "wrong-signature" subtest).
         sig[0] ^= 0x01;
 
-        let pqsig = PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
+        let pqsig = SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
             salt,
             public_key: ByteBuf::from(pk),
             signature: ByteBuf::from(sig),
@@ -3907,10 +4129,10 @@ mod tests {
         let group = [stx.clone()];
         let mut budget = GroupBudget::for_logicsig(1);
         let err = verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus)
-            .expect_err("a tampered PQSig signature must not verify");
+            .expect_err("a tampered SaltedKeySig signature must not verify");
         assert!(
             err.to_string().contains(
-                "pq signature validation failed: invalid falcon-1024 signature: error code "
+                "salted-key signature validation failed: falcon-1024 invalid signature: error code "
             ),
             "expected a signature-verification failure, got: {err}"
         );
@@ -3918,7 +4140,7 @@ mod tests {
 
     #[test]
     fn pqsig_pre_activation_gate_rejects_when_consensus_disabled() {
-        // A well-formed, otherwise-valid PQSig must be hard-rejected before
+        // A well-formed, otherwise-valid SaltedKeySig must be hard-rejected before
         // any scheme/signature check runs when PQSigEnabled() is false
         // (mirrors go's `stxnCoreChecks` pre-activation gate, commit
         // `fc46c74ef`).
@@ -3930,8 +4152,8 @@ mod tests {
         msg.extend_from_slice(&canonical);
         let sig = algo_falcon::falcon_sign(&sk, &msg).expect("falcon sign");
 
-        let pqsig = PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
+        let pqsig = SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
             salt,
             public_key: ByteBuf::from(pk),
             signature: ByteBuf::from(sig),
@@ -3955,7 +4177,7 @@ mod tests {
 
     #[test]
     fn pqsig_empty_signature_bytes_rejected_even_when_scheme_enabled() {
-        // A PQSig with a real scheme/salt/pubkey but an EMPTY signature is
+        // A SaltedKeySig with a real scheme/salt/pubkey but an EMPTY signature is
         // non-blank (so it passes the pre-activation gate and the sig-type
         // count) but must still be rejected — mirrors go's
         // `errPQSigEmpty`/commit `fc46c74ef`'s intent that an empty
@@ -3963,8 +4185,8 @@ mod tests {
         let (pk, _sk, salt, addr) = falcon_identity(3);
         let txn = minimal_pay_txn(addr);
 
-        let pqsig = PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
+        let pqsig = SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
             salt,
             public_key: ByteBuf::from(pk),
             signature: ByteBuf::new(), // empty — never signed
@@ -4002,8 +4224,8 @@ mod tests {
         let sig = algo_falcon::falcon_sign(&sk, &msg).expect("falcon sign");
 
         let oversized_pk = vec![0x11u8; 10 * algo_falcon::FALCON_DET1024_PUBKEY_SIZE];
-        let pqsig = PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
+        let pqsig = SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
             salt,
             public_key: ByteBuf::from(oversized_pk),
             signature: ByteBuf::from(sig),
@@ -4037,7 +4259,7 @@ mod tests {
 
         // "f2" (Falcon-512) is a defined scheme tag upstream but has no
         // registered verifier — must be rejected as unsupported.
-        let pqsig = PQSig {
+        let pqsig = SaltedKeySig {
             scheme: *b"f2",
             salt,
             public_key: ByteBuf::from(pk),
@@ -4077,8 +4299,8 @@ mod tests {
         msg.extend_from_slice(&canonical);
         let sig = algo_falcon::falcon_sign(&sk, &msg).expect("falcon sign");
 
-        let pqsig = PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
+        let pqsig = SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
             salt,
             public_key: ByteBuf::from(pk),
             signature: ByteBuf::from(sig),
@@ -4122,8 +4344,8 @@ mod tests {
         msg.extend_from_slice(&canonical);
         let sig = algo_falcon::falcon_sign(&sk, &msg).expect("falcon sign");
 
-        let pqsig = PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
+        let pqsig = SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
             salt,
             public_key: ByteBuf::from(pk),
             signature: ByteBuf::from(sig),
@@ -4228,8 +4450,8 @@ mod tests {
         msg.extend_from_slice(&canonical);
         let pq_sig_bytes = algo_falcon::falcon_sign(&sk, &msg).expect("falcon sign");
 
-        let pqsig = PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
+        let pqsig = SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
             salt,
             public_key: ByteBuf::from(pk),
             signature: ByteBuf::from(pq_sig_bytes),
@@ -4257,14 +4479,14 @@ mod tests {
         let (pk, sk, salt, addr) = falcon_identity(7);
         let program = int1_program();
 
-        let dp = PQDelegatedProgram {
+        let dp = SKsigDelegatedProgram {
             addr,
             program: program.clone(),
         };
         let sig = algo_falcon::falcon_sign(&sk, &dp.to_be_signed()).expect("falcon sign");
 
-        let pqsig = PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
+        let pqsig = SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
             salt,
             public_key: ByteBuf::from(pk),
             signature: ByteBuf::from(sig),
@@ -4295,7 +4517,7 @@ mod tests {
         let (pk, sk, salt, addr) = falcon_identity(8);
         let original_program = int1_program();
 
-        let dp = PQDelegatedProgram {
+        let dp = SKsigDelegatedProgram {
             addr,
             program: original_program.clone(),
         };
@@ -4306,8 +4528,8 @@ mod tests {
         // program runs before the PQ signature is verified.
         tampered_program.push(0x22);
 
-        let pqsig = PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
+        let pqsig = SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
             salt,
             public_key: ByteBuf::from(pk),
             signature: ByteBuf::from(sig),
@@ -4329,7 +4551,7 @@ mod tests {
         let err = verify_logicsig(&stx, &lsig, &group, 0, &mut budget, &consensus)
             .expect_err("a PQ-delegated LogicSig with a tampered program must be rejected");
         assert!(
-            err.to_string().contains("pq delegated logic signature"),
+            err.to_string().contains("salted-key signature delegation"),
             "expected a pq-delegated-logic-signature error, got: {err}"
         );
     }
@@ -4348,7 +4570,7 @@ mod tests {
         let (pk, sk, salt, addr) = falcon_identity(21);
         let program = int1_program();
 
-        let dp = PQDelegatedProgram {
+        let dp = SKsigDelegatedProgram {
             addr,
             program: program.clone(),
         };
@@ -4365,8 +4587,8 @@ mod tests {
             "signing the raw bytes vs. their digest must produce different signatures"
         );
 
-        let pqsig = PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
+        let pqsig = SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
             salt,
             public_key: ByteBuf::from(pk),
             signature: ByteBuf::from(digest_sig),
@@ -4390,7 +4612,7 @@ mod tests {
              rather than the raw HashRep preimage, must be rejected",
         );
         assert!(
-            err.to_string().contains("pq delegated logic signature"),
+            err.to_string().contains("salted-key signature delegation"),
             "expected a pq-delegated-logic-signature error, got: {err}"
         );
     }
@@ -4402,13 +4624,13 @@ mod tests {
         let program = int1_program();
         let good_ed_sig = sign_program(&key, &program);
 
-        let dp = PQDelegatedProgram {
+        let dp = SKsigDelegatedProgram {
             addr,
             program: program.clone(),
         };
         let pq_sig_bytes = algo_falcon::falcon_sign(&sk, &dp.to_be_signed()).expect("falcon sign");
-        let pqsig = PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
+        let pqsig = SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
             salt,
             public_key: ByteBuf::from(pk),
             signature: ByteBuf::from(pq_sig_bytes),
@@ -4443,14 +4665,14 @@ mod tests {
     fn pq_delegated_logicsig_pre_activation_gate_rejects_when_consensus_disabled() {
         let (pk, sk, salt, addr) = falcon_identity(10);
         let program = int1_program();
-        let dp = PQDelegatedProgram {
+        let dp = SKsigDelegatedProgram {
             addr,
             program: program.clone(),
         };
         let sig = algo_falcon::falcon_sign(&sk, &dp.to_be_signed()).expect("falcon sign");
 
-        let pqsig = PQSig {
-            scheme: PQ_SCHEME_FALCON1024,
+        let pqsig = SaltedKeySig {
+            scheme: SIG_SCHEME_FALCON1024,
             salt,
             public_key: ByteBuf::from(pk),
             signature: ByteBuf::from(sig),
@@ -4482,16 +4704,16 @@ mod tests {
 
     #[test]
     fn pqsig_blank_is_not_a_signature_category() {
-        // A `pqsig: Some(PQSig::default())` (all-zero fields) is Blank() and
+        // A `pqsig: Some(SaltedKeySig::default())` (all-zero fields) is Blank() and
         // must NOT count as a signature category — it behaves exactly like
-        // `pqsig: None` (matches go's `PQSig.Blank()` semantics: a
+        // `pqsig: None` (matches go's `SaltedKeySig.Blank()` semantics: a
         // present-but-zeroed struct is the "absent" representation).
         let (_pk, _sk, _salt, addr) = falcon_identity(11);
         let txn = minimal_pay_txn(addr);
 
         let stx = SignedTransaction {
             txn,
-            pqsig: Some(PQSig::default()),
+            pqsig: Some(SaltedKeySig::default()),
             ..Default::default()
         };
 

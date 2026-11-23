@@ -36,18 +36,18 @@
 // (empty when none); the tracker ports each by hand and a test keeps that
 // list in sync with this dump.
 //
-// Regenerate (go-algorand pin v5.0.5-stable, deterministic):
+// Regenerate (go-algorand pin v5.1.1-stable, deterministic):
 //
 //	cd tools/avm-op-types && go run . > ../../crates/core/algo-avm/tests/fixtures/go_op_types.jsonl
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"reflect"
-	"crypto/sha256"
-	"encoding/hex"
 	"runtime"
 	"sort"
 	"strings"
@@ -67,6 +67,9 @@ type variant struct {
 	Args    []typ  `json:"args"`
 	Returns []typ  `json:"returns"`
 	Refine  string `json:"refine,omitempty"`
+	// Imms are this version's immediates, since go v5.1 an opcode's immediates
+	// may change with the version (falcon_verify gains `f` in v14).
+	Imms []immRow `json:"imms,omitempty"`
 }
 
 type immRow struct {
@@ -80,6 +83,11 @@ type opRow struct {
 	Opcode   int       `json:"opcode"`
 	Sub      int       `json:"sub,omitempty"`
 	Version  uint64    `json:"version"`
+	// LatestVersion is the Version of the spec at logic.LogicVersion: the spec an
+	// assembler falls back to for a version the opcode does not exist at
+	// (prepareVersionedPseudoTable), which differs from Version for opcodes with
+	// several specs (replace3: v7, then v14 for its length-based cost).
+	LatestVersion uint64 `json:"latest_version"`
 	Deadens  bool      `json:"deadens,omitempty"`
 	Imms     []immRow  `json:"imms,omitempty"`
 	Variants []variant `json:"variants"`
@@ -120,7 +128,8 @@ func refineName(spec logic.OpSpec) string {
 func sig(v variant) string {
 	b, _ := json.Marshal(v.Args)
 	c, _ := json.Marshal(v.Returns)
-	return string(b) + string(c) + v.Refine
+	d, _ := json.Marshal(v.Imms)
+	return string(b) + string(c) + v.Refine + string(d)
 }
 
 // groupID names a field group by its go name plus a digest of its contents:
@@ -159,15 +168,20 @@ func main() {
 	groups := map[string]*logic.FieldGroup{}
 	for _, n := range names {
 		s := latest[n]
-		r := opRow{Kind: "op", Name: n, Opcode: int(s.Opcode), Sub: int(s.SubOpcode)}
-		for _, im := range s.Immediates {
-			ir := immRow{Name: im.Name}
-			if im.Group != nil {
-				ir.Group = groupID(im.Group)
-				groups[ir.Group] = im.Group
+		r := opRow{Kind: "op", Name: n, Opcode: int(s.Opcode), Sub: int(s.SubOpcode), LatestVersion: s.Version}
+		immRows := func(sp logic.OpSpec) []immRow {
+			var rows []immRow
+			for _, im := range sp.Immediates {
+				ir := immRow{Name: im.Name}
+				if im.Group != nil {
+					ir.Group = groupID(im.Group)
+					groups[ir.Group] = im.Group
+				}
+				rows = append(rows, ir)
 			}
-			r.Imms = append(r.Imms, ir)
+			return rows
 		}
+		r.Imms = immRows(s)
 		last := ""
 		for v := uint64(1); v <= logic.LogicVersion; v++ {
 			spec, ok := logic.OpsByName[v][n]
@@ -180,7 +194,7 @@ func main() {
 			if spec.Name == "b" || spec.Name == "callsub" || spec.Name == "retsub" || spec.Name == "err" || spec.Name == "return" {
 				r.Deadens = true
 			}
-			vr := variant{From: v, Args: conv(spec.Arg.Types), Returns: conv(spec.Return.Types), Refine: refineName(spec)}
+			vr := variant{From: v, Args: conv(spec.Arg.Types), Returns: conv(spec.Return.Types), Refine: refineName(spec), Imms: immRows(spec)}
 			if s := sig(vr); s != last {
 				r.Variants = append(r.Variants, vr)
 				last = s

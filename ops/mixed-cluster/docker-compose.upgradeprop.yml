@@ -6,7 +6,7 @@
 # COMPOSE_FILE=docker-compose.yml:docker-compose.upgradeprop.yml). go-node-1
 # runs the test-only injector build (upgradeprop-inject/Dockerfile) that
 # proposes a non-UTF-8 `upgradeprop` for rounds [FROM, UNTIL); go-node-2/3
-# stay stock algorand/algod:5.0.5-stable. rust-node-4's image is overridable
+# stay stock algorand/algod:5.1.1-stable. rust-node-4's image is overridable
 # so the same case can run against an older algod-rust build (TDD: a pre-#2397
 # image must stall at the proposal block).
 

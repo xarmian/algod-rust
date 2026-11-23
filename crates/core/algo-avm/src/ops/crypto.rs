@@ -697,7 +697,10 @@ pub fn op_json_ref(machine: &mut AvmMachine, instruction: &Instruction) -> Resul
             // Check if the input is a primitive (null, true, false, number, string, array).
             // parseJSON would have already rejected arrays/primitives, but we follow Go's
             // behavior: if key not found, double-check isPrimitive for null handling.
-            return Err(avm_err(format!("key {key} not found in JSON text")));
+            return Err(avm_err(format!(
+                "key {} not found in JSON text",
+                crate::limited_bytes::limited_bytes(key.as_bytes())
+            )));
         }
     };
 

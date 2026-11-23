@@ -544,7 +544,7 @@ def make_repeat_cases(seeds, rng, cap):
 # `ReadMapHeaderBytes`) and fail with `msgp.ErrOverflow` when it is larger,
 # before reading the value. Each rule below is one such bound reachable from a
 # consensus message (the `Transaction` / `BlockHeader` / `Payset` /
-# `StateProof` / `LogicSig` / `EvalDelta` / bundle decoders of go v5.0.5-stable;
+# `StateProof` / `LogicSig` / `EvalDelta` / bundle decoders of go v5.1.1-stable;
 # the `bounds.*` values are the maxima `config.checkSetAllocBounds` computes
 # over every consensus version). Every rule gives two mutants of a map of that
 # struct: the field again, at the end of the map (so it is the value go keeps),
@@ -924,7 +924,7 @@ ROOT_TYPES = {
     "idverify": "network.identityVerificationMessageSigned",
     # the tx-sync response: a list of signed transactions (go-codec)
     "txsync": ("list", "transactions.SignedTxn"),
-    "pqkey": "main.pqSigningMaterial",
+    "pqkey": "main.saltedSigningMaterial",
 }
 
 
@@ -1554,7 +1554,7 @@ def main():
     ap.add_argument("--go-algorand", default=os.environ.get("GO_ALGORAND_DIR"))
     a = ap.parse_args()
     if not a.go_algorand:
-        sys.exit("set GO_ALGORAND_DIR or pass --go-algorand (a v5.0.5-stable checkout with libsodium built)")
+        sys.exit("set GO_ALGORAND_DIR or pass --go-algorand (a v5.1.1-stable checkout with libsodium built)")
     go = os.path.abspath(a.go_algorand)
     if a.regen_schema:
         text = schema_text(go)

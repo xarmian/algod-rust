@@ -44,8 +44,8 @@ pub use fee::{
     FEE_RESIDUE_SCALE, ONE_MICROS,
 };
 pub use go_dump::{
-    frame_invalid_txn, go_signed_txn_dump, mask_heartbeat_pointer, simulate_member_reason,
-    verify_failure_is_framed, verify_member_reason,
+    frame_invalid_txn, signed_txn_summary, simulate_member_reason, verify_failure_is_framed,
+    verify_member_reason,
 };
 pub use rules::{
     compute_group_id, consensus_params_for_version, has_heartbeat, is_free_heartbeat,
@@ -60,7 +60,8 @@ pub use rules::{
 };
 pub use signature::{
     hash_program, logic_sig_group_size_check, logic_sig_group_size_check_indexed,
-    logicsig_sanity_check, validate_pqsig_envelope, validate_pqsig_scheme,
+    logicsig_sanity_check, sksig_logicsig_sanity_check, validate_pqsig_envelope,
+    validate_pqsig_scheme,
     check_heartbeat_proofs, verify_auth_addr_sender_diff, verify_group_logicsig_size,
     verify_heartbeat_proof, verify_member_heartbeat_proof,
     verify_rekeying_supported, verify_single_sig, verify_transaction_signature,

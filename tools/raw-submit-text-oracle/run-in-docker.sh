@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: MIT
 # See the LICENSE-MIT file in the repository root for the full license text.
 
-# run-in-docker.sh — regenerate the go-algorand v5.0.5-stable oracle for the
+# run-in-docker.sh — regenerate the go-algorand v5.1.1-stable oracle for the
 # raw transaction submit decode responses, POST /v2/transactions and
 # /v2/transactions/async (issue #2492).
 #
@@ -24,8 +24,8 @@ REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 GO_ALGORAND_DIR="${GO_ALGORAND_DIR:-$(cd "$REPO_ROOT/../go-algorand" 2>/dev/null && pwd || true)}"
 FIXTURE="$REPO_ROOT/crates/node/algo-rest-api/tests/fixtures/raw_submit_texts.jsonl"
 
-GO_ALGORAND_PIN="v5.0.5-stable"
-BUILDER_IMAGE="${BUILDER_IMAGE:-golang:1.25-bookworm}"
+GO_ALGORAND_PIN="v5.1.1-stable"
+BUILDER_IMAGE="${BUILDER_IMAGE:-golang:1.27-bookworm}"
 SRC_VOLUME="${SRC_VOLUME:-algod-rust-goalgo-src}"
 MOD_VOLUME="${MOD_VOLUME:-algod-rust-gomod}"
 CACHE_VOLUME="${CACHE_VOLUME:-algod-rust-gocache}"

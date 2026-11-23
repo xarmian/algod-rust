@@ -28,7 +28,7 @@ use std::process::ExitCode;
 /// go: `config.VersionMajor` / `config.VersionMinor` of go-algorand
 /// v5.0.5-stable, the release goal-rust matches.
 const VERSION_MAJOR: u64 = 5;
-const VERSION_MINOR: u64 = 0;
+const VERSION_MINOR: u64 = 1;
 
 /// go: `config.GetLicenseInfo()`.
 pub const LICENSE_INFO: &str = "go-algorand is licensed with AGPLv3.0\nsource code available at https://github.com/algorand/go-algorand";
@@ -208,7 +208,7 @@ mod tests {
         {
             assert_eq!(
                 format_version_and_license(),
-                "5497558138880\n5.0.0. [] (commit #)\n\
+                "5497574916096\n5.1.0. [] (commit #)\n\
                  go-algorand is licensed with AGPLv3.0\n\
                  source code available at https://github.com/algorand/go-algorand"
             );

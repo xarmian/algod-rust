@@ -543,6 +543,12 @@ pub fn lsig_decode_cases() -> Vec<(String, Vec<u8>)> {
         ("pqsig pk 1794", vec![("pk", mp::bin(&vec![1u8; 1794]))]),
         ("pqsig sig 1538", vec![("sig", mp::bin(&vec![1u8; 1538]))]),
         ("pqsig sig 1539", vec![("sig", mp::bin(&vec![1u8; 1539]))]),
+        // go v5.1: the bounds are the largest over all schemes, the `ls`
+        // scheme's program (16000) and encoded arguments (5 + 255*5 + 16000).
+        ("pqsig pk 16000", vec![("pk", mp::bin(&vec![1u8; 16_000]))]),
+        ("pqsig pk 16001", vec![("pk", mp::bin(&vec![1u8; 16_001]))]),
+        ("pqsig sig 17280", vec![("sig", mp::bin(&vec![1u8; 17_280]))]),
+        ("pqsig sig 17281", vec![("sig", mp::bin(&vec![1u8; 17_281]))]),
         ("pqsig only a scheme", vec![("sch", mp::bin(b"fn"))]),
         (
             "pqsig key order",

@@ -947,6 +947,41 @@ fn eof() -> HeaderError {
 /// A MIME header: `(key, value)` pairs as sent.
 type Header = Vec<(Vec<u8>, Vec<u8>)>;
 
+/// go's `%q` of a byte string: `strconv.Quote`, an invalid UTF-8 byte as `\xNN`.
+fn go_quote_bytes(b: &[u8]) -> String {
+    let mut out = String::from("\"");
+    let mut rest = b;
+    while !rest.is_empty() {
+        let (valid, bad) = match std::str::from_utf8(rest) {
+            Ok(s) => (s, false),
+            Err(e) => (
+                std::str::from_utf8(&rest[..e.valid_up_to()]).unwrap_or(""),
+                true,
+            ),
+        };
+        for c in valid.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                    out.push_str(&format!("\\x{:02x}", c as u32));
+                }
+                c => out.push(c),
+            }
+        }
+        rest = &rest[valid.len()..];
+        if bad && !rest.is_empty() {
+            out.push_str(&format!("\\x{:02x}", rest[0]));
+            rest = &rest[1..];
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn read_mime_header(r: &mut impl BufRead) -> Result<Header, HeaderError> {
     let mut out = Vec::new();
     if matches!(r.fill_buf()?.first(), Some(b' ' | b'\t')) {
@@ -954,9 +989,10 @@ fn read_mime_header(r: &mut impl BufRead) -> Result<Header, HeaderError> {
         if line.len() > 80 {
             return Err(HeaderError::Text("message too large".to_string()));
         }
+        // go 1.27 quotes the line (`%q`).
         return Err(HeaderError::Text(format!(
             "malformed MIME header initial line: {}",
-            algo_types::raw_text::encode(&line)
+            go_quote_bytes(&line)
         )));
     }
     loop {

@@ -112,10 +112,52 @@ pub const EVAL_MAX_ARGS: usize = 255;
 pub const MAX_LOGIC_SIG_ARG_SIZE: usize = 4096;
 /// `crypto.maxMultisig`: most `subsig` entries of a `MultisigSig`.
 pub const MAX_MULTISIG: usize = 255;
-/// `crypto.MaxPQPublicKeySize` (`FalconPublicKeySize`).
-pub const MAX_PQ_PUBLIC_KEY_SIZE: usize = 1793;
-/// `crypto.MaxPQSignatureSize` (`FalconMaxSignatureSize`, the CT signature).
-pub const MAX_PQ_SIGNATURE_SIZE: usize = 1538;
+/// `crypto.Falcon1024PublicKeySize`.
+pub const FALCON1024_PUBLIC_KEY_SIZE: usize = 1793;
+/// `crypto.Falcon1024MaxSignatureSize` (`cfalcon.SignatureMaxSize`, the
+/// compressed form; before go v5.1 the CT size, 1538, bounded it).
+pub const FALCON1024_MAX_SIGNATURE_SIZE: usize = 1423;
+/// `crypto.Falcon512PublicKeySize`.
+pub const FALCON512_PUBLIC_KEY_SIZE: usize = 897;
+/// `crypto.Falcon512MaxSignatureSize` (`cfalcon.Det512SignatureMaxSize`).
+pub const FALCON512_MAX_SIGNATURE_SIZE: usize = 713;
+/// `len(crypto.PublicKey{})`, the `ed` scheme's key.
+pub const ED25519_PUBLIC_KEY_SIZE: usize = 32;
+/// `len(crypto.Signature{})`, the `ed` scheme's signature.
+pub const ED25519_SIGNATURE_SIZE: usize = 64;
+/// `msgp.ArrayHeaderSize` and `msgp.BytesPrefixSize` (the 5-byte worst cases).
+const MSGP_ARRAY_HEADER_SIZE: usize = 5;
+const MSGP_BYTES_PREFIX_SIZE: usize = 5;
+
+/// go's `maxSigSchemePublicKeySize()` (`data/transactions/sig_scheme.go`): the
+/// largest public key over all `SaltedKeySig` schemes, the wire bound of
+/// `SaltedKeySig.PublicKey`. An `ls` key is a program, bounded like
+/// `LogicSig.Logic` (`bounds.MaxLogicSigMaxSize`, set from the consensus
+/// parameters, so this is not a constant).
+pub fn max_sig_scheme_public_key_size() -> usize {
+    FALCON1024_PUBLIC_KEY_SIZE
+        .max(FALCON512_PUBLIC_KEY_SIZE)
+        .max(ED25519_PUBLIC_KEY_SIZE)
+        .max(bounds::MAX_LOGIC_SIG_MAX_SIZE.get())
+}
+
+/// go's `maxSigSchemeSignatureSize()`: the largest signature over all schemes,
+/// the wire bound of `SaltedKeySig.Signature`. An `ls` signature is its
+/// encoded arguments: an array header, up to `EvalMaxArgs` byte prefixes and
+/// `bounds.MaxLogicSigMaxSize` bytes.
+pub fn max_sig_scheme_signature_size() -> usize {
+    FALCON1024_MAX_SIGNATURE_SIZE
+        .max(FALCON512_MAX_SIGNATURE_SIZE)
+        .max(ED25519_SIGNATURE_SIZE)
+        .max(ls_max_signature_size())
+}
+
+/// The `ls` scheme's `maxSignatureSize`.
+pub fn ls_max_signature_size() -> usize {
+    MSGP_ARRAY_HEADER_SIZE
+        + EVAL_MAX_ARGS * MSGP_BYTES_PREFIX_SIZE
+        + bounds::MAX_LOGIC_SIG_MAX_SIZE.get()
+}
 
 // ── go's other msgp allocation bounds of consensus messages (issue #2427) ──
 //
@@ -166,9 +208,9 @@ pub const MAX_HASH_DIGEST_SIZE: usize = 64;
 pub const SHA256_SIZE: usize = 32;
 /// `crypto.SumhashDigestSize`: `stateproofmsg.Message.VotersCommitment`.
 pub const SUMHASH_DIGEST_SIZE: usize = 64;
-/// `crypto.FalconMaxSignatureSize` (`cfalcon.CTSignatureSize`): a
-/// `crypto.FalconSignature`.
-pub const FALCON_MAX_SIGNATURE_SIZE: usize = 1538;
+/// `crypto.Falcon1024MaxSignatureSize` (`cfalcon.SignatureMaxSize`, since go v5.1; the CT size, 1538, before): a
+/// `crypto.Falcon1024Signature`.
+pub const FALCON_MAX_SIGNATURE_SIZE: usize = 1423;
 /// `stateproof.MaxReveals`: entries of `Reveals`, elements of
 /// `PositionsToReveal`.
 pub const MAX_REVEALS: usize = 640;
@@ -1483,8 +1525,8 @@ impl StructKeys {
 /// The header of a struct value of go type `go_type` decoded into `s`: a
 /// `nil` resets `s` to its zero value and reads as no fields (go
 /// `(*z) = T{}`), a map yields its keys, an array yields go's positional
-/// field order. go falls back to the array form when the value is not a map
-/// (`msgp.ReadMapHeaderBytes` fails with a `TypeError`).
+/// field order (go-codec reflection only; go v5.1's generated decoders reject
+/// an array like any other non-map value).
 #[inline]
 pub fn struct_keys<T: Default>(
     rd: &mut &[u8],
@@ -1517,7 +1559,10 @@ pub fn struct_keys_with<T>(
         // order of the struct's encodable fields (`kStruct`, `sfiSrc`), a `nil`
         // element zeroing the field like a `nil` map value does, and an
         // element more than the fields an error (`ErrorIfNoField`)
-        Some(0x90..=0x9f | 0xdc | 0xdd) => array_struct_keys(rd, go_type),
+        // go v5.1 (msgp 1.1.66, #6774) generates map-only struct decoders: an
+        // array is `ReadMapHeaderBytes`'s TypeError, as any non-map. Only go-codec's
+        // reflection decode (the tx-sync response) still reads the array form.
+        Some(0x90..=0x9f | 0xdc | 0xdd) if reflect_mode() => array_struct_keys(rd, go_type),
         _ => Ok(StructKeys {
             left: rmp::decode::read_map_len(rd)
                 .map_err(|e| codec_err(format!("read_map_len: {e}")))?,

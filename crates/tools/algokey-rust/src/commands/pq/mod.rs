@@ -25,7 +25,7 @@
 //! Distinct from this repo's participation-key PQ material (`part
 //! generate`/`part info`): these subcommands manage regular (non-
 //! participation) account keys that a normal account can be rekeyed to for
-//! post-quantum transaction/LogicSig authorization (`PQSig`,
+//! post-quantum transaction/LogicSig authorization (`SaltedKeySig`,
 //! `data/transactions/pqsig.go`).
 
 pub mod check_address;
@@ -84,13 +84,13 @@ pub fn looks_like_teal_source(data: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use algo_types::PQAddressSalt;
+    use algo_types::AddressSalt;
 
     #[test]
     fn print_pq_key_info_matches_go_format() {
         let public = PqPublicMaterial {
-            scheme: algo_types::PQ_SCHEME_FALCON1024,
-            salt: PQAddressSalt(3),
+            scheme: algo_types::SIG_SCHEME_FALCON1024,
+            salt: AddressSalt(3),
             public_key: vec![0u8; algo_falcon::FALCON_DET1024_PUBKEY_SIZE],
         };
         let mut out = Vec::new();

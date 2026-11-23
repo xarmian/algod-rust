@@ -1246,6 +1246,21 @@ pub fn run_listpartkeys(cli_d: Vec<PathBuf>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// go v5.1's `isPartkeyRegistered`: `part` is the participation key currently
+/// registered on `account`. The `[]byte` keys compare with `bytes.Equal`, so nil
+/// and empty are equal.
+fn is_partkey_registered(account: &serde_json::Value, part: &serde_json::Value) -> bool {
+    let key = &part["key"];
+    let online = &account["participation"];
+    let bytes_eq = |f: &str| online[f].as_str().unwrap_or("") == key[f].as_str().unwrap_or("");
+    online.is_object()
+        && bytes_eq("vote-participation-key")
+        && bytes_eq("selection-participation-key")
+        && online["vote-first-valid"] == key["vote-first-valid"]
+        && online["vote-last-valid"] == key["vote-last-valid"]
+        && online["vote-key-dilution"] == key["vote-key-dilution"]
+}
+
 /// `account partkeyinfo`: go's `partkeyInfoCmd`, every data dir in turn;
 /// the first failure ends the command (`reportErrorf`).
 pub fn run_partkeyinfo(cli_d: Vec<PathBuf>) -> ExitCode {
@@ -1293,6 +1308,19 @@ pub fn run_partkeyinfo(cli_d: Vec<PathBuf>) -> ExitCode {
             let _ = writeln!(out);
             let _ = writeln!(out, "Participation ID:          {}", s(&part["id"]));
             let _ = writeln!(out, "Parent address:            {}", s(&part["address"]));
+            // go v5.1: `Registered: yes|no|unknown`, from one more account
+            // request per key (`isPartkeyRegistered`).
+            let registered = match get_account(&rt, &endpoint, &s(&part["address"]), false) {
+                Err(_) => "unknown",
+                Ok(account) => {
+                    if is_partkey_registered(&account, part) {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                }
+            };
+            let _ = writeln!(out, "Registered:                {registered}");
             let _ = writeln!(
                 out,
                 "Last vote round:           {}",

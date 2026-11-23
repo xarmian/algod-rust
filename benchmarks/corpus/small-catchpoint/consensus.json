@@ -154,14 +154,20 @@
       "DecayInterval": 1000000
     },
     "Heartbeat": true,
+    "AllowGroupedHeartbeats": false,
     "EnableSha512BlockHash": true,
     "AppSizeUpdates": true,
     "AllowZeroLocalAppRef": true,
     "LoadTracking": true,
     "PerByteTxnSurcharge": 100,
-    "EnablePQSchemeFalcon1024": true,
     "EnableSelectF128": true,
-    "CloseRequiresBaseMinBalance": true
+    "EnablePQSchemeFalcon1024": true,
+    "EnableSigSchemeFalcon512": false,
+    "EnableSigSchemeEd25519": false,
+    "EnableSigSchemeLogicSig": false,
+    "RequireLogicSigArgAccess": false,
+    "CloseRequiresBaseMinBalance": true,
+    "DiscardFailedInnerClearStateDelta": false
   },
   "version": "https://github.com/algorandfoundation/specs/tree/73c43b4a9699390884c51e2a9598d49e28373d10"
 }

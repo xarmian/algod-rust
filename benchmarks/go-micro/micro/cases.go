@@ -488,12 +488,12 @@ func falconVerify(dir string) (*Case, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(f) != 3 || len(f[0]) != crypto.FalconPublicKeySize {
+	if len(f) != 3 || len(f[0]) != crypto.Falcon1024PublicKeySize {
 		return nil, errors.New("falcon.frames: want pk, sig, msg")
 	}
-	var v crypto.FalconVerifier
+	var v crypto.Falcon1024Verifier
 	copy(v.PublicKey[:], f[0])
-	sig := crypto.FalconSignature(f[1])
+	sig := crypto.Falcon1024Signature(f[1])
 	msg := f[2]
 	return &Case{
 		Op:       func() { mustNoErr(v.VerifyBytes(msg, sig)) },
@@ -590,7 +590,7 @@ func LsigGroup(program []byte) []transactions.SignedTxn {
 // EvalLsig evaluates program as the logicsig of LsigGroup.
 func EvalLsig(group []transactions.SignedTxn, proto *config.ConsensusParams) (bool, int, error) {
 	ep := logic.NewSigEvalParams(group, proto, logic.NoHeaderLedger{})
-	pass, cx, err := logic.EvalSignatureFull(0, ep)
+	pass, cx, err := logic.EvalSignatureProgram(group[0].Lsig.Logic, group[0].Lsig.Args, 0, ep)
 	cost := 0
 	if cx != nil {
 		cost = cx.Cost()
@@ -609,7 +609,7 @@ func lsig(file string) builder {
 		return &Case{
 			Op: func() {
 				ep := logic.NewSigEvalParams(group, &proto, logic.NoHeaderLedger{})
-				pass, err := logic.EvalSignature(0, ep)
+				pass, _, err := logic.EvalSignatureProgram(group[0].Lsig.Logic, group[0].Lsig.Args, 0, ep)
 				mustNoErr(err)
 				if !pass {
 					panic("logicsig rejected")

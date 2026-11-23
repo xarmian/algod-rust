@@ -123,9 +123,7 @@ fn pq_failure_texts_match_go_in_simulate() {
                 let group = &result.txn_groups[0];
                 format!(
                     "failure {:?} at {:?}",
-                    algo_validate::mask_heartbeat_pointer(
-                        group.failure_message.as_deref().unwrap_or_default()
-                    ),
+                    group.failure_message.as_deref().unwrap_or_default(),
                     group.failed_at.clone().unwrap_or_default()
                 )
             }
@@ -138,7 +136,7 @@ fn pq_failure_texts_match_go_in_simulate() {
     }
     assert!(
         mismatches.is_empty(),
-        "simulate PQ failure texts differ from go v5.0.5:\n{}",
+        "simulate PQ failure texts differ from go v5.1.1:\n{}",
         mismatches.join("\n")
     );
 }

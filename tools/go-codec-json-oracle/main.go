@@ -20,7 +20,7 @@
 
 // Command go-codec-json-oracle is the parity oracle of algod-rust issue
 // #2466: it decodes algod answer bodies exactly as go-algorand
-// v5.0.5-stable's restClient.submitForm does
+// v5.1.1-stable's restClient.submitForm does
 // (protocol.NewJSONDecoder over an http.MaxBytesReader, Decode(&response)
 // with response an `any` holding a pointer to the answer type) and prints
 // what that made of each.

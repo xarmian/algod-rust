@@ -1,6 +1,6 @@
 # Mixed-Cluster Consensus Harness
 
-A 4-node docker-compose harness that runs 3 go-algorand v5.0.5-stable
+A 4-node docker-compose harness that runs 3 go-algorand v5.1.1-stable
 nodes + 1 algod-rust node on a private network. **All four nodes hold
 online stake and participate in consensus** (issue #469); the Rust node
 runs `algod-rust participate`, votes, and serves the algod v2 REST API.
@@ -35,7 +35,7 @@ Foundation for (all shipped):
                 └──────────────────┘
 ```
 
-- **go-node-1/2/3**: algorand/algod:5.0.5-stable relays with **30%** of
+- **go-node-1/2/3**: algorand/algod:5.1.1-stable relays with **30%** of
   online stake each, all online, all proposing.
 - **rust-node-4**: a built-from-source `algod-rust participate` node
   holding **10%** of online stake, dialing the 3 Go relays over gossip.
@@ -301,7 +301,7 @@ quorum.
 ### The go-algorand-side authenticator
 
 `tools/cert-authenticate` is a small Go program that re-authenticates the
-exported certificates with go-algorand v5.0.5-stable's own verifier.
+exported certificates with go-algorand v5.1.1-stable's own verifier.
 `algo-cert-crossverify --export-go-input` writes it the raw `(block,
 cert)` msgpack plus the `agreement.LedgerReader` facts (seed,
 circulation, per-voter online account data) read out of the **Rust**
@@ -311,7 +311,7 @@ and reports a mismatch distinctly.
 
 Building it needs go-algorand's vendored libsodium fork, so
 `tools/cert-authenticate/run-in-docker.sh` clones the pinned checkout
-inside a `golang:1.25-bookworm` container, runs `make libsodium` there,
+inside a `golang:1.27-bookworm` container, runs `make libsodium` there,
 and caches both in named Docker volumes (first run ~3-5 min, later runs
 seconds). That is also the only supported path on Windows, where the
 host checkout's line endings break autotools.
@@ -517,7 +517,7 @@ How the proposal is produced, without touching algod-rust:
 - An unmodified go node only proposes keys of its own `ApprovedUpgrades`, and
   `consensus.json` cannot carry a non-UTF-8 key (`encoding/json` replaces
   invalid UTF-8 with U+FFFD). So **go-node-1 runs a test-only go-algorand
-  v5.0.5-stable build** (`upgradeprop-inject/Dockerfile` +
+  v5.1.1-stable build** (`upgradeprop-inject/Dockerfile` +
   `upgradeprop-inject/inject.patch`): a hook in `ProcessUpgradeParams`
   (proposer side only) proposes the bytes of
   `ALGOD_TEST_INJECT_UPGRADEPROP_HEX` for rounds `[FROM, UNTIL)` when no
@@ -585,7 +585,7 @@ What it does, in order:
 5. Stage those files into a Go-shaped data dir at
    `<HANDOFF_DIR>/godata/<genesisID>/ledger.{tracker,block}.sqlite`
    alongside a minimal `config.json` + `genesis.json` + `algod.token`.
-6. Boot a one-shot `algorand/algod:5.0.5-stable` container against
+6. Boot a one-shot `algorand/algod:5.1.1-stable` container against
    that data dir on host port 7833.
 7. Assert `/v2/status` responds, `last-round >= HANDOFF_ROUNDS`, and
    Go's startup logs contain no ERROR/FATAL lines.

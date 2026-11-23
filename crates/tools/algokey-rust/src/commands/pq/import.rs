@@ -83,12 +83,12 @@ pub fn run_with_io<O: Write, E: Write>(
 mod tests {
     use super::*;
     use algo_consensus_crypto::key_to_mnemonic;
-    use algo_types::PQ_SCHEME_FALCON1024;
+    use algo_types::SIG_SCHEME_FALCON1024;
 
     #[test]
     fn import_round_trips_generate_output() {
         let (entropy, signing) =
-            super::super::scheme::generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
+            super::super::scheme::generate_pq_signing_material(SIG_SCHEME_FALCON1024).unwrap();
         let mnemonic = key_to_mnemonic(&entropy).unwrap();
 
         let dir = tempfile::tempdir().unwrap();

@@ -21,7 +21,7 @@
 // Command dt-nesting-oracle is the parity oracle of algod-rust issue #2539:
 // it decodes a block whose one transaction carries an eval delta (`dt`)
 // nested N inner-transaction levels deep (`dt` -> `itx` -> `dt` -> ...), as
-// go-algorand v5.0.5-stable's protocol.Decode does, and prints the error (or
+// go-algorand v5.1.1-stable's protocol.Decode does, and prints the error (or
 // null) and go's canonical re-encode of what it decoded. The deepest delta
 // holds a non-UTF-8 `gd` key (a msgpack `bin`) so that a path that stops
 // re-typing `str` positions at some depth shows up as different bytes.

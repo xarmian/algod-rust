@@ -78,10 +78,10 @@ fn is_escrow_logic_sig(stxn: &SignedTransaction) -> bool {
 }
 
 /// Reports whether `program`'s hash decodes as a valid Edwards25519 curve
-/// point (i.e. is "on-curve") -- the same check `Address::is_pq_compliant`
+/// point (i.e. is "on-curve") -- the same check `Address::is_off_ed25519_curve`
 /// applies to account addresses, applied to a LogicSig's program hash.
 fn program_hash_is_edwards25519_point(program: &[u8]) -> bool {
-    !hash_program(program).is_pq_compliant()
+    !hash_program(program).is_off_ed25519_curve()
 }
 
 /// Mirrors go-algorand's `rejectOnCurveLogicSigPrograms`: for every escrow
@@ -137,9 +137,9 @@ pub fn enforce_pq_authorizer_compliance(txgroup: &[SignedTransaction]) -> Result
             continue;
         }
         let authorizer = pq_sig.address();
-        if !authorizer.is_pq_compliant() {
+        if !authorizer.is_off_ed25519_curve() {
             return Err(format!(
-                "transaction {i}: pq signature authorizer address {authorizer} is an Edwards25519 curve point (non PQ-compliant)"
+                "transaction {i}: salted-key signature authorizer address {authorizer} is an Edwards25519 curve point"
             ));
         }
     }
@@ -164,7 +164,7 @@ pub fn enforce_pq_compliance(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use algo_types::pq::{PQAddressSalt, PQSig};
+    use algo_types::pq::{AddressSalt, SaltedKeySig};
     use algo_types::{LogicSig, Transaction};
     use serde_bytes::ByteBuf;
 
@@ -190,7 +190,7 @@ mod tests {
     fn enforce_pq_compliance_skipped_when_requested() {
         // An obviously bad PQ authorizer would normally fail, but skip=true
         // bypasses the check entirely.
-        let pq_sig = PQSig {
+        let pq_sig = SaltedKeySig {
             scheme: *b"f1",
             public_key: ByteBuf::from(vec![0u8; 1793]),
             ..Default::default()
@@ -216,9 +216,9 @@ mod tests {
     fn enforce_pq_authorizer_compliance_ignores_empty_public_key() {
         let stxn = SignedTransaction {
             txn: minimal_pay_txn(Address([1u8; 32])),
-            pqsig: Some(PQSig {
+            pqsig: Some(SaltedKeySig {
                 scheme: *b"f1",
-                salt: PQAddressSalt(0),
+                salt: AddressSalt(0),
                 public_key: ByteBuf::new(),
                 signature: ByteBuf::new(),
             }),

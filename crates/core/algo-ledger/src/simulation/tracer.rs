@@ -354,14 +354,16 @@ impl SimulationTracer {
 }
 
 impl EvalTracer for SimulationTracer {
-    fn before_txn_group(&mut self, _group_size: usize) {
+    fn before_txn_group(&mut self, _group_size: usize, app_calls: usize) {
         // The only production call site (avm_context.rs, inner-txn
-        // submission) fires this exclusively for inner groups, so every call
-        // counts one MaxAppProgramCost unit — see `inner_txn_group_count`
-        // doc comment. Counted unconditionally (not gated on
-        // `config.is_enabled()`), matching `app_cost_consumed`: group budget
-        // is a standard simulate response field, not a trace-capture detail.
-        self.inner_txn_group_count += 1;
+        // submission) fires this exclusively for inner groups. go-algorand
+        // v5.1.0-beta (#6708) reports one MaxAppProgramCost grant for each
+        // app call in the inner group, not one per group: a group of
+        // payments adds nothing. See `inner_txn_group_count`. Counted
+        // unconditionally (not gated on `config.is_enabled()`), matching
+        // `app_cost_consumed`: group budget is a standard simulate response
+        // field, not a trace-capture detail.
+        self.inner_txn_group_count += app_calls as u64;
         self.cursor.before_txn_group();
     }
 
@@ -865,7 +867,7 @@ mod tests {
         tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(1)], &[], None);
 
         // Inner transaction group (simulating itxn_submit hook calls)
-        tracer.before_txn_group(1);
+        tracer.before_txn_group(1, 1);
         tracer.before_txn(0);
 
         // Inner program executes
@@ -911,7 +913,7 @@ mod tests {
         tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(1)], &[], None);
 
         // First inner txn
-        tracer.before_txn_group(1);
+        tracer.before_txn_group(1, 1);
         tracer.before_txn(0);
 
         tracer.before_program(ProgramType::Approval, [0u8; 32]);
@@ -919,7 +921,7 @@ mod tests {
         tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(1)], &[], None);
 
         // Nested inner txn (depth 2)
-        tracer.before_txn_group(1);
+        tracer.before_txn_group(1, 1);
         tracer.before_txn(0);
 
         tracer.before_program(ProgramType::Approval, [0u8; 32]);
@@ -989,7 +991,7 @@ mod tests {
         tracer.after_opcode(1, 0x81, &[AvmValue::Uint64(1)], &[], None);
 
         // Inner txn group with 2 siblings
-        tracer.before_txn_group(2);
+        tracer.before_txn_group(2, 2);
 
         // Sibling 1
         tracer.before_txn(0);
@@ -1039,7 +1041,7 @@ mod tests {
 
         // Opcode 1: itxn_submit. Two inners spawn during its execution.
         tracer.before_opcode(1, 0xb6);
-        tracer.before_txn_group(2);
+        tracer.before_txn_group(2, 2);
         tracer.before_txn(0);
         tracer.before_program(ProgramType::Approval, [0u8; 32]);
         tracer.before_opcode(1, 0x81);
@@ -1134,5 +1136,19 @@ mod tests {
         let trace = tracer.into_transaction_trace().unwrap();
         assert!(!trace.clear_state_rollback);
         assert!(trace.clear_state_rollback_error.is_none());
+    }
+
+    /// go-algorand v5.1.0-beta (#6708): AppBudgetAdded gets one
+    /// MaxAppProgramCost grant per app call in an inner group, so an inner
+    /// group of payments adds nothing and a group of two app calls adds two.
+    #[test]
+    fn test_simulation_tracer_inner_group_budget_counts_app_calls() {
+        let mut tracer = SimulationTracer::new(ExecTraceConfig::default());
+        tracer.before_txn_group(3, 0);
+        assert_eq!(tracer.inner_txn_group_count(), 0);
+        tracer.before_txn_group(3, 2);
+        assert_eq!(tracer.inner_txn_group_count(), 2);
+        tracer.before_txn_group(1, 1);
+        assert_eq!(tracer.inner_txn_group_count(), 3);
     }
 }

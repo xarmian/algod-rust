@@ -19,7 +19,7 @@
 #      (upgradeprop-inject/consensus.json, installed on all 4 nodes through
 #      start.sh's PHASE6_CONSENSUS_OVERRIDE), so the vote deadline is reached
 #      in about a minute;
-#   2. go-node-1 runs a test-only go-algorand v5.0.5-stable build
+#   2. go-node-1 runs a test-only go-algorand v5.1.1-stable build
 #      (upgradeprop-inject/: Dockerfile + inject.patch) whose proposer, for
 #      rounds [FROM, UNTIL), proposes the non-UTF-8 bytes INJECT_HEX.
 #      go-node-2/3 stay stock, rust-node-4 is the image under test;
@@ -90,7 +90,7 @@ if [ "$INJECT_UNTIL" -ge $(( INJECT_FROM + VOTE_ROUNDS )) ]; then
 fi
 
 if ! docker image inspect "$GO_IMAGE" >/dev/null 2>&1; then
-    echo "==> building the injector image $GO_IMAGE (go-algorand v5.0.5-stable + inject.patch)"
+    echo "==> building the injector image $GO_IMAGE (go-algorand v5.1.1-stable + inject.patch)"
     docker build -t "$GO_IMAGE" "$INJECT_DIR" > "$OUT_DIR/build-injector.log" 2>&1 || {
         echo "injector build failed; see $OUT_DIR/build-injector.log" >&2
         exit 1

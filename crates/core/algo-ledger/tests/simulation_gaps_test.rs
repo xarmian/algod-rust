@@ -2206,8 +2206,8 @@ fn programless_logicsig_pqsig_is_orphan_and_empty_args_is_blank() {
 
     // Non-blank PQ envelope, no program: orphan content.
     let orphan = mk(LogicSig {
-        pqsig: Some(algo_types::pq::PQSig {
-            scheme: algo_types::pq::PQ_SCHEME_FALCON1024,
+        pqsig: Some(algo_types::pq::SaltedKeySig {
+            scheme: algo_types::pq::SIG_SCHEME_FALCON1024,
             ..Default::default()
         }),
         ..Default::default()

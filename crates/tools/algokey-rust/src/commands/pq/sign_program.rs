@@ -26,7 +26,7 @@ use std::io::Write;
 use std::process::ExitCode;
 
 use algo_codec::canonical_encode_logicsig;
-use algo_types::{LogicSig, PQDelegatedProgram};
+use algo_types::{LogicSig, SKsigDelegatedProgram};
 use serde_bytes::ByteBuf;
 
 use crate::cli::PqSignProgramArgs;
@@ -87,7 +87,7 @@ pub fn run_with_io<O: Write, E: Write>(
         return ExitCode::from(1);
     }
 
-    let dp = PQDelegatedProgram {
+    let dp = SKsigDelegatedProgram {
         addr: ctx.signing.public.address(),
         program: program.clone(),
     };
@@ -119,12 +119,12 @@ pub fn run_with_io<O: Write, E: Write>(
 mod tests {
     use super::*;
     use crate::commands::pq::scheme::generate_pq_signing_material;
-    use algo_types::PQ_SCHEME_FALCON1024;
+    use algo_types::SIG_SCHEME_FALCON1024;
 
     fn write_keyfile(
         dir: &std::path::Path,
     ) -> (std::path::PathBuf, super::super::key::PqSigningMaterial) {
-        let (_, signing) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
+        let (_, signing) = generate_pq_signing_material(SIG_SCHEME_FALCON1024).unwrap();
         let kf = dir.join("k");
         super::super::key::write_pq_private_key_file(&kf, &signing).unwrap();
         (kf, signing)
@@ -166,7 +166,7 @@ mod tests {
         assert_eq!(lsig.logic.as_slice(), [0x08u8, 0x22, 0x00, 0xff].as_slice());
         let pqsig = lsig.pqsig.expect("pqsig set");
 
-        let dp = PQDelegatedProgram {
+        let dp = SKsigDelegatedProgram {
             addr: signing.public.address(),
             program: lsig.logic.to_vec(),
         };
@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn sign_program_accepts_mnemonic() {
         let dir = tempfile::tempdir().unwrap();
-        let (entropy, signing) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
+        let (entropy, signing) = generate_pq_signing_material(SIG_SCHEME_FALCON1024).unwrap();
         let mnemonic = algo_consensus_crypto::key_to_mnemonic(&entropy).unwrap();
 
         let program_path = dir.path().join("prog.bin");

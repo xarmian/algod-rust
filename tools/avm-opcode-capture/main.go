@@ -103,7 +103,7 @@ import (
 // to run unless `../../../go-algorand` resolves to exactly this tag (or
 // --allow-unpinned is set), so two developers regenerating the corpus get
 // byte-identical output regardless of local go-algorand state.
-const expectedGoAlgorandPin = "v5.0.5-stable"
+const expectedGoAlgorandPin = "v5.1.1-stable"
 
 // protoVersion is the consensus version every fixture is evaluated under.
 // V41 is ConsensusCurrentVersion at the pin; its string value is recorded in
@@ -171,7 +171,7 @@ func evalSig(program []byte, args [][]byte) (bool, string, []stackEntry) {
 	txn.Lsig.Args = args
 	ep := logic.NewSigEvalParams([]transactions.SignedTxn{txn}, &proto, &logic.NoHeaderLedger{})
 
-	pass, cx, err := logic.EvalSignatureFull(0, ep)
+	pass, cx, err := logic.EvalSignatureProgram(program, args, 0, ep)
 	errStr := ""
 	if err != nil {
 		errStr = err.Error()
@@ -196,7 +196,7 @@ func checkSig(program []byte) string {
 	var txn transactions.SignedTxn
 	txn.Lsig.Logic = program
 	ep := logic.NewSigEvalParams([]transactions.SignedTxn{txn}, &proto, &logic.NoHeaderLedger{})
-	if err := logic.CheckSignature(0, ep); err != nil {
+	if err := logic.CheckSignature(program, ep); err != nil {
 		return err.Error()
 	}
 	return ""

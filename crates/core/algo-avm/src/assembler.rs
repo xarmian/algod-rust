@@ -2025,14 +2025,16 @@ fn pseudo_get_spec_errors(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
         Some(&(_, target)) => {
             if let Some(spec) = opcode::lookup_by_name(target) {
                 if spec.version > ops.effective_version() {
+                    // go falls back to the newest spec of the opcode here.
+                    let introduced = type_track::op_entry_by_name(target)
+                        .map_or(spec.version, |e| e.spec_version_at(ops.effective_version()));
                     let phrase = match args.len() {
                         0 => "no immediates".to_string(),
                         1 => "1 immediate".to_string(),
                         n => format!("{n} immediates"),
                     };
                     ops.err_mnemonic(format!(
-                        "{mnemonic} opcode with {phrase} was introduced in v{}",
-                        spec.version
+                        "{mnemonic} opcode with {phrase} was introduced in v{introduced}"
                     ));
                 }
             }
@@ -2494,7 +2496,8 @@ fn asm_default(
     lookup_name: &str,
     args: &[&str],
 ) {
-    if check_arg_count(ops, name, args, entry.imms.len()) {
+    let imms = entry.imms_at(ops.effective_version());
+    if check_arg_count(ops, name, args, imms.len()) {
         return;
     }
     ops.pending.push(spec.opcode);
@@ -2510,15 +2513,14 @@ fn asm_default(
             name.to_string()
         }
     };
-    for (i, imm) in entry.imms.iter().enumerate() {
+    for (i, imm) in imms.iter().enumerate() {
         let arg = args[i];
         match imm.group {
             Some(group) => {
                 let Some(field) = group.iter().find(|f| f.name == arg) else {
                     // The user may have supplied a number where a field belongs.
                     if byte_imm(arg, "").is_ok() {
-                        let correct: Vec<String> = entry
-                            .imms
+                        let correct: Vec<String> = imms
                             .iter()
                             .enumerate()
                             .filter(|(_, o)| o.group.is_none())
@@ -2543,7 +2545,7 @@ fn asm_default(
                             let Some(te) = type_track::op_entry_by_name(target) else {
                                 continue;
                             };
-                            for pi in te.imms {
+                            for pi in te.imms_at(ops.effective_version()) {
                                 if pi.group.is_some_and(|g| g.iter().any(|f| f.name == arg)) {
                                     with_field.push(num_imms);
                                 }
@@ -2594,8 +2596,7 @@ fn asm_default(
                     Err(e) => {
                         if e.contains("unable to parse") {
                             // Perhaps the field works in a different order.
-                            let correct: Vec<String> = entry
-                                .imms
+                            let correct: Vec<String> = imms
                                 .iter()
                                 .enumerate()
                                 .filter(|(_, o)| {
@@ -4871,11 +4872,14 @@ mod tests {
     fn test_replace_pseudo_version_gating() {
         // `replace`/`replace2`/`replace3` were introduced in v7 -- using
         // the pseudo-op below that version is rejected the same way
-        // `txn`/`gtxn`'s array-form dispatch is (`asm_pseudo_arity`).
+        // `txn`/`gtxn`'s array-form dispatch is (`asm_pseudo_arity`). go reports
+        // the version of the newest spec (`prepareVersionedPseudoTable` falls
+        // back to `OpsByName[AssemblerMaxVersion]`): since v5.1 `replace2` /
+        // `replace3` have a v14 spec (length-based cost), so it names v14.
         let errs = expect_errors("#pragma version 6\nbyte 0x0000\nbyte 0x1234\nreplace 0\n");
         assert!(
             errs.iter()
-                .any(|e| e.message == "replace opcode with 1 immediate was introduced in v7"),
+                .any(|e| e.message == "replace opcode with 1 immediate was introduced in v14"),
             "unexpected errors: {errs:?}"
         );
     }
@@ -6786,6 +6790,25 @@ dup
         let ops = assemble_string(source).unwrap();
         // version(1) + pushints (5) + match opcode(1) + count(1) + labels(2*2)
         assert_eq!(ops.program.len(), 1 + 5 + 1 + 1 + 4);
+    }
+
+    /// go v5.1 gives `falcon_verify` an immediate only from v14: a v12/v13
+    /// program takes none, however the table lists the newest form.
+    #[test]
+    fn falcon_verify_takes_no_immediate_before_v14() {
+        for v in [12, 13] {
+            let source = format!(
+                "#pragma version {v}
+#pragma typetrack false
+byte 0x01
+byte 0x02
+byte 0x03
+falcon_verify
+return
+"
+            );
+            assemble_string(&source).unwrap();
+        }
     }
 
     #[test]

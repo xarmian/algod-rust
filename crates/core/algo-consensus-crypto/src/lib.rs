@@ -37,7 +37,7 @@ pub mod merklesignature;
 pub mod multisig;
 pub mod onetimesig;
 pub mod passphrase;
-pub mod pq_scheme;
+pub mod sig_scheme;
 pub mod sortition;
 pub mod stateproof;
 pub mod sumhash;
@@ -45,9 +45,7 @@ pub mod vrf;
 
 pub use kdf::{scrypt_key, ScryptError};
 
-pub use pq_scheme::{
-    lookup_pq_scheme, PQVerifier, PQVerifyError, MAX_PQ_PUBLIC_KEY_SIZE, MAX_PQ_SIGNATURE_SIZE,
-};
+pub use sig_scheme::{verify_falcon1024, verify_falcon512, SigVerifyError, ERR_SIG_INVALID};
 
 pub use multisig::{
     multisig_addr_gen, multisig_assemble, multisig_preimage_from_pks, multisig_sign,

@@ -2966,6 +2966,24 @@ fn pool_evaluator_matches_go_per_transaction_order() {
                 sc.name, sc.test_error, test
             ));
         }
+        // go's oracle row is `BlockEvaluator.TransactionGroup` alone. This
+        // evaluator also runs `verify.TxnGroup`'s group checks first (it is the
+        // one sink of the REST and gossip paths), and since go v5.1
+        // `checkTxnGroupID` refuses a transaction repeated in a group before any
+        // per-member check, so such a row reads that text here, whatever
+        // the evaluator's own order would have said.
+        if let Some((i, j)) = repeated_member(&sc.group) {
+            let want = format!("transactionGroup: duplicate transaction: [{i}] repeats [{j}]");
+            if add != want {
+                mismatches.push(format!(
+                    "{} (apply stage, repeated member)
+  want: {:?}
+  rust: {:?}",
+                    sc.name, want, add
+                ));
+            }
+            continue;
+        }
         if add != sc.add_error && !sc.skip_apply {
             mismatches.push(format!(
                 "{} (apply stage)\n  go:   {:?}\n  rust: {:?}",
@@ -3044,11 +3062,6 @@ fn rest_error_text(e: &algo_error::AlgoError) -> (String, Option<algo_error::Ver
     }
 }
 
-/// go's oracle masks a heartbeat's pointer address; mask the Rust text alike.
-fn mask_heartbeat_pointer(text: &str) -> String {
-    algo_validate::mask_heartbeat_pointer(text)
-}
-
 /// The two texts from shortly before their first differing byte, for a
 /// readable mismatch report of two multi-kilobyte frames.
 fn first_difference(go: &str, rust: &str) -> (String, String) {
@@ -3071,8 +3084,12 @@ fn first_difference(go: &str, rust: &str) -> (String, String) {
 
 /// Splits go's `transaction <dump> invalid : <reason>` into (framed, reason).
 fn split_frame(text: &str) -> (bool, &str) {
-    match (text.starts_with("transaction {"), text.find("} invalid : ")) {
-        (true, Some(at)) => (true, &text[at + "} invalid : ".len()..]),
+    // go v5.1: `transaction <SignedTxn.Summary()> invalid : <reason>`.
+    const TAIL: &str = " invalid : ";
+    match text.find(TAIL) {
+        Some(at) if text.starts_with("transaction ") && text[..at].contains(" from ") => {
+            (true, &text[at + TAIL.len()..])
+        }
         _ => (false, text),
     }
 }
@@ -3139,8 +3156,7 @@ fn wellformed_and_group_error_texts_match_go() {
                 // and `verify_logicsig_errors`): go prints the AVM's own error
                 // and the byte offset `pc` of its `EvalError` (`err=/ 0.
                 // Details: pc=5`, issue #2200).
-                let text = mask_heartbeat_pointer(&text);
-                let rust_framed = split_frame(&text).0;
+                                let rust_framed = split_frame(&text).0;
                 if text != want || rust_framed != row.verify_framed {
                     mismatches.push(format!(
                         "{} (REST path)\n  go:   {}\n  rust: {}",
@@ -3257,6 +3273,16 @@ fn go_and_rust_both_refuse_a_zero_sender_at_decode() {
     }
 }
 
+/// The first `(i, j)` where member `i` repeats the transaction ID of member
+/// `j < i`, the IDs taken with the group ID zeroed (go's `checkTxnGroupID`).
+fn repeated_member(group: &[SignedTransaction]) -> Option<(usize, usize)> {
+    let ids: Vec<_> = group
+        .iter()
+        .map(|s| algo_codec::compute_txn_id_without_group(&s.txn))
+        .collect();
+    (1..ids.len()).find_map(|i| (0..i).find(|&j| ids[j] == ids[i]).map(|j| (i, j)))
+}
+
 /// One signed group of `members` (the group ID computed over them).
 fn signed_group(members: Vec<Transaction>, k: &Key) -> Vec<SignedTransaction> {
     let gid = algo_codec::compute_group_id(&members);
@@ -3279,7 +3305,7 @@ fn pay_txn(k: &Key, to: Address, amount: u64, note: u8) -> Transaction {
 
 /// go's `BlockEvaluator.transaction` is per member, so the FIRST failing member
 /// of a group decides the error and the pool's tag: member 0's overspend is
-/// reported even though member 1 repeats it (a duplicate). The same through
+/// reported even though member 1 overspends too. The same through
 /// `Remember`, with go's frame and tag (issue #2130; the go oracle pins the
 /// texts in `pool_evaluator_matches_go_per_transaction_order`).
 #[test]
@@ -3288,8 +3314,11 @@ fn pool_reports_the_first_failing_member_with_its_own_tag() {
     let a = key(1);
     let b = key(2);
     let (_ledger, pool) = fixture(&[(a.0, funded(5_000_000)), (b.0, funded(1_000_000))], &[]);
+    // Two different overspends (a repeated member is refused by the group
+    // checks first, go v5.1: `checkTxnGroupID`).
     let over = pay_txn(&a, b.0, 900_000_000, 7);
-    let group = signed_group(vec![over.clone(), over], &a);
+    let over_too = pay_txn(&a, b.0, 900_000_000, 8);
+    let group = signed_group(vec![over, over_too], &a);
     let err = pool.remember(group.clone()).expect_err("overspend");
     assert_eq!(classify_pool_error(&err), PoolErrorTag::Overspend, "{err}");
     assert!(
@@ -3305,7 +3334,7 @@ fn pool_reports_the_first_failing_member_with_its_own_tag() {
 /// bare (no `TransactionPool.Remember` / `ingest` frame) and carry the pool
 /// tag the same failure gets on the gossip test stage: too large, group ID,
 /// not well formed. A not-well-formed member is framed as go frames it
-/// (`transaction {..} invalid : <reason>`).
+/// (`transaction <Summary> invalid : <reason>`).
 #[test]
 fn rest_verify_failures_are_bare_and_tagged_like_gossip() {
     use algo_pool::error::{classify_pool_error, PoolErrorTag};
@@ -3342,10 +3371,10 @@ fn rest_verify_failures_are_bare_and_tagged_like_gossip() {
         .remember(vec![sign(long, &a.1)])
         .expect_err("not well formed");
     let text = err.to_string();
-    assert!(text.starts_with("transaction {"), "{text}");
+    assert!(text.starts_with("transaction "), "{text}");
     assert!(
-        text.ends_with("} invalid : transaction window size excessive (1--100000)")
-            || text.contains(" invalid : transaction window size excessive ("),
+        text.contains(" pay from ")
+            && text.contains(" invalid : transaction window size excessive ("),
         "{text}"
     );
     assert!(!text.contains("TransactionPool"), "{text}");

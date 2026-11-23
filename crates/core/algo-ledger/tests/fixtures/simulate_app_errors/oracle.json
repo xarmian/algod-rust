@@ -372,7 +372,7 @@
       "name": "itxn_begin_pay_no_funds",
       "source": "#pragma version 10\nitxn_begin; int pay; itxn_field TypeEnum; txn Sender; itxn_field Receiver; int 1; itxn_field Amount; itxn_submit; int 1",
       "group_msgpack": "gaN0eG6KpGFwYXDEEQogAQGxIrIQMQCyByKyCLMipGFwc3XEAwqBAaNmZWXNA+iiZnYBo2dlbr1zaW11bGF0ZS1hcHAtZXJyb3JzLW9yYWNsZS12MaJnaMQgIPixApD1zKBuEnFHaaegtCweajx4HNIE2rdK1nzDMGuibHbNA+ikbm90ZcQXaXR4bl9iZWdpbl9wYXlfbm9fZnVuZHOjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGw=",
-      "failure_message": "transaction ATWMYK2MAFXLUAMMZGAAHQQAWUBTJR7T7HX6VA5M5GKJI5LXSTYA: logic eval error: inner tx 0 failed: overspend (account OKSDOCOXVGMBXQ5TP5YA4VWTZWZJLJP3OMIILPHMHGHURUFE2Q3JP62QNU, data {AccountBaseData:{Status:Offline MicroAlgos:0.0A RewardsBase:0 RewardedMicroAlgos:0.0A AuthAddr:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ IncentiveEligible:false TotalAppSchema:{NumUint:0 NumByteSlice:0} TotalExtraAppPages:0 TotalAppParams:0 TotalAppLocalStates:0 TotalAssetParams:0 TotalAssets:0 TotalBoxes:0 TotalBoxBytes:0 LastProposed:0 LastHeartbeat:0} VotingData:{VoteID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] SelectionID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] StateProofID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] VoteFirstValid:0 VoteLastValid:0 VoteKeyDilution:0}}, tried to spend 1mA). Details: app=1001, pc=15, opcodes=intc_0 // 1; itxn_field Amount; itxn_submit",
+      "failure_message": "transaction ATWMYK2MAFXLUAMMZGAAHQQAWUBTJR7T7HX6VA5M5GKJI5LXSTYA: logic eval error: inner tx 0 failed: overspend (account OKSDOCOXVGMBXQ5TP5YA4VWTZWZJLJP3OMIILPHMHGHURUFE2Q3JP62QNU, data {AccountBaseData:{Status:Offline MicroAlgos:0.0A RewardsBase:0 RewardedMicroAlgos:0.0A AuthAddr:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ IncentiveEligible:false TotalAppSchema:{NumUint:0 NumByteSlice:0} TotalExtraAppPages:0 TotalAppParams:0 TotalAppLocalStates:0 TotalAssetParams:0 TotalAssets:0 TotalBoxes:0 TotalBoxBytes:0 LastProposed:0 LastHeartbeat:0} VotingData:{VoteID:0000000000000000000000000000000000000000000000000000000000000000 SelectionID:0000000000000000000000000000000000000000000000000000000000000000 StateProofID:00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 VoteFirstValid:0 VoteLastValid:0 VoteKeyDilution:0}}, tried to spend 1mA). Details: app=1001, pc=15, opcodes=intc_0 // 1; itxn_field Amount; itxn_submit",
       "failed_at": [
         0,
         0
@@ -382,7 +382,7 @@
       "name": "itxn_field_wrong_type",
       "source": "#pragma version 10\nitxn_begin; byte \"x\"; callsub ident; itxn_field Amount; int 1; return\nident: retsub",
       "group_msgpack": "gaN0eG6KpGFwYXDEDgqxgAF4iAAFsgiBAUOJpGFwc3XEAwqBAaNmZWXNA+iiZnYBo2dlbr1zaW11bGF0ZS1hcHAtZXJyb3JzLW9yYWNsZS12MaJnaMQgIPixApD1zKBuEnFHaaegtCweajx4HNIE2rdK1nzDMGuibHbNA+ikbm90ZcQVaXR4bl9maWVsZF93cm9uZ190eXBlo3NuZMQgCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgqkdHlwZaRhcHBs",
-      "failure_message": "transaction Q4Q37W24GUMC4DVEXWKATSVYLRJCKWZW22QJDNW2PGHJ7WSEYNGQ: logic eval error: []byte{0x78} is not a uint64. Details: app=1001, pc=8, opcodes=pushbytes 0x78 // \"x\"; callsub label1; itxn_field Amount",
+      "failure_message": "transaction Q4Q37W24GUMC4DVEXWKATSVYLRJCKWZW22QJDNW2PGHJ7WSEYNGQ: logic eval error: x is not a uint64. Details: app=1001, pc=8, opcodes=pushbytes 0x78 // \"x\"; callsub label1; itxn_field Amount",
       "failed_at": [
         0
       ]
@@ -799,7 +799,7 @@
       "name": "raw_check_branch_varint_outside",
       "source": "raw approval=0d4214 clear=0d8101",
       "group_msgpack": "gaN0eG6KpGFwYXDEAw1CFKRhcHN1xAMNgQGjZmVlzQPoomZ2AaNnZW69c2ltdWxhdGUtYXBwLWVycm9ycy1vcmFjbGUtdjGiZ2jEICD4sQKQ9cygbhJxR2mnoLQsHmo8eBzSBNq3StZ8wzBromx2zQPopG5vdGXEH3Jhd19jaGVja19icmFuY2hfdmFyaW50X291dHNpZGWjc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlpGFwcGw=",
-      "failure_message": "transaction 6RDYRT4EP7ZYTJWMCDXKJDUFKQ66XPITYTNUFSYUSLM2JT3U4XBQ: check failed on ApprovalProgram: pc=  1 branch target 13 outside of program",
+      "failure_message": "transaction 6RDYRT4EP7ZYTJWMCDXKJDUFKQ66XPITYTNUFSYUSLM2JT3U4XBQ: check failed on ApprovalProgram: pc=  1 branch offset 10 outside of program",
       "failed_at": [
         0
       ]

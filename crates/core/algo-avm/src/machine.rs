@@ -779,7 +779,7 @@ impl AvmMachine {
     #[inline]
     pub fn charge_cost(&mut self, cost: u64) -> Result<(), AlgoError> {
         if cost as i64 > self.budget {
-            return Err(self.budget_exceeded_error());
+            return Err(self.budget_exceeded_error(cost));
         }
         // Track this program's own cumulative cost independently of the shared
         // (pooled) budget, mirroring go-algorand's `cx.cost`.
@@ -788,21 +788,21 @@ impl AvmMachine {
         Ok(())
     }
 
-    /// go's `step`: `dynamic cost budget exceeded, executing <op>: local
-    /// program cost was <cost so far>`. The budget compared is the pooled one
+    /// go's `step`: `dynamic cost budget exceeded, executing <op> (<opcost>):
+    /// local program cost was <cost so far>` (the `(<opcost>)` is go v5.1's). The budget compared is the pooled one
     /// and the figure printed is this program's own `cost`, both as go's
     /// (`remainingBudget()` vs `cx.cost`). Outside an instruction (direct
     /// calls) there is no opcode to name.
     #[cold]
     #[inline(never)]
-    fn budget_exceeded_error(&self) -> AlgoError {
+    fn budget_exceeded_error(&self, opcost: u64) -> AlgoError {
         let message = match self.current_op_name() {
             "" => format!(
                 "dynamic cost budget exceeded: local program cost was {}",
                 self.cost
             ),
             name => format!(
-                "dynamic cost budget exceeded, executing {name}: local program cost was {}",
+                "dynamic cost budget exceeded, executing {name} ({opcost}): local program cost was {}",
                 self.cost
             ),
         };

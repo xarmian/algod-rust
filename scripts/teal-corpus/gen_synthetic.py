@@ -44,6 +44,12 @@ def main():
         default="3,8,14",
         help="versions at which every immediate byte value is swept (comma separated)",
     )
+    ap.add_argument(
+        "--max-version",
+        type=int,
+        default=15,
+        help="highest program version generated (go v5.1's AVM v14 is not ported yet: #2549)",
+    )
     a = ap.parse_args()
 
     sweep_versions = {int(x) for x in a.sweep_versions.split(",") if x}
@@ -60,7 +66,7 @@ def main():
             f.write(p)
 
     fills = [b"", b"\x00", b"\x01\x02", b"\x03\x00\x00\x00", b"\xff\xff\xff\xff\xff"]
-    for v in range(0, 16):
+    for v in range(0, a.max_version + 1):
         for b in range(256):
             for fill in fills:
                 emit(bytes([v, b]) + fill)
@@ -101,7 +107,7 @@ def main():
     for _ in range(a.random):
         n = rnd.randint(1, 40)
         data = bytearray(rnd.randrange(256) for _ in range(n))
-        data[0] = rnd.randint(0, 15)
+        data[0] = rnd.randint(0, a.max_version)
         emit(bytes(data))
     print(f"{len(seen)} programs in {pdir}", file=sys.stderr)
 

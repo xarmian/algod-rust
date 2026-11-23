@@ -106,7 +106,7 @@
       "stage": "A",
       "round": 0,
       "group_msgpack": "gaN0eG6Lo2FtdM4AD0JAo2ZlZc0D6KJmdgGjZ2Vuu3NpbXVsYXRlLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQgJ6Mcw8919EYod+cYAUWtUCH5BxyJHN8iI0n0tR8HvVejZ3JwxCCw525aHL+SuoTcpwMWfPhkAaNsJQukby9aGs3PIyJ1xaJsds0D6KRub3RlxAV0d2ljZaNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgqkdHlwZaNwYXmBo3R4boujYW10zgAPQkCjZmVlzQPoomZ2AaNnZW67c2ltdWxhdGUtY2hlY2tkdXAtb3JhY2xlLXYxomdoxCAnoxzDz3X0Rih35xgBRa1QIfkHHIkc3yIjSfS1Hwe9V6NncnDEILDnblocv5K6hNynAxZ8+GQBo2wlC6RvL1oazc8jInXFomx2zQPopG5vdGXEBXR3aWNlo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCqR0eXBlo3BheQ==",
-      "failure_message": "transaction already in ledger: MP2F5PCEQ2GMFTKDBEU6CLVFXWRDNKRFJJ5CGLX2P76WKRBL4TWA",
+      "failure_message": "transactionGroup: duplicate transaction: [1] repeats [0]",
       "failed_at": [
         1
       ]

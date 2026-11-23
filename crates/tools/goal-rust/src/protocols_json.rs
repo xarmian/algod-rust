@@ -117,6 +117,31 @@ fn params_json(version: &str, p: &ConsensusParams) -> Json {
             "AllowZeroLocalAppRef",
             Json::Bool(p.allow_zero_local_app_ref),
         ),
+        // go v5.1.0-beta parameters (vFuture only):
+        (
+            "AllowGroupedHeartbeats",
+            Json::Bool(p.allow_grouped_heartbeats),
+        ),
+        (
+            "DiscardFailedInnerClearStateDelta",
+            Json::Bool(p.discard_failed_inner_clear_state_delta),
+        ),
+        (
+            "EnableSigSchemeEd25519",
+            Json::Bool(p.enable_sig_scheme_ed25519),
+        ),
+        (
+            "EnableSigSchemeFalcon512",
+            Json::Bool(p.enable_sig_scheme_falcon512),
+        ),
+        (
+            "EnableSigSchemeLogicSig",
+            Json::Bool(p.enable_sig_scheme_logic_sig),
+        ),
+        (
+            "RequireLogicSigArgAccess",
+            Json::Bool(p.require_logic_sig_arg_access),
+        ),
         (
             "AppFlatOptInMinBalance",
             Json::Uint(p.app_flat_opt_in_min_balance),

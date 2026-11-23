@@ -35,8 +35,10 @@
 //	txn          transactions.Transaction
 //	applydata    transactions.ApplyData
 //	evaldelta    transactions.EvalDelta
-//	txsync       []transactions.SignedTxn  (tx-sync response, rpcs/httpTxSync.go:
-//	                                        protocol.DecodeReflect, issue #2396)
+//	txsync       txSyncResponse            (tx-sync response, rpcs/httpTxSync.go:
+//	                                        protocol.Decode of the generated
+//	                                        []transactions.SignedTxn, go v5.1 #6729;
+//	                                        protocol.DecodeReflect before, issue #2396)
 //
 // and, with $STRICT_SEEDS_OUT, writes fully populated random seeds, and, with
 // $STRICT_SCHEMA_OUT, the msgp field layout (keys in go's declaration order,
@@ -132,9 +134,9 @@ func TestStrictDecodeOracleRpcs(t *testing.T) {
 			case "evaldelta":
 				dec(&transactions.EvalDelta{})
 			case "txsync":
-				// the go-codec decode, then each transaction's msgp encode
-				var v []transactions.SignedTxn
-				if derr = protocol.DecodeReflect(b, &v); derr == nil {
+				// the generated decode (go v5.1), then each transaction's msgp encode
+				var v txSyncResponse
+				if derr = protocol.Decode(b, &v); derr == nil {
 					val = []byte{}
 					for i := range v {
 						val = append(val, protocol.Encode(&v[i])...)

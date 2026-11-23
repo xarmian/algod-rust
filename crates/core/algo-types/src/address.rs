@@ -61,7 +61,7 @@ impl Address {
     /// and matches that acceptance behavior (see also
     /// `algo-avm::assembler::program_hash_is_edwards25519_point`, which uses
     /// the identical check for LogicSig contract-account addresses).
-    pub fn is_pq_compliant(&self) -> bool {
+    pub fn is_off_ed25519_curve(&self) -> bool {
         curve25519_dalek::edwards::CompressedEdwardsY(self.0)
             .decompress()
             .is_none()

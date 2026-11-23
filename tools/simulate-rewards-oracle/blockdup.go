@@ -877,8 +877,11 @@ func blockDupOracle() {
 		// <%+v of the SignedTxn> invalid : <reason>`, kept in full (issue
 		// #2451): only a heartbeat's pointer address is masked.
 		row.VerifyError = maskPointers(errText(verr))
-		if strings.HasPrefix(row.VerifyError, "transaction {") &&
-			strings.Contains(row.VerifyError, "} invalid : ") {
+		// go v5.1 prints `SignedTxn.Summary()` there (`<txid> <type> from
+		// <sender> live <first>-<last> ...`), not the `%+v` dump.
+		if at := strings.Index(row.VerifyError, " invalid : "); at > 0 &&
+			strings.HasPrefix(row.VerifyError, "transaction ") &&
+			strings.Contains(row.VerifyError[:at], " from ") {
 			row.VerifyFramed = true
 		}
 		res, serr := simulation.MakeSimulator(l, false).Simulate(simulation.Request{
@@ -887,7 +890,8 @@ func blockDupOracle() {
 		row.SimulateError = maskPointers(errText(serr))
 		if serr == nil {
 			row.SimulateFailure = maskPointers(res.TxnGroups[0].FailureMessage)
-			// The framed texts are the same dump twice: keep one copy.
+			// A framed verify error is not simulate's text (go v5.1 prints the
+			// inner TxGroupError there); an equal text is kept once.
 			if row.VerifyFramed && row.SimulateFailure == row.VerifyError {
 				row.SimulateFailure = ""
 				row.SimulateFailureIsVerifyError = true

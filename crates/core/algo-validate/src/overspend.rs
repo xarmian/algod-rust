@@ -34,7 +34,7 @@
 //! (`eval.go` `Move`: `Data: fromBal`): for the fee move that is the stored
 //! account, for the amount move it is the state after the fee move
 //! (pending rewards applied, fee debited). The field order, names and
-//! formats below were captured from a go-algorand v5.0.5-stable node.
+//! formats below were captured from a go-algorand v5.1.1-stable node.
 
 use algo_types::{AccountData, AccountStatus, Address};
 
@@ -49,10 +49,11 @@ fn status_name(status: AccountStatus) -> &'static str {
     }
 }
 
-/// Go's `%v` of a byte array: `[1 2 3]`.
-fn byte_array(bytes: &[u8]) -> String {
-    let items: Vec<String> = bytes.iter().map(u8::to_string).collect();
-    format!("[{}]", items.join(" "))
+/// The `String()` go v5.1 gives `OneTimeSignatureVerifier`, `VrfPubkey` and
+/// `merklesignature.Commitment` (#6798): lowercase hex, which `%+v` prints in
+/// place of the `[1 2 3]` of a bare byte array.
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Go's `%+v` of `ledgercore.AccountData`.
@@ -83,9 +84,9 @@ VoteLastValid:{vlv} VoteKeyDilution:{vkd}}}}}",
         box_bytes = data.total_box_bytes,
         proposed = data.last_proposed,
         heartbeat = data.last_heartbeat,
-        vote_id = byte_array(&data.vote_id.unwrap_or([0u8; 32])),
-        sel_id = byte_array(&data.selection_id.unwrap_or([0u8; 32])),
-        sp_id = byte_array(&data.state_proof_id.unwrap_or([0u8; 64])),
+        vote_id = hex_bytes(&data.vote_id.unwrap_or([0u8; 32])),
+        sel_id = hex_bytes(&data.selection_id.unwrap_or([0u8; 32])),
+        sp_id = hex_bytes(&data.state_proof_id.unwrap_or([0u8; 64])),
         vfv = data.vote_first_valid,
         vlv = data.vote_last_valid,
         vkd = data.vote_key_dilution,
@@ -131,7 +132,7 @@ mod tests {
 
     /// Captured from go-algorand v5.0.5-stable (private network, validly
     /// signed payment of 5 Algo from an account holding 1.5 Algo, fee 1000):
-    const CAPTURED_5A: &str = "transaction OEAWIVYPTO2XPMB32G6LKW43P47HYQJZ2PLWZU3N2RACI254YUPQ: overspend (account E3EC3FBAHHXDCRGWFGPKDEXVJ2J4N25J7BUU4D6IAW7HNRSDOBSSJSJ4OA, data {AccountBaseData:{Status:Offline MicroAlgos:1.499000A RewardsBase:0 RewardedMicroAlgos:0.0A AuthAddr:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ IncentiveEligible:false TotalAppSchema:{NumUint:0 NumByteSlice:0} TotalExtraAppPages:0 TotalAppParams:0 TotalAppLocalStates:0 TotalAssetParams:0 TotalAssets:0 TotalBoxes:0 TotalBoxBytes:0 LastProposed:0 LastHeartbeat:0} VotingData:{VoteID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] SelectionID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] StateProofID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] VoteFirstValid:0 VoteLastValid:0 VoteKeyDilution:0}}, tried to spend 5A)";
+    const CAPTURED_5A: &str = "transaction OEAWIVYPTO2XPMB32G6LKW43P47HYQJZ2PLWZU3N2RACI254YUPQ: overspend (account E3EC3FBAHHXDCRGWFGPKDEXVJ2J4N25J7BUU4D6IAW7HNRSDOBSSJSJ4OA, data {AccountBaseData:{Status:Offline MicroAlgos:1.499000A RewardsBase:0 RewardedMicroAlgos:0.0A AuthAddr:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ IncentiveEligible:false TotalAppSchema:{NumUint:0 NumByteSlice:0} TotalExtraAppPages:0 TotalAppParams:0 TotalAppLocalStates:0 TotalAssetParams:0 TotalAssets:0 TotalBoxes:0 TotalBoxBytes:0 LastProposed:0 LastHeartbeat:0} VotingData:{VoteID:0000000000000000000000000000000000000000000000000000000000000000 SelectionID:0000000000000000000000000000000000000000000000000000000000000000 StateProofID:00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 VoteFirstValid:0 VoteLastValid:0 VoteKeyDilution:0}}, tried to spend 5A)";
 
     #[test]
     fn the_message_is_byte_identical_to_a_live_go_capture() {
@@ -192,9 +193,9 @@ mod tests {
         assert!(text.contains(&format!("AuthAddr:{}", Address([9u8; 32]).to_algorand_string())), "{text}");
         assert!(text.contains("IncentiveEligible:true"), "{text}");
         assert!(text.contains("TotalExtraAppPages:1 TotalAppParams:2 TotalAppLocalStates:4 TotalAssetParams:5 TotalAssets:3 TotalBoxes:6 TotalBoxBytes:700 LastProposed:11 LastHeartbeat:12}"), "{text}");
-        assert!(text.contains(&format!("VoteID:{}", byte_array(&[7u8; 32]))), "{text}");
-        assert!(text.contains("SelectionID:[0 0"), "{text}");
+        assert!(text.contains(&format!("VoteID:{}", "07".repeat(32))), "{text}");
+        assert!(text.contains("SelectionID:0000"), "{text}");
         assert!(text.contains("VoteFirstValid:10 VoteLastValid:20 VoteKeyDilution:100}}"), "{text}");
-        assert!(text.contains("StateProofID:[1 1"), "{text}");
+        assert!(text.contains("StateProofID:0101"), "{text}");
     }
 }

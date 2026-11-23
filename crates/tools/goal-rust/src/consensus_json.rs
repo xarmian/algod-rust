@@ -80,7 +80,6 @@ pub fn decode(data: &[u8]) -> Result<(), String> {
         data: &data[..n],
         off: 0,
         saved: None,
-        ctx_struct: None,
         stack: Vec::new(),
     };
     d.value(Ty::Protocols);
@@ -144,31 +143,83 @@ struct Scanner {
     step: State,
     parse: Vec<Parse>,
     err: Option<String>,
+    /// The input and the offset of the byte being stepped: v2's errors name the
+    /// whole rune at the offending offset.
+    data: Vec<u8>,
+    pos: usize,
 }
 
 fn is_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\r' | b'\n')
 }
 
-/// go: `quoteChar` -- `strconv.Quote(string(c))`, the byte as a rune.
-fn quote_char(c: u8) -> String {
-    let q = match c {
-        b'\'' => return r"'\''".to_string(),
-        b'"' => return "'\"'".to_string(),
-        0x07 => r"\a".to_string(),
-        0x08 => r"\b".to_string(),
-        0x0c => r"\f".to_string(),
-        b'\n' => r"\n".to_string(),
-        b'\r' => r"\r".to_string(),
-        b'\t' => r"\t".to_string(),
-        0x0b => r"\v".to_string(),
-        b'\\' => r"\\".to_string(),
-        0x00..=0x1f | 0x7f => format!(r"\x{c:02x}"),
-        // go's `strconv.IsPrint`: U+0080..U+00A0 and U+00AD are not printable
-        0x80..=0xa0 | 0xad => format!(r"\u{c:04x}"),
-        _ => char::from(c).to_string(),
+/// go's `strconv.IsPrint`, for the code points an error text can hold: control
+/// characters, the other separators and the invisible format characters are not.
+fn is_print(r: char) -> bool {
+    let c = r as u32;
+    !(c < 0x20
+        || (0x7f..=0xa0).contains(&c)
+        || c == 0xad
+        || (0x600..=0x605).contains(&c)
+        || c == 0x61c
+        || c == 0x6dd
+        || c == 0x70f
+        || c == 0x180e
+        || (0x2000..=0x200f).contains(&c)
+        || (0x2028..=0x202f).contains(&c)
+        || (0x205f..=0x206f).contains(&c)
+        || c == 0x3000
+        || c == 0xfeff
+        || (0xfff9..=0xfffb).contains(&c)
+        || (0xe000..=0xf8ff).contains(&c))
+}
+
+/// go's `strconv.Quote` of a string (double quotes included).
+fn strconv_quote(s: &str) -> String {
+    format!("\"{}\"", quote_body(s.chars(), '"'))
+}
+
+fn quote_body(chars: impl Iterator<Item = char>, quote: char) -> String {
+    let mut out = String::new();
+    for r in chars {
+        match r {
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\\' => out.push_str("\\\\"),
+            '\u{7}' => out.push_str("\\a"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{b}' => out.push_str("\\v"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c if is_print(c) => out.push(c),
+            c if (c as u32) < 0x10000 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push_str(&format!("\\U{:08x}", c as u32)),
+        }
+    }
+    out
+}
+
+/// jsonwire's `QuoteRune` (go 1.27's `encoding/json` runs on the v2 decoder):
+/// the first rune of `rest` through `strconv.QuoteRune`, `\xNN` for invalid UTF-8.
+fn quote_rune(rest: &[u8]) -> String {
+    let first = rest[0];
+    let head = &rest[..rest.len().min(4)];
+    let valid = match std::str::from_utf8(head) {
+        Ok(s) => s,
+        Err(e) => std::str::from_utf8(&head[..e.valid_up_to()]).unwrap_or(""),
     };
-    format!("'{q}'")
+    match valid.chars().next() {
+        Some('\'') => "'\\''".to_string(),
+        Some(r) => format!("'{}'", quote_body(std::iter::once(r), '\'')),
+        None => format!("'\\x{first:x}'"),
+    }
 }
 
 impl Scanner {
@@ -177,12 +228,59 @@ impl Scanner {
             step: State::BeginValue,
             parse: Vec::new(),
             err: None,
+            data: Vec::new(),
+            pos: 0,
         }
     }
 
     fn error(&mut self, c: u8, context: &str) -> Op {
         self.step = State::Error;
-        self.err = Some(format!("invalid character {} {context}", quote_char(c)));
+        // go 1.27's v2 syntax errors: v1's `in string literal` is `in string`,
+        // every number error `in numeric literal`.
+        let context = match context {
+            "in string literal" => "in string",
+            "after decimal point in numeric literal" | "in exponent of numeric literal" => {
+                "in numeric literal"
+            }
+            other => other,
+        };
+        let rest = self.data.get(self.pos..).filter(|r| !r.is_empty());
+        let quoted = quote_rune(rest.unwrap_or(&[c]));
+        self.err = Some(format!("invalid character {quoted} {context}"));
+        Op::Error
+    }
+
+    /// An invalid escape sequence in a string (jsonwire's
+    /// `NewInvalidEscapeSequenceError`): the backslash and the next byte, or
+    /// for `\u` the four bytes after it.
+    fn escape_error(&mut self, u: bool) -> Op {
+        self.step = State::Error;
+        // `self.pos` is the offending byte; the escape began before it.
+        let seq: Vec<u8> = if u {
+            let digits = match self.data[..self.pos].iter().rposition(|&b| b == b'u') {
+                Some(at) => self.pos - at - 1,
+                None => 0,
+            };
+            let start = self.pos - digits - 2;
+            let end = (start + 6).min(self.data.len());
+            self.data[start..end].to_vec()
+        } else {
+            let mut v = vec![b'\\'];
+            v.extend_from_slice(&self.data[self.pos..(self.pos + 1).min(self.data.len())]);
+            v
+        };
+        let what = String::from_utf8_lossy(&seq).into_owned();
+        let need_escape = what
+            .chars()
+            .any(|r| r == '`' || r == '\u{fffd}' || r.is_whitespace() || !is_print(r));
+        let text = if what.chars().count() == 1 {
+            quote_rune(&seq)
+        } else if need_escape {
+            strconv_quote(&what)
+        } else {
+            format!("`{what}`")
+        };
+        self.err = Some(format!("invalid escape sequence {text} in string"));
         Op::Error
     }
 
@@ -244,7 +342,7 @@ impl Scanner {
                     self.step = State::InStringEscU(0);
                     Op::Continue
                 }
-                _ => self.error(c, "in string escape code"),
+                _ => self.escape_error(false),
             },
             State::InStringEscU(n) => {
                 if c.is_ascii_hexdigit() {
@@ -255,7 +353,7 @@ impl Scanner {
                     };
                     return Op::Continue;
                 }
-                self.error(c, r"in \u hexadecimal character escape")
+                self.escape_error(true)
             }
             State::Neg => {
                 if c == b'0' {
@@ -447,7 +545,9 @@ impl Scanner {
 /// decoder's error.
 fn read_value(data: &[u8]) -> Result<usize, String> {
     let mut s = Scanner::new();
+    s.data = data.to_vec();
     for (i, &c) in data.iter().enumerate() {
+        s.pos = i;
         match s.step(c) {
             Op::End => return Ok(i),
             Op::EndObject | Op::EndArray if s.parse.is_empty() => return Ok(i + 1),
@@ -481,8 +581,6 @@ enum Kind {
 }
 
 struct StructType {
-    /// `reflect.Type.Name()`.
-    name: &'static str,
     /// `reflect.Type.String()`.
     type_name: &'static str,
     fields: &'static [(&'static str, Kind)],
@@ -517,9 +615,9 @@ struct Decoder<'a> {
     off: usize,
     /// go: `decodeState.savedError` -- the first type error.
     saved: Option<String>,
-    /// go: `errorContext.Struct` / `errorContext.FieldStack`.
-    ctx_struct: Option<&'static str>,
-    stack: Vec<&'static str>,
+    /// go 1.27's v2 path of the value being decoded: the JSON object names from
+    /// the root, map keys and field names as the input wrote them.
+    stack: Vec<String>,
 }
 
 impl Decoder<'_> {
@@ -535,10 +633,10 @@ impl Decoder<'_> {
             return;
         }
         let ty_name = ty.type_name();
-        self.saved = Some(if self.ctx_struct.is_some() || !self.stack.is_empty() {
+        self.saved = Some(if !self.stack.is_empty() {
+            // v2 names the root type, then the path (`ConsensusProtocols.v.MinTxnFee`).
             format!(
-                "json: cannot unmarshal {what} into Go struct field {}.{} of type {ty_name}",
-                self.ctx_struct.unwrap_or(""),
+                "json: cannot unmarshal {what} into Go struct field ConsensusProtocols.{} of type {ty_name}",
                 self.stack.join(".")
             )
         } else {
@@ -647,7 +745,6 @@ impl Decoder<'_> {
                 return;
             }
         };
-        let orig_struct = self.ctx_struct;
         let orig_len = self.stack.len();
         self.skip_space();
         if self.data[self.off] == b'}' {
@@ -661,18 +758,21 @@ impl Decoder<'_> {
             self.off += 1; // ':'
             let sub = match fields {
                 Some(st) => match lookup(st, &key) {
-                    Some((name, kind)) => {
-                        self.ctx_struct = Some(st.name);
-                        self.stack.push(name);
+                    Some((_, kind)) => {
+                        self.stack.push(key.clone());
                         Ty::Field(kind)
                     }
                     None => Ty::Skip,
                 },
-                None => elem,
+                None => {
+                    if !matches!(elem, Ty::Skip) {
+                        self.stack.push(key.clone());
+                    }
+                    elem
+                }
             };
             self.value(sub);
             self.stack.truncate(orig_len);
-            self.ctx_struct = orig_struct;
             self.skip_space();
             let c = self.data[self.off];
             self.off += 1;
@@ -757,19 +857,16 @@ fn unquote(raw: &[u8]) -> String {
 }
 
 static CONSENSUS_PARAMS: StructType = StructType {
-    name: "ConsensusParams",
     type_name: "config.ConsensusParams",
     fields: &CONSENSUS_PARAMS_FIELDS,
 };
 
 static PAYOUTS: StructType = StructType {
-    name: "ProposerPayoutRules",
     type_name: "config.ProposerPayoutRules",
     fields: &PAYOUTS_FIELDS,
 };
 
 static BONUS: StructType = StructType {
-    name: "BonusPlan",
     type_name: "config.BonusPlan",
     fields: &BONUS_FIELDS,
 };
@@ -967,7 +1064,7 @@ mod tests {
         );
         assert_eq!(
             err("\u{feff}{}"),
-            "invalid character 'ï' looking for beginning of value"
+            r"invalid character '\ufeff' looking for beginning of value"
         );
         assert_eq!(
             err(r#"{"a":1,}"#),
@@ -979,7 +1076,7 @@ mod tests {
         );
         assert_eq!(
             err("{\"a\":\u{a0}}"),
-            "invalid character 'Â' looking for beginning of value"
+            r"invalid character '\u00a0' looking for beginning of value"
         );
         assert_eq!(
             err("[1,]"),
@@ -1005,28 +1102,28 @@ mod tests {
         );
         assert_eq!(
             err(r#"{"v":"x"}"#),
-            "json: cannot unmarshal string into Go value of type config.ConsensusParams"
+            "json: cannot unmarshal string into Go struct field ConsensusProtocols.v of type config.ConsensusParams"
         );
         assert_eq!(
             err(r#"{"v":{"mintxnfee":1.5}}"#),
-            "json: cannot unmarshal number 1.5 into Go struct field ConsensusParams.MinTxnFee of type uint64"
+            "json: cannot unmarshal number 1.5 into Go struct field ConsensusProtocols.v.mintxnfee of type uint64"
         );
         assert_eq!(
             err(r#"{"v":{"Bonus":{"BaseRound":true}}}"#),
-            "json: cannot unmarshal bool into Go struct field BonusPlan.Bonus.BaseRound of type uint64"
+            "json: cannot unmarshal bool into Go struct field ConsensusProtocols.v.Bonus.BaseRound of type uint64"
         );
         assert_eq!(
             err(r#"{"v":{"ApprovedUpgrades":{"w":"x"}}}"#),
-            "json: cannot unmarshal string into Go struct field ConsensusParams.ApprovedUpgrades of type uint64"
+            "json: cannot unmarshal string into Go struct field ConsensusProtocols.v.ApprovedUpgrades.w of type uint64"
         );
         assert_eq!(
             err(r#"{"v":{"MaxAssetDecimals":4294967296}}"#),
-            "json: cannot unmarshal number 4294967296 into Go struct field ConsensusParams.MaxAssetDecimals of type uint32"
+            "json: cannot unmarshal number 4294967296 into Go struct field ConsensusProtocols.v.MaxAssetDecimals of type uint32"
         );
         // the first error wins; unknown fields and nulls are fine
         assert_eq!(
             err(r#"{"v":{"Nope":"a","MinTxnFee":null,"MaxTxnLife":"a"},"w":{"MinTxnFee":"b"}}"#),
-            "json: cannot unmarshal string into Go struct field ConsensusParams.MaxTxnLife of type uint64"
+            "json: cannot unmarshal string into Go struct field ConsensusProtocols.v.MaxTxnLife of type uint64"
         );
         assert_eq!(
             decode(br#"{"v":{"MaxAppProgramLen":-5,"MinTxnFee":7}}"#),

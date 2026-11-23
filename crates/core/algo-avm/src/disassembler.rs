@@ -250,8 +250,8 @@ enum Group {
 
 /// go's `imm.Group.Names[b]` for the `imm_idx`-th immediate of `op`. The
 /// transaction-field groups differ per opcode: the scalar opcodes list only
-/// non-array fields, the `*a`/`*as` opcodes only array fields, and
-/// `itxn_field`/`gitxn` every field.
+/// non-array fields (`gitxn` since go v5.1), the `*a`/`*as` opcodes only
+/// array fields, and `itxn_field` every field.
 fn group_name(op: &str, imm_idx: usize, b: u8) -> Group {
     let txn_names = |want_array: Option<bool>| match fields::txn_field_name(b) {
         Some(n) => {
@@ -265,7 +265,10 @@ fn group_name(op: &str, imm_idx: usize, b: u8) -> Group {
         None => Group::Invalid,
     };
     match (op, imm_idx) {
-        ("txn", 0) | ("gtxn", 1) | ("gtxns", 0) | ("itxn", 0) => txn_names(Some(false)),
+        // go v5.1 lists `gitxn` among the scalar-field opcodes (`TxnScalarFields`).
+        ("txn", 0) | ("gtxn", 1) | ("gtxns", 0) | ("itxn", 0) | ("gitxn", 1) => {
+            txn_names(Some(false))
+        }
         ("txna", 0)
         | ("gtxna", 1)
         | ("gtxnsa", 0)
@@ -276,7 +279,7 @@ fn group_name(op: &str, imm_idx: usize, b: u8) -> Group {
         | ("itxnas", 0)
         | ("gitxna", 1)
         | ("gitxnas", 1) => txn_names(Some(true)),
-        ("itxn_field", 0) | ("gitxn", 1) => txn_names(None),
+        ("itxn_field", 0) => txn_names(None),
         // Only the box-access fields are settable with app_params_set.
         ("app_params_set", 0) if b < 11 => Group::Invalid,
         _ if fields::opcode_immediate_is_field(op, imm_idx) => {
@@ -472,6 +475,14 @@ impl<'a> Dis<'a> {
                         let (v, n) = varint(&program[pc..]);
                         if n <= 0 {
                             return Err(format!("could not decode label for {}", spec.name));
+                        }
+                        // go v5.1: an offset longer than the program is refused outright.
+                        let len = program.len() as i64;
+                        if v > len || v < -len {
+                            return Err(format!(
+                                "branch offset {v} outside of program for {}",
+                                spec.name
+                            ));
                         }
                         (v, n as usize)
                     } else {

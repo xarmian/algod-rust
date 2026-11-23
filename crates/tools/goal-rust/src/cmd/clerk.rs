@@ -215,6 +215,7 @@ fn run_send_inner(
         args.from_program_bytes.as_deref(),
         args.logic_sig.as_deref(),
         &args.argb64,
+        args.salted,
     )?;
 
     // Resolve from (default account if unset) + to via the accountList name map
@@ -342,14 +343,18 @@ fn run_send_inner(
     let mut stx = if let Some(resolved) = resolved_lsig.as_ref() {
         let mut s = SignedTransaction {
             txn: txn.clone(),
-            lsig: Some(resolved.lsig.clone()),
             ..SignedTransaction::default()
         };
         if resolved.is_program_account {
             // Program-account path: set the AuthAddr (clerk.go:484-488). Go runs
             // no sanity check here; the node verifies on submit.
             s.auth_addr = auth_addr;
+            clerk_sign::authorize_with_program(&mut s, resolved.lsig.clone(), args.salted)?;
         } else {
+            // go v5.1 settles the authorizer, then which of the program's two
+            // addresses it authorizes from (`authorizeWithProgram`).
+            s.auth_addr = auth_addr;
+            clerk_sign::authorize_with_program(&mut s, resolved.lsig.clone(), args.salted)?;
             // Delegated LogicSig path: go's `verify.LogicSigSanityCheck` under
             // the node's consensus version before broadcast (clerk.go:440-462;
             // `PrepareGroupContext` fails with `protocol.Error` on a version
@@ -357,9 +362,13 @@ fn run_send_inner(
             let sanity = match algo_types::consensus::consensus_params_for_version(
                 &params.consensus_version,
             ) {
-                Some(consensus) => {
-                    algo_validate::logicsig_sanity_check(&s, &resolved.lsig, &consensus)
-                }
+                Some(consensus) => match s.pqsig.as_ref().filter(|p| p.scheme == *b"ls") {
+                    // an `ls`-scheme proof carries its program in the SaltedKeySig
+                    Some(sksig) => {
+                        algo_validate::sksig_logicsig_sanity_check(&s, sksig, &consensus).map(|_| ())
+                    }
+                    None => algo_validate::logicsig_sanity_check(&s, &resolved.lsig, &consensus),
+                },
                 None => Err(format!(
                     "protocol not supported: {}",
                     params.consensus_version
@@ -503,6 +512,7 @@ fn resolve_send_lsig(
     from_program_bytes: Option<&str>,
     logic_sig_file: Option<&str>,
     arg_b64: &[String],
+    salted: bool,
 ) -> Result<Option<ResolvedSendLsig>, String> {
     const COLLISION: &str = "should use at most one of --from-program/-F or \
                              --from-program-bytes/-P --logic-sig/-L";
@@ -523,7 +533,7 @@ fn resolve_send_lsig(
                         .collect(),
                 )
             };
-            let escrow_address = clerk_sign::program_address(&program);
+            let escrow_address = clerk_sign::program_authorizer(&program, salted)?;
             Ok(Some(ResolvedSendLsig {
                 lsig: algo_types::LogicSig {
                     logic: serde_bytes::ByteBuf::from(program),
@@ -540,7 +550,7 @@ fn resolve_send_lsig(
                 Some(l) => l,
                 None => return Ok(None),
             };
-            let escrow_address = clerk_sign::program_address(&lsig.logic);
+            let escrow_address = clerk_sign::program_authorizer(&lsig.logic, salted)?;
             Ok(Some(ResolvedSendLsig {
                 lsig,
                 is_program_account: true,
@@ -759,7 +769,6 @@ fn run_sign_inner(
         let consensus = get_proto(args.proto.as_deref(), &cli_d)?;
         let mut out = Vec::new();
         for (idx, stxn) in stxns.iter_mut().enumerate() {
-            stxn.lsig = Some(lsig.clone());
             // A LogicSig-authorized txn must carry exactly one signature type.
             // If the input file already had a top-level ed25519 sig or msig
             // (e.g. it was re-fed from a signed file), clear them so we don't
@@ -774,8 +783,15 @@ fn run_sign_inner(
                 }
                 stxn.auth_addr = Some(signer);
             }
-            algo_validate::logicsig_sanity_check(stxn, &lsig, &consensus)
-                .map_err(|e| format!("{}: txn[{idx}] error {e}", args.infile.display()))?;
+            // The authorizer is settled before the program is attached, since which
+            // of its two addresses the program authorizes from is read off it.
+            clerk_sign::authorize_with_program(stxn, lsig.clone(), args.salted)?;
+            match stxn.pqsig.clone().filter(|p| p.scheme == *b"ls") {
+                Some(sksig) => algo_validate::sksig_logicsig_sanity_check(stxn, &sksig, &consensus)
+                    .map(|_| ()),
+                None => algo_validate::logicsig_sanity_check(stxn, &lsig, &consensus),
+            }
+            .map_err(|e| format!("{}: txn[{idx}] error {e}", args.infile.display()))?;
             out.extend_from_slice(&canonical_encode_signed_transaction(stxn));
         }
         out
@@ -1571,7 +1587,15 @@ fn run_compile_inner(
             hasher.update(b"Program");
             hasher.update(program);
             let digest: [u8; 32] = hasher.finalize().into();
-            println!("{fname_str}: {}", Address(digest).to_algorand_string());
+            // go v5.1 appends the `ls` address to this line rather than printing it on
+            // one of its own, so scripts reading the first address keep working.
+            let (_, salted) = algo_types::canonical_address_salt(algo_types::SIG_SCHEME_LOGIC_SIG, program)
+                .ok_or_else(|| "Could not derive salted address: no canonical salt exists for this public key and scheme".to_string())?;
+            println!(
+                "{fname_str}: {} (salted: {})",
+                Address(digest).to_algorand_string(),
+                salted.to_algorand_string()
+            );
         }
     }
     Ok(())
@@ -2773,7 +2797,7 @@ mod tests {
         s.msig = Some(Default::default());
         assert!(!group_input_already_signed(&s), "blank msig is not a sig");
         // Go rejects a top-level PQsig as already signed.
-        s.pqsig = Some(algo_types::pq::PQSig {
+        s.pqsig = Some(algo_types::pq::SaltedKeySig {
             scheme: *b"f1",
             ..Default::default()
         });
@@ -2815,6 +2839,7 @@ mod tests {
     /// ... -f ... -t ...` invocation.
     fn bare_send_args(from: Option<&str>, to: &str) -> SendArgs {
         SendArgs {
+            salted: false,
             amount: 100_000,
             from: from.map(str::to_string),
             to: to.to_string(),
@@ -3296,15 +3321,15 @@ mod tests {
 
     #[test]
     fn resolve_send_lsig_none_without_source() {
-        assert!(resolve_send_lsig(None, None, None, &[]).unwrap().is_none());
+        assert!(resolve_send_lsig(None, None, None, &[], false).unwrap().is_none());
     }
 
     #[test]
     fn resolve_send_lsig_rejects_multiple_sources() {
         // Any pair of the three program-source flags collides (clerk.go:374-385).
-        let err = resolve_send_lsig(Some("a.teal"), None, Some("b.lsig"), &[]).unwrap_err();
+        let err = resolve_send_lsig(Some("a.teal"), None, Some("b.lsig"), &[], false).unwrap_err();
         assert!(err.contains("at most one of"), "got: {err}");
-        let err = resolve_send_lsig(None, Some("p.bin"), Some("b.lsig"), &[]).unwrap_err();
+        let err = resolve_send_lsig(None, Some("p.bin"), Some("b.lsig"), &[], false).unwrap_err();
         assert!(err.contains("at most one of"), "got: {err}");
     }
 
@@ -3317,7 +3342,7 @@ mod tests {
         // `int 1` assembled for v2: 0x0220010122.
         let bytes = [0x02u8, 0x20, 0x01, 0x01, 0x22];
         std::fs::write(&prog, bytes).unwrap();
-        let resolved = resolve_send_lsig(None, Some(prog.to_str().unwrap()), None, &[])
+        let resolved = resolve_send_lsig(None, Some(prog.to_str().unwrap()), None, &[], false)
             .unwrap()
             .expect("resolved lsig");
         assert!(resolved.is_program_account);
@@ -3336,6 +3361,7 @@ mod tests {
             None,
             None,
             &["AQ==".to_string()],
+            false,
         )
         .unwrap()
         .expect("resolved lsig");

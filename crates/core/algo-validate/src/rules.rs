@@ -1720,7 +1720,7 @@ pub fn validate_transaction_group_strict(txns: &[SignedTransaction]) -> Result<(
     let Some(first) = txns.first() else {
         return Ok(());
     };
-    let mut ids = GroupIdChecker::new(&first.txn, txns.len());
+    let mut ids = GroupIdChecker::new(&first.txn, txns.len()).rejecting_duplicates();
     for (index, stx) in txns.iter().enumerate() {
         ids.check_member(index, &stx.txn)
             .map_err(|message| AlgoError::Validation { message })?;
@@ -1742,6 +1742,7 @@ pub struct GroupIdChecker {
     size: usize,
     group_id: [u8; 32],
     hashes: Vec<Digest>,
+    reject_duplicates: bool,
 }
 
 impl GroupIdChecker {
@@ -1751,7 +1752,18 @@ impl GroupIdChecker {
             size,
             group_id: first.group,
             hashes: Vec::new(),
+            reject_duplicates: false,
         }
+    }
+
+    /// Also refuse a transaction that appears twice, as go v5.1's
+    /// `checkTxnGroupID` does (`CheckTxnGroup` / `CheckPaysetGroup`: the
+    /// `verify.TxnGroup` path, block validation and simulate). The gossip test
+    /// stage (`TestTransactionGroup`) has no such rule: a repeat there is found
+    /// later, as `transaction already in ledger`.
+    pub fn rejecting_duplicates(mut self) -> Self {
+        self.reject_duplicates = true;
+        self
     }
 
     /// Check member `index` (in group order) against the first member's group.
@@ -1766,8 +1778,19 @@ impl GroupIdChecker {
         if txn.group != [0u8; 32] {
             // go: `current := *tx; current.Group = Digest{}; current.ID()`,
             // here without copying the transaction (issue #2193).
-            self.hashes
-                .push(algo_codec::compute_txn_id_without_group(txn));
+            let txid = algo_codec::compute_txn_id_without_group(txn);
+            // go v5.1: a transaction may not appear twice (permanent: the
+            // VerifiedTransactionCache is keyed by txid).
+            if let Some(j) = self
+                .reject_duplicates
+                .then(|| self.hashes.iter().position(|h| *h == txid))
+                .flatten()
+            {
+                return Err(format!(
+                    "transactionGroup: duplicate transaction: [{index}] repeats [{j}]"
+                ));
+            }
+            self.hashes.push(txid);
         } else if self.size > 1 {
             return Err(format!(
                 "transactionGroup: [{index}] had zero Group but was submitted in a group of {}",
@@ -1826,7 +1849,7 @@ fn validate_transaction_group_inner(
         // Verify the group ID commits to exactly these members, with go's
         // `checkTxnGroupID` text (every member here carries the same,
         // non-zero group ID: the group was collected by it).
-        let mut ids = GroupIdChecker::new(&group_members[0].txn, size);
+        let mut ids = GroupIdChecker::new(&group_members[0].txn, size).rejecting_duplicates();
         for (index, stx) in group_members.iter().enumerate() {
             ids.check_member(index, &stx.txn)
                 .map_err(|message| AlgoError::Validation { message })?;
@@ -2925,6 +2948,36 @@ mod tests {
             msg.contains("transactionGroup: incomplete group: "),
             "expected go's incomplete-group error, got: {msg}"
         );
+    }
+
+    /// go v5.1 `checkTxnGroupID`: the same transaction twice in a group is
+    /// refused with `[<i>] repeats [<j>]` (the VerifiedTransactionCache is keyed
+    /// by txid), in the strict path and on block replay alike.
+    #[test]
+    fn a_transaction_repeated_in_a_group_is_rejected_like_go() {
+        let txn = make_valid_txn();
+        let other = {
+            let mut t = make_valid_txn();
+            t.amount = 999;
+            t
+        };
+        let mut grouped = vec![txn.clone(), other, txn];
+        let id = algo_codec::compute_group_id_from_hashes(
+            &grouped
+                .iter()
+                .map(algo_codec::compute_txn_id_without_group)
+                .collect::<Vec<_>>(),
+        );
+        for t in &mut grouped {
+            t.group = id.0;
+        }
+        let signed: Vec<_> = grouped.into_iter().map(wrap_signed).collect();
+        let want = "validation error: transactionGroup: duplicate transaction: [2] repeats [0]";
+        assert_eq!(
+            validate_transaction_group_strict(&signed).unwrap_err().to_string(),
+            want
+        );
+        assert_eq!(validate_transaction_group(&signed).unwrap_err().to_string(), want);
     }
 
     /// Strict mode must still accept a correctly-submitted full group.
