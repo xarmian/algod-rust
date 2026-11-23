@@ -12636,8 +12636,11 @@ mod tests {
             algo_validate::rules::compute_group_id(&[stx.txn.clone(), stx.txn.clone()]).0;
         stx.sig = sign_txn(&stx.txn, &key);
         let err = eval.transaction_group(&[stx.clone(), stx]).unwrap_err();
+        // go v5.1 `checkTxnGroupID` (verify.TxnGroup) refuses the repeat before
+        // any per-member `checkDup` would find it in the group.
         assert!(
-            err.to_string().contains("transaction already in ledger"),
+            err.to_string()
+                .contains("transactionGroup: duplicate transaction: [1] repeats [0]"),
             "expected intra-group duplicate txid error, got: {err}"
         );
     }

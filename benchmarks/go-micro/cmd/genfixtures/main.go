@@ -399,7 +399,7 @@ func lsigProgram(w *writer, name, tmpl string) {
 	proto := micro.CurrentProto()
 	probe := assemble(strings.Replace(tmpl, "CHECK", "int 1", 1))
 	ep := logic.NewSigEvalParams(micro.LsigGroup(probe), &proto, logic.NoHeaderLedger{})
-	pass, cx, err := logic.EvalSignatureFull(0, ep)
+	pass, cx, err := logic.EvalSignatureProgram(probe, nil, 0, ep)
 	if err != nil || !pass {
 		log.Fatalf("%s probe: pass=%v err=%v", name, pass, err)
 	}

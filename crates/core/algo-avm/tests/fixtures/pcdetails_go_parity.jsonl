@@ -51,7 +51,7 @@
 {"class": "field-group", "details": ["", "", "", "", "", ""], "name": "imm_gtxnsa_scalar_field_rejected", "program_hex": "08390000"}
 {"class": "field-group", "details": ["", "", "", "", ""], "name": "imm_itxn_array_field_rejected", "program_hex": "08b41c"}
 {"class": "field-group", "details": ["", "itxn_field Accounts", "", "itxn_field Accounts; return", "", ""], "name": "imm_itxn_field_accepts_array_field", "program_hex": "08b21c43"}
-{"class": "field-group", "details": ["", "gitxn 0 Accounts", "", "", "gitxn 0 Accounts; return", "", ""], "name": "imm_gitxn_accepts_array_field", "program_hex": "08b7001c43"}
+{"class": "field-group", "details": ["", "", "", "", "", "", ""], "name": "imm_gitxn_accepts_array_field", "program_hex": "08b7001c43"}
 {"class": "field-group", "details": ["", "app_params_set AppForeignBoxReads", "", "app_params_set AppForeignBoxReads; return", "", ""], "name": "imm_app_params_set_box_field", "program_hex": "0d760b43"}
 {"class": "field-group", "details": ["", "", "", "", ""], "name": "imm_app_params_set_low_field_rejected", "program_hex": "0d7600"}
 {"class": "immediate", "details": ["", "gtxna 0 Accounts 2", "", "", "", "gtxna 0 Accounts 2; return", "", ""], "name": "imm_gtxna_three", "program_hex": "0837001c0243"}

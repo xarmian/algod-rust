@@ -10,8 +10,8 @@
     "timestamp_offset_s": 3
   },
   "go_algorand": {
-    "tag": "v5.0.5-stable",
-    "commit": "31186e99a69e74483ad95e9ce872903b74758abf"
+    "tag": "v5.1.1-stable",
+    "commit": "0cb826e3fb62ccb5666cbb1552d840585ac3cfe5"
   },
   "network": {
     "genesis_id": "benchcorpus-v1",
@@ -38,9 +38,9 @@
     "txn_counter": 13332,
     "total_money": 464399979197438,
     "online_money": 400344800000000,
-    "accounts": 158,
-    "accounts_microalgos": 563989992018969,
-    "accounts_sha256": "e2a0a9872971f7fda2bdaed522b3a4f55adbfd076a6de151189a089b8462cb83"
+    "accounts": 166,
+    "accounts_microalgos": 564000000100000,
+    "accounts_sha256": "db89c891cc8ba7de93a217a9876b13603fcd9d89f8ef134f0964ea96b1ba96c9"
   },
   "start": {
     "catchpoint": "1500#SQONCPK5LUUBGOSWIT5E265GZHKKNJWRX6YFT634GTOAAU6EWU5A",
