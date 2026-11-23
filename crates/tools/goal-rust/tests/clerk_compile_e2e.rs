@@ -116,7 +116,13 @@ fn compile_writes_tok_prints_address_and_needs_no_node() {
     assert!(out.status.success(), "{}", text(&out.stderr));
     let stdout = text(&out.stdout);
     assert!(stdout.starts_with("a.teal: "), "{stdout}");
-    assert_eq!(stdout.trim_end().len(), "a.teal: ".len() + 58, "{stdout}");
+    // `<address> (salted: <address>)`: go v5.1 appends the `ls` address to the line.
+    assert_eq!(
+        stdout.trim_end().len(),
+        "a.teal: ".len() + 58 + " (salted: ".len() + 58 + ")".len(),
+        "{stdout}"
+    );
+    assert!(stdout.contains(" (salted: ") && stdout.trim_end().ends_with(')'), "{stdout}");
     assert_eq!(
         std::fs::read(tmp.path().join("a.teal.tok")).unwrap(),
         vec![8, 0x81, 1, 0x43]
@@ -422,9 +428,14 @@ fn compile_assembles_non_utf8_source_like_go() {
     // same `hash` and `result` CIAC//6BAQ==).
     let out = run(goal, tmp.path(), &["clerk", "compile", "p.teal"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
-    assert_eq!(
-        text(&out.stdout),
-        "p.teal: MFCZLYTBNJYZALFOIWR6GTHRV7FRWIZPI3NSVBI4YHIUEF5FDYXVBDL354\n"
+    let stdout = text(&out.stdout);
+    // go v5.1 appends the program's `ls` address (`compile_matches_go_goal` pins it).
+    assert!(
+        stdout.starts_with(
+            "p.teal: MFCZLYTBNJYZALFOIWR6GTHRV7FRWIZPI3NSVBI4YHIUEF5FDYXVBDL354 (salted: "
+        ) && stdout.ends_with(")
+"),
+        "{stdout}"
     );
     assert_eq!(
         std::fs::read(tmp.path().join("p.teal.tok")).unwrap(),
