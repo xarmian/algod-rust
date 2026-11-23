@@ -2025,14 +2025,16 @@ fn pseudo_get_spec_errors(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
         Some(&(_, target)) => {
             if let Some(spec) = opcode::lookup_by_name(target) {
                 if spec.version > ops.effective_version() {
+                    // go falls back to the newest spec of the opcode here.
+                    let introduced = type_track::op_entry_by_name(target)
+                        .map_or(spec.version, |e| e.spec_version_at(ops.effective_version()));
                     let phrase = match args.len() {
                         0 => "no immediates".to_string(),
                         1 => "1 immediate".to_string(),
                         n => format!("{n} immediates"),
                     };
                     ops.err_mnemonic(format!(
-                        "{mnemonic} opcode with {phrase} was introduced in v{}",
-                        spec.version
+                        "{mnemonic} opcode with {phrase} was introduced in v{introduced}"
                     ));
                 }
             }
@@ -4870,11 +4872,14 @@ mod tests {
     fn test_replace_pseudo_version_gating() {
         // `replace`/`replace2`/`replace3` were introduced in v7 -- using
         // the pseudo-op below that version is rejected the same way
-        // `txn`/`gtxn`'s array-form dispatch is (`asm_pseudo_arity`).
+        // `txn`/`gtxn`'s array-form dispatch is (`asm_pseudo_arity`). go reports
+        // the version of the newest spec (`prepareVersionedPseudoTable` falls
+        // back to `OpsByName[AssemblerMaxVersion]`): since v5.1 `replace2` /
+        // `replace3` have a v14 spec (length-based cost), so it names v14.
         let errs = expect_errors("#pragma version 6\nbyte 0x0000\nbyte 0x1234\nreplace 0\n");
         assert!(
             errs.iter()
-                .any(|e| e.message == "replace opcode with 1 immediate was introduced in v7"),
+                .any(|e| e.message == "replace opcode with 1 immediate was introduced in v14"),
             "unexpected errors: {errs:?}"
         );
     }

@@ -83,6 +83,11 @@ type opRow struct {
 	Opcode   int       `json:"opcode"`
 	Sub      int       `json:"sub,omitempty"`
 	Version  uint64    `json:"version"`
+	// LatestVersion is the Version of the spec at logic.LogicVersion: the spec an
+	// assembler falls back to for a version the opcode does not exist at
+	// (prepareVersionedPseudoTable), which differs from Version for opcodes with
+	// several specs (replace3: v7, then v14 for its length-based cost).
+	LatestVersion uint64 `json:"latest_version"`
 	Deadens  bool      `json:"deadens,omitempty"`
 	Imms     []immRow  `json:"imms,omitempty"`
 	Variants []variant `json:"variants"`
@@ -163,7 +168,7 @@ func main() {
 	groups := map[string]*logic.FieldGroup{}
 	for _, n := range names {
 		s := latest[n]
-		r := opRow{Kind: "op", Name: n, Opcode: int(s.Opcode), Sub: int(s.SubOpcode)}
+		r := opRow{Kind: "op", Name: n, Opcode: int(s.Opcode), Sub: int(s.SubOpcode), LatestVersion: s.Version}
 		immRows := func(sp logic.OpSpec) []immRow {
 			var rows []immRow
 			for _, im := range sp.Immediates {

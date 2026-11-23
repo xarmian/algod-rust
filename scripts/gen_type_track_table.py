@@ -125,7 +125,7 @@ def build():
 
     for r in sorted(ops, key=lambda r: r["name"]):
         imms = imm_list(r.get("imms", []))
-        out.append(f'    OpEntry {{ name: "{r["name"]}", version: {r["version"]}, ')
+        out.append(f'    OpEntry {{ name: "{r["name"]}", version: {r["version"]}, latest_version: {r["latest_version"]}, ')
         out.append(f"deadens: {str(r.get('deadens', False)).lower()}, imms: &[{imms}], variants: &[\n")
         for v in r["variants"]:
             refine = v.get("refine", "")

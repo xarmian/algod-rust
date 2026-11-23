@@ -210,6 +210,9 @@ pub(crate) struct Variant {
 pub(crate) struct OpEntry {
     pub name: &'static str,
     pub version: u8,
+    /// The version of the spec at the newest AVM version: the one go's assembler
+    /// falls back to for a program version the opcode does not exist at.
+    pub latest_version: u8,
     pub deadens: bool,
     pub imms: &'static [ImmEntry],
     pub variants: &'static [Variant],
@@ -243,6 +246,17 @@ fn op_entry(name: &str) -> Option<&'static OpEntry> {
 }
 
 impl OpEntry {
+    /// `OpsByName[version][name].Version` for a pseudo-op's target, with go's
+    /// `prepareVersionedPseudoTable` fallback to the newest spec when the opcode
+    /// does not exist at `version`.
+    pub(crate) fn spec_version_at(&self, version: u8) -> u8 {
+        if self.version > version {
+            self.latest_version
+        } else {
+            self.version
+        }
+    }
+
     /// The immediates `OpsByName[version][name]` takes; the newest ones for a
     /// version the opcode does not exist at (its own error is reported first).
     pub(crate) fn imms_at(&self, version: u8) -> &'static [ImmEntry] {
@@ -836,7 +850,8 @@ pub(crate) fn pseudo_merged_min_version(name: &str, version: u8) -> Option<u8> {
             Some(s) if s != this => return None,
             Some(_) => {}
         }
-        min_version = Some(min_version.map_or(entry.version, |m| m.min(entry.version)));
+        let spec_version = entry.spec_version_at(version);
+        min_version = Some(min_version.map_or(spec_version, |m| m.min(spec_version)));
     }
     min_version
 }
