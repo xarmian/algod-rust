@@ -125,6 +125,9 @@ pub const CONSENSUS_VFNET1: &str = "fnet1";
 pub const CONSENSUS_VFNET2: &str = "fnet2";
 pub const CONSENSUS_VFNET3: &str = "fnet3";
 pub const CONSENSUS_VFNET4: &str = "fnet4";
+/// go v5.1.0-beta `ConsensusVFnet5`: the protocol AF's FNet runs, with the same
+/// parameters as `ConsensusV42` (the v42 preview, no approved upgrades).
+pub const CONSENSUS_VFNET5: &str = "fnet5";
 
 /// The current (latest release) consensus version.
 pub const CONSENSUS_CURRENT_VERSION: &str = CONSENSUS_V43;
@@ -181,6 +184,7 @@ pub const KNOWN_PROTOCOL_VERSIONS: &[&str] = &[
     CONSENSUS_VFNET2,
     CONSENSUS_VFNET3,
     CONSENSUS_VFNET4,
+    CONSENSUS_VFNET5,
 ];
 
 /// Historical record of every `vN.ApprovedUpgrades[vM] = delay` edge in
@@ -363,6 +367,18 @@ pub struct ConsensusParams {
     /// size sponsor for globals / extra pages of apps it neither created nor
     /// opted into (Go: `CloseRequiresBaseMinBalance`, v43+).
     pub close_requires_base_min_balance: bool,
+    /// A heartbeat may share a transaction group with an application call or an asset creation (Go: `AllowGroupedHeartbeats`, v5.1.0-beta, vFuture).
+    pub allow_grouped_heartbeats: bool,
+    /// Native Falcon-512 transaction authorization for the `f5` scheme (Go: `EnableSigSchemeFalcon512`, v5.1.0-beta, vFuture).
+    pub enable_sig_scheme_falcon512: bool,
+    /// Ed25519 authorization for the `ed` scheme's salted-address profile (Go: `EnableSigSchemeEd25519`, v5.1.0-beta, vFuture).
+    pub enable_sig_scheme_ed25519: bool,
+    /// Authorization by a LogicSig carried in a SaltedKeySig under the `ls` scheme (Go: `EnableSigSchemeLogicSig`, v5.1.0-beta, vFuture).
+    pub enable_sig_scheme_logic_sig: bool,
+    /// A LogicSig may carry no argument it did not read (Go: `RequireLogicSigArgAccess`, v5.1.0-beta, vFuture).
+    pub require_logic_sig_arg_access: bool,
+    /// An inner ClearState call whose program fails or rejects has an empty EvalDelta (Go: `DiscardFailedInnerClearStateDelta`, v5.1.0-beta, vFuture).
+    pub discard_failed_inner_clear_state_delta: bool,
     /// LogicSig sizes pooled across a group (Go: `EnableLogicSigSizePooling`, v40+).
     pub enable_logicsig_size_pooling: bool,
     /// LogicSig costs pooled across a group (Go: `EnableLogicSigCostPooling`, v39+).
@@ -1114,6 +1130,12 @@ fn built_in_consensus_params(version: &str) -> Option<ConsensusParams> {
         enable_pq_scheme_falcon1024: false,
         enable_select_f128: false,
         close_requires_base_min_balance: false,
+        allow_grouped_heartbeats: false,
+        enable_sig_scheme_falcon512: false,
+        enable_sig_scheme_ed25519: false,
+        enable_sig_scheme_logic_sig: false,
+        require_logic_sig_arg_access: false,
+        discard_failed_inner_clear_state_delta: false,
         enable_logicsig_size_pooling: false,
         enable_logicsig_cost_pooling: false,
         enable_app_cost_pooling: false,
@@ -1719,6 +1741,14 @@ fn built_in_consensus_params(version: &str) -> Option<ConsensusParams> {
     // again for the next in-development AVM version).
     let mut v_future = v43.clone();
     v_future.logic_sig_version = 14;
+    // go v5.1.0-beta (#2543): the SigScheme registry, grouped heartbeats, the
+    // LogicSig-arg access rule and the inner ClearState delta discard.
+    v_future.enable_sig_scheme_falcon512 = true;
+    v_future.enable_sig_scheme_ed25519 = true;
+    v_future.require_logic_sig_arg_access = true;
+    v_future.allow_grouped_heartbeats = true;
+    v_future.enable_sig_scheme_logic_sig = true;
+    v_future.discard_failed_inner_clear_state_delta = true;
     if version == CONSENSUS_FUTURE {
         return Some(v_future);
     }
@@ -1801,6 +1831,13 @@ fn built_in_consensus_params(version: &str) -> Option<ConsensusParams> {
     // upgrade path to v40.
     if version == CONSENSUS_VFNET4 {
         return consensus_params_for_version(CONSENSUS_VFNET1);
+    }
+
+    // fnet5 was the v42 preview on FNet: v41 with v42's changes, no upgrades.
+    if version == CONSENSUS_VFNET5 {
+        let mut fnet5 = consensus_params_for_version(CONSENSUS_V42).expect("v42 must be constructible");
+        fnet5.approved_upgrade = None;
+        return Some(fnet5);
     }
 
     // Unknown version
@@ -1959,6 +1996,12 @@ pub struct ConsensusParamsOverride {
     pub enable_pq_scheme_falcon1024: bool,
     pub enable_select_f128: bool,
     pub close_requires_base_min_balance: bool,
+    pub allow_grouped_heartbeats: bool,
+    pub enable_sig_scheme_falcon512: bool,
+    pub enable_sig_scheme_ed25519: bool,
+    pub enable_sig_scheme_logic_sig: bool,
+    pub require_logic_sig_arg_access: bool,
+    pub discard_failed_inner_clear_state_delta: bool,
     /// Same rationale as `enable_fee_pooling` above: go removed
     /// `EnableLogicSigSizePooling` from its live struct once it became
     /// permanently on (v40+), so it is never present in a real
@@ -2165,6 +2208,12 @@ impl ConsensusParamsOverride {
             enable_pq_scheme_falcon1024: self.enable_pq_scheme_falcon1024,
             enable_select_f128: self.enable_select_f128,
             close_requires_base_min_balance: self.close_requires_base_min_balance,
+            allow_grouped_heartbeats: self.allow_grouped_heartbeats,
+            enable_sig_scheme_falcon512: self.enable_sig_scheme_falcon512,
+            enable_sig_scheme_ed25519: self.enable_sig_scheme_ed25519,
+            enable_sig_scheme_logic_sig: self.enable_sig_scheme_logic_sig,
+            require_logic_sig_arg_access: self.require_logic_sig_arg_access,
+            discard_failed_inner_clear_state_delta: self.discard_failed_inner_clear_state_delta,
             enable_logicsig_size_pooling: self.enable_logicsig_size_pooling.0,
             enable_logicsig_cost_pooling: self.enable_logicsig_cost_pooling,
             enable_app_cost_pooling: self.enable_app_cost_pooling,
@@ -2878,6 +2927,30 @@ mod tests {
         // go (v5.0.4-stable): `v42.ApprovedUpgrades[protocol.ConsensusV43] = 208000`.
         let v42 = consensus_params_for_version(CONSENSUS_V42).unwrap();
         assert_eq!(v42.approved_upgrade, Some((CONSENSUS_V43, 208_000)));
+    }
+
+    /// go v5.1.0-beta: `vFnet5` is the v42 preview (v42's parameters, no upgrades)
+    /// and `vFuture` turns on the SigScheme/heartbeat/LogicSig-arg/ClearState flags.
+    #[test]
+    fn test_fnet5_and_the_v5_1_vfuture_flags() {
+        let v42 = consensus_params_for_version(CONSENSUS_V42).unwrap();
+        let fnet5 = consensus_params_for_version(CONSENSUS_VFNET5).unwrap();
+        let mut expected = v42.clone();
+        expected.approved_upgrade = None;
+        assert_eq!(fnet5, expected);
+        let v43 = consensus_params_for_version(CONSENSUS_V43).unwrap();
+        let future = consensus_params_for_version(CONSENSUS_FUTURE).unwrap();
+        for flag in [
+            |p: &ConsensusParams| p.enable_sig_scheme_falcon512,
+            |p: &ConsensusParams| p.enable_sig_scheme_ed25519,
+            |p: &ConsensusParams| p.enable_sig_scheme_logic_sig,
+            |p: &ConsensusParams| p.require_logic_sig_arg_access,
+            |p: &ConsensusParams| p.allow_grouped_heartbeats,
+            |p: &ConsensusParams| p.discard_failed_inner_clear_state_delta,
+        ] {
+            assert!(!flag(&v43) && flag(&future));
+        }
+        assert!(KNOWN_PROTOCOL_VERSIONS.contains(&CONSENSUS_VFNET5));
     }
 
     #[test]
