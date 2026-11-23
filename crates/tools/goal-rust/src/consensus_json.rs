@@ -80,7 +80,6 @@ pub fn decode(data: &[u8]) -> Result<(), String> {
         data: &data[..n],
         off: 0,
         saved: None,
-        ctx_struct: None,
         stack: Vec::new(),
     };
     d.value(Ty::Protocols);
@@ -618,9 +617,9 @@ struct Decoder<'a> {
     off: usize,
     /// go: `decodeState.savedError` -- the first type error.
     saved: Option<String>,
-    /// go: `errorContext.Struct` / `errorContext.FieldStack`.
-    ctx_struct: Option<&'static str>,
-    stack: Vec<&'static str>,
+    /// go 1.27's v2 path of the value being decoded: the JSON object names from
+    /// the root, map keys and field names as the input wrote them.
+    stack: Vec<String>,
 }
 
 impl Decoder<'_> {
@@ -636,10 +635,10 @@ impl Decoder<'_> {
             return;
         }
         let ty_name = ty.type_name();
-        self.saved = Some(if self.ctx_struct.is_some() || !self.stack.is_empty() {
+        self.saved = Some(if !self.stack.is_empty() {
+            // v2 names the root type, then the path (`ConsensusProtocols.v.MinTxnFee`).
             format!(
-                "json: cannot unmarshal {what} into Go struct field {}.{} of type {ty_name}",
-                self.ctx_struct.unwrap_or(""),
+                "json: cannot unmarshal {what} into Go struct field ConsensusProtocols.{} of type {ty_name}",
                 self.stack.join(".")
             )
         } else {
@@ -748,7 +747,6 @@ impl Decoder<'_> {
                 return;
             }
         };
-        let orig_struct = self.ctx_struct;
         let orig_len = self.stack.len();
         self.skip_space();
         if self.data[self.off] == b'}' {
@@ -762,18 +760,21 @@ impl Decoder<'_> {
             self.off += 1; // ':'
             let sub = match fields {
                 Some(st) => match lookup(st, &key) {
-                    Some((name, kind)) => {
-                        self.ctx_struct = Some(st.name);
-                        self.stack.push(name);
+                    Some((_, kind)) => {
+                        self.stack.push(key.clone());
                         Ty::Field(kind)
                     }
                     None => Ty::Skip,
                 },
-                None => elem,
+                None => {
+                    if !matches!(elem, Ty::Skip) {
+                        self.stack.push(key.clone());
+                    }
+                    elem
+                }
             };
             self.value(sub);
             self.stack.truncate(orig_len);
-            self.ctx_struct = orig_struct;
             self.skip_space();
             let c = self.data[self.off];
             self.off += 1;
@@ -1068,7 +1069,7 @@ mod tests {
         );
         assert_eq!(
             err("\u{feff}{}"),
-            "invalid character 'ï' looking for beginning of value"
+            r"invalid character '﻿' looking for beginning of value"
         );
         assert_eq!(
             err(r#"{"a":1,}"#),
@@ -1080,7 +1081,7 @@ mod tests {
         );
         assert_eq!(
             err("{\"a\":\u{a0}}"),
-            "invalid character 'Â' looking for beginning of value"
+            r"invalid character ' ' looking for beginning of value"
         );
         assert_eq!(
             err("[1,]"),
@@ -1106,28 +1107,28 @@ mod tests {
         );
         assert_eq!(
             err(r#"{"v":"x"}"#),
-            "json: cannot unmarshal string into Go value of type config.ConsensusParams"
+            "json: cannot unmarshal string into Go struct field ConsensusProtocols.v of type config.ConsensusParams"
         );
         assert_eq!(
             err(r#"{"v":{"mintxnfee":1.5}}"#),
-            "json: cannot unmarshal number 1.5 into Go struct field ConsensusParams.MinTxnFee of type uint64"
+            "json: cannot unmarshal number 1.5 into Go struct field ConsensusProtocols.v.mintxnfee of type uint64"
         );
         assert_eq!(
             err(r#"{"v":{"Bonus":{"BaseRound":true}}}"#),
-            "json: cannot unmarshal bool into Go struct field BonusPlan.Bonus.BaseRound of type uint64"
+            "json: cannot unmarshal bool into Go struct field ConsensusProtocols.v.Bonus.BaseRound of type uint64"
         );
         assert_eq!(
             err(r#"{"v":{"ApprovedUpgrades":{"w":"x"}}}"#),
-            "json: cannot unmarshal string into Go struct field ConsensusParams.ApprovedUpgrades of type uint64"
+            "json: cannot unmarshal string into Go struct field ConsensusProtocols.v.ApprovedUpgrades.w of type uint64"
         );
         assert_eq!(
             err(r#"{"v":{"MaxAssetDecimals":4294967296}}"#),
-            "json: cannot unmarshal number 4294967296 into Go struct field ConsensusParams.MaxAssetDecimals of type uint32"
+            "json: cannot unmarshal number 4294967296 into Go struct field ConsensusProtocols.v.MaxAssetDecimals of type uint32"
         );
         // the first error wins; unknown fields and nulls are fine
         assert_eq!(
             err(r#"{"v":{"Nope":"a","MinTxnFee":null,"MaxTxnLife":"a"},"w":{"MinTxnFee":"b"}}"#),
-            "json: cannot unmarshal string into Go struct field ConsensusParams.MaxTxnLife of type uint64"
+            "json: cannot unmarshal string into Go struct field ConsensusProtocols.v.MaxTxnLife of type uint64"
         );
         assert_eq!(
             decode(br#"{"v":{"MaxAppProgramLen":-5,"MinTxnFee":7}}"#),
