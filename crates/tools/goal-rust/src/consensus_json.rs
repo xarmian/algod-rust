@@ -1069,7 +1069,7 @@ mod tests {
         );
         assert_eq!(
             err("\u{feff}{}"),
-            r"invalid character '﻿' looking for beginning of value"
+            r"invalid character '\ufeff' looking for beginning of value"
         );
         assert_eq!(
             err(r#"{"a":1,}"#),
@@ -1081,7 +1081,7 @@ mod tests {
         );
         assert_eq!(
             err("{\"a\":\u{a0}}"),
-            r"invalid character ' ' looking for beginning of value"
+            r"invalid character '\u00a0' looking for beginning of value"
         );
         assert_eq!(
             err("[1,]"),
