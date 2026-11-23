@@ -230,25 +230,34 @@ impl TxSyncPeerClient for HttpTxSyncClient {
     }
 }
 
-/// Decode a tx-sync response body: go `protocol.DecodeReflect` into
-/// `[]transactions.SignedTxn` (`rpcs/httpTxSync.go`, `Sync`), whose
-/// `protocol.CodecHandle` has `ErrorIfNoField = true`: a key `SignedTxn` lacks
-/// (including the block-only `hgi`/`hgh`/`ApplyData` keys of a
-/// `SignedTxnInBlock`) fails the whole response (issue #2396). `nil` is an
-/// empty response, and trailing bytes are ignored as go-codec does. go-codec
-/// is not msgp: it checks no `required` field and no `allocbound`, and decodes
-/// a repeated map entry into the existing one (issue #2424,
-/// [`algo_types::go_codec_reflect`]).
+/// go's `rpcs.maxTxSyncResponseTxns`.
+const MAX_TX_SYNC_RESPONSE_TXNS: usize = 25_000;
+
+/// Decode a tx-sync response body: go v5.1 `protocol.Decode` into the generated
+/// `txSyncResponse` (`[]transactions.SignedTxn`, `rpcs/httpTxSync.go`, `Sync`;
+/// before v5.1 it was go-codec's `DecodeReflect`, #6729): a key `SignedTxn`
+/// lacks (including the block-only `hgi`/`hgh`/`ApplyData` keys of a
+/// `SignedTxnInBlock`) fails the whole response (issue #2396), at most
+/// `maxTxSyncResponseTxns` (25000) elements are allocated, every struct is a
+/// map (the generated decoders read no array form), `required` fields and
+/// `allocbound`s are enforced, `nil` is an empty response and trailing bytes
+/// are ignored (go-codec compat in `DecodeMsgp`).
 ///
 /// Synchronous: the strict-unknown-fields mode is thread-local and must not be
 /// held across an `.await`.
 pub fn decode_tx_sync_response(bytes: &[u8]) -> Result<Vec<SignedTransaction>, String> {
-    let _strict = algo_types::go_codec_reflect(bytes);
+    let _strict = algo_types::strict_unknown_fields(bytes);
     let mut rd = bytes;
     if rd.first() == Some(&0xc0) {
         return Ok(Vec::new());
     }
     let n = rmp::decode::read_array_len(&mut rd).map_err(|e| format!("txns array: {e}"))?;
+    // go's `msgp:allocbound txSyncResponse maxTxSyncResponseTxns`.
+    if n as usize > MAX_TX_SYNC_RESPONSE_TXNS {
+        return Err(format!(
+            "msgp: length overflow: {n} > {MAX_TX_SYNC_RESPONSE_TXNS}"
+        ));
+    }
     let mut txns = Vec::with_capacity((n as usize).min(1024));
     for i in 0..n {
         txns.push(

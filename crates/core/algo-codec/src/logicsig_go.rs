@@ -382,8 +382,6 @@ enum E {
     Overflow { l: u64, bound: u64 },
     /// `ErrNoField`: the raw key bytes.
     NoField(Vec<u8>),
-    /// `ErrTooManyArrayFields`.
-    TooManyArrayFields(usize),
     /// `errors.New("missing required field: <key>")`.
     Required(&'static str),
     /// `errWrapped`: any other error after `WrapError`; wrapping it again wraps
@@ -478,9 +476,6 @@ impl E {
                 let mut v = b"Unknown field: ".to_vec();
                 v.extend_from_slice(key);
                 v
-            }
-            E::TooManyArrayFields(n) => {
-                format!("Too many array fields when decoding into struct: {n} left").into_bytes()
             }
             E::Required(text) => text.as_bytes().to_vec(),
             E::Wrapped { cause, ctx } => {
@@ -781,12 +776,11 @@ fn read_map_key(b: &mut &[u8]) -> R<Vec<u8>> {
     }
 }
 
-/// The fields of one generated decoder: a map (or `nil`) is a key loop, an array
-/// is positional.
+/// The fields of one generated decoder: a map (or `nil`) is a key loop. (go v5.1's
+/// decoders no longer read the positional array form.)
 enum Form {
     /// Number of keys, and whether the header was `nil` (the struct is zeroed).
     Map(usize, bool),
-    Array(usize),
 }
 
 /// Open a struct and report how it is laid out; a failure is wrapped with an
@@ -794,7 +788,9 @@ enum Form {
 fn open_struct(b: &mut &[u8]) -> R<Form> {
     let form = match read_map_header(b) {
         Ok(Some((n, nil))) => Ok(Form::Map(n, nil)),
-        Ok(None) => read_array_header(b, true).map(|(n, _)| Form::Array(n)),
+        // go v5.1 (msgp 1.1.66, #6774): the generated decoder reads maps only, an
+        // array is `ReadMapHeaderBytes`'s TypeError.
+        Ok(None) => lead(b).and_then(|l| Err(bad_prefix(Ty::Map, l))),
         Err(e) => Err(e),
     };
     w(form, "")
@@ -803,19 +799,6 @@ fn open_struct(b: &mut &[u8]) -> R<Form> {
 /// An unknown map key: `msgp.WrapError(msgp.ErrNoField(string(field)))`.
 fn no_field<T>(key: Vec<u8>) -> R<T> {
     Err(E::NoField(key).wrap(""))
-}
-
-/// The context of an array-form field: `"struct-from-array", <field>`.
-fn sfa(field: &str) -> String {
-    format!("struct-from-array/{field}")
-}
-
-/// The array-form `ErrTooManyArrayFields` check.
-fn too_many(n: usize) -> R<()> {
-    if n > 0 {
-        return Err(E::TooManyArrayFields(n).wrap("struct-from-array"));
-    }
-    Ok(())
 }
 
 #[derive(Clone)]
@@ -847,17 +830,6 @@ impl SubsigState {
                         other => return no_field(other.to_vec()),
                     }
                 }
-            }
-            Form::Array(mut n) => {
-                if n > 0 {
-                    n -= 1;
-                    w(read_exact(b, &mut self.key), &sfa("Key"))?;
-                }
-                if n > 0 {
-                    n -= 1;
-                    w(read_exact(b, &mut self.sig), &sfa("Sig"))?;
-                }
-                too_many(n)?;
             }
         }
         Ok(())
@@ -909,21 +881,6 @@ impl MsigState {
                         other => return no_field(other.to_vec()),
                     }
                 }
-            }
-            Form::Array(mut n) => {
-                if n > 0 {
-                    n -= 1;
-                    self.version = w(read_u8(b), &sfa("Version"))?;
-                }
-                if n > 0 {
-                    n -= 1;
-                    self.threshold = w(read_u8(b), &sfa("Threshold"))?;
-                }
-                if n > 0 {
-                    n -= 1;
-                    self.decode_subsigs(b, &sfa("Subsigs"))?;
-                }
-                too_many(n)?;
             }
         }
         // `codec:",required"`: the zero value fails, whether or not the key was there.
@@ -998,27 +955,6 @@ impl PqState {
                         other => return no_field(other.to_vec()),
                     }
                 }
-            }
-            Form::Array(mut n) => {
-                if n > 0 {
-                    n -= 1;
-                    scheme(b, &mut self.scheme, &sfa("Scheme"))?;
-                }
-                if n > 0 {
-                    n -= 1;
-                    self.salt = salt(b, &sfa("Salt"))?;
-                }
-                if n > 0 {
-                    n -= 1;
-                    self.public_key =
-                        read_bounded_bytes(b, max_sig_scheme_public_key_size(), &sfa("PublicKey"))?.0;
-                }
-                if n > 0 {
-                    n -= 1;
-                    self.signature =
-                        read_bounded_bytes(b, max_sig_scheme_signature_size(), &sfa("Signature"))?.0;
-                }
-                too_many(n)?;
             }
         }
         Ok(())
@@ -1103,33 +1039,6 @@ impl LsigState {
                         other => return no_field(other.to_vec()),
                     }
                 }
-            }
-            Form::Array(mut n) => {
-                if n > 0 {
-                    n -= 1;
-                    self.decode_logic(b, &sfa("Logic"))?;
-                }
-                if n > 0 {
-                    n -= 1;
-                    self.decode_sig(b, &sfa("Sig"))?;
-                }
-                if n > 0 {
-                    n -= 1;
-                    w(self.msig.decode(b), &sfa("Msig"))?;
-                }
-                if n > 0 {
-                    n -= 1;
-                    w(self.lmsig.decode(b), &sfa("LMsig"))?;
-                }
-                if n > 0 {
-                    n -= 1;
-                    w(self.pqsig.decode(b), &sfa("SKsig"))?;
-                }
-                if n > 0 {
-                    n -= 1;
-                    self.decode_args(b, &sfa("Args"))?;
-                }
-                too_many(n)?;
             }
         }
         Ok(())
