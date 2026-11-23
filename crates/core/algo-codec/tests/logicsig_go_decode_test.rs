@@ -262,7 +262,7 @@ fn rejections_carry_go_msgp_error_text() {
         ("msig v 256", "msgp: 256 overflows uint8 at Msig/Version"),
         (
             "msig subsig as map",
-            "msgp: attempted to decode type \"str\" with method for \"array\" at Msig/Subsigs/0",
+            "msgp: attempted to decode type \"str\" with method for \"map\" at Msig/Subsigs/0",
         ),
         // an `UintBelowZero` replaces it
         ("msig v negative", "msgp: attempted to cast int -1 to unsigned at Msig"),
