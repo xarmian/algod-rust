@@ -201,6 +201,9 @@ pub(crate) struct Variant {
     pub args: &'static [StackType],
     pub returns: &'static [StackType],
     pub refine: &'static str,
+    /// The immediates at this version: since go v5.1 they may change with it
+    /// (`falcon_verify` gains `f` in v14).
+    pub imms: &'static [ImmEntry],
 }
 
 /// An opcode (generated).
@@ -217,7 +220,7 @@ pub(crate) struct OpEntry {
 pub(crate) fn field_name_exists_at(version: u8, name: &str) -> bool {
     OPS.iter().any(|e| {
         e.version <= version
-            && e.imms
+            && e.imms_at(version)
                 .iter()
                 .any(|i| i.group.is_some_and(|g| g.iter().any(|f| f.name == name)))
     })
@@ -240,6 +243,12 @@ fn op_entry(name: &str) -> Option<&'static OpEntry> {
 }
 
 impl OpEntry {
+    /// The immediates `OpsByName[version][name]` takes; the newest ones for a
+    /// version the opcode does not exist at (its own error is reported first).
+    pub(crate) fn imms_at(&self, version: u8) -> &'static [ImmEntry] {
+        self.variant_at(version).map_or(self.imms, |v| v.imms)
+    }
+
     /// `OpsByName[version][name]`'s proto, if the opcode exists at `version`.
     fn variant_at(&self, version: u8) -> Option<&'static Variant> {
         if self.version > version {
@@ -1013,14 +1022,15 @@ fn refine_field_return(ops: &mut OpStream, spec: &Spec, args: &[&str]) {
     if matches!(entry.name, "itxn_field" | "app_params_set") {
         return;
     }
-    if args.len() != entry.imms.len() {
+    let imms = entry.imms_at(ops.effective_version());
+    if args.len() != imms.len() {
         return;
     }
     let n_returns = entry
         .variant_at(ops.effective_version())
         .or_else(|| entry.variants.last())
         .map_or(0, |v| v.returns.len());
-    for (imm, arg) in entry.imms.iter().zip(args) {
+    for (imm, arg) in imms.iter().zip(args) {
         match imm.group {
             Some(group) => {
                 let Some(f) = group.iter().find(|f| f.name == *arg) else {

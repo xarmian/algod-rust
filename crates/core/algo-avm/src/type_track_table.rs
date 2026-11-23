@@ -328,624 +328,624 @@ const GROUP_VRF_VERIFY_9FF243A1: &[FieldEntry] = &[
 /// Every opcode, sorted by name; see [`OpEntry`].
 pub(crate) static OPS: &[OpEntry] = &[
     OpEntry { name: "!", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "!=", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "typeEquals" },
+        Variant { from: 1, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "typeEquals", imms: &[] },
     ] },
     OpEntry { name: "%", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "&", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "&&", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "*", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "+", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "-", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "/", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "<", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "<=", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "==", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "typeEquals" },
+        Variant { from: 1, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "typeEquals", imms: &[] },
     ] },
     OpEntry { name: ">", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: ">=", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "^", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "acct_params_get", version: 6, deadens: false, imms: &[ImmEntry { name: "f", group: Some(GROUP_ACCT_PARAMS_6D8EB94C) }], variants: &[
-        Variant { from: 6, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 6, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[ImmEntry { name: "f", group: Some(GROUP_ACCT_PARAMS_6D8EB94C) }] },
     ] },
     OpEntry { name: "addw", version: 2, deadens: false, imms: &[], variants: &[
-        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "app_box_create", version: 13, deadens: false, imms: &[], variants: &[
-        Variant { from: 13, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 13, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "app_box_del", version: 13, deadens: false, imms: &[], variants: &[
-        Variant { from: 13, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 1, 64, Some("boxName"))], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 13, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 1, 64, Some("boxName"))], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "app_box_extract", version: 13, deadens: false, imms: &[], variants: &[
-        Variant { from: 13, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 13, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "app_box_get", version: 13, deadens: false, imms: &[], variants: &[
-        Variant { from: 13, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 1, 64, Some("boxName"))], returns: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 13, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 1, 64, Some("boxName"))], returns: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "app_box_len", version: 13, deadens: false, imms: &[], variants: &[
-        Variant { from: 13, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 1, 64, Some("boxName"))], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 13, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 1, 64, Some("boxName"))], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "app_box_put", version: 13, deadens: false, imms: &[], variants: &[
-        Variant { from: 13, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[], refine: "" },
+        Variant { from: 13, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[], refine: "", imms: &[] },
     ] },
     OpEntry { name: "app_box_replace", version: 13, deadens: false, imms: &[], variants: &[
-        Variant { from: 13, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[], refine: "" },
+        Variant { from: 13, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[], refine: "", imms: &[] },
     ] },
     OpEntry { name: "app_box_resize", version: 13, deadens: false, imms: &[], variants: &[
-        Variant { from: 13, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[], refine: "" },
+        Variant { from: 13, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[], refine: "", imms: &[] },
     ] },
     OpEntry { name: "app_box_splice", version: 13, deadens: false, imms: &[], variants: &[
-        Variant { from: 13, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[], refine: "" },
+        Variant { from: 13, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[], refine: "", imms: &[] },
     ] },
     OpEntry { name: "app_global_del", version: 2, deadens: false, imms: &[], variants: &[
-        Variant { from: 2, args: &[StackType::new(Avm::Bytes, 0, 64, Some("stateKey"))], returns: &[], refine: "" },
+        Variant { from: 2, args: &[StackType::new(Avm::Bytes, 0, 64, Some("stateKey"))], returns: &[], refine: "", imms: &[] },
     ] },
     OpEntry { name: "app_global_get", version: 2, deadens: false, imms: &[], variants: &[
-        Variant { from: 2, args: &[StackType::new(Avm::Bytes, 0, 64, Some("stateKey"))], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 2, args: &[StackType::new(Avm::Bytes, 0, 64, Some("stateKey"))], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "app_global_get_ex", version: 2, deadens: false, imms: &[], variants: &[
-        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 64, Some("stateKey"))], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 64, Some("stateKey"))], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "app_global_put", version: 2, deadens: false, imms: &[], variants: &[
-        Variant { from: 2, args: &[StackType::new(Avm::Bytes, 0, 64, Some("stateKey")), StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "" },
+        Variant { from: 2, args: &[StackType::new(Avm::Bytes, 0, 64, Some("stateKey")), StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "", imms: &[] },
     ] },
     OpEntry { name: "app_local_del", version: 2, deadens: false, imms: &[], variants: &[
-        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 64, Some("stateKey"))], returns: &[], refine: "" },
-        Variant { from: 4, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Bytes, 0, 64, Some("stateKey"))], returns: &[], refine: "" },
+        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 64, Some("stateKey"))], returns: &[], refine: "", imms: &[] },
+        Variant { from: 4, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Bytes, 0, 64, Some("stateKey"))], returns: &[], refine: "", imms: &[] },
     ] },
     OpEntry { name: "app_local_get", version: 2, deadens: false, imms: &[], variants: &[
-        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 64, Some("stateKey"))], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
-        Variant { from: 4, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Bytes, 0, 64, Some("stateKey"))], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 64, Some("stateKey"))], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[] },
+        Variant { from: 4, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Bytes, 0, 64, Some("stateKey"))], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "app_local_get_ex", version: 2, deadens: false, imms: &[], variants: &[
-        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 64, Some("stateKey"))], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
-        Variant { from: 4, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 64, Some("stateKey"))], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 64, Some("stateKey"))], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
+        Variant { from: 4, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 64, Some("stateKey"))], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "app_local_put", version: 2, deadens: false, imms: &[], variants: &[
-        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 64, Some("stateKey")), StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "" },
-        Variant { from: 4, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Bytes, 0, 64, Some("stateKey")), StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "" },
+        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 64, Some("stateKey")), StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "", imms: &[] },
+        Variant { from: 4, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Bytes, 0, 64, Some("stateKey")), StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "", imms: &[] },
     ] },
     OpEntry { name: "app_opted_in", version: 2, deadens: false, imms: &[], variants: &[
-        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
-        Variant { from: 4, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
+        Variant { from: 4, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "app_params_get", version: 5, deadens: false, imms: &[ImmEntry { name: "f", group: Some(GROUP_APP_PARAMS_AD537DB5) }], variants: &[
-        Variant { from: 5, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 5, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[ImmEntry { name: "f", group: Some(GROUP_APP_PARAMS_AD537DB5) }] },
     ] },
     OpEntry { name: "app_params_set", version: 13, deadens: false, imms: &[ImmEntry { name: "f", group: Some(GROUP_APP_PARAMS_SET_4C7A7833) }], variants: &[
-        Variant { from: 13, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[], refine: "" },
+        Variant { from: 13, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[], refine: "", imms: &[ImmEntry { name: "f", group: Some(GROUP_APP_PARAMS_SET_4C7A7833) }] },
     ] },
     OpEntry { name: "arg", version: 1, deadens: false, imms: &[ImmEntry { name: "n", group: None }], variants: &[
-        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[ImmEntry { name: "n", group: None }] },
     ] },
     OpEntry { name: "arg_0", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "arg_1", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "arg_2", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "arg_3", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "args", version: 5, deadens: false, imms: &[], variants: &[
-        Variant { from: 5, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 5, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "assert", version: 3, deadens: false, imms: &[], variants: &[
-        Variant { from: 3, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[], refine: "" },
+        Variant { from: 3, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[], refine: "", imms: &[] },
     ] },
     OpEntry { name: "asset_holding_get", version: 2, deadens: false, imms: &[ImmEntry { name: "f", group: Some(GROUP_ASSET_HOLDING_183FFBF8) }], variants: &[
-        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
-        Variant { from: 4, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[ImmEntry { name: "f", group: Some(GROUP_ASSET_HOLDING_183FFBF8) }] },
+        Variant { from: 4, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[ImmEntry { name: "f", group: Some(GROUP_ASSET_HOLDING_183FFBF8) }] },
     ] },
     OpEntry { name: "asset_params_get", version: 2, deadens: false, imms: &[ImmEntry { name: "f", group: Some(GROUP_ASSET_PARAMS_8E892463) }], variants: &[
-        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[ImmEntry { name: "f", group: Some(GROUP_ASSET_PARAMS_8E892463) }] },
     ] },
     OpEntry { name: "b", version: 2, deadens: true, imms: &[ImmEntry { name: "target", group: None }], variants: &[
-        Variant { from: 2, args: &[], returns: &[], refine: "" },
+        Variant { from: 2, args: &[], returns: &[], refine: "", imms: &[ImmEntry { name: "target", group: None }] },
     ] },
     OpEntry { name: "b!=", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
-        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
+        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "b%", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], refine: "" },
-        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], refine: "", imms: &[] },
+        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "b&", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "b*", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "typeByteMath:128" },
-        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "typeByteMath:128", imms: &[] },
+        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "b+", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "typeByteMath:65" },
-        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "typeByteMath:65", imms: &[] },
+        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "b-", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], refine: "" },
-        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], refine: "", imms: &[] },
+        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "b/", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], refine: "" },
-        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], refine: "", imms: &[] },
+        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "b<", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
-        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
+        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "b<=", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
-        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
+        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "b==", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
-        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
+        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "b>", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
-        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
+        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "b>=", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
-        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint")), StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
+        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "b^", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "balance", version: 2, deadens: false, imms: &[], variants: &[
-        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
-        Variant { from: 4, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
+        Variant { from: 4, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "base64_decode", version: 7, deadens: false, imms: &[ImmEntry { name: "e", group: Some(GROUP_BASE64_4F2FEB25) }], variants: &[
-        Variant { from: 7, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 7, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[ImmEntry { name: "e", group: Some(GROUP_BASE64_4F2FEB25) }] },
     ] },
     OpEntry { name: "bitlen", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "block", version: 7, deadens: false, imms: &[ImmEntry { name: "f", group: Some(GROUP_BLOCK_D83868A3) }], variants: &[
-        Variant { from: 7, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 7, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[ImmEntry { name: "f", group: Some(GROUP_BLOCK_D83868A3) }] },
     ] },
     OpEntry { name: "bmodexp", version: 14, deadens: false, imms: &[], variants: &[
-        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "bnz", version: 1, deadens: false, imms: &[ImmEntry { name: "target", group: None }], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[], refine: "", imms: &[ImmEntry { name: "target", group: None }] },
     ] },
     OpEntry { name: "box_create", version: 8, deadens: false, imms: &[], variants: &[
-        Variant { from: 8, args: &[StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 8, args: &[StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "box_del", version: 8, deadens: false, imms: &[], variants: &[
-        Variant { from: 8, args: &[StackType::new(Avm::Bytes, 1, 64, Some("boxName"))], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 8, args: &[StackType::new(Avm::Bytes, 1, 64, Some("boxName"))], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "box_extract", version: 8, deadens: false, imms: &[], variants: &[
-        Variant { from: 8, args: &[StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 8, args: &[StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "box_get", version: 8, deadens: false, imms: &[], variants: &[
-        Variant { from: 8, args: &[StackType::new(Avm::Bytes, 1, 64, Some("boxName"))], returns: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 8, args: &[StackType::new(Avm::Bytes, 1, 64, Some("boxName"))], returns: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "box_len", version: 8, deadens: false, imms: &[], variants: &[
-        Variant { from: 8, args: &[StackType::new(Avm::Bytes, 1, 64, Some("boxName"))], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 8, args: &[StackType::new(Avm::Bytes, 1, 64, Some("boxName"))], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "box_put", version: 8, deadens: false, imms: &[], variants: &[
-        Variant { from: 8, args: &[StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[], refine: "" },
+        Variant { from: 8, args: &[StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[], refine: "", imms: &[] },
     ] },
     OpEntry { name: "box_replace", version: 8, deadens: false, imms: &[], variants: &[
-        Variant { from: 8, args: &[StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[], refine: "" },
+        Variant { from: 8, args: &[StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[], refine: "", imms: &[] },
     ] },
     OpEntry { name: "box_resize", version: 10, deadens: false, imms: &[], variants: &[
-        Variant { from: 10, args: &[StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[], refine: "" },
+        Variant { from: 10, args: &[StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[], refine: "", imms: &[] },
     ] },
     OpEntry { name: "box_splice", version: 10, deadens: false, imms: &[], variants: &[
-        Variant { from: 10, args: &[StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[], refine: "" },
+        Variant { from: 10, args: &[StackType::new(Avm::Bytes, 1, 64, Some("boxName")), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[], refine: "", imms: &[] },
     ] },
     OpEntry { name: "bsqrt", version: 6, deadens: false, imms: &[], variants: &[
-        Variant { from: 6, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], refine: "" },
-        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 6, args: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], returns: &[StackType::new(Avm::Bytes, 0, 64, Some("bigint"))], refine: "", imms: &[] },
+        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "btoi", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "bury", version: 8, deadens: false, imms: &[ImmEntry { name: "n", group: None }], variants: &[
-        Variant { from: 8, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "typeBury" },
+        Variant { from: 8, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "typeBury", imms: &[ImmEntry { name: "n", group: None }] },
     ] },
     OpEntry { name: "bytec", version: 1, deadens: false, imms: &[ImmEntry { name: "i", group: None }], variants: &[
-        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[ImmEntry { name: "i", group: None }] },
     ] },
     OpEntry { name: "bytec_0", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "bytec_1", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "bytec_2", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "bytec_3", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "bytecblock", version: 1, deadens: false, imms: &[ImmEntry { name: "bytes ...", group: None }], variants: &[
-        Variant { from: 1, args: &[], returns: &[], refine: "" },
+        Variant { from: 1, args: &[], returns: &[], refine: "", imms: &[ImmEntry { name: "bytes ...", group: None }] },
     ] },
     OpEntry { name: "bz", version: 2, deadens: false, imms: &[ImmEntry { name: "target", group: None }], variants: &[
-        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[], refine: "" },
+        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[], refine: "", imms: &[ImmEntry { name: "target", group: None }] },
     ] },
     OpEntry { name: "bzero", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "typeBzero" },
+        Variant { from: 4, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "typeBzero", imms: &[] },
     ] },
     OpEntry { name: "b|", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "b~", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "callsub", version: 4, deadens: true, imms: &[ImmEntry { name: "target", group: None }], variants: &[
-        Variant { from: 4, args: &[], returns: &[], refine: "" },
+        Variant { from: 4, args: &[], returns: &[], refine: "", imms: &[ImmEntry { name: "target", group: None }] },
     ] },
     OpEntry { name: "concat", version: 2, deadens: false, imms: &[], variants: &[
-        Variant { from: 2, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 2, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "cover", version: 5, deadens: false, imms: &[ImmEntry { name: "n", group: None }], variants: &[
-        Variant { from: 5, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "typeCover" },
+        Variant { from: 5, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "typeCover", imms: &[ImmEntry { name: "n", group: None }] },
     ] },
     OpEntry { name: "dig", version: 3, deadens: false, imms: &[ImmEntry { name: "n", group: None }], variants: &[
-        Variant { from: 3, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None)], refine: "typeDig" },
+        Variant { from: 3, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None)], refine: "typeDig", imms: &[ImmEntry { name: "n", group: None }] },
     ] },
     OpEntry { name: "divmodw", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "divw", version: 6, deadens: false, imms: &[], variants: &[
-        Variant { from: 6, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 6, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "dup", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None)], refine: "typeDup" },
+        Variant { from: 1, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None)], refine: "typeDup", imms: &[] },
     ] },
     OpEntry { name: "dup2", version: 2, deadens: false, imms: &[], variants: &[
-        Variant { from: 2, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None)], refine: "typeDupTwo" },
+        Variant { from: 2, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None)], refine: "typeDupTwo", imms: &[] },
     ] },
     OpEntry { name: "dupn", version: 8, deadens: false, imms: &[ImmEntry { name: "n", group: None }], variants: &[
-        Variant { from: 8, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "typeDupN" },
+        Variant { from: 8, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "typeDupN", imms: &[ImmEntry { name: "n", group: None }] },
     ] },
     OpEntry { name: "ec_add", version: 10, deadens: false, imms: &[ImmEntry { name: "g", group: Some(GROUP_EC_49E63ED0) }], variants: &[
-        Variant { from: 10, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 10, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[ImmEntry { name: "g", group: Some(GROUP_EC_49E63ED0) }] },
     ] },
     OpEntry { name: "ec_map_to", version: 10, deadens: false, imms: &[ImmEntry { name: "g", group: Some(GROUP_EC_49E63ED0) }], variants: &[
-        Variant { from: 10, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 10, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[ImmEntry { name: "g", group: Some(GROUP_EC_49E63ED0) }] },
     ] },
     OpEntry { name: "ec_multi_scalar_mul", version: 10, deadens: false, imms: &[ImmEntry { name: "g", group: Some(GROUP_EC_49E63ED0) }], variants: &[
-        Variant { from: 10, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 10, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[ImmEntry { name: "g", group: Some(GROUP_EC_49E63ED0) }] },
     ] },
     OpEntry { name: "ec_pairing_check", version: 10, deadens: false, imms: &[ImmEntry { name: "g", group: Some(GROUP_EC_49E63ED0) }], variants: &[
-        Variant { from: 10, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 10, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[ImmEntry { name: "g", group: Some(GROUP_EC_49E63ED0) }] },
     ] },
     OpEntry { name: "ec_scalar_mul", version: 10, deadens: false, imms: &[ImmEntry { name: "g", group: Some(GROUP_EC_49E63ED0) }], variants: &[
-        Variant { from: 10, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 10, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[ImmEntry { name: "g", group: Some(GROUP_EC_49E63ED0) }] },
     ] },
     OpEntry { name: "ec_subgroup_check", version: 10, deadens: false, imms: &[ImmEntry { name: "g", group: Some(GROUP_EC_49E63ED0) }], variants: &[
-        Variant { from: 10, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 10, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[ImmEntry { name: "g", group: Some(GROUP_EC_49E63ED0) }] },
     ] },
     OpEntry { name: "ecdsa_pk_decompress", version: 5, deadens: false, imms: &[ImmEntry { name: "v", group: Some(GROUP_ECDSA_5035A4E5) }], variants: &[
-        Variant { from: 5, args: &[StackType::new(Avm::Bytes, 33, 33, None)], returns: &[StackType::new(Avm::Bytes, 32, 32, None), StackType::new(Avm::Bytes, 32, 32, None)], refine: "" },
+        Variant { from: 5, args: &[StackType::new(Avm::Bytes, 33, 33, None)], returns: &[StackType::new(Avm::Bytes, 32, 32, None), StackType::new(Avm::Bytes, 32, 32, None)], refine: "", imms: &[ImmEntry { name: "v", group: Some(GROUP_ECDSA_5035A4E5) }] },
     ] },
     OpEntry { name: "ecdsa_pk_recover", version: 5, deadens: false, imms: &[ImmEntry { name: "v", group: Some(GROUP_ECDSA_5035A4E5) }], variants: &[
-        Variant { from: 5, args: &[StackType::new(Avm::Bytes, 32, 32, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 32, 32, None), StackType::new(Avm::Bytes, 32, 32, None)], returns: &[StackType::new(Avm::Bytes, 32, 32, None), StackType::new(Avm::Bytes, 32, 32, None)], refine: "" },
+        Variant { from: 5, args: &[StackType::new(Avm::Bytes, 32, 32, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 32, 32, None), StackType::new(Avm::Bytes, 32, 32, None)], returns: &[StackType::new(Avm::Bytes, 32, 32, None), StackType::new(Avm::Bytes, 32, 32, None)], refine: "", imms: &[ImmEntry { name: "v", group: Some(GROUP_ECDSA_5035A4E5) }] },
     ] },
     OpEntry { name: "ecdsa_verify", version: 5, deadens: false, imms: &[ImmEntry { name: "v", group: Some(GROUP_ECDSA_5035A4E5) }], variants: &[
-        Variant { from: 5, args: &[StackType::new(Avm::Bytes, 32, 32, None), StackType::new(Avm::Bytes, 32, 32, None), StackType::new(Avm::Bytes, 32, 32, None), StackType::new(Avm::Bytes, 32, 32, None), StackType::new(Avm::Bytes, 32, 32, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 5, args: &[StackType::new(Avm::Bytes, 32, 32, None), StackType::new(Avm::Bytes, 32, 32, None), StackType::new(Avm::Bytes, 32, 32, None), StackType::new(Avm::Bytes, 32, 32, None), StackType::new(Avm::Bytes, 32, 32, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[ImmEntry { name: "v", group: Some(GROUP_ECDSA_5035A4E5) }] },
     ] },
     OpEntry { name: "ed25519verify", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 64, 64, None), StackType::new(Avm::Bytes, 32, 32, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 64, 64, None), StackType::new(Avm::Bytes, 32, 32, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "ed25519verify_bare", version: 7, deadens: false, imms: &[], variants: &[
-        Variant { from: 7, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 64, 64, None), StackType::new(Avm::Bytes, 32, 32, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 7, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 64, 64, None), StackType::new(Avm::Bytes, 32, 32, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "err", version: 1, deadens: true, imms: &[], variants: &[
-        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::None, 0, 0, None)], refine: "" },
+        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::None, 0, 0, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "exp", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "expw", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "extract", version: 5, deadens: false, imms: &[ImmEntry { name: "s", group: None }, ImmEntry { name: "l", group: None }], variants: &[
-        Variant { from: 5, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 5, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[ImmEntry { name: "s", group: None }, ImmEntry { name: "l", group: None }] },
     ] },
     OpEntry { name: "extract3", version: 5, deadens: false, imms: &[], variants: &[
-        Variant { from: 5, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 5, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "extract_uint16", version: 5, deadens: false, imms: &[], variants: &[
-        Variant { from: 5, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 5, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "extract_uint32", version: 5, deadens: false, imms: &[], variants: &[
-        Variant { from: 5, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 5, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "extract_uint64", version: 5, deadens: false, imms: &[], variants: &[
-        Variant { from: 5, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 5, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "falcon_verify", version: 12, deadens: false, imms: &[ImmEntry { name: "f", group: Some(GROUP_FALCON_CONFIGURATIONS_CF946D03) }], variants: &[
-        Variant { from: 12, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 1793, 1793, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
-        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "typeFalconVerify" },
+        Variant { from: 12, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 1793, 1793, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
+        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "typeFalconVerify", imms: &[ImmEntry { name: "f", group: Some(GROUP_FALCON_CONFIGURATIONS_CF946D03) }] },
     ] },
     OpEntry { name: "frame_bury", version: 8, deadens: false, imms: &[ImmEntry { name: "i", group: None }], variants: &[
-        Variant { from: 8, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "typeFrameBury" },
+        Variant { from: 8, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "typeFrameBury", imms: &[ImmEntry { name: "i", group: None }] },
     ] },
     OpEntry { name: "frame_dig", version: 8, deadens: false, imms: &[ImmEntry { name: "i", group: None }], variants: &[
-        Variant { from: 8, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "typeFrameDig" },
+        Variant { from: 8, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "typeFrameDig", imms: &[ImmEntry { name: "i", group: None }] },
     ] },
     OpEntry { name: "gaid", version: 4, deadens: false, imms: &[ImmEntry { name: "t", group: None }], variants: &[
-        Variant { from: 4, args: &[], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 4, args: &[], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[ImmEntry { name: "t", group: None }] },
     ] },
     OpEntry { name: "gaids", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "getbit", version: 3, deadens: false, imms: &[], variants: &[
-        Variant { from: 3, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 3, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "getbyte", version: 3, deadens: false, imms: &[], variants: &[
-        Variant { from: 3, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 3, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "gitxn", version: 6, deadens: false, imms: &[ImmEntry { name: "t", group: None }, ImmEntry { name: "f", group: Some(GROUP_TXN_EE695701) }], variants: &[
-        Variant { from: 6, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 6, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[ImmEntry { name: "t", group: None }, ImmEntry { name: "f", group: Some(GROUP_TXN_EE695701) }] },
     ] },
     OpEntry { name: "gitxna", version: 6, deadens: false, imms: &[ImmEntry { name: "t", group: None }, ImmEntry { name: "f", group: Some(GROUP_TXNA_98892EB3) }, ImmEntry { name: "i", group: None }], variants: &[
-        Variant { from: 6, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 6, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[ImmEntry { name: "t", group: None }, ImmEntry { name: "f", group: Some(GROUP_TXNA_98892EB3) }, ImmEntry { name: "i", group: None }] },
     ] },
     OpEntry { name: "gitxnas", version: 6, deadens: false, imms: &[ImmEntry { name: "t", group: None }, ImmEntry { name: "f", group: Some(GROUP_TXNA_98892EB3) }], variants: &[
-        Variant { from: 6, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 6, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[ImmEntry { name: "t", group: None }, ImmEntry { name: "f", group: Some(GROUP_TXNA_98892EB3) }] },
     ] },
     OpEntry { name: "gload", version: 4, deadens: false, imms: &[ImmEntry { name: "t", group: None }, ImmEntry { name: "i", group: None }], variants: &[
-        Variant { from: 4, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 4, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[ImmEntry { name: "t", group: None }, ImmEntry { name: "i", group: None }] },
     ] },
     OpEntry { name: "gloads", version: 4, deadens: false, imms: &[ImmEntry { name: "i", group: None }], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[ImmEntry { name: "i", group: None }] },
     ] },
     OpEntry { name: "gloadss", version: 6, deadens: false, imms: &[], variants: &[
-        Variant { from: 6, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 6, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "global", version: 1, deadens: false, imms: &[ImmEntry { name: "f", group: Some(GROUP_GLOBAL_3192150C) }], variants: &[
-        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[ImmEntry { name: "f", group: Some(GROUP_GLOBAL_3192150C) }] },
     ] },
     OpEntry { name: "gtxn", version: 1, deadens: false, imms: &[ImmEntry { name: "t", group: None }, ImmEntry { name: "f", group: Some(GROUP_TXN_EE695701) }], variants: &[
-        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[ImmEntry { name: "t", group: None }, ImmEntry { name: "f", group: Some(GROUP_TXN_EE695701) }] },
     ] },
     OpEntry { name: "gtxna", version: 2, deadens: false, imms: &[ImmEntry { name: "t", group: None }, ImmEntry { name: "f", group: Some(GROUP_TXNA_98892EB3) }, ImmEntry { name: "i", group: None }], variants: &[
-        Variant { from: 2, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 2, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[ImmEntry { name: "t", group: None }, ImmEntry { name: "f", group: Some(GROUP_TXNA_98892EB3) }, ImmEntry { name: "i", group: None }] },
     ] },
     OpEntry { name: "gtxnas", version: 5, deadens: false, imms: &[ImmEntry { name: "t", group: None }, ImmEntry { name: "f", group: Some(GROUP_TXNA_98892EB3) }], variants: &[
-        Variant { from: 5, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 5, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[ImmEntry { name: "t", group: None }, ImmEntry { name: "f", group: Some(GROUP_TXNA_98892EB3) }] },
     ] },
     OpEntry { name: "gtxns", version: 3, deadens: false, imms: &[ImmEntry { name: "f", group: Some(GROUP_TXN_EE695701) }], variants: &[
-        Variant { from: 3, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 3, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[ImmEntry { name: "f", group: Some(GROUP_TXN_EE695701) }] },
     ] },
     OpEntry { name: "gtxnsa", version: 3, deadens: false, imms: &[ImmEntry { name: "f", group: Some(GROUP_TXNA_98892EB3) }, ImmEntry { name: "i", group: None }], variants: &[
-        Variant { from: 3, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 3, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[ImmEntry { name: "f", group: Some(GROUP_TXNA_98892EB3) }, ImmEntry { name: "i", group: None }] },
     ] },
     OpEntry { name: "gtxnsas", version: 5, deadens: false, imms: &[ImmEntry { name: "f", group: Some(GROUP_TXNA_98892EB3) }], variants: &[
-        Variant { from: 5, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 5, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[ImmEntry { name: "f", group: Some(GROUP_TXNA_98892EB3) }] },
     ] },
     OpEntry { name: "intc", version: 1, deadens: false, imms: &[ImmEntry { name: "i", group: None }], variants: &[
-        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[ImmEntry { name: "i", group: None }] },
     ] },
     OpEntry { name: "intc_0", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "intc_1", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "intc_2", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "intc_3", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "intcblock", version: 1, deadens: false, imms: &[ImmEntry { name: "uint ...", group: None }], variants: &[
-        Variant { from: 1, args: &[], returns: &[], refine: "" },
+        Variant { from: 1, args: &[], returns: &[], refine: "", imms: &[ImmEntry { name: "uint ...", group: None }] },
     ] },
     OpEntry { name: "itob", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Bytes, 8, 8, None)], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Bytes, 8, 8, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "itxn", version: 5, deadens: false, imms: &[ImmEntry { name: "f", group: Some(GROUP_TXN_EE695701) }], variants: &[
-        Variant { from: 5, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 5, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[ImmEntry { name: "f", group: Some(GROUP_TXN_EE695701) }] },
     ] },
     OpEntry { name: "itxn_begin", version: 5, deadens: false, imms: &[], variants: &[
-        Variant { from: 5, args: &[], returns: &[], refine: "" },
+        Variant { from: 5, args: &[], returns: &[], refine: "", imms: &[] },
     ] },
     OpEntry { name: "itxn_field", version: 5, deadens: false, imms: &[ImmEntry { name: "f", group: Some(GROUP_TXN_F778743F) }], variants: &[
-        Variant { from: 5, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "typeTxField" },
+        Variant { from: 5, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "typeTxField", imms: &[ImmEntry { name: "f", group: Some(GROUP_TXN_F778743F) }] },
     ] },
     OpEntry { name: "itxn_next", version: 6, deadens: false, imms: &[], variants: &[
-        Variant { from: 6, args: &[], returns: &[], refine: "" },
+        Variant { from: 6, args: &[], returns: &[], refine: "", imms: &[] },
     ] },
     OpEntry { name: "itxn_submit", version: 5, deadens: false, imms: &[], variants: &[
-        Variant { from: 5, args: &[], returns: &[], refine: "" },
+        Variant { from: 5, args: &[], returns: &[], refine: "", imms: &[] },
     ] },
     OpEntry { name: "itxna", version: 5, deadens: false, imms: &[ImmEntry { name: "f", group: Some(GROUP_TXNA_98892EB3) }, ImmEntry { name: "i", group: None }], variants: &[
-        Variant { from: 5, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 5, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[ImmEntry { name: "f", group: Some(GROUP_TXNA_98892EB3) }, ImmEntry { name: "i", group: None }] },
     ] },
     OpEntry { name: "itxnas", version: 6, deadens: false, imms: &[ImmEntry { name: "f", group: Some(GROUP_TXNA_98892EB3) }], variants: &[
-        Variant { from: 6, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 6, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[ImmEntry { name: "f", group: Some(GROUP_TXNA_98892EB3) }] },
     ] },
     OpEntry { name: "json_ref", version: 7, deadens: false, imms: &[ImmEntry { name: "r", group: Some(GROUP_JSON_REF_EA77FF5B) }], variants: &[
-        Variant { from: 7, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 7, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[ImmEntry { name: "r", group: Some(GROUP_JSON_REF_EA77FF5B) }] },
     ] },
     OpEntry { name: "keccak256", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 32, 32, None)], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 32, 32, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "len", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "load", version: 1, deadens: false, imms: &[ImmEntry { name: "i", group: None }], variants: &[
-        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "typeLoad" },
+        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "typeLoad", imms: &[ImmEntry { name: "i", group: None }] },
     ] },
     OpEntry { name: "loads", version: 5, deadens: false, imms: &[], variants: &[
-        Variant { from: 5, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "typeLoads" },
+        Variant { from: 5, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "typeLoads", imms: &[] },
     ] },
     OpEntry { name: "log", version: 5, deadens: false, imms: &[], variants: &[
-        Variant { from: 5, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[], refine: "" },
+        Variant { from: 5, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[], refine: "", imms: &[] },
     ] },
     OpEntry { name: "match", version: 8, deadens: false, imms: &[ImmEntry { name: "target ...", group: None }], variants: &[
-        Variant { from: 8, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "typeMatch" },
+        Variant { from: 8, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "typeMatch", imms: &[ImmEntry { name: "target ...", group: None }] },
     ] },
     OpEntry { name: "mimc", version: 11, deadens: false, imms: &[ImmEntry { name: "c", group: Some(GROUP_MIMCCONFIGURATIONS_5BD995DE) }], variants: &[
-        Variant { from: 11, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 32, 32, None)], refine: "" },
+        Variant { from: 11, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 32, 32, None)], refine: "", imms: &[ImmEntry { name: "c", group: Some(GROUP_MIMCCONFIGURATIONS_5BD995DE) }] },
     ] },
     OpEntry { name: "min_balance", version: 3, deadens: false, imms: &[], variants: &[
-        Variant { from: 3, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
-        Variant { from: 4, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 3, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
+        Variant { from: 4, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "mldsa_verify", version: 14, deadens: false, imms: &[ImmEntry { name: "p", group: Some(GROUP_ML_DSA_CONFIGURATIONS_0EE908CB) }], variants: &[
-        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "typeMLDSAVerify" },
+        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "typeMLDSAVerify", imms: &[ImmEntry { name: "p", group: Some(GROUP_ML_DSA_CONFIGURATIONS_0EE908CB) }] },
     ] },
     OpEntry { name: "mulw", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "online_stake", version: 11, deadens: false, imms: &[], variants: &[
-        Variant { from: 11, args: &[], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 11, args: &[], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "pop", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "", imms: &[] },
     ] },
     OpEntry { name: "popn", version: 8, deadens: false, imms: &[ImmEntry { name: "n", group: None }], variants: &[
-        Variant { from: 8, args: &[], returns: &[], refine: "typePopN" },
+        Variant { from: 8, args: &[], returns: &[], refine: "typePopN", imms: &[ImmEntry { name: "n", group: None }] },
     ] },
     OpEntry { name: "poseidon2", version: 13, deadens: false, imms: &[ImmEntry { name: "c", group: Some(GROUP_POSEIDON2_CONFIGURATIONS_B25F2B57) }], variants: &[
-        Variant { from: 13, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 32, 32, None)], refine: "" },
+        Variant { from: 13, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 32, 32, None)], refine: "", imms: &[ImmEntry { name: "c", group: Some(GROUP_POSEIDON2_CONFIGURATIONS_B25F2B57) }] },
     ] },
     OpEntry { name: "proto", version: 8, deadens: false, imms: &[ImmEntry { name: "a", group: None }, ImmEntry { name: "r", group: None }], variants: &[
-        Variant { from: 8, args: &[], returns: &[], refine: "typeProto" },
+        Variant { from: 8, args: &[], returns: &[], refine: "typeProto", imms: &[ImmEntry { name: "a", group: None }, ImmEntry { name: "r", group: None }] },
     ] },
     OpEntry { name: "pushbytes", version: 3, deadens: false, imms: &[ImmEntry { name: "bytes", group: None }], variants: &[
-        Variant { from: 3, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 3, args: &[], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[ImmEntry { name: "bytes", group: None }] },
     ] },
     OpEntry { name: "pushbytess", version: 8, deadens: false, imms: &[ImmEntry { name: "bytes ...", group: None }], variants: &[
-        Variant { from: 8, args: &[], returns: &[], refine: "typePushBytess" },
+        Variant { from: 8, args: &[], returns: &[], refine: "typePushBytess", imms: &[ImmEntry { name: "bytes ...", group: None }] },
     ] },
     OpEntry { name: "pushint", version: 3, deadens: false, imms: &[ImmEntry { name: "uint", group: None }], variants: &[
-        Variant { from: 3, args: &[], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 3, args: &[], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[ImmEntry { name: "uint", group: None }] },
     ] },
     OpEntry { name: "pushints", version: 8, deadens: false, imms: &[ImmEntry { name: "uint ...", group: None }], variants: &[
-        Variant { from: 8, args: &[], returns: &[], refine: "typePushInts" },
+        Variant { from: 8, args: &[], returns: &[], refine: "typePushInts", imms: &[ImmEntry { name: "uint ...", group: None }] },
     ] },
     OpEntry { name: "replace2", version: 7, deadens: false, imms: &[ImmEntry { name: "s", group: None }], variants: &[
-        Variant { from: 7, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 7, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[ImmEntry { name: "s", group: None }] },
     ] },
     OpEntry { name: "replace3", version: 7, deadens: false, imms: &[], variants: &[
-        Variant { from: 7, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 7, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "retsub", version: 4, deadens: true, imms: &[], variants: &[
-        Variant { from: 4, args: &[], returns: &[], refine: "" },
+        Variant { from: 4, args: &[], returns: &[], refine: "", imms: &[] },
     ] },
     OpEntry { name: "return", version: 2, deadens: true, imms: &[], variants: &[
-        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::None, 0, 0, None)], refine: "" },
+        Variant { from: 2, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::None, 0, 0, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "select", version: 3, deadens: false, imms: &[], variants: &[
-        Variant { from: 3, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "typeSelect" },
+        Variant { from: 3, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "typeSelect", imms: &[] },
     ] },
     OpEntry { name: "setbit", version: 3, deadens: false, imms: &[], variants: &[
-        Variant { from: 3, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "typeSetBit" },
+        Variant { from: 3, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "typeSetBit", imms: &[] },
     ] },
     OpEntry { name: "setbyte", version: 3, deadens: false, imms: &[], variants: &[
-        Variant { from: 3, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 3, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "sha256", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 32, 32, None)], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 32, 32, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "sha3_256", version: 7, deadens: false, imms: &[], variants: &[
-        Variant { from: 7, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 32, 32, None)], refine: "" },
+        Variant { from: 7, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 32, 32, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "sha512", version: 13, deadens: false, imms: &[], variants: &[
-        Variant { from: 13, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 64, 64, None)], refine: "" },
+        Variant { from: 13, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 64, 64, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "sha512_256", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 32, 32, None)], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 32, 32, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "shl", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "shr", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "sqrt", version: 4, deadens: false, imms: &[], variants: &[
-        Variant { from: 4, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 4, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "store", version: 1, deadens: false, imms: &[ImmEntry { name: "i", group: None }], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "typeStore" },
+        Variant { from: 1, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "typeStore", imms: &[ImmEntry { name: "i", group: None }] },
     ] },
     OpEntry { name: "stores", version: 5, deadens: false, imms: &[], variants: &[
-        Variant { from: 5, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "typeStores" },
+        Variant { from: 5, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Any, 0, 0, None)], returns: &[], refine: "typeStores", imms: &[] },
     ] },
     OpEntry { name: "substring", version: 2, deadens: false, imms: &[ImmEntry { name: "s", group: None }, ImmEntry { name: "e", group: None }], variants: &[
-        Variant { from: 2, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 2, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[ImmEntry { name: "s", group: None }, ImmEntry { name: "e", group: None }] },
     ] },
     OpEntry { name: "substring3", version: 2, deadens: false, imms: &[], variants: &[
-        Variant { from: 2, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "" },
+        Variant { from: 2, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Bytes, 0, 4096, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "sumhash512", version: 14, deadens: false, imms: &[], variants: &[
-        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 64, 64, None)], refine: "" },
+        Variant { from: 14, args: &[StackType::new(Avm::Bytes, 0, 4096, None)], returns: &[StackType::new(Avm::Bytes, 64, 64, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "swap", version: 3, deadens: false, imms: &[], variants: &[
-        Variant { from: 3, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None)], refine: "typeSwap" },
+        Variant { from: 3, args: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Any, 0, 0, None)], refine: "typeSwap", imms: &[] },
     ] },
     OpEntry { name: "switch", version: 8, deadens: false, imms: &[ImmEntry { name: "target ...", group: None }], variants: &[
-        Variant { from: 8, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[], refine: "" },
+        Variant { from: 8, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[], refine: "", imms: &[ImmEntry { name: "target ...", group: None }] },
     ] },
     OpEntry { name: "txn", version: 1, deadens: false, imms: &[ImmEntry { name: "f", group: Some(GROUP_TXN_EE695701) }], variants: &[
-        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 1, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[ImmEntry { name: "f", group: Some(GROUP_TXN_EE695701) }] },
     ] },
     OpEntry { name: "txna", version: 2, deadens: false, imms: &[ImmEntry { name: "f", group: Some(GROUP_TXNA_98892EB3) }, ImmEntry { name: "i", group: None }], variants: &[
-        Variant { from: 2, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 2, args: &[], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[ImmEntry { name: "f", group: Some(GROUP_TXNA_98892EB3) }, ImmEntry { name: "i", group: None }] },
     ] },
     OpEntry { name: "txnas", version: 5, deadens: false, imms: &[ImmEntry { name: "f", group: Some(GROUP_TXNA_98892EB3) }], variants: &[
-        Variant { from: 5, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "" },
+        Variant { from: 5, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "", imms: &[ImmEntry { name: "f", group: Some(GROUP_TXNA_98892EB3) }] },
     ] },
     OpEntry { name: "uncover", version: 5, deadens: false, imms: &[ImmEntry { name: "n", group: None }], variants: &[
-        Variant { from: 5, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "typeUncover" },
+        Variant { from: 5, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Any, 0, 0, None)], refine: "typeUncover", imms: &[ImmEntry { name: "n", group: None }] },
     ] },
     OpEntry { name: "voter_params_get", version: 11, deadens: false, imms: &[ImmEntry { name: "f", group: Some(GROUP_VOTER_PARAMS_E53589CE) }], variants: &[
-        Variant { from: 11, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 11, args: &[StackType::new(Avm::Any, 0, 0, None)], returns: &[StackType::new(Avm::Any, 0, 0, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[ImmEntry { name: "f", group: Some(GROUP_VOTER_PARAMS_E53589CE) }] },
     ] },
     OpEntry { name: "vrf_verify", version: 7, deadens: false, imms: &[ImmEntry { name: "s", group: Some(GROUP_VRF_VERIFY_9FF243A1) }], variants: &[
-        Variant { from: 7, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 80, 80, None), StackType::new(Avm::Bytes, 32, 32, None)], returns: &[StackType::new(Avm::Bytes, 64, 64, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 7, args: &[StackType::new(Avm::Bytes, 0, 4096, None), StackType::new(Avm::Bytes, 80, 80, None), StackType::new(Avm::Bytes, 32, 32, None)], returns: &[StackType::new(Avm::Bytes, 64, 64, None), StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[ImmEntry { name: "s", group: Some(GROUP_VRF_VERIFY_9FF243A1) }] },
     ] },
     OpEntry { name: "|", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
     OpEntry { name: "||", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None), StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 1, Some("bool"))], refine: "", imms: &[] },
     ] },
     OpEntry { name: "~", version: 1, deadens: false, imms: &[], variants: &[
-        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "" },
+        Variant { from: 1, args: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], returns: &[StackType::new(Avm::Uint64, 0, 18446744073709551615, None)], refine: "", imms: &[] },
     ] },
 ];

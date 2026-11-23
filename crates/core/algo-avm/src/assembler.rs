@@ -2494,7 +2494,8 @@ fn asm_default(
     lookup_name: &str,
     args: &[&str],
 ) {
-    if check_arg_count(ops, name, args, entry.imms.len()) {
+    let imms = entry.imms_at(ops.effective_version());
+    if check_arg_count(ops, name, args, imms.len()) {
         return;
     }
     ops.pending.push(spec.opcode);
@@ -2510,15 +2511,14 @@ fn asm_default(
             name.to_string()
         }
     };
-    for (i, imm) in entry.imms.iter().enumerate() {
+    for (i, imm) in imms.iter().enumerate() {
         let arg = args[i];
         match imm.group {
             Some(group) => {
                 let Some(field) = group.iter().find(|f| f.name == arg) else {
                     // The user may have supplied a number where a field belongs.
                     if byte_imm(arg, "").is_ok() {
-                        let correct: Vec<String> = entry
-                            .imms
+                        let correct: Vec<String> = imms
                             .iter()
                             .enumerate()
                             .filter(|(_, o)| o.group.is_none())
@@ -2543,7 +2543,7 @@ fn asm_default(
                             let Some(te) = type_track::op_entry_by_name(target) else {
                                 continue;
                             };
-                            for pi in te.imms {
+                            for pi in te.imms_at(ops.effective_version()) {
                                 if pi.group.is_some_and(|g| g.iter().any(|f| f.name == arg)) {
                                     with_field.push(num_imms);
                                 }
@@ -2594,8 +2594,7 @@ fn asm_default(
                     Err(e) => {
                         if e.contains("unable to parse") {
                             // Perhaps the field works in a different order.
-                            let correct: Vec<String> = entry
-                                .imms
+                            let correct: Vec<String> = imms
                                 .iter()
                                 .enumerate()
                                 .filter(|(_, o)| {
@@ -6786,6 +6785,25 @@ dup
         let ops = assemble_string(source).unwrap();
         // version(1) + pushints (5) + match opcode(1) + count(1) + labels(2*2)
         assert_eq!(ops.program.len(), 1 + 5 + 1 + 1 + 4);
+    }
+
+    /// go v5.1 gives `falcon_verify` an immediate only from v14: a v12/v13
+    /// program takes none, however the table lists the newest form.
+    #[test]
+    fn falcon_verify_takes_no_immediate_before_v14() {
+        for v in [12, 13] {
+            let source = format!(
+                "#pragma version {v}
+#pragma typetrack false
+byte 0x01
+byte 0x02
+byte 0x03
+falcon_verify
+return
+"
+            );
+            assemble_string(&source).unwrap();
+        }
     }
 
     #[test]
