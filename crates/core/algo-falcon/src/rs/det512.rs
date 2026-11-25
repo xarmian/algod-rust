@@ -33,8 +33,9 @@
 
 use super::codec::{comp_decode, trim_i16_encode, MAX_SIG_BITS};
 use super::falcon::{
-    get_logn, keygen_make, privkey_size, pubkey_size, sig_compressed_maxsize, sign_dyn_finish_compressed, verify_compressed,
-    FALCON_ERR_BADSIG, FALCON_ERR_FORMAT, FALCON_ERR_SIZE,
+    get_logn, keygen_make, privkey_size, pubkey_size, sig_compressed_maxsize,
+    sign_dyn_finish_compressed, verify_compressed, FALCON_ERR_BADSIG, FALCON_ERR_FORMAT,
+    FALCON_ERR_SIZE,
 };
 use super::shake256::Shake256;
 
@@ -46,7 +47,8 @@ const SALTED_SIG_COMPRESSED_MAXSIZE: usize = sig_compressed_maxsize(LOGN);
 /// Unsalted det512 compressed maximum: salt (40) replaced by version (1).
 pub(crate) const SIG_COMPRESSED_MAXSIZE: usize = SALTED_SIG_COMPRESSED_MAXSIZE - 40 + 1;
 /// `FALCON_DET512_SIG_CT_SIZE`: header, salt version and the trimmed coefficients.
-pub(crate) const SIG_CT_SIZE: usize = 2 + (((1usize << LOGN) * MAX_SIG_BITS[LOGN as usize] as usize) + 7) / 8;
+pub(crate) const SIG_CT_SIZE: usize =
+    2 + ((1usize << LOGN) * MAX_SIG_BITS[LOGN as usize] as usize).div_ceil(8);
 pub(crate) const CURRENT_SALT_VERSION: u8 = 0;
 /// `FALCON_DET512_SIG_COMPRESSED_HEADER` (`0x39 | 0x80`).
 pub(crate) const SIG_COMPRESSED_HEADER: u8 = 0xB9;

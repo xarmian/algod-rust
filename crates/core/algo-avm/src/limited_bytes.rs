@@ -59,8 +59,14 @@ mod tests {
     #[test]
     fn long_value_is_cut_to_sixteen_bytes_with_its_length() {
         let v = vec![b'a'; 20];
-        assert_eq!(limited_bytes(&v), format!("{}... (20 bytes)", "a".repeat(16)));
+        assert_eq!(
+            limited_bytes(&v),
+            format!("{}... (20 bytes)", "a".repeat(16))
+        );
         let v = vec![1u8; 17];
-        assert_eq!(limited_bytes(&v), format!("0x{}... (17 bytes)", "01".repeat(16)));
+        assert_eq!(
+            limited_bytes(&v),
+            format!("0x{}... (17 bytes)", "01".repeat(16))
+        );
     }
 }

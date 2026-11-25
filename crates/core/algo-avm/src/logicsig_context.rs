@@ -124,6 +124,10 @@ pub struct LogicSigAvmContext<'a> {
     /// error with "no block header access", exactly as go does when no
     /// `LedgerForSignature` is available.
     sig_ledger: Option<&'a dyn SigBlockSource>,
+    /// Which arguments `arg`/`arg_N`/`args` have pushed, one bit per index
+    /// (go's `argsRead`): the consensus rule `RequireLogicSigArgAccess` reads it
+    /// after the program approved ([`Self::unaccounted_arg`]).
+    args_read: std::cell::RefCell<Vec<u64>>,
 }
 
 impl<'a> LogicSigAvmContext<'a> {
@@ -166,7 +170,31 @@ impl<'a> LogicSigAvmContext<'a> {
             genesis_hash,
             consensus,
             sig_ledger: None,
+            args_read: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    fn arg_was_read(&self, n: usize) -> bool {
+        self.args_read
+            .borrow()
+            .get(n / 64)
+            .is_some_and(|w| w & (1u64 << (n % 64)) != 0)
+    }
+
+    /// go's `EvalContext.UnaccountedArg`: an argument this LogicSig did not read.
+    /// Reading the last argument is what rules out anything above the highest
+    /// index the program read, so the scan need only police the blanks below:
+    /// an unread argument there is fine only when it is empty.
+    pub fn unaccounted_arg(&self) -> Option<usize> {
+        let last = self.args.len().checked_sub(1)?;
+        if !self.arg_was_read(last) {
+            return Some(last);
+        }
+        self.args
+            .iter()
+            .enumerate()
+            .find(|(i, a)| !a.is_empty() && !self.arg_was_read(*i))
+            .map(|(i, _)| i)
     }
 
     /// Attach a block-history lookback source, enabling `txn FirstValidTime`
@@ -359,14 +387,17 @@ impl<'a> AvmContext for LogicSigAvmContext<'a> {
 
     fn arg(&self, index: usize) -> Result<Vec<u8>, AlgoError> {
         if index >= self.args.len() {
+            // go: `cannot load arg[%d] from %d args`
             return Err(AlgoError::Avm {
-                message: format!(
-                    "arg index {} out of range (num_args={})",
-                    index,
-                    self.args.len()
-                ),
+                message: format!("cannot load arg[{index}] from {} args", self.args.len()),
             });
         }
+        // Marked after the bounds check, so a failed read is no access.
+        let mut read = self.args_read.borrow_mut();
+        if read.len() <= index / 64 {
+            read.resize(index / 64 + 1, 0);
+        }
+        read[index / 64] |= 1u64 << (index % 64);
         Ok(self.args[index].clone())
     }
 
@@ -997,5 +1028,61 @@ mod tests {
             format!("{err}").contains("not available in LogicSig mode"),
             "unexpected error: {err}"
         );
+    }
+
+    // Issue #2548: go's `TestUnaccountedArg` / `TestUnaccountedArgFailedRead`.
+    fn unaccounted(args: &[&[u8]], reads: &[usize]) -> Option<usize> {
+        let group = vec![make_pay_stxn([0x10; 32])];
+        let ctx = LogicSigAvmContext::new(
+            &group,
+            0,
+            &[0x01],
+            args.iter().map(|a| a.to_vec()).collect(),
+            ConsensusParams::default(),
+        );
+        for &r in reads {
+            ctx.arg(r).expect("in range");
+        }
+        ctx.unaccounted_arg()
+    }
+
+    #[test]
+    fn unaccounted_arg_table_matches_go() {
+        let x: &[u8] = b"x";
+        assert_eq!(unaccounted(&[], &[]), None, "none supplied");
+        assert_eq!(unaccounted(&[b"a", b"a"], &[0, 1]), None, "all read");
+        assert_eq!(unaccounted(&[b"a", b"b"], &[0]), Some(1), "unread above");
+        assert_eq!(unaccounted(&[b"a", b""], &[0]), Some(1), "empty above");
+        assert_eq!(unaccounted(&[b"", b"", x], &[2]), None, "empty holes below");
+        assert_eq!(
+            unaccounted(&[b"j", b"", x], &[2]),
+            Some(0),
+            "filled hole below"
+        );
+        assert_eq!(unaccounted(&[b""], &[0]), None, "empty arg read");
+        assert_eq!(
+            unaccounted(&[b"x", b"y"], &[0, 0]),
+            Some(1),
+            "same arg twice"
+        );
+        // 255 args reads the top word of the mask
+        let many = vec![&b""[..]; 255];
+        let all: Vec<usize> = (0..255).collect();
+        assert_eq!(unaccounted(&many, &all), None, "all of EvalMaxArgs");
+    }
+
+    #[test]
+    fn failed_arg_read_does_not_mark_the_index() {
+        let group = vec![make_pay_stxn([0x10; 32])];
+        let ctx = LogicSigAvmContext::new(
+            &group,
+            0,
+            &[0x01],
+            vec![b"x".to_vec()],
+            ConsensusParams::default(),
+        );
+        let e = ctx.arg(1).expect_err("out of range").to_string();
+        assert!(e.contains("cannot load arg[1] from 1 args"), "{e}");
+        assert_eq!(ctx.unaccounted_arg(), Some(0), "arg 0 was never read");
     }
 }

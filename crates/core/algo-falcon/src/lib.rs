@@ -286,7 +286,6 @@ pub fn falcon_verify_code_with(
     Ok(verify_code_unchecked(backend, pubkey, sig, data))
 }
 
-
 // ---------------------------------------------------------------------------
 // Falcon-512 (go-algorand falcon v0.2.0, `Det512*`): the same deterministic
 // layer at n = 512, used by the `f5` signature scheme (#2546, go v5.1.0-beta).

@@ -1650,11 +1650,11 @@ mod tests {
     use super::*;
     // The independent reference the opcode is checked against: `sha2`, not the
     // `ring`-backed helper the opcode itself uses (issue #2321).
-    use sha2::Sha512_256;
     use crate::bytecode::parse;
     use crate::context::NullContext;
     use crate::machine::ExecMode;
     use crate::ops::helpers::prog;
+    use sha2::Sha512_256;
 
     /// Helper: run a program and return the machine (for stack inspection).
     fn run_prog(version: u8, code: &[u8]) -> Result<AvmMachine, AlgoError> {
