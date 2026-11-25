@@ -67,7 +67,8 @@ fn check_bigint_input(bytes: &[u8], version: u8) -> Result<BigUint, AlgoError> {
     Ok(BigUint::from_bytes_be(bytes))
 }
 
-/// Pop one byte-math operand (at most 64 bytes, else go's error).
+/// Pop one byte-math operand (at most 64 bytes before v14, else go's error;
+/// unlimited from `fullByteMathVersion`).
 fn pop_bigint(machine: &mut AvmMachine) -> Result<BigUint, AlgoError> {
     let version = machine.version;
     check_bigint_input(&machine.pop_bytes()?, version)
@@ -330,7 +331,7 @@ pub fn op_bzero(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<
 // ---------------------------------------------------------------------------
 
 /// `b+` (0xa0): pop b, pop a, push a+b as bytes. Inputs are at most 64 bytes
-/// (the result may be longer, as go's).
+/// before v14 (the result may be longer, as go's); unlimited from v14.
 pub fn op_badd(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
     let (a, b) = pop_bigint_pair(machine)?;
     let result = biguint_to_bytes(&(a + b));
@@ -357,7 +358,8 @@ pub fn op_bdiv(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(
     machine.push(crate::machine::AvmValue::Bytes(result))
 }
 
-/// `b*` (0xa3): pop b, pop a, push a*b as bytes. Inputs are at most 64 bytes.
+/// `b*` (0xa3): pop b, pop a, push a*b as bytes. Inputs are at most 64 bytes
+/// before v14.
 pub fn op_bmul(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
     let (a, b) = pop_bigint_pair(machine)?;
     let result = biguint_to_bytes(&(a * b));
@@ -473,7 +475,8 @@ pub fn op_bmodexp(machine: &mut AvmMachine, _instruction: &Instruction) -> Resul
     machine.push(crate::machine::AvmValue::Bytes(result))
 }
 
-/// `bsqrt` (0x96): pop a (bytes), push integer square root as bytes.
+/// `bsqrt` (0x96): pop a (bytes, at most 64 before v14), push integer square
+/// root as bytes.
 pub fn op_bsqrt(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
     let a = pop_bigint(machine)?;
     let result = biguint_to_bytes(&a.sqrt());
