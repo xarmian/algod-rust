@@ -255,6 +255,6 @@ Inserted by `scripts/phase17_parity_delta.py repin`. Replace each row's status w
 
 | go-algorand test | algod-rust test(s) | status | notes |
 |---|---|---|---|
-| [TestEnsureAndResolveGenesisDirs_migrateRestart](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/config/config_test.go#L1045) | — | unclassified | new in `v5.1.1-stable` |
-| [TestSigSchemeLogicSigParams](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/config/consensus_test.go#L66) | — | unclassified | new in `v5.1.1-stable` |
-| [TestSigSchemes](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/protocol/sig_scheme_test.go#L27) | — | unclassified | new in `v5.1.1-stable` |
+| [TestEnsureAndResolveGenesisDirs_migrateRestart](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/config/config_test.go#L1045) | [resolving_again_after_a_restart_finds_the_crash_db_in_the_hot_dir](../../bin/algod-rust/src/commands/participate.rs#L16015) | matched-1:1 | resolution is a pure function with no migration step (see TestEnsureAndResolveGenesisDirs_migrate): resolving again finds the same hot-dir crash DB |
+| [TestSigSchemeLogicSigParams](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/config/consensus_test.go#L66) | [ls_scheme_requires_logic_sig_cost_pooling_and_logic_sigs](../../crates/core/algo-types/src/consensus.rs#L3900) | matched-1:1 | over every built-in protocol (`KNOWN_PROTOCOL_VERSIONS`) |
+| [TestSigSchemes](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/protocol/sig_scheme_test.go#L27) | [sig_scheme_literals_are_printable_ascii_and_distinct](../../crates/core/algo-types/src/pq.rs#L246) | matched-1:1 | all four scheme literals |

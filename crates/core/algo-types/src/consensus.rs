@@ -1827,7 +1827,8 @@ fn built_in_consensus_params(version: &str) -> Option<ConsensusParams> {
 
     // fnet5 was the v42 preview on FNet: v41 with v42's changes, no upgrades.
     if version == CONSENSUS_VFNET5 {
-        let mut fnet5 = consensus_params_for_version(CONSENSUS_V42).expect("v42 must be constructible");
+        let mut fnet5 =
+            consensus_params_for_version(CONSENSUS_V42).expect("v42 must be constructible");
         fnet5.approved_upgrade = None;
         return Some(fnet5);
     }
@@ -3888,6 +3889,34 @@ mod tests {
         assert!(v38.enable_bare_budget_error);
         let v42 = consensus_params_for_version(CONSENSUS_V42).unwrap();
         assert!(v42.enable_bare_budget_error);
+    }
+
+    /// go v5.1's `TestSigSchemeLogicSigParams` (`config/consensus_test.go`,
+    /// #2543): wherever the `ls` scheme is enabled, LogicSig cost pooling is too
+    /// (a delegating ls account runs two programs against one budget, which the
+    /// unpooled fallback would hand a full `LogicSigMaxCost` each) and LogicSigs
+    /// exist at all.
+    #[test]
+    fn ls_scheme_requires_logic_sig_cost_pooling_and_logic_sigs() {
+        let mut checked = 0;
+        for version in KNOWN_PROTOCOL_VERSIONS {
+            let params = consensus_params_for_version(version).expect("known protocol");
+            if params.enable_sig_scheme_logic_sig {
+                assert!(
+                    params.enable_logicsig_cost_pooling,
+                    "{version}: ls enabled without LogicSig cost pooling"
+                );
+                assert_ne!(
+                    params.logic_sig_version, 0,
+                    "{version}: ls enabled without LogicSigs"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 1,
+            "no protocol enables ls: the test would pass vacuously"
+        );
     }
 
     #[test]

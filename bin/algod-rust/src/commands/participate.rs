@@ -16007,6 +16007,25 @@ mod tests {
         );
     }
 
+    /// go's `TestEnsureAndResolveGenesisDirs_migrateRestart` (#2543): once the
+    /// crash DB lives in `HotDataDir`, resolving again (a node restart) finds it
+    /// there. `resolve_resource_paths` is a pure function with no migration step
+    /// to repeat, so a second resolution is identical and points at `HotDataDir`.
+    #[test]
+    fn resolving_again_after_a_restart_finds_the_crash_db_in_the_hot_dir() {
+        let cfg = algo_config::Local {
+            hot_data_dir: "/data/hot".to_string(),
+            cold_data_dir: "/data/cold".to_string(),
+            ..Default::default()
+        };
+        let ledger_path = Path::new("/data/ledger");
+        let first = super::resolve_resource_paths(ledger_path, &cfg);
+        let second = super::resolve_resource_paths(ledger_path, &cfg);
+        assert_eq!(first.crash_path, second.crash_path);
+        assert_eq!(second.crash_path, PathBuf::from("/data/hot/crash.sqlite"));
+        assert_eq!(first.tracker_path, second.tracker_path);
+    }
+
     /// TDD anchor for issue #953, mirroring go-algorand's
     /// `TestConfiguredResourcePaths`: explicit `TrackerDBDir`/`BlockDBDir`/
     /// `CrashDBDir` take precedence over `HotDataDir`/`ColdDataDir`, even

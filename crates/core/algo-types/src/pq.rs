@@ -240,6 +240,28 @@ pub fn canonical_address_salt(
 mod tests {
     use super::*;
 
+    /// go v5.1's `TestSigSchemes` (`protocol/sig_scheme_test.go`, #2543): every
+    /// registered scheme's wire literal is printable ASCII and no two collide.
+    #[test]
+    fn sig_scheme_literals_are_printable_ascii_and_distinct() {
+        let schemes = [
+            SIG_SCHEME_ED25519,
+            SIG_SCHEME_FALCON1024,
+            SIG_SCHEME_FALCON512,
+            SIG_SCHEME_LOGIC_SIG,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for scheme in schemes {
+            for b in scheme {
+                assert!(
+                    (0x20..0x7f).contains(&b),
+                    "{scheme:?} must be printable ASCII"
+                );
+            }
+            assert!(seen.insert(scheme), "{scheme:?} is repeated");
+        }
+    }
+
     #[test]
     fn pqsig_blank_matches_default() {
         assert!(SaltedKeySig::default().blank());
