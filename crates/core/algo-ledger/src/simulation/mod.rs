@@ -1814,7 +1814,7 @@ fn txn_has_no_signature(stx: &SignedTransaction) -> bool {
 /// proxy signature.
 fn is_placeholder_pqsig(stx: &SignedTransaction) -> bool {
     match &stx.pqsig {
-        Some(pq) if !pq.blank() && pq.signature.is_empty() && pq.scheme != *b"ls" => {
+        Some(pq) if !pq.blank() && pq.signature.is_empty() && pq.scheme != algo_types::SIG_SCHEME_LOGIC_SIG => {
             !stx.has_non_pq_signature()
         }
         _ => false,
@@ -1845,7 +1845,7 @@ fn is_placeholder_delegated_pqsig(stx: &SignedTransaction) -> bool {
             // program, so it cannot delegate to another program, and treating it
             // as a placeholder would let simulation succeed for a transaction
             // that can never be valid.
-            matches!(&lsig.pqsig, Some(pq) if !pq.blank() && pq.signature.is_empty() && pq.scheme != *b"ls")
+            matches!(&lsig.pqsig, Some(pq) if !pq.blank() && pq.signature.is_empty() && pq.scheme != algo_types::SIG_SCHEME_LOGIC_SIG)
         }
         _ => false,
     }
