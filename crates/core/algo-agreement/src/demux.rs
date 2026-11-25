@@ -1801,6 +1801,64 @@ mod tests {
         );
     }
 
+    /// Port of go's `TestProposalGroupRuleFollowsProtocol`
+    /// (agreement/message_test.go, v5.1.1-stable; issue #2552): the screen
+    /// applies the heartbeat/resource-group rule according to the protocol of
+    /// the block it is screening. A heartbeat grouped with an application call
+    /// is rejected under v41 and accepted under `future`
+    /// (`AllowGroupedHeartbeats`); an unknown protocol gains nothing.
+    #[test]
+    fn proposal_group_rule_follows_the_block_protocol() {
+        use algo_types::consensus::{
+            allow_grouped_heartbeats_for_protocol, CONSENSUS_FUTURE, CONSENSUS_V41,
+        };
+        use algo_types::{HeartbeatTxnFields, SignedTransaction, Transaction, TxnType};
+
+        assert!(allow_grouped_heartbeats_for_protocol(CONSENSUS_FUTURE));
+        assert!(!allow_grouped_heartbeats_for_protocol(CONSENSUS_V41));
+        assert!(!allow_grouped_heartbeats_for_protocol("no-such-protocol"));
+
+        let appl = Transaction {
+            txn_type: TxnType::from("appl"),
+            sender: Address([1u8; 32]),
+            ..Transaction::default()
+        };
+        let hb = Transaction {
+            txn_type: TxnType::from("hb"),
+            sender: Address([1u8; 32]),
+            heartbeat: Some(HeartbeatTxnFields::default()),
+            ..Transaction::default()
+        };
+        // a real group id, so the only rule that can reject this is the one
+        // keeping a heartbeat out of a resource group
+        let ids: Vec<algo_types::Digest> = [&appl, &hb]
+            .iter()
+            .map(|t| algo_codec::compute_txn_id(t))
+            .collect();
+        let gid = algo_codec::compute_group_id_from_hashes(&ids);
+        let payset: Vec<SignedTransaction> = [appl, hb]
+            .into_iter()
+            .map(|mut txn| {
+                txn.group = gid.0;
+                SignedTransaction {
+                    txn,
+                    ..SignedTransaction::default()
+                }
+            })
+            .collect();
+        for (protocol, accepted) in [
+            (CONSENSUS_V41, false),
+            (CONSENSUS_FUTURE, true),
+            ("no-such-protocol", false),
+        ] {
+            let r = algo_validate::check_payset(
+                &payset,
+                allow_grouped_heartbeats_for_protocol(protocol),
+            );
+            assert_eq!(r.is_ok(), accepted, "{protocol}: {r:?}");
+        }
+    }
+
     #[test]
     fn demux_raw_proposal_with_oversized_txn_group_is_dropped_not_disconnected() {
         // TestProposalCarriesOversizedTxnGroup (go: agreement/message_test.go):
