@@ -116,7 +116,7 @@ pub(super) static TABLE: [Option<&[ArgType]>; 256] = {
     t[0x76] = Some(&[UINT]); // app_params_set
     t[0x78] = Some(&[ANY]); // min_balance
     t[0x84] = Some(&[BYTES, BYTES64, BYTES32]); // ed25519verify_bare
-    t[0x85] = Some(&[BYTES, BYTES, BYTES1793]); // falcon_verify
+    t[0x85] = Some(&[BYTES, BYTES, BYTES]); // falcon_verify
     t[0x86] = Some(&[BYTES]); // sumhash512
     t[0x87] = Some(&[BYTES]); // sha512
     t[0x8c] = Some(&[ANY]); // frame_bury
@@ -128,20 +128,21 @@ pub(super) static TABLE: [Option<&[ArgType]>; 256] = {
     t[0x93] = Some(&[ANY]); // bitlen
     t[0x94] = Some(&[UINT, UINT]); // exp
     t[0x95] = Some(&[UINT, UINT]); // expw
-    t[0x96] = Some(&[BIGINT]); // bsqrt
+    t[0x96] = Some(&[BYTES]); // bsqrt
     t[0x97] = Some(&[UINT, UINT, UINT]); // divw
     t[0x98] = Some(&[BYTES]); // sha3_256
-    t[0xa0] = Some(&[BIGINT, BIGINT]); // b+
-    t[0xa1] = Some(&[BIGINT, BIGINT]); // b-
-    t[0xa2] = Some(&[BIGINT, BIGINT]); // b/
-    t[0xa3] = Some(&[BIGINT, BIGINT]); // b*
-    t[0xa4] = Some(&[BIGINT, BIGINT]); // b<
-    t[0xa5] = Some(&[BIGINT, BIGINT]); // b>
-    t[0xa6] = Some(&[BIGINT, BIGINT]); // b<=
-    t[0xa7] = Some(&[BIGINT, BIGINT]); // b>=
-    t[0xa8] = Some(&[BIGINT, BIGINT]); // b==
-    t[0xa9] = Some(&[BIGINT, BIGINT]); // b!=
-    t[0xaa] = Some(&[BIGINT, BIGINT]); // b%
+    t[0x99] = Some(&[BYTES, BYTES, BYTES]); // bmodexp
+    t[0xa0] = Some(&[BYTES, BYTES]); // b+
+    t[0xa1] = Some(&[BYTES, BYTES]); // b-
+    t[0xa2] = Some(&[BYTES, BYTES]); // b/
+    t[0xa3] = Some(&[BYTES, BYTES]); // b*
+    t[0xa4] = Some(&[BYTES, BYTES]); // b<
+    t[0xa5] = Some(&[BYTES, BYTES]); // b>
+    t[0xa6] = Some(&[BYTES, BYTES]); // b<=
+    t[0xa7] = Some(&[BYTES, BYTES]); // b>=
+    t[0xa8] = Some(&[BYTES, BYTES]); // b==
+    t[0xa9] = Some(&[BYTES, BYTES]); // b!=
+    t[0xaa] = Some(&[BYTES, BYTES]); // b%
     t[0xab] = Some(&[BYTES, BYTES]); // b|
     t[0xac] = Some(&[BYTES, BYTES]); // b&
     t[0xad] = Some(&[BYTES, BYTES]); // b^
@@ -174,6 +175,7 @@ pub(super) static TABLE: [Option<&[ArgType]>; 256] = {
     t[0xe5] = Some(&[BYTES]); // ec_map_to
     t[0xe6] = Some(&[BYTES]); // mimc
     t[0xe7] = Some(&[BYTES]); // poseidon2
+    t[0xe8] = Some(&[BYTES, BYTES, BYTES, BYTES]); // mldsa_verify
     t
 };
 
@@ -230,6 +232,49 @@ pub(super) static MIN_VERSION: [u8; 256] = {
     t[0x68] = 4; // app_local_del
     t[0x70] = 4; // asset_holding_get
     t[0x78] = 4; // min_balance
+    t[0x85] = 14; // falcon_verify
+    t[0x96] = 14; // bsqrt
+    t[0xa0] = 14; // b+
+    t[0xa1] = 14; // b-
+    t[0xa2] = 14; // b/
+    t[0xa3] = 14; // b*
+    t[0xa4] = 14; // b<
+    t[0xa5] = 14; // b>
+    t[0xa6] = 14; // b<=
+    t[0xa7] = 14; // b>=
+    t[0xa8] = 14; // b==
+    t[0xa9] = 14; // b!=
+    t[0xaa] = 14; // b%
+    t
+};
+
+/// Opcodes whose ARGUMENT types change between AVM versions, as `(first
+/// version, argument types)` steps: a program is gated with the step of its
+/// own version (`arg_gate::gate_for`); older than the first step: not gated.
+type ArgStep = (u8, &'static [ArgType]);
+pub(super) static ARG_VARIANTS: [Option<&[ArgStep]>; 256] = {
+    let mut t: [Option<&[ArgStep]>; 256] = [None; 256];
+    t[0x60] = Some(&[(2, &[UINT]), (4, &[ANY])]); // balance
+    t[0x61] = Some(&[(2, &[UINT, UINT]), (4, &[ANY, UINT])]); // app_opted_in
+    t[0x62] = Some(&[(2, &[UINT, STATEKEY]), (4, &[ANY, STATEKEY])]); // app_local_get
+    t[0x63] = Some(&[(2, &[UINT, UINT, STATEKEY]), (4, &[ANY, UINT, STATEKEY])]); // app_local_get_ex
+    t[0x66] = Some(&[(2, &[UINT, STATEKEY, ANY]), (4, &[ANY, STATEKEY, ANY])]); // app_local_put
+    t[0x68] = Some(&[(2, &[UINT, STATEKEY]), (4, &[ANY, STATEKEY])]); // app_local_del
+    t[0x70] = Some(&[(2, &[UINT, UINT]), (4, &[ANY, UINT])]); // asset_holding_get
+    t[0x78] = Some(&[(3, &[UINT]), (4, &[ANY])]); // min_balance
+    t[0x85] = Some(&[(12, &[BYTES, BYTES, BYTES1793]), (14, &[BYTES, BYTES, BYTES])]); // falcon_verify
+    t[0x96] = Some(&[(6, &[BIGINT]), (14, &[BYTES])]); // bsqrt
+    t[0xa0] = Some(&[(4, &[BIGINT, BIGINT]), (14, &[BYTES, BYTES])]); // b+
+    t[0xa1] = Some(&[(4, &[BIGINT, BIGINT]), (14, &[BYTES, BYTES])]); // b-
+    t[0xa2] = Some(&[(4, &[BIGINT, BIGINT]), (14, &[BYTES, BYTES])]); // b/
+    t[0xa3] = Some(&[(4, &[BIGINT, BIGINT]), (14, &[BYTES, BYTES])]); // b*
+    t[0xa4] = Some(&[(4, &[BIGINT, BIGINT]), (14, &[BYTES, BYTES])]); // b<
+    t[0xa5] = Some(&[(4, &[BIGINT, BIGINT]), (14, &[BYTES, BYTES])]); // b>
+    t[0xa6] = Some(&[(4, &[BIGINT, BIGINT]), (14, &[BYTES, BYTES])]); // b<=
+    t[0xa7] = Some(&[(4, &[BIGINT, BIGINT]), (14, &[BYTES, BYTES])]); // b>=
+    t[0xa8] = Some(&[(4, &[BIGINT, BIGINT]), (14, &[BYTES, BYTES])]); // b==
+    t[0xa9] = Some(&[(4, &[BIGINT, BIGINT]), (14, &[BYTES, BYTES])]); // b!=
+    t[0xaa] = Some(&[(4, &[BIGINT, BIGINT]), (14, &[BYTES, BYTES])]); // b%
     t
 };
 

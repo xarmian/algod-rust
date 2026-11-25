@@ -30,6 +30,7 @@ pub mod assembler;
 pub mod bytecode;
 pub mod check;
 pub mod context;
+pub mod cost14;
 pub mod disassembler;
 pub mod eval;
 pub mod fields;

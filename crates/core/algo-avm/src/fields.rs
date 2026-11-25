@@ -1488,6 +1488,23 @@ pub fn falcon_config_name(index: u8) -> Option<&'static str> {
     }
 }
 
+/// Look up an MLDSAConfig by name (`mldsa_verify`'s immediate).
+pub fn mldsa_config_by_name(name: &str) -> Option<u8> {
+    match name {
+        "MLDSA44" => Some(0),
+        "MLDSA65" => Some(1),
+        _ => None,
+    }
+}
+
+pub fn mldsa_config_name(index: u8) -> Option<&'static str> {
+    match index {
+        0 => Some("MLDSA44"),
+        1 => Some("MLDSA65"),
+        _ => None,
+    }
+}
+
 pub fn poseidon2_config_name(index: u8) -> Option<&'static str> {
     match index {
         0 => Some("BN254t2"),
@@ -1544,6 +1561,7 @@ pub fn field_name_for_opcode(mnemonic: &str, imm_index: usize, value: u8) -> Opt
         ("mimc", 0) => mimc_config_name(value),
         ("poseidon2", 0) => poseidon2_config_name(value),
         ("falcon_verify", 0) => falcon_config_name(value),
+        ("mldsa_verify", 0) => mldsa_config_name(value),
 
         _ => None,
     }
@@ -1600,6 +1618,7 @@ pub fn opcode_immediate_is_field(mnemonic: &str, imm_index: usize) -> bool {
             | ("mimc", 0)
             | ("poseidon2", 0)
             | ("falcon_verify", 0)
+            | ("mldsa_verify", 0)
     )
 }
 

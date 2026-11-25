@@ -128,7 +128,29 @@ def mode_variants():
     return sorted(out)
 
 
-def render(table, variants, app_only):
+def arg_variants():
+    """(opcode, name, [(from_version, arg kinds)]) for every single-byte opcode
+    whose ARGUMENT types differ between versions (go: `b+` is `bigint, bigint`
+    from v4 and `[]byte, []byte` from v14). A program meets the spec of its own
+    version, so the gate picks the step for the program's version."""
+    out = []
+    lines = fixture()
+    per_byte = Counter(r["opcode"] for r in lines)
+    excluded = excluded_bytes()
+    for r in lines:
+        if r["stable"] or per_byte[r["opcode"]] != 1 or r["opcode"] in excluded:
+            continue
+        steps = [
+            (v["from"], [KINDS[(a["avm"], a["name"])] for a in v["args"]])
+            for v in r["variants"]
+            if v["modes"] in (2, 3) and v["args"]
+        ]
+        if len({tuple(k) for _, k in steps}) > 1:
+            out.append((r["opcode"], r["name"], steps))
+    return sorted(out)
+
+
+def render(table, variants, app_only, argv=()):
     nl = "\n"
     body = [HEADER]
     body.append("use super::arg_gate::ArgType;" + nl)
@@ -168,6 +190,17 @@ def render(table, variants, app_only):
             body.append(f"    t[0x{op:02x}] = {first}; // {name}" + nl)
     body.append("    t" + nl + "};" + nl)
     body.append(nl)
+    body.append("/// Opcodes whose ARGUMENT types change between AVM versions, as `(first" + nl)
+    body.append("/// version, argument types)` steps: a program is gated with the step of its" + nl)
+    body.append("/// own version (`arg_gate::gate_for`); older than the first step: not gated." + nl)
+    body.append("type ArgStep = (u8, &'static [ArgType]);" + nl)
+    body.append("pub(super) static ARG_VARIANTS: [Option<&[ArgStep]>; 256] = {" + nl)
+    body.append("    let mut t: [Option<&[ArgStep]>; 256] = [None; 256];" + nl)
+    for op, name, steps in argv:
+        rendered = ", ".join(f"({v}, &[{', '.join(k)}])" for v, k in steps)
+        body.append(f"    t[0x{op:02x}] = Some(&[{rendered}]); // {name}" + nl)
+    body.append("    t" + nl + "};" + nl)
+    body.append(nl)
     body.append("/// Opcodes whose run-mode set changes between AVM versions, as `(first" + nl)
     body.append("/// version, mode bits)` steps (1 = LogicSig, 2 = application): go checks" + nl)
     body.append("/// the mode of the program's own version before anything else." + nl)
@@ -183,7 +216,7 @@ def render(table, variants, app_only):
 def main():
     table = rows()
     variants = mode_variants()
-    text = render(table, variants, app_only_bytes(table))
+    text = render(table, variants, app_only_bytes(table), arg_variants())
     if "--check" in sys.argv:
         # Compare with line endings normalised, so a CRLF checkout of the
         # generated file is not "stale".

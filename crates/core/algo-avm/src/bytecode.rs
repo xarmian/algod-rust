@@ -677,6 +677,7 @@ pub(crate) fn uint8_immediate_names(op_name: &str) -> Option<&'static [&'static 
         | "ec_map_to" => &["g"],
         "mimc" | "poseidon2" => &["c"],
         "falcon_verify" => &["f"],
+        "mldsa_verify" => &["p"],
         "gtxn" => &["t", "f"],
         "txna" | "gtxnsa" | "itxna" => &["f", "i"],
         "gload" => &["t", "i"],

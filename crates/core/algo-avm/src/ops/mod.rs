@@ -276,6 +276,7 @@ pub fn dispatch(
 
         // ---- Big-integer byte-math ----
         0x96 => bytes::op_bsqrt(machine, instruction),
+        0x99 => bytes::op_bmodexp(machine, instruction),
         0xa0 => bytes::op_badd(machine, instruction),
         0xa1 => bytes::op_bsub(machine, instruction),
         0xa2 => bytes::op_bdiv(machine, instruction),
@@ -359,6 +360,7 @@ pub fn dispatch(
 
         // ---- Poseidon2 hash (v13+) ----
         0xe7 => crypto::op_poseidon2(machine, instruction),
+        0xe8 => crypto::op_mldsa_verify(machine, instruction),
 
         // ---- Everything else: not yet implemented ----
         _ => {

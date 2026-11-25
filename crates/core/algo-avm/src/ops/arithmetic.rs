@@ -383,6 +383,74 @@ mod tests {
         }
     }
 
+    // go's `TestRapidDivModw` / `TestRapidExpw` (seeded): `divmodw` and `expw`
+    // against `BigUint`, over wide values (words with random leading zeros).
+    #[test]
+    fn divmodw_and_expw_match_biguint_on_wide_inputs() {
+        use num_bigint::BigUint;
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        let wide = |x: u64, shift: u64| x >> (shift % 64);
+        let big = |hi: u64, lo: u64| (BigUint::from(hi) << 64u32) | BigUint::from(lo);
+        let instr = dummy_instruction();
+        for _ in 0..4000 {
+            let hi_num = if next() % 2 == 0 {
+                0
+            } else {
+                wide(next(), next())
+            };
+            let lo_num = next();
+            let hi_den = if next() % 2 == 0 {
+                0
+            } else {
+                wide(next(), next())
+            };
+            let lo_den = wide(next(), next());
+            let mut m = make_machine();
+            for v in [hi_num, lo_num, hi_den, lo_den] {
+                m.push(AvmValue::Uint64(v)).unwrap();
+            }
+            if hi_den == 0 && lo_den == 0 {
+                assert!(op_divmodw(&mut m, &instr).is_err());
+                continue;
+            }
+            op_divmodw(&mut m, &instr).unwrap();
+            let (lo_rem, hi_rem, lo_quo, hi_quo) = (
+                m.pop_uint().unwrap(),
+                m.pop_uint().unwrap(),
+                m.pop_uint().unwrap(),
+                m.pop_uint().unwrap(),
+            );
+            let (n, d) = (big(hi_num, lo_num), big(hi_den, lo_den));
+            assert_eq!(big(hi_quo, lo_quo), &n / &d);
+            assert_eq!(big(hi_rem, lo_rem), &n % &d);
+
+            let base = wide(next(), next());
+            let exp = next() % 141;
+            let mut m = make_machine();
+            m.push(AvmValue::Uint64(base)).unwrap();
+            m.push(AvmValue::Uint64(exp)).unwrap();
+            let got = op_expw(&mut m, &instr);
+            if base == 0 && exp == 0 {
+                assert!(got.is_err());
+                continue;
+            }
+            let want = BigUint::from(base).pow(exp as u32);
+            if want >= (BigUint::from(1u8) << 128u32) {
+                assert!(got.is_err(), "{base}^{exp}");
+            } else {
+                got.unwrap();
+                let (lo, hi) = (m.pop_uint().unwrap(), m.pop_uint().unwrap());
+                assert_eq!(big(hi, lo), want, "{base}^{exp}");
+            }
+        }
+    }
+
     // ---- Addition ----
     #[test]
     fn test_add_basic() {

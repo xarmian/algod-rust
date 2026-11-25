@@ -2990,6 +2990,7 @@ fn resolve_field_immediate_at(
         ("mimc", 0) => fields::mimc_config_by_name(arg),
         ("poseidon2", 0) => fields::poseidon2_config_by_name(arg),
         ("falcon_verify", 0) => fields::falcon_config_by_name(arg),
+        ("mldsa_verify", 0) => fields::mldsa_config_by_name(arg),
 
         _ => None,
     }

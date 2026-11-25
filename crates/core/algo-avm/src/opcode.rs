@@ -511,6 +511,7 @@ static OPCODE_TABLE: [Option<OpSpec>; 256] = {
     op!(0x98, "sha3_256", 7, Static(130), 1, 1, Any, None);
 
     // ---- Big-int byte ops (v4+) ----
+    op!(0x99, "bmodexp", 14, Dynamic, 3, 1, Any, None);
     op!(0xa0, "b+", 4, Static(10), 2, 1, Any, None);
     op!(0xa1, "b-", 4, Static(10), 2, 1, Any, None);
     op!(0xa2, "b/", 4, Static(20), 2, 1, Any, None);
@@ -587,6 +588,10 @@ static OPCODE_TABLE: [Option<OpSpec>; 256] = {
 
     // ---- Poseidon2 hash (v13) ----
     op!(0xe7, "poseidon2", 13, Dynamic, 1, 1, Any, Uint8);
+    // v14 (go `mldsaVersion`); the verifier itself is issue #2575 -- the
+    // handler fails the program until it lands (nothing runs v14 yet: it is
+    // vFuture-only).
+    op!(0xe8, "mldsa_verify", 14, Dynamic, 4, 1, Any, Uint8);
 
     // ---- Foreign box opcodes (v13, App only, multi-byte prefix 0xd4) ----
     // Registered below via `APP_BOX_SUB_OPS`; the prefix entry here only
@@ -685,6 +690,19 @@ pub fn effective_cost(spec: &OpSpec, version: u8) -> CostKind {
     // by its immediate: charged by the opcode itself.
     if spec.opcode == 0x85 && version >= FALCON_CONFIG_VERSION {
         return CostKind::Dynamic;
+    }
+    // go v5.1 `fullByteMathVersion`/`lengthCostVersion` (14): length-dependent
+    // costs, computed from the stack by `crate::cost14` when the machine
+    // charges the instruction; `divmodw` and `expw` become cheaper.
+    if crate::cost14::has_dynamic_cost(spec.opcode, version) {
+        return CostKind::Dynamic;
+    }
+    if version >= crate::cost14::FULL_BYTE_MATH_VERSION {
+        match spec.opcode {
+            0x1f => return CostKind::Static(2), // divmodw
+            0x95 => return CostKind::Static(1), // expw
+            _ => {}
+        }
     }
     if version <= 1 {
         match spec.opcode {
@@ -936,8 +954,9 @@ mod tests {
 
     #[test]
     fn test_undefined_opcode() {
-        // 0x99 is not assigned
-        assert!(lookup(0x99).is_none());
+        // 0x9a is not assigned (0x99 became `bmodexp` in v14)
+        assert!(lookup(0x9a).is_none());
+        assert_eq!(lookup(0x99).map(|s| s.name), Some("bmodexp"));
     }
 
     #[test]
@@ -1023,6 +1042,14 @@ mod tests {
                 // (go v5.1 `costByField`): dynamic, charged by the opcode.
                 if entry.opcode == 0x85 && version >= FALCON_CONFIG_VERSION {
                     assert_eq!(effective_cost(entry, version), CostKind::Dynamic);
+                    continue;
+                }
+                // v14 length costs (`crate::cost14`) and the cheaper
+                // divmodw/expw.
+                if version >= crate::cost14::FULL_BYTE_MATH_VERSION
+                    && (crate::cost14::has_dynamic_cost(entry.opcode, version)
+                        || matches!(entry.opcode, 0x1f | 0x95))
+                {
                     continue;
                 }
                 assert_eq!(

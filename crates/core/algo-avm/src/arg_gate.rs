@@ -148,6 +148,15 @@ pub(crate) fn arg_types(opcode: u8) -> Option<&'static [ArgType]> {
 /// the older spec is not in the table and the opcode keeps its lazy pops).
 #[inline(always)]
 pub(crate) fn gate_for(opcode: u8, version: u8) -> Option<&'static [ArgType]> {
+    // An opcode whose argument types changed between versions is gated with
+    // the spec of the program's own version (none before its first step).
+    if let Some(steps) = crate::arg_gate_table::ARG_VARIANTS[opcode as usize] {
+        return steps
+            .iter()
+            .rev()
+            .find(|(from, _)| *from <= version)
+            .map(|(_, types)| *types);
+    }
     if version < crate::arg_gate_table::MIN_VERSION[opcode as usize] {
         return None;
     }

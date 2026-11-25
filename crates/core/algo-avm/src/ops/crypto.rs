@@ -1250,6 +1250,15 @@ pub fn op_vrf_verify(machine: &mut AvmMachine, instruction: &Instruction) -> Res
 // Falcon verify (opcode 0x85, AVM v12+)
 // ---------------------------------------------------------------------------
 
+/// `mldsa_verify` (0xe8, v14): not implemented yet (issue #2575). The program
+/// fails rather than guessing a verdict.
+pub fn op_mldsa_verify(
+    _machine: &mut AvmMachine,
+    _instruction: &Instruction,
+) -> Result<(), AlgoError> {
+    Err(avm_err("mldsa_verify is not implemented (issue #2575)"))
+}
+
 /// `falcon_verify` (opcode 0x85, AVM v12+ / consensus V41).
 ///
 /// Stack: ..., data, signature, pubkey -> ..., bool

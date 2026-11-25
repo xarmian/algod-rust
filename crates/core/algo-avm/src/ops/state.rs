@@ -2372,8 +2372,15 @@ mod tests {
     fn asset_holding_get_pre_v4_takes_direct_id_without_availability_check() {
         let addr = test_addr(0x27);
         for (version, ok) in [(3u8, true), (4, false), (8, false)] {
-            let mut code = vec![0x80, 0x20];
-            code.extend_from_slice(&addr);
+            // go's v2/v3 spec types the account argument `uint64` (an account
+            // index; 0 is the sender), v4+ takes `any`: a raw address.
+            let mut code = if version < 4 {
+                vec![0x81, 0x00]
+            } else {
+                let mut c = vec![0x80, 0x20];
+                c.extend_from_slice(&addr);
+                c
+            };
             code.push(0x81);
             code.extend_from_slice(&encode_uvarint(626_283_733));
             code.extend_from_slice(&[0x70, 0x00]); // asset_holding_get AssetBalance
@@ -2381,6 +2388,7 @@ mod tests {
             let program = bytecode::parse(&raw).unwrap();
             let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
             let mut ctx = TestStateContext::new(100);
+            ctx.accounts.push(addr); // account index 0 (pre-v4 programs name it by index)
             ctx.resolve_asset_fail.insert(626_283_733);
             let res = step_n(&mut m, &mut ctx, 3);
             if ok {
@@ -2401,10 +2409,19 @@ mod tests {
     fn locals_reference_pre_v4_takes_direct_app_id_without_availability_check() {
         let addr = test_addr(0x28);
         for (version, ok) in [(3u8, true), (4, false)] {
-            let raw = addr_and_uint_prog(addr, 777_777, 0x61, version);
+            // pre-v4 the account argument is a `uint64` index (go's spec)
+            let raw = if version < 4 {
+                let mut code = vec![0x81, 0x00, 0x81];
+                code.extend_from_slice(&encode_uvarint(777_777));
+                code.push(0x61);
+                prog(version, &code)
+            } else {
+                addr_and_uint_prog(addr, 777_777, 0x61, version)
+            };
             let program = bytecode::parse(&raw).unwrap();
             let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
             let mut ctx = TestStateContext::new(100);
+            ctx.accounts.push(addr); // account index 0 (pre-v4 programs name it by index)
             ctx.resolve_app_fail.insert(777_777);
             let res = step_n(&mut m, &mut ctx, 3);
             assert_eq!(res.is_ok(), ok, "v{version}: {res:?}");
