@@ -147,7 +147,9 @@ pub fn verify_falcon512(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use algo_falcon::{FALCON_DET1024_SIG_COMPRESSED_MAXSIZE, FALCON_DET512_SIG_COMPRESSED_MAXSIZE};
+    use algo_falcon::{
+        FALCON_DET1024_SIG_COMPRESSED_MAXSIZE, FALCON_DET512_SIG_COMPRESSED_MAXSIZE,
+    };
 
     /// The wire bounds `algo-types` carries are the sizes the falcon crate
     /// produces.
@@ -164,6 +166,63 @@ mod tests {
             r::FALCON512_MAX_SIGNATURE_SIZE,
             FALCON_DET512_SIG_COMPRESSED_MAXSIZE
         );
+    }
+
+    /// go's `TestVerifyFalconRejectsMalformedInputs` (`crypto/falconWrapper_test.go`):
+    /// for each Falcon scheme, a short or long public key, an empty signature and
+    /// one longer than the scheme allows are all `ErrSigInvalid` ("invalid
+    /// signature" in the text), never a pass and never a panic.
+    #[test]
+    fn falcon_verifiers_reject_malformed_inputs() {
+        type Verify = fn(&[u8], &[u8], &[u8]) -> Result<(), SigVerifyError>;
+        let msg = b"verify falcon malformed inputs";
+        let mut seed = [0u8; algo_falcon::FALCON_SEED_SIZE];
+        seed[0] = 1;
+        let schemes: [(&str, Verify, usize, usize); 2] = [
+            (
+                "falcon-1024",
+                verify_falcon1024,
+                FALCON_DET1024_PUBKEY_SIZE,
+                FALCON_DET1024_SIG_COMPRESSED_MAXSIZE,
+            ),
+            (
+                "falcon-512",
+                verify_falcon512,
+                FALCON_DET512_PUBKEY_SIZE,
+                FALCON_DET512_SIG_COMPRESSED_MAXSIZE,
+            ),
+        ];
+        for (name, verify, pk_len, max_sig) in schemes {
+            let (pk, sk) = if name == "falcon-1024" {
+                algo_falcon::falcon_keygen(&seed).unwrap()
+            } else {
+                algo_falcon::falcon512_keygen(&seed).unwrap()
+            };
+            assert_eq!(pk.len(), pk_len);
+            let sig = if name == "falcon-1024" {
+                algo_falcon::falcon_sign(&sk, msg).unwrap()
+            } else {
+                algo_falcon::falcon512_sign(&sk, msg).unwrap()
+            };
+            verify(msg, &pk, &sig).unwrap();
+            let mut long_pk = pk.clone();
+            long_pk.push(0);
+            let cases: [(&str, &[u8], Vec<u8>); 4] = [
+                ("short public key", &pk[..pk.len() - 1], sig.clone()),
+                ("long public key", &long_pk, sig.clone()),
+                ("empty signature", &pk, Vec::new()),
+                ("oversized signature", &pk, vec![0u8; max_sig + 1]),
+            ];
+            for (case, key, signature) in cases {
+                let e = verify(msg, key, &signature).expect_err(case).to_string();
+                assert!(
+                    e.starts_with(&format!("{name} invalid signature")),
+                    "{name} {case}: {e}"
+                );
+            }
+            // go's `TestFalconCanHandleNilSignature`
+            assert!(verify(b"Test", &pk, &[]).is_err(), "{name}");
+        }
     }
 
     #[test]
