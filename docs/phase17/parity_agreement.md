@@ -362,9 +362,9 @@ Inserted by `scripts/phase17_parity_delta.py repin`. Replace each row's status w
 
 | go-algorand test | algod-rust test(s) | status | notes |
 |---|---|---|---|
-| [TestDemuxTokenizerRejectsStepAboveDown](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/agreement/demux_test.go#L739) | — | unclassified | new in `v5.1.1-stable` |
+| [TestDemuxTokenizerRejectsStepAboveDown](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/agreement/demux_test.go#L739) | [demux_raw_vote_with_step_above_down_is_dropped_and_disconnects](../../crates/core/algo-agreement/src/demux.rs), [demux_raw_bundle_with_step_above_down_is_dropped_and_disconnects](../../crates/core/algo-agreement/src/demux.rs), [demux_raw_proposal_with_prior_vote_step_above_down_is_dropped_not_disconnected](../../crates/core/algo-agreement/src/demux.rs) | matched-1:many | vote and bundle: peer disconnected; proposal: dropped without disconnect (the stub network records disconnects). Rust handles each message individually, so the well-formed message behind is consumed independently |
 | [TestProposalQueueSourceIsRoutingAddr](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/agreement/gossip/proposalQueue_test.go#L41) | — | unclassified | new in `v5.1.1-stable` |
-| [TestProposalGroupRuleFollowsProtocol](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/agreement/message_test.go#L283) | — | unclassified | new in `v5.1.1-stable` |
+| [TestProposalGroupRuleFollowsProtocol](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/agreement/message_test.go#L283) | [proposal_group_rule_follows_the_block_protocol](../../crates/core/algo-agreement/src/demux.rs) | matched-1:1 | v41 rejects, `future` accepts, an unknown protocol gains nothing (#2552, #2544) |
 | [TestPlayerIgnoresStaleCertBundle](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/agreement/player_test.go#L4035) | — | unclassified | new in `v5.1.1-stable` |
 | [TestPlayerConsumesCertBundleOnePeriodBehind](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/agreement/player_test.go#L4078) | — | unclassified | new in `v5.1.1-stable` |
 | [TestRouterUpdateGarbageCollection](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/agreement/router_gc_test.go#L64) | — | unclassified | new in `v5.1.1-stable` |
