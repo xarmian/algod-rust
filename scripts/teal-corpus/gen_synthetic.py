@@ -48,7 +48,7 @@ def main():
         "--max-version",
         type=int,
         default=15,
-        help="highest program version generated (go v5.1's AVM v14 is not ported yet: #2549)",
+        help="highest program version generated (15 is one past go v5.1's AVM v14)",
     )
     a = ap.parse_args()
 
