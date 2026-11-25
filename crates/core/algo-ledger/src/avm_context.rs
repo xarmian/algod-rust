@@ -16032,6 +16032,10 @@ mod tests {
                     num_uint: 2,
                     num_byte_slice: 5,
                 },
+                global_state_schema: StateSchema {
+                    num_uint: 4,
+                    num_byte_slice: 4,
+                },
                 ..Default::default()
             },
         );
@@ -16082,6 +16086,43 @@ byte \"hello\"
 log
 int 1
 return";
+
+    const WRITES_STATE_THEN_REJECTS: &str = "#pragma version 6
+        byte \"gk\"
+int 7
+app_global_put
+        txn Sender
+byte \"lk\"
+byte \"lv\"
+app_local_put
+        byte \"hello\"
+log
+int 0
+return";
+
+    fn dt_keys(dt: &rmpv::Value) -> Vec<String> {
+        let mut k: Vec<String> = dt
+            .as_map()
+            .expect("dt is a map")
+            .iter()
+            .map(|(k, _)| k.as_str().unwrap().to_string())
+            .collect();
+        k.sort();
+        k
+    }
+
+    #[test]
+    fn inner_clearstate_reject_keeps_state_deltas_and_logs_before_the_param() {
+        // go (pre-v5.1): the rejected program's `ad.EvalDelta` keeps what it wrote
+        // as it ran: global delta, local delta and logs.
+        let dt = inner_clearstate_eval_delta(WRITES_STATE_THEN_REJECTS, false)
+            .expect("partial delta kept");
+        assert_eq!(dt_keys(&dt), ["gd", "ld", "lg"]);
+        assert_eq!(
+            inner_clearstate_eval_delta(WRITES_STATE_THEN_REJECTS, true),
+            None
+        );
+    }
 
     #[test]
     fn inner_clearstate_reject_keeps_its_delta_before_the_param() {
