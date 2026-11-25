@@ -1557,6 +1557,11 @@ pub fn logic_sig_group_size_check_indexed(
 mod bv_compatible_vectors;
 
 #[cfg(test)]
+mod sksig_tests;
+#[cfg(test)]
+mod sksig_txn_tests;
+
+#[cfg(test)]
 mod tests {
     /// Issue #2345: the byte-level canonical-encoding test replaces the
     /// decompress-then-recompress check (two field inversions, ~2.4 us each)

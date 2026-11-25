@@ -2523,6 +2523,49 @@ mod tests {
         assert_eq!(decoded_no_pq.pqsig, None);
     }
 
+    /// go's `TestLogicSigBlankSaltedKeySigOmitted`: a LogicSig without a
+    /// delegated SaltedKeySig encodes no `pqsig` key at all.
+    #[test]
+    fn a_blank_logicsig_pqsig_is_omitted_from_the_encoding() {
+        let lsig = LogicSig {
+            logic: serde_bytes::ByteBuf::from(vec![1u8]),
+            ..LogicSig::default()
+        };
+        let encoded = canonical_encode_logicsig(&lsig);
+        let value = rmpv::decode::read_value(&mut &encoded[..]).expect("msgpack");
+        let keys: Vec<&str> = value
+            .as_map()
+            .expect("a map")
+            .iter()
+            .map(|(k, _)| k.as_str().expect("string key"))
+            .collect();
+        assert!(!keys.contains(&"pqsig"), "{keys:?}");
+        assert_eq!(keys, ["l"]);
+    }
+
+    /// go's `TestLogicSigSaltedKeySigMsgpackRoundTrip`: a LogicSig carrying a
+    /// SaltedKeySig of every scheme (and arguments) survives the round trip.
+    #[test]
+    fn logicsig_with_a_salted_key_sig_of_every_scheme_round_trips() {
+        for scheme in [*b"f1", *b"f5", *b"ed", *b"ls"] {
+            let lsig = LogicSig {
+                logic: serde_bytes::ByteBuf::from(vec![1u8, 32, 1]),
+                args: Some(vec![Some(serde_bytes::ByteBuf::from(vec![2u8, 3]))]),
+                pqsig: Some(SaltedKeySig {
+                    scheme,
+                    salt: algo_types::AddressSalt(7),
+                    public_key: serde_bytes::ByteBuf::from(vec![9u8; 40]),
+                    signature: serde_bytes::ByteBuf::from(vec![5u8; 30]),
+                }),
+                ..LogicSig::default()
+            };
+            let encoded = canonical_encode_logicsig(&lsig);
+            let decoded: LogicSig = rmp_serde::from_slice(&encoded).expect("decodes");
+            assert_eq!(decoded, lsig, "{scheme:?}");
+            assert_eq!(canonical_encode_logicsig(&decoded), encoded, "{scheme:?}");
+        }
+    }
+
     #[test]
     fn logicsig_with_pqsig_round_trips_through_rmp_serde() {
         let pqsig = SaltedKeySig {

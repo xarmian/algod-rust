@@ -443,6 +443,169 @@ mod tests {
     use super::*;
     use algo_types::consensus::{consensus_params_for_version, CONSENSUS_V41, CONSENSUS_V42};
 
+    // ── Issues #2546/#2547: go v5.1 `SignedTxn.FeeFactor` with salted-key signatures ──
+
+    /// go's `SignedTxn.FeeFactor`: the transaction's own factor plus its
+    /// signature type's surcharge.
+    fn fee_factor(stx: &SignedTransaction, p: &ConsensusParams) -> u64 {
+        txn_fee_factor(&stx.txn, p) + signature_fee_contribution(stx, p)
+    }
+
+    fn future() -> ConsensusParams {
+        consensus_params_for_version(algo_types::consensus::CONSENSUS_FUTURE).expect("vFuture")
+    }
+
+    fn sksig(scheme: [u8; 2]) -> algo_types::SaltedKeySig {
+        algo_types::SaltedKeySig {
+            scheme,
+            ..Default::default()
+        }
+    }
+
+    // go's `TestSignedTxnFeeFactorSaltedKeySignatureContribution`.
+    #[test]
+    fn fee_factor_of_salted_key_signatures_matches_go() {
+        use algo_types::{HeartbeatTxnFields, LogicSig};
+        use serde_bytes::ByteBuf;
+        let p = future();
+        let pay = || SignedTransaction {
+            txn: Transaction {
+                txn_type: "pay".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let lsig = |sk: Option<algo_types::SaltedKeySig>| {
+            Some(LogicSig {
+                logic: ByteBuf::from(vec![1]),
+                pqsig: sk,
+                ..LogicSig::default()
+            })
+        };
+        let m = |n: u64| n * 1_000_000;
+        let f1 = sksig(*b"f1");
+        // plain signatures carry no surcharge
+        let mut regular = pay();
+        regular.sig[0] = 1;
+        let mut msig = pay();
+        msig.msig = Some(algo_types::MultisigSig {
+            version: 1,
+            ..Default::default()
+        });
+        let mut plain_lsig = pay();
+        plain_lsig.lsig = lsig(None);
+        for stx in [&pay(), &regular, &msig, &plain_lsig] {
+            assert_eq!(fee_factor(stx, &p), m(1));
+        }
+        assert_eq!(p.sig_scheme_fee_contribution(*b"f1"), m(2));
+        assert_eq!(p.sig_scheme_fee_contribution(*b"f5"), m(1));
+        assert_eq!(p.sig_scheme_fee_contribution(*b"ed"), 0);
+        let with_pqsig = |sk: algo_types::SaltedKeySig| {
+            let mut s = pay();
+            s.pqsig = Some(sk);
+            s
+        };
+        let with_delegated = |sk: algo_types::SaltedKeySig| {
+            let mut s = pay();
+            s.lsig = lsig(Some(sk));
+            s
+        };
+        // unknown scheme: no surcharge (it is rejected at verification)
+        assert_eq!(fee_factor(&with_pqsig(sksig(*b"x1")), &p), m(1));
+        assert_eq!(fee_factor(&with_delegated(sksig(*b"x1")), &p), m(1));
+        // ed has none, falcon-1024 charges 2x
+        assert_eq!(fee_factor(&with_pqsig(sksig(*b"ed")), &p), m(1));
+        assert_eq!(fee_factor(&with_delegated(sksig(*b"ed")), &p), m(1));
+        let sksig_signed = with_pqsig(f1.clone());
+        let delegated = with_delegated(f1.clone());
+        assert_eq!(fee_factor(&sksig_signed, &p), m(3));
+        assert_eq!(fee_factor(&delegated, &p), m(3));
+        let mut rekeyed = delegated.clone();
+        rekeyed.auth_addr = Some(algo_types::Address([2u8; 32]));
+        assert_eq!(fee_factor(&rekeyed, &p), fee_factor(&delegated, &p));
+        // a programless lsig with an sksig, and an sksig next to a regular sig
+        let mut programless = regular.clone();
+        programless.lsig = Some(LogicSig {
+            pqsig: Some(f1.clone()),
+            ..LogicSig::default()
+        });
+        assert_eq!(fee_factor(&programless, &p), m(3));
+        let mut both = sksig_signed.clone();
+        both.sig[0] = 1;
+        assert_eq!(fee_factor(&both, &p), m(3));
+
+        // heartbeats: a plain one pays the base fee, singleton or not
+        let hb = |s: &SignedTransaction, discount: bool, grouped: bool| {
+            let mut s = s.clone();
+            s.txn.txn_type = "hb".into();
+            s.txn.heartbeat = Some(HeartbeatTxnFields {
+                hb_challenge_discount: discount,
+                ..Default::default()
+            });
+            if grouped {
+                s.txn.group = [1u8; 32];
+            }
+            s
+        };
+        assert_eq!(fee_factor(&hb(&regular, false, false), &p), m(1));
+        assert_eq!(fee_factor(&hb(&sksig_signed, false, false), &p), m(3));
+        assert_eq!(fee_factor(&hb(&both, false, false), &p), m(3));
+        assert_eq!(fee_factor(&hb(&delegated, false, false), &p), m(3));
+        assert_eq!(fee_factor(&hb(&sksig_signed, false, true), &p), m(3));
+        assert_eq!(fee_factor(&hb(&delegated, false, true), &p), m(3));
+        // the challenge discount removes exactly one min fee, leaving surcharges
+        assert_eq!(fee_factor(&hb(&regular, true, false), &p), 0);
+        assert_eq!(fee_factor(&hb(&sksig_signed, true, false), &p), m(2));
+        assert_eq!(fee_factor(&hb(&sksig_signed, true, true), &p), m(2));
+
+        // the required fee is three min fees; a delegated one the same
+        let (req, ov) = required_fee_for_usage(fee_factor(&sksig_signed, &p), &p);
+        assert!(!ov);
+        assert_eq!(req, p.min_txn_fee * 3);
+        let (req_d, _) = required_fee_for_usage(fee_factor(&delegated, &p), &p);
+        assert_eq!(req_d, req);
+        let (usage, _) = summarize_fees(&[&regular, &delegated], &p);
+        assert_eq!(usage, m(4));
+    }
+
+    // go's `TestLogicSigSaltedKeySigFee`: an ls program is priced by the byte like a
+    // LogicSig's, and carries no scheme surcharge of its own.
+    #[test]
+    fn logic_sig_salted_key_sig_fee_prices_the_program_bytes() {
+        use serde_bytes::ByteBuf;
+        let p = future();
+        assert!(p.txn_size_pricing_enabled());
+        let ls = |len: usize| SignedTransaction {
+            pqsig: Some(algo_types::SaltedKeySig {
+                scheme: *b"ls",
+                public_key: ByteBuf::from(vec![0u8; len]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let max = p.logic_sig_max_size as usize;
+        let one = ls(max);
+        assert_eq!(fee_factor(&one, &p), ONE_MICROS);
+        // free up to the group's per-transaction allowance, wherever the program sits
+        let (usage, _) = summarize_fees(&[&one], &p);
+        assert_eq!(usage, ONE_MICROS);
+        // beyond it, surcharged exactly as a LogicSig's bytes are
+        let over_by = 500usize;
+        let ls_over = ls(max + over_by);
+        let lsig_over = SignedTransaction {
+            lsig: Some(algo_types::LogicSig {
+                logic: ByteBuf::from(vec![0u8; max + over_by]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (ls_usage, _) = summarize_fees(&[&ls_over], &p);
+        let (lsig_usage, _) = summarize_fees(&[&lsig_over], &p);
+        assert_eq!(ls_usage, lsig_usage);
+        let (surcharge, _) = micros_mul_int(p.per_byte_txn_surcharge, over_by as i64);
+        assert_eq!(ls_usage, ONE_MICROS + surcharge);
+    }
+
     // ── mul2div_u64 (mirrors go's basics.Mul2div) ─────────────────
 
     #[test]
