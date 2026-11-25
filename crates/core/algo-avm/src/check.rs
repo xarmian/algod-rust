@@ -454,6 +454,21 @@ mod tests {
         }
     }
 
+    // The other side of `TestBranchOffsetTruncation`: a valid offset, taken or
+    // not, still runs (offset 0 falls through to the next instruction).
+    #[test]
+    fn varint_branches_with_valid_offsets_run_taken_or_not() {
+        use crate::machine::{AvmMachine, ExecMode};
+        // pushint <cond>; <op> 0; pushint 1
+        for (op, cond) in [(0x40u8, 0u8), (0x40, 1), (0x41, 0), (0x41, 1)] {
+            let program = vec![13u8, 0x81, cond, op, 0x00, 0x81, 0x01];
+            assert!(super::static_check(&program, super::ExecMode::LogicSig).is_none());
+            let parsed = crate::bytecode::parse(&program).unwrap();
+            let mut m = AvmMachine::new(parsed, ExecMode::LogicSig, 1000);
+            assert!(m.run(&mut crate::context::NullContext).unwrap(), "{op:#x} {cond}");
+        }
+    }
+
     // Issue #2575: `mldsa_verify <p>` with a parameter set that has no cost.
     #[test]
     fn mldsa_verify_unknown_parameter_set_has_no_cost() {

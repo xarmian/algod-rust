@@ -866,14 +866,6 @@ impl AvmMachine {
         })
     }
 
-    /// Resolve a branch target from an instruction index + varint-encoded
-    /// (zigzag+ULEB128) offset -- `bnz`/`bz`/`b`/`callsub` at
-    /// `LogicSigVersion >= opcode::VARINT_BRANCH_VERSION`.
-    ///
-    /// Sign-dependent base point (see [`crate::bytecode::varint_branch_target`]):
-    /// a negative offset back-jumps from the start of the instruction; a
-    /// non-negative offset forward-jumps from the end of the instruction
-    /// (opcode byte + `varint_len` encoded bytes).
     /// go v5.1 `branchTargetVarint`'s bounds checks, which a varint branch makes
     /// whether or not it is taken: an offset beyond the program's length is
     /// rejected before a target is computed (a 32-bit `int` must not truncate it
@@ -901,6 +893,14 @@ impl AvmMachine {
         Ok(target as usize)
     }
 
+    /// Resolve a branch target from an instruction index + varint-encoded
+    /// (zigzag+ULEB128) offset -- `bnz`/`bz`/`b`/`callsub` at
+    /// `LogicSigVersion >= opcode::VARINT_BRANCH_VERSION`.
+    ///
+    /// Sign-dependent base point (see [`crate::bytecode::varint_branch_target`]):
+    /// a negative offset back-jumps from the start of the instruction; a
+    /// non-negative offset forward-jumps from the end of the instruction
+    /// (opcode byte + `varint_len` encoded bytes).
     pub fn get_varint_branch_target(
         &self,
         from_instruction: usize,
