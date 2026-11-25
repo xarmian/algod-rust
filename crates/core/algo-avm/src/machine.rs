@@ -866,6 +866,33 @@ impl AvmMachine {
         })
     }
 
+    /// go v5.1 `branchTargetVarint`'s bounds checks, which a varint branch makes
+    /// whether or not it is taken: an offset beyond the program's length is
+    /// rejected before a target is computed (a 32-bit `int` must not truncate it
+    /// into a valid one), then a target outside `0..=len`. Returns the target's
+    /// byte offset.
+    pub fn varint_branch_target_in_bounds(
+        &self,
+        from_instruction: usize,
+        offset: i64,
+        varint_len: usize,
+    ) -> Result<usize, AlgoError> {
+        let len = self.end_of_program_offset as i64;
+        if offset > len || offset < -len {
+            return Err(AlgoError::Avm {
+                message: format!("branch offset {offset} outside of program"),
+            });
+        }
+        let instr = &self.program.instructions[from_instruction];
+        let target = crate::bytecode::varint_branch_target(instr.offset, varint_len, offset);
+        if target < 0 || target > self.end_of_program_offset as i128 {
+            return Err(AlgoError::Avm {
+                message: format!("branch target {target} outside of program"),
+            });
+        }
+        Ok(target as usize)
+    }
+
     /// Resolve a branch target from an instruction index + varint-encoded
     /// (zigzag+ULEB128) offset -- `bnz`/`bz`/`b`/`callsub` at
     /// `LogicSigVersion >= opcode::VARINT_BRANCH_VERSION`.
@@ -880,15 +907,8 @@ impl AvmMachine {
         offset: i64,
         varint_len: usize,
     ) -> Result<usize, AlgoError> {
-        let instr = &self.program.instructions[from_instruction];
-        let target = crate::bytecode::varint_branch_target(instr.offset, varint_len, offset);
-
-        if target < 0 || target > self.end_of_program_offset as i128 {
-            return Err(AlgoError::Avm {
-                message: format!("branch target {target} outside of program"),
-            });
-        }
-        let target_offset = target as usize;
+        let target_offset =
+            self.varint_branch_target_in_bounds(from_instruction, offset, varint_len)?;
 
         // Check if target is an instruction boundary.
         if let Some(idx) = self.index_of_offset(target_offset) {
