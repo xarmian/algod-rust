@@ -991,6 +991,14 @@ pub fn genesis_flags_for_version(version: &str) -> Option<GenesisProtocolFlags> 
     with_consensus_params(version, GenesisProtocolFlags::of)
 }
 
+/// Whether `version` lets a heartbeat share a group with an application call or
+/// an asset creation (go `config.Consensus[v].AllowGroupedHeartbeats`; an unknown
+/// protocol is `false`, rejected later by its own checks). Reads the built-in
+/// table without cloning the parameters.
+pub fn allow_grouped_heartbeats_for_protocol(version: &str) -> bool {
+    with_consensus_params(version, |p| p.allow_grouped_heartbeats).unwrap_or(false)
+}
+
 /// The single override-then-built-in resolution behind every protocol
 /// lookup: a `consensus.json` override entry (`Some`: replaced/added, `None`:
 /// deleted) wins wholesale and is read in place; otherwise the entry comes

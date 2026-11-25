@@ -765,10 +765,9 @@ impl Demux {
                     &compound.proposal.block.payset,
                     // go: `config.Consensus[up.Block.CurrentProtocol].AllowGroupedHeartbeats`;
                     // an unknown protocol is rejected later (`BlockHeader.PreCheck`).
-                    algo_types::consensus::consensus_params_for_version(
+                    algo_types::consensus::allow_grouped_heartbeats_for_protocol(
                         &compound.proposal.block.current_protocol,
-                    )
-                    .is_some_and(|p| p.allow_grouped_heartbeats),
+                    ),
                 ) {
                     warn!(
                         len = msg.data.len(),
