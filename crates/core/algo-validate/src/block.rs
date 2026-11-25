@@ -443,7 +443,7 @@ pub fn validate_block_with_cache(
         // `txnGroupBatchPrep` calling `CheckTxnGroup` before any per-txn
         // signature prep). Runs ahead of the per-member loop below, exactly
         // like Go's real ordering.
-        if let Err(e) = crate::checks::check_txn_group(group_txns) {
+        if let Err(e) = crate::checks::check_txn_group(group_txns, params.allow_grouped_heartbeats) {
             errors.push(BlockValidationError::GroupValidationFailed {
                 error: e.to_string(),
             });

@@ -262,7 +262,10 @@ fn check_application_call_boxes(txn: &Transaction) -> Result<(), AlgoError> {
 /// go-algorand's `CheckTxnGroup`. Run this *before* per-txn signature
 /// verification/prep, over the same contiguous group signature
 /// verification operates on (a "group" of one is still a group here).
-pub fn check_txn_group(group: &[SignedTransaction]) -> Result<(), AlgoError> {
+pub fn check_txn_group(
+    group: &[SignedTransaction],
+    allow_grouped_heartbeats: bool,
+) -> Result<(), AlgoError> {
     let mut heartbeat = false;
     let mut avail_trigger = false;
 
@@ -293,7 +296,7 @@ pub fn check_txn_group(group: &[SignedTransaction]) -> Result<(), AlgoError> {
         }
     }
 
-    if heartbeat && avail_trigger {
+    if !allow_grouped_heartbeats && heartbeat && avail_trigger {
         return Err(err(
             "heartbeat transaction may not be grouped with an application call or asset creation",
         ));
@@ -306,11 +309,14 @@ pub fn check_txn_group(group: &[SignedTransaction]) -> Result<(), AlgoError> {
 /// `CheckPayset`: walks the payset in contiguous runs of the same non-zero
 /// group (a zero-group txn is its own singleton run) and runs
 /// [`check_txn_group`] over each run.
-pub fn check_payset(payset: &[SignedTransaction]) -> Result<(), AlgoError> {
+pub fn check_payset(
+    payset: &[SignedTransaction],
+    allow_grouped_heartbeats: bool,
+) -> Result<(), AlgoError> {
     let groups = crate::block::detect_validation_groups(payset).map_err(err)?;
     for group in groups {
         let members: Vec<SignedTransaction> = group.iter().map(|&(_, stx)| stx.clone()).collect();
-        check_txn_group(&members)?;
+        check_txn_group(&members, allow_grouped_heartbeats)?;
     }
     Ok(())
 }
@@ -443,7 +449,7 @@ mod tests {
     fn heartbeat_missing_fields_is_rejected() {
         let mut txn = base_txn("hb");
         txn.heartbeat = None;
-        let err = check_txn_group(&[signed(txn)]).unwrap_err();
+        let err = check_txn_group(&[signed(txn)], false).unwrap_err();
         assert!(err.to_string().contains("heartbeat"), "got: {err}");
     }
 
@@ -456,7 +462,8 @@ mod tests {
         let pay = base_txn("pay");
         let mut hb = base_txn("hb");
         hb.heartbeat = None;
-        let err = check_txn_group(&[signed(pay.clone()), signed(hb), signed(pay)]).unwrap_err();
+        let err =
+            check_txn_group(&[signed(pay.clone()), signed(hb), signed(pay)], false).unwrap_err();
         assert_eq!(
             err.to_string(),
             "validation error: heartbeat transaction is missing its heartbeat fields"
@@ -467,7 +474,7 @@ mod tests {
     fn heartbeat_with_fields_is_accepted() {
         let mut txn = base_txn("hb");
         txn.heartbeat = Some(HeartbeatTxnFields::default());
-        check_txn_group(&[signed(txn)]).unwrap();
+        check_txn_group(&[signed(txn)], false).unwrap();
     }
 
     // ── Heartbeat grouped with resource-availability trigger ─────
@@ -477,7 +484,7 @@ mod tests {
         let mut hb = base_txn("hb");
         hb.heartbeat = Some(HeartbeatTxnFields::default());
         let appl = base_txn("appl");
-        let err = check_txn_group(&[signed(hb), signed(appl)]).unwrap_err();
+        let err = check_txn_group(&[signed(hb), signed(appl)], false).unwrap_err();
         assert!(err.to_string().contains("heartbeat"), "got: {err}");
     }
 
@@ -487,7 +494,7 @@ mod tests {
         hb.heartbeat = Some(HeartbeatTxnFields::default());
         let mut acfg = base_txn("acfg");
         acfg.config_asset = 0; // creation
-        let err = check_txn_group(&[signed(hb), signed(acfg)]).unwrap_err();
+        let err = check_txn_group(&[signed(hb), signed(acfg)], false).unwrap_err();
         assert!(err.to_string().contains("heartbeat"), "got: {err}");
     }
 
@@ -497,7 +504,44 @@ mod tests {
         hb.heartbeat = Some(HeartbeatTxnFields::default());
         let mut acfg = base_txn("acfg");
         acfg.config_asset = 42; // reconfigure, not create
-        check_txn_group(&[signed(hb), signed(acfg)]).unwrap();
+        check_txn_group(&[signed(hb), signed(acfg)], false).unwrap();
+    }
+
+    // go v5.1 `AllowGroupedHeartbeats` (#2544): where consensus allows it a
+    // heartbeat may share a group with an application call or asset creation.
+    #[test]
+    fn allow_grouped_heartbeats_lifts_the_resource_group_rule() {
+        let mut hb = base_txn("hb");
+        hb.heartbeat = Some(HeartbeatTxnFields::default());
+        let appl = base_txn("appl");
+        let mut acfg = base_txn("acfg");
+        acfg.config_asset = 0; // creation
+        for other in [appl, acfg] {
+            let group = [signed(hb.clone()), signed(other)];
+            let e = check_txn_group(&group, false).unwrap_err().to_string();
+            assert!(
+                e.contains("heartbeat transaction may not be grouped with an application call or asset creation"),
+                "{e}"
+            );
+            check_txn_group(&group, true).expect("allowed under AllowGroupedHeartbeats");
+        }
+        // the flag does not excuse a heartbeat missing its fields... (still checked)
+        let mut bare = base_txn("hb");
+        bare.heartbeat = None;
+        assert!(check_txn_group(&[signed(bare)], true).is_err());
+        // check_payset passes the flag per run
+        let mut hb2 = hb.clone();
+        let mut appl2 = base_txn("appl");
+        let ids: Vec<algo_types::Digest> = [&hb2, &appl2]
+            .iter()
+            .map(|t| algo_codec::compute_txn_id(t))
+            .collect();
+        let gid = algo_codec::compute_group_id_from_hashes(&ids);
+        hb2.group = gid.0;
+        appl2.group = gid.0;
+        let payset = [signed(hb2), signed(appl2)];
+        assert!(check_payset(&payset, false).is_err());
+        check_payset(&payset, true).unwrap();
     }
 
     #[test]
@@ -505,7 +549,7 @@ mod tests {
         let mut hb = base_txn("hb");
         hb.heartbeat = Some(HeartbeatTxnFields::default());
         let pay = base_txn("pay");
-        check_txn_group(&[signed(hb), signed(pay)]).unwrap();
+        check_txn_group(&[signed(hb), signed(pay)], false).unwrap();
     }
 
     // ── StateProof reveal bounds ──────────────────────────────────
@@ -671,7 +715,7 @@ mod tests {
             index: 3,
             name: None,
         }]);
-        let err = check_txn_group(&[signed(txn)]).unwrap_err();
+        let err = check_txn_group(&[signed(txn)], false).unwrap_err();
         assert!(err.to_string().contains("box"), "got: {err}");
     }
 
@@ -684,7 +728,7 @@ mod tests {
             index: 2,
             name: None,
         }]);
-        check_txn_group(&[signed(txn)]).unwrap();
+        check_txn_group(&[signed(txn)], false).unwrap();
     }
 
     #[test]
@@ -697,7 +741,7 @@ mod tests {
             index: 99,
             name: None,
         }]);
-        check_txn_group(&[signed(txn)]).unwrap();
+        check_txn_group(&[signed(txn)], false).unwrap();
     }
 
     // ── Unknown transaction type ───────────────────────────────────
@@ -705,7 +749,7 @@ mod tests {
     #[test]
     fn unknown_txn_type_alone_is_rejected() {
         let txn = base_txn("bogus");
-        let err = check_txn_group(&[signed(txn)]).unwrap_err();
+        let err = check_txn_group(&[signed(txn)], false).unwrap_err();
         assert!(err.to_string().contains("unknown"), "got: {err}");
     }
 
@@ -717,7 +761,7 @@ mod tests {
         // triggers it.
         let appl = base_txn("appl");
         let bogus = base_txn("bogus");
-        let err = check_txn_group(&[signed(appl), signed(bogus)]).unwrap_err();
+        let err = check_txn_group(&[signed(appl), signed(bogus)], false).unwrap_err();
         assert!(err.to_string().contains("unknown"), "got: {err}");
     }
 
@@ -732,17 +776,17 @@ mod tests {
         // `checks_test.go`, `v5.0.1-stable`).
         for t in ["pay", "keyreg", "acfg", "axfer", "afrz", "appl"] {
             let txn = base_txn(t);
-            check_txn_group(&[signed(txn)])
+            check_txn_group(&[signed(txn)], false)
                 .unwrap_or_else(|e| panic!("type {t:?} should be accepted, got: {e}"));
         }
         // Heartbeat needs its fields populated to be accepted on its own.
         let mut hb = base_txn("hb");
         hb.heartbeat = Some(HeartbeatTxnFields::default());
-        check_txn_group(&[signed(hb)]).unwrap();
+        check_txn_group(&[signed(hb)], false).unwrap();
 
         let mut stpf = base_txn("stpf");
         stpf.state_proof = Some(well_formed_state_proof_body());
-        check_txn_group(&[signed(stpf)]).unwrap();
+        check_txn_group(&[signed(stpf)], false).unwrap();
     }
 
     // ── check_basic_state_proof / check_state_proof (go:
@@ -906,7 +950,7 @@ mod tests {
     fn check_payset_rejects_a_malformed_group_anywhere_in_the_payset() {
         let good = signed(base_txn("pay"));
         let bad = signed(base_txn("bogus"));
-        let err = check_payset(&[good, bad]).unwrap_err();
+        let err = check_payset(&[good, bad], false).unwrap_err();
         assert!(err.to_string().contains("unknown"), "got: {err}");
     }
 
@@ -923,7 +967,7 @@ mod tests {
             txn.group = group_hash;
             txns.push(signed(txn));
         }
-        let err = check_payset(&txns).unwrap_err();
+        let err = check_payset(&txns, false).unwrap_err();
         assert!(err.to_string().contains("exceeds maximum"), "got: {err}");
     }
 
@@ -936,7 +980,7 @@ mod tests {
             txn.group = group_hash;
             txns.push(signed(txn));
         }
-        check_payset(&txns).unwrap();
+        check_payset(&txns, false).unwrap();
     }
 
     #[test]
@@ -946,6 +990,6 @@ mod tests {
             signed(base_txn("axfer")),
             signed(base_txn("afrz")),
         ];
-        check_payset(&txns).unwrap();
+        check_payset(&txns, false).unwrap();
     }
 }

@@ -1635,7 +1635,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // with an unknown txn type, an out-of-range box index, etc. must be
         // rejected here, not silently accepted or left to fail later during
         // AVM evaluation.
-        check_txn_group(&verify_group).map_err(|e| {
+        check_txn_group(&verify_group, consensus.allow_grouped_heartbeats).map_err(|e| {
             SimulatorError::InvalidRequest(InvalidRequestError {
                 message: go_error_text(&e),
             })
