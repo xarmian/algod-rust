@@ -1256,6 +1256,21 @@ mod tests {
     }
 
     #[test]
+    fn type_falcon_verify_pins_the_public_key_length_per_config() {
+        let mut p = Knowledge::new();
+        for (cfg, len) in [("FalconDet1024", 1793), ("FalconDet512", 897)] {
+            let r = run_refine("typeFalconVerify", &mut p, &[cfg], None);
+            let args = r.args.expect("pins the arguments");
+            assert_eq!(args.len(), 3);
+            assert_eq!(args[2], StackType::new(Avm::Bytes, len, len, None), "{cfg}");
+        }
+        for odd in [&[][..], &["nope"][..], &["FalconDet512", "x"][..]] {
+            let r = run_refine("typeFalconVerify", &mut p, odd, None);
+            assert!(r.args.is_none(), "{odd:?} pins nothing");
+        }
+    }
+
+    #[test]
     #[ignore = "Phase 26 carve-out: typeMLDSAVerify arrives with mldsa_verify (#2575, go v5.1.0-beta)"]
     fn every_refine_function_of_the_go_table_is_ported() {
         let mut p = Knowledge::new();

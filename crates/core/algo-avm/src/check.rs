@@ -253,10 +253,15 @@ pub fn static_check(program: &[u8], mode: ExecMode) -> Option<String> {
             if size > 1 && pc + size > len {
                 return fail(pc, "program ends without immediate value(s)".to_string());
             }
-            if COST_BY_IMMEDIATE.contains(&op)
-                || (op == 0x85 && version >= opcode::FALCON_CONFIG_VERSION)
-            {
+            if COST_BY_IMMEDIATE.contains(&op) {
                 return None;
+            }
+            // go v5.1 `falcon_verify <config>`: costs 1700/850 by config; a
+            // config with no cost entry is `non-positive cost 0` (go's
+            // `costByField` leaves the other 254 entries zero). The walk goes on
+            // for a known config.
+            if op == 0x85 && version >= opcode::FALCON_CONFIG_VERSION && program[pc + 1] >= 2 {
+                return fail(pc, "falcon_verify reported non-positive cost 0".to_string());
             }
             if spec.imm == ImmKind::Int16 {
                 // go's `checkBranch` for `bnz`/`bz`/`b`/`callsub`.
@@ -393,6 +398,23 @@ pub fn contract_static_check(program: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    // Issue #2572: v14 `falcon_verify <config>` in go's `check`.
+    #[test]
+    fn falcon_verify_config_is_checked_and_the_walk_goes_on() {
+        // v14: pushbytes x3, falcon_verify <cfg>, then an out-of-range branch
+        let prog = |cfg: u8, tail: &[u8]| {
+            let mut p = vec![14u8, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x85, cfg];
+            p.extend_from_slice(tail);
+            p
+        };
+        // config 2 has no cost: go reports `non-positive cost 0`
+        let e = super::static_check(&prog(2, &[0x22]), super::ExecMode::LogicSig).unwrap();
+        assert!(e.contains("falcon_verify reported non-positive cost 0"), "{e}");
+        // a known config continues the walk: a bad opcode after it is found
+        let e = super::static_check(&prog(1, &[0xff]), super::ExecMode::LogicSig);
+        assert!(e.is_some(), "the walk must continue past a costed falcon_verify");
+    }
+
     use super::*;
 
     #[test]

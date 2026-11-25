@@ -1287,9 +1287,9 @@ pub fn op_falcon_verify(
         let cost = match config {
             0 => 1700,
             1 => 850,
-            // go's `costByField` has no cost for an unknown field value; the
-            // eval error below is what a run reports (`invalid falcon config`)
-            _ => 1700,
+            // go's `costByField` has cost 0 for an unknown field value; the run
+            // then reports `invalid falcon config` below
+            _ => 0,
         };
         machine.charge_cost(cost)?;
         config
