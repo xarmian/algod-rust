@@ -405,7 +405,7 @@ pub fn parse(raw: &[u8]) -> Result<Program, AlgoError> {
         {
             ImmKind::BranchVarint
         } else {
-            spec.imm
+            opcode::effective_imm(spec, version)
         };
 
         let (immediates, consumed) = parse_immediates(code, pc, imm_kind, spec.name, version)?;
@@ -676,6 +676,7 @@ pub(crate) fn uint8_immediate_names(op_name: &str) -> Option<&'static [&'static 
         | "ec_subgroup_check"
         | "ec_map_to" => &["g"],
         "mimc" | "poseidon2" => &["c"],
+        "falcon_verify" => &["f"],
         "gtxn" => &["t", "f"],
         "txna" | "gtxnsa" | "itxna" => &["f", "i"],
         "gload" => &["t", "i"],

@@ -1471,6 +1471,23 @@ pub fn poseidon2_config_by_name(name: &str) -> Option<u8> {
     }
 }
 
+/// Look up a FalconConfig by name (`falcon_verify`'s v14 immediate).
+pub fn falcon_config_by_name(name: &str) -> Option<u8> {
+    match name {
+        "FalconDet1024" => Some(0),
+        "FalconDet512" => Some(1),
+        _ => None,
+    }
+}
+
+pub fn falcon_config_name(index: u8) -> Option<&'static str> {
+    match index {
+        0 => Some("FalconDet1024"),
+        1 => Some("FalconDet512"),
+        _ => None,
+    }
+}
+
 pub fn poseidon2_config_name(index: u8) -> Option<&'static str> {
     match index {
         0 => Some("BN254t2"),
@@ -1526,6 +1543,7 @@ pub fn field_name_for_opcode(mnemonic: &str, imm_index: usize, value: u8) -> Opt
         ("block", 0) => block_field_name(value),
         ("mimc", 0) => mimc_config_name(value),
         ("poseidon2", 0) => poseidon2_config_name(value),
+        ("falcon_verify", 0) => falcon_config_name(value),
 
         _ => None,
     }
@@ -1581,6 +1599,7 @@ pub fn opcode_immediate_is_field(mnemonic: &str, imm_index: usize) -> bool {
             | ("block", 0)
             | ("mimc", 0)
             | ("poseidon2", 0)
+            | ("falcon_verify", 0)
     )
 }
 

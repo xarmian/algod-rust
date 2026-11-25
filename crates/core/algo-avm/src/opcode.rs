@@ -111,6 +111,24 @@ pub enum ImmKind {
 /// encoding.
 pub const VARINT_BRANCH_VERSION: u8 = 13;
 
+/// The AVM version at which `falcon_verify` gains its one-byte config
+/// immediate (`FalconDet1024` / `FalconDet512`; go `f512Version`). v12/v13
+/// programs keep the immediate-less, Falcon-1024-only form.
+pub const FALCON_CONFIG_VERSION: u8 = 14;
+
+/// The immediate kind of `spec` in a program of `version`: the table's
+/// [`OpSpec::imm`] except for `falcon_verify`, whose table entry is the
+/// pre-v14 immediate-less form and which takes a one-byte config from v14 on.
+/// (`bnz`/`bz`/`b`/`callsub` are resolved separately, see
+/// [`is_varint_branch_opcode`].)
+pub fn effective_imm(spec: &OpSpec, version: u8) -> ImmKind {
+    if spec.opcode == 0x85 && version >= FALCON_CONFIG_VERSION {
+        ImmKind::Uint8
+    } else {
+        spec.imm
+    }
+}
+
 /// Returns `true` for the four opcodes whose branch-offset encoding is
 /// version-gated by [`VARINT_BRANCH_VERSION`]: `bnz` (0x40), `bz` (0x41),
 /// `b` (0x42), `callsub` (0x88). `switch`/`match` are deliberately excluded.
@@ -663,6 +681,11 @@ pub fn lookup(byte: u8) -> Option<&'static OpSpec> {
 /// every other opcode's `version` field already doubles as "cost effective
 /// from this version on".
 pub fn effective_cost(spec: &OpSpec, version: u8) -> CostKind {
+    // `falcon_verify` costs 1700 (FalconDet1024) or 850 (FalconDet512) from v14,
+    // by its immediate: charged by the opcode itself.
+    if spec.opcode == 0x85 && version >= FALCON_CONFIG_VERSION {
+        return CostKind::Dynamic;
+    }
     if version <= 1 {
         match spec.opcode {
             0x01 => return CostKind::Static(7),  // sha256 (pre-v2)
@@ -990,12 +1013,18 @@ mod tests {
         // Every opcode other than sha256/keccak256/sha512_256 must be
         // unaffected by `effective_cost` at any version -- the audit around
         // go's commit `3a9bca479` found no other opcode with a version-gated
-        // static-cost bump (issue #1121).
+        // static-cost bump (issue #1121); v5.1's falcon_verify is handled below.
         for entry in OPCODE_TABLE.iter().filter_map(|o| o.as_ref()) {
             if matches!(entry.opcode, 0x01..=0x03) {
                 continue;
             }
             for version in 0..=MAX_AVM_VERSION {
+                // `falcon_verify` is costed by its config immediate from v14
+                // (go v5.1 `costByField`): dynamic, charged by the opcode.
+                if entry.opcode == 0x85 && version >= FALCON_CONFIG_VERSION {
+                    assert_eq!(effective_cost(entry, version), CostKind::Dynamic);
+                    continue;
+                }
                 assert_eq!(
                     effective_cost(entry, version),
                     entry.cost,
