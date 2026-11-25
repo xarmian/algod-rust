@@ -37,6 +37,7 @@ pub fn op_err(_machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(
 /// `bnz offset` (0x40): pop top of stack; branch if non-zero.
 pub fn op_bnz(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(), AlgoError> {
     let val = machine.pop_uint()?;
+    validate_varint_target(machine, instruction)?;
     if val != 0 {
         branch(machine, instruction)
     } else {
@@ -48,6 +49,7 @@ pub fn op_bnz(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(),
 /// `bz offset` (0x41): pop top of stack; branch if zero.
 pub fn op_bz(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(), AlgoError> {
     let val = machine.pop_uint()?;
+    validate_varint_target(machine, instruction)?;
     if val == 0 {
         branch(machine, instruction)
     } else {
@@ -370,6 +372,20 @@ fn resolve_label(
             "switch/match: branch target byte offset {target_byte_offset} does not match any instruction"
         ),
     })
+}
+
+/// go v5.1's varint branches (`opBnz`/`opBz`, LogicSigVersion 13+) work out and
+/// validate the target before looking at the condition, so a bad offset fails
+/// the program even when the branch is not taken. The fixed-width form (below
+/// v13) only resolves a target that is taken.
+fn validate_varint_target(
+    machine: &AvmMachine,
+    instruction: &Instruction,
+) -> Result<(), AlgoError> {
+    if let Immediates::BranchVarint(offset, varint_len) = instruction.immediates {
+        machine.varint_branch_target_in_bounds(machine.pc, offset, varint_len)?;
+    }
+    Ok(())
 }
 
 /// Helper: resolve a branch offset (`Int16` below LogicSigVersion 13,

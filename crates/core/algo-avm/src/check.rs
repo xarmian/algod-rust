@@ -402,6 +402,58 @@ pub fn contract_static_check(program: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    // Issue #2576: go's `TestBranchOffsetTruncation`. Varint branch offsets too
+    // large for a 32-bit int are rejected by the checker, the evaluator and the
+    // disassembler alike, rather than truncated into a valid target.
+    #[test]
+    fn varint_branch_offsets_beyond_32_bits_are_outside_of_program() {
+        use crate::machine::{AvmMachine, ExecMode};
+        fn varint(v: i64) -> Vec<u8> {
+            // binary.AppendVarint: zigzag then uvarint
+            let mut u = ((v << 1) ^ (v >> 63)) as u64;
+            let mut out = Vec::new();
+            while u >= 0x80 {
+                out.push((u as u8) | 0x80);
+                u >>= 7;
+            }
+            out.push(u as u8);
+            out
+        }
+        let offsets = [
+            1i64 << 32,
+            (1i64 << 32) + 2,
+            -(1i64 << 32),
+            i64::MAX,
+            i64::MIN,
+        ];
+        for op in [0x42u8, 0x41, 0x40, 0x88] {
+            for offset in offsets {
+                // pushint 0; <op> <offset>; pushint 1; pushint 1
+                let mut program = vec![13u8, 0x81, 0x00, op];
+                program.extend(varint(offset));
+                program.extend_from_slice(&[0x81, 0x01, 0x81, 0x01]);
+                let what = format!("{op:#x} {offset}");
+                let e = super::static_check(&program, super::ExecMode::LogicSig)
+                    .unwrap_or_else(|| panic!("check accepted {what}"));
+                assert!(e.contains("outside of program"), "{what}: {e}");
+                let e = crate::disassembler::disassemble(&program)
+                    .err()
+                    .unwrap_or_else(|| panic!("disassembled {what}"));
+                assert!(e.contains("outside of program"), "{what}: {e}");
+                // the evaluator: parse + run
+                let run = crate::bytecode::parse(&program)
+                    .map_err(|e| e.to_string())
+                    .and_then(|p| {
+                        AvmMachine::new(p, ExecMode::LogicSig, 1000)
+                            .run(&mut crate::context::NullContext)
+                            .map_err(|e| e.to_string())
+                    });
+                let e = run.err().unwrap_or_else(|| panic!("ran {what}"));
+                assert!(e.contains("outside of program"), "{what}: {e}");
+            }
+        }
+    }
+
     // Issue #2575: `mldsa_verify <p>` with a parameter set that has no cost.
     #[test]
     fn mldsa_verify_unknown_parameter_set_has_no_cost() {
