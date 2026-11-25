@@ -149,20 +149,20 @@ impl RootRouter {
     ///
     /// Mirrors Go's `rootRouter.update`.
     pub fn update(&mut self, state: &Player, r: Round, gc: bool) {
-        self.children.entry(r).or_default();
+        let cred_lag = credential_round_lag();
+        let survives = |rnd: Round| rnd.0.saturating_add(cred_lag) >= state.round.0;
+        // Don't create a child the gc pass below would immediately delete
+        // (go v5.1: rootRouter.update; submitTop hits this with r=0 on every
+        // event).
+        if (!gc || survives(r)) && !self.children.contains_key(&r) {
+            self.children.insert(r, RoundRouter::default());
+        }
 
         if gc {
-            let cred_lag = credential_round_lag();
-            let mut children = HashMap::new();
-            for (&rnd, child) in &self.children {
-                // Keep old round routers around for as long as credentials may
-                // arrive, to keep track of them.
-                let rr = Round(rnd.0.saturating_add(cred_lag));
-                if rr.0 >= state.round.0 {
-                    children.insert(rnd, child.clone());
-                }
-            }
-            self.children = children;
+            // Keep old round routers around for as long as credentials may
+            // arrive, to keep track of them. Delete in place: surviving
+            // children keep their state and are not cloned.
+            self.children.retain(|&rnd, _| survives(rnd));
             // Go keeps the proposal store and vote tracker inside the
             // roundRouter, so they are freed with it. They live at the root
             // here, so prune them with the same retention window.
@@ -333,21 +333,17 @@ impl RoundRouter {
     ///
     /// Mirrors Go's `roundRouter.update`.
     pub fn update(&mut self, state: &Player, p: Period, gc: bool) {
-        self.children.entry(p).or_default();
+        // Keep p+1 >= state.Period, and keep periods 0 and 1 to avoid
+        // garbage-collecting (next round, period 0/1) state. This is
+        // conservative; we can collect more eagerly if the router's round is
+        // passed in. A child the gc pass would delete is not created (go v5.1).
+        let survives = |per: Period| per.0 + 1 >= state.period.0 || per.0 <= 1;
+        if (!gc || survives(p)) && !self.children.contains_key(&p) {
+            self.children.insert(p, PeriodRouter::default());
+        }
 
         if gc {
-            let mut children = HashMap::new();
-            for (&per, child) in &self.children {
-                if per.0 + 1 >= state.period.0 {
-                    children.insert(per, child.clone());
-                } else if per.0 <= 1 {
-                    // Avoid garbage-collecting (next round, period 0/1) state.
-                    // This is conservative; we can collect more eagerly if the
-                    // router's round is passed in.
-                    children.insert(per, child.clone());
-                }
-            }
-            self.children = children;
+            self.children.retain(|&per, _| survives(per));
         }
     }
 
@@ -1014,5 +1010,123 @@ mod tests {
         router.update(Step(7));
         router.update(Step(7));
         assert_eq!(router.children.len(), 1);
+    }
+
+    // go v5.1 TestRouterUpdateGarbageCollection / TestRouterUpdateKeepsChildIdentity
+    // (issue #2552): collecting in place keeps exactly the children the previous
+    // rebuild-into-a-new-map approach kept, and a surviving child keeps its state.
+    fn rebuild_root_children(seeded: &HashMap<Round, RoundRouter>, state_round: u64) -> Vec<Round> {
+        let lag = credential_round_lag();
+        let mut keys: Vec<Round> = seeded
+            .keys()
+            .copied()
+            .filter(|r| r.0 + lag >= state_round)
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    fn rebuild_round_children(seeded: &HashMap<Period, PeriodRouter>, state_period: u64) -> Vec<Period> {
+        let mut keys: Vec<Period> = seeded
+            .keys()
+            .copied()
+            .filter(|p| p.0 + 1 >= state_period || p.0 <= 1)
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    fn sorted_keys<K: Ord + Copy, V>(m: &HashMap<K, V>) -> Vec<K> {
+        let mut k: Vec<K> = m.keys().copied().collect();
+        k.sort();
+        k
+    }
+
+    #[test]
+    fn router_update_garbage_collection_matches_rebuild() {
+        let max_round = 3 * credential_round_lag();
+        for state_round in 0..=max_round {
+            for child_round in 0..=max_round {
+                for arg in [0, child_round, state_round, max_round] {
+                    let mut root = RootRouter::default();
+                    root.children.insert(Round(child_round), RoundRouter::default());
+                    let mut seeded = root.children.clone();
+                    seeded.entry(Round(arg)).or_default();
+                    let want = rebuild_root_children(&seeded, state_round);
+                    let player = Player {
+                        round: Round(state_round),
+                        ..Player::default()
+                    };
+                    root.update(&player, Round(arg), true);
+                    assert_eq!(
+                        want,
+                        sorted_keys(&root.children),
+                        "state={state_round} child={child_round} arg={arg}"
+                    );
+                }
+            }
+        }
+        for state_period in 0..=6u64 {
+            for child_period in 0..=6u64 {
+                for arg in [0, child_period, state_period, 6] {
+                    let mut rr = RoundRouter::default();
+                    rr.children.insert(Period(child_period), PeriodRouter::default());
+                    let mut seeded = rr.children.clone();
+                    seeded.entry(Period(arg)).or_default();
+                    let want = rebuild_round_children(&seeded, state_period);
+                    let player = Player {
+                        period: Period(state_period),
+                        ..Player::default()
+                    };
+                    rr.update(&player, Period(arg), true);
+                    assert_eq!(
+                        want,
+                        sorted_keys(&rr.children),
+                        "state={state_period} child={child_period} arg={arg}"
+                    );
+                }
+            }
+        }
+        // several children at once, deleting more than one while collecting
+        let mut x: u64 = 42;
+        let mut next = |m: u64| {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) % m
+        };
+        for _ in 0..200 {
+            let state_round = next(max_round);
+            let arg = next(max_round);
+            let mut root = RootRouter::default();
+            for _ in 0..1 + next(15) {
+                root.children.insert(Round(next(max_round)), RoundRouter::default());
+            }
+            let mut seeded = root.children.clone();
+            seeded.entry(Round(arg)).or_default();
+            let want = rebuild_root_children(&seeded, state_round);
+            let player = Player {
+                round: Round(state_round),
+                ..Player::default()
+            };
+            root.update(&player, Round(arg), true);
+            assert_eq!(want, sorted_keys(&root.children), "state={state_round} arg={arg}");
+        }
+    }
+
+    #[test]
+    fn router_update_keeps_surviving_child_state() {
+        let mut root = RootRouter::default();
+        let mut survivor = RoundRouter::default();
+        survivor.children.insert(Period(7), PeriodRouter::default());
+        root.children.insert(Round(100), survivor);
+        root.children.insert(Round(1), RoundRouter::default());
+        let player = Player {
+            round: Round(100),
+            ..Player::default()
+        };
+        root.update(&player, Round(100), true);
+        assert!(root.children[&Round(100)].children.contains_key(&Period(7)));
+        assert!(!root.children.contains_key(&Round(1)));
     }
 }

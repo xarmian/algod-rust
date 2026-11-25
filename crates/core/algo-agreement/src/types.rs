@@ -357,7 +357,7 @@ pub fn bundle_fresh(fresh_data: &FreshnessData, b: &UnauthenticatedBundle) -> Re
 
     if fresh_data.player_period != Period(0) && fresh_data.player_period.0 - 1 > b.period.0 {
         return Err(format!(
-            "filtered stale bundle: period {} >= {}",
+            "filtered stale bundle: period {} - 1 > {}",
             fresh_data.player_period, b.period
         ));
     }
@@ -1207,6 +1207,12 @@ mod tests {
         assert!(
             bundle_fresh(&fd, &bundle_at(0, CERT)).is_err(),
             "far behind must be discarded"
+        );
+
+        // go v5.1.1 words the stale-period filter `period %d - 1 > %d`.
+        assert_eq!(
+            bundle_fresh(&fd, &bundle_at(2, CERT)).unwrap_err(),
+            "filtered stale bundle: period 4 - 1 > 2"
         );
 
         // Non-cert bundles are unchanged by removing the cert exception.
