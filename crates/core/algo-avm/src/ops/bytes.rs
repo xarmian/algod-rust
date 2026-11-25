@@ -59,24 +59,31 @@ fn biguint_to_bytes(v: &BigUint) -> Vec<u8> {
 }
 
 /// go's `maxByteMathSize` input check (`opBytesBinOp`, `opBytesSqrt`, ...).
-fn check_bigint_input(bytes: &[u8]) -> Result<BigUint, AlgoError> {
-    if bytes.len() > MAX_BIGINT_LEN {
+/// From `fullByteMathVersion` (14) there is no limit (`checkByteMathOperands`).
+fn check_bigint_input(bytes: &[u8], version: u8) -> Result<BigUint, AlgoError> {
+    if version < crate::cost14::FULL_BYTE_MATH_VERSION && bytes.len() > MAX_BIGINT_LEN {
         return Err(avm_err("math attempted on large byte-array"));
     }
     Ok(BigUint::from_bytes_be(bytes))
 }
 
-/// Pop one byte-math operand (at most 64 bytes, else go's error).
+/// Pop one byte-math operand (at most 64 bytes before v14, else go's error;
+/// unlimited from `fullByteMathVersion`).
 fn pop_bigint(machine: &mut AvmMachine) -> Result<BigUint, AlgoError> {
-    check_bigint_input(&machine.pop_bytes()?)
+    let version = machine.version;
+    check_bigint_input(&machine.pop_bytes()?, version)
 }
 
 /// Pop the two operands `(a, b)` of a byte-math opcode; go checks both
 /// lengths before anything else about the values.
 fn pop_bigint_pair(machine: &mut AvmMachine) -> Result<(BigUint, BigUint), AlgoError> {
+    let version = machine.version;
     let b = machine.pop_bytes()?;
     let a = machine.pop_bytes()?;
-    let (a, b) = (check_bigint_input(&a), check_bigint_input(&b));
+    let (a, b) = (
+        check_bigint_input(&a, version),
+        check_bigint_input(&b, version),
+    );
     Ok((a?, b?))
 }
 
@@ -324,7 +331,7 @@ pub fn op_bzero(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<
 // ---------------------------------------------------------------------------
 
 /// `b+` (0xa0): pop b, pop a, push a+b as bytes. Inputs are at most 64 bytes
-/// (the result may be longer, as go's).
+/// before v14 (the result may be longer, as go's); unlimited from v14.
 pub fn op_badd(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
     let (a, b) = pop_bigint_pair(machine)?;
     let result = biguint_to_bytes(&(a + b));
@@ -351,7 +358,8 @@ pub fn op_bdiv(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(
     machine.push(crate::machine::AvmValue::Bytes(result))
 }
 
-/// `b*` (0xa3): pop b, pop a, push a*b as bytes. Inputs are at most 64 bytes.
+/// `b*` (0xa3): pop b, pop a, push a*b as bytes. Inputs are at most 64 bytes
+/// before v14.
 pub fn op_bmul(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
     let (a, b) = pop_bigint_pair(machine)?;
     let result = biguint_to_bytes(&(a * b));
@@ -450,7 +458,25 @@ pub fn op_bbitwise_not(
     machine.push(crate::machine::AvmValue::Bytes(result))
 }
 
-/// `bsqrt` (0x96): pop a (bytes), push integer square root as bytes.
+/// `bmodexp` (0x99, v14): pop modulus, exponent, base; push `base^exp mod
+/// modulus` as bytes (go's `opBytesModExp`; operands of any length).
+pub fn op_bmodexp(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
+    let z = BigUint::from_bytes_be(&machine.pop_bytes()?);
+    if z == BigUint::ZERO {
+        return Err(avm_err("modulo by zero"));
+    }
+    let y = BigUint::from_bytes_be(&machine.pop_bytes()?);
+    let x = BigUint::from_bytes_be(&machine.pop_bytes()?);
+    // big.Int.Exp treats 0^0 as 1, but exp and expw consider it undefined.
+    if x == BigUint::ZERO && y == BigUint::ZERO {
+        return Err(avm_err("0^0 is undefined"));
+    }
+    let result = biguint_to_bytes(&x.modpow(&y, &z));
+    machine.push(crate::machine::AvmValue::Bytes(result))
+}
+
+/// `bsqrt` (0x96): pop a (bytes, at most 64 before v14), push integer square
+/// root as bytes.
 pub fn op_bsqrt(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
     let a = pop_bigint(machine)?;
     let result = biguint_to_bytes(&a.sqrt());
@@ -482,8 +508,12 @@ mod tests {
 
     /// Helper: create a machine with some values pre-pushed on the stack.
     fn machine_with_stack(stack: Vec<AvmValue>) -> AvmMachine {
+        machine_with_stack_at(6, stack)
+    }
+
+    fn machine_with_stack_at(version: u8, stack: Vec<AvmValue>) -> AvmMachine {
         let program = Program {
-            version: 6,
+            version,
             instructions: vec![],
         };
         let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
@@ -773,6 +803,241 @@ mod tests {
         let mut m = machine_with_stack(vec![bytes_val(&[0; 65]), bytes_val(&[0x01])]);
         let err = op_badd(&mut m, &instr).unwrap_err().to_string();
         assert_eq!(err, "AVM: math attempted on large byte-array");
+    }
+
+    // Issue #2573: from `fullByteMathVersion` (14) byte math is unconstrained by
+    // `maxByteMathSize`, for every operation that took the limit.
+    #[test]
+    fn full_byte_math_lifts_the_operand_size_limit_from_v14() {
+        let big = bytes_val(&[0x01; 100]);
+        let one = bytes_val(&[0x01]);
+        type Op = fn(&mut AvmMachine, &Instruction) -> Result<(), AlgoError>;
+        let ops: [(u8, Op); 11] = [
+            (0xa0, op_badd),
+            (0xa1, op_bsub),
+            (0xa2, op_bdiv),
+            (0xa3, op_bmul),
+            (0xa4, op_blt),
+            (0xa5, op_bgt),
+            (0xa6, op_ble),
+            (0xa7, op_bge),
+            (0xa8, op_beq),
+            (0xa9, op_bne),
+            (0xaa, op_bmod),
+        ];
+        for (opcode, f) in ops {
+            let instr = dummy_instr(opcode, Immediates::None);
+            // v13 keeps the limit...
+            let mut m = machine_with_stack_at(13, vec![big.clone(), one.clone()]);
+            let e = f(&mut m, &instr).unwrap_err().to_string();
+            assert_eq!(
+                e, "AVM: math attempted on large byte-array",
+                "{opcode:#x} v13"
+            );
+            // ...v14 does not.
+            let mut m = machine_with_stack_at(14, vec![big.clone(), one.clone()]);
+            f(&mut m, &instr).unwrap_or_else(|e| panic!("{opcode:#x} v14: {e}"));
+        }
+        // bsqrt of a 100 byte value
+        let instr = dummy_instr(0x96, Immediates::None);
+        let mut m = machine_with_stack_at(13, vec![big.clone()]);
+        assert!(op_bsqrt(&mut m, &instr).is_err());
+        let mut m = machine_with_stack_at(14, vec![big]);
+        let root = op_bsqrt(&mut m, &instr)
+            .map(|_| m.pop_bytes().unwrap())
+            .unwrap();
+        assert_eq!(root.len(), 50);
+    }
+
+    /// Deterministic xorshift64*: the property tests below are seeded, not random.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// go's `TestRapidAddSubBytes` input: runs of zeros, 0xff and arbitrary
+    /// bytes, so leading zeros, long carries and long borrows all occur.
+    fn draw_runs(r: &mut Rng) -> Vec<u8> {
+        let mut out = Vec::new();
+        for _ in 0..r.below(5) {
+            let n = r.below(71) as usize;
+            match r.below(3) {
+                0 => out.extend(vec![0u8; n]),
+                1 => out.extend(vec![0xffu8; n]),
+                _ => out.extend((0..n).map(|_| r.next() as u8)),
+            }
+        }
+        out
+    }
+
+    /// Schoolbook big-endian add/sub of byte strings, independent of `BigUint`.
+    fn model_add(a: &[u8], b: &[u8]) -> Vec<u8> {
+        let n = a.len().max(b.len()) + 1;
+        let mut out = vec![0u8; n];
+        let mut carry = 0u16;
+        for i in 0..n {
+            let x = if i < a.len() {
+                a[a.len() - 1 - i] as u16
+            } else {
+                0
+            };
+            let y = if i < b.len() {
+                b[b.len() - 1 - i] as u16
+            } else {
+                0
+            };
+            let s = x + y + carry;
+            out[n - 1 - i] = s as u8;
+            carry = s >> 8;
+        }
+        let skip = out.iter().take_while(|x| **x == 0).count();
+        out[skip..].to_vec()
+    }
+
+    fn model_sub(a: &[u8], b: &[u8]) -> Option<Vec<u8>> {
+        let n = a.len().max(b.len());
+        let mut out = vec![0u8; n];
+        let mut borrow = 0i16;
+        for i in 0..n {
+            let x = if i < a.len() {
+                a[a.len() - 1 - i] as i16
+            } else {
+                0
+            };
+            let y = if i < b.len() {
+                b[b.len() - 1 - i] as i16
+            } else {
+                0
+            };
+            let mut d = x - y - borrow;
+            borrow = 0;
+            if d < 0 {
+                d += 256;
+                borrow = 1;
+            }
+            out[n - 1 - i] = d as u8;
+        }
+        if borrow != 0 {
+            return None;
+        }
+        let skip = out.iter().take_while(|x| **x == 0).count();
+        Some(out[skip..].to_vec())
+    }
+
+    fn run_bin(
+        version: u8,
+        f: fn(&mut AvmMachine, &Instruction) -> Result<(), AlgoError>,
+        opcode: u8,
+        a: &[u8],
+        b: &[u8],
+    ) -> Result<Vec<u8>, AlgoError> {
+        let mut m = machine_with_stack_at(version, vec![bytes_val(a), bytes_val(b)]);
+        f(&mut m, &dummy_instr(opcode, Immediates::None))?;
+        m.pop_bytes()
+    }
+
+    // go's `TestRapidAddSubBytes`, `TestRapidBitwise` and `TestRapidNonzero`
+    // check go's word-at-a-time implementations against references; here the
+    // opcodes are checked against independent byte-level models, seeded.
+    #[test]
+    fn byte_ops_match_independent_models_on_stress_inputs() {
+        let mut r = Rng(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..3000 {
+            let (a, b) = (draw_runs(&mut r), draw_runs(&mut r));
+            assert_eq!(
+                run_bin(14, op_badd, 0xa0, &a, &b).unwrap(),
+                model_add(&a, &b),
+                "{a:x?} + {b:x?}"
+            );
+            match model_sub(&a, &b) {
+                Some(d) => assert_eq!(
+                    run_bin(14, op_bsub, 0xa1, &a, &b).unwrap(),
+                    d,
+                    "{a:x?} - {b:x?}"
+                ),
+                None => assert!(
+                    run_bin(14, op_bsub, 0xa1, &a, &b).is_err(),
+                    "{a:x?} - {b:x?}"
+                ),
+            }
+            let n = a.len().max(b.len());
+            let pad = |x: &[u8]| {
+                let mut v = vec![0u8; n - x.len()];
+                v.extend_from_slice(x);
+                v
+            };
+            let (pa, pb) = (pad(&a), pad(&b));
+            type Bit = (
+                u8,
+                fn(&mut AvmMachine, &Instruction) -> Result<(), AlgoError>,
+                fn(u8, u8) -> u8,
+            );
+            let ops: [Bit; 3] = [
+                (0xab, op_bbitwise_or, |x, y| x | y),
+                (0xac, op_bbitwise_and, |x, y| x & y),
+                (0xad, op_bbitwise_xor, |x, y| x ^ y),
+            ];
+            for (opcode, f, byte) in ops {
+                let want: Vec<u8> = pa.iter().zip(&pb).map(|(x, y)| byte(*x, *y)).collect();
+                assert_eq!(
+                    run_bin(14, f, opcode, &a, &b).unwrap(),
+                    want,
+                    "{opcode:#x} {a:x?} {b:x?}"
+                );
+            }
+            let mut m = machine_with_stack_at(14, vec![bytes_val(&a)]);
+            op_bbitwise_not(&mut m, &dummy_instr(0xae, Immediates::None)).unwrap();
+            let want: Vec<u8> = a.iter().map(|x| !x).collect();
+            assert_eq!(m.pop_bytes().unwrap(), want);
+        }
+    }
+
+    // go's `TestBytesModExp` panic cases and a few accept cases (`bmodexp`).
+    #[test]
+    fn bmodexp_matches_go_s_vectors() {
+        let run = |x: &[u8], y: &[u8], z: &[u8]| -> Result<Vec<u8>, String> {
+            let mut m = machine_with_stack_at(14, vec![bytes_val(x), bytes_val(y), bytes_val(z)]);
+            op_bmodexp(&mut m, &dummy_instr(0x99, Immediates::None)).map_err(|e| e.to_string())?;
+            Ok(m.pop_bytes().unwrap())
+        };
+        // modulo of 0, however spelled, is an error
+        for z in [&[][..], &[0, 0][..]] {
+            assert_eq!(run(&[1], &[1], z).unwrap_err(), "AVM: modulo by zero");
+        }
+        assert_eq!(run(&[0], &[0], &[]).unwrap_err(), "AVM: modulo by zero");
+        // 0^0 is undefined, regardless of modulus and leading zeros
+        for (x, y, z) in [
+            (&[0][..], &[0][..], &[2][..]),
+            (&[0], &[0], &[1]),
+            (&[0, 0], &[0, 0], &[7]),
+        ] {
+            assert_eq!(run(x, y, z).unwrap_err(), "AVM: 0^0 is undefined");
+        }
+        assert_eq!(
+            run(&[0], &[5], &[7]).unwrap(),
+            Vec::<u8>::new(),
+            "0^5 mod 7"
+        );
+        assert_eq!(run(&[7], &[0], &[5]).unwrap(), vec![1], "7^0 mod 5");
+        assert_eq!(
+            run(&[0x54, 0xb7], &[0], &[1]).unwrap(),
+            Vec::<u8>::new(),
+            "x^0 mod 1"
+        );
+        assert_eq!(run(&[2], &[0x0b], &[0x0d]).unwrap(), vec![7], "2^11 mod 13");
+        assert_eq!(run(&[1, 2], &[3], &[7]).unwrap(), vec![6], "258^3 mod 7");
+        assert_eq!(
+            run(&[2], &[1, 0, 0, 0, 0, 0, 0, 0, 0], &[0x0d]).unwrap(),
+            vec![3]
+        );
     }
 
     #[test]

@@ -465,12 +465,10 @@ impl AvmMachine {
         // (e.g. `app_box_*` at 0xd4) charges its actual sub-opcode's own
         // declared cost, not the synthetic prefix-family stub's -- see
         // issue #698.
-        if let Some(spec) = self.resolve_cost_spec(instr.opcode, instr.sub_opcode) {
-            if let CostKind::Static(cost) = opcode::effective_cost(spec, self.version) {
-                self.charge_cost(cost)?;
-            }
-            // Dynamic cost is charged by the handler.
+        if let Some(cost) = self.instruction_cost(instr) {
+            self.charge_cost(cost)?;
         }
+        // Other dynamic costs are charged by the handler.
 
         // Dispatch to opcode handler.
         ops::dispatch(self, instr, ctx)?;
@@ -587,19 +585,17 @@ impl AvmMachine {
         // (e.g. `app_box_*` at 0xd4) charges its actual sub-opcode's own
         // declared cost, not the synthetic prefix-family stub's -- see
         // issue #698.
-        if let Some(spec) = self.resolve_cost_spec(instr.opcode, instr.sub_opcode) {
-            if let CostKind::Static(cost) = opcode::effective_cost(spec, self.version) {
-                if let Err(e) = self.charge_cost(cost) {
-                    let msg = e.to_string();
-                    tracer.after_opcode(
-                        old_byte_pc,
-                        instr.opcode,
-                        &self.stack,
-                        &self.scratch,
-                        Some(&msg),
-                    );
-                    return Err(e);
-                }
+        if let Some(cost) = self.instruction_cost(instr) {
+            if let Err(e) = self.charge_cost(cost) {
+                let msg = e.to_string();
+                tracer.after_opcode(
+                    old_byte_pc,
+                    instr.opcode,
+                    &self.stack,
+                    &self.scratch,
+                    Some(&msg),
+                );
+                return Err(e);
             }
         }
 
@@ -758,6 +754,24 @@ impl AvmMachine {
             AvmValue::Bytes(b) => Ok(b),
             AvmValue::Uint64(_) => {
                 Err(self.arg_type_error(crate::arg_gate::BYTES_NAME, crate::arg_gate::UINT64_NAME))
+            }
+        }
+    }
+
+    /// The cost to charge before `instr` runs: its static cost, or for the v14
+    /// length-costed opcodes the cost computed from the stack
+    /// ([`crate::cost14`], go's `deets.Cost(program, pc, stack)`). `None` when
+    /// the handler charges its own dynamic cost.
+    fn instruction_cost(&self, instr: &Instruction) -> Option<u64> {
+        let spec = self.resolve_cost_spec(instr.opcode, instr.sub_opcode)?;
+        match opcode::effective_cost(spec, self.version) {
+            CostKind::Static(cost) => Some(cost),
+            CostKind::Dynamic => {
+                if crate::cost14::has_dynamic_cost(instr.opcode, self.version) {
+                    crate::cost14::dynamic_cost(instr, &self.stack)
+                } else {
+                    None
+                }
             }
         }
     }

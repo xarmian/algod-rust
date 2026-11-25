@@ -409,10 +409,16 @@ mod tests {
         };
         // config 2 has no cost: go reports `non-positive cost 0`
         let e = super::static_check(&prog(2, &[0x22]), super::ExecMode::LogicSig).unwrap();
-        assert!(e.contains("falcon_verify reported non-positive cost 0"), "{e}");
+        assert!(
+            e.contains("falcon_verify reported non-positive cost 0"),
+            "{e}"
+        );
         // a known config continues the walk: a bad opcode after it is found
         let e = super::static_check(&prog(1, &[0xff]), super::ExecMode::LogicSig);
-        assert!(e.is_some(), "the walk must continue past a costed falcon_verify");
+        assert!(
+            e.is_some(),
+            "the walk must continue past a costed falcon_verify"
+        );
     }
 
     use super::*;
