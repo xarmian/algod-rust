@@ -177,15 +177,13 @@ jobs:
         run: |
           set -euo pipefail
           export GO_DRIVER="$RUNNER_TEMP/teal-corpus-go" RUST_DRIVER="$PWD/target/release/teal-corpus"
-          # Phase 26 carve-out: versions above 13 (AVM v14: falcon_verify immediate,
-          # bmodexp, mldsa_verify, full byte math) arrive with #2549; drop --max-version then.
           # go's disassembly of the synthetic byte programs, assembled by both
           # (#2368): zero mismatches, panics, timeouts.
-          python3 scripts/teal-corpus/gen_synthetic.py "$RUNNER_TEMP/syn" --sweep-versions 8 --random 5000 --max-version 13
+          python3 scripts/teal-corpus/gen_synthetic.py "$RUNNER_TEMP/syn" --sweep-versions 8 --random 5000
           bash scripts/teal-corpus/run_drivers.sh "$RUNNER_TEMP/syn" "$RUNNER_TEMP/synre" reassemble
           # Typed pushes before every opcode and random stack/frame/branch
           # programs: the assembler's static type tracking against go's.
-          python3 scripts/teal-corpus/gen_synthetic_asm.py "$RUNNER_TEMP/synasm" --random 20000 --versions 8,13
+          python3 scripts/teal-corpus/gen_synthetic_asm.py "$RUNNER_TEMP/synasm" --random 20000 --versions 8,13,14
           bash scripts/teal-corpus/run_drivers.sh "$RUNNER_TEMP/synasm" "$RUNNER_TEMP/synasmout" assemble
 
       - name: Assembly error-shaping parity on a synthetic adversarial corpus
@@ -208,7 +206,7 @@ jobs:
           export GO_DRIVER="$RUNNER_TEMP/teal-corpus-go" RUST_DRIVER="$PWD/target/release/teal-corpus"
           # Every opcode byte at every version, every immediate byte value (at
           # v8), random and truncated programs: zero mismatches, panics, timeouts.
-          python3 scripts/teal-corpus/gen_synthetic.py "$RUNNER_TEMP/syn" --sweep-versions 8 --random 5000 --max-version 13
+          python3 scripts/teal-corpus/gen_synthetic.py "$RUNNER_TEMP/syn" --sweep-versions 8 --random 5000
           bash scripts/teal-corpus/run_drivers.sh "$RUNNER_TEMP/syn" "$RUNNER_TEMP/synout" disassemble
 
   goal-clerk-compile-parity:
