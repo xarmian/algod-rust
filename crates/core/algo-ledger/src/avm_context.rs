@@ -205,7 +205,10 @@ impl InnerTxnBuilder {
     fn validate_field_type(field: u8, value: &TealValue, version: u8) -> Result<(), AlgoError> {
         fn not_a_uint64(b: &[u8]) -> AlgoError {
             AlgoError::Avm {
-                message: format!("{} is not a uint64", algo_avm::limited_bytes::limited_bytes(b)),
+                message: format!(
+                    "{} is not a uint64",
+                    algo_avm::limited_bytes::limited_bytes(b)
+                ),
             }
         }
         fn not_an_address() -> AlgoError {
@@ -4944,11 +4947,30 @@ fn execute_inner_appl<L: LedgerStore>(
     // (eval.go:5751 appends each inner txn with its own ApplyData). Reuses the
     // same encoder as the outer txn (TASK-280); nested `itx[*].dt` are already
     // populated on each child stxn, so the recursion composes. (TASK-281)
-    let dt = crate::eval_delta::encode_eval_delta(
-        &avm_result,
-        &stxn.txn,
-        consensus.no_empty_local_deltas,
-    );
+    //
+    // A ClearState program that rejected or errored (go swallows both; the
+    // call never fails the caller): go's `ledger/apply/application.go` only sets
+    // `ad.EvalDelta` when it passed. An inner call's `ad` is the ApplyData the
+    // program wrote its EvalDelta into as it ran, so before
+    // `DiscardFailedInnerClearStateDelta` (v5.1, vFuture) the partial delta
+    // (logs, global/local changes) stays; with it the delta is emptied.
+    let failed_clear_state = on_completion == ON_COMPLETION_CLEAR_STATE && !avm_result.approved;
+    let dt = if failed_clear_state && consensus.discard_failed_inner_clear_state_delta {
+        None
+    } else if failed_clear_state {
+        let mut partial = avm_result.clone();
+        partial.global_delta = inner_ctx.take_global_delta();
+        partial.local_deltas = inner_ctx.take_local_deltas();
+        partial.local_delta_order = inner_ctx.take_local_delta_order();
+        partial.logs = inner_ctx.take_logs();
+        crate::eval_delta::encode_eval_delta(&partial, &stxn.txn, consensus.no_empty_local_deltas)
+    } else {
+        crate::eval_delta::encode_eval_delta(
+            &avm_result,
+            &stxn.txn,
+            consensus.no_empty_local_deltas,
+        )
+    };
     stxn.eval_delta = dt;
 
     // ── Apply OnCompletion side effects (post-program) ──
@@ -15987,6 +16009,139 @@ mod tests {
         );
         // Local state should be removed.
         assert!(!store.has_app_local_state(&app42_addr, 100));
+    }
+
+    // ---- Issue #2545: DiscardFailedInnerClearStateDelta (go v5.1) ----
+
+    /// Submit an inner ClearState call (app 100 opted in) whose clear program
+    /// is `clear_src`, and return the inner txn's `eval_delta` as recorded.
+    fn inner_clearstate_eval_delta(clear_src: &str, discard: bool) -> Option<rmpv::Value> {
+        let clear = algo_avm::assemble_string(clear_src)
+            .expect("assembles")
+            .program;
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        let app42_addr = Address(app_address(42));
+        store.set_app_params(
+            100,
+            AppParams {
+                creator: Address([1u8; 32]),
+                approval_program: make_program(6, true),
+                clear_state_program: clear,
+                local_state_schema: StateSchema {
+                    num_uint: 2,
+                    num_byte_slice: 5,
+                },
+                global_state_schema: StateSchema {
+                    num_uint: 4,
+                    num_byte_slice: 4,
+                },
+                ..Default::default()
+            },
+        );
+        store.set_app_local_state(
+            &app42_addr,
+            100,
+            AppLocalState {
+                schema: StateSchema {
+                    num_uint: 2,
+                    num_byte_slice: 5,
+                },
+                key_value: BTreeMap::new(),
+            },
+        );
+        store.set_account(
+            &app42_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                total_apps_opted_in: 1,
+                ..Default::default()
+            },
+        );
+        let txn = make_appl_txn([10u8; 32], 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+        ctx.consensus.discard_failed_inner_clear_state_delta = discard;
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // TypeEnum = appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // ApplicationID
+        ctx.itxn_field(25, TealValue::Uint(3)).unwrap(); // OnCompletion = ClearState
+        ctx.itxn_submit()
+            .expect("a ClearState rejection never fails the caller");
+        ctx.inner_txns()[0][0].eval_delta.clone()
+    }
+
+    const LOGS_THEN_REJECTS: &str = "#pragma version 6
+byte \"hello\"
+log
+int 0
+return";
+    const LOGS_THEN_ERRORS: &str = "#pragma version 6
+byte \"hello\"
+log
+err";
+    const LOGS_THEN_APPROVES: &str = "#pragma version 6
+byte \"hello\"
+log
+int 1
+return";
+
+    const WRITES_STATE_THEN_REJECTS: &str = "#pragma version 6
+        byte \"gk\"
+int 7
+app_global_put
+        txn Sender
+byte \"lk\"
+byte \"lv\"
+app_local_put
+        byte \"hello\"
+log
+int 0
+return";
+
+    fn dt_keys(dt: &rmpv::Value) -> Vec<String> {
+        let mut k: Vec<String> = dt
+            .as_map()
+            .expect("dt is a map")
+            .iter()
+            .map(|(k, _)| k.as_str().unwrap().to_string())
+            .collect();
+        k.sort();
+        k
+    }
+
+    #[test]
+    fn inner_clearstate_reject_keeps_state_deltas_and_logs_before_the_param() {
+        // go (pre-v5.1): the rejected program's `ad.EvalDelta` keeps what it wrote
+        // as it ran: global delta, local delta and logs.
+        let dt = inner_clearstate_eval_delta(WRITES_STATE_THEN_REJECTS, false)
+            .expect("partial delta kept");
+        assert_eq!(dt_keys(&dt), ["gd", "ld", "lg"]);
+        assert_eq!(
+            inner_clearstate_eval_delta(WRITES_STATE_THEN_REJECTS, true),
+            None
+        );
+    }
+
+    #[test]
+    fn inner_clearstate_reject_keeps_its_delta_before_the_param() {
+        // pre-v5.1 behaviour (param off): the rejected program's logs stay.
+        let dt = inner_clearstate_eval_delta(LOGS_THEN_REJECTS, false);
+        assert!(dt.is_some(), "param off keeps the partial delta");
+    }
+
+    #[test]
+    fn inner_clearstate_reject_or_error_discards_its_delta_with_the_param() {
+        // go v5.1 `DiscardFailedInnerClearStateDelta`: `ad.EvalDelta` is emptied
+        // when the inner ClearState program rejects or errors.
+        assert_eq!(inner_clearstate_eval_delta(LOGS_THEN_REJECTS, true), None);
+        assert_eq!(inner_clearstate_eval_delta(LOGS_THEN_ERRORS, true), None);
+    }
+
+    #[test]
+    fn inner_clearstate_approval_keeps_its_delta_with_the_param() {
+        assert!(inner_clearstate_eval_delta(LOGS_THEN_APPROVES, true).is_some());
     }
 
     // ---- P1: Preserve txn_counter across sibling inner txns ----
