@@ -2216,7 +2216,7 @@ impl SimpleBlockEvaluator {
         // payload). A failure is a `TxGroupError` with the not-well-formed
         // reason, returned bare (issue #2196). The gossip test stage does not
         // run it (go's `TestTransactionGroup` does not).
-        algo_validate::check_txn_group(txgroup)
+        algo_validate::check_txn_group(txgroup, params.allow_grouped_heartbeats)
             .map_err(|e| Self::verify_rejection(algo_error::VerifyKind::NotWell, None, e))?;
 
         // 3. Group ID consistency. This is fresh-submission (pool-admission)
