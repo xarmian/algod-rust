@@ -988,6 +988,21 @@ fn evaluate_logicsig_program(
         });
     }
 
+    // go v5.1 `evalSigProgram`: with `RequireLogicSigArgAccess` a LogicSig that
+    // approved must also have read every argument it carries (nothing above the
+    // highest index read, nothing unread below it unless empty).
+    if consensus.require_logic_sig_arg_access {
+        if let Some(i) = ctx.unaccounted_arg() {
+            return Err(AlgoError::Validation {
+                message: format!(
+                    "transaction {}: LogicSig arg[{i}] of {} was not accessed",
+                    algo_codec::compute_txn_id(&group[group_index].txn),
+                    lsig.arg_bytes().count()
+                ),
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -4823,6 +4838,174 @@ mod tests {
             verify_logicsig(&stx, &lsig, &group, 0, &mut budget, &consensus).is_ok(),
             "args exactly at both limits must be accepted"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #2548: `RequireLogicSigArgAccess` -- a LogicSig may carry no
+    // argument it did not read. Ported from go's `TestLogicSigArgAccess`
+    // table (`data/transactions/verify/txn_test.go`) and `TestUnaccountedArg`
+    // (`data/transactions/logic/eval_test.go`).
+    // ------------------------------------------------------------------
+
+    /// Verify a contract-account LogicSig running `source` with `args`
+    /// (`None` is a nil arg) under `consensus`.
+    fn verify_args(
+        source: &str,
+        args: &[Option<&[u8]>],
+        consensus: &ConsensusParams,
+    ) -> Result<(), AlgoError> {
+        let program = algo_avm::assemble_string(source).expect("assembles").program;
+        let lsig = LogicSig {
+            logic: ByteBuf::from(program.clone()),
+            args: Some(
+                args.iter()
+                    .map(|a| a.map(|b| ByteBuf::from(b.to_vec())))
+                    .collect(),
+            ),
+            ..LogicSig::default()
+        };
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(hash_program(&program)),
+            lsig: Some(lsig.clone()),
+            ..Default::default()
+        };
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        verify_logicsig(&stx, &lsig, &group, 0, &mut budget, consensus)
+    }
+
+    fn arg_access_consensus(required: bool) -> ConsensusParams {
+        ConsensusParams {
+            require_logic_sig_arg_access: required,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn logicsig_arg_access_table_matches_go() {
+        let x: &[u8] = b"x";
+        let junk: &[u8] = b"junk";
+        // (name, args, bad): the program reads arg 0 and arg 2.
+        type Args<'a> = Vec<Option<&'a [u8]>>;
+        let cases: [(&str, Args, bool); 5] = [
+            ("exactly what is read", vec![Some(x), None, Some(x)], false),
+            ("empty hole below the mark", vec![Some(x), Some(b""), Some(x)], false),
+            ("filled hole below the mark", vec![Some(x), Some(junk), Some(x)], true),
+            ("junk appended", vec![Some(x), None, Some(x), Some(junk)], true),
+            ("empty appended", vec![Some(x), None, Some(x), Some(b"")], true),
+        ];
+        for (name, args, bad) in cases {
+            let src = "#pragma version 2
+arg 0
+arg 2
+==";
+            // without the consensus rule every shape is accepted
+            verify_args(src, &args, &arg_access_consensus(false))
+                .unwrap_or_else(|e| panic!("{name}: permissive must accept, got {e}"));
+            let strict = verify_args(src, &args, &arg_access_consensus(true));
+            if bad {
+                let e = strict.expect_err(name).to_string();
+                assert!(e.contains("was not accessed"), "{name}: {e}");
+            } else {
+                strict.unwrap_or_else(|e| panic!("{name}: strict must accept, got {e}"));
+            }
+        }
+    }
+
+    #[test]
+    fn logicsig_arg_access_error_text_matches_go() {
+        // go: `transaction <txid>: LogicSig arg[%d] of %d was not accessed`
+        let e = verify_args(
+            "#pragma version 2
+arg 0
+len
+int 1
+==",
+            &[Some(b"a"), Some(b"b")],
+            &arg_access_consensus(true),
+        )
+        .expect_err("unread arg 1")
+        .to_string();
+        let e = e.strip_prefix("validation error: ").unwrap_or(&e);
+        assert!(e.starts_with("transaction "), "{e}");
+        assert!(e.ends_with(": LogicSig arg[1] of 2 was not accessed"), "{e}");
+    }
+
+    #[test]
+    fn logicsig_arg_access_rule_is_checked_after_approval_only() {
+        // A rejecting program is "rejected by logic" whatever its args are:
+        // the access check runs only on a pass (go's `evalSigProgram`).
+        let e = verify_args(
+            "#pragma version 2
+int 0",
+            &[Some(b"unread")],
+            &arg_access_consensus(true),
+        )
+        .expect_err("rejects")
+        .to_string();
+        assert!(e.contains("rejected by logic"), "{e}");
+    }
+
+    /// go's `makeSaltedLogicSigTxn`: an `ls`-scheme proof carrying `source`
+    /// and `args` in its SaltedKeySig, authorized from the salted address.
+    fn salted_logicsig_txn(source: &str, args: &[&[u8]]) -> SignedTransaction {
+        let program = algo_avm::assemble_string(source).expect("assembles").program;
+        let (salt, addr) =
+            algo_types::canonical_address_salt(algo_types::SIG_SCHEME_LOGIC_SIG, &program)
+                .expect("canonical salt");
+        let args: Vec<Option<Vec<u8>>> = args.iter().map(|a| Some(a.to_vec())).collect();
+        SignedTransaction {
+            txn: minimal_pay_txn(addr),
+            pqsig: Some(SaltedKeySig {
+                scheme: algo_types::SIG_SCHEME_LOGIC_SIG,
+                salt,
+                public_key: ByteBuf::from(program),
+                signature: ByteBuf::from(algo_codec::encode_logic_sig_args(&args)),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn ls_consensus(require_arg_access: bool) -> ConsensusParams {
+        ConsensusParams {
+            enable_sig_scheme_logic_sig: true,
+            require_logic_sig_arg_access: require_arg_access,
+            ..Default::default()
+        }
+    }
+
+    fn verify_ls(stx: &SignedTransaction, consensus: &ConsensusParams) -> Result<(), AlgoError> {
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        verify_transaction_signature(stx, &group, 0, &mut budget, consensus)
+    }
+
+    #[test]
+    fn ls_scheme_arg_access_rule_applies_and_is_gated() {
+        // go's `TestTxnValidationLogicSigSaltedKeySig` / `...ArgAccessGating`.
+        let src = "#pragma version 2
+arg 0
+byte \"open\"
+==";
+        let ok = salted_logicsig_txn(src, &[b"open"]);
+        verify_ls(&ok, &ls_consensus(true)).expect("reads its one arg");
+
+        let padded = salted_logicsig_txn(src, &[b"open", b"junk"]);
+        let e = verify_ls(&padded, &ls_consensus(true)).expect_err("padded").to_string();
+        assert!(e.contains("arg[1] of 2 was not accessed"), "{e}");
+        // a version that enabled ls without the rule lets its args be padded
+        verify_ls(&padded, &ls_consensus(false)).expect("rule off");
+
+        // an unread arg below the highest one read must be empty
+        let src2 = "#pragma version 2
+arg 1
+byte \"open\"
+==";
+        let skips = salted_logicsig_txn(src2, &[b"", b"open"]);
+        verify_ls(&skips, &ls_consensus(true)).expect("empty hole");
+        let filled = salted_logicsig_txn(src2, &[b"junk", b"open"]);
+        let e = verify_ls(&filled, &ls_consensus(true)).expect_err("filled").to_string();
+        assert!(e.contains("arg[0] of 2 was not accessed"), "{e}");
     }
 
     // ------------------------------------------------------------------

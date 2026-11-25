@@ -479,8 +479,8 @@ Inserted by `scripts/phase17_parity_delta.py repin`. Replace each row's status w
 | [TestMLDSAVerifyInputs](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/data/transactions/logic/crypto_test.go#L1400) | — | unclassified | new in `v5.1.1-stable` |
 | [TestMLDSAVerifyVectors](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/data/transactions/logic/crypto_test.go#L1461) | — | unclassified | new in `v5.1.1-stable` |
 | [TestMLDSAFIPS140v1](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/data/transactions/logic/crypto_test.go#L1524) | — | unclassified | new in `v5.1.1-stable` |
-| [TestUnaccountedArg](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/data/transactions/logic/eval_test.go#L299) | — | unclassified | new in `v5.1.1-stable` |
-| [TestUnaccountedArgFailedRead](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/data/transactions/logic/eval_test.go#L382) | — | unclassified | new in `v5.1.1-stable` |
+| [TestUnaccountedArg](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/data/transactions/logic/eval_test.go#L299) | [unaccounted_arg_table_matches_go](../../crates/core/algo-avm/src/logicsig_context.rs#L1050) | matched-1:1 | same table at the context level; the 255-arg row reads the top mask word |
+| [TestUnaccountedArgFailedRead](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/data/transactions/logic/eval_test.go#L382) | [failed_arg_read_does_not_mark_the_index](../../crates/core/algo-avm/src/logicsig_context.rs#L1067) | matched-1:1 | also pins go's `cannot load arg[N] from M args` text (#2548) |
 | [TestEvalSignatureProgramArgs](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/data/transactions/logic/eval_test.go#L630) | — | unclassified | new in `v5.1.1-stable` |
 | [TestRapidDivModw](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/data/transactions/logic/eval_test.go#L1024) | — | unclassified | new in `v5.1.1-stable` |
 | [TestRapidExpw](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/data/transactions/logic/eval_test.go#L1045) | — | unclassified | new in `v5.1.1-stable` |
