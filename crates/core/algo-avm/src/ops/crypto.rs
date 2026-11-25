@@ -3870,7 +3870,7 @@ mod tests {
     }
 
     /// go's `mldsaTestKey`/`mldsaTestSign`: the fixed seed `[config+1; 32]`,
-    /// deterministic signing; returns `(pk, sig, signing key's mu inputs)`.
+    /// deterministic signing; returns `(pk, sig)`.
     fn mldsa_sign(config: u8, msg: &[u8], ctx: &[u8]) -> (Vec<u8>, Vec<u8>) {
         fn go<P: ml_dsa::MlDsaParams>(seed: u8, msg: &[u8], ctx: &[u8]) -> (Vec<u8>, Vec<u8>) {
             use ml_dsa::{signature::Keypair, KeyExport, SigningKey};
