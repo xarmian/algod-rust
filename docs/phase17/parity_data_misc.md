@@ -305,7 +305,7 @@ Inserted by `scripts/phase17_parity_delta.py repin`. Replace each row's status w
 | [TestCanonicalAddressSalt](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/data/basics/salted_address_test.go#L270) | — | unclassified | new in `v5.1.1-stable` |
 | [TestLogicSigSaltedAddress](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/data/basics/salted_address_test.go#L317) | — | unclassified | new in `v5.1.1-stable` |
 | [TestCanonicalAddressSaltDoesNotRequireRegisteredSchemeOrValidatedKey](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/data/basics/salted_address_test.go#L367) | — | unclassified | new in `v5.1.1-stable` |
-| [TestSeedFormatsAsHex](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/data/committee/encoding_test.go#L37) | — | unclassified | new in `v5.1.1-stable` |
+| [TestSeedFormatsAsHex](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/data/committee/encoding_test.go#L37) | | out-of-scope | go `fmt` of `committee.Seed` as hex; no Rust `Display` for the seed type (see TestByteTypesFormatAsHex, #2564) |
 | [TestStatusCacheRoundTrip](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/data/pools/statusCache_test.go#L173) | — | unclassified | new in `v5.1.1-stable` |
 | [TestPoolBlockGeneration](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/data/pools/transactionPool_generation_test.go#L77) | — | unclassified | new in `v5.1.1-stable` |
 | [TestPoolParticipationChanges](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/data/pools/transactionPool_generation_test.go#L156) | — | unclassified | new in `v5.1.1-stable` |
