@@ -1649,9 +1649,8 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // incomplete group (`GroupIndex: -1`) the request error. go's
         // texts, unprefixed.
         if let Some(first) = verify_group.first() {
-            let mut ids =
-                algo_validate::GroupIdChecker::new(&first.txn, verify_group.len())
-                    .rejecting_duplicates();
+            let mut ids = algo_validate::GroupIdChecker::new(&first.txn, verify_group.len())
+                .rejecting_duplicates();
             for (i, stx) in verify_group.iter().enumerate() {
                 if let Err(message) = ids.check_member(i, &stx.txn) {
                     return Ok(CheckOutcome::RecoverableFailure {
@@ -1808,9 +1807,16 @@ fn txn_has_no_signature(stx: &SignedTransaction) -> bool {
 /// Matches go-algorand's `isPlaceholderPQSig` (`ledger/simulation/
 /// simulator.go`, issue #835) -- used for fee/budget-estimation simulation
 /// without a real Falcon-1024 signature.
+///
+/// go v5.1: an `ls`-scheme SaltedKeySig is never a placeholder. Empty signature
+/// bytes there mean a program that takes no arguments, which is a complete
+/// authorization: the program must be evaluated and traced, not swapped for a
+/// proxy signature.
 fn is_placeholder_pqsig(stx: &SignedTransaction) -> bool {
     match &stx.pqsig {
-        Some(pq) if !pq.blank() && pq.signature.is_empty() => !stx.has_non_pq_signature(),
+        Some(pq) if !pq.blank() && pq.signature.is_empty() && pq.scheme != algo_types::SIG_SCHEME_LOGIC_SIG => {
+            !stx.has_non_pq_signature()
+        }
         _ => false,
     }
 }
@@ -1834,7 +1840,12 @@ fn is_placeholder_delegated_pqsig(stx: &SignedTransaction) -> bool {
                 && lsig.msig.as_ref().is_none_or(|m| m.blank())
                 && lsig.lmsig.as_ref().is_none_or(|m| m.blank()) =>
         {
-            matches!(&lsig.pqsig, Some(pq) if !pq.blank() && pq.signature.is_empty())
+            // go v5.1: an `ls`-scheme nested SaltedKeySig is never a placeholder:
+            // a salted LogicSig account authorizes only by evaluating its own
+            // program, so it cannot delegate to another program, and treating it
+            // as a placeholder would let simulation succeed for a transaction
+            // that can never be valid.
+            matches!(&lsig.pqsig, Some(pq) if !pq.blank() && pq.signature.is_empty() && pq.scheme != algo_types::SIG_SCHEME_LOGIC_SIG)
         }
         _ => false,
     }
@@ -1875,7 +1886,10 @@ fn validate_fixed_placeholder_pq_envelopes(
                 validate_pqsig_envelope(pqsig, &authorizer, consensus).map_err(|e| {
                     (
                         i,
-                        format!("salted-key signature validation failed: {}", go_error_text(&e)),
+                        format!(
+                            "salted-key signature validation failed: {}",
+                            go_error_text(&e)
+                        ),
                     )
                 })?;
             }
