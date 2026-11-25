@@ -2387,7 +2387,10 @@ mod tests {
                 res.unwrap_or_else(|e| panic!("v{version} must not check availability: {e}"));
             } else {
                 let msg = res.unwrap_err().to_string();
-                assert!(msg.contains("unavailable Asset 626283733"), "v{version}: {msg}");
+                assert!(
+                    msg.contains("unavailable Asset 626283733"),
+                    "v{version}: {msg}"
+                );
             }
         }
     }

@@ -1054,9 +1054,17 @@ mod tests {
         assert_eq!(unaccounted(&[b"a", b"b"], &[0]), Some(1), "unread above");
         assert_eq!(unaccounted(&[b"a", b""], &[0]), Some(1), "empty above");
         assert_eq!(unaccounted(&[b"", b"", x], &[2]), None, "empty holes below");
-        assert_eq!(unaccounted(&[b"j", b"", x], &[2]), Some(0), "filled hole below");
+        assert_eq!(
+            unaccounted(&[b"j", b"", x], &[2]),
+            Some(0),
+            "filled hole below"
+        );
         assert_eq!(unaccounted(&[b""], &[0]), None, "empty arg read");
-        assert_eq!(unaccounted(&[b"x", b"y"], &[0, 0]), Some(1), "same arg twice");
+        assert_eq!(
+            unaccounted(&[b"x", b"y"], &[0, 0]),
+            Some(1),
+            "same arg twice"
+        );
         // 255 args reads the top word of the mask
         let many = vec![&b""[..]; 255];
         let all: Vec<usize> = (0..255).collect();
@@ -1066,10 +1074,15 @@ mod tests {
     #[test]
     fn failed_arg_read_does_not_mark_the_index() {
         let group = vec![make_pay_stxn([0x10; 32])];
-        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![b"x".to_vec()], ConsensusParams::default());
+        let ctx = LogicSigAvmContext::new(
+            &group,
+            0,
+            &[0x01],
+            vec![b"x".to_vec()],
+            ConsensusParams::default(),
+        );
         let e = ctx.arg(1).expect_err("out of range").to_string();
         assert!(e.contains("cannot load arg[1] from 1 args"), "{e}");
         assert_eq!(ctx.unaccounted_arg(), Some(0), "arg 0 was never read");
     }
-
 }

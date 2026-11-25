@@ -78,7 +78,8 @@ use algo_codec::canonical_encode_transaction;
 use algo_error::AlgoError;
 use algo_types::consensus::ConsensusParams;
 use algo_types::{
-    Address, HeartbeatProof, LogicSig, MultisigSig, SKsigDelegatedProgram, SaltedKeySig, SignedTransaction,
+    Address, HeartbeatProof, LogicSig, MultisigSig, SKsigDelegatedProgram, SaltedKeySig,
+    SignedTransaction,
 };
 use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
 use curve25519_dalek::scalar::Scalar;
@@ -434,9 +435,8 @@ fn verify_sksig_bytes(
     if sksig.signature.is_empty() {
         return Err(prep("salted-key signature is empty"));
     }
-    let falcon = |r: Result<(), algo_consensus_crypto::SigVerifyError>| {
-        r.map_err(|e| prep(&e.to_string()))
-    };
+    let falcon =
+        |r: Result<(), algo_consensus_crypto::SigVerifyError>| r.map_err(|e| prep(&e.to_string()));
     match scheme {
         SigScheme::Falcon1024 => falcon(algo_consensus_crypto::verify_falcon1024(
             message,
@@ -465,7 +465,11 @@ fn verify_sksig_bytes(
                     g::ED25519_SIGNATURE_SIZE
                 )));
             }
-            let pk: &[u8; 32] = sksig.public_key.as_slice().try_into().expect("size checked");
+            let pk: &[u8; 32] = sksig
+                .public_key
+                .as_slice()
+                .try_into()
+                .expect("size checked");
             let sig: &[u8; 64] = sksig.signature.as_slice().try_into().expect("size checked");
             if ed25519_bv_compatible_verify(pk, message, sig) {
                 Ok(())
@@ -632,7 +636,13 @@ pub fn verify_sksig_logicsig_with_tracer(
     let lsig = sksig_logicsig_sanity_check(stx, sksig, consensus)
         .map_err(|message| AlgoError::Validation { message })?;
     evaluate_logicsig_program(
-        &lsig, group, group_index, budget, consensus, tracer, sig_ledger,
+        &lsig,
+        group,
+        group_index,
+        budget,
+        consensus,
+        tracer,
+        sig_ledger,
     )
 }
 
@@ -905,7 +915,13 @@ pub fn verify_logicsig_with_tracer(
         .map_err(|message| AlgoError::Validation { message })?;
 
     evaluate_logicsig_program(
-        lsig, group, group_index, budget, consensus, tracer, sig_ledger,
+        lsig,
+        group,
+        group_index,
+        budget,
+        consensus,
+        tracer,
+        sig_ledger,
     )
 }
 
@@ -1497,10 +1513,7 @@ pub fn logic_sig_group_size_check_indexed(
                 message: e.to_string(),
             })?;
             logic_len += carried.logic.len() as u64;
-            args_len += carried
-                .arg_bytes()
-                .map(|a| a.len() as u64)
-                .sum::<u64>();
+            args_len += carried.arg_bytes().map(|a| a.len() as u64).sum::<u64>();
         }
 
         lsig_pooled_size += logic_len + args_len;
@@ -1618,7 +1631,7 @@ mod tests {
     use algo_avm::group::GroupBudget;
     use algo_error::AvmDiagnosticValue;
     use algo_types::{
-        Address, MultisigSubsig, AddressSalt, Round, Transaction, SIG_SCHEME_FALCON1024,
+        Address, AddressSalt, MultisigSubsig, Round, Transaction, SIG_SCHEME_FALCON1024,
     };
     use ed25519_dalek::SigningKey;
     use serde_bytes::ByteBuf;
@@ -4098,7 +4111,9 @@ mod tests {
         let group = [stx.clone()];
         let mut budget = GroupBudget::for_logicsig(1);
         let err = verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus)
-            .expect_err("a SaltedKeySig must not verify against a transaction it wasn't signed over");
+            .expect_err(
+                "a SaltedKeySig must not verify against a transaction it wasn't signed over",
+            );
         assert!(
             err.to_string().contains(
                 "salted-key signature validation failed: falcon-1024 invalid signature: error code "
@@ -4854,7 +4869,9 @@ mod tests {
         args: &[Option<&[u8]>],
         consensus: &ConsensusParams,
     ) -> Result<(), AlgoError> {
-        let program = algo_avm::assemble_string(source).expect("assembles").program;
+        let program = algo_avm::assemble_string(source)
+            .expect("assembles")
+            .program;
         let lsig = LogicSig {
             logic: ByteBuf::from(program.clone()),
             args: Some(
@@ -4889,10 +4906,26 @@ mod tests {
         type Args<'a> = Vec<Option<&'a [u8]>>;
         let cases: [(&str, Args, bool); 5] = [
             ("exactly what is read", vec![Some(x), None, Some(x)], false),
-            ("empty hole below the mark", vec![Some(x), Some(b""), Some(x)], false),
-            ("filled hole below the mark", vec![Some(x), Some(junk), Some(x)], true),
-            ("junk appended", vec![Some(x), None, Some(x), Some(junk)], true),
-            ("empty appended", vec![Some(x), None, Some(x), Some(b"")], true),
+            (
+                "empty hole below the mark",
+                vec![Some(x), Some(b""), Some(x)],
+                false,
+            ),
+            (
+                "filled hole below the mark",
+                vec![Some(x), Some(junk), Some(x)],
+                true,
+            ),
+            (
+                "junk appended",
+                vec![Some(x), None, Some(x), Some(junk)],
+                true,
+            ),
+            (
+                "empty appended",
+                vec![Some(x), None, Some(x), Some(b"")],
+                true,
+            ),
         ];
         for (name, args, bad) in cases {
             let src = "#pragma version 2
@@ -4928,7 +4961,10 @@ int 1
         .to_string();
         let e = e.strip_prefix("validation error: ").unwrap_or(&e);
         assert!(e.starts_with("transaction "), "{e}");
-        assert!(e.ends_with(": LogicSig arg[1] of 2 was not accessed"), "{e}");
+        assert!(
+            e.ends_with(": LogicSig arg[1] of 2 was not accessed"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -4949,7 +4985,9 @@ int 0",
     /// go's `makeSaltedLogicSigTxn`: an `ls`-scheme proof carrying `source`
     /// and `args` in its SaltedKeySig, authorized from the salted address.
     fn salted_logicsig_txn(source: &str, args: &[&[u8]]) -> SignedTransaction {
-        let program = algo_avm::assemble_string(source).expect("assembles").program;
+        let program = algo_avm::assemble_string(source)
+            .expect("assembles")
+            .program;
         let (salt, addr) =
             algo_types::canonical_address_salt(algo_types::SIG_SCHEME_LOGIC_SIG, &program)
                 .expect("canonical salt");
@@ -4991,7 +5029,9 @@ byte \"open\"
         verify_ls(&ok, &ls_consensus(true)).expect("reads its one arg");
 
         let padded = salted_logicsig_txn(src, &[b"open", b"junk"]);
-        let e = verify_ls(&padded, &ls_consensus(true)).expect_err("padded").to_string();
+        let e = verify_ls(&padded, &ls_consensus(true))
+            .expect_err("padded")
+            .to_string();
         assert!(e.contains("arg[1] of 2 was not accessed"), "{e}");
         // a version that enabled ls without the rule lets its args be padded
         verify_ls(&padded, &ls_consensus(false)).expect("rule off");
@@ -5004,7 +5044,9 @@ byte \"open\"
         let skips = salted_logicsig_txn(src2, &[b"", b"open"]);
         verify_ls(&skips, &ls_consensus(true)).expect("empty hole");
         let filled = salted_logicsig_txn(src2, &[b"junk", b"open"]);
-        let e = verify_ls(&filled, &ls_consensus(true)).expect_err("filled").to_string();
+        let e = verify_ls(&filled, &ls_consensus(true))
+            .expect_err("filled")
+            .to_string();
         assert!(e.contains("arg[0] of 2 was not accessed"), "{e}");
     }
 

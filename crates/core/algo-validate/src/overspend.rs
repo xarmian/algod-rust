@@ -121,8 +121,8 @@ mod tests {
 
     /// The account of the live capture below: offline, 1.499 Algo, nothing else.
     fn captured_account() -> (Address, AccountData) {
-        let addr =
-            Address::from_str("E3EC3FBAHHXDCRGWFGPKDEXVJ2J4N25J7BUU4D6IAW7HNRSDOBSSJSJ4OA").unwrap();
+        let addr = Address::from_str("E3EC3FBAHHXDCRGWFGPKDEXVJ2J4N25J7BUU4D6IAW7HNRSDOBSSJSJ4OA")
+            .unwrap();
         let data = AccountData {
             micro_algos: 1_499_000,
             ..AccountData::default()
@@ -150,16 +150,24 @@ mod tests {
     #[test]
     fn a_fractional_amount_reads_like_go() {
         let (addr, data) = captured_account();
-        let got = overspend_message("E7REUMLE4CVRJ2SQN3QMNK2RHHVK365XKOIALY4LR6N2IAAC47YQ", &addr, &data, 1_499_500);
+        let got = overspend_message(
+            "E7REUMLE4CVRJ2SQN3QMNK2RHHVK365XKOIALY4LR6N2IAAC47YQ",
+            &addr,
+            &data,
+            1_499_500,
+        );
         assert!(got.ends_with(", tried to spend 1.499500A)"), "{got}");
     }
 
     #[test]
     fn an_unfunded_account_shows_zero_algos_and_the_fee_that_was_tried() {
-        let addr =
-            Address::from_str("DF7WWI7BNSCTFRVLZA4PVTK6U6E34DDWWKJAGNADTP5IWPJWRVQZRC323I").unwrap();
+        let addr = Address::from_str("DF7WWI7BNSCTFRVLZA4PVTK6U6E34DDWWKJAGNADTP5IWPJWRVQZRC323I")
+            .unwrap();
         let got = overspend_message("T", &addr, &AccountData::default(), 1);
-        assert!(got.contains("MicroAlgos:0.0A RewardsBase:0 RewardedMicroAlgos:0.0A"), "{got}");
+        assert!(
+            got.contains("MicroAlgos:0.0A RewardsBase:0 RewardedMicroAlgos:0.0A"),
+            "{got}"
+        );
         assert!(got.ends_with(", tried to spend 1uA)"), "{got}");
     }
 
@@ -189,13 +197,28 @@ mod tests {
             ..AccountData::default()
         };
         let text = format_account_data(&data);
-        assert!(text.starts_with("{AccountBaseData:{Status:Not Participating MicroAlgos:0.0A"), "{text}");
-        assert!(text.contains(&format!("AuthAddr:{}", Address([9u8; 32]).to_algorand_string())), "{text}");
+        assert!(
+            text.starts_with("{AccountBaseData:{Status:Not Participating MicroAlgos:0.0A"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "AuthAddr:{}",
+                Address([9u8; 32]).to_algorand_string()
+            )),
+            "{text}"
+        );
         assert!(text.contains("IncentiveEligible:true"), "{text}");
         assert!(text.contains("TotalExtraAppPages:1 TotalAppParams:2 TotalAppLocalStates:4 TotalAssetParams:5 TotalAssets:3 TotalBoxes:6 TotalBoxBytes:700 LastProposed:11 LastHeartbeat:12}"), "{text}");
-        assert!(text.contains(&format!("VoteID:{}", "07".repeat(32))), "{text}");
+        assert!(
+            text.contains(&format!("VoteID:{}", "07".repeat(32))),
+            "{text}"
+        );
         assert!(text.contains("SelectionID:0000"), "{text}");
-        assert!(text.contains("VoteFirstValid:10 VoteLastValid:20 VoteKeyDilution:100}}"), "{text}");
+        assert!(
+            text.contains("VoteFirstValid:10 VoteLastValid:20 VoteKeyDilution:100}}"),
+            "{text}"
+        );
         assert!(text.contains("StateProofID:0101"), "{text}");
     }
 }

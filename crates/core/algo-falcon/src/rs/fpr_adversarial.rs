@@ -139,7 +139,11 @@ fn exact_result_underflows(op: &str, ops: &[f64], native: f64) -> bool {
     let threshold = MIN * scale;
     match op {
         "mul" | "sqr" => {
-            let (x, y) = if op == "mul" { (ops[0], ops[1]) } else { (ops[0], ops[0]) };
+            let (x, y) = if op == "mul" {
+                (ops[0], ops[1])
+            } else {
+                (ops[0], ops[0])
+            };
             let xs = x * scale;
             let p = xs * y;
             if p.abs() < threshold {
@@ -152,7 +156,11 @@ fn exact_result_underflows(op: &str, ops: &[f64], native: f64) -> bool {
             false
         }
         "div" | "inv" => {
-            let (x, y) = if op == "div" { (ops[0], ops[1]) } else { (1.0, ops[0]) };
+            let (x, y) = if op == "div" {
+                (ops[0], ops[1])
+            } else {
+                (1.0, ops[0])
+            };
             let xs = x * scale;
             let q = xs / y;
             if q.abs() < threshold {
@@ -227,20 +235,41 @@ pub(super) fn both(op: &str, a: u64, b: u64) -> (u64, u64) {
     unsafe {
         match op {
             "add" => (fpr_add(x, y).to_bits(), cint::falcon_inner_fpr_add(a, b)),
-            "sub" => (fpr_sub(x, y).to_bits(), cint::shim::falcon_shim_x_fpr_sub(a, b)),
+            "sub" => (
+                fpr_sub(x, y).to_bits(),
+                cint::shim::falcon_shim_x_fpr_sub(a, b),
+            ),
             "mul" => (fpr_mul(x, y).to_bits(), cint::falcon_inner_fpr_mul(a, b)),
             "div" => (fpr_div(x, y).to_bits(), cint::falcon_inner_fpr_div(a, b)),
-            "lt" => (u64::from(fpr_lt(x, y)), cint::shim::falcon_shim_x_fpr_lt(a, b) as u64),
+            "lt" => (
+                u64::from(fpr_lt(x, y)),
+                cint::shim::falcon_shim_x_fpr_lt(a, b) as u64,
+            ),
             "inv" => (fpr_inv(x).to_bits(), cint::shim::falcon_shim_x_fpr_inv(a)),
             "sqr" => (fpr_sqr(x).to_bits(), cint::shim::falcon_shim_x_fpr_sqr(a)),
             "half" => (fpr_half(x).to_bits(), cint::shim::falcon_shim_x_fpr_half(a)),
-            "double" => (fpr_double(x).to_bits(), cint::shim::falcon_shim_x_fpr_double(a)),
+            "double" => (
+                fpr_double(x).to_bits(),
+                cint::shim::falcon_shim_x_fpr_double(a),
+            ),
             "neg" => (fpr_neg(x).to_bits(), cint::shim::falcon_shim_x_fpr_neg(a)),
             "sqrt" => (fpr_sqrt(x).to_bits(), cint::falcon_inner_fpr_sqrt(a)),
-            "rint" => (fpr_rint(x) as u64, cint::shim::falcon_shim_x_fpr_rint(a) as u64),
-            "floor" => (fpr_floor(x) as u64, cint::shim::falcon_shim_x_fpr_floor(a) as u64),
-            "trunc" => (fpr_trunc(x) as u64, cint::shim::falcon_shim_x_fpr_trunc(a) as u64),
-            "of" => (fpr_of(a as i64).to_bits(), cint::shim::falcon_shim_x_fpr_of(a as i64)),
+            "rint" => (
+                fpr_rint(x) as u64,
+                cint::shim::falcon_shim_x_fpr_rint(a) as u64,
+            ),
+            "floor" => (
+                fpr_floor(x) as u64,
+                cint::shim::falcon_shim_x_fpr_floor(a) as u64,
+            ),
+            "trunc" => (
+                fpr_trunc(x) as u64,
+                cint::shim::falcon_shim_x_fpr_trunc(a) as u64,
+            ),
+            "of" => (
+                fpr_of(a as i64).to_bits(),
+                cint::shim::falcon_shim_x_fpr_of(a as i64),
+            ),
             _ => panic!("unknown operation {op}"),
         }
     }
@@ -252,7 +281,9 @@ fn float_result(op: &str) -> bool {
 }
 
 const BINARY: [&str; 5] = ["add", "sub", "mul", "div", "lt"];
-const UNARY: [&str; 10] = ["inv", "sqr", "half", "double", "neg", "sqrt", "rint", "floor", "trunc", "of"];
+const UNARY: [&str; 10] = [
+    "inv", "sqr", "half", "double", "neg", "sqrt", "rint", "floor", "trunc", "of",
+];
 
 /// A recorded divergence: the operands and what each implementation returns.
 #[derive(Clone, Debug)]
@@ -299,7 +330,10 @@ impl Report {
             });
         }
         if entry.1.len() < 3 {
-            let operands: Vec<String> = ops.iter().map(|o| format!("{:#018x}", o.to_bits())).collect();
+            let operands: Vec<String> = ops
+                .iter()
+                .map(|o| format!("{:#018x}", o.to_bits()))
+                .collect();
             entry.1.push(format!(
                 "{op}({}) rust={native:#018x} c={emulated:#018x}",
                 operands.join(", ")
@@ -308,7 +342,11 @@ impl Report {
     }
 
     fn count(&self, class: Class) -> u64 {
-        self.found.iter().filter(|((_, c), _)| *c == class).map(|(_, (n, _))| *n).sum()
+        self.found
+            .iter()
+            .filter(|((_, c), _)| *c == class)
+            .map(|(_, (n, _))| *n)
+            .sum()
     }
 
     fn print(&self) {
@@ -444,7 +482,10 @@ fn adversarial_operands_report() {
         }
     }
     let in_domain = r.count(Class::InDomain);
-    assert_eq!(in_domain, 0, "in-domain mismatches between the Rust fpr layer and the emulated C: see report above");
+    assert_eq!(
+        in_domain, 0,
+        "in-domain mismatches between the Rust fpr layer and the emulated C: see report above"
+    );
 }
 
 /// Keygen and signing never leave the domain in which the Rust and the
@@ -457,9 +498,15 @@ fn falcon_keygen_and_signing_stay_inside_the_bit_identical_domain() {
 
     // 10 keys x 6 messages in CI; scale up by hand for a heavier measurement
     let env = |name: &str, default: u32| {
-        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
     };
-    let (seeds, messages) = (env("FALCON_DOMAIN_SEEDS", 10), env("FALCON_DOMAIN_MESSAGES", 6));
+    let (seeds, messages) = (
+        env("FALCON_DOMAIN_SEEDS", 10),
+        env("FALCON_DOMAIN_MESSAGES", 6),
+    );
     domain::reset();
     for seed in 0u32..seeds {
         let seed_bytes = [seed as u8, (seed >> 8) as u8, 7, 7, 7, 7, 7, 7];
@@ -477,11 +524,20 @@ fn falcon_keygen_and_signing_stay_inside_the_bit_identical_domain() {
     println!("== falcon domain over keygen + signing: {st:?}");
     // (counts operands and results: this only proves the layer was exercised;
     // 10 keys x 6 messages measured ~1.6 x 10^8)
-    assert!(st.ops > 10_000_000, "the run must exercise the fpr layer: {st:?}");
+    assert!(
+        st.ops > 10_000_000,
+        "the run must exercise the fpr layer: {st:?}"
+    );
     assert_eq!(st.subnormal, 0, "{st:?}");
     assert_eq!(st.nonfinite, 0, "{st:?}");
-    assert_eq!(st.div_zero_over_negative, 0, "fpr_div(0, negative) differs in the sign of zero: {st:?}");
-    assert_eq!(st.half_negative_zero, 0, "fpr_half(-0) differs in the sign of zero: {st:?}");
+    assert_eq!(
+        st.div_zero_over_negative, 0,
+        "fpr_div(0, negative) differs in the sign of zero: {st:?}"
+    );
+    assert_eq!(
+        st.half_negative_zero, 0,
+        "fpr_half(-0) differs in the sign of zero: {st:?}"
+    );
     // The smallest normal is 2^-1022 and the largest 2^1023. Keygen's big-integer
     // to floating-point conversions reach about 2^+-572 (observed), i.e. ~450
     // binades short of either limit, so neither underflow (where FPEMU flushes
@@ -490,7 +546,10 @@ fn falcon_keygen_and_signing_stay_inside_the_bit_identical_domain() {
     assert!(st.max_exp < 800, "{st:?}");
 }
 
-const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/falcon/fpr_divergences.jsonl");
+const FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/falcon/fpr_divergences.jsonl"
+);
 
 fn class_name(c: Class) -> &'static str {
     match c {
@@ -556,14 +615,20 @@ fn the_committed_fixture_is_what_the_hunt_produces() {
 
 fn hex_field(line: &str, key: &str) -> u64 {
     let pat = format!("\"{key}\":\"");
-    let start = line.find(&pat).unwrap_or_else(|| panic!("no {key} in {line}")) + pat.len();
+    let start = line
+        .find(&pat)
+        .unwrap_or_else(|| panic!("no {key} in {line}"))
+        + pat.len();
     let end = start + line[start..].find('"').unwrap();
     u64::from_str_radix(line[start..end].trim_start_matches("0x"), 16).unwrap()
 }
 
 fn str_field<'a>(line: &'a str, key: &str) -> &'a str {
     let pat = format!("\"{key}\":\"");
-    let start = line.find(&pat).unwrap_or_else(|| panic!("no {key} in {line}")) + pat.len();
+    let start = line
+        .find(&pat)
+        .unwrap_or_else(|| panic!("no {key} in {line}"))
+        + pat.len();
     let end = start + line[start..].find('"').unwrap();
     &line[start..end]
 }
@@ -586,12 +651,21 @@ fn committed_divergences_are_still_divergent_and_out_of_domain() {
         assert_eq!(c, hex_field(line, "c"), "C result changed: {line}");
         assert_ne!(rust, c, "no longer a divergence: {line}");
         let class = str_field(line, "class");
-        assert_ne!(class, "in-domain", "an in-domain divergence must be fixed, not recorded: {line}");
+        assert_ne!(
+            class, "in-domain",
+            "an in-domain divergence must be fixed, not recorded: {line}"
+        );
         classes.insert(class.to_string());
         n += 1;
     }
     assert!(n >= 50, "fixture unexpectedly small: {n}");
-    for want in ["zero-sign", "subnormal-operand", "non-finite-operand", "underflow", "overflow"] {
+    for want in [
+        "zero-sign",
+        "subnormal-operand",
+        "non-finite-operand",
+        "underflow",
+        "overflow",
+    ] {
         assert!(classes.contains(want), "fixture lacks the {want} class");
     }
 }

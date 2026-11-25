@@ -157,7 +157,10 @@ const UNEXPECTED_PATH_LENGTH: &str = "unexpected number of Merkle path elements"
 /// shorter than its depth.
 fn check_merkle_path_lengths(sp: &StateProofBody) -> Result<(), AlgoError> {
     let num_leaves = sp.reveals.as_ref().map_or(0, |r| r.len()) as u64;
-    for (name, proof) in [("SigProofs", &sp.sig_proofs), ("PartProofs", &sp.part_proofs)] {
+    for (name, proof) in [
+        ("SigProofs", &sp.sig_proofs),
+        ("PartProofs", &sp.part_proofs),
+    ] {
         let path_len = proof
             .as_ref()
             .and_then(|p| p.path.as_ref())
@@ -176,9 +179,7 @@ fn check_merkle_path_lengths(sp: &StateProofBody) -> Result<(), AlgoError> {
             .and_then(|s| s.sig.as_ref())
             .and_then(|s| s.proof.as_ref());
         let depth = proof.map_or(0, |p| p.tree_depth) as usize;
-        let path_len = proof
-            .and_then(|p| p.path.as_ref())
-            .map_or(0, |p| p.len());
+        let path_len = proof.and_then(|p| p.path.as_ref()).map_or(0, |p| p.len());
         if depth > MAX_ENCODED_TREE_DEPTH {
             return Err(err(format!(
                 "reveal {pos}: tree depth is too large: signature proof TreeDepth {depth}, maximum {MAX_ENCODED_TREE_DEPTH}"

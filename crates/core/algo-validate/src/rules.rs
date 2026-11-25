@@ -2974,10 +2974,15 @@ mod tests {
         let signed: Vec<_> = grouped.into_iter().map(wrap_signed).collect();
         let want = "validation error: transactionGroup: duplicate transaction: [2] repeats [0]";
         assert_eq!(
-            validate_transaction_group_strict(&signed).unwrap_err().to_string(),
+            validate_transaction_group_strict(&signed)
+                .unwrap_err()
+                .to_string(),
             want
         );
-        assert_eq!(validate_transaction_group(&signed).unwrap_err().to_string(), want);
+        assert_eq!(
+            validate_transaction_group(&signed).unwrap_err().to_string(),
+            want
+        );
     }
 
     /// Strict mode must still accept a correctly-submitted full group.
