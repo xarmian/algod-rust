@@ -722,6 +722,27 @@ fn run_refine(
                 None,
             )
         }
+        // go's `typeMLDSAVerify`: pin the signature and public key to the
+        // parameter set's sizes and bound the context.
+        "typeMLDSAVerify" => {
+            if args.len() != 1 {
+                return Refined::default();
+            }
+            let (sig, pk) = match args[0] {
+                "MLDSA44" => (2420, 1312),
+                "MLDSA65" => (3309, 1952),
+                _ => return Refined::default(),
+            };
+            refined(
+                Some(vec![
+                    BYTES,
+                    StackType::new(Avm::Bytes, sig, sig, None),
+                    StackType::new(Avm::Bytes, pk, pk, None),
+                    StackType::new(Avm::Bytes, 0, 255, None),
+                ]),
+                None,
+            )
+        }
         "typeStore" => {
             let Some(i) = get_imm(args, 0, false) else {
                 return Refined::default();
@@ -1271,7 +1292,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Phase 26 carve-out: typeMLDSAVerify arrives with mldsa_verify (#2575, go v5.1.0-beta)"]
     fn every_refine_function_of_the_go_table_is_ported() {
         let mut p = Knowledge::new();
         for e in OPS {

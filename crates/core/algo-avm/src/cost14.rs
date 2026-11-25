@@ -40,6 +40,9 @@ pub const FULL_BYTE_MATH_VERSION: u8 = 14;
 /// for the array's length and `match` for each of its cases.
 pub const LENGTH_COST_VERSION: u8 = 14;
 
+/// go's `mldsaVersion`.
+pub const MLDSA_VERSION: u8 = 14;
+
 /// The opcodes whose cost [`dynamic_cost`] computes at `version`.
 pub fn has_dynamic_cost(opcode: u8, version: u8) -> bool {
     match opcode {
@@ -47,6 +50,8 @@ pub fn has_dynamic_cost(opcode: u8, version: u8) -> bool {
         0x54 | 0x56 | 0x5c | 0x5d | 0x8e => version >= LENGTH_COST_VERSION,
         // bitlen, bsqrt, bmodexp, b+ .. b~
         0x93 | 0x96 | 0x99 | 0xa0..=0xae => version >= FULL_BYTE_MATH_VERSION,
+        // mldsa_verify
+        0xe8 => version >= MLDSA_VERSION,
         _ => false,
     }
 }
@@ -203,6 +208,17 @@ pub fn dynamic_cost(instr: &Instruction, stack: &[AvmValue]) -> Option<u64> {
         0xa3 => mul_complexity(blen(top(0)?), blen(top(1)?)), // b*
         0xa4..=0xa9 | 0xab..=0xad => by_longest(stack, 1, 1, 32, 2), // b< .. b!=, b| b& b^
         0xae => by_length(stack, 1, 1, 32, 0),         // b~
+        0xe8 => {
+            // mldsa_verify: base by config + 5 per 64 bytes of the message
+            // (4th from the top; never the context). An unknown config has no
+            // cost entry: 0, as go's `costByField` leaves it.
+            let base = match instr.immediates {
+                Immediates::Uint8(0) => 3700,
+                Immediates::Uint8(1) => 5850,
+                _ => return Some(0),
+            };
+            base + 5 * div_ceil(blen(top(3)?), 64)
+        }
         _ => return None,
     };
     Some(cost as u64)

@@ -6880,6 +6880,73 @@ return
         }
     }
 
+    // Issue #2575: go's `TestMLDSAVerifyInputs`, assembly half.
+    #[test]
+    fn mldsa_verify_assembly_inputs_match_go() {
+        let e = asm_err(
+            "#pragma version 14
+arg 0
+arg 1
+arg 2
+arg 3
+mldsa_verify",
+        );
+        assert!(
+            e.contains("mldsa_verify expects 1 immediate argument"),
+            "{e}"
+        );
+        let e = asm_err(
+            "#pragma version 14
+arg 0
+arg 1
+arg 2
+arg 3
+mldsa_verify MLDSA87",
+        );
+        assert!(e.contains("mldsa_verify unknown field: \"MLDSA87\""), "{e}");
+        let e = asm_err(
+            "#pragma version 13
+arg 0
+arg 1
+arg 2
+arg 3
+mldsa_verify MLDSA44",
+        );
+        assert!(
+            e.contains("mldsa_verify opcode was introduced in v14"),
+            "{e}"
+        );
+        // constants of the wrong length are caught by the assembler
+        for (cfg, sig, pk) in [("MLDSA44", 2420usize, 1312usize), ("MLDSA65", 3309, 1952)] {
+            let consts = |sig: usize, pk: usize, ctx: usize| {
+                format!(
+                    "#pragma version 14
+byte 0x01
+byte 0x{}
+byte 0x{}
+byte 0x{}
+mldsa_verify {cfg}",
+                    "aa".repeat(sig),
+                    "bb".repeat(pk),
+                    "cc".repeat(ctx)
+                )
+            };
+            assemble_string(&consts(sig, pk, 255)).unwrap();
+            let e = asm_err(&consts(sig - 1, pk, 0));
+            assert!(
+                e.contains(&format!("wanted type [{sig}]byte got [{}]byte", sig - 1)),
+                "{e}"
+            );
+            let e = asm_err(&consts(sig, pk + 1, 0));
+            assert!(
+                e.contains(&format!("wanted type [{pk}]byte got [{}]byte", pk + 1)),
+                "{e}"
+            );
+            let e = asm_err(&consts(sig, pk, 256));
+            assert!(e.contains("wanted type [<=255]byte got [256]byte"), "{e}");
+        }
+    }
+
     #[test]
     fn test_assemble_match_byte_array_args() {
         let source = "#pragma version 8\npushbytess \"1\" \"2\" \"1\"\nmatch label1 label2\nlabel1:\nlabel2:\n";

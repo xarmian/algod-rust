@@ -1250,13 +1250,76 @@ pub fn op_vrf_verify(machine: &mut AvmMachine, instruction: &Instruction) -> Res
 // Falcon verify (opcode 0x85, AVM v12+)
 // ---------------------------------------------------------------------------
 
-/// `mldsa_verify` (0xe8, v14): not implemented yet (issue #2575). The program
-/// fails rather than guessing a verdict.
+/// go's `mldsaMaxContextSize`: FIPS 204 contexts are at most 255 bytes.
+const MLDSA_MAX_CONTEXT_SIZE: usize = 255;
+
+/// Pure ML-DSA verification (FIPS 204 Algorithm 3) for parameter set `P`.
+/// `pk` and `sig` already have the parameter set's sizes. A signature whose
+/// encoding does not decode simply does not verify, as in go's `mldsa.Verify`.
+fn mldsa_verify_with<P: ml_dsa::MlDsaParams>(
+    pk: &[u8],
+    sig: &[u8],
+    msg: &[u8],
+    ctx: &[u8],
+) -> bool {
+    let Ok(pk) = ml_dsa::EncodedVerifyingKey::<P>::try_from(pk) else {
+        return false;
+    };
+    let vk = ml_dsa::VerifyingKey::<P>::decode(&pk);
+    let Ok(sig) = ml_dsa::EncodedSignature::<P>::try_from(sig) else {
+        return false;
+    };
+    let Some(sig) = ml_dsa::Signature::<P>::decode(&sig) else {
+        return false;
+    };
+    vk.verify_with_context(msg, ctx, &sig)
+}
+
+/// `mldsa_verify` (0xe8, v14; go's `opMLDSAVerify`): stack `data, signature,
+/// public key, context -> bool`, with a one-byte config (`MLDSA44` = 0,
+/// `MLDSA65` = 1). Inputs of the wrong length fail the program (as in
+/// `ed25519verify_bare`) instead of pushing 0; the cost is charged by
+/// [`crate::cost14`] before this runs.
 pub fn op_mldsa_verify(
-    _machine: &mut AvmMachine,
-    _instruction: &Instruction,
+    machine: &mut AvmMachine,
+    instruction: &Instruction,
 ) -> Result<(), AlgoError> {
-    Err(avm_err("mldsa_verify is not implemented (issue #2575)"))
+    let config = get_uint8(instruction)?;
+    // (public key size, signature size) of the parameter set
+    let (pk_size, sig_size) = match config {
+        0 => (1312usize, 2420usize),
+        1 => (1952, 3309),
+        // go: `invalid mldsa config %s` (MLDSAConfig's stringer text)
+        c => return Err(avm_err(format!("invalid mldsa config MLDSAConfig({c})"))),
+    };
+    let ctx = machine.pop_bytes()?;
+    let pk = machine.pop_bytes()?;
+    let sig = machine.pop_bytes()?;
+    let msg = machine.pop_bytes()?;
+    if pk.len() != pk_size {
+        return Err(avm_err(format!(
+            "invalid public key size {} != {pk_size}",
+            pk.len()
+        )));
+    }
+    if sig.len() != sig_size {
+        return Err(avm_err(format!(
+            "invalid signature size {} != {sig_size}",
+            sig.len()
+        )));
+    }
+    if ctx.len() > MLDSA_MAX_CONTEXT_SIZE {
+        return Err(avm_err(format!(
+            "context too long {} > {MLDSA_MAX_CONTEXT_SIZE}",
+            ctx.len()
+        )));
+    }
+    let valid = if config == 0 {
+        mldsa_verify_with::<ml_dsa::MlDsa44>(&pk, &sig, &msg, &ctx)
+    } else {
+        mldsa_verify_with::<ml_dsa::MlDsa65>(&pk, &sig, &msg, &ctx)
+    };
+    machine.push(AvmValue::Uint64(valid as u64))
 }
 
 /// `falcon_verify` (opcode 0x85, AVM v12+ / consensus V41).
@@ -3791,6 +3854,290 @@ mod tests {
         code.push(0x85); // falcon_verify
         code.push(0x43); // return
         code
+    }
+
+    // ---- Issue #2575: v14 `mldsa_verify <config>` (go `opMLDSAVerify`) ----
+
+    /// `msg, sig, pk, ctx; mldsa_verify <config>; return` as raw v14 bytecode.
+    fn mldsa_code(msg: &[u8], sig: &[u8], pk: &[u8], ctx: &[u8], config: u8) -> Vec<u8> {
+        let mut code = Vec::new();
+        for arg in [msg, sig, pk, ctx] {
+            pushbytes(&mut code, arg);
+        }
+        code.extend_from_slice(&[0xe8, config]);
+        code.push(0x43);
+        code
+    }
+
+    /// go's `mldsaTestKey`/`mldsaTestSign`: the fixed seed `[config+1; 32]`,
+    /// deterministic signing; returns `(pk, sig)`.
+    fn mldsa_sign(config: u8, msg: &[u8], ctx: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        fn go<P: ml_dsa::MlDsaParams>(seed: u8, msg: &[u8], ctx: &[u8]) -> (Vec<u8>, Vec<u8>) {
+            use ml_dsa::{signature::Keypair, KeyExport, SigningKey};
+            let sk = SigningKey::<P>::from_seed(&ml_dsa::Seed::from([seed; 32]));
+            let sig = sk
+                .expanded_key()
+                .sign_deterministic(msg, ctx)
+                .expect("signs");
+            (
+                sk.verifying_key().to_bytes().to_vec(),
+                sig.encode().to_vec(),
+            )
+        }
+        if config == 0 {
+            go::<ml_dsa::MlDsa44>(1, msg, ctx)
+        } else {
+            go::<ml_dsa::MlDsa65>(2, msg, ctx)
+        }
+    }
+
+    // go's `TestMLDSAVerify`: signatures verify, and flipping a bit of any
+    // input (at the same length) fails verification, for message and context
+    // lengths at their edges.
+    #[test]
+    fn mldsa_verify_accepts_signatures_and_rejects_any_flipped_input() {
+        for config in [0u8, 1] {
+            for msg_len in [0usize, 1, 32, 4096] {
+                for ctx_len in [0usize, 1, 255] {
+                    let msg: Vec<u8> = (0..msg_len).map(|i| (i * 7 + 3) as u8).collect();
+                    let ctx: Vec<u8> = (0..ctx_len).map(|i| (i * 5 + 1) as u8).collect();
+                    let (pk, sig) = mldsa_sign(config, &msg, &ctx);
+                    let run = |m: &[u8], s: &[u8], p: &[u8], c: &[u8]| {
+                        run_prog(14, &mldsa_code(m, s, p, c, config))
+                            .expect("runs")
+                            .pass
+                    };
+                    assert!(
+                        run(&msg, &sig, &pk, &ctx),
+                        "config {config} msg {msg_len} ctx {ctx_len}"
+                    );
+                    let flip = |v: &[u8]| {
+                        let mut v = v.to_vec();
+                        if let Some(b) = v.first_mut() {
+                            *b ^= 1;
+                        }
+                        v
+                    };
+                    if !msg.is_empty() {
+                        assert!(!run(&flip(&msg), &sig, &pk, &ctx), "msg");
+                    }
+                    assert!(!run(&msg, &flip(&sig), &pk, &ctx), "sig");
+                    assert!(!run(&msg, &sig, &flip(&pk), &ctx), "pk");
+                    if !ctx.is_empty() {
+                        assert!(!run(&msg, &sig, &pk, &flip(&ctx)), "ctx");
+                    }
+                }
+            }
+        }
+    }
+
+    // go's `TestMLDSAVerifyExternalMu`: a signature made through the
+    // external-mu interface (RFC 9881), with mu computed from FIPS 204's
+    // definition, verifies against the original message and context.
+    #[test]
+    fn mldsa_verify_accepts_an_external_mu_signature() {
+        use ml_dsa::{signature::Keypair, KeyExport, SigningKey};
+        use shake::digest::{ExtendableOutput, Update, XofReader};
+        for config in [0u8, 1] {
+            let msg = b"signed by a remote signer that only sees mu";
+            let ctx = b"context";
+            let (pk, sig) = if config == 0 {
+                let sk = SigningKey::<ml_dsa::MlDsa44>::from_seed(&ml_dsa::Seed::from([1u8; 32]));
+                let pk = sk.verifying_key().to_bytes().to_vec();
+                let mu = mldsa_mu(&pk, ctx, msg);
+                (
+                    pk,
+                    sk.expanded_key()
+                        .sign_mu_deterministic(&mu.as_slice().try_into().unwrap())
+                        .encode()
+                        .to_vec(),
+                )
+            } else {
+                let sk = SigningKey::<ml_dsa::MlDsa65>::from_seed(&ml_dsa::Seed::from([2u8; 32]));
+                let pk = sk.verifying_key().to_bytes().to_vec();
+                let mu = mldsa_mu(&pk, ctx, msg);
+                (
+                    pk,
+                    sk.expanded_key()
+                        .sign_mu_deterministic(&mu.as_slice().try_into().unwrap())
+                        .encode()
+                        .to_vec(),
+                )
+            };
+            assert!(
+                run_prog(14, &mldsa_code(msg, &sig, &pk, ctx, config))
+                    .unwrap()
+                    .pass
+            );
+            // the wrong (empty) context does not verify
+            assert!(
+                !run_prog(14, &mldsa_code(msg, &sig, &pk, b"", config))
+                    .unwrap()
+                    .pass
+            );
+        }
+
+        // tr = H(pk, 64), mu = H(tr || M', 64), M' = 0 || |ctx| || ctx || M.
+        fn mldsa_mu(pk: &[u8], ctx: &[u8], msg: &[u8]) -> [u8; 64] {
+            let mut tr = [0u8; 64];
+            let mut h = shake::Shake256::default();
+            h.update(pk);
+            h.finalize_xof().read(&mut tr);
+            let mut h = shake::Shake256::default();
+            h.update(&tr);
+            h.update(&[0, ctx.len() as u8]);
+            h.update(ctx);
+            h.update(msg);
+            let mut mu = [0u8; 64];
+            h.finalize_xof().read(&mut mu);
+            mu
+        }
+    }
+
+    // go's `TestMLDSAVerifyStack`: exactly four arguments are consumed, and a
+    // budget below the cost fails *before* the verification, naming the cost.
+    #[test]
+    fn mldsa_verify_consumes_four_arguments_and_charges_before_running() {
+        let (pk, sig) = mldsa_sign(0, b"stack", b"ctx");
+        // int 7; msg; sig; pk; ctx; mldsa_verify MLDSA44; pop; return -> [7]
+        let mut code = vec![0x81, 0x07];
+        for arg in [&b"stack"[..], &sig, &pk, b"ctx"] {
+            pushbytes(&mut code, arg);
+        }
+        code.extend_from_slice(&[0xe8, 0x00, 0x48, 0x43]);
+        assert!(run_prog(14, &code).expect("runs").pass);
+
+        let raw = prog(14, &code);
+        let program = parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 3000);
+        for _ in 0..5 {
+            m.step(&mut NullContext).unwrap();
+        }
+        let e = m.step(&mut NullContext).unwrap_err().to_string();
+        // 3700 + 5 for the 5 byte message; go: `... (<cost>): local program cost was <n>`
+        assert!(
+            e.contains("executing mldsa_verify (3705): local program cost was 5"),
+            "{e}"
+        );
+    }
+
+    // go's `TestMLDSAVerifyVectors`: Wycheproof and NIST ACVP vectors
+    // (`go_mldsa_vectors.jsonl`, the 25 cases of go's testdata/mldsa_vectors.json.gz
+    // whose message fits an AVM value; sources: C2SP/wycheproof (Apache-2.0)
+    // and usnistgov/ACVP-Server). valid = verifies, invalid = well formed but
+    // pushes 0, malformed = wrong key/signature length or context over 255:
+    // the program fails.
+    #[test]
+    fn mldsa_verify_matches_go_s_wycheproof_and_acvp_vectors() {
+        let fixture = include_str!("../../tests/fixtures/go_mldsa_vectors.jsonl");
+        let mut ran = 0;
+        for line in fixture.lines().filter(|l| !l.trim().is_empty()) {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            let hexf = |k: &str| hex_decode(v[k].as_str().unwrap());
+            let config = match v["parameterSet"].as_str().unwrap() {
+                "ML-DSA-44" => 0u8,
+                "ML-DSA-65" => 1u8,
+                other => panic!("{other}"),
+            };
+            let code = mldsa_code(
+                &hexf("msg"),
+                &hexf("sig"),
+                &hexf("pk"),
+                &hexf("ctx"),
+                config,
+            );
+            let desc = format!("{} {} tcId {}", v["parameterSet"], v["source"], v["tcId"]);
+            let run = run_prog(14, &code);
+            match v["expect"].as_str().unwrap() {
+                "valid" => assert!(run.expect(&desc).pass, "{desc}"),
+                "invalid" => assert!(!run.expect(&desc).pass, "{desc}"),
+                "malformed" => assert!(run.is_err(), "{desc}"),
+                other => panic!("{other}"),
+            }
+            ran += 1;
+        }
+        assert_eq!(ran, 25);
+    }
+
+    // go's `TestMLDSAVerifyInputs`, runtime half: lengths are checked when the
+    // opcode runs, with go's texts, and an unknown config is an error.
+    #[test]
+    fn mldsa_verify_input_errors_match_go() {
+        let line = include_str!("../../tests/fixtures/go_mldsa_vectors.jsonl")
+            .lines()
+            .find(|l| l.contains("\"ML-DSA-44\"") && l.contains("\"valid\""))
+            .expect("a valid ML-DSA-44 vector");
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        let hexf = |k: &str| hex_decode(v[k].as_str().unwrap());
+        let (msg, sig, pk, ctx) = (hexf("msg"), hexf("sig"), hexf("pk"), hexf("ctx"));
+        let err = |code: Vec<u8>| run_prog(14, &code).err().expect("errors").to_string();
+        assert!(
+            run_prog(14, &mldsa_code(&msg, &sig, &pk, &ctx, 0))
+                .unwrap()
+                .pass
+        );
+        assert!(err(mldsa_code(&msg, &sig[..sig.len() - 1], &pk, &ctx, 0))
+            .contains("invalid signature size 2419 != 2420"));
+        assert!(err(mldsa_code(&msg, &sig, &pk[..pk.len() - 1], &ctx, 0))
+            .contains("invalid public key size 1311 != 1312"));
+        assert!(
+            err(mldsa_code(&msg, &sig, &pk, &[0u8; 256], 0)).contains("context too long 256 > 255")
+        );
+        // 44's key under the 65 config
+        assert!(err(mldsa_code(&msg, &sig, &pk, &ctx, 1))
+            .contains("invalid public key size 1312 != 1952"));
+        assert!(err(mldsa_code(&msg, &sig, &pk, &ctx, 2))
+            .contains("invalid mldsa config MLDSAConfig(2)"));
+    }
+
+    // go's `TestMLDSAVerifyCost`: 3700 / 5850 + 5 per 64 bytes of the message,
+    // never the context; exact whether or not the signature is valid.
+    #[test]
+    fn mldsa_verify_costs_what_go_charges() {
+        let cases = [
+            (0u8, 0usize, 3700u64),
+            (0, 1, 3705),
+            (0, 64, 3705),
+            (0, 65, 3710),
+            (0, 4096, 4020),
+            (1, 0, 5850),
+            (1, 1, 5855),
+            (1, 64, 5855),
+            (1, 65, 5860),
+            (1, 4096, 6170),
+        ];
+        for (config, msg_len, cost) in cases {
+            for ctx_len in [0usize, 255] {
+                // right-sized but garbage key/signature: pushes 0 (or errors on
+                // decode), either way the cost is charged first
+                let (sig_len, pk_len) = if config == 0 {
+                    (2420, 1312)
+                } else {
+                    (3309, 1952)
+                };
+                let code = mldsa_code(
+                    &vec![0u8; msg_len],
+                    &vec![0u8; sig_len],
+                    &vec![0u8; pk_len],
+                    &vec![0u8; ctx_len],
+                    config,
+                );
+                let raw = prog(14, &code);
+                let program = parse(&raw).unwrap();
+                let mut m = AvmMachine::new(program, ExecMode::LogicSig, 100_000);
+                // pushbytes x4, then mldsa_verify
+                for _ in 0..4 {
+                    m.step(&mut NullContext).unwrap();
+                }
+                let before = m.cost;
+                m.step(&mut NullContext).unwrap();
+                assert_eq!(
+                    m.cost - before,
+                    cost,
+                    "config {config} msg {msg_len} ctx {ctx_len}"
+                );
+            }
+        }
     }
 
     // ---- Issue #2572: v14 `falcon_verify <config>` (go `opFalconVerify`) ----

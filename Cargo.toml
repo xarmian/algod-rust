@@ -145,6 +145,8 @@ algo-txn-pipeline = { path = "crates/node/algo-txn-pipeline" }
 algo-bench = { path = "crates/tools/algo-bench" }
 algo-build-info = { path = "crates/tools/algo-build-info" }
 num-bigint = "0.5"
+# ML-DSA (FIPS 204) verification for the AVM `mldsa_verify` opcode (v14, #2575)
+ml-dsa = { version = "0.1.2", default-features = false }
 num-traits = "0.2"
 statrs = "0.19"
 
