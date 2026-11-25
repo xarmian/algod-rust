@@ -2015,6 +2015,98 @@ mod tests {
         }
     }
 
+    // ---- Issue #2544: go v5.1 `TestCheckTxnGroupIDDuplicateTxn` ----
+
+    /// go's `regroup`: stamp every member with a group ID that commits to the
+    /// members' (group-less) transaction IDs, repeats included.
+    fn regroup(group: &mut [SignedTransaction]) {
+        let hashes: Vec<algo_types::Digest> = group
+            .iter()
+            .map(|s| {
+                let mut t = s.txn.clone();
+                t.group = [0u8; 32];
+                algo_codec::compute_txn_id(&t)
+            })
+            .collect();
+        let id = algo_codec::compute_group_id_from_hashes(&hashes);
+        for s in group.iter_mut() {
+            s.txn.group = id.0;
+        }
+    }
+
+    fn pay_from(sender: u8) -> SignedTransaction {
+        SignedTransaction {
+            txn: Transaction {
+                txn_type: "pay".into(),
+                sender: Address([sender; 32]),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_transaction_may_not_appear_twice_in_a_group() {
+        let txn = pay_from(1);
+        // [A, A]: a group ID committing to both, so only the duplicate check rejects it
+        let mut dup = vec![txn.clone(), txn.clone()];
+        regroup(&mut dup);
+        let e = validate_transaction_group_strict(&dup)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("transactionGroup: duplicate transaction: [1] repeats [0]"),
+            "{e}"
+        );
+
+        // identical transactions whose LogicSigs carry different args: same txid
+        let mut args_dup = vec![txn.clone(), txn.clone()];
+        regroup(&mut args_dup);
+        let lsig = |arg: u8| algo_types::LogicSig {
+            logic: ByteBuf::from(vec![0x01]),
+            args: Some(vec![Some(ByteBuf::from(vec![arg]))]),
+            ..algo_types::LogicSig::default()
+        };
+        args_dup[0].lsig = Some(lsig(0));
+        args_dup[1].lsig = Some(lsig(1));
+        assert_eq!(
+            algo_codec::compute_txn_id(&args_dup[0].txn),
+            algo_codec::compute_txn_id(&args_dup[1].txn)
+        );
+        let e = validate_transaction_group_strict(&args_dup)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("duplicate transaction"), "{e}");
+
+        // the duplicate need not be adjacent, and the index names the later one
+        let mut spread = vec![txn.clone(), pay_from(2), txn.clone()];
+        regroup(&mut spread);
+        let e = validate_transaction_group_strict(&spread)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("duplicate transaction: [2] repeats [0]"), "{e}");
+
+        // distinct transactions still pass, as does a lone ungrouped transaction
+        let mut valid = vec![txn.clone(), pay_from(2)];
+        regroup(&mut valid);
+        validate_transaction_group_strict(&valid).unwrap();
+        validate_transaction_group_strict(&[pay_from(0)]).unwrap();
+    }
+
+    #[test]
+    fn the_gossip_test_stage_does_not_reject_a_repeat_as_a_duplicate() {
+        // go's `TestTransactionGroup` has no such rule (a repeat is found later,
+        // as `transaction already in ledger`): the checker without the
+        // `rejecting_duplicates` opt-in accepts it.
+        let mut dup = vec![pay_from(1), pay_from(1)];
+        regroup(&mut dup);
+        let mut ids = GroupIdChecker::new(&dup[0].txn, 2);
+        for (i, s) in dup.iter().enumerate() {
+            ids.check_member(i, &s.txn).unwrap();
+        }
+        ids.finish().unwrap();
+    }
+
     #[test]
     fn test_valid_transaction_passes() {
         let txn = make_valid_txn();
