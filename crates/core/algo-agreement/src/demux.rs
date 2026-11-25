@@ -761,7 +761,14 @@ impl Demux {
                 // `tokenizeMessages`). A proposal whose payset fails this
                 // screen is silently dropped — logged, but the peer is NOT
                 // disconnected, like a decode failure below.
-                if let Err(e) = algo_validate::check_payset(&compound.proposal.block.payset) {
+                if let Err(e) = algo_validate::check_payset(
+                    &compound.proposal.block.payset,
+                    // go: `config.Consensus[up.Block.CurrentProtocol].AllowGroupedHeartbeats`;
+                    // an unknown protocol is rejected later (`BlockHeader.PreCheck`).
+                    algo_types::consensus::allow_grouped_heartbeats_for_protocol(
+                        &compound.proposal.block.current_protocol,
+                    ),
+                ) {
                     warn!(
                         len = msg.data.len(),
                         prefix = %hex_prefix(&msg.data, 96),
