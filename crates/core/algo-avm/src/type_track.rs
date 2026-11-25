@@ -701,6 +701,27 @@ fn run_refine(
                 None => Refined::default(),
             }
         }
+        // go's `typeFalconVerify`: pin the public key argument to the length of
+        // the named config (restoring the assembly-time check the immediate-less
+        // `falcon_verify` had with its `b{1793}` proto).
+        "typeFalconVerify" => {
+            if args.len() != 1 {
+                return Refined::default();
+            }
+            let len = match args[0] {
+                "FalconDet1024" => 1793,
+                "FalconDet512" => 897,
+                _ => return Refined::default(),
+            };
+            refined(
+                Some(vec![
+                    BYTES,
+                    BYTES,
+                    StackType::new(Avm::Bytes, len, len, None),
+                ]),
+                None,
+            )
+        }
         "typeStore" => {
             let Some(i) = get_imm(args, 0, false) else {
                 return Refined::default();
@@ -1235,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Phase 26 carve-out: typeFalconVerify/typeMLDSAVerify arrive with AVM v14 (#2549, go v5.1.0-beta)"]
+    #[ignore = "Phase 26 carve-out: typeMLDSAVerify arrives with mldsa_verify (#2575, go v5.1.0-beta)"]
     fn every_refine_function_of_the_go_table_is_ported() {
         let mut p = Knowledge::new();
         for e in OPS {

@@ -159,7 +159,7 @@ impl Imms {
 }
 
 /// The immediates of `spec` as go's `OpDetails.Immediates` lists them.
-fn immediates_of(spec: &OpSpec) -> Imms {
+fn immediates_of(spec: &OpSpec, version: u8) -> Imms {
     let names = bytecode::uint8_immediate_names(spec.name).unwrap_or(&[]);
     let byte = |i: usize| {
         let n = names.get(i).copied().unwrap_or("?");
@@ -173,7 +173,7 @@ fn immediates_of(spec: &OpSpec) -> Imms {
         items: [byte(0), byte(1), byte(2)],
         len,
     };
-    match spec.imm {
+    match opcode::effective_imm(spec, version) {
         ImmKind::None => Imms {
             items: [Imm::Int; 3],
             len: 0,
@@ -436,7 +436,7 @@ impl<'a> Dis<'a> {
         let imms = if varint_branch {
             Imms::one(Imm::Label)
         } else {
-            immediates_of(spec)
+            immediates_of(spec, self.version)
         };
         for (idx, imm) in imms.as_slice().iter().enumerate() {
             out.push(' ');

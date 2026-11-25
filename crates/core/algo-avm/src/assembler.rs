@@ -2795,7 +2795,7 @@ fn asm_regular_named(
         return;
     }
 
-    match spec.imm {
+    match opcode::effective_imm(spec, ops.version) {
         ImmKind::None | ImmKind::Uint8 | ImmKind::Uint8Uint8 | ImmKind::Uint8Uint8Uint8 => {
             let entry = type_track::op_entry_by_name(lookup_name);
             // `itxn` with two immediates was dispatched above; `lookup_name` is
@@ -2989,6 +2989,7 @@ fn resolve_field_immediate_at(
         ("block", 0) => fields::block_field_by_name(arg),
         ("mimc", 0) => fields::mimc_config_by_name(arg),
         ("poseidon2", 0) => fields::poseidon2_config_by_name(arg),
+        ("falcon_verify", 0) => fields::falcon_config_by_name(arg),
 
         _ => None,
     }
@@ -6808,6 +6809,73 @@ return
 "
             );
             assemble_string(&source).unwrap();
+        }
+    }
+
+    // Issue #2572: go's `TestFalconVerifyNeedsImmediate` / `...ConfigMismatch`
+    // and the config round trip.
+    fn asm_err(src: &str) -> String {
+        match assemble_string(src) {
+            Ok(_) => panic!("assembled: {src}"),
+            Err(e) => e[0].to_string(),
+        }
+    }
+
+    #[test]
+    fn falcon_verify_v14_needs_an_immediate() {
+        let e = asm_err(
+            "#pragma version 14
+arg 0
+arg 1
+arg 3
+falcon_verify",
+        );
+        assert!(
+            e.contains("falcon_verify expects 1 immediate argument"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn falcon_verify_v14_config_mismatch_is_caught_at_assembly() {
+        let pk1024 = "aa".repeat(1793);
+        let pk512 = "bb".repeat(897);
+        let e = asm_err(&format!(
+            "#pragma version 14
+int 1
+int 2
+byte 0x{pk1024}
+falcon_verify FalconDet512"
+        ));
+        assert!(e.contains("wanted type [897]byte got [1793]byte"), "{e}");
+        let e = asm_err(&format!(
+            "#pragma version 14
+int 1
+int 2
+byte 0x{pk512}
+falcon_verify FalconDet1024"
+        ));
+        assert!(e.contains("wanted type [1793]byte got [897]byte"), "{e}");
+    }
+
+    #[test]
+    fn falcon_verify_v14_assembles_and_disassembles_with_the_config_name() {
+        for (name, byte) in [("FalconDet1024", 0u8), ("FalconDet512", 1u8)] {
+            let src = format!(
+                "#pragma version 14
+#pragma typetrack false
+int 1
+int 2
+int 3
+falcon_verify {name}
+return
+"
+            );
+            let ops = assemble_string(&src).unwrap();
+            let at = ops.program.iter().position(|b| *b == 0x85).unwrap();
+            assert_eq!(ops.program[at + 1], byte, "{name}");
+            let dis = crate::disassembler::disassemble(&ops.program).unwrap();
+            assert!(dis.contains(&format!("falcon_verify {name}")), "{dis}");
         }
     }
 

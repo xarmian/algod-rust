@@ -1275,9 +1275,27 @@ pub fn op_vrf_verify(machine: &mut AvmMachine, instruction: &Instruction) -> Res
 /// `crate::opcode`'s `falcon_verify` entry for the full note.
 pub fn op_falcon_verify(
     machine: &mut AvmMachine,
-    _instruction: &Instruction,
+    instruction: &Instruction,
 ) -> Result<(), AlgoError> {
     use super::falcon;
+
+    // go v5.1 `falconVerify`: v12/v13 have no immediate and mean
+    // FalconDet1024 at the table's static 1700; from v14 the immediate names
+    // the scheme and the cost (1700 / 850) is charged here.
+    let config = if machine.version >= crate::opcode::FALCON_CONFIG_VERSION {
+        let config = get_uint8(instruction)?;
+        let cost = match config {
+            0 => 1700,
+            1 => 850,
+            // go's `costByField` has no cost for an unknown field value; the
+            // eval error below is what a run reports (`invalid falcon config`)
+            _ => 1700,
+        };
+        machine.charge_cost(cost)?;
+        config
+    } else {
+        0
+    };
 
     // Pop the three arguments in reverse stack order (top first):
     // pubkey on top, then signature, then data on bottom.
@@ -1285,22 +1303,34 @@ pub fn op_falcon_verify(
     let sig = machine.pop_bytes()?;
     let data = machine.pop_bytes()?;
 
-    // Invalid pubkey size is a hard error, matching Go's opFalconVerify which
+    let want = match config {
+        0 => falcon::FALCON_DET1024_PUBKEY_SIZE,
+        1 => algo_falcon::FALCON_DET512_PUBKEY_SIZE,
+        // go: `invalid falcon config %s` (FalconConfig's stringer text)
+        c => return Err(avm_err(format!("invalid falcon config FalconConfig({c})"))),
+    };
+    // Invalid pubkey size is a hard error, matching Go's falconVerify which
     // returns fmt.Errorf("invalid public key size %d != %d", ...).
-    if pubkey.len() != falcon::FALCON_DET1024_PUBKEY_SIZE {
+    if pubkey.len() != want {
         return Err(avm_err(format!(
-            "invalid public key size {} != {}",
+            "invalid public key size {} != {want}",
             pubkey.len(),
-            falcon::FALCON_DET1024_PUBKEY_SIZE,
         )));
     }
 
     // Attempt verification. Any failure (bad sig, wrong data, bad sig size)
     // results in pushing 0, matching Go behavior where VerifyBytes error
     // maps to boolToSV(false).
-    let verified = match falcon::falcon_verify(&pubkey, &sig, &data) {
-        Ok(true) => 1u64,
-        Ok(false) | Err(_) => 0u64,
+    let verified = if config == 0 {
+        match falcon::falcon_verify(&pubkey, &sig, &data) {
+            Ok(true) => 1u64,
+            Ok(false) | Err(_) => 0u64,
+        }
+    } else {
+        match algo_falcon::falcon512_verify_code(&pubkey, &sig, &data) {
+            Ok(0) => 1u64,
+            _ => 0u64,
+        }
     };
 
     machine.push(AvmValue::Uint64(verified))
@@ -3752,6 +3782,91 @@ mod tests {
         code.push(0x85); // falcon_verify
         code.push(0x43); // return
         code
+    }
+
+    // ---- Issue #2572: v14 `falcon_verify <config>` (go `opFalconVerify`) ----
+
+    /// `data, sig, pk; falcon_verify <config>; return` as raw v14 bytecode.
+    fn falcon_verify_v14_code(data: &[u8], sig: &[u8], pk: &[u8], config: u8) -> Vec<u8> {
+        let mut code = Vec::new();
+        pushbytes(&mut code, data);
+        pushbytes(&mut code, sig);
+        pushbytes(&mut code, pk);
+        code.extend_from_slice(&[0x85, config]);
+        code.push(0x43);
+        code
+    }
+
+    fn falcon512_test_keygen_sign(msg: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let (pk, sk) = algo_falcon::falcon512_keygen(&[0u8; 32]).expect("keygen512");
+        let sig = algo_falcon::falcon512_sign(&sk, msg).expect("sign512");
+        (pk, sig)
+    }
+
+    #[test]
+    fn falcon_verify_v14_immediate_selects_the_scheme_and_its_cost() {
+        let msg = b"hello falcon config";
+        let (pk1024, sig1024, _) = falcon_test_keygen_sign(msg);
+        let (pk512, sig512) = falcon512_test_keygen_sign(msg);
+
+        // pushbytes x3 (1 each) + falcon_verify + return (1)
+        let m = run_prog(14, &falcon_verify_v14_code(msg, &sig1024, &pk1024, 0)).unwrap();
+        assert!(m.pass, "FalconDet1024 verifies");
+        assert_eq!(m.cost, 3 + 1700 + 1, "FalconDet1024 costs 1700");
+
+        let m = run_prog(14, &falcon_verify_v14_code(msg, &sig512, &pk512, 1)).unwrap();
+        assert!(m.pass, "FalconDet512 verifies");
+        assert_eq!(m.cost, 3 + 850 + 1, "FalconDet512 costs 850");
+
+        // altered data and a truncated signature push 0 (go: `err == nil`)
+        let m = run_prog(14, &falcon_verify_v14_code(b"other", &sig512, &pk512, 1)).unwrap();
+        assert!(!m.pass, "altered data fails");
+        let m = run_prog(14, &falcon_verify_v14_code(msg, &sig512[1..], &pk512, 1)).unwrap();
+        assert!(!m.pass, "short signature fails");
+    }
+
+    #[test]
+    fn falcon_verify_v14_config_mismatch_and_invalid_config_are_errors() {
+        let msg = b"m";
+        let (pk1024, sig1024, _) = falcon_test_keygen_sign(msg);
+        let (pk512, sig512) = falcon512_test_keygen_sign(msg);
+        // go: `invalid public key size %d != %d`
+        let e = run_prog(14, &falcon_verify_v14_code(msg, &sig1024, &pk1024, 1))
+            .err()
+            .expect("errors");
+        assert!(
+            e.to_string()
+                .contains("invalid public key size 1793 != 897"),
+            "{e}"
+        );
+        let e = run_prog(14, &falcon_verify_v14_code(msg, &sig512, &pk512, 0))
+            .err()
+            .expect("errors");
+        assert!(
+            e.to_string()
+                .contains("invalid public key size 897 != 1793"),
+            "{e}"
+        );
+        // go: `invalid falcon config %s` with FalconConfig's stringer text
+        let e = run_prog(14, &falcon_verify_v14_code(msg, &sig512, &pk512, 2))
+            .err()
+            .expect("errors");
+        assert!(
+            e.to_string()
+                .contains("invalid falcon config FalconConfig(2)"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn falcon_verify_before_v14_has_no_immediate_and_costs_1700() {
+        let msg = b"m";
+        let (pk, sig, _) = falcon_test_keygen_sign(msg);
+        for v in [12, 13] {
+            let m = run_prog(v, &falcon_verify_code(msg, &sig, &pk)).unwrap();
+            assert!(m.pass);
+            assert_eq!(m.cost, 3 + 1700 + 1, "v{v}");
+        }
     }
 
     #[test]

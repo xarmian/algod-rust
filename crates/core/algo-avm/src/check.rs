@@ -240,7 +240,7 @@ pub fn static_check(program: &[u8], mode: ExecMode) -> Option<String> {
         let size = if varint_branch {
             None
         } else {
-            match spec.imm {
+            match opcode::effective_imm(spec, version) {
                 ImmKind::None => Some(1),
                 ImmKind::Uint8 => Some(2),
                 ImmKind::Uint8Uint8 | ImmKind::Int16 => Some(3),
@@ -253,7 +253,9 @@ pub fn static_check(program: &[u8], mode: ExecMode) -> Option<String> {
             if size > 1 && pc + size > len {
                 return fail(pc, "program ends without immediate value(s)".to_string());
             }
-            if COST_BY_IMMEDIATE.contains(&op) {
+            if COST_BY_IMMEDIATE.contains(&op)
+                || (op == 0x85 && version >= opcode::FALCON_CONFIG_VERSION)
+            {
                 return None;
             }
             if spec.imm == ImmKind::Int16 {
