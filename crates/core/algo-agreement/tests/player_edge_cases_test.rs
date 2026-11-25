@@ -1679,3 +1679,86 @@ fn player_ff_soft_threshold_late_payload_cert() {
         "player did not remain fast forwarded to new period"
     );
 }
+
+fn has_action_type(machine: &IoAutomataConcretePlayer, t: ActionType) -> bool {
+    machine.trace().contains_action_fn(|a| a.action_type() == t)
+}
+
+// ---------------------------------------------------------------------------
+// go v5.1 `TestPlayerIgnoresStaleCertBundle` (`player_test.go`, issue #2552): a
+// cert bundle two or more periods behind the player is filtered like any other
+// bundle, per the spec bundle relay rule, and never reaches the vote trackers.
+// ---------------------------------------------------------------------------
+#[test]
+fn player_ignores_stale_cert_bundle() {
+    let r = Round(209);
+    let p = algo_agreement::Period(4);
+    let params = test_params();
+    for bundle_period in [0u64, 2] {
+        for t in [EventType::BundlePresent, EventType::BundleVerified] {
+            let (_player, mut machine, mut helper) = setup_p(r, p, SOFT, &params);
+            let pv = algo_agreement::test_support::make_random_proposal_payload(r)
+                .unauthenticated_proposal
+                .value();
+            let b = helper.make_verified_bundle(
+                r,
+                algo_agreement::Period(bundle_period),
+                CERT,
+                pv,
+                &params,
+            );
+            let msg = MessageEvent {
+                t,
+                input: InternalMessage {
+                    verified_bundle_votes: b.votes.clone(),
+                    unauthenticated_bundle: b.u.clone(),
+                    ..InternalMessage::default()
+                },
+                proto: proto_view(),
+                ..MessageEvent::default()
+            };
+            machine
+                .transition(Event::Message(msg))
+                .expect("a stale cert bundle must not panic");
+            let what = format!("period {bundle_period} {t:?}");
+            assert!(has_action_type(&machine, ActionType::Ignore), "{what}");
+            for forbidden in [
+                ActionType::VerifyBundle,
+                ActionType::StageDigest,
+                ActionType::Ensure,
+                ActionType::Relay,
+            ] {
+                assert!(!has_action_type(&machine, forbidden), "{what}: {forbidden:?}");
+            }
+            assert_eq!(machine.player().round, r, "{what}");
+            assert_eq!(machine.player().period, p, "{what}");
+        }
+    }
+}
+
+// go v5.1 `TestPlayerConsumesCertBundleOnePeriodBehind`: the boundary of the
+// rule. A cert bundle exactly one period behind is still observed: relayed, and
+// its digest staged.
+#[test]
+fn player_consumes_cert_bundle_one_period_behind() {
+    let r = Round(209);
+    let p = algo_agreement::Period(4);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, SOFT, &params);
+    let pv = algo_agreement::test_support::make_random_proposal_payload(r)
+        .unauthenticated_proposal
+        .value();
+    let cert = send_bundle_verified(
+        &mut machine,
+        &mut helper,
+        r,
+        algo_agreement::Period(p.0 - 1),
+        CERT,
+        pv,
+    );
+    assert!(has_action_type(&machine, ActionType::Relay), "relayed");
+    assert!(contains_stage_digest_for(&machine, &cert), "digest staged");
+    assert!(!has_action_type(&machine, ActionType::Ignore));
+    assert_eq!(machine.player().round, r);
+    assert_eq!(machine.player().period, p);
+}
