@@ -263,6 +263,10 @@ pub fn static_check(program: &[u8], mode: ExecMode) -> Option<String> {
             if op == 0x85 && version >= opcode::FALCON_CONFIG_VERSION && program[pc + 1] >= 2 {
                 return fail(pc, "falcon_verify reported non-positive cost 0".to_string());
             }
+            // likewise `mldsa_verify <p>`: 3700/5850 for the two parameter sets
+            if op == 0xe8 && program[pc + 1] >= 2 {
+                return fail(pc, "mldsa_verify reported non-positive cost 0".to_string());
+            }
             if spec.imm == ImmKind::Int16 {
                 // go's `checkBranch` for `bnz`/`bz`/`b`/`callsub`.
                 let offset = i64::from(i16::from_be_bytes([program[pc + 1], program[pc + 2]]));
@@ -398,6 +402,25 @@ pub fn contract_static_check(program: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    // Issue #2575: `mldsa_verify <p>` with a parameter set that has no cost.
+    #[test]
+    fn mldsa_verify_unknown_parameter_set_has_no_cost() {
+        let prog = |cfg: u8| {
+            let mut p = vec![14u8];
+            for _ in 0..4 {
+                p.extend_from_slice(&[0x80, 0x00]);
+            }
+            p.extend_from_slice(&[0xe8, cfg, 0x22]);
+            p
+        };
+        let e = super::static_check(&prog(2), super::ExecMode::LogicSig).unwrap();
+        assert!(
+            e.contains("mldsa_verify reported non-positive cost 0"),
+            "{e}"
+        );
+        assert!(super::static_check(&prog(1), super::ExecMode::LogicSig).is_none());
+    }
+
     // Issue #2572: v14 `falcon_verify <config>` in go's `check`.
     #[test]
     fn falcon_verify_config_is_checked_and_the_walk_goes_on() {
