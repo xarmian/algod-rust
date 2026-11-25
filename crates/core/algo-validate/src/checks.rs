@@ -339,6 +339,104 @@ mod tests {
         }
     }
 
+    // ── Issue #2553: go v5.1's `CheckMerklePathLengths` ──────────
+
+    use algo_types::MerkleSignature;
+
+    fn proof(path_len: usize, tree_depth: u8) -> Option<MerkleProof> {
+        Some(MerkleProof {
+            path: Some(vec![Some(ByteBuf::from(vec![0u8; 32])); path_len]),
+            hash_factory: None,
+            tree_depth,
+        })
+    }
+
+    fn reveal_with_proof(path_len: usize, tree_depth: u8) -> Reveal {
+        Reveal {
+            sig_slot: Some(SigSlotCommit {
+                sig: Some(MerkleSignature {
+                    proof: proof(path_len, tree_depth),
+                    ..Default::default()
+                }),
+                l: 0,
+            }),
+            part: None,
+        }
+    }
+
+    fn sp_with(
+        sig_proofs: Option<MerkleProof>,
+        part_proofs: Option<MerkleProof>,
+        reveals: Vec<Reveal>,
+    ) -> StateProofBody {
+        StateProofBody {
+            sig_proofs,
+            part_proofs,
+            reveals: Some(
+                reveals
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, r)| (i as u64, r))
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn multi_leaf_proof_paths_are_bounded_by_leaves_times_depth() {
+        // 3 reveals at TreeDepth 4: up to 12 path elements
+        let reveals = || (0..3).map(|_| reveal_with_proof(2, 2)).collect::<Vec<_>>();
+        check_merkle_path_lengths(&sp_with(proof(12, 4), proof(12, 4), reveals())).unwrap();
+        let e = check_merkle_path_lengths(&sp_with(proof(13, 4), proof(0, 0), reveals()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.ends_with(
+                "SigProofs: unexpected number of Merkle path elements: 13 path elements for 3 leaves at TreeDepth 4"
+            ),
+            "{e}"
+        );
+        let e = check_merkle_path_lengths(&sp_with(proof(0, 0), proof(13, 4), reveals()))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("PartProofs: unexpected number of Merkle path elements: 13 path elements for 3 leaves at TreeDepth 4"), "{e}");
+        // TreeDepth 0 admits no path at all
+        let e = check_merkle_path_lengths(&sp_with(proof(1, 0), None, reveals())).unwrap_err();
+        assert!(e.to_string().contains("SigProofs:"), "{e}");
+        // an absent proof is empty
+        check_merkle_path_lengths(&sp_with(None, None, reveals())).unwrap();
+    }
+
+    #[test]
+    fn revealed_signature_proof_paths_are_bounded_by_the_max_encoded_depth() {
+        let one = |r| sp_with(None, None, vec![r]);
+        // depth 16 with 16 elements (and depth 3 with 5: longer than depth is fine)
+        check_merkle_path_lengths(&one(reveal_with_proof(16, 16))).unwrap();
+        check_merkle_path_lengths(&one(reveal_with_proof(5, 3))).unwrap();
+        // the checked reveal is named by its position
+        let e = check_merkle_path_lengths(&one(reveal_with_proof(17, 16)))
+            .unwrap_err()
+            .to_string();
+        assert!(e.ends_with("reveal 0: unexpected number of Merkle path elements: signature proof has 17 path elements, maximum 16"), "{e}");
+        let e = check_merkle_path_lengths(&one(reveal_with_proof(20, 17)))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.ends_with(
+                "reveal 0: tree depth is too large: signature proof TreeDepth 17, maximum 16"
+            ),
+            "{e}"
+        );
+        // a path shorter than TreeDepth
+        let e = check_merkle_path_lengths(&one(reveal_with_proof(2, 3)))
+            .unwrap_err()
+            .to_string();
+        assert!(e.ends_with("reveal 0: unexpected number of Merkle path elements: signature proof has 2 path elements for TreeDepth 3"), "{e}");
+        // an all-default signature (no reveal) is checked the same way: depth 0, path 0
+        check_merkle_path_lengths(&one(Reveal::default())).unwrap();
+    }
+
     // ── Heartbeat missing fields ─────────────────────────────────
 
     #[test]

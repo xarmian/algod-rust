@@ -299,7 +299,7 @@ Inserted by `scripts/phase17_parity_delta.py repin`. Replace each row's status w
 | go-algorand test | algod-rust test(s) | status | notes |
 |---|---|---|---|
 | [TestVerifyFalconRejectsMalformedInputs](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/crypto/falconWrapper_test.go#L168) | — | unclassified | new in `v5.1.1-stable` |
-| [TestCommitmentFormatsAsHex](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/crypto/merklesignature/merkleSignatureScheme_test.go#L120) | — | unclassified | new in `v5.1.1-stable` |
+| [TestCommitmentFormatsAsHex](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/crypto/merklesignature/merkleSignatureScheme_test.go#L120) | | out-of-scope | Checks go's `%v`/`%s` of the fixed-size `merklesignature.Commitment` array prints hex. algod-rust's byte types have no `Display`; the go texts that embed these values (overspend `account ... data {...}`, `transaction <Summary> invalid`) are built with explicit hex helpers and pinned by go-generated fixtures (#2564: `overspend.rs`, `go_dump.rs` tests and the regenerated rewards/simulate oracles) |
 | [TestMarshalUnmarshalFalcon1024PrivateKey](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/crypto/msgp_gen_test.go#L76) | — | unclassified | new in `v5.1.1-stable` |
 | [TestRandomizedEncodingFalcon1024PrivateKey](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/crypto/msgp_gen_test.go#L97) | — | unclassified | new in `v5.1.1-stable` |
 | [TestMarshalUnmarshalFalcon1024PublicKey](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/crypto/msgp_gen_test.go#L136) | — | unclassified | new in `v5.1.1-stable` |
@@ -324,5 +324,5 @@ Inserted by `scripts/phase17_parity_delta.py repin`. Replace each row's status w
 | [TestWordlist](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/crypto/passphrase/passphrase_test.go#L162) | — | unclassified | new in `v5.1.1-stable` |
 | [TestSigSchemeVerifierEd25519](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/crypto/sig_scheme_test.go#L27) | — | unclassified | new in `v5.1.1-stable` |
 | [TestSigSchemeVerifierFalconRoundTrip](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/crypto/sig_scheme_test.go#L48) | — | unclassified | new in `v5.1.1-stable` |
-| [TestStateProofString](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/crypto/stateproof/prover_test.go#L706) | — | unclassified | new in `v5.1.1-stable` |
-| [TestByteTypesFormatAsHex](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/crypto/util_test.go#L85) | — | unclassified | new in `v5.1.1-stable` |
+| [TestStateProofString](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/crypto/stateproof/prover_test.go#L706) | | out-of-scope | `StateProof.String()` only feeds go's log lines (`StateProof: {<hex>, w, n}`); algod-rust has no such log text, and the hex of `GenericDigest` it prints is the formatting covered by #2564's fixtures |
+| [TestByteTypesFormatAsHex](https://github.com/algorand/go-algorand/blob/v5.1.1-stable/crypto/util_test.go#L85) | | out-of-scope | go `fmt` verbs on its fixed-size crypto byte arrays (VrfPubkey, Sha512Digest, OneTimeSignatureVerifier, GenericDigest, Signature, ...); no Rust `Display` exists to test - the strings go builds from them in error text are produced by explicit hex helpers pinned by go-generated fixtures (#2564) |
