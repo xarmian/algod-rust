@@ -69,7 +69,7 @@ const SUMMARY_TICK: Duration = Duration::from_secs(1);
 /// limited).
 ///
 /// hickory 0.26 logs `exceeded max validation depth` (via `error!` in
-/// hickory-net `src/dnssec/mod.rs`, `DnssecDnsHandle::send`; before the 0.26
+/// hickory-net `src/dnssec/mod.rs`, `DnssecDnsHandle::send`, re-checked at 0.26.4; before the 0.26
 /// split of hickory-proto it was `hickory_proto::dnssec::dnssec_dns_handle`,
 /// issue #1828). The test `locked_hickory_versions_match_the_pinned_noisy_path`
 /// fails when the locked hickory-net/-proto versions change, to force
@@ -586,7 +586,7 @@ mod tests {
         versions.sort_unstable();
         assert_eq!(
             versions,
-            ["0.26.3"],
+            ["0.26.4"],
             "locked hickory-net versions changed: re-check where `exceeded max validation              depth` is logged and update NOISY_TARGET_PATHS"
         );
     }
