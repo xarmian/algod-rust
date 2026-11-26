@@ -5484,6 +5484,18 @@ fn collect_inner_participants(eval_delta: &rmpv::Value, out: &mut Vec<Address>, 
     }
 }
 
+/// go's `ledgercore.OverspendError` from the fee or payment `Move`, bare
+/// (`overspend (account <addr>, data {...}, tried to spend <A>)`); the group
+/// loop frames it `transaction <txid>: ` ([`frame_apply_error`]) and an inner
+/// transaction reports it as `inner tx <i> failed: <this>`.
+fn overspend_rejected(account: &Address, data: &algo_types::AccountData, tried: u64) -> AlgoError {
+    AlgoError::Rejected {
+        source: None,
+        message: algo_validate::overspend::overspend_error_text(account, data, tried),
+        class: algo_error::RejectClass::Other,
+    }
+}
+
 /// Debit fee from sender and credit to fee_sink.
 ///
 /// Also counts the fee into `ctx.fees_collected` (go `takeFee`), unless the
@@ -5498,12 +5510,7 @@ fn apply_fee<L: crate::store_trait::LedgerStore>(
     let consensus = &ctx.consensus;
     let sender_account_before = store.get_or_default_account(sender);
     if sender_account_before.micro_algos < fee {
-        return Err(AlgoError::Ledger {
-            message: format!(
-                "sender {} has insufficient balance {} for fee {}",
-                sender, sender_account_before.micro_algos, fee,
-            ),
-        });
+        return Err(overspend_rejected(sender, &sender_account_before, fee));
     }
     let mut sender_account = sender_account_before.clone();
     sender_account.micro_algos -= fee;
@@ -5655,12 +5662,7 @@ pub fn apply_pay<L: crate::store_trait::LedgerStore>(
     if txn.amount > 0 || !txn.receiver.is_zero() {
         let mut sender = store.get_or_default_account(&txn.sender);
         if sender.micro_algos < txn.amount {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "sender {} has insufficient balance {} for payment {}",
-                    txn.sender, sender.micro_algos, txn.amount,
-                ),
-            });
+            return Err(overspend_rejected(&txn.sender, &sender, txn.amount));
         }
         sender.micro_algos -= txn.amount;
         // Issue #1654 (live mainnet block 65561121, zero-fee zero-amount

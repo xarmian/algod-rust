@@ -319,7 +319,7 @@ pub fn frame_min_balance(err: AlgoError, txid: impl FnOnce() -> String) -> AlgoE
             source,
             message,
             class: RejectClass::Other,
-        } if message.starts_with(CHECK_FAILED_PREFIX) => AlgoError::Rejected {
+        } if message.starts_with(CHECK_FAILED_PREFIX) || message.starts_with(OVERSPEND_PREFIX) => AlgoError::Rejected {
             source,
             message: format!("transaction {}: {message}", txid()),
             class: RejectClass::Framed(FramedKind::Other),
@@ -327,6 +327,11 @@ pub fn frame_min_balance(err: AlgoError, txid: impl FnOnce() -> String) -> AlgoE
         other => other,
     }
 }
+
+/// The start of go's `ledgercore.OverspendError` text, returned bare from the
+/// fee/payment `Move` and framed `transaction <txid>: ` by
+/// `BlockEvaluator.transaction` ([`frame_min_balance`]).
+pub const OVERSPEND_PREFIX: &str = "overspend (account ";
 
 /// The start of go's `checkPrograms` failure text.
 pub const CHECK_FAILED_PREFIX: &str = "check failed on ";

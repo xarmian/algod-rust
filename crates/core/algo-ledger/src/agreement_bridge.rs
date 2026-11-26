@@ -193,6 +193,7 @@ impl CommitFailure {
                     | AlgoError::Eval { .. }
                     | AlgoError::AppDoesNotExist { .. }
                     | AlgoError::ApprovalRejected { .. }
+                    | AlgoError::Rejected { .. }
             )
     }
 }

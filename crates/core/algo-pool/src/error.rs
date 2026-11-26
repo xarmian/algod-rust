@@ -418,7 +418,7 @@ fn classify_evaluator_message(msg: &str) -> PoolErrorTag {
         PoolErrorTag::TealErr
     } else if msg.contains("approval program rejected transaction") {
         PoolErrorTag::TealReject
-    } else if msg.contains(": overspend (account ") {
+    } else if msg.contains(": overspend (account ") || msg.starts_with("overspend (account ") {
         // go: `ledgercore.OverspendError` (the algo balance is short)
         PoolErrorTag::Overspend
     } else if msg.contains("insufficient for transfer") {
