@@ -876,7 +876,7 @@ fn fee_credit_insufficient_fails() {
 /// `itxn_next` time, not just at `itxn_submit`. Before the fix, algod-rust
 /// always defaulted an unset Fee to the flat `MinTxnFee`, so a zero-balance
 /// inner-txn sender relying purely on an ancestor's fee overpayment failed
-/// with "insufficient balance ... for fee" even though go-algorand's
+/// with an overspend on the fee even though go-algorand's
 /// equivalent transaction succeeds (the default fee there is 0 whenever
 /// FeeCredit already covers the group's MinTxnFee requirement).
 #[test]

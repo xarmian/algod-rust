@@ -1129,11 +1129,14 @@ impl BlockEvaluator for BalanceEvaluator {
             let sender_bal = *balances.get(&t.sender).unwrap_or(&0);
             let total_spend = t.fee + t.amount;
             if sender_bal < total_spend {
-                return Err(AlgoError::Ledger {
+                // go's `ledgercore.OverspendError`, as the real apply reports it.
+                return Err(AlgoError::Rejected {
+                    source: None,
                     message: format!(
-                        "sender {} has insufficient balance {} for payment {}",
-                        t.sender, sender_bal, total_spend
+                        "overspend (account {}, data {{}}, tried to spend {total_spend}uA)",
+                        t.sender
                     ),
+                    class: algo_error::RejectClass::Overspend,
                 });
             }
             let remainder = sender_bal - total_spend;
@@ -1266,7 +1269,7 @@ fn test_close_account() {
         .expect_err("closed sender should not be able to spend");
     let err_str = err.to_string();
     assert!(
-        err_str.contains("insufficient balance"),
+        err_str.contains("overspend (account "),
         "expected an overspend-style rejection, got: {}",
         err_str
     );
@@ -1305,7 +1308,7 @@ fn test_close_account_while_tx_is_pending() {
         .remember_one(overspend_close)
         .expect_err("second close should overspend by 1");
     assert!(
-        err.to_string().contains("insufficient balance"),
+        err.to_string().contains("overspend (account "),
         "expected an overspend-style rejection, got: {}",
         err
     );

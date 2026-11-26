@@ -313,6 +313,17 @@ pub fn frame_min_balance(err: AlgoError, txid: impl FnOnce() -> String) -> AlgoE
                 class: RejectClass::Framed(FramedKind::MinBalance),
             }
         }
+        // go's `OverspendError` from the fee/payment `Move`, bare from the
+        // apply and framed the same way.
+        AlgoError::Rejected {
+            source,
+            message,
+            class: RejectClass::Overspend,
+        } => AlgoError::Rejected {
+            source,
+            message: format!("transaction {}: {message}", txid()),
+            class: RejectClass::Framed(FramedKind::Overspend),
+        },
         // go's `checkPrograms` text (`ledger/apply/application.go`), also
         // returned bare from the apply and framed by `BlockEvaluator.transaction`.
         AlgoError::Rejected {
@@ -443,6 +454,11 @@ pub enum RejectClass {
     /// [`RejectClass::Framed`]`(`[`FramedKind::MinBalance`]`)`. go's pool tags
     /// both forms `min_balance`.
     MinBalance,
+    /// go `ledgercore.OverspendError` from the fee or payment `Move`, UNFRAMED
+    /// (framed by [`frame_min_balance`] into
+    /// [`RejectClass::Framed`]`(`[`FramedKind::Overspend`]`)`); go's pool tags
+    /// both forms `overspend`.
+    Overspend,
     /// go `ledgercore.TxGroupMalformedError` from `TestTransactionGroup`
     /// (inconsistent, empty or incomplete group ID), whose pool tag is
     /// `groupid`.
@@ -476,6 +492,9 @@ pub enum FramedKind {
     /// go's `ledgercore.MinBalanceError` behind the `transaction <txid>:`
     /// frame: [`RejectClass::MinBalance`] once unframed.
     MinBalance,
+    /// go's `ledgercore.OverspendError` behind the `transaction <txid>:`
+    /// frame: [`RejectClass::Overspend`] once unframed.
+    Overspend,
     /// Any other rejection a producer framed itself (go's authorizer check
     /// error, the max-minimum-balance rejection): [`RejectClass::Other`] once
     /// unframed, its pool tag read from the text.
@@ -496,6 +515,7 @@ impl RejectClass {
     pub fn unframed(self) -> Self {
         match self {
             Self::Framed(FramedKind::MinBalance) => Self::MinBalance,
+            Self::Framed(FramedKind::Overspend) => Self::Overspend,
             Self::Framed(FramedKind::Other) => Self::Other,
             other => other,
         }
@@ -587,6 +607,30 @@ impl AlgoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// go's `BlockEvaluator.transaction` frames the bare `OverspendError` of the
+    /// fee/payment `Move` `transaction <txid>: ` (#2587); the framed form is
+    /// typed, and unframes back to the same tag family.
+    #[test]
+    fn an_overspend_is_framed_with_the_txid_and_typed() {
+        let bare = AlgoError::Rejected {
+            source: None,
+            message: "overspend (account A, data {}, tried to spend 5uA)".into(),
+            class: RejectClass::Overspend,
+        };
+        match frame_min_balance(bare, || "TXID".into()) {
+            AlgoError::Rejected { message, class, .. } => {
+                assert_eq!(
+                    message,
+                    "transaction TXID: overspend (account A, data {}, tried to spend 5uA)"
+                );
+                assert_eq!(class, RejectClass::Framed(FramedKind::Overspend));
+                assert!(class.is_framed());
+                assert_eq!(class.unframed(), RejectClass::Overspend);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn batch_sig_failure_is_recognised_only_for_gos_exact_text() {

@@ -193,6 +193,7 @@ impl CommitFailure {
                     | AlgoError::Eval { .. }
                     | AlgoError::AppDoesNotExist { .. }
                     | AlgoError::ApprovalRejected { .. }
+                    | AlgoError::Rejected { .. }
             )
     }
 }
@@ -1789,6 +1790,23 @@ mod tests {
         ));
         // Content verdicts.
         assert!(f(CommitStage::Apply, ledger_err()));
+        // The apply's typed rejections (go's OverspendError from the fee or
+        // payment `Move`, a MinBalanceError) are verdicts on the block too
+        // (#2587): a block spending funds its sender lacks never applies.
+        for class in [
+            algo_error::RejectClass::Overspend,
+            algo_error::RejectClass::MinBalance,
+            algo_error::RejectClass::Framed(algo_error::FramedKind::Overspend),
+        ] {
+            assert!(f(
+                CommitStage::Apply,
+                AlgoError::Rejected {
+                    source: None,
+                    message: "m".into(),
+                    class
+                }
+            ));
+        }
         assert!(f(
             CommitStage::Apply,
             AlgoError::Avm {

@@ -318,10 +318,9 @@ fn scheme_fee_ls(sksig: &SaltedKeySig) -> u64 {
 }
 
 /// go's `TestPlaceholderSaltedKeySignatures` "invalid public key" subtest expects
-/// the failure text `overspend`; algod-rust's ledger apply words an unfunded
-/// sender differently today (issue #2587).
+/// the failure text `overspend`: go's framed `ledgercore.OverspendError`
+/// (issue #2587).
 #[test]
-#[ignore = "ledger apply reports its own `insufficient balance` text, not go's OverspendError: #2587"]
 fn unfunded_placeholder_sender_reports_overspend() {
     let scheme = SIG_SCHEME_ED25519;
     let (_, full) = placeholder(scheme, 0x11);
@@ -345,4 +344,11 @@ fn unfunded_placeholder_sender_reports_overspend() {
         .unwrap_or_default()
         .to_string();
     assert!(m.contains("overspend"), "{m}");
+    // go: `transaction <txid>: overspend (account <addr>, data {...}, tried to spend <A>)`
+    assert!(m.starts_with("transaction "), "{m}");
+    assert!(
+        m.contains(&format!(": overspend (account {}, data ", addr.to_algorand_string())),
+        "{m}"
+    );
+    assert!(m.contains(", tried to spend "), "{m}");
 }

@@ -147,7 +147,7 @@ fn a_past_round_is_simulated_on_the_state_of_that_round() {
     assert_eq!(l.get_account(&SENDER), sender_now, "latest state restored");
 
     let at_latest = simulate_at(&mut l, 3).expect("the latest round is served");
-    assert!(at_latest.contains("insufficient balance"), "{at_latest}");
+    assert!(at_latest.contains("overspend (account "), "{at_latest}");
     assert_eq!(l.get_account(&SENDER), sender_now);
     assert_eq!(l.current_round(), Round(3));
     assert_eq!(l.rewards_level(), 30, "the rewards state is restored");
@@ -177,7 +177,7 @@ fn rounds_older_than_the_window_fail_with_go_s_text() {
     );
     assert!(simulate_at(&mut l, 3)
         .expect("latest")
-        .contains("insufficient balance"));
+        .contains("overspend (account "));
 }
 
 /// Issue #2123 (second comment): `start + 1` is the historical header's rewards

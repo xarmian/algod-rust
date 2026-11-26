@@ -35,7 +35,7 @@
 //! directory, submit real signed transactions to its live `/v2/transactions`
 //! endpoint, and observe the real accept/reject decision computed by the
 //! actual ledger/pool apply path (`algo-ledger`'s
-//! `"sender {} has insufficient balance {} for payment {}"` /
+//! go's `overspend (account ...)` (was `"sender {} has insufficient balance {} for payment {}"`) /
 //! `algo-validate`'s `"transaction fee {} is below minimum {}"`), not a
 //! locally-computed or mocked one.
 //!

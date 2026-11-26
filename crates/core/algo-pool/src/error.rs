@@ -344,6 +344,8 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
             algo_error::RejectClass::LeaseInLedger { in_block: false } => PoolErrorTag::Lease,
             // go `ClassifyTxPoolError` on the typed `MinBalanceError`.
             algo_error::RejectClass::MinBalance => PoolErrorTag::MinBalance,
+            // go `ClassifyTxPoolError` on the typed `OverspendError`.
+            algo_error::RejectClass::Overspend => PoolErrorTag::Overspend,
             // go `ClassifyTxPoolError` on `TxGroupMalformedError` (every reason
             // but `ExceedMaxSize` is `groupid`) and `TxnNotWellFormedError`.
             algo_error::RejectClass::GroupId => PoolErrorTag::GroupId,
@@ -382,7 +384,9 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
 ///   mirroring Go's `ledgercore.AssetBalanceError` case.
 /// - `"account <a> balance <n> below min <m> (<k> assets)"` => `MinBalance`,
 ///   mirroring Go's `ledgercore.MinBalanceError` case.
-/// - `"...insufficient balance ... for fee/payment ..."` => `Overspend`,
+/// - `"...: overspend (account ..."` => `Overspend` (the typed
+///   [`RejectClass::Overspend`] is what the evaluators report; this is the text
+///   fallback),
 ///   mirroring Go's `ledgercore.OverspendError` case.
 /// - `"block does not have space for transaction"` (Go's
 ///   `ledgercore.ErrNoSpace.Error()` verbatim) => `NoSpace`, mirroring Go's
@@ -729,6 +733,15 @@ mod tests {
             classify_pool_error(&rej(RejectClass::Framed(FramedKind::MinBalance), "anything")),
             PoolErrorTag::MinBalance
         );
+        for class in [
+            RejectClass::Overspend,
+            RejectClass::Framed(FramedKind::Overspend),
+        ] {
+            assert_eq!(
+                classify_pool_error(&rej(class, "anything")),
+                PoolErrorTag::Overspend
+            );
+        }
         let overspend =
             "transaction T: overspend (account A, data {AccountBaseData:{}}, tried to spend 1uA)";
         let by_text = classify_pool_error(&rej(RejectClass::Other, overspend));
