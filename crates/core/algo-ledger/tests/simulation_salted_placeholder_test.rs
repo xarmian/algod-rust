@@ -318,8 +318,8 @@ fn scheme_fee_ls(sksig: &SaltedKeySig) -> u64 {
 }
 
 /// go's `TestPlaceholderSaltedKeySignatures` "invalid public key" subtest expects
-/// the failure text `overspend` (issue #2587).
-/// sender differently today (issue #2587).
+/// the failure text `overspend`: go's framed `ledgercore.OverspendError`
+/// (issue #2587).
 #[test]
 fn unfunded_placeholder_sender_reports_overspend() {
     let scheme = SIG_SCHEME_ED25519;

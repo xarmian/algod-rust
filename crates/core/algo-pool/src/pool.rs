@@ -941,6 +941,7 @@ impl TransactionPool {
                         | algo_error::RejectClass::TealReject
                         | algo_error::RejectClass::TealErr
                         | algo_error::RejectClass::MinBalance
+                        | algo_error::RejectClass::Overspend
                         | algo_error::RejectClass::Other => pool_error_from_evaluator(&e),
                         // `unframed()` never returns `Framed`.
                         algo_error::RejectClass::Framed(_) => {

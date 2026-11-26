@@ -5492,7 +5492,7 @@ fn overspend_rejected(account: &Address, data: &algo_types::AccountData, tried: 
     AlgoError::Rejected {
         source: None,
         message: algo_validate::overspend::overspend_error_text(account, data, tried),
-        class: algo_error::RejectClass::Other,
+        class: algo_error::RejectClass::Overspend,
     }
 }
 

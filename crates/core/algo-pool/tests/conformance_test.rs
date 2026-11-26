@@ -1136,7 +1136,7 @@ impl BlockEvaluator for BalanceEvaluator {
                         "overspend (account {}, data {{}}, tried to spend {total_spend}uA)",
                         t.sender
                     ),
-                    class: algo_error::RejectClass::Other,
+                    class: algo_error::RejectClass::Overspend,
                 });
             }
             let remainder = sender_bal - total_spend;
