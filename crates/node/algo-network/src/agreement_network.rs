@@ -54,6 +54,7 @@ use algo_agreement::traits::{
     AGREEMENT_VOTE_TAG, PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
 };
 
+use crate::fair_queue::FairQueue;
 use crate::forwarding_policy::ForwardingPolicy;
 use crate::gossip_node::{GossipNode, Peer};
 use crate::handler::{MessageHandler, TaggedMessageHandler};
@@ -96,6 +97,41 @@ pub const DEFAULT_BUNDLE_QUEUE_LEN: usize = 15;
 /// without requiring a full `PeerHandle` or `PeerSender`.
 struct PeerRef {
     addr: String,
+    routing: Vec<u8>,
+}
+
+impl PeerRef {
+    fn new(addr: String) -> Self {
+        let routing = routing_addr_of(&addr);
+        Self { addr, routing }
+    }
+}
+
+/// The routing address of a peer given its address string: the IP address
+/// bytes (4 for IPv4, 16 for IPv6), so all of a host's connections share one
+/// routing address, as go's `wsPeer.RoutingAddr` does. An address that is not
+/// an IP (e.g. a libp2p peer id) is its own routing address.
+fn routing_addr_of(addr: &str) -> Vec<u8> {
+    use std::net::{IpAddr, SocketAddr};
+    let ip = addr
+        .parse::<SocketAddr>()
+        .map(|sa| sa.ip())
+        .or_else(|_| addr.parse::<IpAddr>())
+        .ok();
+    match ip {
+        Some(IpAddr::V4(v4)) => v4.octets().to_vec(),
+        Some(IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.octets().to_vec(),
+            None => v6.octets().to_vec(),
+        },
+        None => addr.as_bytes().to_vec(),
+    }
+}
+
+/// The key of a message's source in the proposal queue: its routing address
+/// (go `proposalSource`, `network.IPAddressable.RoutingAddr`).
+fn proposal_source(routing: &[u8]) -> String {
+    routing.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl Peer for PeerRef {
@@ -108,7 +144,7 @@ impl Peer for PeerRef {
     }
 
     fn routing_addr(&self) -> &[u8] {
-        &[]
+        &self.routing
     }
 }
 
@@ -295,9 +331,7 @@ impl ChannelForwarder {
 impl MessageHandler for ChannelForwarder {
     async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
         let sender_peer: Option<Arc<dyn Peer>> = if !msg.sender.is_empty() {
-            Some(Arc::new(PeerRef {
-                addr: msg.sender.clone(),
-            }))
+            Some(Arc::new(PeerRef::new(msg.sender.clone())))
         } else {
             None
         };
@@ -318,6 +352,46 @@ impl MessageHandler for ChannelForwarder {
 
         // Always return Ignore — agreement handles relay/broadcast decisions
         // itself through the AgreementNetwork trait methods.
+        OutgoingMessage {
+            action: ForwardingPolicy::Ignore,
+            tag: msg.tag,
+            payload: Vec::new(),
+            topics: None,
+        }
+    }
+}
+
+/// Queues proposal payloads in the shared [`FairQueue`] keyed by their
+/// sender's routing address, mirroring go's `processProposalMessage`
+/// (`agreement/gossip/network.go`, v5.1.1-stable): every peer shares one queue,
+/// so sources are served fairly rather than first in, first out, and all of a
+/// host's connections count as one source.
+struct ProposalForwarder {
+    queue: Arc<FairQueue<Message>>,
+    counters: Arc<AgreementMessageCounters>,
+}
+
+#[async_trait]
+impl MessageHandler for ProposalForwarder {
+    async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
+        let sender_peer: Option<Arc<dyn Peer>> = if !msg.sender.is_empty() {
+            Some(Arc::new(PeerRef::new(msg.sender.clone())))
+        } else {
+            None
+        };
+        let source = proposal_source(&routing_addr_of(&msg.sender));
+        let agreement_msg = Message {
+            handle: Some(Arc::new(MessageMetadata { sender_peer })),
+            data: msg.data.clone(),
+        };
+
+        // go: `enqueue` counts a dropped value and reports the new one queued,
+        // so `submitMessage` counts it handled too.
+        if self.queue.offer(&source, agreement_msg) {
+            self.counters.record_dropped("proposal");
+        }
+        self.counters.record_handled("proposal");
+
         OutgoingMessage {
             action: ForwardingPolicy::Ignore,
             tag: msg.tag,
@@ -368,15 +442,17 @@ pub struct AgreementNetworkBridge {
 
     /// Receiver end of the vote channel (AV tag).
     vote_rx: Mutex<Option<crossbeam_channel::Receiver<Message>>>,
-    /// Receiver end of the proposal channel (PP tag).
-    proposal_rx: Mutex<Option<crossbeam_channel::Receiver<Message>>>,
+    /// Proposal payloads wait here, fairly queued by source, until agreement
+    /// takes them (PP tag). See [`ProposalForwarder`].
+    proposals: Arc<FairQueue<Message>>,
+    /// Set once [`AgreementNetwork::messages`] has handed out the proposal
+    /// receiver and started its pump.
+    proposal_pump_started: Mutex<bool>,
     /// Receiver end of the bundle channel (VB tag).
     bundle_rx: Mutex<Option<crossbeam_channel::Receiver<Message>>>,
 
     /// Sender end of the vote channel (kept for handler registration).
     vote_tx: crossbeam_channel::Sender<Message>,
-    /// Sender end of the proposal channel.
-    proposal_tx: crossbeam_channel::Sender<Message>,
     /// Sender end of the bundle channel.
     bundle_tx: crossbeam_channel::Sender<Message>,
 
@@ -401,17 +477,16 @@ impl AgreementNetworkBridge {
         config: AgreementNetworkConfig,
     ) -> Self {
         let (vote_tx, vote_rx) = crossbeam_channel::bounded(config.vote_queue_len);
-        let (proposal_tx, proposal_rx) = crossbeam_channel::bounded(config.proposal_queue_len);
         let (bundle_tx, bundle_rx) = crossbeam_channel::bounded(config.bundle_queue_len);
 
         Self {
             net,
             rt_handle,
             vote_rx: Mutex::new(Some(vote_rx)),
-            proposal_rx: Mutex::new(Some(proposal_rx)),
+            proposals: Arc::new(FairQueue::new(config.proposal_queue_len)),
+            proposal_pump_started: Mutex::new(false),
             bundle_rx: Mutex::new(Some(bundle_rx)),
             vote_tx,
-            proposal_tx,
             bundle_tx,
             message_counters: Arc::new(AgreementMessageCounters::new()),
         }
@@ -433,6 +508,29 @@ impl AgreementNetworkBridge {
         self
     }
 
+    /// Hands proposal payloads to agreement one at a time, fairly across
+    /// their sources, as go's `networkImpl.NextProposal` does. The returned
+    /// channel has no capacity: a pump thread takes the next payload from the
+    /// [`FairQueue`] and offers it, and the send completes only when the
+    /// consumer is receiving, so the queue chooses the payload as late as the
+    /// channel interface the demux `select` needs allows (one payload is taken
+    /// ahead). The pump ends when the receiver is dropped or the bridge is.
+    fn start_proposal_pump(&self) -> crossbeam_channel::Receiver<Message> {
+        let (tx, rx) = crossbeam_channel::bounded(0);
+        let queue = self.proposals.clone();
+        std::thread::Builder::new()
+            .name("agreement-proposal-queue".into())
+            .spawn(move || {
+                while let Some(m) = queue.next() {
+                    if tx.send(m).is_err() {
+                        return;
+                    }
+                }
+            })
+            .expect("spawn proposal queue pump");
+        rx
+    }
+
     /// The handled/dropped-by-type counters this bridge's forwarders update.
     /// Exposed so `GET /metrics` can render them (issue #1134).
     pub fn message_counters(&self) -> &Arc<AgreementMessageCounters> {
@@ -440,11 +538,33 @@ impl AgreementNetworkBridge {
     }
 }
 
+impl Drop for AgreementNetworkBridge {
+    fn drop(&mut self) {
+        // Ends the proposal pump.
+        self.proposals.close();
+    }
+}
+
 impl AgreementNetwork for AgreementNetworkBridge {
     fn messages(&self, tag: &AgreementTag) -> crossbeam_channel::Receiver<Message> {
         let mutex = match tag.0 {
             AGREEMENT_VOTE_TAG => &self.vote_rx,
-            PROPOSAL_PAYLOAD_TAG => &self.proposal_rx,
+            PROPOSAL_PAYLOAD_TAG => {
+                // go serves proposal payloads with `NextProposal`, not
+                // `Messages`; the receiver is the pull-style equivalent.
+                let mut started = self
+                    .proposal_pump_started
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if *started {
+                    // Already handed out (same semantics as the other tags).
+                    let (tx, rx) = crossbeam_channel::bounded(0);
+                    drop(tx);
+                    return rx;
+                }
+                *started = true;
+                return self.start_proposal_pump();
+            }
             VOTE_BUNDLE_TAG => &self.bundle_rx,
             other => {
                 warn!(
@@ -472,7 +592,6 @@ impl AgreementNetwork for AgreementNetworkBridge {
                 // receiver is lost, matching Go's semantics).
                 let (tx, rx) = crossbeam_channel::bounded(match tag.0 {
                     AGREEMENT_VOTE_TAG => DEFAULT_VOTE_QUEUE_LEN,
-                    PROPOSAL_PAYLOAD_TAG => DEFAULT_PROPOSAL_QUEUE_LEN,
                     VOTE_BUNDLE_TAG => DEFAULT_BUNDLE_QUEUE_LEN,
                     _ => unreachable!(),
                 });
@@ -559,11 +678,10 @@ impl AgreementNetwork for AgreementNetworkBridge {
             },
             TaggedMessageHandler {
                 tag: Tag::ProposalPayload,
-                handler: Arc::new(ChannelForwarder::new(
-                    self.proposal_tx.clone(),
-                    "proposal",
-                    self.message_counters.clone(),
-                )),
+                handler: Arc::new(ProposalForwarder {
+                    queue: self.proposals.clone(),
+                    counters: self.message_counters.clone(),
+                }),
             },
             TaggedMessageHandler {
                 tag: Tag::VoteBundle,
@@ -771,9 +889,7 @@ mod tests {
 
     #[test]
     fn metadata_from_handle_with_metadata() {
-        let peer: Arc<dyn Peer> = Arc::new(PeerRef {
-            addr: "1.2.3.4:4160".to_string(),
-        });
+        let peer: Arc<dyn Peer> = Arc::new(PeerRef::new("1.2.3.4:4160".to_string()));
         let handle: MessageHandle = Some(Arc::new(MessageMetadata {
             sender_peer: Some(peer),
         }));
@@ -1086,5 +1202,103 @@ mod tests {
             DEFAULT_BUNDLE_QUEUE_LEN, 15,
             "go's AgreementIncomingBundlesQueueLength default is 15 as of version 27"
         );
+    }
+
+    /// go `TestProposalQueueSourceIsRoutingAddr`
+    /// (`agreement/gossip/proposalQueue_test.go`): proposals are queued by the
+    /// routing address of their sender, so two connections from one address
+    /// share one turn.
+    #[tokio::test]
+    async fn proposal_queue_source_is_routing_addr() {
+        let gossip = Arc::new(MockGossipNode::new());
+        let bridge =
+            AgreementNetworkBridge::with_defaults(gossip, tokio::runtime::Handle::current());
+        let forwarder = ProposalForwarder {
+            queue: bridge.proposals.clone(),
+            counters: bridge.message_counters.clone(),
+        };
+        // Two connections from the same address (distinct ports), then two
+        // other addresses.
+        for (sender, data) in [
+            ("10.0.0.1:1111", "a0"),
+            ("10.0.0.1:2222", "a1"),
+            ("10.0.0.2:3333", "b0"),
+            ("10.0.0.3:4444", "c0"),
+        ] {
+            forwarder
+                .handle(IncomingMessage::new(
+                    Tag::ProposalPayload,
+                    data.as_bytes().to_vec(),
+                    sender.to_string(),
+                    0,
+                ))
+                .await;
+        }
+
+        // a1 waits for a's next turn, after b and c.
+        let rx = bridge.messages(&AgreementTag(PROPOSAL_PAYLOAD_TAG));
+        let got: Vec<String> = (0..4)
+            .map(|_| {
+                let m = rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("queued proposal");
+                String::from_utf8(m.data).unwrap()
+            })
+            .collect();
+        assert_eq!(got, ["a0", "b0", "c0", "a1"]);
+        assert_eq!(bridge.message_counters().handled("proposal"), 4);
+        assert_eq!(bridge.message_counters().dropped("proposal"), 0);
+    }
+
+    /// A full proposal queue drops the oldest value of the source with the
+    /// most waiting (go `FairQueue.Offer`) and counts both a drop and a handle
+    /// (go `processProposalMessage`).
+    #[tokio::test]
+    async fn proposal_queue_full_drops_from_the_busiest_source() {
+        let gossip = Arc::new(MockGossipNode::new());
+        let bridge = AgreementNetworkBridge::new(
+            gossip,
+            tokio::runtime::Handle::current(),
+            AgreementNetworkConfig {
+                proposal_queue_len: 2,
+                ..AgreementNetworkConfig::default()
+            },
+        );
+        let forwarder = ProposalForwarder {
+            queue: bridge.proposals.clone(),
+            counters: bridge.message_counters.clone(),
+        };
+        for (sender, data) in [
+            ("10.0.0.1:1", "a0"),
+            ("10.0.0.1:2", "a1"),
+            ("10.0.0.2:3", "b0"),
+        ] {
+            forwarder
+                .handle(IncomingMessage::new(
+                    Tag::ProposalPayload,
+                    data.as_bytes().to_vec(),
+                    sender.to_string(),
+                    0,
+                ))
+                .await;
+        }
+        assert_eq!(bridge.message_counters().dropped("proposal"), 1);
+        assert_eq!(bridge.message_counters().handled("proposal"), 3);
+        let rx = bridge.messages(&AgreementTag(PROPOSAL_PAYLOAD_TAG));
+        let got: Vec<String> = (0..2)
+            .map(|_| {
+                String::from_utf8(rx.recv_timeout(Duration::from_secs(5)).unwrap().data).unwrap()
+            })
+            .collect();
+        assert_eq!(got, ["a1", "b0"]);
+    }
+
+    #[test]
+    fn routing_addr_is_the_ip_not_the_connection() {
+        assert_eq!(routing_addr_of("10.0.0.1:1111"), vec![10, 0, 0, 1]);
+        assert_eq!(routing_addr_of("10.0.0.1:2222"), vec![10, 0, 0, 1]);
+        assert_eq!(routing_addr_of("[::1]:80").len(), 16);
+        assert_eq!(routing_addr_of("[::ffff:10.0.0.1]:80"), vec![10, 0, 0, 1]);
+        assert_eq!(routing_addr_of("peer-id"), b"peer-id".to_vec());
     }
 }

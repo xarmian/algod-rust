@@ -29,6 +29,7 @@ pub mod compression;
 pub mod conn_perf_monitor;
 pub mod connect;
 pub mod errors;
+pub mod fair_queue;
 pub mod fd_limits;
 pub mod forwarding_policy;
 pub mod framing;
