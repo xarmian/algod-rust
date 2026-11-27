@@ -541,9 +541,6 @@ fn spawn_proxy(proxy: Proxy, target: Option<u16>, log: Arc<Mutex<String>>) -> u1
                             let _ = std::io::copy(&mut from_client, &mut upstream);
                         });
                         let _ = std::io::copy(&mut from_upstream, &mut stream);
-                        // upstream is done: end the client's read too, else
-                        // `t.join()` waits on a client that is waiting on us
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
                         let _ = t.join();
                     }
                 }
