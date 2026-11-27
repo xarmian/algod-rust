@@ -112,8 +112,8 @@ impl Tag {
             Tag::MsgDigestSkip => 69,
             Tag::NetPrioResponse => 850,
             Tag::NetIDVerification => 215,
-            Tag::ProposalPayload => 5_250_594,
-            Tag::StateProofSig => 6_378,
+            Tag::ProposalPayload => 5_250_618, // 0x501e3a
+            Tag::StateProofSig => 6_263,
             Tag::TopicMsgResp => 6 * 1024 * 1024, // == MAX_MESSAGE_LENGTH
             Tag::Transaction => 5_000_000,
             Tag::UniEnsBlockReq => 67,
@@ -241,6 +241,26 @@ mod tests {
         assert_eq!(Tag::from_bytes(b"\x00\x00"), None);
     }
 
+    /// The agreement crate sends no message longer than go's
+    /// `Tag.MaxMessageSize` (issue #2552); its limits are this table's.
+    #[test]
+    fn agreement_send_limits_match_the_network_tag_sizes() {
+        use algo_agreement::Tag as AgreementTag;
+        for (code, tag) in [
+            ("AV", Tag::AgreementVote),
+            ("PP", Tag::ProposalPayload),
+            ("VB", Tag::VoteBundle),
+        ] {
+            let code: &'static str = code;
+            assert_eq!(
+                AgreementTag(code).max_message_size() as usize,
+                tag.max_message_size(),
+                "{code}"
+            );
+        }
+        assert_eq!(AgreementTag("ZZ").max_message_size(), 0);
+    }
+
     #[test]
     fn max_sizes_match_go() {
         // Spot-check values from go-algorand/protocol/tags.go
@@ -249,8 +269,8 @@ mod tests {
         assert_eq!(Tag::MsgDigestSkip.max_message_size(), 69);
         assert_eq!(Tag::NetPrioResponse.max_message_size(), 850);
         assert_eq!(Tag::NetIDVerification.max_message_size(), 215);
-        assert_eq!(Tag::ProposalPayload.max_message_size(), 5_250_594);
-        assert_eq!(Tag::StateProofSig.max_message_size(), 6_378);
+        assert_eq!(Tag::ProposalPayload.max_message_size(), 5_250_618);
+        assert_eq!(Tag::StateProofSig.max_message_size(), 6_263);
         assert_eq!(Tag::TopicMsgResp.max_message_size(), 6 * 1024 * 1024);
         assert_eq!(Tag::Transaction.max_message_size(), 5_000_000);
         assert_eq!(Tag::UniEnsBlockReq.max_message_size(), 67);

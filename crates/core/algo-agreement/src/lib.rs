@@ -42,6 +42,7 @@ mod hashable;
 mod ledger_reader;
 mod lookback;
 pub mod metrics;
+pub mod payload_deferral;
 pub mod persistence;
 pub mod player;
 mod proposal;
@@ -124,7 +125,7 @@ pub use events::{
     NextThresholdStatusEvent, NextThresholdStatusRequestEvent, PayloadProcessedEvent,
     PinnedValueEvent, Proposal, ProposalAcceptedEvent, ProposalFrozenEvent, ReadLowestEvent,
     RoundInterruptionEvent, SerializableError, StagingValueEvent, ThresholdEvent, TimeoutEvent,
-    VoteAcceptedEvent, VoteFilterRequestEvent, PIPELINED_MESSAGE_TIMESTAMP,
+    VoteAcceptedEvent, VoteFilterRequestEvent, WantedPayloadsEvent, PIPELINED_MESSAGE_TIMESTAMP,
 };
 pub use pseudonode::{AccountSigningKeys, AsyncPseudonode, Pseudonode, PseudonodeError};
 pub use types::{

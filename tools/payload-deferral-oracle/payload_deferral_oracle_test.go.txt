@@ -1,0 +1,682 @@
+// Copyright (C) 2019-2026 Algorand Foundation Ltd.
+// Modifications Copyright (C) 2026 Algod DAO
+// This file is part of algod-rust, a modified work based on go-algorand
+// (https://github.com/algorand/go-algorand).
+//
+// algod-rust is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// algod-rust is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with algod-rust.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// This file is NOT part of any Go module here: it is a template that
+// tools/payload-deferral-oracle/run.sh copies, as
+// zz_payload_deferral_oracle_test.go, into the pinned go-algorand checkout's
+// agreement package (parsePayloadPrefix, payloadEncodingDigest,
+// decodeDeferredPayload and decodeProposal are unexported) and runs there.
+// Issue #2552.
+//
+// It builds go's own proposal payloads (a transmittedPayload with a payset, a
+// prior vote, a heartbeat group, a bad group ID, an unknown protocol, ...) plus
+// the PP seeds of $PD_SEEDS (a JSONL file of {"name","hex"}), derives a few
+// hundred truncated, reordered, duplicated, re-typed and hostile variants of
+// them, and writes one JSON row per case to $PD_OUT with what go's real
+// functions answer:
+//
+//	parse     parsePayloadPrefix: ok, the prefix fields, the offsets
+//	enc       writeProposalEncoding: ok, hash of the bytes written
+//	digest    payloadEncodingDigest
+//	proposal  decodeProposal (the demux tokenizer): ok, the stub's round /
+//	          original period / original proposer, the prior vote after
+//	          clearPKSigOld
+//	deferred  decodeDeferredPayload given the stub, once with the payload's
+//	          own digest wanted, once with none, once with another: ok, and
+//	          on success the decoded proposal's digests
+//
+// The rows are committed as
+// crates/core/algo-agreement/tests/fixtures/payload_deferral/cases.jsonl and
+// replayed by crates/core/algo-agreement/src/payload_deferral.rs.
+
+package agreement
+
+import (
+	"bufio"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/algorand/msgp/msgp"
+	"github.com/stretchr/testify/require"
+
+	"github.com/algorand/go-algorand/crypto"
+	"github.com/algorand/go-algorand/crypto/merklearray"
+	"github.com/algorand/go-algorand/crypto/stateproof"
+	"github.com/algorand/go-algorand/data/basics"
+	"github.com/algorand/go-algorand/data/bookkeeping"
+	"github.com/algorand/go-algorand/data/transactions"
+	"github.com/algorand/go-algorand/protocol"
+)
+
+type pdParse struct {
+	Ok           bool   `json:"ok"`
+	Err          string `json:"err,omitempty"`
+	Round        uint64 `json:"round"`
+	Oper         uint64 `json:"oper"`
+	Oprop        string `json:"oprop"`
+	NumEntries   uint32 `json:"num_entries"`
+	EntriesStart int    `json:"entries_start"`
+	VoteStart    int    `json:"vote_start"`
+	VoteEnd      int    `json:"vote_end"`
+	Vote         string `json:"vote"`
+}
+
+type pdHash struct {
+	Ok   bool   `json:"ok"`
+	Err  string `json:"err,omitempty"`
+	Hash string `json:"hash,omitempty"`
+}
+
+type pdProposal struct {
+	Ok    bool   `json:"ok"`
+	Err   string `json:"err,omitempty"`
+	Round uint64 `json:"round"`
+	Oper  uint64 `json:"oper"`
+	Oprop string `json:"oprop"`
+	Vote  string `json:"vote"`
+}
+
+type pdDeferred struct {
+	Ok          bool   `json:"ok"`
+	Err         string `json:"err,omitempty"`
+	BlockDigest string `json:"block_digest,omitempty"`
+	EncDigest   string `json:"enc_digest,omitempty"`
+}
+
+type pdRow struct {
+	Name     string                 `json:"name"`
+	Hex      string                 `json:"hex"`
+	Parse    pdParse                `json:"parse"`
+	Enc      pdHash                 `json:"enc"`
+	Digest   pdHash                 `json:"digest"`
+	Proposal pdProposal             `json:"proposal"`
+	Deferred map[string]*pdDeferred `json:"deferred,omitempty"`
+}
+
+func pdSum(b []byte) string {
+	d := crypto.Hash(b)
+	return hex.EncodeToString(d[:])
+}
+
+type pdCase struct {
+	name string
+	data []byte
+}
+
+// pdEntry is one key/value pair of a top-level map, as raw msgpack.
+type pdEntry struct {
+	key []byte // the key as it was encoded (header included)
+	val []byte
+	str string // the key's text
+}
+
+func pdSplit(b []byte) (entries []pdEntry, ok bool) {
+	n, _, rest, err := msgp.ReadMapHeaderBytes(b)
+	if err != nil {
+		return nil, false
+	}
+	for i := 0; i < n; i++ {
+		k, r2, err := msgp.ReadMapKeyZC(rest)
+		if err != nil {
+			return nil, false
+		}
+		keyRaw := rest[:len(rest)-len(r2)]
+		r3, err := msgp.Skip(r2)
+		if err != nil {
+			return nil, false
+		}
+		entries = append(entries, pdEntry{key: keyRaw, val: r2[:len(r2)-len(r3)], str: string(k)})
+		rest = r3
+	}
+	return entries, true
+}
+
+func pdJoin(header []byte, entries []pdEntry) []byte {
+	out := append([]byte(nil), header...)
+	for _, e := range entries {
+		out = append(out, e.key...)
+		out = append(out, e.val...)
+	}
+	return out
+}
+
+func pdMap(entries []pdEntry) []byte {
+	return pdJoin(msgp.AppendMapHeader(nil, uint32(len(entries))), entries)
+}
+
+func pdKey(s string) []byte { return msgp.AppendString(nil, s) }
+
+// pdNested returns an array nested depth levels deep.
+func pdNested(depth int) []byte {
+	var b []byte
+	for i := 0; i < depth; i++ {
+		b = append(b, 0x91)
+	}
+	return append(b, 0xc0)
+}
+
+func pdFind(entries []pdEntry, key string) int {
+	for i, e := range entries {
+		if e.str == key {
+			return i
+		}
+	}
+	return -1
+}
+
+func pdWithout(entries []pdEntry, i int) []pdEntry {
+	out := append([]pdEntry(nil), entries[:i]...)
+	return append(out, entries[i+1:]...)
+}
+
+func pdInsert(entries []pdEntry, i int, e pdEntry) []pdEntry {
+	out := append([]pdEntry(nil), entries[:i]...)
+	out = append(out, e)
+	return append(out, entries[i:]...)
+}
+
+func pdReplaceVal(entries []pdEntry, key string, val []byte) []pdEntry {
+	out := append([]pdEntry(nil), entries...)
+	if i := pdFind(out, key); i >= 0 {
+		out[i].val = val
+	}
+	return out
+}
+
+func pdReplaceKey(entries []pdEntry, i int, key []byte) []pdEntry {
+	out := append([]pdEntry(nil), entries...)
+	out[i].key = key
+	return out
+}
+
+func pdTxn(genesisHash crypto.Digest, sender byte) transactions.Transaction {
+	return transactions.Transaction{
+		Type: protocol.PaymentTx,
+		Header: transactions.Header{
+			Sender:      basics.Address{sender},
+			GenesisHash: genesisHash,
+			Fee:         basics.MicroAlgos{Raw: 1000},
+			FirstValid:  1,
+			LastValid:   100,
+		},
+		PaymentTxnFields: transactions.PaymentTxnFields{Receiver: basics.Address{9}, Amount: basics.MicroAlgos{Raw: 5}},
+	}
+}
+
+// pdBlock builds a block of the given protocol whose payset is the given
+// transactions, with the group ID the transactions already carry.
+func pdBlock(version protocol.ConsensusVersion, rnd basics.Round, txns []transactions.Transaction) bookkeeping.Block {
+	genesisHash := crypto.Hash([]byte("payload-deferral-oracle"))
+	block := bookkeeping.Block{BlockHeader: bookkeeping.BlockHeader{
+		Round:       rnd,
+		GenesisID:   "oracle-net",
+		GenesisHash: genesisHash,
+		UpgradeState: bookkeeping.UpgradeState{
+			CurrentProtocol: protocol.ConsensusCurrentVersion,
+		},
+	}}
+	if version == protocol.ConsensusFuture {
+		block.CurrentProtocol = version
+	}
+	for _, txn := range txns {
+		stib, err := block.EncodeSignedTxn(transactions.SignedTxn{Txn: txn}, transactions.ApplyData{})
+		if err != nil {
+			panic(err)
+		}
+		block.Payset = append(block.Payset, stib)
+	}
+	// go cannot encode a transaction for a protocol it does not know, so the
+	// payset above is encoded for the current one and only the name changes
+	block.CurrentProtocol = version
+	return block
+}
+
+func pdGrouped(txns []transactions.Transaction) []transactions.Transaction {
+	var group transactions.TxGroup
+	for _, txn := range txns {
+		group.TxGroupHashes = append(group.TxGroupHashes, crypto.Digest(txn.ID()))
+	}
+	id := crypto.HashObj(group)
+	out := append([]transactions.Transaction(nil), txns...)
+	for i := range out {
+		out[i].Group = id
+	}
+	return out
+}
+
+func pdVote(rnd basics.Round, per period, st step) unauthenticatedVote {
+	var v unauthenticatedVote
+	v.R = rawVote{Sender: basics.Address{3}, Round: rnd, Period: per, Step: st,
+		Proposal: proposalValue{OriginalPeriod: 1, OriginalProposer: basics.Address{4}, BlockDigest: crypto.Digest{5}, EncodingDigest: crypto.Digest{6}}}
+	v.Cred.Proof[0] = 7
+	v.Sig.PK[0] = 8
+	v.Sig.PKSigOld[0] = 9 // cleared by decodeProposal
+	v.Sig.PK2[0] = 10
+	v.Sig.PK1Sig[0] = 11
+	v.Sig.PK2Sig[0] = 12
+	return v
+}
+
+func pdPayload(block bookkeeping.Block, oper period, vote unauthenticatedVote) []byte {
+	tp := transmittedPayload{
+		unauthenticatedProposal: unauthenticatedProposal{Block: block, OriginalPeriod: oper, OriginalProposer: basics.Address{2}},
+		PriorVote:               vote,
+	}
+	tp.SeedProof[0] = 1
+	return protocol.Encode(&tp)
+}
+
+func pdCases(t *testing.T) []pdCase {
+	var cases []pdCase
+	add := func(name string, data []byte) {
+		cases = append(cases, pdCase{name: name, data: data})
+	}
+
+	genesisHash := crypto.Hash([]byte("payload-deferral-oracle"))
+	plain := []transactions.Transaction{pdTxn(genesisHash, 1), pdTxn(genesisHash, 2)}
+	groupedOK := pdGrouped(plain)
+	pv := pdVote(7, 2, soft)
+
+	base := pdPayload(pdBlock(protocol.ConsensusCurrentVersion, 7, groupedOK), 2, pv)
+	noVote := pdPayload(pdBlock(protocol.ConsensusCurrentVersion, 7, groupedOK), 2, unauthenticatedVote{})
+	empty := pdPayload(pdBlock(protocol.ConsensusCurrentVersion, 7, nil), 0, unauthenticatedVote{})
+	add("base", base)
+	add("base_no_vote", noVote)
+	add("base_empty_block_zero_period", empty)
+	add("base_vote_step_above_down", pdPayload(pdBlock(protocol.ConsensusCurrentVersion, 7, groupedOK), 2, pdVote(7, 2, down+1)))
+	add("base_vote_step_down", pdPayload(pdBlock(protocol.ConsensusCurrentVersion, 7, groupedOK), 2, pdVote(7, 2, down)))
+
+	// payset screens
+	badGroup := pdGrouped(plain)
+	badGroup[1].Group = crypto.Digest{1, 2, 3}
+	add("bad_group_id", pdPayload(pdBlock(protocol.ConsensusCurrentVersion, 7, badGroup), 2, pv))
+	swapped := []transactions.Transaction{groupedOK[1], groupedOK[0]}
+	add("group_order_swapped", pdPayload(pdBlock(protocol.ConsensusCurrentVersion, 7, swapped), 2, pv))
+	hb := []transactions.Transaction{
+		{Type: protocol.ApplicationCallTx, Header: transactions.Header{Sender: basics.Address{1}, GenesisHash: genesisHash, FirstValid: 1, LastValid: 100}},
+		{Type: protocol.HeartbeatTx, Header: transactions.Header{Sender: basics.Address{2}, GenesisHash: genesisHash, FirstValid: 1, LastValid: 100}},
+	}
+	add("heartbeat_group_current", pdPayload(pdBlock(protocol.ConsensusCurrentVersion, 7, pdGrouped(hb)), 2, pv))
+	add("heartbeat_group_future", pdPayload(pdBlock(protocol.ConsensusFuture, 7, pdGrouped(hb)), 2, pv))
+	add("unknown_protocol", pdPayload(pdBlock("oracle-unknown-protocol", 7, groupedOK), 2, pv))
+	add("no_protocol", pdPayload(pdBlock("", 7, groupedOK), 2, pv))
+	// checks go v5.1 no longer makes at this stage (WellFormed does, later)
+	bogus := transactions.Transaction{Type: "bogus", Header: transactions.Header{Sender: basics.Address{1}, GenesisHash: genesisHash}}
+	add("unknown_txn_type", pdPayload(pdBlock(protocol.ConsensusCurrentVersion, 7, []transactions.Transaction{bogus}), 2, pv))
+	boxIdx := transactions.Transaction{Type: protocol.ApplicationCallTx, Header: transactions.Header{Sender: basics.Address{1}, GenesisHash: genesisHash},
+		ApplicationCallTxnFields: transactions.ApplicationCallTxnFields{Boxes: []transactions.BoxRef{{Index: 5, Name: []byte("b")}}}}
+	add("box_index_over_foreign_apps", pdPayload(pdBlock(protocol.ConsensusCurrentVersion, 7, []transactions.Transaction{boxIdx}), 2, pv))
+	hbNoFields := transactions.Transaction{Type: protocol.HeartbeatTx, Header: transactions.Header{Sender: basics.Address{1}, GenesisHash: genesisHash}}
+	add("heartbeat_without_fields", pdPayload(pdBlock(protocol.ConsensusCurrentVersion, 7, []transactions.Transaction{hbNoFields}), 2, pv))
+	// every branch of checkTxnGroup: heartbeat with an app call / an asset
+	// creation (rejected unless the protocol allows grouped heartbeats), and a
+	// state proof payload with a malformed Merkle path
+	hbBase := transactions.Transaction{Type: protocol.HeartbeatTx, Header: transactions.Header{Sender: basics.Address{2}, GenesisHash: genesisHash, FirstValid: 1, LastValid: 100}}
+	acfgCreate := transactions.Transaction{Type: protocol.AssetConfigTx, Header: transactions.Header{Sender: basics.Address{1}, GenesisHash: genesisHash, FirstValid: 1, LastValid: 100}}
+	acfgModify := acfgCreate
+	acfgModify.ConfigAsset = 7
+	pay := pdTxn(genesisHash, 1)
+	for _, v := range []struct {
+		name string
+		ver  protocol.ConsensusVersion
+	}{{"current", protocol.ConsensusCurrentVersion}, {"future", protocol.ConsensusFuture}} {
+		add("hb_acfg_create_"+v.name, pdPayload(pdBlock(v.ver, 7, pdGrouped([]transactions.Transaction{acfgCreate, hbBase})), 2, pv))
+		add("hb_acfg_modify_"+v.name, pdPayload(pdBlock(v.ver, 7, pdGrouped([]transactions.Transaction{acfgModify, hbBase})), 2, pv))
+		add("hb_pay_"+v.name, pdPayload(pdBlock(v.ver, 7, pdGrouped([]transactions.Transaction{pay, hbBase})), 2, pv))
+	}
+	spTxn := transactions.Transaction{
+		Type:   protocol.StateProofTx,
+		Header: transactions.Header{GenesisHash: genesisHash},
+		StateProofTxnFields: transactions.StateProofTxnFields{StateProof: stateproof.StateProof{
+			SigCommit:  make(crypto.GenericDigest, stateproof.HashSize),
+			SigProofs:  merklearray.Proof{HashFactory: crypto.HashFactory{HashType: stateproof.HashType}},
+			Reveals:    map[uint64]stateproof.Reveal{0: {}},
+			PartProofs: merklearray.Proof{Path: []crypto.GenericDigest{make(crypto.GenericDigest, 2*stateproof.HashSize)}, HashFactory: crypto.HashFactory{HashType: stateproof.HashType}, TreeDepth: 1},
+		}},
+	}
+	add("state_proof_bad_path", pdPayload(pdBlock(protocol.ConsensusCurrentVersion, 7, []transactions.Transaction{spTxn}), 2, pv))
+	spTxn.StateProof.PartProofs.Path[0] = make(crypto.GenericDigest, stateproof.HashSize)
+	add("state_proof_ok_path", pdPayload(pdBlock(protocol.ConsensusCurrentVersion, 7, []transactions.Transaction{spTxn}), 2, pv))
+	spTxn.StateProof.PartProofs.HashFactory.HashType = crypto.Sha256
+	add("state_proof_wrong_hash", pdPayload(pdBlock(protocol.ConsensusCurrentVersion, 7, []transactions.Transaction{spTxn}), 2, pv))
+	var big []transactions.Transaction
+	for i := 0; i < 17; i++ {
+		big = append(big, pdTxn(genesisHash, byte(i+1)))
+	}
+	add("oversized_group", pdPayload(pdBlock(protocol.ConsensusCurrentVersion, 7, pdGrouped(big)), 2, pv))
+	add("max_group", pdPayload(pdBlock(protocol.ConsensusCurrentVersion, 7, pdGrouped(big[:16])), 2, pv))
+
+	// seeds
+	if seeds := os.Getenv("PD_SEEDS"); seeds != "" {
+		f, err := os.Open(seeds)
+		require.NoError(t, err)
+		defer f.Close()
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 1<<20), 1<<24)
+		for sc.Scan() {
+			var row struct{ Name, Hex string }
+			require.NoError(t, json.Unmarshal(sc.Bytes(), &row))
+			b, err := hex.DecodeString(row.Hex)
+			require.NoError(t, err)
+			add("seed_"+row.Name, b)
+		}
+	}
+
+	// truncation: every length of the first 640 bytes, then every 17th
+	for n := 0; n < len(base) && n < 640; n++ {
+		add(fmt.Sprintf("truncate_%d", n), base[:n])
+	}
+	for n := 640; n < len(base); n += 17 {
+		add(fmt.Sprintf("truncate_%d", n), base[:n])
+	}
+	for n := 0; n < len(noVote) && n < 80; n++ {
+		add(fmt.Sprintf("novote_truncate_%d", n), noVote[:n])
+	}
+	add("trailing_zero", append(append([]byte(nil), base...), 0x00))
+	add("trailing_map", append(append([]byte(nil), base...), 0x80))
+	add("trailing_garbage", append(append([]byte(nil), base...), 0xc1, 0xff, 0x00))
+	add("double_payload", append(append([]byte(nil), base...), base...))
+
+	// the top level
+	add("empty_input", nil)
+	add("top_nil", []byte{0xc0})
+	add("top_empty_map", []byte{0x80})
+	add("top_array0", []byte{0x90})
+	add("top_array_of_base", append([]byte{0x91}, base...))
+	add("top_int", []byte{0x01})
+	add("top_invalid_c1", []byte{0xc1})
+	add("top_str", []byte{0xa1, 'a'})
+	add("top_map16_empty", []byte{0xde, 0x00, 0x00})
+	add("top_map32_empty", []byte{0xdf, 0x00, 0x00, 0x00, 0x00})
+	add("top_map_declares_1_no_entry", []byte{0x81})
+	add("top_map16_short_header", []byte{0xde, 0x00})
+	add("top_map32_short_header", []byte{0xdf, 0x00, 0x00, 0x00})
+	add("top_map32_huge_count", []byte{0xdf, 0xff, 0xff, 0xff, 0xff})
+
+	for _, bc := range []struct {
+		tag  string
+		data []byte
+	}{{"v", base}, {"nv", noVote}, {"e", empty}} {
+		entries, ok := pdSplit(bc.data)
+		require.True(t, ok, bc.tag)
+		keys := make([]string, len(entries))
+		for i, e := range entries {
+			keys[i] = e.str
+		}
+		if bc.tag == "v" {
+			t.Logf("base keys: %v", keys)
+		}
+		n := uint32(len(entries))
+		prefixKeys := map[string]bool{"rnd": true, "oper": true, "oprop": true, "pv": true}
+
+		// non-minimal map headers
+		add(bc.tag+"_hdr_map16", pdJoin([]byte{0xde, byte(n >> 8), byte(n)}, entries))
+		add(bc.tag+"_hdr_map32", pdJoin([]byte{0xdf, 0, 0, byte(n >> 8), byte(n)}, entries))
+		add(bc.tag+"_hdr_plus1", pdJoin(msgp.AppendMapHeader(nil, n+1), entries))
+		add(bc.tag+"_hdr_minus1", pdJoin(msgp.AppendMapHeader(nil, n-1), entries))
+		add(bc.tag+"_hdr_zero", pdJoin([]byte{0x80}, entries))
+		add(bc.tag+"_hdr_as_array", pdJoin(msgp.AppendArrayHeader(nil, 2*n), entries))
+		add(bc.tag+"_hdr_nil", pdJoin([]byte{0xc0}, entries))
+
+		// each entry dropped, and each prefix field replaced
+		for i, e := range entries {
+			add(fmt.Sprintf("%s_drop_%s", bc.tag, e.str), pdMap(pdWithout(entries, i)))
+			if prefixKeys[e.str] || e.str == "txns" {
+				add(fmt.Sprintf("%s_dup_%s_same", bc.tag, e.str), pdMap(pdInsert(entries, i, e)))
+			}
+		}
+		// order
+		rev := make([]pdEntry, len(entries))
+		for i, e := range entries {
+			rev[len(entries)-1-i] = e
+		}
+		add(bc.tag+"_reversed", pdMap(rev))
+		if i := pdFind(entries, "pv"); i >= 0 {
+			e := entries[i]
+			rest := pdWithout(entries, i)
+			add(bc.tag+"_pv_first", pdMap(append([]pdEntry{e}, rest...)))
+			add(bc.tag+"_pv_last", pdMap(append(append([]pdEntry(nil), rest...), e)))
+			add(bc.tag+"_pv_after_txns", pdMap(pdInsert(rest, pdFind(rest, "txns")+1, e)))
+			add(bc.tag+"_pv_twice", pdMap(pdInsert(entries, i, e)))
+			add(bc.tag+"_pv_only", pdMap([]pdEntry{e}))
+			add(bc.tag+"_pv_nil", pdMap(pdReplaceVal(entries, "pv", []byte{0xc0})))
+			add(bc.tag+"_pv_empty_map", pdMap(pdReplaceVal(entries, "pv", []byte{0x80})))
+			add(bc.tag+"_pv_int", pdMap(pdReplaceVal(entries, "pv", []byte{0x05})))
+			add(bc.tag+"_pv_array0", pdMap(pdReplaceVal(entries, "pv", []byte{0x90})))
+			add(bc.tag+"_pv_str", pdMap(pdReplaceVal(entries, "pv", []byte{0xa1, 'x'})))
+			// unknown fields inside the prior vote
+			vm, ok := pdSplit(e.val)
+			require.True(t, ok)
+			for _, d := range []int{1, 100, 251, 252, 253, 254, 255, 300} {
+				u := pdEntry{key: pdKey("zzzz"), val: pdNested(d), str: "zzzz"}
+				add(fmt.Sprintf("%s_pv_unknown_nested_%d", bc.tag, d), pdMap(pdReplaceVal(entries, "pv", pdMap(append(append([]pdEntry(nil), vm...), u)))))
+			}
+		}
+		if i := pdFind(entries, "rnd"); i >= 0 {
+			for name, val := range map[string][]byte{
+				"zero": {0x00}, "neg": {0xff}, "neg64": {0xd3, 0x80, 0, 0, 0, 0, 0, 0, 0}, "nil": {0xc0}, "str": {0xa1, '7'},
+				"u8": {0xcc, 0x07}, "u16": {0xcd, 0x00, 0x07}, "u32": {0xce, 0, 0, 0, 7}, "u64": {0xcf, 0, 0, 0, 0, 0, 0, 0, 7},
+				"i8": {0xd0, 0x07}, "i16": {0xd1, 0, 7}, "i32": {0xd2, 0, 0, 0, 7}, "i64": {0xd3, 0, 0, 0, 0, 0, 0, 0, 7},
+				"max": {0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, "float": {0xcb, 0x40, 0x1c, 0, 0, 0, 0, 0, 0},
+				"true": {0xc3}, "map": {0x80}, "array": {0x90}, "bin": {0xc4, 0x01, 0x07},
+			} {
+				add(fmt.Sprintf("%s_rnd_%s", bc.tag, name), pdMap(pdReplaceVal(entries, "rnd", val)))
+			}
+			// a second rnd, before and after txns, with another value
+			other := pdEntry{key: pdKey("rnd"), val: []byte{0x08}, str: "rnd"}
+			add(bc.tag+"_rnd_dup_other_before", pdMap(pdInsert(entries, i, other)))
+			add(bc.tag+"_rnd_dup_other_after", pdMap(append(append([]pdEntry(nil), entries...), other)))
+			add(bc.tag+"_rnd_dup_other_after_txns", pdMap(pdInsert(entries, len(entries), other)))
+		}
+		if i := pdFind(entries, "oper"); i >= 0 {
+			other := pdEntry{key: pdKey("oper"), val: []byte{0x09}, str: "oper"}
+			add(bc.tag+"_oper_dup_other_after", pdMap(append(append([]pdEntry(nil), entries...), other)))
+			add(bc.tag+"_oper_neg", pdMap(pdReplaceVal(entries, "oper", []byte{0xff})))
+		}
+		if i := pdFind(entries, "oprop"); i >= 0 {
+			for name, val := range map[string][]byte{
+				"31": append([]byte{0xc4, 31}, make([]byte, 31)...),
+				"33": append([]byte{0xc4, 33}, make([]byte, 33)...),
+				"bin16_32": append([]byte{0xc5, 0, 32}, make([]byte, 32)...),
+				"bin32_32": append([]byte{0xc6, 0, 0, 0, 32}, make([]byte, 32)...),
+				"str32": append([]byte{0xd9, 32}, make([]byte, 32)...),
+				"fixstr31": append([]byte{0xbf}, make([]byte, 31)...),
+				"nil": {0xc0}, "int": {0x01}, "empty_bin": {0xc4, 0},
+			} {
+				add(fmt.Sprintf("%s_oprop_%s", bc.tag, name), pdMap(pdReplaceVal(entries, "oprop", val)))
+			}
+		}
+
+		// key encodings
+		for i, e := range entries {
+			ks := []byte(e.str)
+			forms := map[string][]byte{
+				"str8":   append([]byte{0xd9, byte(len(ks))}, ks...),
+				"str16":  append([]byte{0xda, 0, byte(len(ks))}, ks...),
+				"str32":  append([]byte{0xdb, 0, 0, 0, byte(len(ks))}, ks...),
+				"bin8":   append([]byte{0xc4, byte(len(ks))}, ks...),
+				"bin16":  append([]byte{0xc5, 0, byte(len(ks))}, ks...),
+				"bin32":  append([]byte{0xc6, 0, 0, 0, byte(len(ks))}, ks...),
+				"nil":    {0xc0},
+				"int":    {0x01},
+				"array":  {0x90},
+				"ext":    {0xd4, 0x01, 0x00},
+				"truncd": e.key[:len(e.key)-1],
+			}
+			if i < 6 || e.str == "pv" || e.str == "txns" {
+				for name, k := range forms {
+					add(fmt.Sprintf("%s_key_%s_%s", bc.tag, e.str, name), pdMap(pdReplaceKey(entries, i, k)))
+				}
+			}
+		}
+
+		// unknown keys in front of the prefix fields, around "txns"
+		first := entries[0]
+		_ = first
+		for _, k := range []string{"aaa", "a", "txn", "txns", "txnsa", "txo", "zzz", "", "TXNS", "\xff"} {
+			u := pdEntry{key: pdKey(k), val: []byte{0x01}, str: k}
+			add(fmt.Sprintf("%s_unknown_key_%q_first", bc.tag, k), pdMap(append([]pdEntry{u}, entries...)))
+			add(fmt.Sprintf("%s_unknown_key_%q_last", bc.tag, k), pdMap(append(append([]pdEntry(nil), entries...), u)))
+		}
+		// "txns" itself as a non-array before the prefix fields
+		u := pdEntry{key: pdKey("txns"), val: []byte{0x01}, str: "txns"}
+		add(bc.tag+"_txns_int_first", pdMap(append([]pdEntry{u}, entries...)))
+		// deeply nested unknown values, in the prefix and after it
+		for _, d := range []int{1, 100, 252, 253, 254, 255, 256, 400} {
+			u := pdEntry{key: pdKey("aaa"), val: pdNested(d), str: "aaa"}
+			add(fmt.Sprintf("%s_unknown_nested_%d_first", bc.tag, d), pdMap(append([]pdEntry{u}, entries...)))
+			add(fmt.Sprintf("%s_unknown_nested_%d_last", bc.tag, d), pdMap(append(append([]pdEntry(nil), entries...), u)))
+			// the same depth as maps
+			var m []byte
+			for i := 0; i < d; i++ {
+				m = append(m, 0x81, 0xa1, 'k')
+			}
+			m = append(m, 0xc0)
+			um := pdEntry{key: pdKey("aaa"), val: m, str: "aaa"}
+			add(fmt.Sprintf("%s_unknown_nestedmap_%d_first", bc.tag, d), pdMap(append([]pdEntry{um}, entries...)))
+		}
+		// unknown values of every msgpack kind
+		for name, val := range map[string][]byte{
+			"empty_array": {0x90}, "empty_map": {0x80}, "array16_empty": {0xdc, 0, 0}, "map16_empty": {0xde, 0, 0},
+			"array32_declares_big": {0xdd, 0xff, 0xff, 0xff, 0xff}, "map32_declares_big": {0xdf, 0xff, 0xff, 0xff, 0xff},
+			"ext": {0xd4, 0x01, 0x00}, "ext8": {0xc7, 0x01, 0x01, 0x00}, "float": {0xca, 0, 0, 0, 0}, "invalid_c1": {0xc1},
+			"str_trunc": {0xa5, 'a'}, "bin_trunc": {0xc4, 9, 1}, "array_trunc": {0x93, 1, 2},
+		} {
+			u := pdEntry{key: pdKey("aaa"), val: val, str: "aaa"}
+			add(fmt.Sprintf("%s_unknown_value_%s", bc.tag, name), pdMap(append([]pdEntry{u}, entries...)))
+		}
+
+		// the 64 KiB prefix limit: pad so that the "txns" key, where the parse
+		// stops, ends at limit-2 .. limit+2
+		if bc.tag == "v" {
+			for _, delta := range []int{-2, -1, 0, 1, 2} {
+				padKey := pdKey("aaa")
+				ti := pdFind(entries, "txns")
+				// the bytes up to and including the "txns" key, with an empty pad
+				head := pdMap(append([]pdEntry{{key: padKey, val: []byte{0xc6, 0, 0, 0, 0}, str: "aaa"}}, entries[:ti]...))
+				headLen := len(head) + len(entries[ti].key)
+				pad := payloadPrefixLimit + delta - headLen
+				if pad < 0 {
+					t.Fatalf("pad %d", pad)
+				}
+				val := append([]byte{0xc6, byte(pad >> 24), byte(pad >> 16), byte(pad >> 8), byte(pad)}, make([]byte, pad)...)
+				p := pdEntry{key: padKey, val: val, str: "aaa"}
+				add(fmt.Sprintf("v_pad_txns_key_end_limit%+d", delta), pdMap(append([]pdEntry{p}, entries...)))
+			}
+			// a payload bigger than the limit that is entirely canonical: a huge payset
+			var many []transactions.Transaction
+			for i := 0; i < 700; i++ {
+				many = append(many, pdTxn(genesisHash, byte(i)))
+			}
+			// distinct transactions, unique senders by note
+			for i := range many {
+				many[i].Note = []byte(fmt.Sprintf("%d-padpadpadpadpadpadpadpadpadpadpadpadpadpad", i))
+			}
+			add("big_payset_canonical", pdPayload(pdBlock(protocol.ConsensusCurrentVersion, 7, many), 2, pv))
+		}
+	}
+	return cases
+}
+
+func pdOne(c pdCase) (row pdRow) {
+	row.Name = c.name
+	row.Hex = hex.EncodeToString(c.data)
+	defer func() {
+		if r := recover(); r != nil {
+			row.Parse.Err = fmt.Sprintf("PANIC: %v", r)
+		}
+	}()
+
+	pp, err := parsePayloadPrefix(c.data)
+	row.Parse = pdParse{Ok: err == nil, Round: uint64(pp.round), Oper: uint64(pp.originalPeriod),
+		Oprop: hex.EncodeToString(pp.originalProposer[:]), NumEntries: pp.numEntries, EntriesStart: pp.entriesStartIdx,
+		VoteStart: pp.voteStartIdx, VoteEnd: pp.voteEndIdx, Vote: pdSum(protocol.Encode(&pp.priorVote))}
+	if err != nil {
+		row.Parse.Err = err.Error()
+	}
+
+	var sb strings.Builder
+	err = writeProposalEncoding(&sb, c.data)
+	row.Enc = pdHash{Ok: err == nil}
+	if err != nil {
+		row.Enc.Err = err.Error()
+	} else {
+		row.Enc.Hash = pdSum([]byte(sb.String()))
+	}
+
+	d, err := payloadEncodingDigest(c.data)
+	row.Digest = pdHash{Ok: err == nil}
+	if err != nil {
+		row.Digest.Err = err.Error()
+	} else {
+		row.Digest.Hash = hex.EncodeToString(d[:])
+	}
+
+	o, err := decodeProposal(c.data)
+	if err != nil {
+		row.Proposal = pdProposal{Err: err.Error()}
+		return row
+	}
+	cm := o.(compoundMessage)
+	row.Proposal = pdProposal{Ok: true, Round: uint64(cm.Proposal.Round()), Oper: uint64(cm.Proposal.OriginalPeriod),
+		Oprop: hex.EncodeToString(cm.Proposal.OriginalProposer[:]), Vote: pdSum(protocol.Encode(&cm.Vote))}
+
+	row.Deferred = map[string]*pdDeferred{}
+	wanted := map[string][]crypto.Digest{"none": nil, "other": {{0xee}}}
+	if row.Digest.Ok {
+		wanted["own"] = []crypto.Digest{d}
+		wanted["own_and_other"] = []crypto.Digest{{0xee}, d}
+	}
+	for name, w := range wanted {
+		up, err := decodeDeferredPayload(cm.Proposal, w)
+		res := &pdDeferred{Ok: err == nil}
+		if err != nil {
+			res.Err = err.Error()
+		} else {
+			res.BlockDigest = hex.EncodeToString(func() []byte { x := up.Digest(); return x[:] }())
+			e := crypto.HashObj(up)
+			res.EncDigest = hex.EncodeToString(e[:])
+		}
+		row.Deferred[name] = res
+	}
+	return row
+}
+
+func TestPayloadDeferralOracle(t *testing.T) {
+	out, err := os.Create(os.Getenv("PD_OUT"))
+	require.NoError(t, err)
+	defer out.Close()
+	w := bufio.NewWriter(out)
+	defer w.Flush()
+	cases := pdCases(t)
+	sort.SliceStable(cases, func(i, j int) bool { return cases[i].name < cases[j].name })
+	for _, c := range cases {
+		b, err := json.Marshal(pdOne(c))
+		require.NoError(t, err)
+		w.Write(b)
+		w.WriteByte('\n')
+	}
+	t.Logf("wrote %d rows", len(cases))
+}

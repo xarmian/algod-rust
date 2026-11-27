@@ -541,6 +541,26 @@ impl ProposalStore {
                 }
             }
 
+            EventType::ReadWantedPayloads => {
+                let mut ce = match e {
+                    Event::WantedPayloads(ce) => ce,
+                    _ => panic!("proposalStore: expected WantedPayloadsEvent"),
+                };
+                // The proposal-values of the payload's original period and
+                // proposer that have neither been filled nor assembled.
+                for (pv, ea) in &self.assemblers {
+                    if pv.original_period != ce.original_period
+                        || pv.original_proposer != ce.original_proposer
+                    {
+                        continue;
+                    }
+                    if !ea.assembled && !ea.filled {
+                        ce.encoding_digests.push(pv.encoding_digest);
+                    }
+                }
+                Event::WantedPayloads(ce)
+            }
+
             EventType::ReadPinned => {
                 let mut se = match e {
                     Event::PinnedValue(se) => se,

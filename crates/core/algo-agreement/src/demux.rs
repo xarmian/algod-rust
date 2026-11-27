@@ -92,7 +92,7 @@ fn rate_limit_allows(
 
 /// Count one unknown-protocol proposal drop and, rate-limited, warn with the
 /// escaped/truncated protocol and the running total.
-fn note_unknown_protocol_drop(protocol: &str) {
+pub(crate) fn note_unknown_protocol_drop(protocol: &str) {
     let total = UNKNOWN_PROTOCOL_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -689,7 +689,7 @@ impl Demux {
     /// Decodes the vote from wire format and constructs a `VotePresent` event.
     fn handle_raw_vote(&self, msg: Message) -> Option<ExternalEvent> {
         match codec::decode_vote(&msg.data) {
-            Ok(vote) => {
+            Ok(mut vote) => {
                 // Mirrors Go's `decodeVote` (agreement/message.go,
                 // v5.0.2-stable): a stateless well-formedness check
                 // (step > down rejected) is enforced at decode time, as
@@ -701,6 +701,9 @@ impl Demux {
                     }
                     return None;
                 }
+                // go's `clearPKSigOld`: no verifier reads PKSigOld, and the
+                // vote stays valid without it.
+                vote.sig.pk_sig_old = [0u8; 64];
                 let internal = InternalMessage {
                     message_handle: msg.handle,
                     tag: AGREEMENT_VOTE_TAG.to_string(),
@@ -738,90 +741,20 @@ impl Demux {
         msg: Message,
         consensus_version: &ConsensusVersionView,
     ) -> Option<ExternalEvent> {
-        match codec::decode_compound_message(&msg.data) {
-            Ok(compound) => {
-                // Mirrors Go's `decodeProposal` (agreement/message.go,
-                // v5.0.2-stable): the embedded prior-vote's stateless
-                // well-formedness (step > down rejected) is checked at
-                // decode time, as defense in depth ahead of `verify()`'s
-                // own check.
-                // Like every proposal decode failure it drops the proposal
-                // without disconnecting the peer (see the `Err` arm below).
-                if let Err(e) = compound.vote.well_formed() {
-                    warn!(
-                        len = msg.data.len(),
-                        prefix = %hex_prefix(&msg.data, 96),
-                        "dropping proposal that failed to decode: {}",
-                        e
-                    );
-                    return None;
-                }
-                // Group-level structural screen (Go: `agreement/message.go`'s
-                // `proposalCarriesInvalidTxn`, called from `demux.go`'s
-                // `tokenizeMessages`). A proposal whose payset fails this
-                // screen is silently dropped — logged, but the peer is NOT
-                // disconnected, like a decode failure below.
-                if let Err(e) = algo_validate::check_payset(
-                    &compound.proposal.block.payset,
-                    // go: `config.Consensus[up.Block.CurrentProtocol].AllowGroupedHeartbeats`;
-                    // an unknown protocol is rejected later (`BlockHeader.PreCheck`).
-                    algo_types::consensus::allow_grouped_heartbeats_for_protocol(
-                        &compound.proposal.block.current_protocol,
-                    ),
-                ) {
-                    warn!(
-                        len = msg.data.len(),
-                        prefix = %hex_prefix(&msg.data, 96),
-                        "dropping proposal with a malformed transaction payload: {}",
-                        e
-                    );
-                    return None;
-                }
-                // go-algorand v4.7.4-stable (`checks: recompute group IDs`,
-                // commit b07049dfb) folded a cryptographic check into this
-                // same early screen: each payset group's claimed `Group`
-                // digest must actually commit to (be the hash of) its
-                // member transactions, and the group must not exceed the
-                // max group size. `check_payset` above only detects group
-                // *boundaries*; it never recomputes the hash. Without this,
-                // a proposal whose `Group` field doesn't commit to its
-                // transactions would pass this early screen and only be
-                // caught later, in full block validation.
-                // The payset strips genesis ID/hash; the group ID commits to
-                // the full transaction, so restore them from the block
-                // header first (issue #1686).
-                // An unknown protocol is go's `consensus protocol %s not
-                // found` decode failure (issue #1728): drop the proposal.
-                let restored =
-                    match algo_validate::restore_payset_genesis_fields(&compound.proposal.block) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            // Distinct from malformed bytes (decode errors
-                            // below): the proposal decoded fine but names a
-                            // protocol this node does not know. No peer
-                            // penalty change. This runs before any
-                            // authentication on a peer-controlled string, so
-                            // the string is escaped + truncated and the log
-                            // is rate-limited; every drop is counted.
-                            note_unknown_protocol_drop(&e.protocol);
-                            return None;
-                        }
-                    };
-                if let Err(e) = algo_validate::validate_transaction_group(&restored) {
-                    warn!(
-                        len = msg.data.len(),
-                        prefix = %hex_prefix(&msg.data, 96),
-                        "dropping proposal with a transaction group that fails group-ID verification: {}",
-                        e
-                    );
-                    return None;
-                }
-                Some(setup_compound_message_from_network(
-                    compound,
-                    msg.handle,
-                    consensus_version,
-                ))
-            }
+        // go's `decodeProposal` (agreement/message.go, v5.1.1-stable) reads
+        // only the fields before the payset, the prior vote's stateless
+        // well-formedness (step > down rejected) included. The payset is
+        // decoded, and screened (`proposalCarriesInvalidTxn`), once the
+        // proposalStore wants the payload: see `Player::decode_payload_if_wanted`.
+        // A proposal that fails here is dropped, logged, without disconnecting
+        // the peer, like a vote's or a bundle's decode failure is not.
+        let data: Arc<[u8]> = Arc::from(msg.data);
+        match crate::payload_deferral::decode_proposal(Arc::clone(&data)) {
+            Ok(compound) => Some(setup_compound_message_from_network(
+                compound,
+                msg.handle,
+                consensus_version,
+            )),
             Err(e) => {
                 // go's `tokenizeMessages` (agreement/demux.go, since
                 // v4.7.2-stable commit 2fd42e446 "transactions: updates for
@@ -830,8 +763,8 @@ impl Demux {
                 // a payload over a msgp allocbound (issue #2427) is such a
                 // failure.
                 warn!(
-                    len = msg.data.len(),
-                    prefix = %hex_prefix(&msg.data, 96),
+                    len = data.len(),
+                    prefix = %hex_prefix(&data, 96),
                     "dropping proposal that failed to decode: {}",
                     e
                 );
@@ -845,7 +778,7 @@ impl Demux {
     /// Decodes the bundle from wire format and constructs a `BundlePresent` event.
     fn handle_raw_bundle(&self, msg: Message) -> Option<ExternalEvent> {
         match codec::decode_bundle(&msg.data) {
-            Ok(bundle) => {
+            Ok(mut bundle) => {
                 // Mirrors Go's `decodeBundle` (agreement/message.go,
                 // v5.0.2-stable): a stateless well-formedness check
                 // (step > down rejected) is enforced at decode time, as
@@ -856,6 +789,15 @@ impl Demux {
                         net.disconnect(&msg.handle);
                     }
                     return None;
+                }
+                // go's `clearPKSigOld` on every signature of the bundle
+                for v in &mut bundle.votes {
+                    v.sig.pk_sig_old = [0u8; 64];
+                }
+                for ev in &mut bundle.equivocation_votes {
+                    for sig in &mut ev.sigs {
+                        sig.pk_sig_old = [0u8; 64];
+                    }
                 }
                 let internal = InternalMessage {
                     message_handle: msg.handle,
@@ -1432,7 +1374,7 @@ mod tests {
         let encoded = codec::encode_compound_message(&compound);
         pp_tx
             .send(Message {
-                data: encoded,
+                data: encoded.clone(),
                 handle: None,
             })
             .unwrap();
@@ -1475,6 +1417,28 @@ mod tests {
         assert!(unknown_protocol_drop_count() > before);
     }
 
+    /// go's `decodeProposal` reads only the prefix of a proposal payload, so
+    /// the demux passes on a payload whose payset is malformed (go v5.1.1
+    /// moved `proposalCarriesInvalidTxn` and the payset decode out of the
+    /// demux): the payload is refused when the player decodes it, even if its
+    /// proposal-value is waiting for it. `encoded` is the payload received.
+    fn assert_refused_when_decoded(result: Option<ExternalEvent>, encoded: &[u8], why: &str) {
+        let event = result
+            .unwrap_or_else(|| panic!("{why}: the demux passes the payload on undecoded"))
+            .event;
+        let Event::Message(me) = event else {
+            panic!("{why}: expected a message event")
+        };
+        assert_eq!(me.t, EventType::PayloadPresent, "{why}");
+        let stub = me.input.unauthenticated_proposal;
+        assert!(stub.deferred_payload.is_some(), "{why}: payload deferred");
+        let wanted = crate::payload_deferral::payload_encoding_digest(encoded).unwrap();
+        assert!(
+            crate::payload_deferral::decode_deferred_payload(&stub, &[wanted]).is_err(),
+            "{why}: the deferred decode must refuse the payload"
+        );
+    }
+
     #[test]
     fn demux_raw_proposal_with_unknown_protocol_is_dropped() {
         let (demux, ..) = make_test_demux();
@@ -1484,6 +1448,14 @@ mod tests {
                 block: algo_types::Block {
                     round: Round(1),
                     current_protocol: "no-such-protocol".into(),
+                    payset: vec![algo_types::SignedTransaction {
+                        txn: algo_types::Transaction {
+                            txn_type: algo_types::TxnType::from("pay"),
+                            sender: Address([1u8; 32]),
+                            ..algo_types::Transaction::default()
+                        },
+                        ..algo_types::SignedTransaction::default()
+                    }],
                     ..algo_types::Block::default()
                 },
                 seed_proof: [0u8; crate::VRF_PROOF_SIZE],
@@ -1492,24 +1464,23 @@ mod tests {
                 ..crate::proposal::UnauthenticatedProposal::default()
             },
         };
+        let encoded = codec::encode_compound_message(&compound);
         let result = demux.handle_raw_proposal(
             Message {
-                data: codec::encode_compound_message(&compound),
+                data: encoded.clone(),
                 handle: None,
             },
             &ConsensusVersionView::default(),
         );
-        assert!(result.is_none());
+        assert_refused_when_decoded(result, &encoded, "unknown protocol");
     }
 
     #[test]
-    fn demux_raw_proposal_with_malformed_payset_is_dropped_not_disconnected() {
-        // go-algorand v4.7.2-stable: `agreement/message.go`'s
-        // `proposalCarriesInvalidTxn`, called from `demux.go`'s
-        // `tokenizeMessages`. A proposal that decodes fine but whose block
-        // payset fails the group-level `CheckPayset` screen is silently
-        // dropped — logged, but NOT a disconnect-worthy malformed message
-        // like an actual decode failure is.
+    fn demux_raw_proposal_with_unknown_txn_type_is_not_screened_before_validation() {
+        // go-algorand v5.1.1-stable: `checkTxnGroup` no longer rejects an
+        // unknown transaction type (#6728); `WellFormed` does, later. The
+        // demux passes the payload on, the deferred decode accepts it, and no
+        // peer is disconnected.
         use crate::stubs::StubNetwork;
         use algo_types::{SignedTransaction, Transaction, TxnType};
 
@@ -1519,8 +1490,7 @@ mod tests {
         let stub = Arc::new(StubNetwork::new());
         demux.set_network(stub.clone() as Arc<dyn AgreementNetwork + Send + Sync>);
 
-        // A payset containing a transaction of an unrecognized type — one of
-        // the five checkTxnGroup rejection cases.
+        // A payset containing a transaction of an unrecognized type.
         let bogus_txn = SignedTransaction {
             txn: Transaction {
                 txn_type: TxnType::from("bogus"),
@@ -1547,7 +1517,7 @@ mod tests {
         let encoded = codec::encode_compound_message(&compound);
         pp_tx
             .send(Message {
-                data: encoded,
+                data: encoded.clone(),
                 handle: None,
             })
             .unwrap();
@@ -1558,10 +1528,20 @@ mod tests {
         let signals = default_signals();
         let result = demux.next(&signals, None);
 
-        assert!(result.is_none(), "dropped proposal yields no event");
+        // go v5.1 (`checkTxnGroup`, "remove obsolete checks", #6728) no longer
+        // rejects an unknown transaction type here: `WellFormed` does, later,
+        // so a proposal carrying one is neither dropped nor refused (the
+        // oracle row `unknown_txn_type` of `payload_deferral/cases.jsonl`).
+        let event = result.expect("passed on undecoded").event;
+        let Event::Message(me) = event else {
+            panic!("expected a message event")
+        };
+        let received = me.input.unauthenticated_proposal;
+        let wanted = crate::payload_deferral::payload_encoding_digest(&encoded).unwrap();
+        assert!(crate::payload_deferral::decode_deferred_payload(&received, &[wanted]).is_ok());
         assert!(
             stub.disconnected.lock().unwrap().is_empty(),
-            "a malformed-payset proposal must be dropped, not disconnect the peer"
+            "a proposal that is passed on must not disconnect the peer"
         );
     }
 
@@ -1639,16 +1619,13 @@ mod tests {
 
         let result = demux.handle_raw_proposal(
             Message {
-                data: encoded,
+                data: encoded.clone(),
                 handle: None,
             },
             &ConsensusVersionView::default(),
         );
 
-        assert!(
-            result.is_none(),
-            "a proposal carrying a malformed StateProof path must be dropped"
-        );
+        assert_refused_when_decoded(result, &encoded, "malformed StateProof path");
         assert!(
             stub.disconnected.lock().unwrap().is_empty(),
             "a malformed-state-proof proposal must be dropped, not disconnect the peer"
@@ -1716,7 +1693,7 @@ mod tests {
         let encoded = codec::encode_compound_message(&compound);
         pp_tx
             .send(Message {
-                data: encoded,
+                data: encoded.clone(),
                 handle: None,
             })
             .unwrap();
@@ -1727,10 +1704,7 @@ mod tests {
         let signals = default_signals();
         let result = demux.next(&signals, None);
 
-        assert!(
-            result.is_none(),
-            "a proposal whose group ID doesn't commit to its transactions must be dropped"
-        );
+        assert_refused_when_decoded(result, &encoded, "group ID does not commit");
         assert!(
             stub.disconnected.lock().unwrap().is_empty(),
             "a group-ID-mismatch proposal must be dropped, not disconnect the peer"
@@ -1904,7 +1878,7 @@ mod tests {
         let encoded = codec::encode_compound_message(&compound);
         pp_tx
             .send(Message {
-                data: encoded,
+                data: encoded.clone(),
                 handle: None,
             })
             .unwrap();
@@ -1915,10 +1889,7 @@ mod tests {
         let signals = default_signals();
         let result = demux.next(&signals, None);
 
-        assert!(
-            result.is_none(),
-            "a proposal with a group larger than MAX_GROUP_SIZE must be dropped"
-        );
+        assert_refused_when_decoded(result, &encoded, "group larger than MAX_GROUP_SIZE");
         assert!(
             stub.disconnected.lock().unwrap().is_empty(),
             "an oversized-group proposal must be dropped, not disconnect the peer"
@@ -2078,14 +2049,15 @@ mod tests {
         assert!(codec::decode_compound_message(&payload(4096)).is_ok());
         assert!(codec::decode_compound_message(&payload(4097)).is_err());
 
+        let over = payload(4097);
         let result = demux.handle_raw_proposal(
             Message {
-                data: payload(4097),
+                data: over.clone(),
                 handle: None,
             },
             &ConsensusVersionView::default(),
         );
-        assert!(result.is_none(), "an over-bound proposal must be dropped");
+        assert_refused_when_decoded(result, &over, "over-bound payset");
         assert!(
             stub.disconnected.lock().unwrap().is_empty(),
             "a proposal that fails to decode is dropped without disconnecting the peer"

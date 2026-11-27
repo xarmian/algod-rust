@@ -68,20 +68,31 @@ pub fn read_key_bytes<'a>(rd: &mut &'a [u8]) -> Result<&'a [u8]> {
     if (0xa0..=0xbf).contains(&b) {
         len = (b & 0x1f) as usize;
         *rd = &rd[1..];
-    } else if b == 0xd9 {
-        // str8
+    } else if b == 0xd9 || b == 0xc4 {
+        // str8 / bin8 (go's `ReadMapKeyZC` reads a bin key as a string, #2552)
         if rd.len() < 2 {
             return Err(codec_err("read_key_bytes: str8 unexpected EOF"));
         }
         len = rd[1] as usize;
         *rd = &rd[2..];
-    } else if b == 0xda {
-        // str16
+    } else if b == 0xda || b == 0xc5 {
+        // str16 / bin16
         if rd.len() < 3 {
             return Err(codec_err("read_key_bytes: str16 unexpected EOF"));
         }
         len = u16::from_be_bytes([rd[1], rd[2]]) as usize;
         *rd = &rd[3..];
+    } else if b == 0xdb || b == 0xc6 {
+        // str32 / bin32
+        if rd.len() < 5 {
+            return Err(codec_err("read_key_bytes: str32 unexpected EOF"));
+        }
+        len = u32::from_be_bytes([rd[1], rd[2], rd[3], rd[4]]) as usize;
+        *rd = &rd[5..];
+    } else if b == 0xc0 {
+        // nil: go's `ReadStringZC` reads it as the empty key
+        *rd = &rd[1..];
+        return Ok(&[]);
     } else {
         return Err(codec_err(format!(
             "read_key_bytes: expected string marker, got 0x{b:02x}"

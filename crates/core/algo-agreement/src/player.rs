@@ -1054,13 +1054,66 @@ impl Player {
         self.step >= PARTITION_STEP || self.period >= Period(3)
     }
 
+    /// Decodes `deferred`, a payload that arrived undecoded, if a
+    /// proposal-value in its round's proposalStore is waiting for a payload
+    /// with its encoding digest. Otherwise it returns an error without
+    /// decoding the payset. If no proposal-value from the payload's original
+    /// period and proposer is waiting for a payload, it does not hash the
+    /// payload either.
+    ///
+    /// It refuses a payload of any round but `round` and `round + 1`. The
+    /// proposalManager would send it to the proposalStore of `round + 1`,
+    /// where it matches nothing.
+    ///
+    /// Mirrors Go's `player.decodePayloadIfWanted`.
+    fn decode_payload_if_wanted(
+        &mut self,
+        router: &mut RootRouter,
+        deferred: &crate::proposal::UnauthenticatedProposal,
+        params: &ConsensusParams,
+    ) -> Result<crate::proposal::UnauthenticatedProposal, String> {
+        let rnd = deferred.round();
+        if rnd != self.round && rnd != Round(self.round.0 + 1) {
+            return Err(format!(
+                "ignoring proposal payload for round {} in round {}",
+                rnd.0, self.round.0
+            ));
+        }
+        let qe = Event::WantedPayloads(crate::events::WantedPayloadsEvent {
+            round: rnd,
+            original_period: deferred.original_period,
+            original_proposer: deferred.original_proposer,
+            encoding_digests: Vec::new(),
+        });
+        let ce = match router.dispatch(
+            self,
+            qe,
+            StateMachineTag::ProposalMachineRound,
+            rnd,
+            Period(0),
+            Step(0),
+            params,
+        ) {
+            Event::WantedPayloads(ce) => ce,
+            other => panic!("decodePayloadIfWanted: expected wantedPayloadsEvent, got {other}"),
+        };
+        if ce.encoding_digests.is_empty() {
+            return Err(format!(
+                "proposalStore: no proposal-value from period {} proposer {:?} wants a payload",
+                deferred.original_period.0, deferred.original_proposer
+            ));
+        }
+        crate::payload_deferral::decode_deferred_payload(deferred, &ce.encoding_digests)
+            .map_err(|e| e.0)
+    }
+
     /// Handle a message event (vote, proposal, or bundle).
     ///
     /// Mirrors Go's `player.handleMessageEvent`.
     fn handle_message_event(
         &mut self,
         router: &mut RootRouter,
-        e: MessageEvent,
+        mut e: MessageEvent,
         params: &ConsensusParams,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
@@ -1070,7 +1123,7 @@ impl Player {
             && e.input.unauthenticated_vote.raw_vote.step == PROPOSE;
 
         // Wrap message event with current player state for freshness
-        let delegated_e = FilterableMessageEvent {
+        let mut delegated_e = FilterableMessageEvent {
             message_event: e.clone(),
             freshness_data: crate::events::FreshnessData {
                 player_round: self.round,
@@ -1086,6 +1139,30 @@ impl Player {
 
         match e.t {
             EventType::PayloadPresent | EventType::PayloadVerified => {
+                // A payload that arrived undecoded (see
+                // `payload_deferral::decode_proposal`) is decoded only if a
+                // proposal-value in its round's proposalStore is waiting for
+                // a payload with its encoding digest.
+                if e.t == EventType::PayloadPresent
+                    && e.input.unauthenticated_proposal.deferred_payload.is_some()
+                {
+                    match self.decode_payload_if_wanted(
+                        router,
+                        &e.input.unauthenticated_proposal,
+                        params,
+                    ) {
+                        Ok(up) => {
+                            e.input.unauthenticated_proposal = up;
+                            delegated_e.message_event = e.clone();
+                        }
+                        Err(err) => {
+                            return vec![crate::actions::ignore_action(
+                                &e,
+                                crate::events::SerializableError::new(err),
+                            )];
+                        }
+                    }
+                }
                 let ef = router.dispatch(
                     self,
                     Event::FilterableMessage(delegated_e.clone()),

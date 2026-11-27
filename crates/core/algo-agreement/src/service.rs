@@ -1604,6 +1604,22 @@ fn do_action<N, L, BV, C>(
     }
 }
 
+/// Peers close their connection to the sender of a message longer than
+/// `Tag.MaxMessageSize`, so one is not sent (go: `networkAction.do`).
+fn within_max_message_size(tag_str: &'static str, data: &[u8]) -> bool {
+    let max_size = Tag(tag_str).max_message_size();
+    if data.len() as u64 > max_size {
+        warn!(
+            "agreement: not sending {} message of {} bytes, the limit is {}",
+            tag_str,
+            data.len(),
+            max_size
+        );
+        return false;
+    }
+    true
+}
+
 /// Execute a network action (broadcast, relay, disconnect, ignore).
 ///
 /// Mirrors Go's `networkAction.do`.
@@ -1635,6 +1651,9 @@ fn do_network_action<N: AgreementNetwork>(
         }
         ActionType::Broadcast => {
             if let Some((tag_str, data)) = encode_network_payload(na) {
+                if !within_max_message_size(tag_str, &data) {
+                    return;
+                }
                 // Fire the test-only checkpoint hook immediately before a
                 // node's OWN proposal-payload broadcast reaches the network
                 // — see `ProposeBroadcastHook`'s doc comment. Scoped to this
@@ -1657,6 +1676,9 @@ fn do_network_action<N: AgreementNetwork>(
         }
         ActionType::Relay => {
             if let Some((tag_str, data)) = encode_network_payload(na) {
+                if !within_max_message_size(tag_str, &data) {
+                    return;
+                }
                 // A relay with NO message handle is a locally originated
                 // message (Go: `relayAction` with a nil handle -- the
                 // proposer's own compound message; see player.rs "Relay as
@@ -1930,6 +1952,24 @@ impl<L: LedgerReader + Send + Sync + 'static> LedgerReader for LedgerReaderRef<L
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// go's `networkAction.do` sends nothing longer than
+    /// `Tag.MaxMessageSize` (issue #2552): peers close the connection to the
+    /// sender of such a message.
+    #[test]
+    fn a_message_over_the_tag_limit_is_not_sent() {
+        for (tag, max) in [
+            (AGREEMENT_VOTE_TAG, 1228usize),
+            (PROPOSAL_PAYLOAD_TAG, 0x501e3a),
+            (VOTE_BUNDLE_TAG, 6 * 1024 * 1024),
+        ] {
+            assert!(within_max_message_size(tag, &vec![0u8; max]), "{tag} at the limit");
+            assert!(
+                !within_max_message_size(tag, &vec![0u8; max + 1]),
+                "{tag} one byte over"
+            );
+        }
+    }
     use crate::certificate::Certificate;
     use crate::stubs::{
         StubBlockFactory, StubBlockValidator, StubCryptoVerifier, StubEventsProcessingMonitor,
