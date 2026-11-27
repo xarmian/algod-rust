@@ -1189,9 +1189,10 @@ fn deserialize_box_ref_name<'de, D: serde::Deserializer<'de>>(
 }
 
 impl BoxRef {
-    /// Mirrors go-algorand's `BoxRef.Empty()`.
+    /// Mirrors go-algorand's `BoxRef.Empty()`: `Name` is tested by length
+    /// (v5.1, #6728), so an empty name is an absent one.
     pub fn is_empty(&self) -> bool {
-        self.index == 0 && self.name.is_none()
+        self.index == 0 && self.name.as_ref().is_none_or(|n| n.is_empty())
     }
 }
 

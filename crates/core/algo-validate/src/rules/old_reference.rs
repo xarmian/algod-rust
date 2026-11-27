@@ -1031,6 +1031,18 @@ fn classify_wellformed_delta(
     {
         return Some("whole-struct heartbeat proof emptiness");
     }
+    // 3. go v5.1 (#6728): `checkTxnGroup` no longer rejects an unknown type
+    //    for the block path, so `WellFormed` does, on every path.
+    if old.is_ok()
+        && new.is_err()
+        && !matches!(
+            t.txn_type.as_str(),
+            "pay" | "keyreg" | "acfg" | "axfer" | "afrz" | "appl" | "stpf" | "hb"
+        )
+        && message(new).starts_with("unknown tx type ")
+    {
+        return Some("unknown type rejected on every path");
+    }
     None
 }
 
@@ -1058,30 +1070,6 @@ fn wellformed_verdicts_match_the_old_validator_on_random_transactions() {
         let spec_arg = if rng.chance(4) { None } else { Some(&sp) };
         let old = old_validate_transaction_wellformed(&t, pool, p, spec_arg);
         let new = validate_transaction_wellformed(&t, pool, p, spec_arg);
-        // The admission mode only ever rejects MORE (an unknown type).
-        let adm = validate_transaction_wellformed_in_mode(
-            &t,
-            pool,
-            p,
-            spec_arg,
-            WellFormedMode::Admission,
-        );
-        if new.is_err() {
-            assert!(
-                adm.is_err(),
-                "#{i}: admission accepted what block mode rejects"
-            );
-        }
-        if verdict(&adm) != verdict(&new) {
-            assert!(
-                new.is_ok()
-                    && !matches!(
-                        t.txn_type.as_str(),
-                        "pay" | "keyreg" | "acfg" | "axfer" | "afrz" | "appl" | "stpf" | "hb"
-                    ),
-                "#{i}: admission differs from block mode for a known type: {t:?}"
-            );
-        }
         accepted += u32::from(new.is_ok());
         if verdict(&old) != verdict(&new) {
             let name = classify_wellformed_delta(&t, p, &old, &new).unwrap_or_else(|| {
@@ -1268,6 +1256,10 @@ fn verdicts_match_the_old_validators_on_every_oracle_row() {
             for pool in [false, true] {
                 let old = old_validate_transaction_wellformed(&stx.txn, pool, &params, Some(&sp));
                 let new = validate_transaction_wellformed(&stx.txn, pool, &params, Some(&sp));
+                if classify_wellformed_delta(&stx.txn, &params, &old, &new).is_some() {
+                    // a deliberate delta (go v5.1: unknown type), see its table
+                    continue;
+                }
                 assert_eq!(
                     verdict(&old),
                     verdict(&new),
@@ -1388,17 +1380,14 @@ fn wellformed_matches_go_on_every_consensus_version() {
             algo_codec::decode_signed_txn_stream(&b64(r["txn"].as_str().unwrap())).expect("txn");
         let txn = stx.remove(0).txn;
         let want = r["error"].as_str().unwrap();
-        for mode in [WellFormedMode::Block, WellFormedMode::Admission] {
-            let got = message(&validate_transaction_wellformed_in_mode(
-                &txn,
-                true,
-                &params,
-                Some(&sp),
-                mode,
-            ));
-            if got != want {
-                mismatches.push(format!("{name} @ {version}: go {want:?}, rust {got:?}"));
-            }
+        let got = message(&validate_transaction_wellformed(
+            &txn,
+            true,
+            &params,
+            Some(&sp),
+        ));
+        if got != want {
+            mismatches.push(format!("{name} @ {version}: go {want:?}, rust {got:?}"));
         }
         if name == "proto_hb_valid_fields" {
             if params.enable_heartbeat {

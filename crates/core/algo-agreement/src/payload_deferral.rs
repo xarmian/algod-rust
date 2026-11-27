@@ -504,35 +504,20 @@ pub fn decode_proposal(data: Arc<[u8]>) -> Result<CompoundMessage> {
 }
 
 /// go v5.1.1's `checkTxnGroup` (`data/transactions/checks.go`) for one run of
-/// the payset: the state proof payload rule, the rule that keeps a heartbeat
-/// out of a resource group (unless the protocol allows it), and the group-ID
-/// rules (go's `checkTxnGroupID`: size, consistency, duplicates, commitment).
+/// the payset: `algo_validate::check_txn_group` (the state proof payload rule
+/// and the rule that keeps a heartbeat out of a resource group unless the
+/// protocol allows it), then the group-ID rules (go's `checkTxnGroupID`: size,
+/// consistency, duplicates, commitment).
 ///
-/// It is not `algo_validate::check_txn_group`, which also rejects a missing
-/// heartbeat body, an unknown transaction type and a box index go v5.1 no
-/// longer screens for here (`WellFormed` does, later): a proposal carrying one
-/// is not dropped by go at this stage.
+/// Since go v5.1 (#6728) `check_txn_group` no longer rejects a missing
+/// heartbeat body, an unknown transaction type or a box index (`WellFormed`
+/// does, later), so a proposal carrying one is not dropped by go at this stage
+/// and is not dropped here.
 fn check_txn_group(
     group: &[algo_types::SignedTransaction],
     allow_grouped_heartbeats: bool,
 ) -> std::result::Result<(), algo_error::AlgoError> {
-    let (mut heartbeat, mut avail_trigger) = (false, false);
-    for stx in group {
-        let txn = &stx.txn;
-        match txn.txn_type.as_str() {
-            "hb" => heartbeat = true,
-            "stpf" => algo_validate::checks::check_state_proof_payload(txn)?,
-            "appl" => avail_trigger = true,
-            "acfg" if txn.config_asset == 0 => avail_trigger = true,
-            _ => {}
-        }
-    }
-    if !allow_grouped_heartbeats && heartbeat && avail_trigger {
-        return Err(algo_error::AlgoError::Validation {
-            message: "heartbeat transaction may not be grouped with an application call or asset creation"
-                .into(),
-        });
-    }
+    algo_validate::check_txn_group(group, allow_grouped_heartbeats)?;
     algo_validate::rules::validate_transaction_group_strict(group)
 }
 

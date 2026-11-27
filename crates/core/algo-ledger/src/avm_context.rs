@@ -5246,7 +5246,7 @@ pub(crate) fn fill_group_resources(group: &[SignedTransaction]) -> GroupResource
                 }
             }
             "appl" => {
-                if let Some(access) = &txn.access {
+                if let Some(access) = txn.access.as_ref().filter(|a| !a.is_empty()) {
                     r.fill_application_call_access(txn, access);
                 } else {
                     r.fill_application_call_foreign(txn);
@@ -5691,7 +5691,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // (`data/transactions/application.go`): when `tx.Access` is present
         // (AVM v10+), indices > 0 resolve into it instead of the legacy
         // `Accounts` array (only one of the two is ever populated).
-        if let Some(access) = &txn.access {
+        if let Some(access) = txn.access.as_ref().filter(|a| !a.is_empty()) {
             let i = (index - 1) as usize;
             return match access.get(i) {
                 Some(rr) if !rr.address.is_zero() => Ok(rr.address.0),
@@ -9211,6 +9211,21 @@ mod tests {
         );
         // Out of range.
         assert!(ctx.resolve_account(3).is_err());
+    }
+
+    /// go v5.1 (#6728) `AddressByIndex` tests `len(Access) > 0`, so an empty
+    /// (but present) access list is an absent one: `Accounts` still resolves,
+    /// and the resource fill uses the legacy lists.
+    #[test]
+    fn an_empty_access_list_is_an_absent_one() {
+        let sender = [10u8; 32];
+        let acct1 = Address([30u8; 32]);
+        let mut txn = make_appl_txn(sender, 42, vec![acct1], vec![], vec![]);
+        txn.txn.access = Some(vec![]);
+        let mut store = LedgerState::new();
+        let ctx = make_context(&mut store, vec![txn]);
+        assert_eq!(ctx.resolve_account(1).unwrap(), acct1.0);
+        assert!(ctx.is_account_available(&acct1.0));
     }
 
     #[test]
