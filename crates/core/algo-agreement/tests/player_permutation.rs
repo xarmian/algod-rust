@@ -157,6 +157,9 @@ fn get_player_permutation(
             let (_, mut machine, mut helper) = setup_p(r, p, SOFT, params);
             machine.ensure_round_period(r, p);
             machine.set_proposal_assembler(r, pv, BlockAssembler::default());
+            // go v5.1.1 holds a payload no started period is interested in
+            // (`proposalStore.held`), so the injected value is relevant to `p`.
+            machine.set_proposal_relevant(r, p, pv);
             // Override sender 0 with a fresh address, then mark it as duplicate.
             let dup_addr = Address(random_block_hash().0);
             helper.addresses.insert(0, dup_addr);
@@ -167,6 +170,9 @@ fn get_player_permutation(
             let (_, mut machine, mut helper) = setup_p(r, p, SOFT, params);
             machine.ensure_round_period(r, p);
             machine.set_proposal_assembler(r, pv, BlockAssembler::default());
+            // go v5.1.1 holds a payload no started period is interested in
+            // (`proposalStore.held`), so the injected value is relevant to `p`.
+            machine.set_proposal_relevant(r, p, pv);
             let dup_addr = Address(random_block_hash().0);
             helper.addresses.insert(0, dup_addr);
             machine.set_proposal_duplicate(r, p, dup_addr);
@@ -177,6 +183,9 @@ fn get_player_permutation(
             let (_, mut machine, mut helper) = setup_p(r, p, SOFT, params);
             machine.ensure_round_period(r, p);
             machine.set_proposal_assembler(r, pv, BlockAssembler::default());
+            // go v5.1.1 holds a payload no started period is interested in
+            // (`proposalStore.held`), so the injected value is relevant to `p`.
+            machine.set_proposal_relevant(r, p, pv);
             machine.set_cert_threshold(r, p, pv);
             let dup_addr = Address(random_block_hash().0);
             helper.addresses.insert(0, dup_addr);
@@ -194,8 +203,12 @@ fn get_player_permutation(
                 payload: Some(payload.clone()),
                 assembled: true,
                 authenticators: Vec::new(),
+                held: false,
             };
             machine.set_proposal_assembler(r, pv, assembled);
+            // go v5.1.1 holds a payload no started period is interested in
+            // (`proposalStore.held`), so the injected value is relevant to `p`.
+            machine.set_proposal_relevant(r, p, pv);
             let dup_addr = Address(random_block_hash().0);
             helper.addresses.insert(0, dup_addr);
             machine.set_proposal_duplicate(r, p, dup_addr);

@@ -564,6 +564,26 @@ pub fn verify_payload_action(e: &MessageEvent, r: Round, p: Period, pinned: bool
     }))
 }
 
+/// Requests validation of a payload which the proposalStore held after
+/// pipelining it: one pipelined before its round started, or one whose
+/// validation request was held back or cancelled.
+///
+/// Mirrors Go's `verifyPipelinedPayloadAction`.
+pub fn verify_pipelined_payload_action(
+    r: Round,
+    e: &crate::events::PayloadProcessedEvent,
+) -> Action {
+    let msg = MessageEvent {
+        t: crate::events::EventType::PayloadPresent,
+        input: crate::events::InternalMessage {
+            unauthenticated_proposal: e.unauthenticated_payload.clone(),
+            ..crate::events::InternalMessage::default()
+        },
+        ..MessageEvent::default()
+    };
+    verify_payload_action(&msg, r, e.period, e.pinned)
+}
+
 /// Creates a verify-bundle crypto action.
 ///
 /// Mirrors Go's `verifyBundleAction`.

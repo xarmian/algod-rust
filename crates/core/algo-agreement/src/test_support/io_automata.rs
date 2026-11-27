@@ -225,6 +225,18 @@ impl IoAutomataConcretePlayer {
         period_router.update(crate::step::Step(0));
     }
 
+    /// Mark `value` relevant to `period` in the proposalStore of `round`: go
+    /// v5.1.1 holds a payload (`proposalStore.held`) that no started period is
+    /// interested in, so a test that injects an assembler also injects this
+    /// (go's `getPlayerPermutation` sets `Relevant = {p: pV}`).
+    pub fn set_proposal_relevant(&mut self, round: Round, period: Period, value: ProposalValue) {
+        self.router
+            .proposal_manager
+            .store_for_round(round)
+            .relevant
+            .insert(period, value);
+    }
+
     /// Insert (or overwrite) a `BlockAssembler` for `(round, value)` in the
     /// per-round `ProposalStore`. Mirrors Go's
     /// `pM.Children[r].ProposalStore.Assemblers[pV] = blockAssembler{...}`.

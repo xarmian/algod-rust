@@ -707,6 +707,13 @@ pub struct NewPeriodEvent {
     pub period: Period,
     /// The proposal-value the new period may want to agree on.
     pub proposal: ProposalValue,
+    /// Whether the proposalStore should resume a held payload which the new
+    /// period is interested in. It is set only for a `nextThreshold`: a
+    /// soft/certThreshold updates `Relevant` after newPeriod, so the
+    /// proposalStore resumes held payloads while handling the threshold.
+    ///
+    /// Mirrors Go's `newPeriodEvent.ResumeHeld`.
+    pub resume_held: bool,
 }
 
 impl Default for NewPeriodEvent {
@@ -714,6 +721,7 @@ impl Default for NewPeriodEvent {
         Self {
             period: Period(0),
             proposal: BOTTOM,
+            resume_held: false,
         }
     }
 }
@@ -804,6 +812,10 @@ pub struct ProposalAcceptedEvent {
     pub payload: Option<Proposal>,
     /// Whether the payload has been received.
     pub payload_ok: bool,
+    /// The `PayloadPipelined` event for a held payload whose validation became
+    /// due on the event which produced this one, if any; otherwise its type is
+    /// `None`.
+    pub pipelined: PayloadProcessedEvent,
 }
 
 impl Default for ProposalAcceptedEvent {
@@ -814,6 +826,7 @@ impl Default for ProposalAcceptedEvent {
             proposal: BOTTOM,
             payload: None,
             payload_ok: false,
+            pipelined: PayloadProcessedEvent::default(),
         }
     }
 }
@@ -860,6 +873,8 @@ pub struct CommittableEvent {
     pub proposal: ProposalValue,
     /// The proposal-vote that authenticated the payload (if one exists).
     pub vote: Option<Vote>,
+    /// As in [`ProposalAcceptedEvent::pipelined`], for a soft/certThreshold.
+    pub pipelined: PayloadProcessedEvent,
 }
 
 impl Default for CommittableEvent {
@@ -867,6 +882,7 @@ impl Default for CommittableEvent {
         Self {
             proposal: BOTTOM,
             vote: None,
+            pipelined: PayloadProcessedEvent::default(),
         }
     }
 }
@@ -891,6 +907,11 @@ pub struct PayloadProcessedEvent {
     pub period: Period,
     /// Whether this is a pinned payload (if so, period will be 0).
     pub pinned: bool,
+    /// Set if the proposalStore holds the payload without a validation request
+    /// because only a period which has not started is interested in it. If the
+    /// payload is relevant to a period which has started, `period` is the
+    /// latest such period; it is not set if `held` is.
+    pub held: bool,
     /// The proposal-value corresponding to the payload.
     pub proposal: ProposalValue,
     /// The unauthenticated proposal payload that was pipelined.
@@ -908,6 +929,7 @@ impl Default for PayloadProcessedEvent {
             round: Round(0),
             period: Period(0),
             pinned: false,
+            held: false,
             proposal: BOTTOM,
             unauthenticated_payload: UnauthenticatedProposal::default(),
             vote: None,

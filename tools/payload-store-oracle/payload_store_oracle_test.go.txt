@@ -1,0 +1,232 @@
+// Copyright (C) 2019-2026 Algorand Foundation Ltd.
+// Modifications Copyright (C) 2026 Algod DAO
+// This file is part of algod-rust, a modified work based on go-algorand
+// (https://github.com/algorand/go-algorand).
+//
+// algod-rust is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// algod-rust is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with algod-rust.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// This file is NOT part of any Go module here: it is a template that
+// tools/payload-store-oracle/run.sh copies, as
+// zz_payload_store_oracle_test.go, into the pinned go-algorand checkout's
+// agreement package and runs there. Issue #2552.
+//
+// It drives go's real player (setupP: the root router, proposalManager,
+// proposalStore and voteAggregator) through scripted event sequences about
+// held proposal payloads (go v5.1.1 `held`, `requestOrHold`, `resumeHeld`,
+// `verifyHeldPayload`, the cancelled payloadVerified re-pipelining and the
+// proposalManager round-age checks) and writes, per scenario, the script and
+// what go did after every step (the player's round/period/step and the
+// actions it emitted) to $PS_OUT as JSONL. The rows are committed as
+// crates/core/algo-agreement/tests/fixtures/payload_store/scenarios.jsonl and
+// replayed by crates/core/algo-agreement/tests/payload_store_oracle_test.rs.
+
+package agreement
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"sort"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/algorand/go-algorand/protocol"
+)
+
+type psProp struct {
+	Name  string `json:"name"`
+	Round uint64 `json:"round"`
+}
+
+type psStep struct {
+	Op        string `json:"op"` // vote, payload_present, payload_verified, bundle
+	Round     uint64 `json:"round,omitempty"`
+	Period    uint64 `json:"period,omitempty"`
+	Step      uint64 `json:"step,omitempty"`
+	Prop      string `json:"prop,omitempty"` // "" for the bottom value
+	Cancelled bool   `json:"cancelled,omitempty"`
+}
+
+type psResult struct {
+	Round   uint64   `json:"round"`
+	Period  uint64   `json:"period"`
+	Step    uint64   `json:"step"`
+	Actions []string `json:"actions"`
+}
+
+type psScenario struct {
+	Name    string     `json:"name"`
+	Start   [3]uint64  `json:"start"` // round, period, step
+	Props   []psProp   `json:"props"`
+	Steps   []psStep   `json:"steps"`
+	Results []psResult `json:"results"`
+}
+
+func psSummarize(a action) (string, bool) {
+	switch a := a.(type) {
+	case cryptoAction:
+		return fmt.Sprintf("crypto:%v:r%d:p%d:s%d:pin=%v", a.T, a.Round, a.Period, a.Step, a.Pinned), true
+	case networkAction:
+		return fmt.Sprintf("net:%v:%v", a.T, a.Tag), true
+	case pseudonodeAction:
+		return fmt.Sprintf("pseudo:%v:r%d:p%d", a.T, a.Round, a.Period), true
+	case rezeroAction:
+		return fmt.Sprintf("rezero:r%d", a.Round), true
+	case ensureAction:
+		return fmt.Sprintf("ensure:r%d", a.Certificate.Round), true
+	case stageDigestAction:
+		return fmt.Sprintf("stage:r%d", a.Certificate.Round), true
+	}
+	return "", false
+}
+
+func psScenarios() []psScenario {
+	r := uint64(100)
+	A := []psProp{{"A", r}}
+	AB := []psProp{{"A", r}, {"B", r}}
+	start := [3]uint64{r, 0, 2}
+	vote := func(rnd, per uint64, prop string) psStep {
+		return psStep{Op: "vote", Round: rnd, Period: per, Step: 0, Prop: prop}
+	}
+	present := func(prop string) psStep { return psStep{Op: "payload_present", Prop: prop} }
+	verified := func(prop string, cancelled bool) psStep {
+		return psStep{Op: "payload_verified", Prop: prop, Cancelled: cancelled}
+	}
+	bundle := func(rnd, per, st uint64, prop string) psStep {
+		return psStep{Op: "bundle", Round: rnd, Period: per, Step: st, Prop: prop}
+	}
+	return []psScenario{
+		{Name: "current_period_payload_is_verified", Start: start, Props: A,
+			Steps: []psStep{vote(r, 0, "A"), present("A")}},
+		{Name: "future_period_payload_is_held", Start: start, Props: A,
+			Steps: []psStep{vote(r, 1, "A"), present("A")}},
+		{Name: "held_resumes_on_next_threshold", Start: start, Props: A,
+			Steps: []psStep{vote(r, 1, "A"), present("A"), bundle(r, 0, 3, "A")}},
+		{Name: "held_resumes_on_next_threshold_bottom", Start: start, Props: A,
+			Steps: []psStep{vote(r, 1, "A"), present("A"), bundle(r, 0, 3, "")}},
+		{Name: "held_resumes_on_soft_threshold_of_its_period", Start: start, Props: A,
+			Steps: []psStep{vote(r, 1, "A"), present("A"), bundle(r, 1, 1, "A")}},
+		{Name: "held_resumes_on_cert_threshold_of_its_period", Start: start, Props: A,
+			Steps: []psStep{vote(r, 1, "A"), present("A"), bundle(r, 1, 2, "A")}},
+		{Name: "held_resumes_on_soft_threshold_of_the_current_period", Start: start, Props: A,
+			Steps: []psStep{vote(r, 1, "A"), present("A"), bundle(r, 0, 1, "A")}},
+		{Name: "held_resumes_on_a_vote_for_the_current_period", Start: start, Props: A,
+			Steps: []psStep{vote(r, 1, "A"), present("A"), vote(r, 0, "A")}},
+		{Name: "cancelled_verification_is_requested_again", Start: start, Props: A,
+			Steps: []psStep{vote(r, 0, "A"), present("A"), verified("A", true)}},
+		{Name: "cancelled_verification_of_a_held_payload_stays_held", Start: start, Props: A,
+			Steps: []psStep{vote(r, 1, "A"), present("A"), verified("A", true), bundle(r, 0, 3, "A")}},
+		{Name: "cancelled_verification_twice", Start: start, Props: A,
+			Steps: []psStep{vote(r, 0, "A"), present("A"), verified("A", true), verified("A", true), verified("A", false)}},
+		{Name: "cancelled_verification_of_an_unknown_payload", Start: start, Props: AB,
+			Steps: []psStep{vote(r, 0, "A"), present("A"), verified("B", true)}},
+		{Name: "cancelled_verification_of_an_assembled_payload", Start: start, Props: A,
+			Steps: []psStep{vote(r, 0, "A"), present("A"), verified("A", false), verified("A", true)}},
+		{Name: "cancelled_verification_after_the_round_ended", Start: start, Props: A,
+			Steps: []psStep{vote(r, 0, "A"), present("A"), verified("A", false), bundle(r, 0, 2, "A"), verified("A", true)}},
+		{Name: "verification_result_after_the_round_ended", Start: start, Props: A,
+			Steps: []psStep{vote(r, 0, "A"), present("A"), bundle(r, 0, 2, "A"), verified("A", false)}},
+		{Name: "next_round_payload_is_verified_when_its_round_starts", Start: start,
+			Props: []psProp{{"A", r}, {"B", r + 1}},
+			Steps: []psStep{vote(r+1, 0, "B"), present("B"), vote(r, 0, "A"), verified("A", false), bundle(r, 0, 2, "A")}},
+		{Name: "two_values_one_held", Start: start, Props: AB,
+			Steps: []psStep{vote(r, 1, "A"), vote(r, 0, "B"), present("B"), present("A"), bundle(r, 1, 1, "A")}},
+		{Name: "held_payload_then_duplicate_payload", Start: start, Props: A,
+			Steps: []psStep{vote(r, 1, "A"), present("A"), present("A")}},
+	}
+}
+
+func psRun(t *testing.T, sc *psScenario) {
+	_, pM, helper := setupP(t, round(sc.Start[0]), period(sc.Start[1]), step(sc.Start[2]))
+	payloads := map[string]*proposal{}
+	values := map[string]proposalValue{}
+	for _, p := range sc.Props {
+		pp, pv := helper.MakeRandomProposalPayload(t, round(p.Round))
+		payloads[p.Name] = pp
+		values[p.Name] = *pv
+	}
+	proto := ConsensusVersionView{Version: protocol.ConsensusCurrentVersion}
+	voter := 0
+	for _, s := range sc.Steps {
+		cp := pM.(*ioAutomataConcretePlayer)
+		before := 0
+		if cp.savedTrace != nil {
+			before = len(cp.savedTrace.events)
+		}
+		var in event
+		switch s.Op {
+		case "vote":
+			vv := helper.MakeVerifiedVote(t, voter, round(s.Round), period(s.Period), step(s.Step), values[s.Prop])
+			voter++
+			in = messageEvent{T: voteVerified, Input: message{Vote: vv, UnauthenticatedVote: vv.u()}, Proto: proto}
+		case "payload_present":
+			in = messageEvent{T: payloadPresent, Input: message{UnauthenticatedProposal: payloads[s.Prop].u(), messageHandle: "h"}, Proto: proto}
+		case "payload_verified":
+			m := message{Proposal: *payloads[s.Prop], UnauthenticatedProposal: payloads[s.Prop].u()}
+			ev := messageEvent{T: payloadVerified, Proto: proto}
+			if s.Cancelled {
+				// the verifier may leave Input.Proposal empty on a cancelled result
+				m.Proposal = proposal{}
+				ev.Cancelled = true
+				ev.Err = makeSerErr(errors.New("cancelled"))
+			}
+			ev.Input = m
+			in = ev
+		case "bundle":
+			var b bundle
+			if s.Prop == "" {
+				b = helper.MakeVerifiedBundle(t, round(s.Round), period(s.Period), step(s.Step), proposalValue{})
+			} else {
+				b = helper.MakeVerifiedBundle(t, round(s.Round), period(s.Period), step(s.Step), values[s.Prop])
+			}
+			in = messageEvent{T: bundleVerified, Input: message{Bundle: b, UnauthenticatedBundle: b.U}, Proto: proto}
+		default:
+			t.Fatalf("op %q", s.Op)
+		}
+		err, panicErr := pM.transition(in)
+		require.NoError(t, err)
+		res := psResult{}
+		if panicErr != nil {
+			res.Actions = []string{"PANIC"}
+		}
+		for _, e := range pM.getTrace().events[before:] {
+			if w, ok := e.(wrappedActionEvent); ok {
+				if str, ok := psSummarize(w.action); ok {
+					res.Actions = append(res.Actions, str)
+				}
+			}
+		}
+		pl := pM.(*ioAutomataConcretePlayer).underlying()
+		res.Round, res.Period, res.Step = uint64(pl.Round), uint64(pl.Period), uint64(pl.Step)
+		sc.Results = append(sc.Results, res)
+	}
+}
+
+func TestPayloadStoreOracle(t *testing.T) {
+	out, err := os.Create(os.Getenv("PS_OUT"))
+	require.NoError(t, err)
+	defer out.Close()
+	scs := psScenarios()
+	sort.SliceStable(scs, func(i, j int) bool { return scs[i].Name < scs[j].Name })
+	for i := range scs {
+		psRun(t, &scs[i])
+		b, err := json.Marshal(scs[i])
+		require.NoError(t, err)
+		out.Write(append(b, '\n'))
+	}
+}
