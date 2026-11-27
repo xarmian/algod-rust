@@ -748,9 +748,8 @@ impl Demux {
         // proposalStore wants the payload: see `Player::decode_payload_if_wanted`.
         // A proposal that fails here is dropped, logged, without disconnecting
         // the peer, like a vote's or a bundle's decode failure is not.
-        let len = msg.data.len();
-        let prefix = hex_prefix(&msg.data, 96);
-        match crate::payload_deferral::decode_proposal(std::sync::Arc::from(msg.data)) {
+        let data: Arc<[u8]> = Arc::from(msg.data);
+        match crate::payload_deferral::decode_proposal(Arc::clone(&data)) {
             Ok(compound) => Some(setup_compound_message_from_network(
                 compound,
                 msg.handle,
@@ -764,8 +763,8 @@ impl Demux {
                 // a payload over a msgp allocbound (issue #2427) is such a
                 // failure.
                 warn!(
-                    len,
-                    prefix = %prefix,
+                    len = data.len(),
+                    prefix = %hex_prefix(&data, 96),
                     "dropping proposal that failed to decode: {}",
                     e
                 );
