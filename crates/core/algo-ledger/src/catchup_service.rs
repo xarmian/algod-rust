@@ -5678,9 +5678,10 @@ mod tests {
                 }
                 let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 self.max_in_flight.fetch_max(now, Ordering::SeqCst);
-                // Hold until a second authentication overlaps (bounded), so
-                // concurrency is observed without a wall-clock assertion.
-                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                // Hold until two authentications overlap (the r - 2 lookback caps the overlap) (bounded to 500 ms,
+                // so a serial regression fails fast on the assertion below),
+                // observing concurrency without a wall-clock assertion.
+                let deadline = std::time::Instant::now() + Duration::from_millis(500);
                 while self.max_in_flight.load(Ordering::SeqCst) < 2
                     && std::time::Instant::now() < deadline
                 {
