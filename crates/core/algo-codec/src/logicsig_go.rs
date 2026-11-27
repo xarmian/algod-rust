@@ -64,6 +64,9 @@ use algo_types::go_msgp::{
 use algo_types::{LogicSig, MultisigSig, MultisigSubsig, AddressSalt, SaltedKeySig};
 use serde_bytes::ByteBuf;
 
+mod signedtxn;
+pub use signedtxn::decode_signed_txn_go;
+
 /// A `transactions.LogicSig` as go's generated decoder leaves it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GoLogicSig {
@@ -794,6 +797,14 @@ fn open_struct(b: &mut &[u8]) -> R<Form> {
         Err(e) => Err(e),
     };
     w(form, "")
+}
+
+/// `msgp.ReadMapHeaderBytes`: the size, and whether the value was `nil`.
+fn map_header_strict(b: &mut &[u8]) -> R<(usize, bool)> {
+    match read_map_header(b)? {
+        Some(h) => Ok(h),
+        None => Err(bad_prefix(Ty::Map, lead(b)?)),
+    }
 }
 
 /// An unknown map key: `msgp.WrapError(msgp.ErrNoField(string(field)))`.

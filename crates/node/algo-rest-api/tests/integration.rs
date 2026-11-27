@@ -6825,16 +6825,9 @@ async fn raw_transaction_in_block_only_field_returns_400() {
         assert_eq!(resp.status(), 400, "{field}");
         let json: serde_json::Value = resp.json().await.unwrap();
         let msg = json["message"].as_str().unwrap();
-        // go-algorand v5.0.5-stable answers `msgpack decode error [pos N]: no
-        // matching struct field found when decoding stream map with key hgi`
-        // (captured live; issue #1962 corrected the wording of #1727).
-        assert!(
-            msg.starts_with("msgpack decode error [pos ")
-                && msg.ends_with(&format!(
-                    "]: no matching struct field found when decoding stream map with key {field}"
-                )),
-            "{msg}"
-        );
+        // go-algorand v5.1.1-stable's generated msgp decoder answers
+        // `Unknown field: hgi` (`msgp.ErrNoField`, `raw_submit_texts.jsonl`)
+        assert_eq!(msg, format!("Unknown field: {field}"));
     }
 }
 
@@ -6859,28 +6852,50 @@ async fn raw_transaction_async_in_block_only_field_returns_400() {
     assert_eq!(resp.status(), 400);
     let json: serde_json::Value = resp.json().await.unwrap();
     let msg = json["message"].as_str().unwrap();
-    assert!(
-        msg.starts_with("msgpack decode error [pos ")
-            && msg.ends_with(
-                "]: no matching struct field found when decoding stream map with key hgi"
-            ),
-        "{msg}"
-    );
+    assert_eq!(msg, "Unknown field: hgi");
 }
 
-/// Issue #1962: a key the target struct lacks is a 400 with go's exact text and
-/// offset (captured from a go-algorand v5.0.5-stable node for these bytes: a
-/// one-entry map `{"zzz": 1}` is `[pos 5]`; the same key as the third entry of
-/// a second transaction in a group counts from the start of the whole body).
+/// A key the target struct lacks is a 400 with msgp's `ErrNoField` text, no
+/// offset any more (go v5.1.1-stable's generated decoder, `raw_submit_texts.jsonl`).
 #[tokio::test]
-async fn raw_transaction_unknown_field_returns_go_text_with_group_offset() {
+async fn raw_transaction_unknown_field_returns_go_text() {
     let server = TestServer::start(MockNode::synced()).await;
     let ok = encode_signed_txn_for_post(&make_test_signed_txn());
     let bad: Vec<u8> = vec![0x81, 0xa3, b'z', b'z', b'z', 0x01];
 
-    for (body, pos) in [
-        (bad.clone(), 5usize),
-        ([ok.clone(), bad.clone()].concat(), ok.len() + 5),
+    for body in [bad.clone(), [ok.clone(), bad.clone()].concat()] {
+        let resp = server
+            .client
+            .post(server.url("/v2/transactions"))
+            .header("X-Algo-API-Token", &server.api_token)
+            .header("Content-Type", "application/x-binary")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(json["message"].as_str().unwrap(), "Unknown field: zzz");
+    }
+}
+
+/// go v5.1.1 checks the group-size limit before it decodes the next
+/// transaction (`decodeTxGroup`): a full group followed by any byte, even one
+/// that is no transaction, is `max group size is 16`, and a body that breaks off
+/// inside a transaction is that decoder's error, not a shorter group (#2555).
+#[tokio::test]
+async fn raw_transaction_group_limit_comes_before_the_next_decode() {
+    let server = TestServer::start(MockNode::synced()).await;
+    let ok = encode_signed_txn_for_post(&make_test_signed_txn());
+    let full = ok.repeat(16);
+    let cut = &ok[..ok.len() - 3];
+    for (body, want) in [
+        ([full.clone(), vec![0xc1]].concat(), "max group size is 16"),
+        ([full.clone(), ok.clone()].concat(), "max group size is 16"),
+        (
+            [ok.clone(), cut.to_vec()].concat(),
+            "msgp: too few bytes left to read object",
+        ),
     ] {
         let resp = server
             .client
@@ -6893,12 +6908,7 @@ async fn raw_transaction_unknown_field_returns_go_text_with_group_offset() {
             .unwrap();
         assert_eq!(resp.status(), 400);
         let json: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(
-            json["message"].as_str().unwrap(),
-            format!(
-                "msgpack decode error [pos {pos}]: no matching struct field found when decoding stream map with key zzz"
-            )
-        );
+        assert_eq!(json["message"].as_str().unwrap(), want);
     }
 }
 
@@ -6984,11 +6994,11 @@ async fn raw_transaction_invalid_msgpack_returns_400() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 
-    // go-codec's own text (issue #2492, `raw_submit_texts.jsonl`)
+    // msgp's own text (issue #2555, `raw_submit_texts.jsonl`)
     let json: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(
         json["message"],
-        "msgpack decode error [pos 1]: only encoded map or array can be decoded into a struct"
+        "msgp: attempted to decode type \"int\" with method for \"map\""
     );
 }
 
@@ -9592,20 +9602,21 @@ async fn teal_compile_assembles_non_utf8_bodies_like_go() {
     );
 }
 
-/// An invalid byte in a failed compile's message is one `\ufffd` escape per
-/// byte in go's JSON (`encoding/json`); a valid U+FFFD or private-use character
-/// is written as is (#2388, go v5.0.5-stable bodies).
+/// An invalid byte in a failed compile's message is one U+FFFD character per
+/// byte in go's JSON (v5.1.1's `encoding/json/v2` serializer, #2555; go v5.0.5
+/// wrote the escape `\ufffd`); a valid U+FFFD or private-use character is
+/// written as is (#2388).
 #[tokio::test]
 async fn teal_compile_error_bodies_render_invalid_bytes_like_go() {
     let server = TestServer::start(mock_with_developer_api()).await;
     let cases: &[(&[u8], &str)] = &[
         (
             b"#pragma version 8\nfoo\xff\nint 1\n",
-            "{\"message\":\"1 error: 2: unknown opcode: foo\\ufffd\\n\"}",
+            "{\"message\":\"1 error: 2: unknown opcode: foo\u{fffd}\\n\"}",
         ),
         (
             b"#pragma version 8\nint 1\n\xe2\x82 \n",
-            "{\"message\":\"1 error: 3: unknown opcode: \\ufffd\\ufffd\\n\"}",
+            "{\"message\":\"1 error: 3: unknown opcode: \u{fffd}\u{fffd}\\n\"}",
         ),
         (
             b"#pragma version 8\nint \xff\n",
@@ -12291,15 +12302,14 @@ async fn simulate_json_is_go_shaped_and_round_trips_with_the_rust_client() {
 // ===========================================================================
 
 /// Issue #2492: `POST /v2/transactions` and `/v2/transactions/async` answer
-/// every body as go v5.0.5-stable's `RawTransaction`/`RawTransactionAsync`
-/// do -- go-codec's msgpack decode texts, positions included, a body cut off
-/// inside a transaction ending the group, and every body go-codec accepts
-/// decoded to the same transactions. The expected responses, and the
+/// every body as go v5.1.1-stable's `RawTransaction`/`RawTransactionAsync`
+/// do -- the generated msgp decoder's texts, context path included, a body
+/// cut off inside a transaction an error, the group-size limit checked before
+/// each decode, and every body go accepts decoded to the same transactions. The expected responses, and the
 /// canonical encoding of each transaction go decoded, come from go's own
 /// handlers (`tools/raw-submit-text-oracle`, re-checked in CI by
 /// `simulate-rewards-oracle.yml`).
 #[tokio::test]
-#[ignore = "Phase 26 carve-out: go v5.1 decodes the submit body with generated msgp (maps only, required fields, allocbounds, msgp error texts); the REST decode moves with #2555"]
 async fn raw_submit_responses_match_go() {
     use tower::ServiceExt;
 

@@ -1051,20 +1051,7 @@ async fn teal_corpus_rest_matches_go_and_offline() {
             b"#pragma version 8\nfoo\xff\nbar\xfe\n",
         ),
     ];
-    // Phase 26 carve-out (#2555, go v5.1.0-beta #6808): go now streams JSON
-    // with encoding/json/v2, which writes invalid UTF-8 in an error message
-    // raw instead of as `�`. These four cases echo the invalid bytes in
-    // the 400 message; the carve-out is removed when #2555 lands.
-    const GO_JSON_V2_RAW_INVALID_UTF8: &[&str] = &[
-        "compile non-UTF-8 unknown opcode",
-        "compile truncated sequence",
-        "compile only invalid bytes",
-        "compile two non-UTF-8 errors",
-    ];
     for (name, body) in non_utf8 {
-        if GO_JSON_V2_RAW_INVALID_UTF8.contains(name) {
-            continue;
-        }
         edge.push((
             *name,
             reqwest::Method::POST,
