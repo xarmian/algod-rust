@@ -145,7 +145,9 @@ impl CatchpointService {
     }
 
     /// go's `LedgerService.ServeHTTP` without a `round` path value: the round
-    /// (`r`) and an optional version (`v`) come from the query form.
+    /// (`r`) and an optional version (`v`) come from the query form. Like in
+    /// go, no route reaches it (`/v1/{genesisID}/ledger/{round}` needs a
+    /// round); it is the handler's own contract, called directly.
     pub async fn serve_ledger_query(
         &self,
         genesis_id: &str,
