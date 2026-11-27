@@ -701,6 +701,7 @@ dependencies = [
  "algo-error",
  "algo-falcon",
  "algo-types",
+ "base64 0.23.1",
  "criterion",
  "curve25519-dalek 5.0.0",
  "data-encoding",

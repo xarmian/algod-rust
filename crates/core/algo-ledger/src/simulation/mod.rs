@@ -57,8 +57,7 @@ use algo_types::consensus::{consensus_params_for_version, ConsensusParams};
 use algo_types::{Address, Round, SignedTransaction};
 use algo_validate::{
     check_txn_group, validate_pqsig_envelope, validate_pqsig_scheme,
-    validate_transaction_wellformed_in_mode, verify_transaction_signature_with_tracer,
-    SpecialAddresses, WellFormedMode,
+    validate_transaction_wellformed, verify_transaction_signature_with_tracer, SpecialAddresses,
 };
 use ed25519_dalek::{Signer, SigningKey};
 
@@ -1528,12 +1527,11 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // frame OUTSIDE the `TxGroupError`, and `Simulate` reports the
             // `TxGroupError`'s own text: the bare reason (issue #2451). It is
             // the submission's `WellFormed`, which rejects an unknown type.
-            if let Err(e) = validate_transaction_wellformed_in_mode(
+            if let Err(e) = validate_transaction_wellformed(
                 &stx.txn,
                 consensus.enable_fee_pooling,
                 consensus,
                 Some(&spec),
-                WellFormedMode::Admission,
             ) {
                 return Ok(CheckOutcome::RecoverableFailure {
                     index: i,

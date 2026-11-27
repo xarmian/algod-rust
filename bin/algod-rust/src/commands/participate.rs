@@ -2199,23 +2199,21 @@ impl SimpleBlockEvaluator {
             rewards_pool: self.hdr.rewards_pool,
         };
         for stx in txgroup {
-            algo_validate::validate_transaction_wellformed_in_mode(
-                &stx.txn,
-                true,
-                params,
-                Some(&specials),
-                algo_validate::WellFormedMode::Admission,
-            )
-            .map_err(|e| Self::verify_rejection(algo_error::VerifyKind::NotWell, Some(stx), e))?;
+            algo_validate::validate_transaction_wellformed(&stx.txn, true, params, Some(&specials))
+                .map_err(|e| {
+                    Self::verify_rejection(algo_error::VerifyKind::NotWell, Some(stx), e)
+                })?;
         }
 
         // go's `txnGroupBatchPrep` runs `transactions.CheckTxnGroup` right after
         // every member is well formed and before the group ID is judged: the
         // group-wide rules (a heartbeat grouped with an application call or an
-        // asset creation, a box index above the foreign apps, a missing heartbeat
-        // payload). A failure is a `TxGroupError` with the not-well-formed
-        // reason, returned bare (issue #2196). The gossip test stage does not
-        // run it (go's `TestTransactionGroup` does not).
+        // asset creation, unless AllowGroupedHeartbeats, and the state proof
+        // payload rules; go v5.1 dropped the box-index, unknown-type and
+        // missing-heartbeat-body checks from here). A failure is a
+        // `TxGroupError` with the not-well-formed reason, returned bare (issue
+        // #2196). The gossip test stage does not run it (go's
+        // `TestTransactionGroup` does not).
         algo_validate::check_txn_group(txgroup, params.allow_grouped_heartbeats)
             .map_err(|e| Self::verify_rejection(algo_error::VerifyKind::NotWell, None, e))?;
 
@@ -2409,28 +2407,22 @@ impl SimpleBlockEvaluator {
             rewards_pool: self.hdr.rewards_pool,
         };
         for stx in txgroup {
-            algo_validate::validate_transaction_wellformed_in_mode(
-                &stx.txn,
-                true,
-                params,
-                Some(&specials),
-                algo_validate::WellFormedMode::Admission,
-            )
-            .map_err(|e| {
-                // go's `TxnNotWellFormedError`.
-                let reason = match e {
-                    algo_error::AlgoError::Validation { message } => message,
-                    other => other.to_string(),
-                };
-                rejected(
-                    algo_error::RejectClass::NotWell,
-                    format!(
-                        "transaction {}: malformed: {}",
-                        algo_types::Digest(txid_of(stx)),
-                        reason
-                    ),
-                )
-            })?;
+            algo_validate::validate_transaction_wellformed(&stx.txn, true, params, Some(&specials))
+                .map_err(|e| {
+                    // go's `TxnNotWellFormedError`.
+                    let reason = match e {
+                        algo_error::AlgoError::Validation { message } => message,
+                        other => other.to_string(),
+                    };
+                    rejected(
+                        algo_error::RejectClass::NotWell,
+                        format!(
+                            "transaction {}: malformed: {}",
+                            algo_types::Digest(txid_of(stx)),
+                            reason
+                        ),
+                    )
+                })?;
         }
 
         // `checkDup`'s ledger half for members `from..`, read under one
@@ -12642,6 +12634,42 @@ mod tests {
             err.to_string()
                 .contains("transactionGroup: duplicate transaction: [1] repeats [0]"),
             "expected intra-group duplicate txid error, got: {err}"
+        );
+    }
+
+    /// go's `TestTxnGroupRejectsDuplicateTxid` (verifiedTxnCache_test.go): a
+    /// group repeating a transaction, whose group ID commits to both
+    /// occurrences, is a `TxGroupMalformedError` for duplicates, and nothing
+    /// from the failed group reaches the verified-group cache.
+    #[test]
+    fn a_duplicate_group_is_rejected_and_never_cached() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(56);
+        let (receiver, _) = test_keypair(57);
+        let cache = Arc::new(algo_validate::VerifiedTransactionCache::new(16));
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+        eval.verified_txn_cache = Some(cache.clone());
+
+        let mut stx = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
+        stx.txn.group =
+            algo_validate::rules::compute_group_id(&[stx.txn.clone(), stx.txn.clone()]).0;
+        stx.sig = sign_txn(&stx.txn, &key);
+        let err = eval
+            .transaction_group(&[stx.clone(), stx.clone()])
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("transactionGroup: duplicate transaction: [1] repeats [0]"),
+            "{err}"
+        );
+        let context = cache_context(&eval);
+        assert_eq!(
+            cache
+                .get_unverified_transaction_groups(&[vec![stx.clone(), stx]], &context)
+                .len(),
+            1,
+            "nothing from the failed group may reach the cache"
         );
     }
 

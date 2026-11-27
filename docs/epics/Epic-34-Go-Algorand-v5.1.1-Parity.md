@@ -19,7 +19,7 @@ See `docs/PHASE26_PROPOSAL.md`. Test-parity delta: 294 added / 91 removed /
 
 - [ ] #2558 — pin sweep + `repin`
 - [ ] #2543 — ConsensusParams / fnet5
-- [ ] #2544 — grouped heartbeats, group duplicates
+- [x] #2544 — grouped heartbeats, group duplicates
 - [ ] #2546 — SigScheme registry (Falcon-512, `ed`)
 - [ ] #2547 — `ls` scheme
 - [ ] #2548 — RequireLogicSigArgAccess

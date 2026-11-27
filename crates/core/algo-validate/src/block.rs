@@ -2471,4 +2471,27 @@ mod tests {
             result.errors
         );
     }
+
+    /// go v5.1 (#6728): `checkTxnGroup` no longer rejects an unknown
+    /// transaction type, so a block carrying one is refused by `WellFormed`
+    /// (`unknown tx type`), which block validation runs for every member.
+    #[test]
+    fn block_rejects_an_unknown_transaction_type_through_wellformed() {
+        let key = test_signing_key();
+        let mut stx = make_signed_txn(&key, 5000);
+        stx.txn.txn_type = "bogus".into();
+        let mut block = empty_block();
+        block.payset = vec![stx];
+        let root = compute_payset_merkle_root(&block);
+        block.txn_commitment = root;
+        set_expected_load(&mut block);
+
+        let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash(), None);
+        assert!(!result.is_valid);
+        assert!(
+            format!("{:?}", result.errors).contains("unknown tx type bogus"),
+            "got: {:?}",
+            result.errors
+        );
+    }
 }

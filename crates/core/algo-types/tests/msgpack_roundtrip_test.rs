@@ -428,6 +428,22 @@ fn resource_ref_default_is_empty() {
     assert!(BoxRef::default().is_empty());
 }
 
+/// go v5.1 (#6728): `BoxRef.Empty` tests `len(Name)`, so a present but empty
+/// name is an absent one.
+#[test]
+fn box_ref_with_an_empty_name_is_empty() {
+    let b = BoxRef {
+        index: 0,
+        name: Some(serde_bytes::ByteBuf::new()),
+    };
+    assert!(b.is_empty());
+    let named = BoxRef {
+        index: 0,
+        name: Some(serde_bytes::ByteBuf::from(vec![1u8])),
+    };
+    assert!(!named.is_empty());
+}
+
 #[test]
 fn resource_ref_near_zero_and_zero_variants() {
     // Direct address reference.

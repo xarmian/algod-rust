@@ -1055,8 +1055,8 @@ fn test_appl_optin_rejected_at_max_apps_opted_in_cap_pre_v32() {
 // `resources.go:376-377` (`fillApplicationCallForeign`) silently skips an
 // out-of-range box index reached this way. This test pins that
 // already-correct algod-rust behavior: `apply_block` on a replay-mode
-// context must NOT error on a box ref that `check_txn_group` would have
-// rejected, since sync/replay never runs that screen (see the comment at
+// context must NOT error on a box ref that `WellFormed` rejects (go v5.1 no
+// longer screens it in `CheckTxnGroup`), since sync/replay never runs it (see the comment at
 // `avm_context.rs`'s `ensure_boxes_initialized`).
 // ---------------------------------------------------------------------------
 
@@ -1081,10 +1081,9 @@ fn test_sync_replay_apply_block_skips_out_of_range_box_index_without_error() {
     apply_block(&mut state, &create_block).expect("app creation must apply cleanly");
 
     // Call the app with a box ref whose index (1) exceeds `foreign_apps`
-    // (empty) — exactly the case `check_txn_group`'s
-    // `check_application_call_boxes` would reject. This block is applied
-    // directly via `apply_block`, bypassing `validate_block`/
-    // `check_txn_group`, matching how sync/replay/catchpoint-restore invoke
+    // (empty) — a box ref `WellFormed` rejects (go v5.1 dropped the
+    // `CheckTxnGroup` box-index screen). This block is applied
+    // directly via `apply_block`, bypassing `validate_block`, matching how sync/replay/catchpoint-restore invoke
     // it on an already-trusted chain.
     let mut call = appl_optin_txn(creator, 1_000, app_id);
     call.txn.on_completion = 0; // NoOp, not opt-in — no local state needed

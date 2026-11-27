@@ -115,50 +115,17 @@ pub fn validate_transaction_rules(
 /// Then, NOT part of go's `WellFormed` (go judges fees for the whole group,
 /// later): the per-transaction minimum fee, unless `allow_fee_pooling`.
 ///
-/// This is [`WellFormedMode::Block`]: the entry point of block validation
-/// (`block.rs`), simulation and [`validate_transaction_rules`]. The two
-/// submission paths (REST and gossip admission, `participate.rs`) call
-/// [`validate_transaction_wellformed_in_mode`] with
-/// [`WellFormedMode::Admission`]; `wellformed_callers_pass_the_intended_mode`
-/// pins the production call sites.
+/// An unknown transaction type is rejected here, with go's `unknown tx type
+/// <type>` (the `default` case of `WellFormed`'s type switch), on every path:
+/// since go v5.1 (#6728) `checkTxnGroup` no longer rejects it earlier, so block
+/// validation, simulation and the submission paths (REST, gossip admission) all
+/// get it from this one function.
 pub fn validate_transaction_wellformed(
     txn: &Transaction,
     allow_fee_pooling: bool,
     params: &ConsensusParams,
     spec: Option<&SpecialAddresses>,
 ) -> Result<(), AlgoError> {
-    validate_transaction_wellformed_in_mode(
-        txn,
-        allow_fee_pooling,
-        params,
-        spec,
-        WellFormedMode::Block,
-    )
-}
-
-/// Which caller class a well-formedness check serves (issue #2193).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WellFormedMode {
-    /// Block validation: an unknown transaction type is rejected earlier and
-    /// differently, in [`crate::checks::check_txn_group`].
-    Block,
-    /// The submission paths (REST, gossip admission and simulate, whose
-    /// `check` runs go's `verify.TxnGroup`), which also reject an
-    /// unknown transaction type with go's `unknown tx type <type>` (the
-    /// `default` case of `WellFormed`'s type switch). Apart from that case the
-    /// two modes run the same rules, the state-proof payload check included.
-    Admission,
-}
-
-/// [`validate_transaction_wellformed`] with an explicit [`WellFormedMode`].
-pub fn validate_transaction_wellformed_in_mode(
-    txn: &Transaction,
-    allow_fee_pooling: bool,
-    params: &ConsensusParams,
-    spec: Option<&SpecialAddresses>,
-    mode: WellFormedMode,
-) -> Result<(), AlgoError> {
-    let reject_unknown_type = mode == WellFormedMode::Admission;
     // ── Heartbeat-specific checks (Go: HeartbeatTxnFields.wellFormed) ──
     if txn.txn_type == "hb" {
         // Go: `if !proto.Heartbeat { return fmt.Errorf("heartbeat transaction
@@ -635,14 +602,11 @@ pub fn validate_transaction_wellformed_in_mode(
         crate::checks::check_state_proof_payload(txn)?;
     }
 
-    // Go: the type switch's `default` case (see
-    // `validate_transaction_wellformed_for_admission`).
-    if reject_unknown_type
-        && !matches!(
-            txn.txn_type.as_str(),
-            "pay" | "keyreg" | "acfg" | "axfer" | "afrz" | "appl" | "stpf" | "hb"
-        )
-    {
+    // Go: the type switch's `default` case.
+    if !matches!(
+        txn.txn_type.as_str(),
+        "pay" | "keyreg" | "acfg" | "axfer" | "afrz" | "appl" | "stpf" | "hb"
+    ) {
         return Err(AlgoError::Validation {
             message: format!("unknown tx type {}", txn.txn_type.as_str()),
         });
@@ -707,13 +671,13 @@ pub fn validate_transaction_wellformed_in_mode(
     }
 
     if !params.support_transaction_leases && txn.lease != [0u8; 32] {
-        // Go prints the lease with `%v` of a `[32]byte`: space-separated
-        // decimal bytes in brackets.
-        let lease: Vec<String> = txn.lease.iter().map(ToString::to_string).collect();
+        // go v5.1 prints the lease as standard base64 (`%s` of
+        // `base64.StdEncoding.EncodeToString`; v5.0 printed `%v` of the array).
+        use base64::Engine as _;
         return Err(AlgoError::Validation {
             message: format!(
-                "transaction tried to acquire lease [{}] but protocol does not support transaction leases",
-                lease.join(" ")
+                "transaction tried to acquire lease {} but protocol does not support transaction leases",
+                base64::engine::general_purpose::STANDARD.encode(txn.lease)
             ),
         });
     }
@@ -780,13 +744,9 @@ pub fn validate_transaction_wellformed_in_mode(
 fn check_txn_type_field_isolation(txn: &Transaction) -> Result<(), AlgoError> {
     // An unrecognized `txn_type` is not this check's concern: Go's `WellFormed`
     // rejects it earlier via its type `switch`'s `default` case ("unknown tx
-    // type %v"), before ever reaching `nonZeroFields`. algod-rust's structural
-    // "unknown type" rejection instead lives in `checks.rs::check_txn_group`
-    // (`transaction has an unknown type`, matching go's `CheckTxnGroup`) as a
-    // group-level admission gate with different failure-propagation semantics
-    // (aborts the whole request rather than failing a single transaction) —
-    // deferring to it here avoids duplicating that rejection under this
-    // function's different (per-transaction) error path.
+    // type %v"), before ever reaching `nonZeroFields`; here that rejection is
+    // `validate_transaction_wellformed`'s own type check (go v5.1 no longer
+    // screens for it in `checkTxnGroup`), so this helper just skips it.
     const KNOWN_TYPES: [&str; 8] = [
         "pay", "keyreg", "acfg", "axfer", "afrz", "appl", "stpf", "hb",
     ];
@@ -825,7 +785,8 @@ fn check_txn_type_field_isolation(txn: &Transaction) -> Result<(), AlgoError> {
         || txn.global_state_schema.is_some()
         || txn.local_state_schema.is_some()
         || txn.extra_program_pages != 0
-        || txn.access.is_some()
+        // go tests the length (`MsgIsZero`): an empty Access list is absent
+        || txn.access.as_ref().is_some_and(|a| !a.is_empty())
         || txn.reject_version != 0;
     let is_stpf_nonzero =
         txn.state_proof_type != 0 || txn.state_proof.is_some() || txn.state_proof_message.is_some();
@@ -2460,22 +2421,14 @@ mod tests {
         let mut txn = make_valid_txn();
         txn.txn_type = "xyz".into();
         let params = ConsensusParams::default();
-        // The submission paths reject it with go's text; block validation and
-        // simulation reject it earlier, in `check_txn_group`, and are
-        // unchanged.
-        match validate_transaction_wellformed_in_mode(
-            &txn,
-            true,
-            &params,
-            None,
-            WellFormedMode::Admission,
-        ) {
+        // Every path rejects it with go's text: since go v5.1 the group check
+        // no longer does it earlier.
+        match validate_transaction_wellformed(&txn, true, &params, None) {
             Err(AlgoError::Validation { message }) => {
                 assert_eq!(message, "unknown tx type xyz")
             }
             other => panic!("expected the unknown-type rejection, got {other:?}"),
         }
-        assert!(validate_transaction_wellformed(&txn, true, &params, None).is_ok());
     }
 
     #[test]
@@ -2487,15 +2440,15 @@ mod tests {
             ..ConsensusParams::default()
         };
         let mut txn = make_valid_txn();
-        // go prints the lease with `%v` of a `[32]byte`.
+        // go v5.1 prints the lease as standard base64.
         txn.lease = [7u8; 32];
         txn.group = [9u8; 32];
         txn.rekey_to = Some(Address([3u8; 32]));
-        let sevens = vec!["7"; 32].join(" ");
+        let sevens = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
         assert_eq!(
             wf_text(&txn, &p),
             format!(
-                "transaction tried to acquire lease [{sevens}] but protocol does not support transaction leases"
+                "transaction tried to acquire lease {sevens} but protocol does not support transaction leases"
             )
         );
         // The rules run in go's order: lease, then group, then rekey.
@@ -3431,6 +3384,20 @@ mod tests {
         let txn = make_valid_txn();
         let params = v42_params();
         assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    /// go's `nonZeroFields` uses `MsgIsZero`, which tests `len(Access)`: a
+    /// payment carrying a present but empty Access list is not carrying
+    /// application fields (go v5.1 treats an empty list as an absent one).
+    #[test]
+    fn an_empty_access_list_is_not_a_non_zero_application_field() {
+        let mut txn = make_valid_txn();
+        txn.access = Some(vec![]);
+        let params = v42_params();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+        txn.access = Some(vec![algo_types::ResourceRef::default()]);
+        let e = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(e.to_string().contains("non-zero fields for type appl"), "{e}");
     }
 
     #[test]

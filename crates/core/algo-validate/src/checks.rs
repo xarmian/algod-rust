@@ -219,7 +219,7 @@ fn check_state_proof(state_proof_type: u64, sp: &StateProofBody) -> Result<(), A
 /// go runs this check in TWO places and so does this port, through this one
 /// helper (issue #2196): per member in `WellFormed` (so the gossip test stage
 /// and the REST path report the first malformed member in go's order, called
-/// from `rules::validate_transaction_wellformed_in_mode`) and at group level in
+/// from `rules::validate_transaction_wellformed`) and at group level in
 /// `checkTxnGroup` ([`check_txn_group`], which block validation, the agreement
 /// demux's `proposalCarriesInvalidTxn` screen, simulation and the REST path run).
 /// Block validation checks the payload there, in `check_txn_group`, even for an
@@ -228,34 +228,6 @@ pub fn check_state_proof_payload(txn: &Transaction) -> Result<(), AlgoError> {
     let default_sp = StateProofBody::default();
     let sp = txn.state_proof.as_ref().unwrap_or(&default_sp);
     check_state_proof(txn.state_proof_type, sp)
-}
-
-/// Mirrors Go's `checkApplicationCallBoxes`: when a txn doesn't use the
-/// `Access`-based resource list, every box ref's `Index` must be within
-/// `ForeignApps`'s bounds (0 always refers to the called app itself).
-///
-/// This is a group-level check (run once per txn in `check_txn_group`,
-/// independent of consensus params). `rules::validate_application_call_wellformed`
-/// (issue #701) separately ports the same bound — plus the
-/// `EnableBoxRefNameError` box-name-length check this function doesn't
-/// cover — directly from upstream's `wellFormed`, so a box-index violation
-/// is now caught by both; that's intentional redundancy, not a bug.
-fn check_application_call_boxes(txn: &Transaction) -> Result<(), AlgoError> {
-    if txn.access.is_some() {
-        return Ok(());
-    }
-    let foreign_apps_len = txn.foreign_apps.as_ref().map_or(0, |v| v.len()) as u64;
-    let Some(ref boxes) = txn.boxes else {
-        return Ok(());
-    };
-    for b in boxes {
-        if b.index > foreign_apps_len {
-            return Err(err(
-                "application transaction box index exceeds foreign apps",
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Screen a signed-transaction group for invalid transactions, mirroring
@@ -269,30 +241,20 @@ pub fn check_txn_group(
     let mut heartbeat = false;
     let mut avail_trigger = false;
 
+    // go v5.1 (#6728): only the state proof payload rule and the heartbeat /
+    // resource-availability rule remain. The missing-heartbeat-body,
+    // unknown-type and box-index group checks were removed upstream:
+    // `Transaction.WellFormed` rejects those, per transaction.
     for stx in group {
         let txn = &stx.txn;
         match txn.txn_type.as_str() {
-            "hb" => {
-                heartbeat = true;
-                if txn.heartbeat.is_none() {
-                    return Err(err("heartbeat transaction is missing its heartbeat fields"));
-                }
-            }
-            "stpf" => {
-                check_state_proof_payload(txn)?;
-            }
-            "appl" => {
+            "hb" => heartbeat = true,
+            "stpf" => check_state_proof_payload(txn)?,
+            "appl" => avail_trigger = true,
+            "pay" | "keyreg" | "acfg" | "axfer" | "afrz" if triggers_resource_availability(txn) => {
                 avail_trigger = true;
-                check_application_call_boxes(txn)?;
             }
-            "pay" | "keyreg" | "acfg" | "axfer" | "afrz" => {
-                if triggers_resource_availability(txn) {
-                    avail_trigger = true;
-                }
-            }
-            other => {
-                return Err(err(format!("transaction has an unknown type: {other}")));
-            }
+            _ => {}
         }
     }
 
@@ -445,29 +407,14 @@ mod tests {
 
     // ── Heartbeat missing fields ─────────────────────────────────
 
+    /// go v5.1 (#6728) dropped `errMissingHeartbeatFields` from
+    /// `checkTxnGroup`: `Transaction.WellFormed` ("heartbeat transaction has
+    /// no heartbeat fields") is what rejects it, later.
     #[test]
-    fn heartbeat_missing_fields_is_rejected() {
+    fn heartbeat_missing_fields_is_not_a_group_check() {
         let mut txn = base_txn("hb");
         txn.heartbeat = None;
-        let err = check_txn_group(&[signed(txn)], false).unwrap_err();
-        assert!(err.to_string().contains("heartbeat"), "got: {err}");
-    }
-
-    /// go's `CheckTxnGroup` errors that are not a `TxGroupMalformedError` carry
-    /// `GroupIndex = -1` (`txnGroupBatchPrep`), so there is no member index to
-    /// report: the error is the bare text wherever the member sits (issue
-    /// #2196; the REST path returns it unframed).
-    #[test]
-    fn a_group_error_has_no_member_index_in_the_text() {
-        let pay = base_txn("pay");
-        let mut hb = base_txn("hb");
-        hb.heartbeat = None;
-        let err =
-            check_txn_group(&[signed(pay.clone()), signed(hb), signed(pay)], false).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "validation error: heartbeat transaction is missing its heartbeat fields"
-        );
+        check_txn_group(&[signed(txn)], false).unwrap();
     }
 
     #[test]
@@ -525,10 +472,6 @@ mod tests {
             );
             check_txn_group(&group, true).expect("allowed under AllowGroupedHeartbeats");
         }
-        // the flag does not excuse a heartbeat missing its fields... (still checked)
-        let mut bare = base_txn("hb");
-        bare.heartbeat = None;
-        assert!(check_txn_group(&[signed(bare)], true).is_err());
         // check_payset passes the flag per run
         let mut hb2 = hb.clone();
         let mut appl2 = base_txn("appl");
@@ -704,10 +647,14 @@ mod tests {
         check_state_proof_payload(&txn).unwrap();
     }
 
-    // ── Application box index bound ────────────────────────────────
+    // ── Application box index (go v5.1: no longer a group check) ───
 
+    /// go v5.1 removed `errMalformedApplicationBoxIndex` from `checkTxnGroup`
+    /// (`TestCheckTxnGroupApplicationBoxIndex` and
+    /// `TestCheckPaysetGroupApplicationBoxIndex` are deleted): a box index
+    /// past `ForeignApps` is the business of `WellFormed`, not of the group.
     #[test]
-    fn box_index_exceeding_foreign_apps_is_rejected() {
+    fn box_index_is_not_a_group_check() {
         use algo_types::BoxRef;
         let mut txn = base_txn("appl");
         txn.foreign_apps = Some(vec![100, 200]); // len 2
@@ -715,71 +662,32 @@ mod tests {
             index: 3,
             name: None,
         }]);
-        let err = check_txn_group(&[signed(txn)], false).unwrap_err();
-        assert!(err.to_string().contains("box"), "got: {err}");
-    }
-
-    #[test]
-    fn box_index_within_foreign_apps_is_accepted() {
-        use algo_types::BoxRef;
-        let mut txn = base_txn("appl");
-        txn.foreign_apps = Some(vec![100, 200]);
-        txn.boxes = Some(vec![BoxRef {
-            index: 2,
-            name: None,
-        }]);
         check_txn_group(&[signed(txn)], false).unwrap();
     }
 
-    #[test]
-    fn box_index_bound_skipped_when_access_is_used() {
-        use algo_types::{BoxRef, ResourceRef};
-        let mut txn = base_txn("appl");
-        txn.access = Some(vec![ResourceRef::default()]);
-        txn.foreign_apps = None;
-        txn.boxes = Some(vec![BoxRef {
-            index: 99,
-            name: None,
-        }]);
-        check_txn_group(&[signed(txn)], false).unwrap();
-    }
+    // ── Unknown transaction type (go v5.1: no longer a group check) ─
 
-    // ── Unknown transaction type ───────────────────────────────────
-
+    /// go v5.1: "checkTxnGroup used to reject an unknown type on behalf of
+    /// nodes whose resources.fill could not cope with one. WellFormed is what
+    /// rejects it" (`TestCheckTxnGroupUnknownType`).
     #[test]
-    fn unknown_txn_type_alone_is_rejected() {
-        let txn = base_txn("bogus");
-        let err = check_txn_group(&[signed(txn)], false).unwrap_err();
-        assert!(err.to_string().contains("unknown"), "got: {err}");
-    }
-
-    #[test]
-    fn unknown_txn_type_grouped_after_appl_is_rejected() {
-        // The crash case upstream (go-algorand's pre-fix panic): the
-        // group-wide availability computation used to walk every member,
-        // including an unknown type appearing after the app call that
-        // triggers it.
-        let appl = base_txn("appl");
+    fn unknown_txn_type_is_not_a_group_check() {
         let bogus = base_txn("bogus");
-        let err = check_txn_group(&[signed(appl), signed(bogus)], false).unwrap_err();
-        assert!(err.to_string().contains("unknown"), "got: {err}");
+        check_txn_group(&[signed(bogus.clone())], false).unwrap();
+        check_txn_group(&[signed(base_txn("appl")), signed(bogus)], false).unwrap();
     }
 
     #[test]
     fn every_known_type_is_accepted() {
-        // "stpf" is checked separately below: since `v5.0.1-stable`, an
-        // all-default `StateProofBody` is itself malformed (its zero-value
-        // `SigCommit`/hash factories fail `check_basic_state_proof`), so it
-        // no longer belongs in a loop of types accepted with zero fields
-        // set. Matches go's own test split
-        // (`TestCheckTxnGroupUnknownType`/`TestCheckTxnGroupStateProofBasicSuite`,
-        // `checks_test.go`, `v5.0.1-stable`).
+        // "stpf" is checked separately: an all-default `StateProofBody` is
+        // itself malformed (its zero-value `SigCommit`/hash factories fail
+        // `check_basic_state_proof`), matching go's own test split
+        // (`TestCheckTxnGroupUnknownType`/`TestCheckTxnGroupStateProofBasicSuite`).
         for t in ["pay", "keyreg", "acfg", "axfer", "afrz", "appl"] {
             let txn = base_txn(t);
             check_txn_group(&[signed(txn)], false)
                 .unwrap_or_else(|e| panic!("type {t:?} should be accepted, got: {e}"));
         }
-        // Heartbeat needs its fields populated to be accepted on its own.
         let mut hb = base_txn("hb");
         hb.heartbeat = Some(HeartbeatTxnFields::default());
         check_txn_group(&[signed(hb)], false).unwrap();
@@ -949,9 +857,14 @@ mod tests {
     #[test]
     fn check_payset_rejects_a_malformed_group_anywhere_in_the_payset() {
         let good = signed(base_txn("pay"));
-        let bad = signed(base_txn("bogus"));
-        let err = check_payset(&[good, bad], false).unwrap_err();
-        assert!(err.to_string().contains("unknown"), "got: {err}");
+        // a state proof with an all-default body is malformed
+        let mut bad = base_txn("stpf");
+        bad.state_proof = Some(StateProofBody::default());
+        let err = check_payset(&[good, signed(bad)], false).unwrap_err();
+        assert!(
+            err.to_string().contains("signature commitment"),
+            "got: {err}"
+        );
     }
 
     #[test]
