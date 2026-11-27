@@ -3281,22 +3281,21 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                             // `if br.Index > uint64(len(tx.ForeignApps)) {
                             // continue }`) exactly: an out-of-range box index
                             // reaching *evaluation* is silently skipped in Go
-                            // too, because Go's own group-level
-                            // `CheckTxnGroup` screen is what rejects the
-                            // transaction outright, and it runs ahead of
+                            // too, because `Transaction.WellFormed` rejects
+                            // the transaction outright (go v5.1 no longer
+                            // screens a box index in the group-level
+                            // `CheckTxnGroup`), and it runs ahead of
                             // evaluation only on the paths that verify
-                            // signatures fresh — `Eval(..., validate=true)`
+                            // fresh — `Eval(..., validate=true)`
                             // (agreement/relay block validation) and
                             // `Simulator.check()`. `Eval(..., validate=false)`
                             // (`AddBlock`, and the tracker/catchup replay
-                            // path) never re-verifies `CheckTxnGroup`
-                            // (`ledger/eval/eval.go:2096-2100`'s doc comment),
-                            // trusting that whoever first validated the block
-                            // already ran it. algod-rust's sync/replay/
-                            // catchpoint-restore paths mirror that same trust
-                            // model by not re-running `check_txn_group`
-                            // before `apply_block`, so this branch being live
-                            // there matches Go's own behavior rather than
+                            // path) trusts that whoever first validated the
+                            // block already ran it. algod-rust's
+                            // sync/replay/catchpoint-restore paths mirror that
+                            // same trust model by not re-validating before
+                            // `apply_block`, so this branch being live there
+                            // matches Go's own behavior rather than
                             // being a gap (see issue #628).
                             None => continue,
                         }

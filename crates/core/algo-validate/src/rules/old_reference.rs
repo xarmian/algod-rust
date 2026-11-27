@@ -1256,7 +1256,9 @@ fn verdicts_match_the_old_validators_on_every_oracle_row() {
             for pool in [false, true] {
                 let old = old_validate_transaction_wellformed(&stx.txn, pool, &params, Some(&sp));
                 let new = validate_transaction_wellformed(&stx.txn, pool, &params, Some(&sp));
-                if classify_wellformed_delta(&stx.txn, &params, &old, &new).is_some() {
+                if classify_wellformed_delta(&stx.txn, &params, &old, &new)
+                    == Some("unknown type rejected on every path")
+                {
                     // a deliberate delta (go v5.1: unknown type), see its table
                     continue;
                 }
