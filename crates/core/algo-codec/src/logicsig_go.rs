@@ -65,7 +65,7 @@ use algo_types::{LogicSig, MultisigSig, MultisigSubsig, AddressSalt, SaltedKeySi
 use serde_bytes::ByteBuf;
 
 mod signedtxn;
-pub use signedtxn::decode_signed_txn_go;
+pub use signedtxn::{decode_signed_txn_go, decode_simulate_request_go};
 
 /// A `transactions.LogicSig` as go's generated decoder leaves it.
 #[derive(Debug, Clone, PartialEq)]

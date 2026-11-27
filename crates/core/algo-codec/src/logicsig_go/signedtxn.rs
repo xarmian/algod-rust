@@ -62,6 +62,14 @@ pub fn decode_signed_txn_go(bytes: &[u8]) -> Result<usize, GoMsgpError> {
     Ok(bytes.len() - b.len())
 }
 
+/// What go v5.1.1's `protocol.Decode(data, &specv2.SimulateRequest)` does with
+/// a msgpack simulate request (`daemon/algod/api/spec/v2/msgp_gen.go`, issue
+/// #2555): its error, or nothing. Bytes after the value are ignored.
+pub fn decode_simulate_request_go(bytes: &[u8]) -> Result<(), GoMsgpError> {
+    let mut b = bytes;
+    simulate_request(&mut b).map_err(GoMsgpError)
+}
+
 /// `ctx` joined with the member name: the context of an inline struct's member.
 fn cx(ctx: &str, name: &str) -> String {
     if ctx.is_empty() {
@@ -674,4 +682,83 @@ fn state_proof_message(b: &mut &[u8]) -> R<()> {
             (b"l", "LastAttestedRound", Kind::U64),
         ],
     )
+}
+
+// --- simulate request ------------------------------------------------------
+
+/// `bounds.MaxTxGroupSize`: the allocbound of the group list and of each group.
+const MAX_TX_GROUP_SIZE: usize = 16;
+
+/// `msgp.ReadInt64Bytes`: any msgpack int, `nil` as 0; a uint64 above
+/// `MaxInt64` wraps (go-codec compat).
+fn read_i64(b: &mut &[u8]) -> R<()> {
+    let l = lead(b)?;
+    let used = match l {
+        0x00..=0x7f | 0xe0..=0xff | 0xc0 => 1,
+        0xcc | 0xd0 => 2,
+        0xcd | 0xd1 => 3,
+        0xce | 0xd2 => 5,
+        0xcf | 0xd3 => 9,
+        _ => return Err(super::bad_prefix(super::Ty::Int, l)),
+    };
+    if b.len() < used {
+        return Err(E::Short);
+    }
+    *b = &b[used..];
+    Ok(())
+}
+
+/// `SimulateRequestTxnGroups.UnmarshalMsg`: the groups are inline structs.
+fn txn_groups(b: &mut &[u8]) -> R<()> {
+    let (n, _) = w(read_array_header(b, true), "")?;
+    if n > MAX_TX_GROUP_SIZE {
+        return Err(overflow(n, MAX_TX_GROUP_SIZE).wrap(""));
+    }
+    for i in 0..n {
+        let ctx = i.to_string();
+        map_struct(b, &ctx, &mut || {}, &mut |key, b| {
+            match key {
+                b"txns" => {
+                    let name = format!("{ctx}/Txns");
+                    let n = bounded_array(b, MAX_TX_GROUP_SIZE, &name)?;
+                    for j in 0..n {
+                        w(signed_txn(b), &format!("{name}/{j}"))?;
+                    }
+                }
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+    }
+    Ok(())
+}
+
+/// `specv2.SimulateRequest`.
+fn simulate_request(b: &mut &[u8]) -> R<()> {
+    map_struct(b, "", &mut || {}, &mut |key, b| {
+        match key {
+            b"txn-groups" => w(txn_groups(b), "TxnGroups")?,
+            b"round" => w(w(read_u64(b).map(|_| ()), ""), "Round")?,
+            b"allow-empty-signatures" => Kind::Bool.read(b, "AllowEmptySignatures")?,
+            b"allow-more-logging" => Kind::Bool.read(b, "AllowMoreLogging")?,
+            b"allow-unnamed-resources" => Kind::Bool.read(b, "AllowUnnamedResources")?,
+            b"extra-opcode-budget" => w(read_i64(b), "ExtraOpcodeBudget")?,
+            b"exec-trace-config" => w(
+                table_struct(
+                    b,
+                    "",
+                    &[
+                        (b"enable", "Enable", Kind::Bool),
+                        (b"stack-change", "Stack", Kind::Bool),
+                        (b"scratch-change", "Scratch", Kind::Bool),
+                        (b"state-change", "State", Kind::Bool),
+                    ],
+                ),
+                "ExecTraceConfig",
+            )?,
+            b"fix-signers" => Kind::Bool.read(b, "FixSigners")?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })
 }

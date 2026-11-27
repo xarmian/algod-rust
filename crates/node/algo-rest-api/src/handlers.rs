@@ -2680,6 +2680,28 @@ fn read_accepted_signed_txn(bytes: &[u8]) -> Result<algo_types::SignedTransactio
     })
 }
 
+/// The msgpack request `body` with an `extra-opcode-budget` above `i64::MAX`
+/// rewritten as the int64 go's `ReadInt64Bytes` makes of it.
+fn wrap_extra_opcode_budget(body: &[u8]) -> Option<Vec<u8>> {
+    use rmpv::Value;
+    let mut cursor = body;
+    let Value::Map(mut pairs) = rmpv::decode::read_value(&mut cursor).ok()? else {
+        return None;
+    };
+    let mut changed = false;
+    for (k, v) in pairs.iter_mut() {
+        if k.as_str() == Some("extra-opcode-budget") {
+            if let Some(u) = v.as_u64().filter(|u| *u > i64::MAX as u64) {
+                *v = Value::from(u as i64);
+                changed = true;
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(body.len());
+    rmpv::encode::write_value(&mut out, &Value::Map(pairs)).ok()?;
+    changed.then_some(out)
+}
+
 /// `value` with every map key that is an array of uint8 spelled as a string.
 fn string_keys(value: rmpv::Value) -> rmpv::Value {
     use rmpv::Value;
@@ -3351,56 +3373,78 @@ pub async fn simulate_transaction<N: NodeInterface>(
         return error::bad_request(REQUEST_BODY_TOO_LARGE);
     }
 
-    // go decodes the body into `PreEncodedSimulateRequest` with the strict
-    // msgpack handle (`ErrorIfNoField`) before its JSON fallback: a msgpack
-    // body it rejects always ends in the same fixed JSON-decoder text (issue
-    // #1967). A msgpack body is parsed with `rmpv` so its binary fields
+    // go v5.1.1 (`decodeSimulateRequest`, issue #2555) tells the two forms by
+    // the first byte: a msgpack map header is never an ASCII byte (>= 0x80),
+    // a JSON request always starts with one. A msgpack body is decoded with
+    // the generated msgp decoder of `SimulateRequest`, whose error is the
+    // answer; one it accepts is parsed with `rmpv` so its binary fields
     // survive (`serde_json::Value` cannot hold a `bin`; issue #1968): the
     // request carries `null` placeholders and each transaction's own msgpack
     // bytes travel alongside in `raw_txns`.
-    //
-    // Every body go's msgpack decode rejects is answered by its JSON decode of
-    // the same bytes, `failed to decode object: <go-codec's error>` with its
-    // byte position (issue #2477).
     use crate::simulate_strict::{
         go_json_decode, parse_json_request, parse_msgpack_request, request_from_go_value,
-        JsonSimulate, MsgpackSimulate, GO_MSGPACK_REJECTION,
+        JsonSimulate, MsgpackSimulate,
     };
-    let (mut request, raw_txns) = match parse_msgpack_request(&body) {
-        MsgpackSimulate::Decoded(d) => (d.request, d.raw_txns),
-        MsgpackSimulate::Rejected => {
-            return match go_json_decode(&body) {
-                Err(text) => error::bad_request_bytes(&text),
-                Ok(_) => error::bad_request(GO_MSGPACK_REJECTION),
-            };
+    let is_msgpack = body.first().is_some_and(|b| *b >= 0x80);
+    let (mut request, raw_txns) = if is_msgpack {
+        if let Err(e) = algo_codec::decode_simulate_request_go(&body) {
+            return error::bad_request_bytes(&e.text());
         }
-        MsgpackSimulate::NotMsgpack => {
-            let value = match go_json_decode(&body) {
-                Ok(value) => value,
-                Err(text) => return error::bad_request_bytes(&text),
-            };
-            // go's own JSON form (base64 bytes, address strings) goes through
-            // the same pipeline as msgpack (issue #1972); the rest of what
-            // go-codec accepts goes through it as the msgpack go would
-            // encode from the decoded value.
-            match parse_json_request(&body) {
-                JsonSimulate::Decoded(d) => (d.request, d.raw_txns),
-                // go's strict JSON decode names the first unknown key and its
-                // offset (issue #1971).
-                JsonSimulate::UnknownField(u) => return error::bad_request(u.message()),
-                JsonSimulate::NotGoForm => match request_from_go_value(&value) {
-                    Some(d) => (d.request, d.raw_txns),
-                    // Unreachable: the msgpack go encodes from what go-codec
-                    // decoded always decodes (issue #2494,
-                    // `every_body_go_decodes_reaches_the_msgpack_pipeline`).
-                    None => {
-                        tracing::error!("simulate: a request go decodes did not convert");
-                        return error::internal_error("failed to decode simulate request");
-                    }
-                },
-            }
+        match parse_msgpack_request(&body) {
+            MsgpackSimulate::Decoded(d) => (d.request, d.raw_txns),
+            // `ReadInt64Bytes` wraps a uint64 above `MaxInt64` (go-codec
+            // compat): the older reader wants the int64 go reads
+            _ => match wrap_extra_opcode_budget(&body).map(|b| parse_msgpack_request(&b)) {
+                Some(MsgpackSimulate::Decoded(d)) => (d.request, d.raw_txns),
+                // go's decoder accepted bytes the older reader refuses: not reached
+                _ => {
+                    tracing::error!("simulate: a request go decodes did not convert");
+                    return error::internal_error("failed to decode simulate request");
+                }
+            },
+        }
+    } else {
+        // JSON, decoded with go-codec's strict handle (issue #2477)
+        let value = match go_json_decode(&body) {
+            Ok(value) => value,
+            Err(text) => return error::bad_request_bytes(&text),
+        };
+        // go's own JSON form (base64 bytes, address strings) goes through
+        // the same pipeline as msgpack (issue #1972); the rest of what
+        // go-codec accepts goes through it as the msgpack go would
+        // encode from the decoded value.
+        match parse_json_request(&body) {
+            JsonSimulate::Decoded(d) => (d.request, d.raw_txns),
+            // go's strict JSON decode names the first unknown key and its
+            // offset (issue #1971).
+            JsonSimulate::UnknownField(u) => return error::bad_request(u.message()),
+            JsonSimulate::NotGoForm => match request_from_go_value(&value) {
+                Some(d) => (d.request, d.raw_txns),
+                // Unreachable: the msgpack go encodes from what go-codec
+                // decoded always decodes (issue #2494,
+                // `every_body_go_decodes_reaches_the_msgpack_pipeline`).
+                None => {
+                    tracing::error!("simulate: a request go decodes did not convert");
+                    return error::internal_error("failed to decode simulate request");
+                }
+            },
         }
     };
+
+    // `simulation.CheckTxnGroupCount`, before any transaction is decoded
+    let n_groups = request.txn_groups.len();
+    if !(1..=1).contains(&n_groups) {
+        return error::bad_request(format!("expected 1 transaction group, got {n_groups}"));
+    }
+    // go's JSON decode bounds each group by `bounds.MaxTxGroupSize` the same way
+    for group in &request.txn_groups {
+        if group.txns.len() > 16 {
+            return error::bad_request(format!(
+                "transaction group size {} exceeds limit 16",
+                group.txns.len()
+            ));
+        }
+    }
 
     // Decode each transaction to SignedTransaction from the msgpack bytes
     // carried in `raw_txns` (a `serde_json::Value` cannot hold a msgpack
@@ -3410,6 +3454,9 @@ pub async fn simulate_transaction<N: NodeInterface>(
         let mut decoded_txns = Vec::with_capacity(group.txns.len());
         for j in 0..group.txns.len() {
             let decode_result = match raw_txns.get(i).and_then(|g| g.get(j)) {
+                // msgpack: go's generated decoder already accepted the bytes;
+                // JSON: go-codec's reflection decoder (no required fields)
+                Some(bytes) if is_msgpack => read_accepted_signed_txn(bytes),
                 Some(bytes) => crate::simulate_strict::decode_signed_txn(bytes),
                 None => Err("transaction bytes missing".to_string()),
             };
@@ -3432,19 +3479,10 @@ pub async fn simulate_transaction<N: NodeInterface>(
     }
     request.decoded_txn_groups = decoded_groups;
 
-    // go checks each group's size once the whole body has decoded; the group
-    // count (none, or more than one) is the simulator's own check, with its
-    // own text (handlers.go SimulateTransaction, simulator.go Simulate).
-    let max_group_size = node.max_tx_group_size();
+    // an empty group is the simulator's own check (simulator.go Simulate)
     for group in &request.txn_groups {
         if group.txns.is_empty() {
             return error::bad_request("empty txgroup");
-        }
-        if group.txns.len() > max_group_size {
-            return error::bad_request(format!(
-                "transaction group size {} exceeds protocol max {max_group_size}",
-                group.txns.len()
-            ));
         }
     }
 
