@@ -191,6 +191,21 @@ pub trait LedgerStore {
     /// Returns a `Vec` to avoid lifetime issues with non-in-memory backends.
     fn app_params_created_by(&self, creator: &Address) -> Vec<AppParams>;
 
+    // ---- Generate-only cross-type lookups (go v5.1.1, issue #2545) ----
+
+    /// go `roundCowBase.watchCrossTypes`: start recording, for the
+    /// transaction about to be applied, any lookup that found nothing of the
+    /// type asked for at an id the address held as the other creatable type
+    /// as of the previous block. A store with no base to consult (the default)
+    /// records nothing.
+    fn watch_cross_types(&self) {}
+
+    /// go `roundCowBase.stopWatchingCrossTypes`: end the check and return what
+    /// it found (the error text go reports), `None` when nothing was noted.
+    fn stop_watching_cross_types(&self) -> Option<String> {
+        None
+    }
+
     // ---- App Local States ----
 
     fn get_app_local_state(&self, addr: &Address, app_id: u64) -> Option<AppLocalState>;

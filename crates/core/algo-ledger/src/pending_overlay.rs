@@ -411,13 +411,68 @@ impl OverlayBase for SqliteLedger {
 pub struct OverlayStore<'a, B: OverlayBase + ?Sized = SqliteLedger> {
     base: &'a B,
     st: &'a mut PendingOverlay,
+    /// go `roundCowBase.watchCrossType` / `crossTypeHit` (issue #2545).
+    watch_cross_type: std::cell::Cell<bool>,
+    cross_type_hit: std::cell::RefCell<Option<String>>,
 }
 
 impl<'a, B: OverlayBase + ?Sized> OverlayStore<'a, B> {
     /// Layer `overlay` on `base`. `base` must be the ledger the overlay was
     /// created from, still at the same committed round.
     pub fn new(base: &'a B, overlay: &'a mut PendingOverlay) -> Self {
-        Self { base, st: overlay }
+        Self {
+            base,
+            st: overlay,
+            watch_cross_type: std::cell::Cell::new(false),
+            cross_type_hit: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// go `roundCowBase.noteMiss`: a lookup of `addr`'s resource `id` as one
+    /// creatable type reached the base and found nothing. While watching,
+    /// record whether `addr` held `id` as the other type as of the base
+    /// round. IDs above the base's transaction counter cannot be held at all
+    /// (go's `absent`), and an id the base knows as the type asked for cannot
+    /// be held as the other (go's `knownAs`: one counter assigns both).
+    fn note_miss(&self, addr: &Address, id: u64, is_app: bool) {
+        if !self.watch_cross_type.get() || self.cross_type_hit.borrow().is_some() {
+            return;
+        }
+        if id > self.base.base_txn_counter() {
+            return;
+        }
+        let known = if is_app {
+            self.base.base_get_app_params(id).is_some()
+        } else {
+            self.base.base_get_asset_params(id).is_some()
+        };
+        if known {
+            return;
+        }
+        // The other type's resource: params (the account created it) or the
+        // holding / local state.
+        let held = if is_app {
+            self.base.base_get_asset_holding(addr, id).is_some()
+                || self
+                    .base
+                    .base_get_asset_params(id)
+                    .is_some_and(|r| r.creator == *addr)
+        } else {
+            self.base.base_get_app_local_state(addr, id).is_some()
+                || self
+                    .base
+                    .base_get_app_params(id)
+                    .is_some_and(|p| p.creator == *addr)
+        };
+        if held {
+            let (other, wanted) = if is_app {
+                ("asset", "an app")
+            } else {
+                ("app", "an asset")
+            };
+            *self.cross_type_hit.borrow_mut() =
+                Some(format!("cannot look up {addr}'s {other} {id} as {wanted}"));
+        }
     }
 }
 
@@ -459,10 +514,26 @@ impl<B: OverlayBase + ?Sized> LedgerStore for OverlayStore<'_, B> {
 
     // ---- Asset holdings ----
 
+    fn watch_cross_types(&self) {
+        self.watch_cross_type.set(true);
+        *self.cross_type_hit.borrow_mut() = None;
+    }
+
+    fn stop_watching_cross_types(&self) -> Option<String> {
+        self.watch_cross_type.set(false);
+        self.cross_type_hit.borrow_mut().take()
+    }
+
     fn get_asset_holding(&self, addr: &Address, asset_id: u64) -> Option<AssetHolding> {
         match self.st.holdings.get(&(*addr, asset_id)) {
             Some(v) => v.clone(),
-            None => self.base.base_get_asset_holding(addr, asset_id),
+            None => {
+                let held = self.base.base_get_asset_holding(addr, asset_id);
+                if held.is_none() {
+                    self.note_miss(addr, asset_id, false);
+                }
+                held
+            }
         }
     }
 
@@ -554,7 +625,13 @@ impl<B: OverlayBase + ?Sized> LedgerStore for OverlayStore<'_, B> {
     fn get_app_local_state(&self, addr: &Address, app_id: u64) -> Option<AppLocalState> {
         match self.st.locals.get(&(*addr, app_id)) {
             Some(v) => v.clone(),
-            None => self.base.base_get_app_local_state(addr, app_id),
+            None => {
+                let state = self.base.base_get_app_local_state(addr, app_id);
+                if state.is_none() {
+                    self.note_miss(addr, app_id, true);
+                }
+                state
+            }
         }
     }
 

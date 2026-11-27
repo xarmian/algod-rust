@@ -1125,4 +1125,206 @@ mod tests {
             "{violations} violations, {clean} clean"
         );
     }
+
+    // ---- Issue #2545: generate-only cross-type lookups (go v5.1.1
+    // `roundCowBase.watchCrossTypes` / `noteMiss`) ----
+
+    /// go `TestCowBaseCrossTypeLookups` (`ledger/eval/eval_test.go`) on
+    /// [`OverlayStore`], whose base is the ledger as of the previous block.
+    #[test]
+    fn cross_type_lookups_are_noted_only_while_watching() {
+        use algo_types::{AppLocalState, AppParams, AssetParams, AssetParamsRecord};
+        let holder = addr(1);
+        let other = addr(2);
+        let creator = addr(3);
+        let (asa, created, app) = (7u64, 9u64, 8u64);
+        let mut l = ledger(&[
+            (holder, funded(5_000_000)),
+            (other, funded(5_000_000)),
+            (creator, funded(5_000_000)),
+        ]);
+        l.set_txn_counter(100);
+        l.set_asset_params(
+            asa,
+            AssetParamsRecord {
+                params: AssetParams::default(),
+                creator,
+            },
+        );
+        l.set_asset_params(
+            created,
+            AssetParamsRecord {
+                params: AssetParams::default(),
+                creator: holder,
+            },
+        );
+        l.set_app_params(
+            app,
+            AppParams {
+                creator,
+                ..Default::default()
+            },
+        );
+        l.set_asset_holding(
+            &holder,
+            asa,
+            AssetHolding {
+                amount: 1,
+                ..Default::default()
+            },
+        );
+        l.set_app_local_state(
+            &holder,
+            app,
+            AppLocalState {
+                schema: Default::default(),
+                key_value: Default::default(),
+            },
+        );
+        let mut ov = PendingOverlay::new(&l);
+        let st = OverlayStore::new(&l, &mut ov);
+
+        let watched = |f: &dyn Fn()| {
+            st.watch_cross_types();
+            f();
+            st.stop_watching_cross_types()
+        };
+        // Not watching: nothing is noted.
+        assert!(st.get_app_local_state(&holder, asa).is_none());
+        assert_eq!(st.stop_watching_cross_types(), None);
+        // Watching, a local-state lookup of an asset id the account holds.
+        let err =
+            watched(&|| assert!(st.get_app_local_state(&holder, asa).is_none())).expect("noted");
+        assert!(
+            err.contains(&format!("cannot look up {holder}'s asset {asa} as an app")),
+            "{err}"
+        );
+        // The reverse direction (a holding lookup of an app id).
+        let err =
+            watched(&|| assert!(st.get_asset_holding(&holder, app).is_none())).expect("noted");
+        assert!(
+            err.contains(&format!("cannot look up {holder}'s app {app} as an asset")),
+            "{err}"
+        );
+        // The account created the asset: params count as holding it.
+        let err = watched(&|| assert!(st.get_app_local_state(&holder, created).is_none()))
+            .expect("noted");
+        assert!(err.contains("asset 9 as an app"), "{err}");
+        // Ordinary misses: the id is of the type asked for.
+        assert_eq!(
+            watched(&|| assert!(st.get_app_local_state(&other, app).is_none())),
+            None
+        );
+        assert_eq!(
+            watched(&|| assert!(st.get_asset_holding(&other, asa).is_none())),
+            None
+        );
+        // An id the account does not hold as the other type either.
+        assert_eq!(
+            watched(&|| assert!(st.get_app_local_state(&other, asa).is_none())),
+            None
+        );
+        // Ids above the previous block's counter cannot be held at all.
+        assert_eq!(
+            watched(&|| assert!(st.get_app_local_state(&holder, 101).is_none())),
+            None
+        );
+        assert_eq!(
+            watched(&|| assert!(st.get_asset_holding(&holder, 102).is_none())),
+            None
+        );
+        // A hit never notes anything.
+        assert_eq!(
+            watched(&|| assert!(st.get_asset_holding(&holder, asa).is_some())),
+            None
+        );
+    }
+
+    fn asset_holding_of_app_id_call(
+        sender: Address,
+        app_id: u64,
+        asset_ref: u64,
+    ) -> SignedTransaction {
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = TxnType::Appl;
+        stx.txn.sender = sender;
+        stx.txn.fee = 1_000;
+        stx.txn.first_valid = Round(1);
+        stx.txn.last_valid = Round(1000);
+        stx.txn.application_id = app_id;
+        stx.txn.foreign_assets = Some(vec![asset_ref]);
+        stx
+    }
+
+    /// A transaction that succeeds although its program looked an app id up as
+    /// an asset the sender holds is refused while generating (pool admission);
+    /// the check lives behind `ApplyContext::generate`, so validation is
+    /// untouched.
+    #[test]
+    fn generating_refuses_a_txn_that_looked_up_an_app_as_an_asset() {
+        use algo_types::{AppLocalState, AppParams};
+        let a = addr(1);
+        let creator = addr(3);
+        let (app, other_app) = (1008u64, 1009u64);
+        let mut l = ledger(&[(a, funded(50_000_000)), (creator, funded(5_000_000))]);
+        l.set_txn_counter(2000);
+        let program = algo_avm::assembler::assemble_string(
+            "#pragma version 8
+txn Sender
+txn Assets 0
+asset_holding_get AssetBalance
+pop
+pop
+int 1
+",
+        )
+        .unwrap()
+        .program;
+        for id in [app, other_app] {
+            l.set_app_params(
+                id,
+                AppParams {
+                    creator,
+                    approval_program: program.clone(),
+                    clear_state_program: program.clone(),
+                    ..Default::default()
+                },
+            );
+        }
+        // The sender is opted in to app 8, so it holds id 8 as an app.
+        l.set_app_local_state(
+            &a,
+            app,
+            AppLocalState {
+                schema: Default::default(),
+                key_value: Default::default(),
+            },
+        );
+        let t = template(&l);
+
+        // Looking up app 8 as an asset: refused while generating.
+        let mut ov = PendingOverlay::new(&l);
+        let err = evaluate_group(
+            &l,
+            &mut ov,
+            &t,
+            &[asset_holding_of_app_id_call(a, other_app, app)],
+        )
+        .expect_err("a cross-type lookup is refused");
+        assert!(
+            format!("{err:?}").contains(&format!("cannot look up {a}'s app {app} as an asset")),
+            "{err:?}"
+        );
+        assert!(ov.is_empty(), "the refused group leaves no effects");
+
+        // Control: an id the sender holds nothing at passes.
+        let mut ov = PendingOverlay::new(&l);
+        evaluate_group(
+            &l,
+            &mut ov,
+            &t,
+            &[asset_holding_of_app_id_call(a, other_app, 1005)],
+        )
+        .expect("an ordinary miss is admitted");
+    }
 }

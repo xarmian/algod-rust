@@ -2352,7 +2352,11 @@ mod app_rate_limiter_wiring_tests {
         fn generate_block(&mut self, _voting_accounts: &[Address]) -> Result<Block, AlgoError> {
             Ok(Block::default())
         }
-        fn reset_txn_bytes(&mut self) {}
+        fn reset_txn_bytes(&mut self) -> usize {
+            0
+        }
+
+        fn restore_txn_bytes(&mut self, _txn_bytes: usize) {}
     }
 
     /// Build a pool with a stub evaluator wired via `on_new_block`, plus
@@ -2745,7 +2749,11 @@ mod batch_verifier_wiring_tests {
         fn generate_block(&mut self, _voting_accounts: &[Address]) -> Result<Block, AlgoError> {
             Ok(Block::default())
         }
-        fn reset_txn_bytes(&mut self) {}
+        fn reset_txn_bytes(&mut self) -> usize {
+            0
+        }
+
+        fn restore_txn_bytes(&mut self, _txn_bytes: usize) {}
     }
 
     fn make_pool() -> Arc<TransactionPool> {
@@ -2809,7 +2817,11 @@ mod batch_verifier_wiring_tests {
         fn generate_block(&mut self, _voting_accounts: &[Address]) -> Result<Block, AlgoError> {
             Ok(Block::default())
         }
-        fn reset_txn_bytes(&mut self) {}
+        fn reset_txn_bytes(&mut self) -> usize {
+            0
+        }
+
+        fn restore_txn_bytes(&mut self, _txn_bytes: usize) {}
     }
 
     fn make_pool_rejecting_test() -> Arc<TransactionPool> {
@@ -3162,7 +3174,11 @@ mod canonical_cache_wiring_tests {
         fn generate_block(&mut self, _voting_accounts: &[Address]) -> Result<Block, AlgoError> {
             Ok(Block::default())
         }
-        fn reset_txn_bytes(&mut self) {}
+        fn reset_txn_bytes(&mut self) -> usize {
+            0
+        }
+
+        fn restore_txn_bytes(&mut self, _txn_bytes: usize) {}
     }
 
     fn make_pool() -> (Arc<TransactionPool>, Arc<AtomicBool>, Arc<AtomicUsize>) {
@@ -3631,7 +3647,11 @@ mod backlog_queue_tests {
         fn generate_block(&mut self, _voting_accounts: &[Address]) -> Result<Block, AlgoError> {
             Ok(Block::default())
         }
-        fn reset_txn_bytes(&mut self) {}
+        fn reset_txn_bytes(&mut self) -> usize {
+            0
+        }
+
+        fn restore_txn_bytes(&mut self, _txn_bytes: usize) {}
     }
 
     fn make_pool() -> (Arc<TransactionPool>, Arc<AtomicUsize>) {

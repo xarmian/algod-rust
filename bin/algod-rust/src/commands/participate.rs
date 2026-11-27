@@ -4908,8 +4908,12 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         Ok(block)
     }
 
-    fn reset_txn_bytes(&mut self) {
-        self.txn_bytes = 0;
+    fn reset_txn_bytes(&mut self) -> usize {
+        std::mem::take(&mut self.txn_bytes)
+    }
+
+    fn restore_txn_bytes(&mut self, txn_bytes: usize) {
+        self.txn_bytes = txn_bytes;
     }
 
     /// `transaction_group` runs go's `checkDup` per member (issue #2130), also
