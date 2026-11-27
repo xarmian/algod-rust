@@ -30,7 +30,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use algo_types::Round;
+use algo_types::{Address, Digest, Round};
 use serde::{Deserialize, Serialize};
 
 use crate::bundle::UnauthenticatedBundle;
@@ -157,6 +157,11 @@ pub enum EventType {
 
     /// Checkpoint has been persisted to disk.
     CheckpointReached,
+
+    /// Sent to the proposalStore to ask which proposal-values from some
+    /// original period and proposer still want a payload, before a received
+    /// payload is decoded. It is returned by the store with the answer.
+    ReadWantedPayloads,
 }
 
 impl fmt::Display for EventType {
@@ -202,6 +207,7 @@ impl fmt::Display for EventType {
             Self::DumpVotes => "dumpVotes",
             Self::WrappedAction => "wrappedAction",
             Self::CheckpointReached => "checkpointReached",
+            Self::ReadWantedPayloads => "readWantedPayloads",
         };
         write!(f, "{s}")
     }
@@ -1020,6 +1026,37 @@ impl fmt::Display for PinnedValueEvent {
     }
 }
 
+/// The answer to a `ReadWantedPayloads` query.
+///
+/// Mirrors Go's `wantedPayloadsEvent`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WantedPayloadsEvent {
+    /// The round of the payload, and of the proposalStore asked.
+    pub round: Round,
+    /// The original period of the payload.
+    pub original_period: Period,
+    /// The original proposer of the payload.
+    pub original_proposer: Address,
+    /// The `EncodingDigest` of each proposal-value with this original period
+    /// and proposer whose blockAssembler has not been filled or assembled
+    /// yet.
+    pub encoding_digests: Vec<Digest>,
+}
+
+impl fmt::Display for WantedPayloadsEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}: {} {} {:?} {}",
+            EventType::ReadWantedPayloads,
+            self.round.0,
+            self.original_period.0,
+            self.original_proposer,
+            self.encoding_digests.len()
+        )
+    }
+}
+
 /// A threshold event — a threshold of votes has been reached for a given step.
 ///
 /// Mirrors Go's `thresholdEvent`.
@@ -1355,6 +1392,8 @@ pub enum Event {
     DumpVotes(DumpVotesEvent),
     /// A checkpoint event.
     Checkpoint(CheckpointEvent),
+    /// A wanted-payloads query and its answer.
+    WantedPayloads(WantedPayloadsEvent),
 }
 
 impl Event {
@@ -1389,6 +1428,7 @@ impl Event {
             Self::DumpVotesRequest(_) => EventType::DumpVotesRequest,
             Self::DumpVotes(_) => EventType::DumpVotes,
             Self::Checkpoint(_) => EventType::CheckpointReached,
+            Self::WantedPayloads(_) => EventType::ReadWantedPayloads,
         }
     }
 }
@@ -1428,6 +1468,7 @@ impl fmt::Display for Event {
             Self::DumpVotesRequest(e) => write!(f, "{e}"),
             Self::DumpVotes(e) => write!(f, "{e}"),
             Self::Checkpoint(e) => write!(f, "{e}"),
+            Self::WantedPayloads(e) => write!(f, "{e}"),
         }
     }
 }
@@ -1468,6 +1509,7 @@ pub fn zero_event(t: EventType) -> Event {
         EventType::ReadStaging => Event::StagingValue(StagingValueEvent::default()),
         EventType::ReadPinned => Event::PinnedValue(PinnedValueEvent::default()),
         EventType::ReadLowestVote => Event::ReadLowest(ReadLowestEvent::default()),
+        EventType::ReadWantedPayloads => Event::WantedPayloads(WantedPayloadsEvent::default()),
         _ => panic!("bad event type: {t}"),
     }
 }

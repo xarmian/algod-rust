@@ -938,6 +938,16 @@ fn vote_into(rd: &mut &[u8], vote: &mut UnauthenticatedVote) -> GoResult<()> {
     Ok(())
 }
 
+/// `unauthenticatedVote.UnmarshalMsg` at the start of `rd`, decoded into
+/// `vote`: the `pv` entry of a proposal payload prefix
+/// (`payload_deferral::parse_payload_prefix`).
+pub(crate) fn decode_vote_into(
+    rd: &mut &[u8],
+    vote: &mut UnauthenticatedVote,
+) -> Result<(), CodecError> {
+    vote_into(rd, vote).map_err(go_err)
+}
+
 /// `voteAuthenticator` decoded into `auth`.
 fn vote_authenticator_into(rd: &mut &[u8], auth: &mut VoteAuthenticator) -> GoResult<()> {
     let mut keys = go_msgp::struct_keys_with(

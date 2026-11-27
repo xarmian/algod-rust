@@ -804,6 +804,7 @@ async fn run_malformed_proposal(cli: &Cli, algod: &Algod, transport: &Transport)
         original_period: Period(0),
         original_proposer: Address([0u8; 32]),
         received_at: Duration::ZERO,
+        deferred_payload: None,
     }
     .block_digest();
     report.committed_block_digest = Some(committed_digest.to_string());
@@ -891,6 +892,7 @@ async fn run_unknown_field_proposal(
             original_period: Period(0),
             original_proposer: Address([0u8; 32]),
             received_at: Duration::ZERO,
+            deferred_payload: None,
         }
         .block_digest()
         .to_string(),

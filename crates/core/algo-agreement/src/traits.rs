@@ -360,6 +360,30 @@ pub struct Message {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Tag(pub &'static str);
 
+/// go's `protocol.AgreementVoteTagMaxSize`.
+pub const AGREEMENT_VOTE_TAG_MAX_SIZE: u64 = 1228;
+
+/// go's `protocol.ProposalPayloadTagMaxSize` (`0x501e3a`, dominated by
+/// `MaxTxnBytesPerBlock`).
+pub const PROPOSAL_PAYLOAD_TAG_MAX_SIZE: u64 = 0x501e3a;
+
+/// go's `protocol.VoteBundleTagMaxSize`.
+pub const VOTE_BUNDLE_TAG_MAX_SIZE: u64 = 6 * 1024 * 1024;
+
+impl Tag {
+    /// go's `Tag.MaxMessageSize` for the agreement tags: peers close their
+    /// connection to the sender of a longer message. 0 for any other tag, as
+    /// go's is for an unknown one.
+    pub fn max_message_size(&self) -> u64 {
+        match self.0 {
+            AGREEMENT_VOTE_TAG => AGREEMENT_VOTE_TAG_MAX_SIZE,
+            PROPOSAL_PAYLOAD_TAG => PROPOSAL_PAYLOAD_TAG_MAX_SIZE,
+            VOTE_BUNDLE_TAG => VOTE_BUNDLE_TAG_MAX_SIZE,
+            _ => 0,
+        }
+    }
+}
+
 /// The tag for agreement vote messages (`"AV"`).
 pub const AGREEMENT_VOTE_TAG: &str = "AV";
 

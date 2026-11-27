@@ -224,7 +224,7 @@ fn check_state_proof(state_proof_type: u64, sp: &StateProofBody) -> Result<(), A
 /// demux's `proposalCarriesInvalidTxn` screen, simulation and the REST path run).
 /// Block validation checks the payload there, in `check_txn_group`, even for an
 /// `stpf` whose per-transaction rules `block.rs` skips.
-pub(crate) fn check_state_proof_payload(txn: &Transaction) -> Result<(), AlgoError> {
+pub fn check_state_proof_payload(txn: &Transaction) -> Result<(), AlgoError> {
     let default_sp = StateProofBody::default();
     let sp = txn.state_proof.as_ref().unwrap_or(&default_sp);
     check_state_proof(txn.state_proof_type, sp)

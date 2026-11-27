@@ -27,6 +27,7 @@
 //
 // `ProposalValue` is defined in vote.rs and re-exported from lib.rs.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -90,6 +91,20 @@ pub struct UnauthenticatedProposal {
     /// matching Go, where a restarted node also loses this value.
     #[serde(skip)]
     pub received_at: Duration,
+
+    /// If set, the encoded `transmittedPayload` this proposal was received
+    /// as. The proposal is then not decoded yet: only its round,
+    /// `original_period` and `original_proposer` are set (see
+    /// `payload_deferral::decode_proposal`), and
+    /// `Player::decode_payload_if_wanted` decodes it if agreement wants the
+    /// payload.
+    ///
+    /// Mirrors Go's unexported `unauthenticatedProposal.deferredPayload`,
+    /// which has no codec tag: it is not serialized, so a proposal restored
+    /// from the crash state without it matches no proposal-value and is
+    /// rejected.
+    #[serde(skip)]
+    pub deferred_payload: Option<Arc<[u8]>>,
 }
 
 impl Default for UnauthenticatedProposal {
@@ -100,6 +115,7 @@ impl Default for UnauthenticatedProposal {
             original_period: Period(0),
             original_proposer: Address([0u8; 32]),
             received_at: Duration::ZERO,
+            deferred_payload: None,
         }
     }
 }

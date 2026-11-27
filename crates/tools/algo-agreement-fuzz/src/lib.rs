@@ -1280,6 +1280,7 @@ mod tests {
             original_period: Period(0),
             original_proposer: Address([0x42; 32]),
             received_at: std::time::Duration::ZERO,
+            deferred_payload: None,
         }
     }
 

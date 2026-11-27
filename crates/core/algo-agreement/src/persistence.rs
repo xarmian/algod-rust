@@ -259,16 +259,13 @@ impl From<rusqlite::Error> for PersistenceError {
 /// `Service::start`'s `restore_crash_state` resets the row and
 /// bootstraps fresh, so the upgrade is a one-time loss of in-flight
 /// crash state and nothing more.
-/// go `snapshotCompressionLevel` / `compressSnapshots` / `zstdFrameMagic`
-/// (`agreement/persistence.go`, v5.0.4-stable). The persisted state can be
-/// zstd-compressed, which is very effective for votes and bundles that repeat
-/// the same proposal values, signatures and msgpack field names. Decoding
-/// support ships first, so `COMPRESS_SNAPSHOTS` can be turned on only once no
-/// node can roll back to a binary that cannot read a compressed state.
+/// go `snapshotCompressionLevel` / `zstdFrameMagic` (`agreement/persistence.go`,
+/// v5.1.1-stable). The persisted state is zstd-compressed, which is very
+/// effective for votes and bundles that repeat the same proposal values,
+/// signatures and msgpack field names. Decoding support shipped first
+/// (v5.0.4), so both compressed and uncompressed states are read; go v5.1
+/// dropped its `compressSnapshots` switch and persists compressed (issue #2552).
 const SNAPSHOT_COMPRESSION_LEVEL: i32 = 3;
-
-/// Whether [`encode`] compresses the state; see above.
-const COMPRESS_SNAPSHOTS: bool = false;
 
 /// Every zstd frame starts with this magic. A state persisted uncompressed
 /// starts with a msgpack map header, which cannot be this.
@@ -326,11 +323,7 @@ pub fn encode(
 
     let raw = rmp_serde::to_vec_named(&disk_state)
         .map_err(|e| PersistenceError::Encode(e.to_string()))?;
-    Ok(if COMPRESS_SNAPSHOTS {
-        compress_snapshot(raw)
-    } else {
-        raw
-    })
+    Ok(compress_snapshot(raw))
 }
 
 /// Decode persisted agreement state, compressed (see [`compress_snapshot`])
@@ -1217,12 +1210,11 @@ mod tests {
     }
 
     // -- Test: zstd-compressed snapshots (go `TestAgreementSnapshotCompression`,
-    //    v5.0.4-stable, issue #2024) ------------------------------------------
+    //    v5.1.1-stable, issues #2024, #2552) ------------------------------------------
 
-    /// This release persists the state uncompressed and restores it
-    /// compressed, as the next release will persist it: a compressed state
-    /// decodes to the same state, through the crash database as well, and a
-    /// damaged one is rejected.
+    /// The persisted state is a zstd frame that decodes to the state, through
+    /// the crash database as well; the uncompressed form the previous release
+    /// persisted decodes to the same state; a damaged frame is rejected.
     #[test]
     fn agreement_snapshot_compression() {
         let mut router = RootRouter::default();
@@ -1251,15 +1243,14 @@ mod tests {
             .insert(TimeoutType::Deadline, Duration::from_secs(5));
         let actions = vec![Action::Noop(NoopAction)];
 
-        let uncompressed = encode(&router, &player, &clock, &actions).expect("encode");
+        let compressed = encode(&router, &player, &clock, &actions).expect("encode");
         assert!(
-            !uncompressed.starts_with(&ZSTD_FRAME_MAGIC),
-            "this release persists the state compressed"
+            compressed.starts_with(&ZSTD_FRAME_MAGIC),
+            "the state is persisted compressed"
         );
-        let compressed = compress_snapshot(uncompressed.clone());
-        assert!(compressed.starts_with(&ZSTD_FRAME_MAGIC));
-        let round_trip = zstd::stream::decode_all(&compressed[..]).expect("zstd round trip");
-        assert_eq!(uncompressed, round_trip);
+        let uncompressed = zstd::stream::decode_all(&compressed[..]).expect("zstd round trip");
+        assert!(!uncompressed.starts_with(&ZSTD_FRAME_MAGIC));
+        assert_eq!(compress_snapshot(uncompressed.clone()), compressed);
 
         // The routers hold `HashMap`s, so compare their (sorted) shape rather
         // than a `Debug` rendering whose map order is per-instance.
