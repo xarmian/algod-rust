@@ -202,6 +202,13 @@ struct NetworkState {
     drop_slow_next_votes: bool,
     drop_votes: bool,
 
+    /// Mirrors go's `testingNetwork.disconnectsIgnored`/`ignoredDisconnects`
+    /// (go `v5.1.1-stable`): turns peer disconnect hints into counted no-ops,
+    /// so a test can inject deliberately invalid messages without
+    /// partitioning the network it is observing.
+    disconnects_ignored: bool,
+    ignored_disconnects: usize,
+
     /// `Some` while pocketing is active; mirrors go's
     /// `certVotePocket`/`softVotePocket`/`compoundPocket` channel fields
     /// (a plain `Vec` here rather than a channel — the harness never needs
@@ -316,6 +323,8 @@ impl TestingNetwork {
                 drop_soft_votes: false,
                 drop_slow_next_votes: false,
                 drop_votes: false,
+                disconnects_ignored: false,
+                ignored_disconnects: 0,
                 cert_vote_pocket: None,
                 soft_vote_pocket: None,
                 compound_pocket: None,
@@ -360,6 +369,38 @@ impl TestingNetwork {
             .lock()
             .expect("TestingNetwork poisoned")
             .drop_soft_votes = true;
+    }
+
+    /// Mirrors go's `testingNetwork.ignoreDisconnects`.
+    pub fn ignore_disconnects(&self) {
+        self.state
+            .lock()
+            .expect("TestingNetwork poisoned")
+            .disconnects_ignored = true;
+    }
+
+    /// Mirrors go's `testingNetwork.ignoredDisconnectCount`.
+    pub fn ignored_disconnect_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("TestingNetwork poisoned")
+            .ignored_disconnects
+    }
+
+    /// Mirrors go's `testingNetwork.restoreDisconnects`.
+    pub fn restore_disconnects(&self) {
+        self.state
+            .lock()
+            .expect("TestingNetwork poisoned")
+            .disconnects_ignored = false;
+    }
+
+    /// Mirrors go's `baseNetwork.multicast(tag, data, source, exclude)` for a
+    /// message the test builds itself (e.g. an invalid bundle) rather than one
+    /// it pocketed: delivers `data` from `source` to every node but `source`
+    /// and `exclude`, through the normal routing path.
+    pub fn inject(&self, tag: &'static str, data: &[u8], source: usize, exclude: usize) {
+        multicast(self, tag, data, source, exclude);
     }
 
     /// Mirrors go's `testingNetwork.dropAllSlowNextVotes`.
@@ -696,6 +737,10 @@ impl AgreementNetwork for TestingNetworkEndpoint {
     fn disconnect(&self, handle: &MessageHandle) {
         if let Some(source_id) = source_of(&self.network, handle) {
             let mut state = self.network.state.lock().expect("TestingNetwork poisoned");
+            if state.disconnects_ignored {
+                state.ignored_disconnects += 1;
+                return;
+            }
             state.connected[self.id][source_id] = false;
             state.connected[source_id][self.id] = false;
         }

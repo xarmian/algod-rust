@@ -74,8 +74,9 @@ mod simulate;
 use std::sync::Arc;
 use std::time::Duration;
 
+use algo_agreement::traits::VOTE_BUNDLE_TAG;
 use algo_agreement::types::TimeoutType;
-use algo_agreement::{codec, ProposalValue, BOTTOM};
+use algo_agreement::{codec, ProposalValue, UnauthenticatedBundle, BOTTOM};
 use algo_types::Round;
 
 use crate::simulate::propose_broadcast_gate::ProposeBroadcastGate;
@@ -2207,6 +2208,153 @@ fn regression_wrong_period_payload_verification_cancellation_8ba23942_five_node(
         total_rounds >= 5,
         "expected at least 5 rounds to have committed (2 initial + 1 \
          recovered + 2 final), got {total_rounds}"
+    );
+    sanity_check(&cluster, start_round, total_rounds);
+}
+
+/// Port of go-algorand `v5.1.1-stable`'s
+/// `TestAgreementFutureBundlesDoNotCancelPayloadVerification`
+/// (`agreement/service_test.go`, issue #2552).
+///
+/// Bundles from far-future periods pass freshness while still
+/// unauthenticated, so every node admits them to bundle verification; they
+/// must not cancel the round's pending payload verifications. The test
+/// suspends payload validation so the pending verifications are observable,
+/// injects invalid future-period bundles, and expects the round to finish once
+/// validation resumes.
+///
+/// Adapted to this harness the way
+/// `regression_wrong_period_payload_verification_cancellation_8ba23942_five_node`
+/// is: the propose-broadcast gate closes the race between arming the pocket
+/// and the next proposal, and quiescence is polled via
+/// `pending_proposal_validations` while validation is suspended.
+#[test]
+fn future_bundles_do_not_cancel_payload_verification_five_node() {
+    let _heavy_guard = HEAVY_PROPOSE_GATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    const NUM_NODES: usize = 5;
+    let validator = SuspendableBlockValidator::new();
+    let propose_gate = ProposeBroadcastGate::new();
+    let cluster = setup_agreement_with_validator_and_propose_gate(
+        NUM_NODES,
+        validator.clone(),
+        Arc::clone(&propose_gate),
+    );
+    let start_round = cluster.start_round;
+
+    // The injected bundles fail verification, and every receiver responds by
+    // asking the network to disconnect the sender. Counting those hints
+    // instead of honouring them keeps the network intact and gives a
+    // completion signal.
+    cluster.network.ignore_disconnects();
+
+    cluster.wait_for_quiet();
+    let mut round = current_round(&cluster);
+    assert_eq!(round, start_round);
+    // run two rounds
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+
+    // Suspend validation and pocket the next round's payloads, so the round
+    // starts with its proposal votes known but no payload delivered yet.
+    arm_and_catch_next_proposal_broadcast(&cluster.clocks, &propose_gate, Duration::from_secs(300));
+    validator.suspend();
+    cluster.network.pocket_all_compound();
+    propose_gate.release();
+    cluster.wait_for_quiet();
+    let attacked_round = current_round(&cluster);
+    assert!(attacked_round.0 >= round.0);
+    let pocketed = cluster.network.stop_pocketing_compound();
+    assert!(
+        !pocketed.is_empty(),
+        "the attacked round's proposal payload must have been pocketed"
+    );
+
+    // Release the payloads. Only the winning proposal keeps an assembler on
+    // each node, so every node other than its proposer starts exactly one
+    // payload verification and blocks inside the suspended validator.
+    cluster.network.replay_all(&pocketed);
+    let expected_pending = NUM_NODES - 1;
+    let wait_until = |what: &str, mut done: Box<dyn FnMut() -> bool>| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let pending = || cluster.pending_proposal_validations();
+    wait_until(
+        "payload verifications",
+        Box::new(|| pending() == expected_pending),
+    );
+    let cancelled_before = cluster.cancelled_proposal_results();
+
+    // Inject invalid bundles from far-future periods. They are fresh for the
+    // current round, so every node admits them to bundle verification.
+    const NUM_BUNDLES: usize = 3;
+    let attackers = [0usize, 1]; // between them, every node receives each bundle
+    for i in 0..NUM_BUNDLES {
+        let ub = UnauthenticatedBundle {
+            round: attacked_round,
+            period: algo_agreement::Period(1000 + i as u64),
+            step: algo_agreement::SOFT,
+            ..UnauthenticatedBundle::default()
+        };
+        let data = codec::encode_bundle(&ub);
+        for &src in &attackers {
+            cluster.network.inject(VOTE_BUNDLE_TAG, &data, src, src);
+        }
+    }
+    let expected_disconnects = NUM_BUNDLES * attackers.len() * (NUM_NODES - 1);
+    wait_until(
+        "bundle injection",
+        Box::new(|| {
+            cluster.network.ignored_disconnect_count() == expected_disconnects
+                && pending() == expected_pending
+        }),
+    );
+
+    // The injected bundles are fully processed, so the recovery below runs
+    // with ordinary disconnect handling.
+    cluster.network.restore_disconnects();
+
+    // Resume validation. With the payload verifications intact, the
+    // deadline timeout leads to soft and cert thresholds and the round ends.
+    validator.resume();
+    cluster.wait_for_quiet();
+    assert_eq!(cluster.pending_proposal_validations(), 0);
+    // The pending payload verifications survived the bundles: none finished
+    // cancelled (a cancellation is only reported when its validation returns,
+    // so this is read after the resume). A cancelled verification can also be
+    // redone by a later period in this harness, so the round ending below is
+    // not proof enough on its own.
+    assert_eq!(
+        cluster.cancelled_proposal_results(),
+        cancelled_before,
+        "an injected future-period bundle cancelled a pending payload verification"
+    );
+    // go: one filter timeout ends the round (a single trigger, no retries): a
+    // cancelled payload verification would leave the round without its
+    // payload, and it could then only end in a later period.
+    trigger_global_timeout(&cluster, TimeoutType::Deadline);
+    assert!(
+        current_round(&cluster).0 > round.0,
+        "the round did not end after validation resumed: its payload verifications must have been cancelled by the injected bundles"
+    );
+    round = current_round(&cluster);
+    // one more ordinary round to show the network is healthy afterwards
+    round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+
+    cluster.shutdown();
+    let total_rounds = round.0 - start_round.0;
+    assert!(
+        total_rounds >= 4,
+        "expected at least 4 rounds to have committed, got {total_rounds}"
     );
     sanity_check(&cluster, start_round, total_rounds);
 }

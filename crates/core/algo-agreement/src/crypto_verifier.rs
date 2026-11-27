@@ -46,7 +46,7 @@ use crate::traits::{
     CryptoVoteRequest, CryptoVoteVerifyResult, ValidatedBlock, AGREEMENT_VOTE_TAG,
     PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
 };
-use crate::vote::{RawVote, UnauthenticatedVote, VoteVerifyParams};
+use crate::vote::{ProposalValue, RawVote, UnauthenticatedVote, VoteVerifyParams};
 
 // ---------------------------------------------------------------------------
 // Constants: worker pool sizes (matching Go's cryptoVerifier.go)
@@ -142,6 +142,9 @@ struct PeriodRequestsContext {
     /// When a new proposal arrives for the same (round, period), the old
     /// proposal's token is set to `true` before creating a new one.
     proposal_cancelled: Option<Arc<AtomicBool>>,
+    /// The proposal-value validated under `proposal_cancelled` (go
+    /// `periodRequestsContext.proposalValue`, `v5.1.1-stable`).
+    proposal_value: Option<ProposalValue>,
 }
 
 /// Per-round cancellation context.
@@ -200,6 +203,7 @@ impl PendingRequestsContext {
             .or_insert_with(|| PeriodRequestsContext {
                 cancelled: Arc::new(AtomicBool::new(false)),
                 proposal_cancelled: None,
+                proposal_value: None,
             })
     }
 
@@ -216,10 +220,19 @@ impl PendingRequestsContext {
     }
 
     /// Returns a cancellation token for a proposal request.
-    /// Cancels any previous proposal for the same (round, period/pinned).
+    /// Cancels any previous request for a different payload for the same
+    /// (round, period/pinned).
     ///
-    /// Mirrors Go's `addProposal`.
-    fn add_proposal(&mut self, round: Round, period: Period, pinned: bool) -> Arc<AtomicBool> {
+    /// Mirrors Go's `addProposal` (`v5.1.1-stable`): `pv` is the
+    /// proposal-value of the payload, whose `EncodingDigest` covers its
+    /// complete encoding, compared before sharing a validation context.
+    fn add_proposal(
+        &mut self,
+        round: Round,
+        period: Period,
+        pinned: bool,
+        pv: ProposalValue,
+    ) -> Arc<AtomicBool> {
         let pkey = if pinned {
             CryptoRequestCtxKey {
                 period: Period(0),
@@ -236,14 +249,23 @@ impl PendingRequestsContext {
 
         let period_ctx = self.get_req_ctx(round, pkey);
 
-        // Cancel the old proposal for this (round, period).
         if let Some(ref old_cancel) = period_ctx.proposal_cancelled {
+            if period_ctx.proposal_value == Some(pv) {
+                // The same payload is requested again, e.g. after its
+                // blockAssembler was trimmed and refilled. Cancelling the
+                // earlier request would make proposalStore request the
+                // payload again on its cancelled result, and the two
+                // requests would keep cancelling each other.
+                return old_cancel.clone();
+            }
+            // Cancel the old proposal for this (round, period).
             old_cancel.store(true, Ordering::Release);
         }
 
         // Create a new proposal-specific cancellation token.
         let new_cancel = Arc::new(AtomicBool::new(false));
         period_ctx.proposal_cancelled = Some(new_cancel.clone());
+        period_ctx.proposal_value = Some(pv);
         new_cancel
     }
 
@@ -397,6 +419,10 @@ pub struct AsyncCryptoVerifier<
     /// all `PROPOSAL_PARALLELISM` worker threads. See
     /// `pending_proposal_validations`'s doc comment.
     pending_proposal_validations: Arc<AtomicUsize>,
+    /// Number of proposal results delivered with `cancelled` set, counted by
+    /// the proposal workers (observability for tests, see
+    /// [`Self::cancelled_proposal_results`]).
+    cancelled_proposal_results: Arc<AtomicUsize>,
 
     /// Count of vote and bundle requests a worker has dequeued but not yet
     /// handed to its output channel. See `in_flight_verifications`.
@@ -510,6 +536,13 @@ fn vote_worker<L: LedgerReader + Send + Sync + 'static>(
     }
 }
 
+/// The least capacity of the proposal input channel (go `minProposalRequests`,
+/// `v5.1.1-stable`). A request is issued only for a proposal whose credential
+/// improves on the lowest seen for its round and period, and about 20
+/// accounts propose per period, so this is more than the proposals of the
+/// periods and rounds a node takes proposals for can request at once.
+const MIN_PROPOSAL_REQUESTS: usize = 128;
+
 /// Proposal worker loop: receives proposals, validates via BlockValidator, sends results.
 ///
 /// Uses `crossbeam_channel::select!` on both input recv and output send so
@@ -521,6 +554,7 @@ fn proposal_worker<BV: BlockValidator + Send + Sync + 'static>(
     quit_rx: crossbeam_channel::Receiver<()>,
     validator: Arc<BV>,
     pending_validations: Arc<AtomicUsize>,
+    cancelled_results: Arc<AtomicUsize>,
 ) {
     loop {
         let internal = crossbeam_channel::select! {
@@ -530,6 +564,15 @@ fn proposal_worker<BV: BlockValidator + Send + Sync + 'static>(
             },
             recv(quit_rx) -> _ => break,
         };
+
+        // go (`v5.1.1-stable`): quit closes the input, which may still hold
+        // requests. Do not validate them.
+        if matches!(
+            quit_rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        ) {
+            break;
+        }
 
         let request = &internal.request;
 
@@ -541,6 +584,7 @@ fn proposal_worker<BV: BlockValidator + Send + Sync + 'static>(
                 unauthenticated_proposal: m.unauthenticated_proposal.clone(),
                 ..Proposal::default()
             });
+            cancelled_results.fetch_add(1, Ordering::SeqCst);
             let result = CryptoResult {
                 message: m,
                 task_index: request.task_index,
@@ -581,6 +625,7 @@ fn proposal_worker<BV: BlockValidator + Send + Sync + 'static>(
         // Check cancellation again after verification.
         if internal.cancel.load(Ordering::Acquire) {
             result.cancelled = true;
+            cancelled_results.fetch_add(1, Ordering::SeqCst);
             if result.err.is_none() {
                 result.err = Some(crate::events::SerializableError::new(
                     "proposal verification cancelled".to_string(),
@@ -1085,14 +1130,19 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
         let (vote_out_tx, vote_out_rx) =
             crossbeam_channel::bounded::<CryptoVoteVerifyResult>(3 * VOTE_PARALLELISM);
 
-        let (proposal_in_tx, proposal_in_rx) =
-            crossbeam_channel::bounded::<InternalProposalRequest>(1);
         let base_buffer = 3;
         // max_votes formula: in_cap + out_cap + parallelism = N + 3N + N = 5N.
         // This is equivalent to Go's `5 * numCPU` on a 16-core machine (5 * 16 = 80).
         // It sizes the proposal output channel large enough to hold all vote results
         // that could be in-flight simultaneously.
         let max_votes = VOTE_PARALLELISM + 3 * VOTE_PARALLELISM + VOTE_PARALLELISM;
+        // go `makeCryptoVerifier` (`v5.1.1-stable`): `verify_proposal` is called
+        // from the agreement main loop and blocks while the input is full, so
+        // it has room for one request per pending vote, and for at least
+        // `MIN_PROPOSAL_REQUESTS`.
+        let (proposal_in_tx, proposal_in_rx) = crossbeam_channel::bounded::<InternalProposalRequest>(
+            (max_votes + base_buffer).max(MIN_PROPOSAL_REQUESTS),
+        );
         let (proposal_out_tx, proposal_out_rx) =
             crossbeam_channel::bounded::<CryptoResult>(max_votes + base_buffer);
 
@@ -1109,6 +1159,7 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
         let mut handles =
             Vec::with_capacity(VOTE_PARALLELISM + PROPOSAL_PARALLELISM + BUNDLE_PARALLELISM);
         let pending_proposal_validations = Arc::new(AtomicUsize::new(0));
+        let cancelled_proposal_results = Arc::new(AtomicUsize::new(0));
         let in_flight_verifications = Arc::new(AtomicUsize::new(0));
 
         for i in 0..VOTE_PARALLELISM {
@@ -1131,10 +1182,11 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
             let qrx = quit_signal_rx.clone();
             let v = validator.clone();
             let pv = Arc::clone(&pending_proposal_validations);
+            let cr = Arc::clone(&cancelled_proposal_results);
             handles.push(
                 thread::Builder::new()
                     .name(format!("proposal-worker-{i}"))
-                    .spawn(move || proposal_worker(rx, tx, qrx, v, pv))
+                    .spawn(move || proposal_worker(rx, tx, qrx, v, pv, cr))
                     .expect("failed to spawn proposal worker thread"),
             );
         }
@@ -1172,6 +1224,7 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
             worker_handles: Mutex::new(Some(handles)),
             cancellation: Mutex::new(PendingRequestsContext::new()),
             pending_proposal_validations,
+            cancelled_proposal_results,
             in_flight_verifications,
             outstanding_verifications: Arc::new(AtomicUsize::new(0)),
             _validator: std::marker::PhantomData,
@@ -1195,6 +1248,16 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
     /// transient value.
     pub fn pending_proposal_validations(&self) -> usize {
         self.pending_proposal_validations.load(Ordering::SeqCst)
+    }
+
+    /// Number of proposal-payload results this verifier has delivered with
+    /// `cancelled` set, since it was created. A scenario asserting that
+    /// something (e.g. an injected future-period bundle) must NOT cancel a
+    /// pending payload verification reads this: the round may still end via
+    /// a later period after a cancellation, so completion alone does not
+    /// prove the verification survived.
+    pub fn cancelled_proposal_results(&self) -> usize {
+        self.cancelled_proposal_results.load(Ordering::SeqCst)
     }
 
     /// Number of vote and bundle requests a worker thread has dequeued but
@@ -1273,7 +1336,12 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
         let cancel = {
             let mut ctx = self.cancellation.lock().unwrap();
             ctx.clear_stale_contexts(request.round, request.period, request.pinned, false);
-            ctx.add_proposal(request.round, request.period, request.pinned)
+            ctx.add_proposal(
+                request.round,
+                request.period,
+                request.pinned,
+                request.message.unauthenticated_proposal.value(),
+            )
         };
         let internal = InternalProposalRequest {
             request,
@@ -1377,9 +1445,11 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
                         < VOTE_PARALLELISM + self.vote_in_rx.len()
             }
             PROPOSAL_PAYLOAD_TAG => {
-                // proposals.in full OR output has more than 1 pending result
-                self.proposal_in_rx.len() == self.proposal_in_rx.capacity().unwrap_or(0)
-                    || self.proposal_out_rx.len() > 1
+                // go (`v5.1.1-stable`): one request waiting behind the one
+                // being validated is enough to hold back payloads from the
+                // network. The rest of proposals.in is for the requests that
+                // the demux does not hold back.
+                !self.proposal_in_rx.is_empty() || self.proposal_out_rx.len() > 1
             }
             VOTE_BUNDLE_TAG => {
                 // bundles.in full OR insufficient output capacity
@@ -1699,14 +1769,25 @@ mod tests {
         assert!(Arc::ptr_eq(&token, &token2));
     }
 
+    /// A proposal-value that differs per `n`, like go's tests that set
+    /// `UnauthenticatedProposal.BlockHeader.Round = 1` ("a different block").
+    fn pv(n: u8) -> ProposalValue {
+        ProposalValue {
+            block_digest: algo_types::Digest([n; 32]),
+            ..crate::vote::BOTTOM
+        }
+    }
+
+    /// go `TestCryptoRequestContextAddCancelProposal` (`v5.1.1-stable`,
+    /// body changed: the second request is for a different block).
     #[test]
     fn pending_requests_context_add_proposal_cancels_old() {
         let mut ctx = PendingRequestsContext::new();
-        let token1 = ctx.add_proposal(Round(10), Period(1), false);
+        let token1 = ctx.add_proposal(Round(10), Period(1), false, pv(0));
         assert!(!token1.load(Ordering::Acquire));
 
         // Adding a new proposal for the same (round, period) cancels the old one.
-        let token2 = ctx.add_proposal(Round(10), Period(1), false);
+        let token2 = ctx.add_proposal(Round(10), Period(1), false, pv(1));
         assert!(
             token1.load(Ordering::Acquire),
             "old proposal should be cancelled"
@@ -1715,6 +1796,28 @@ mod tests {
             !token2.load(Ordering::Acquire),
             "new proposal should not be cancelled"
         );
+    }
+
+    /// go `v5.1.1-stable` `addProposal`: the same payload requested again
+    /// shares its validation context instead of cancelling it, for the period
+    /// key and the pinned key alike (go `TestCryptoRequestContextAddCancelPinnedProposal`
+    /// is the different-block counterpart).
+    #[test]
+    fn pending_requests_context_add_proposal_same_value_shares_context() {
+        let mut ctx = PendingRequestsContext::new();
+        let token1 = ctx.add_proposal(Round(10), Period(1), false, pv(0));
+        let token2 = ctx.add_proposal(Round(10), Period(1), false, pv(0));
+        assert!(Arc::ptr_eq(&token1, &token2));
+        assert!(!token1.load(Ordering::Acquire));
+
+        let pinned1 = ctx.add_proposal(Round(10), Period(0), true, pv(0));
+        let pinned2 = ctx.add_proposal(Round(10), Period(0), true, pv(0));
+        assert!(Arc::ptr_eq(&pinned1, &pinned2));
+        let pinned3 = ctx.add_proposal(Round(10), Period(0), true, pv(1));
+        assert!(pinned1.load(Ordering::Acquire), "a different block cancels");
+        assert!(!pinned3.load(Ordering::Acquire));
+        // The period request is untouched by the pinned one.
+        assert!(!token1.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1812,8 +1915,8 @@ mod tests {
         const PER: Period = Period(7);
 
         let vote_token = ctx.add_vote(RND, PER);
-        let payload_token = ctx.add_proposal(RND, PER, false);
-        let pinned_token = ctx.add_proposal(RND, Period(0), true);
+        let payload_token = ctx.add_proposal(RND, PER, false, pv(0));
+        let pinned_token = ctx.add_proposal(RND, Period(0), true, pv(0));
 
         // Every bundle admission in this round shares the same context,
         // regardless of how many times it's called.

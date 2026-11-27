@@ -109,6 +109,15 @@ impl<BV: algo_agreement::BlockValidator + Send + Sync + 'static> AgreementCluste
             .map(|v| v.pending_proposal_validations())
             .sum()
     }
+
+    /// Sum, across every node, of proposal-payload verification results
+    /// delivered cancelled — see `AsyncCryptoVerifier::cancelled_proposal_results`.
+    pub fn cancelled_proposal_results(&self) -> usize {
+        self.verifiers
+            .iter()
+            .map(|v| v.cancelled_proposal_results())
+            .sum()
+    }
     /// Block until the cluster is EXACTLY quiet (issue #1695): every node's
     /// demux thread is parked in its blocking select with nothing ready,
     /// every network channel is empty, and every verifier has no
