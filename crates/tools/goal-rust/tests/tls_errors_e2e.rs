@@ -473,6 +473,11 @@ fn spawn_server(server: Server) -> u16 {
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 Server::PlainHttp => {
+                    // Read the ClientHello first: closing with it unread sends a
+                    // TCP RST that, on a loaded runner, can discard the answer
+                    // before the proxy relays it (the client then waits for
+                    // its handshake timeout instead of seeing go's text).
+                    read_record(&mut stream);
                     let _ = stream.write_all(
                         b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                     );
@@ -536,6 +541,9 @@ fn spawn_proxy(proxy: Proxy, target: Option<u16>, log: Arc<Mutex<String>>) -> u1
                             let _ = std::io::copy(&mut from_client, &mut upstream);
                         });
                         let _ = std::io::copy(&mut from_upstream, &mut stream);
+                        // upstream is done: end the client's read too, else
+                        // `t.join()` waits on a client that is waiting on us
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
                         let _ = t.join();
                     }
                 }
