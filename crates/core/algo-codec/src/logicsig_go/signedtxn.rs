@@ -229,10 +229,16 @@ fn signed_txn(b: &mut &[u8]) -> R<()> {
     let lsig = std::cell::RefCell::new(LsigState::default());
     let sksig = std::cell::RefCell::new(PqState::default());
     let txn_read = std::cell::Cell::new(false);
+    // a repeated `txn` key decodes into the `Transaction` already there, so its
+    // required members (`type`, `snd`) persist across the keys
+    let txn_ty = std::cell::RefCell::new(Vec::<u8>::new());
+    let txn_snd = std::cell::RefCell::new([0u8; 32]);
     map_struct(
         b,
         "",
         &mut || {
+            txn_ty.borrow_mut().clear();
+            *txn_snd.borrow_mut() = [0u8; 32];
             *sig.borrow_mut() = [0u8; 64];
             *msig.borrow_mut() = MsigState::default();
             *lsig.borrow_mut() = LsigState::default();
@@ -246,7 +252,7 @@ fn signed_txn(b: &mut &[u8]) -> R<()> {
                 b"lsig" => w(lsig.borrow_mut().decode(b), "Lsig")?,
                 b"pqsig" => w(sksig.borrow_mut().decode(b), "SKsig")?,
                 b"txn" => {
-                    w(transaction(b), "Txn")?;
+                    w(transaction(b, &txn_ty, &txn_snd), "Txn")?;
                     txn_read.set(true);
                 }
                 b"sgnr" => w(addr(b).map(|_| ()), "AuthAddr")?,
@@ -265,9 +271,11 @@ fn signed_txn(b: &mut &[u8]) -> R<()> {
 
 // --- Transaction -----------------------------------------------------------
 
-fn transaction(b: &mut &[u8]) -> R<()> {
-    let ty = std::cell::RefCell::new(Vec::<u8>::new());
-    let snd = std::cell::RefCell::new([0u8; 32]);
+fn transaction(
+    b: &mut &[u8],
+    ty: &std::cell::RefCell<Vec<u8>>,
+    snd: &std::cell::RefCell<[u8; 32]>,
+) -> R<()> {
     map_struct(
         b,
         "",
@@ -561,9 +569,9 @@ fn merkle_verifier(b: &mut &[u8], state: &mut ([u8; 64], u64)) -> R<()> {
     )
 }
 
-/// `basics.Participant`.
-fn participant(b: &mut &[u8]) -> R<()> {
-    let pk = std::cell::RefCell::new(([0u8; 64], 0u64));
+/// `basics.Participant`; `pk` is its key's state, which a repeated `p` key of
+/// the `Reveal` decodes into.
+fn participant(b: &mut &[u8], pk: &std::cell::RefCell<([u8; 64], u64)>) -> R<()> {
     map_struct(
         b,
         "",
@@ -611,7 +619,12 @@ fn merkle_signature(b: &mut &[u8]) -> R<()> {
 /// `stateproof.Reveal`.
 fn reveal(b: &mut &[u8]) -> R<()> {
     let part = std::cell::Cell::new(false);
-    map_struct(b, "", &mut || part.set(false), &mut |key, b| {
+    let part_pk = std::cell::RefCell::new(([0u8; 64], 0u64));
+    let reset = || {
+        part.set(false);
+        *part_pk.borrow_mut() = ([0u8; 64], 0);
+    };
+    map_struct(b, "", &mut || reset(), &mut |key, b| {
         match key {
             // an inline struct: every error carries the whole path
             b"s" => map_struct(b, "SigSlot", &mut || {}, &mut |key, b| {
@@ -623,7 +636,7 @@ fn reveal(b: &mut &[u8]) -> R<()> {
                 Ok(true)
             })?,
             b"p" => {
-                w(participant(b), "Part")?;
+                w(participant(b, &part_pk), "Part")?;
                 part.set(true);
             }
             _ => return Ok(false),

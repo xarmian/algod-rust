@@ -198,3 +198,50 @@ fn issue_1254_app_cost_pooling_enabled_lets_expensive_sibling_borrow() {
         "AppBudgetAdded should report the full 2-call pooled allocation when pooling is enabled"
     );
 }
+
+/// go v5.1.0-beta (#6708/#6818 follow-up) `TestExtraBudgetWithInner`
+/// (`ledger/simulation/simulation_eval_test.go`, v5.1.1-stable): a requested
+/// `ExtraOpcodeBudget` is granted once for the whole group, not again for every
+/// inner group, and `AppBudgetAdded` counts one `MaxAppProgramCost` per app
+/// call, top-level or inner. The program costs 700 and creates one inner app,
+/// so the group reports 700 (top-level call) + 700 (inner call) + the extra
+/// once. (go creates the app inside the group; here it exists already, the
+/// budget accounting is the same.)
+#[test]
+fn extra_budget_with_inner_is_granted_once() {
+    let sender = Address([0xAA; 32]);
+    let mut state = setup_state(sender, algo_types::consensus::CONSENSUS_V41);
+    let src = format!(
+        "#pragma version 6\npushint 1\ncover 0\n{}itxn_begin\nint appl\nitxn_field TypeEnum\nbyte 0x068101\ndup\nitxn_field ClearStateProgram\nitxn_field ApprovalProgram\nitxn_submit\n",
+        "pushint 1\npop\n".repeat(345)
+    );
+    let program = algo_avm::assembler::assemble_string(&src)
+        .expect("program must assemble")
+        .program;
+    register_app(&mut state, sender, 1002, program);
+    let app_addr = Address(algo_ledger::avm_context::app_address(1002));
+    state.set_account(
+        &app_addr,
+        AccountData {
+            micro_algos: 401_000,
+            ..Default::default()
+        },
+    );
+
+    const EXTRA: i64 = 1000;
+    let request = SimulationRequest {
+        txn_groups: vec![vec![make_appl_txn(sender, 1002)]],
+        allow_empty_signatures: true,
+        extra_opcode_budget: EXTRA,
+        ..Default::default()
+    };
+    let result = simulate(&mut state, request);
+    let group = &result.txn_groups[0];
+    assert!(
+        group.failure_message.is_none(),
+        "{:?}",
+        group.failure_message
+    );
+    assert_eq!(group.app_budget_added, 1400 + EXTRA as u64);
+    assert_eq!(group.app_budget_consumed, 701);
+}
