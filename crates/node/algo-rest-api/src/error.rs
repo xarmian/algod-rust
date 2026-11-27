@@ -477,7 +477,7 @@ mod tests {
             // are the handler's
             assert_eq!(
                 hex::encode(&body),
-                case["v2_hex"].as_str().unwrap().trim_end_matches("0a"),
+                case["v2_hex"].as_str().unwrap().strip_suffix("0a").unwrap(),
                 "{name}"
             );
             cases += 1;

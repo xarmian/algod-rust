@@ -16,6 +16,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with algod-rust.  If not, see <https://www.gnu.org/licenses/>.
 //
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 // Parity oracle for algod-rust issue #2555 (go-algorand v5.1.0-beta #6808):
 // the exact response bytes of go v5.1.1-stable's jsonSerializer
