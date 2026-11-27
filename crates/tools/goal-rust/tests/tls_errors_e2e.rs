@@ -473,6 +473,11 @@ fn spawn_server(server: Server) -> u16 {
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 Server::PlainHttp => {
+                    // Read the ClientHello first: closing with it unread sends a
+                    // TCP RST that, on a loaded runner, can discard the answer
+                    // before the proxy relays it (the client then waits for
+                    // its handshake timeout instead of seeing go's text).
+                    read_record(&mut stream);
                     let _ = stream.write_all(
                         b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                     );
