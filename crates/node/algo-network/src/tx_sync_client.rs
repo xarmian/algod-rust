@@ -439,6 +439,21 @@ mod tests {
         assert!(err.contains("length overflow"), "{err}");
     }
 
+    /// A repeated `txn` key decodes into the `Transaction` already there (the
+    /// generated decoder merges), so its `required` members persist: the
+    /// fuzz mutants `{txn: <full>, txn: {}}` are accepted by go (#2555).
+    #[test]
+    fn a_repeated_txn_key_merges_into_the_decoded_transaction() {
+        let one = algo_codec::canonical_encode_signed_transaction(&make_txn(5));
+        // one = fixmap(1) 'txn' <txn map>; repeat the key with an empty map
+        assert_eq!(&one[..5], &[0x81, 0xa3, b't', b'x', b'n']);
+        let mut body = vec![0x91, 0x82];
+        body.extend_from_slice(&one[1..]);
+        body.extend_from_slice(&[0xa3, b't', b'x', b'n', 0x80]);
+        let txns = decode_tx_sync_response(&body).expect("go accepts the merge");
+        assert_eq!(txns[0].txn.fee, 5);
+    }
+
     struct FakePool(Vec<Vec<SignedTransaction>>);
     impl PendingTxGroupsSource for FakePool {
         fn pending_tx_groups(&self) -> Vec<Vec<SignedTransaction>> {
