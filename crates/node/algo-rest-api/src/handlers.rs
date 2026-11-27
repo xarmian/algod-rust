@@ -2621,47 +2621,95 @@ pub struct RawTransactionParams {
 }
 
 /// Decode a request body of concatenated msgpack `SignedTxn` objects the way
-/// go's `decodeTxGroup` does (`daemon/algod/api/server/v2/handlers.go:1172`,
-/// issue #2492): go-codec's reflection decoder (`protocol.NewDecoder`) reads
-/// one `SignedTxn` after another until `io.EOF` -- which it also returns for
-/// a body that breaks off inside a transaction, ending the group there --
-/// and answers any other failure with its own text, `msgpack decode error
-/// [pos N]: ...` (N counting from the start of the body). Each decoded value
-/// becomes a [`algo_types::SignedTransaction`] through go-codec's rules
-/// ([`crate::simulate_strict::decode_signed_txn`]).
+/// go v5.1.1's `decodeTxGroup` does (`daemon/algod/api/server/v2/handlers.go`,
+/// issue #2555): the whole body is read, then `SignedTxn`s are decoded with
+/// the generated msgp decoder one after the other until no byte is left. The
+/// group-size limit is checked *before* each decode, so a body of
+/// `max_group_size` transactions and one more byte answers `max group size is
+/// N`; a body that breaks off inside a transaction, or holds any malformed
+/// one, answers the decoder's own text, context path included
+/// (`msgp: length overflow: 30 > 16 at Access at Txn`); and nothing is left
+/// for a trailing partial value to hide behind.
+/// [`algo_codec::decode_signed_txn_go`] is that decoder's verdict (the text and
+/// the length of the value); the value is then read by algod-rust's strict
+/// reader, which takes exactly the bytes go's decoder takes.
 #[allow(clippy::result_large_err)]
 fn decode_tx_group(
     body: &[u8],
     max_group_size: usize,
 ) -> Result<Vec<algo_types::SignedTransaction>, Response> {
-    use crate::simulate_request_schema::TRANSACTIONS_SIGNEDTXN;
-    use algo_codec::go_codec_msgpack::{encode, Decoder, Error};
-
-    let mut dec = Decoder::new(body);
     let mut txgroup: Vec<algo_types::SignedTransaction> = Vec::new();
-    loop {
-        let value = match dec.decode(&TRANSACTIONS_SIGNEDTXN) {
-            Ok(v) => v,
-            Err(Error::Eof) => break,
-            Err(e) => return Err(error::bad_request_bytes(&e.to_bytes())),
-        };
-        let mut bytes = Vec::new();
-        encode(&value, &TRANSACTIONS_SIGNEDTXN, &mut bytes);
-        let stxn = crate::simulate_strict::decode_signed_txn(&bytes).map_err(|e| {
-            // go-codec's value always fits the type: not reached
-            error::internal_error(format!("could not rebuild the decoded transaction: {e}"))
-        })?;
-        txgroup.push(stxn);
-        if txgroup.len() > max_group_size {
+    let mut rest = body;
+    while !rest.is_empty() {
+        if txgroup.len() == max_group_size {
             return Err(error::bad_request(format!(
                 "max group size is {max_group_size}"
             )));
         }
+        let used = algo_codec::decode_signed_txn_go(rest)
+            .map_err(|e| error::bad_request_bytes(&e.text()))?;
+        let stxn = read_accepted_signed_txn(&rest[..used]).map_err(|e| {
+            // go's decoder accepted these bytes: not reached
+            error::internal_error(format!("could not read the decoded transaction: {e}"))
+        })?;
+        txgroup.push(stxn);
+        rest = &rest[used..];
     }
     if txgroup.is_empty() {
         return Err(error::bad_request("empty txgroup"));
     }
     Ok(txgroup)
+}
+
+/// Read one `SignedTxn` that go's generated decoder accepted. go's
+/// `ReadMapKeyZC` also takes a key spelled as an array of uint8; the strict
+/// reader takes the string spellings (`str`, `bin`, `nil`) only, so a value it
+/// refuses is read again with its keys rewritten as strings.
+fn read_accepted_signed_txn(bytes: &[u8]) -> Result<algo_types::SignedTransaction, String> {
+    let read = |bytes: &[u8]| {
+        let _strict = algo_types::strict_unknown_fields(bytes);
+        let mut cursor = bytes;
+        algo_types::SignedTransaction::decode_from_reader(&mut cursor).map_err(|e| e.to_string())
+    };
+    read(bytes).or_else(|first| {
+        let mut cursor = bytes;
+        let value = rmpv::decode::read_value(&mut cursor).map_err(|_| first.clone())?;
+        let mut rewritten = Vec::with_capacity(bytes.len());
+        rmpv::encode::write_value(&mut rewritten, &string_keys(value)).map_err(|_| first)?;
+        read(&rewritten)
+    })
+}
+
+/// `value` with every map key that is an array of uint8 spelled as a string.
+fn string_keys(value: rmpv::Value) -> rmpv::Value {
+    use rmpv::Value;
+    match value {
+        Value::Map(pairs) => Value::Map(
+            pairs
+                .into_iter()
+                .map(|(k, v)| {
+                    let key = match k {
+                        Value::Array(items) => {
+                            let bytes: Option<Vec<u8>> = items
+                                .iter()
+                                .map(|i| i.as_u64().and_then(|n| u8::try_from(n).ok()))
+                                .collect();
+                            match bytes {
+                                Some(b) => {
+                                    Value::String(String::from_utf8_lossy(&b).into_owned().into())
+                                }
+                                None => Value::Array(items),
+                            }
+                        }
+                        other => other,
+                    };
+                    (key, string_keys(v))
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(string_keys).collect()),
+        other => other,
+    }
 }
 
 /// Submit a raw transaction (or transaction group) to the network.

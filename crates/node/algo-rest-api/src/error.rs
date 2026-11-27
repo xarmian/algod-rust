@@ -83,9 +83,11 @@ pub fn bad_request(msg: impl Into<String>) -> Response {
 /// Return a 400 Bad Request JSON error response for a message that is a byte
 /// string rather than text (go's `%s` of a source token that was not UTF-8).
 ///
-/// go's `encoding/json` writes each byte that is not part of a valid UTF-8
-/// sequence as the six-character escape `\ufffd`, and a valid U+FFFD as the
-/// character itself.
+/// go v5.1.1 streams every response with `encoding/json/v2` (#6808,
+/// `jsonSerializer`), which writes each byte that is not part of a valid UTF-8
+/// sequence as the character U+FFFD itself, three bytes each, the same as a
+/// valid U+FFFD (go v5.0.5's encoder wrote the six-character escape `\ufffd`
+/// for it). `tools/json-serializer-oracle` has go's bytes.
 pub fn bad_request_bytes(msg: &[u8]) -> Response {
     let mut inner = String::with_capacity(msg.len() + 8);
     for chunk in msg.utf8_chunks() {
@@ -93,7 +95,7 @@ pub fn bad_request_bytes(msg: &[u8]) -> Response {
         // The surrounding quotes are not part of the string's content.
         inner.push_str(&escape_json_like_go(&valid[1..valid.len() - 1]));
         for _ in chunk.invalid() {
-            inner.push_str("\\ufffd");
+            inner.push('\u{FFFD}');
         }
     }
     let json = format!("{{\"message\":\"{inner}\"}}");
@@ -455,5 +457,31 @@ mod tests {
         assert!(data.get("app-index").is_none());
         // An empty scratch/stack dump omits both keys (go's `omitempty`).
         assert_eq!(data["eval-states"][0], serde_json::json!({}));
+    }
+
+    /// go v5.1.1's `jsonSerializer` bytes for an error message holding every
+    /// kind of byte string (`tools/json-serializer-oracle`, go-generated):
+    /// one U+FFFD character per invalid byte, `<`, `>`, `&` and U+2028/9
+    /// escaped (issue #2555, `TestJSONSerializer`).
+    #[tokio::test]
+    async fn bad_request_bytes_match_gos_json_serializer() {
+        const FIXTURE: &str = include_str!("../tests/fixtures/json_serializer.jsonl");
+        let mut cases = 0;
+        for line in FIXTURE.lines().filter(|l| !l.trim().is_empty()) {
+            let case: serde_json::Value = serde_json::from_str(line).unwrap();
+            let name = case["name"].as_str().unwrap();
+            let message = hex::decode(case["message_hex"].as_str().unwrap()).unwrap();
+            let resp = bad_request_bytes(&message);
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            // go ends the value with a newline; the status line and header
+            // are the handler's
+            assert_eq!(
+                hex::encode(&body),
+                case["v2_hex"].as_str().unwrap().trim_end_matches("0a"),
+                "{name}"
+            );
+            cases += 1;
+        }
+        assert!(cases >= 15, "fixture has {cases} cases");
     }
 }

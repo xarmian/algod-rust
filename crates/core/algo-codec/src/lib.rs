@@ -27,7 +27,7 @@ mod json_escape;
 mod logicsig_go;
 pub use json_escape::escape_json_like_go;
 pub use logicsig_go::{
-    decode_logic_sig_args, decode_logicsig_go, decode_multisig_go, encode_logic_sig_args, GoLogicSig,
+    decode_logic_sig_args, decode_logicsig_go, decode_multisig_go, decode_signed_txn_go, encode_logic_sig_args, GoLogicSig,
     LogicSigArgsError,
 };
 
