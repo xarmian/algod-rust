@@ -131,9 +131,8 @@ impl CatchpointService {
 
     /// Build an [`axum::Router`] for the HTTP catchpoint endpoint.
     ///
-    /// Registers `GET /{version_seg}/{genesis_id}/ledger/{round}` where
-    /// `version_seg` looks like `v1`, and `round` is base-36 encoded —
-    /// matches go's `LedgerServiceLedgerPath`.
+    /// Registers `GET /v1/{genesis_id}/ledger/{round}` where `round` is
+    /// base-36 encoded: go's `LedgerServiceLedgerPath` (only version 1).
     pub fn http_router(&self) -> Router {
         let state = CatchpointServiceState {
             ledger: std::sync::Arc::clone(&self.ledger),
@@ -141,11 +140,66 @@ impl CatchpointService {
         };
 
         Router::new()
-            .route(
-                "/{version_seg}/{genesis_id}/ledger/{round}",
-                get(serve_catchpoint),
-            )
+            .route("/v1/{genesis_id}/ledger/{round}", get(serve_catchpoint))
             .with_state(state)
+    }
+
+    /// go's `LedgerService.ServeHTTP` without a `round` path value: the round
+    /// (`r`) and an optional version (`v`) come from the query form.
+    pub async fn serve_ledger_query(
+        &self,
+        genesis_id: &str,
+        query: &str,
+        method: Method,
+        headers: HeaderMap,
+    ) -> Response {
+        let state = CatchpointServiceState {
+            ledger: std::sync::Arc::clone(&self.ledger),
+            genesis_id: self.genesis_id.clone(),
+        };
+        if genesis_id != state.genesis_id {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("mismatching genesisID '{genesis_id}'"),
+            )
+                .into_response();
+        }
+        let form: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect();
+        let values = |key: &str| -> Vec<String> {
+            form.iter()
+                .filter(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .collect()
+        };
+        let rounds = values("r");
+        if rounds.len() != 1 {
+            return (
+                StatusCode::BAD_REQUEST,
+                "invalid round number specified in 'r' form argument",
+            )
+                .into_response();
+        }
+        let plain_400 = |body: String| {
+            let mut resp = (StatusCode::BAD_REQUEST, body).into_response();
+            resp.headers_mut().insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            resp.headers_mut().insert(
+                "x-content-type-options",
+                http::HeaderValue::from_static("nosniff"),
+            );
+            resp
+        };
+        match values("v").as_slice() {
+            [] => {}
+            [v] if v == "1" => {}
+            [v] => return plain_400(format!("unsupported version specified '{v}'")),
+            vs => return plain_400(format!("invalid number of version specified {}", vs.len())),
+        }
+        serve_round(state, &rounds[0], method, headers).await
     }
 }
 
@@ -159,22 +213,13 @@ struct CatchpointServiceState {
 // HTTP handler
 // ---------------------------------------------------------------------------
 
-/// Axum handler for `GET/HEAD /{version_seg}/{genesis_id}/ledger/{round}`.
+/// Axum handler for `GET/HEAD /v1/{genesis_id}/ledger/{round}`.
 async fn serve_catchpoint(
     State(state): State<CatchpointServiceState>,
-    Path((version_seg, genesis_id, round_str)): Path<(String, String, String)>,
+    Path((genesis_id, round_str)): Path<(String, String)>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    let version = version_seg.strip_prefix('v').unwrap_or("");
-    if version != "1" {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("unsupported version '{version}'"),
-        )
-            .into_response();
-    }
-
     if genesis_id != state.genesis_id {
         return (
             StatusCode::BAD_REQUEST,
@@ -182,8 +227,17 @@ async fn serve_catchpoint(
         )
             .into_response();
     }
+    serve_round(state, &round_str, method, headers).await
+}
 
-    let round = match parse_round_base36(&round_str) {
+/// The rest of go's `ServeHTTP`, from the parsed round on.
+async fn serve_round(
+    state: CatchpointServiceState,
+    round_str: &str,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    let round = match parse_round_base36(round_str) {
         Some(r) => r,
         None => {
             return (
@@ -430,22 +484,53 @@ mod tests {
         assert!(body.is_empty());
     }
 
+    /// go v5.1.1 serves the ledger path with `http.ServeMux` and registers
+    /// only `/v1/...` (`LedgerServiceLedgerPath`): any other version is not
+    /// routed (404), where gorilla/mux's `v{version}` answered 400 (#2555,
+    /// `TestServicePathsShareServeMux`'s `/v2/...` row).
     #[tokio::test]
-    async fn http_returns_400_for_bad_version() {
+    async fn http_does_not_route_other_versions() {
         let ledger = std::sync::Arc::new(MockCatchpointLedger::new());
         let app = make_test_service(ledger);
 
-        let req = Request::builder()
-            .uri("/v2/testnet-v1.0/ledger/0")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        for uri in ["/v2/testnet-v1.0/ledger/0", "/v1/testnet-v1.0/ledger/"] {
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
 
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("unsupported version"));
+    /// go's `TestLedgerServiceVersionErrors`: the `?r=&v=` form answers a bad
+    /// or repeated `v` with a plain-text 400 carrying `nosniff`, the version
+    /// echoed back only as the text of a `text/plain` body.
+    #[tokio::test]
+    async fn query_form_version_errors_are_plain_text() {
+        let ledger = std::sync::Arc::new(MockCatchpointLedger::new());
+        let service = CatchpointService::new(ledger, "testnet-v1.0".to_string());
+        for (query, want) in [
+            (
+                "r=1&v=%3Cscript%3Ealert%281%29%3C%2Fscript%3E",
+                "unsupported version specified '<script>alert(1)</script>'",
+            ),
+            ("r=1&v=1&v=2", "invalid number of version specified 2"),
+        ] {
+            let resp = service
+                .serve_ledger_query("testnet-v1.0", query, Method::GET, HeaderMap::new())
+                .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{query}");
+            assert_eq!(
+                resp.headers().get("content-type").unwrap(),
+                "text/plain; charset=utf-8"
+            );
+            assert_eq!(
+                resp.headers().get("x-content-type-options").unwrap(),
+                "nosniff"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&body), want);
+        }
     }
 
     #[tokio::test]

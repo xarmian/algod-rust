@@ -354,8 +354,8 @@ impl BlockService {
 
     /// Build an [`axum::Router`] for the HTTP block endpoint.
     ///
-    /// Registers `GET /{version_seg}/{genesis_id}/block/{round}` where
-    /// `version_seg` looks like `v1`, and `round` is base-36 encoded.
+    /// Registers `GET /v1/{genesis_id}/block/{round}` where `round` is
+    /// base-36 encoded (go's `BlockServiceBlockPath`: only version 1).
     pub fn http_router(&self) -> Router {
         let state = BlockServiceState {
             ledger: Arc::clone(&self.ledger),
@@ -365,11 +365,8 @@ impl BlockService {
             fallback: Arc::clone(&self.fallback),
         };
 
-        // Axum requires each `:param` to span a full path segment, so we
-        // capture the `v1` segment as `:version_seg` and parse out the
-        // version in the handler.
         Router::new()
-            .route("/{version_seg}/{genesis_id}/block/{round}", get(serve_block))
+            .route("/v1/{genesis_id}/block/{round}", get(serve_block))
             .with_state(state)
     }
 
@@ -627,20 +624,11 @@ pub(crate) fn parse_round_base36(s: &str) -> Option<u64> {
 // HTTP handler
 // ---------------------------------------------------------------------------
 
-/// Axum handler for `GET /{version_seg}/{genesis_id}/block/{round}`.
-///
-/// The `version_seg` path segment is expected to be `v1` (matching Go's
-/// route pattern `/v{version:[0-9.]+}/...`).
+/// Axum handler for `GET /v1/{genesis_id}/block/{round}`.
 async fn serve_block(
     State(state): State<BlockServiceState>,
-    Path((version_seg, genesis_id, round_str)): Path<(String, String, String)>,
+    Path((genesis_id, round_str)): Path<(String, String)>,
 ) -> Response {
-    // Parse version: expect "v1" pattern
-    let version = version_seg.strip_prefix('v').unwrap_or("");
-    if version != "1" {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-
     // Validate genesis ID
     if genesis_id != state.genesis_id {
         return StatusCode::BAD_REQUEST.into_response();
@@ -997,18 +985,20 @@ mod tests {
         );
     }
 
+    /// go v5.1.1 registers only `/v1/{genesisID}/block/{round}` on its
+    /// `http.ServeMux` (`BlockServiceBlockPath`, #2555,
+    /// `TestServicePathsShareServeMux`): another version, or an empty round,
+    /// is not routed (404), where gorilla/mux's `v{version}` answered 400.
     #[tokio::test]
-    async fn http_returns_400_for_bad_version() {
+    async fn http_does_not_route_other_versions() {
         let ledger = Arc::new(MockLedger::new());
         let app = make_test_service(ledger);
 
-        let req = Request::builder()
-            .uri("/v2/testnet-v1.0/block/0")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        for uri in ["/v2/testnet-v1.0/block/0", "/v1/testnet-v1.0/block/"] {
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
     }
 
     #[tokio::test]

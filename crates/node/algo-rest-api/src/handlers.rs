@@ -5227,3 +5227,40 @@ mod txn_merkle_array_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod ed_index_tests {
+    use super::*;
+
+    /// go v5.1.1's `edIndexToAddress` (`daemon/algod/api/server/v2/utils.go`,
+    /// #6818 follow-up) compares in `uint64`: `index-1 < uint64(len(accounts))`,
+    /// then `index-1-uint64(len(accounts)) < uint64(len(shared))`. An index that
+    /// converted to a negative `int` before (2^63 + 1) or is the largest uint64
+    /// is the "Invalid Account Index" text, never a panic. `usize` is 64 bits
+    /// on every supported target, so the Rust comparison is the same one.
+    #[test]
+    fn ed_index_to_address_huge_indexes_are_invalid_not_panics() {
+        let stxn = algo_types::SignedTransaction {
+            txn: algo_types::Transaction {
+                accounts: Some(vec![algo_types::Address([2; 32])]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let shared = [algo_types::Address([3; 32])];
+        assert_eq!(
+            ed_index_to_address(1, &stxn, &shared),
+            algo_types::Address([2; 32]).to_string()
+        );
+        assert_eq!(
+            ed_index_to_address(2, &stxn, &shared),
+            algo_types::Address([3; 32]).to_string()
+        );
+        for index in [3u64, (1 << 63) + 1, u64::MAX] {
+            assert_eq!(
+                ed_index_to_address(index, &stxn, &shared),
+                format!("Invalid Account Index {index} in LocalDelta")
+            );
+        }
+    }
+}

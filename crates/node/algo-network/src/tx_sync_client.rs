@@ -260,9 +260,14 @@ pub fn decode_tx_sync_response(bytes: &[u8]) -> Result<Vec<SignedTransaction>, S
     }
     let mut txns = Vec::with_capacity((n as usize).min(1024));
     for i in 0..n {
+        // the generated decoder's verdict and text first (maps only, required
+        // fields, allocbounds), then the value
+        let used = algo_codec::decode_signed_txn_go(rd).map_err(|e| format!("txn {i}: {e}"))?;
         txns.push(
-            SignedTransaction::decode_from_reader(&mut rd).map_err(|e| format!("txn {i}: {e}"))?,
+            SignedTransaction::decode_from_reader(&mut &rd[..used])
+                .map_err(|e| format!("txn {i}: {e}"))?,
         );
+        rd = &rd[used..];
     }
     Ok(txns)
 }
@@ -396,6 +401,42 @@ mod tests {
         stx.txn.sender = algo_types::Address([1u8; 32]);
         stx.txn.fee = fee;
         stx
+    }
+
+    /// go v5.1.1's `TestTxSyncResponseDecode` (`rpcs/httpTxSync_test.go`).
+    #[test]
+    fn tx_sync_response_decode_go_v5_1_1() {
+        let encode = |txns: &[SignedTransaction]| {
+            let mut out = vec![0xdd];
+            out.extend_from_slice(&(txns.len() as u32).to_be_bytes());
+            for t in txns {
+                out.extend_from_slice(&algo_codec::canonical_encode_signed_transaction(t));
+            }
+            out
+        };
+        // normal
+        let txns = vec![make_txn(1000), make_txn(7)];
+        let decoded = decode_tx_sync_response(&encode(&txns)).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[1].txn.fee, 7);
+        // empty response: an empty array and nil both decode to nothing
+        assert!(decode_tx_sync_response(&[0x90]).unwrap().is_empty());
+        assert!(decode_tx_sync_response(&[0xc0]).unwrap().is_empty());
+        // a nil element is refused, `txn` being required
+        let mut nils = vec![0xdd, 0, 0, 0, 8];
+        nils.extend_from_slice(&[0xc0; 8]);
+        let err = decode_tx_sync_response(&nils).unwrap_err();
+        assert!(err.contains("missing required field: txn"), "{err}");
+        // at the bound
+        let minimal = make_txn(0);
+        let at =
+            decode_tx_sync_response(&encode(&vec![minimal.clone(); MAX_TX_SYNC_RESPONSE_TXNS]))
+                .unwrap();
+        assert_eq!(at.len(), MAX_TX_SYNC_RESPONSE_TXNS);
+        // over the bound: refused before the array is allocated
+        let err = decode_tx_sync_response(&encode(&vec![minimal; MAX_TX_SYNC_RESPONSE_TXNS + 1]))
+            .unwrap_err();
+        assert!(err.contains("length overflow"), "{err}");
     }
 
     struct FakePool(Vec<Vec<SignedTransaction>>);

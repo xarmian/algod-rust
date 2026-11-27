@@ -296,6 +296,10 @@ int 1
         group.failure_message
     );
 
+    // go v5.1.1 counts one `MaxAppProgramCost` per app call, top-level or
+    // inner: the three-app chain is three grants (#2555)
+    assert_eq!(group.app_budget_added, 3 * 700);
+
     let trace = group.txn_results[0].trace.as_ref().expect("trace present");
     let outer_approval = trace
         .approval_program_trace

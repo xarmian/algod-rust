@@ -361,4 +361,61 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Edwards25519 point"));
     }
+
+    /// A salted-key signature (scheme `f1`) whose authorizer address is off the
+    /// Ed25519 curve (`off_curve`) or on it, found by trying salts: go's
+    /// `makeSKsigSignedTxnWithOffCurveAuthorizer`.
+    fn sksig_with_authorizer(off_curve: bool) -> SaltedKeySig {
+        (0..=255u8)
+            .map(|salt| SaltedKeySig {
+                scheme: *b"f1",
+                salt: AddressSalt(salt),
+                public_key: ByteBuf::from(vec![7u8; 1793]),
+                ..Default::default()
+            })
+            .find(|s| s.address().is_off_ed25519_curve() == off_curve)
+            .expect("some salt gives each kind of address")
+    }
+
+    /// go v5.1.1's `TestPostTransactionOffCurveAuthorizers` (and, through the
+    /// shared `enforceOffCurveAuthorizers`, `TestPostTransactionAsync...`): a
+    /// salted-key authorizer on the curve is `transaction 0: salted-key
+    /// signature authorizer address ...`, off the curve and with the skip flag
+    /// it is accepted, for a top-level signature and a delegated LogicSig one.
+    #[test]
+    fn off_curve_authorizers_go_v5_1_1() {
+        let top = |s: SaltedKeySig| SignedTransaction {
+            txn: minimal_pay_txn(Address([1u8; 32])),
+            pqsig: Some(s),
+            ..Default::default()
+        };
+        let delegated = |s: SaltedKeySig| SignedTransaction {
+            txn: minimal_pay_txn(Address([1u8; 32])),
+            lsig: Some(LogicSig {
+                logic: ByteBuf::from(vec![0x0d, 0x81, 0x01]),
+                pqsig: Some(s),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for make in [
+            &top as &dyn Fn(SaltedKeySig) -> SignedTransaction,
+            &delegated,
+        ] {
+            assert_eq!(
+                enforce_pq_compliance(&[make(sksig_with_authorizer(true))], None),
+                Ok(())
+            );
+            let err = enforce_pq_compliance(&[make(sksig_with_authorizer(false))], None)
+                .expect_err("an on-curve authorizer is refused");
+            assert!(
+                err.starts_with("transaction 0: salted-key signature authorizer address "),
+                "{err}"
+            );
+            assert_eq!(
+                enforce_pq_compliance(&[make(sksig_with_authorizer(false))], Some(true)),
+                Ok(())
+            );
+        }
+    }
 }
