@@ -74,6 +74,17 @@ pub struct BlockAssembler {
     /// machine, a matching vote can be concatenated with the payload to ensure
     /// peers do not drop it.
     pub authenticators: Vec<Vote>,
+
+    /// Set if `pipeline` has no validation request because, when it was
+    /// pipelined or when its validation was cancelled, only a period which had
+    /// not started was interested in it. Validation is requested once a period
+    /// which has started is interested in it (see `ProposalStore::resume_held`).
+    ///
+    /// Not serialized, as in go: after a crash, agreement does not request
+    /// validation of a held `pipeline`, as for a `pipeline` whose validation
+    /// was in the cryptoVerifier.
+    #[serde(skip)]
+    pub held: bool,
 }
 
 impl BlockAssembler {
@@ -267,6 +278,80 @@ impl ProposalStore {
         self.assemblers.remove(&BOTTOM);
     }
 
+    /// Stores `ea`, whose `pipeline` has no validation request in flight. If
+    /// `pv` is pinned or relevant to a period no later than `cur`, returns the
+    /// `PayloadPipelined` event on which the player requests validation of the
+    /// `pipeline`. Otherwise only a period after `cur` is interested in `pv`:
+    /// it marks `ea` held and returns an event with `held` set, on which the
+    /// player does not request validation.
+    ///
+    /// Mirrors Go's `proposalStore.requestOrHold`.
+    fn request_or_hold(
+        &mut self,
+        pv: ProposalValue,
+        mut ea: BlockAssembler,
+        cur: Period,
+    ) -> PayloadProcessedEvent {
+        let (per, pinned, ok) = self.request_key(pv, cur);
+        ea.held = !ok;
+        let event = PayloadProcessedEvent {
+            t: EventType::PayloadPipelined,
+            vote: ea.authenticator(cur),
+            period: per,
+            pinned,
+            held: ea.held,
+            proposal: pv,
+            unauthenticated_payload: ea.pipeline.clone(),
+            ..PayloadProcessedEvent::default()
+        };
+        self.assemblers.insert(pv, ea);
+        event
+    }
+
+    /// Returns the `PayloadPipelined` event for a held payload whose
+    /// proposal-value is now pinned or relevant to a period no later than
+    /// `cur`, and clears its held flag. Returns a zero event if there is no
+    /// such payload. A payload stays held only while its proposal-value is
+    /// relevant to the next period alone, so at most one blockAssembler is held
+    /// at a time.
+    ///
+    /// Mirrors Go's `proposalStore.resumeHeld`.
+    fn resume_held(&mut self, cur: Period) -> PayloadProcessedEvent {
+        let held: Vec<ProposalValue> = self
+            .assemblers
+            .iter()
+            .filter(|(_, ea)| ea.held && !ea.assembled)
+            .map(|(pv, _)| *pv)
+            .collect();
+        for pv in held {
+            let ea = self.assemblers[&pv].clone();
+            let ep = self.request_or_hold(pv, ea, cur);
+            if !self.assemblers[&pv].held {
+                return ep;
+            }
+        }
+        PayloadProcessedEvent::default()
+    }
+
+    /// Returns the period whose validation request a payload of `pv` belongs
+    /// to: the pinned request, or the latest period no later than `cur` for
+    /// which `pv` is relevant. `ok` is false if there is no such period, and
+    /// the payload is held until there is one.
+    ///
+    /// Mirrors Go's `proposalStore.requestKey`.
+    fn request_key(&self, pv: ProposalValue, cur: Period) -> (Period, bool, bool) {
+        if self.pinned == pv {
+            return (Period(0), true, true);
+        }
+        let mut best: Option<Period> = None;
+        for (&p, v) in &self.relevant {
+            if p <= cur && *v == pv && best.is_none_or(|b| p > b) {
+                best = Some(p);
+            }
+        }
+        (best.unwrap_or(Period(0)), false, best.is_some())
+    }
+
     /// Handle an event dispatched to this proposalMachineRound.
     ///
     /// Dispatches on event type and returns the resulting event.
@@ -306,6 +391,7 @@ impl ProposalStore {
 
                     pae.payload = payload;
                     pae.payload_ok = assembled;
+                    pae.pipelined = self.resume_held(current_period);
                     return Event::ProposalAccepted(pae);
                 }
 
@@ -333,20 +419,9 @@ impl ProposalStore {
                     }
                 };
 
-                match ea.clone().pipeline(up.clone()) {
+                match ea.pipeline(up) {
                     Ok(new_ea) => {
-                        let auth_vote = ea.authenticator(current_period);
-                        let (relevant_period, pinned) = self.last_relevant(pv);
-                        self.assemblers.insert(pv, new_ea);
-                        Event::PayloadProcessed(PayloadProcessedEvent {
-                            t: EventType::PayloadPipelined,
-                            vote: auth_vote,
-                            period: relevant_period,
-                            pinned,
-                            proposal: pv,
-                            unauthenticated_payload: up,
-                            ..PayloadProcessedEvent::default()
-                        })
+                        Event::PayloadProcessed(self.request_or_hold(pv, new_ea, current_period))
                     }
                     Err(err) => Event::PayloadProcessed(PayloadProcessedEvent {
                         t: EventType::PayloadRejected,
@@ -361,6 +436,27 @@ impl ProposalStore {
                     Event::Message(me) => me.clone(),
                     _ => panic!("proposalStore: expected MessageEvent for PayloadVerified"),
                 };
+                if me.cancelled {
+                    // The payload was neither validated nor refuted, and its
+                    // blockAssembler rejects later copies, so request its
+                    // validation again or hold it, as if it had just been
+                    // pipelined.
+                    let up = me.input.unauthenticated_proposal.clone();
+                    let pv = up.value();
+                    return match self.assemblers.get(&pv) {
+                        Some(ea) if !ea.assembled => {
+                            let mut ea = ea.clone();
+                            ea.pipeline = up;
+                            ea.filled = true;
+                            Event::PayloadProcessed(self.request_or_hold(pv, ea, current_period))
+                        }
+                        _ => Event::PayloadProcessed(PayloadProcessedEvent {
+                            t: EventType::PayloadRejected,
+                            err: me.err.clone(),
+                            ..PayloadProcessedEvent::default()
+                        }),
+                    };
+                }
                 let pp = me
                     .input
                     .proposal
@@ -392,6 +488,7 @@ impl ProposalStore {
                             return Event::Committable(CommittableEvent {
                                 proposal: pv,
                                 vote: auth_vote,
+                                ..CommittableEvent::default()
                             });
                         }
                         Event::PayloadProcessed(PayloadProcessedEvent {
@@ -436,6 +533,12 @@ impl ProposalStore {
                     self.relevant.remove(&per);
                 }
                 self.trim(current_period);
+                if npe.resume_held {
+                    let ep = self.resume_held(npe.period);
+                    if ep.t == EventType::PayloadPipelined {
+                        return Event::PayloadProcessed(ep);
+                    }
+                }
                 Event::Empty(EmptyEvent)
             }
 
@@ -476,31 +579,35 @@ impl ProposalStore {
                     _ => panic!("proposalStore: expected ProposalAccepted from tracker"),
                 };
 
-                // Return committableEvent if the block is assembled
-                if let Some(ea) = self.assemblers.get(&pae.proposal) {
-                    if ea.assembled {
-                        let auth_vote = ea.authenticator(current_period);
-                        return Event::Committable(CommittableEvent {
-                            proposal: pae.proposal,
-                            vote: auth_vote,
-                        });
-                    }
-                }
-
-                // Ensure an assembler exists for this proposal value
-                let ea = self.assemblers.entry(pae.proposal).or_default();
-                let payload = ea.payload.clone();
-                let assembled = ea.assembled;
-
+                // An assembler may not exist: add a new one if it does not.
+                // The value is not pinned here: new period logic does that if
+                // we fast forward.
+                let ea = self.assemblers.entry(pae.proposal).or_default().clone();
                 self.relevant.insert(period, pae.proposal);
                 self.trim(current_period);
 
+                // Resume held payloads only now that `relevant` and
+                // `assemblers` reflect the threshold: a payload which the
+                // threshold's value replaced in `relevant[period]` is no longer
+                // tracked. `period` has started once the player handles the
+                // threshold.
+                let pipelined = self.resume_held(current_period.max(period));
+
+                // Return committableEvent if the block is assembled.
+                if ea.assembled {
+                    return Event::Committable(CommittableEvent {
+                        proposal: pae.proposal,
+                        vote: ea.authenticator(current_period),
+                        pipelined,
+                    });
+                }
                 Event::ProposalAccepted(ProposalAcceptedEvent {
                     round: pae.round,
                     period: pae.period,
                     proposal: pae.proposal,
-                    payload,
-                    payload_ok: assembled,
+                    payload: ea.payload,
+                    payload_ok: ea.assembled,
+                    pipelined,
                 })
             }
 
@@ -726,6 +833,7 @@ mod tests {
             }),
             assembled: true,
             authenticators: vec![vote],
+            held: false,
         };
         let bytes = rmp_serde::to_vec_named(&ba).expect("msgpack serialize");
         let decoded: BlockAssembler = rmp_serde::from_slice(&bytes).expect("msgpack decode");
@@ -771,6 +879,7 @@ mod tests {
         let e = Event::NewPeriod(NewPeriodEvent {
             period: Period(3),
             proposal: BOTTOM,
+            resume_held: false,
         });
         let result = store.handle(Period(0), e);
         assert_eq!(result.event_type(), EventType::None);
@@ -906,6 +1015,7 @@ mod tests {
             Event::NewPeriod(NewPeriodEvent {
                 period: Period(3),
                 proposal: pv,
+                resume_held: false,
             }),
         );
         assert_eq!(res.event_type(), EventType::None);
@@ -919,6 +1029,7 @@ mod tests {
             Event::NewPeriod(NewPeriodEvent {
                 period: Period(4),
                 proposal: BOTTOM,
+                resume_held: false,
             }),
         );
         assert_eq!(res.event_type(), EventType::None);
@@ -1214,6 +1325,7 @@ mod tests {
                         Event::NewPeriod(NewPeriodEvent {
                             period: Period(1),
                             proposal: BOTTOM,
+                            resume_held: false,
                         })
                     )
                     .event_type(),
@@ -1242,6 +1354,7 @@ mod tests {
                         Event::NewPeriod(NewPeriodEvent {
                             period: Period(2),
                             proposal: BOTTOM,
+                            resume_held: false,
                         })
                     )
                     .event_type(),
@@ -1299,6 +1412,7 @@ mod tests {
             Event::NewPeriod(NewPeriodEvent {
                 period: Period(1),
                 proposal: BOTTOM,
+                resume_held: false,
             }),
         );
         let res = store.handle(
@@ -1313,16 +1427,19 @@ mod tests {
             Event::NewPeriod(NewPeriodEvent {
                 period: Period(2),
                 proposal: BOTTOM,
+                resume_held: false,
             }),
         );
+        // The player is in period 2 from here on. A payload for a period that
+        // has not started is held, and its event leaves `period` unset.
         let res = store.handle(
-            Period(0),
+            Period(2),
             vote_verified_event(cur_round, Period(2), proposer, pv2),
         );
         assert_eq!(res.event_type(), EventType::ProposalAccepted);
 
         // PayloadPresent for pay2 — pipelined with period == 2.
-        let res = store.handle(Period(0), payload_event(EventType::PayloadPresent, pay2));
+        let res = store.handle(Period(2), payload_event(EventType::PayloadPresent, pay2));
         assert_eq!(res.event_type(), EventType::PayloadPipelined);
         if let Event::PayloadProcessed(pe) = res {
             assert_eq!(pe.period, Period(2));
@@ -1332,7 +1449,7 @@ mod tests {
 
         // PayloadPresent for pay1, arriving AFTER pay2 — must report
         // period = 1 (its own period), NOT period = 2 (current).
-        let res = store.handle(Period(0), payload_event(EventType::PayloadPresent, pay1));
+        let res = store.handle(Period(2), payload_event(EventType::PayloadPresent, pay1));
         assert_eq!(res.event_type(), EventType::PayloadPipelined);
         if let Event::PayloadProcessed(pe) = res {
             assert_ne!(
@@ -1344,6 +1461,59 @@ mod tests {
         } else {
             panic!("expected PayloadProcessed event");
         }
+    }
+
+    /// go's `held` is not serialized: after a crash, agreement does not
+    /// request validation of a held payload.
+    #[test]
+    fn block_assembler_held_is_not_serialized() {
+        let ba = BlockAssembler {
+            held: true,
+            filled: true,
+            ..BlockAssembler::default()
+        };
+        let bytes = rmp_serde::to_vec_named(&ba).expect("serialize");
+        let decoded: BlockAssembler = rmp_serde::from_slice(&bytes).expect("decode");
+        assert!(decoded.filled);
+        assert!(!decoded.held);
+    }
+
+    /// `requestKey`/`requestOrHold`/`resumeHeld` (go v5.1.1): a payload whose
+    /// value is relevant only to a period after the player's is held without
+    /// a validation request, and resumed once a started period is interested.
+    #[test]
+    fn payload_for_a_future_period_is_held_then_resumed() {
+        let pv = make_proposal_value(0xaa);
+        let mut store = ProposalStore::default();
+        store.relevant.insert(Period(1), pv);
+        let ea = BlockAssembler {
+            filled: true,
+            ..BlockAssembler::default()
+        };
+        store.assemblers.insert(pv, ea);
+
+        let held = store.request_or_hold(pv, store.assemblers[&pv].clone(), Period(0));
+        assert!(held.held);
+        assert_eq!(
+            held.period,
+            Period(0),
+            "period is not set for a held payload"
+        );
+        assert!(store.assemblers[&pv].held);
+        assert_eq!(store.resume_held(Period(0)).t, EventType::None);
+
+        let resumed = store.resume_held(Period(1));
+        assert_eq!(resumed.t, EventType::PayloadPipelined);
+        assert!(!resumed.held);
+        assert_eq!(resumed.period, Period(1));
+        assert!(!store.assemblers[&pv].held);
+        assert_eq!(store.resume_held(Period(1)).t, EventType::None);
+
+        // a pinned value is never held
+        store.pinned = pv;
+        store.relevant.clear();
+        let pinned = store.request_or_hold(pv, store.assemblers[&pv].clone(), Period(0));
+        assert!(pinned.pinned && !pinned.held);
     }
 
     #[test]

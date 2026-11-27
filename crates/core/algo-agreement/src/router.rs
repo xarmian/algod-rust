@@ -240,7 +240,13 @@ impl RootRouter {
             // for now (persistence shape, future refactor in follow-up
             // task), but no production dispatch hits it.
             StateMachineTag::ProposalMachineRound => {
-                self.proposal_manager.store_for_round(r).handle(p, e)
+                // The store sees the player's period (go's `dispatch(p player,
+                // ...)`), not the routing period `p`: `held` payloads are
+                // decided against it.
+                let _ = p;
+                self.proposal_manager
+                    .store_for_round(r)
+                    .handle(state.period, e)
             }
             // ProposalMachinePeriod queries (`ProposalFrozen`, `ReadLowest`,
             // `ReadStaging`, etc.) must consult the SAME per-period

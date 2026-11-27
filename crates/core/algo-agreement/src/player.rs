@@ -671,7 +671,7 @@ impl Player {
         match e.t {
             EventType::CertThreshold => {
                 // Dispatch to proposal machine for cert threshold tracking
-                router.dispatch(
+                let ec = router.dispatch(
                     self,
                     Event::Threshold(e.clone()),
                     StateMachineTag::ProposalMachine,
@@ -707,6 +707,7 @@ impl Player {
                 actions.push(Action::StageDigest(Box::new(StageDigestAction {
                     certificate: Certificate::from_bundle(&e.bundle),
                 })));
+                actions.extend(self.verify_held_payload(&ec));
                 if self.period < e.period {
                     let as_ = self.enter_period(router, &e, e.period, params);
                     actions.extend(as_);
@@ -736,6 +737,7 @@ impl Player {
                         actions.push(self.issue_cert_vote(ce));
                     }
                 }
+                actions.extend(self.verify_held_payload(&ec));
                 actions
             }
 
@@ -748,6 +750,25 @@ impl Player {
 
             _ => panic!("player: bad threshold event type: {:?}", e.t),
         }
+    }
+
+    /// Returns an action requesting validation of a held payload which the
+    /// proposalMachine handed back with `e`, if any.
+    ///
+    /// Mirrors Go's `player.verifyHeldPayload`.
+    fn verify_held_payload(&self, e: &Event) -> Vec<Action> {
+        let ep = match e {
+            Event::PayloadProcessed(ep) => ep,
+            Event::ProposalAccepted(pae) => &pae.pipelined,
+            Event::Committable(ce) => &ce.pipelined,
+            _ => return Vec::new(),
+        };
+        if ep.t != EventType::PayloadPipelined {
+            return Vec::new();
+        }
+        vec![crate::actions::verify_pipelined_payload_action(
+            self.round, ep,
+        )]
     }
 
     /// Enter a new period within the current round.
@@ -796,6 +817,7 @@ impl Player {
         };
 
         actions.push(Action::Rezero(RezeroAction { round: self.round }));
+        actions.extend(self.verify_held_payload(&e));
 
         if e.event_type() == EventType::ProposalCommittable {
             // implies source.t() == softThreshold
@@ -890,17 +912,9 @@ impl Player {
 
         if e.event_type() == EventType::PayloadPipelined {
             if let Event::PayloadProcessed(ref ep) = e {
-                let msg = MessageEvent {
-                    t: EventType::PayloadPresent,
-                    input: crate::events::InternalMessage {
-                        unauthenticated_proposal: ep.unauthenticated_payload.clone(),
-                        ..crate::events::InternalMessage::default()
-                    },
-                    ..MessageEvent::default()
-                };
-                let a =
-                    crate::actions::verify_payload_action(&msg, self.round, ep.period, ep.pinned);
-                actions.push(a);
+                actions.push(crate::actions::verify_pipelined_payload_action(
+                    self.round, ep,
+                ));
             }
         }
 
@@ -1193,6 +1207,28 @@ impl Player {
                     }
                     EventType::PayloadPipelined => {
                         if let Event::PayloadProcessed(ref ep) = ef {
+                            // A payload of the next round is validated once
+                            // that round starts, and one which only a period
+                            // that has not started is interested in, once a
+                            // started period is (see
+                            // `ProposalStore::resume_held`). The proposalStore
+                            // of the next round decides `held` against this
+                            // round's period, so the round is checked here.
+                            let due = ep.round == self.round && !ep.held;
+
+                            if e.t == EventType::PayloadVerified {
+                                // The validation of this payload was
+                                // cancelled, and the proposalStore holds it
+                                // again. It was relayed when it was first
+                                // pipelined.
+                                if due {
+                                    actions.push(crate::actions::verify_pipelined_payload_action(
+                                        self.round, ep,
+                                    ));
+                                }
+                                return actions;
+                            }
+
                             let up = e.input.unauthenticated_proposal.clone();
                             let uv = match &ep.vote {
                                 Some(v) => v.to_unauthenticated(),
@@ -1209,7 +1245,7 @@ impl Player {
                                 ..NetworkAction::default()
                             }));
 
-                            if ep.round == self.round {
+                            if due {
                                 let vpa = crate::actions::verify_payload_action(
                                     &e, ep.round, ep.period, ep.pinned,
                                 );
@@ -1593,6 +1629,7 @@ impl Player {
                         ..NetworkAction::default()
                     })));
                 }
+                actions.extend(self.verify_held_payload(&ef));
             }
         }
 

@@ -236,6 +236,18 @@ impl IoAutomataConcretePlayer {
     /// port maintains both because the original architecture didn't
     /// consolidate the duplicate hierarchies; mirroring keeps the test
     /// observable from either lookup path.
+    /// Mark `value` relevant to `period` in the proposalStore of `round`: go
+    /// v5.1.1 holds a payload (`proposalStore.held`) that no started period is
+    /// interested in, so a test that injects an assembler also injects this
+    /// (go's `getPlayerPermutation` sets `Relevant = {p: pV}`).
+    pub fn set_proposal_relevant(&mut self, round: Round, period: Period, value: ProposalValue) {
+        self.router
+            .proposal_manager
+            .store_for_round(round)
+            .relevant
+            .insert(period, value);
+    }
+
     pub fn set_proposal_assembler(
         &mut self,
         round: Round,

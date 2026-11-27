@@ -136,10 +136,11 @@ impl ProposalManager {
                 if player_period < te.period {
                     self.handle_new_period(player_period, &te);
                 }
+                // The store sees the player's period, as go's `r.dispatch(p, ...)`
+                // passes the player: `resumeHeld` and `trim` depend on it.
                 let round = te.round;
-                let period = te.period;
                 let store = self.store_for(round);
-                store.handle(period, Event::Threshold(te))
+                store.handle(player_period, Event::Threshold(te))
             }
 
             EventType::NextThreshold => {
@@ -147,8 +148,9 @@ impl ProposalManager {
                     Event::Threshold(te) => te,
                     _ => panic!("proposalManager: expected ThresholdEvent"),
                 };
-                self.handle_new_period(player_period, &te);
-                Event::Empty(EmptyEvent)
+                // A payloadPipelined event for a held payload whose validation
+                // is now due, if there is one.
+                self.handle_new_period(player_period, &te)
             }
 
             other => {
@@ -176,7 +178,7 @@ impl ProposalManager {
     /// (before the period change). In Go, the player object `p` is passed
     /// through to `proposalStore.handle`, which uses `p.Period` for staging
     /// queries and authenticator trimming.
-    fn handle_new_period(&mut self, player_period: Period, e: &ThresholdEvent) {
+    fn handle_new_period(&mut self, player_period: Period, e: &ThresholdEvent) -> Event {
         let target = if e.t == EventType::NextThreshold {
             Period(e.period.0 + 1)
         } else {
@@ -186,9 +188,10 @@ impl ProposalManager {
         let en = NewPeriodEvent {
             period: target,
             proposal: e.proposal,
+            resume_held: e.t == EventType::NextThreshold,
         };
         let store = self.store_for(e.round);
-        store.handle(player_period, Event::NewPeriod(en));
+        store.handle(player_period, Event::NewPeriod(en))
     }
 
     /// Handle a filterable message event (vote or payload present/verified).
@@ -280,10 +283,9 @@ impl ProposalManager {
                 }
 
                 let vote_round = v.raw_vote.round;
-                let vote_period = v.raw_vote.period;
 
                 let store = self.store_for(vote_round);
-                let result = store.handle(vote_period, Event::Message(e.message_event));
+                let result = store.handle(player_period, Event::Message(e.message_event));
 
                 if keep_for_late_credential_tracking {
                     let err_msg = if let Err(fresh_err) = err {
@@ -351,7 +353,9 @@ impl ProposalManager {
                 // Pipeline for next round
                 let next_round = Round(player_round.0 + 1);
                 let store = self.store_for(next_round);
-                let e2 = store.handle(Period(0), Event::Message(input));
+                // The proposalStore of the next round decides `held` against
+                // this round's period.
+                let e2 = store.handle(player_period, Event::Message(input));
                 if e2.event_type() == EventType::PayloadRejected {
                     return e2;
                 }
@@ -365,11 +369,32 @@ impl ProposalManager {
 
             EventType::PayloadVerified => {
                 if e.message_event.cancelled {
-                    return Event::PayloadProcessed(PayloadProcessedEvent {
-                        t: EventType::PayloadRejected,
-                        err: e.message_event.err.clone(),
-                        ..PayloadProcessedEvent::default()
-                    });
+                    // As with a validated payload below, a block from a round
+                    // the player has left must not reach this round's
+                    // proposalStore, which would hold it again and request its
+                    // validation. The crypto verifier may leave `input.proposal`
+                    // empty on a cancelled result, so the round comes from
+                    // `input.unauthenticated_proposal`.
+                    let pr = e.message_event.input.unauthenticated_proposal.round();
+                    if pr != player_round {
+                        return Event::PayloadProcessed(PayloadProcessedEvent {
+                            t: EventType::PayloadRejected,
+                            err: Some(SerializableError::new(format!(
+                                "proposalManager: ignoring cancelled proposal payload due to age: payload round {}, player round {}",
+                                pr.0, player_round.0
+                            ))),
+                            ..PayloadProcessedEvent::default()
+                        });
+                    }
+                    let store = self.store_for(player_round);
+                    let e1 = store.handle(player_period, Event::Message(e.message_event));
+                    if let Event::PayloadProcessed(mut ep) = e1 {
+                        if ep.t == EventType::PayloadPipelined {
+                            ep.round = player_round;
+                        }
+                        return Event::PayloadProcessed(ep);
+                    }
+                    return e1;
                 }
 
                 if e.message_event.err.is_some() {
@@ -377,6 +402,26 @@ impl ProposalManager {
                         t: EventType::PayloadMalformed,
                         err: e.message_event.err.clone(),
                         ..FilteredEvent::default()
+                    });
+                }
+
+                // The validation request compared the block round with the round
+                // the player was in when it requested validation, so the result
+                // is for that round only.
+                let pr = e
+                    .message_event
+                    .input
+                    .proposal
+                    .as_ref()
+                    .map_or(Round(0), |p| p.unauthenticated_proposal.round());
+                if pr != player_round {
+                    return Event::PayloadProcessed(PayloadProcessedEvent {
+                        t: EventType::PayloadRejected,
+                        err: Some(SerializableError::new(format!(
+                            "proposalManager: ignoring proposal payload due to age: payload round {}, player round {}",
+                            pr.0, player_round.0
+                        ))),
+                        ..PayloadProcessedEvent::default()
                     });
                 }
 
