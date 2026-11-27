@@ -744,13 +744,9 @@ pub fn validate_transaction_wellformed(
 fn check_txn_type_field_isolation(txn: &Transaction) -> Result<(), AlgoError> {
     // An unrecognized `txn_type` is not this check's concern: Go's `WellFormed`
     // rejects it earlier via its type `switch`'s `default` case ("unknown tx
-    // type %v"), before ever reaching `nonZeroFields`. algod-rust's structural
-    // "unknown type" rejection instead lives in `checks.rs::check_txn_group`
-    // (`transaction has an unknown type`, matching go's `CheckTxnGroup`) as a
-    // group-level admission gate with different failure-propagation semantics
-    // (aborts the whole request rather than failing a single transaction) —
-    // deferring to it here avoids duplicating that rejection under this
-    // function's different (per-transaction) error path.
+    // type %v"), before ever reaching `nonZeroFields`; here that rejection is
+    // `validate_transaction_wellformed`'s own type check (go v5.1 no longer
+    // screens for it in `checkTxnGroup`), so this helper just skips it.
     const KNOWN_TYPES: [&str; 8] = [
         "pay", "keyreg", "acfg", "axfer", "afrz", "appl", "stpf", "hb",
     ];

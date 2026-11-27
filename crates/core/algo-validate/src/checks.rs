@@ -219,7 +219,7 @@ fn check_state_proof(state_proof_type: u64, sp: &StateProofBody) -> Result<(), A
 /// go runs this check in TWO places and so does this port, through this one
 /// helper (issue #2196): per member in `WellFormed` (so the gossip test stage
 /// and the REST path report the first malformed member in go's order, called
-/// from `rules::validate_transaction_wellformed_in_mode`) and at group level in
+/// from `rules::validate_transaction_wellformed`) and at group level in
 /// `checkTxnGroup` ([`check_txn_group`], which block validation, the agreement
 /// demux's `proposalCarriesInvalidTxn` screen, simulation and the REST path run).
 /// Block validation checks the payload there, in `check_txn_group`, even for an
