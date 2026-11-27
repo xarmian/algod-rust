@@ -2680,6 +2680,28 @@ fn read_accepted_signed_txn(bytes: &[u8]) -> Result<algo_types::SignedTransactio
     })
 }
 
+/// The msgpack request `body` with an `extra-opcode-budget` above `i64::MAX`
+/// rewritten as the int64 go's `ReadInt64Bytes` makes of it.
+fn wrap_extra_opcode_budget(body: &[u8]) -> Option<Vec<u8>> {
+    use rmpv::Value;
+    let mut cursor = body;
+    let Value::Map(mut pairs) = rmpv::decode::read_value(&mut cursor).ok()? else {
+        return None;
+    };
+    let mut changed = false;
+    for (k, v) in pairs.iter_mut() {
+        if k.as_str() == Some("extra-opcode-budget") {
+            if let Some(u) = v.as_u64().filter(|u| *u > i64::MAX as u64) {
+                *v = Value::from(u as i64);
+                changed = true;
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(body.len());
+    rmpv::encode::write_value(&mut out, &Value::Map(pairs)).ok()?;
+    changed.then_some(out)
+}
+
 /// `value` with every map key that is an array of uint8 spelled as a string.
 fn string_keys(value: rmpv::Value) -> rmpv::Value {
     use rmpv::Value;
@@ -3370,11 +3392,16 @@ pub async fn simulate_transaction<N: NodeInterface>(
         }
         match parse_msgpack_request(&body) {
             MsgpackSimulate::Decoded(d) => (d.request, d.raw_txns),
-            // go's decoder accepted bytes the older reader refuses: not reached
-            _ => {
-                tracing::error!("simulate: a request go decodes did not convert");
-                return error::internal_error("failed to decode simulate request");
-            }
+            // `ReadInt64Bytes` wraps a uint64 above `MaxInt64` (go-codec
+            // compat): the older reader wants the int64 go reads
+            _ => match wrap_extra_opcode_budget(&body).map(|b| parse_msgpack_request(&b)) {
+                Some(MsgpackSimulate::Decoded(d)) => (d.request, d.raw_txns),
+                // go's decoder accepted bytes the older reader refuses: not reached
+                _ => {
+                    tracing::error!("simulate: a request go decodes did not convert");
+                    return error::internal_error("failed to decode simulate request");
+                }
+            },
         }
     } else {
         // JSON, decoded with go-codec's strict handle (issue #2477)

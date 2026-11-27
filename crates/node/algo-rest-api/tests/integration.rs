@@ -8291,6 +8291,30 @@ async fn simulate_empty_txn_groups_is_rejected_by_the_handler() {
 }
 
 #[tokio::test]
+async fn simulate_catchpoint_returns_503() {
+    let node = MockNode::catchpoint_catchup();
+    let server = TestServer::start(node).await;
+
+    let request_json = serde_json::json!({
+        "txn-groups": [{
+            "txns": [{"txn": {"type": "pay"}}]
+        }]
+    });
+    let body = serde_json::to_vec(&request_json).unwrap();
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/simulate"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+}
+
+#[tokio::test]
 async fn simulate_not_implemented_returns_500() {
     let node = MockNode::synced();
     let server = TestServer::start(node).await;
@@ -8692,14 +8716,57 @@ async fn simulate_msgpack_unknown_key_returns_msgp_text() {
         .unwrap();
     assert_eq!(resp.status(), 400);
     let json: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(
-        json["message"].as_str().unwrap(),
-        "Unknown field: zzz"
-    );
+    assert_eq!(json["message"].as_str().unwrap(), "Unknown field: zzz");
 
     // a clean request is not rejected by the decoder (the mock has no simulate result: 500)
     let resp = post(request(vec![])).await.unwrap();
     assert_ne!(resp.status(), 400, "{}", resp.text().await.unwrap());
+}
+
+/// go reads `extra-opcode-budget` with `ReadInt64Bytes`, which wraps a uint64
+/// above `MaxInt64`: such a request and one with trailing bytes pass go's
+/// decoder and must not end in the handler's "did not convert" 500 (#2555).
+#[tokio::test]
+async fn simulate_msgpack_accepted_oddities_reach_the_node() {
+    use rmpv::Value;
+    let s = |x: &str| Value::String(x.into());
+    let ok_stxn = algo_codec::canonical_encode_signed_transaction(&make_test_signed_txn());
+    let ok_val = rmpv::decode::read_value(&mut &ok_stxn[..]).unwrap();
+    let server = TestServer::start(MockNode::synced()).await;
+    for (budget, trailing) in [(u64::MAX, false), (1u64 << 63, false), (5, true)] {
+        let mut out = Vec::new();
+        rmpv::encode::write_value(
+            &mut out,
+            &Value::Map(vec![
+                (
+                    s("txn-groups"),
+                    Value::Array(vec![Value::Map(vec![(
+                        s("txns"),
+                        Value::Array(vec![ok_val.clone()]),
+                    )])]),
+                ),
+                (s("extra-opcode-budget"), Value::from(budget)),
+            ]),
+        )
+        .unwrap();
+        if trailing {
+            out.extend_from_slice(&[0xc1, 0xff]);
+        }
+        let resp = server
+            .client
+            .post(server.url("/v2/transactions/simulate"))
+            .header("X-Algo-API-Token", &server.api_token)
+            .header("Content-Type", "application/msgpack")
+            .body(out)
+            .send()
+            .await
+            .unwrap();
+        let text = resp.text().await.unwrap();
+        assert!(
+            !text.contains("did not convert") && !text.contains("failed to decode"),
+            "{budget} {trailing}: {text}"
+        );
+    }
 }
 
 /// Issue #1972: a JSON simulate request in go's JSON form (base64 `sig`,
