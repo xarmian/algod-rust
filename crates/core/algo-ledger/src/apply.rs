@@ -4637,8 +4637,51 @@ pub fn apply_transaction_with_tracer<L: crate::store_trait::LedgerStore>(
 
 /// Core transaction application logic, shared by `apply_transaction`,
 /// `apply_transaction_with_tracer`, and `apply_transaction_with_budget`.
+///
+/// go `BlockEvaluator.transaction`'s generate-only cross-type check (v5.1.1,
+/// issue #2545): while generating, a top-level transaction that applied but
+/// looked a resource up as the creatable type it is not (an app id as an
+/// asset the account holds, or the reverse) is refused. Like
+/// [`check_close_min_balance`] it runs only while generating and never while
+/// validating, so it cannot make this node vote differently from its peers.
 #[allow(clippy::too_many_arguments)]
 fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    stx: &SignedTransaction,
+    ctx: &ApplyContext,
+    depth: u32,
+    group_budget: Option<&mut GroupBudget>,
+    group_box_budget: Option<&mut BoxBudgetState>,
+    group_info: Option<&GroupInfo<'_>>,
+    tracer: Option<&mut dyn EvalTracer>,
+) -> Result<ApplyData, AlgoError> {
+    let watching = ctx.generate && depth == 0;
+    if watching {
+        store.watch_cross_types();
+    }
+    let result = apply_transaction_inner_watched(
+        store,
+        stx,
+        ctx,
+        depth,
+        group_budget,
+        group_box_budget,
+        group_info,
+        tracer,
+    );
+    if !watching {
+        return result;
+    }
+    let cross_type = store.stop_watching_cross_types();
+    let ad = result?;
+    match cross_type {
+        Some(message) => Err(AlgoError::Eval { message }),
+        None => Ok(ad),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_transaction_inner_watched<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     stx: &SignedTransaction,
     ctx: &ApplyContext,

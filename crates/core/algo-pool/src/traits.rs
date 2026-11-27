@@ -40,7 +40,8 @@ use algo_types::{Address, Block, BlockHeader, ConsensusParams, Digest, Round, Si
 /// PaySetSize() int
 /// TransactionGroup(txads ...SignedTxnWithAD) error
 /// GenerateBlock(addrs []Address) (*UnfinishedBlock, error)
-/// ResetTxnBytes()
+/// ResetTxnBytes() int
+/// RestoreTxnBytes(txnBytes int)
 /// ```
 pub trait BlockEvaluator: Send {
     /// The round this evaluator is building a block for.
@@ -61,9 +62,15 @@ pub trait BlockEvaluator: Send {
     /// (used for proposer payout eligibility in consensus v39+).
     fn generate_block(&mut self, voting_accounts: &[Address]) -> Result<Block, AlgoError>;
 
-    /// Reset the running transaction byte count, allowing more transactions
-    /// to be added after hitting the per-block byte limit.
-    fn reset_txn_bytes(&mut self);
+    /// Reset the running transaction byte count to zero, allowing more
+    /// transactions to be added after hitting the per-block byte limit, and
+    /// return the count it had (go v5.1.1 `ResetTxnBytes() int`).
+    fn reset_txn_bytes(&mut self) -> usize;
+
+    /// Set the running transaction byte count back to a value returned by
+    /// [`Self::reset_txn_bytes`], for when the group that made it start another
+    /// block does not fit there either (go v5.1.1 `RestoreTxnBytes`).
+    fn restore_txn_bytes(&mut self, txn_bytes: usize);
 
     /// Whether [`Self::transaction_group`] runs go's `checkDup` itself, per
     /// transaction (the pending block's txids and leases, the ledger's), as

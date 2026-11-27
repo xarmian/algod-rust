@@ -1,0 +1,22 @@
+[
+ {"name":"gdel_absent","same_block":false,"calls":[{"oc":"optin","ops":[["gdel","k"]]}]},
+ {"name":"gput_then_gdel_absent_before","same_block":false,"calls":[{"oc":"optin","ops":[["gput","k","u:5"],["gdel","k"]]}]},
+ {"name":"gput_gdel_gput","same_block":false,"calls":[{"oc":"optin","ops":[["gput","k","u:1"],["gdel","k"],["gput","k","u:2"]]}]},
+ {"name":"gput_same_value_back","same_block":false,"calls":[{"oc":"optin","ops":[["gput","k","u:5"]]},{"ops":[["gput","k","u:6"],["gput","k","u:5"]]}]},
+ {"name":"gdel_then_gput_same","same_block":false,"calls":[{"oc":"optin","ops":[["gput","k","u:5"]]},{"ops":[["gdel","k"],["gput","k","u:5"]]}]},
+ {"name":"gput_then_gdel_existing","same_block":false,"calls":[{"oc":"optin","ops":[["gput","k","u:5"]]},{"ops":[["gput","k","u:6"],["gdel","k"]]}]},
+ {"name":"gdel_twice_existing","same_block":false,"calls":[{"oc":"optin","ops":[["gput","k","b:hi"]]},{"ops":[["gdel","k"],["gdel","k"]]}]},
+ {"name":"gput_type_change_back","same_block":false,"calls":[{"oc":"optin","ops":[["gput","k","u:5"]]},{"ops":[["gput","k","b:x"],["gput","k","u:5"]]}]},
+ {"name":"gput_empty_bytes","same_block":false,"calls":[{"oc":"optin","ops":[["gput","k","b:"],["gput","z","u:0"]]}]},
+ {"name":"lput_lput_back","same_block":false,"calls":[{"oc":"optin","ops":[["lput","k","u:5"]]},{"ops":[["lput","k","u:6"],["lput","k","u:5"]]}]},
+ {"name":"ldel_absent","same_block":false,"calls":[{"oc":"optin","ops":[["ldel","k"]]}]},
+ {"name":"lput_then_ldel_absent_before","same_block":false,"calls":[{"oc":"optin","ops":[["lput","k","u:5"],["ldel","k"]]}]},
+ {"name":"lput_ldel_lput","same_block":false,"calls":[{"oc":"optin","ops":[["lput","k","u:1"],["ldel","k"],["lput","k","u:2"]]}]},
+ {"name":"ldel_then_lput_same","same_block":false,"calls":[{"oc":"optin","ops":[["lput","k","b:v"]]},{"ops":[["ldel","k"],["lput","k","b:v"]]}]},
+ {"name":"block_gput_then_gdel","same_block":true,"calls":[{"oc":"optin","ops":[["gput","k","u:5"]]},{"ops":[["gdel","k"]]}]},
+ {"name":"block_gput_gdel_gput","same_block":true,"calls":[{"oc":"optin","ops":[["gput","k","u:5"]]},{"ops":[["gdel","k"]]},{"ops":[["gput","k","u:7"]]}]},
+ {"name":"block_gdel_gput_same","same_block":true,"calls":[{"oc":"optin","ops":[["gput","k","u:5"]]},{"ops":[["gdel","k"]]},{"ops":[["gput","k","u:5"]]}]},
+ {"name":"block_lput_then_ldel","same_block":true,"calls":[{"oc":"optin","ops":[["lput","k","u:5"]]},{"ops":[["ldel","k"]]}]},
+ {"name":"block_ldel_absent_then_lput","same_block":true,"calls":[{"oc":"optin","ops":[["ldel","k"]]},{"ops":[["lput","k","u:3"]]}]},
+ {"name":"block_gdel_absent_gdel_absent","same_block":true,"calls":[{"oc":"optin","ops":[["gdel","k"]]},{"ops":[["gdel","k"]]}]}
+]

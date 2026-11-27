@@ -1,0 +1,158 @@
+// Copyright (C) 2019-2026 Algorand Foundation Ltd.
+// Modifications Copyright (C) 2026 Algod DAO
+// This file is part of algod-rust, a modified work based on go-algorand
+// (https://github.com/algorand/go-algorand).
+//
+// algod-rust is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// algod-rust is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with algod-rust.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// eval-delta-state-oracle (issue #2545): runs scenario programs that write and
+// delete app global/local keys through go-algorand's ledger (block evaluator,
+// ledger/eval appcow.go delKey/applyChild) and emits each call's ApplyData
+// EvalDelta gd/ld as JSON lines, for the Rust parity test
+// crates/core/algo-ledger/tests/eval_delta_state_oracle_test.rs.
+//
+// Run (WSL, go-algorand checkout at v5.1.1-stable with `make libsodium` done):
+//
+//	cp tools/eval-delta-state-oracle/oracle_test.go.txt ../go-algorand/ledger/evaldeltastate_oracle_test.go
+//	cd ../go-algorand && SCENARIOS=$PWD/../algod-rust/tools/eval-delta-state-oracle/scenarios.json \
+//	  OUT=$PWD/../algod-rust/crates/core/algo-ledger/tests/fixtures/eval_delta_state_go.jsonl \
+//	  go test ./ledger -run TestEvalDeltaStateOracle -count=1
+//	rm ledger/evaldeltastate_oracle_test.go
+//
+// The scenario file is the single input shared by go and Rust.
+
+package ledger
+
+import (
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/algorand/go-algorand/config"
+	"github.com/algorand/go-algorand/data/basics"
+	"github.com/algorand/go-algorand/data/transactions"
+	"github.com/algorand/go-algorand/data/txntest"
+	ledgertesting "github.com/algorand/go-algorand/ledger/testing"
+	"github.com/algorand/go-algorand/protocol"
+)
+
+type oracleCall struct {
+	OC  string     `json:"oc"`
+	Ops [][]string `json:"ops"`
+}
+
+type oracleScenario struct {
+	Name      string       `json:"name"`
+	SameBlock bool         `json:"same_block"`
+	Calls     []oracleCall `json:"calls"`
+}
+
+func oracleValue(v string) string {
+	if strings.HasPrefix(v, "u:") {
+		return "int " + v[2:]
+	}
+	return fmt.Sprintf("byte %q", v[2:])
+}
+
+func oracleSource(calls []oracleCall) string {
+	var b strings.Builder
+	b.WriteString("#pragma version 8\ntxn NumAppArgs\nbz done\n")
+	for i, c := range calls {
+		fmt.Fprintf(&b, "txn ApplicationArgs 0\nbtoi\nint %d\n==\nbz next%d\n", i, i)
+		for _, op := range c.Ops {
+			switch op[0] {
+			case "gput":
+				fmt.Fprintf(&b, "byte %q\n%s\napp_global_put\n", op[1], oracleValue(op[2]))
+			case "gdel":
+				fmt.Fprintf(&b, "byte %q\napp_global_del\n", op[1])
+			case "lput":
+				fmt.Fprintf(&b, "txn Sender\nbyte %q\n%s\napp_local_put\n", op[1], oracleValue(op[2]))
+			case "ldel":
+				fmt.Fprintf(&b, "txn Sender\nbyte %q\napp_local_del\n", op[1])
+			}
+		}
+		fmt.Fprintf(&b, "b done\nnext%d:\n", i)
+	}
+	b.WriteString("done:\nint 1\n")
+	return b.String()
+}
+
+func oracleStateDelta(sd basics.StateDelta) map[string][3]string {
+	out := map[string][3]string{}
+	for k, vd := range sd {
+		out[hex.EncodeToString([]byte(k))] = [3]string{fmt.Sprint(vd.Action), fmt.Sprint(vd.Uint), hex.EncodeToString([]byte(vd.Bytes))}
+	}
+	return out
+}
+
+func TestEvalDeltaStateOracle(t *testing.T) {
+	raw, err := os.ReadFile(os.Getenv("SCENARIOS"))
+	require.NoError(t, err)
+	var scenarios []oracleScenario
+	require.NoError(t, json.Unmarshal(raw, &scenarios))
+
+	genBalances, addrs, _ := ledgertesting.NewTestGenesis()
+	var lines []string
+	for _, sc := range scenarios {
+		dl := NewDoubleLedger(t, genBalances, protocol.ConsensusCurrentVersion, config.GetDefaultLocal())
+		app := dl.createApp(addrs[0], oracleSource(sc.Calls),
+			basics.StateSchema{NumUint: 8, NumByteSlice: 8}, basics.StateSchema{NumUint: 8, NumByteSlice: 8})
+		var txs []*txntest.Txn
+		for i, c := range sc.Calls {
+			tx := &txntest.Txn{Type: "appl", Sender: addrs[0], ApplicationID: app, ApplicationArgs: [][]byte{{byte(i)}}}
+			if c.OC == "optin" {
+				tx.OnCompletion = transactions.OptInOC
+			}
+			txs = append(txs, tx)
+		}
+		var payset []transactions.SignedTxnInBlock
+		if sc.SameBlock {
+			payset = dl.txns(txs...)
+		} else {
+			for _, tx := range txs {
+				payset = append(payset, *dl.txn(tx))
+			}
+		}
+		require.Len(t, payset, len(sc.Calls))
+		var calls []map[string]interface{}
+		for _, stib := range payset {
+			ed := stib.ApplyData.EvalDelta
+			call := map[string]interface{}{"gd": oracleStateDelta(ed.GlobalDelta)}
+			ld := map[string]map[string][3]string{}
+			var idx []uint64
+			for k := range ed.LocalDeltas {
+				idx = append(idx, k)
+			}
+			sort.Slice(idx, func(i, j int) bool { return idx[i] < idx[j] })
+			for _, k := range idx {
+				ld[fmt.Sprint(k)] = oracleStateDelta(ed.LocalDeltas[k])
+			}
+			call["ld"] = ld
+			calls = append(calls, call)
+		}
+		line, err := json.Marshal(map[string]interface{}{"name": sc.Name, "calls": calls})
+		require.NoError(t, err)
+		lines = append(lines, string(line))
+		dl.Close()
+	}
+	require.NoError(t, os.WriteFile(os.Getenv("OUT"), []byte(strings.Join(lines, "\n")+"\n"), 0o644))
+}

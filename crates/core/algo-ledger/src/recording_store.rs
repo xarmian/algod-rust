@@ -126,6 +126,14 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
 
     // ---- Asset Holdings ----
 
+    fn watch_cross_types(&self) {
+        self.inner.watch_cross_types()
+    }
+
+    fn stop_watching_cross_types(&self) -> Option<String> {
+        self.inner.stop_watching_cross_types()
+    }
+
     fn get_asset_holding(&self, addr: &Address, asset_id: u64) -> Option<AssetHolding> {
         self.inner.get_asset_holding(addr, asset_id)
     }

@@ -158,9 +158,12 @@ impl BlockEvaluator for MockEvaluator {
         Ok(Block::default())
     }
 
-    fn reset_txn_bytes(&mut self) {
+    fn reset_txn_bytes(&mut self) -> usize {
         // Allow more transactions after a reset.
+        0
     }
+
+    fn restore_txn_bytes(&mut self, _txn_bytes: usize) {}
 }
 
 // ── Test helpers ──────────────────────────────────────────────────
@@ -1197,7 +1200,11 @@ impl BlockEvaluator for BalanceEvaluator {
         Ok(Block::default())
     }
 
-    fn reset_txn_bytes(&mut self) {}
+    fn reset_txn_bytes(&mut self) -> usize {
+        0
+    }
+
+    fn restore_txn_bytes(&mut self, _txn_bytes: usize) {}
 }
 
 /// Build a pool backed by a [`BalanceLedger`] seeded with the given

@@ -4472,9 +4472,12 @@ mod tests {
         ) -> Result<algo_types::Block, algo_error::AlgoError> {
             Ok(algo_types::Block::default())
         }
-        fn reset_txn_bytes(&mut self) {
+        fn reset_txn_bytes(&mut self) -> usize {
             self.used = false;
+            0
         }
+
+        fn restore_txn_bytes(&mut self, _txn_bytes: usize) {}
     }
 
     struct CongestedLedgerStub;

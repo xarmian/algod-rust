@@ -118,7 +118,11 @@ impl BlockEvaluator for StubEvaluator {
     fn generate_block(&mut self, _voting_accounts: &[Address]) -> Result<Block, AlgoError> {
         Ok(Block::default())
     }
-    fn reset_txn_bytes(&mut self) {}
+    fn reset_txn_bytes(&mut self) -> usize {
+        0
+    }
+
+    fn restore_txn_bytes(&mut self, _txn_bytes: usize) {}
 }
 
 // ---------------------------------------------------------------------------

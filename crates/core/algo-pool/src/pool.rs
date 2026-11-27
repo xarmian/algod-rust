@@ -741,7 +741,7 @@ impl TransactionPool {
     /// Mirrors go-algorand's `addToPendingBlockEvaluator()`:
     /// - Calls `add_to_pending_block_evaluator_once()` (expiry check + evaluator call)
     /// - If the evaluator returns "no space", increments `num_pending_whole_blocks`,
-    ///   resets txn bytes, and retries once
+    ///   resets txn bytes, and retries once; a failed retry undoes both
     ///
     /// This is used by both `ingest()` (normal Remember path) and
     /// `add_to_block_evaluator()` (recompute path). It does NOT store in
@@ -757,10 +757,25 @@ impl TransactionPool {
                 let err_str = e.to_string();
                 if err_str.contains("no space") || err_str.contains("NoSpace") {
                     inner.num_pending_whole_blocks += 1;
-                    if let Some(ref mut evaluator) = inner.evaluator {
-                        evaluator.reset_txn_bytes();
+                    let txn_bytes = inner
+                        .evaluator
+                        .as_mut()
+                        .map(|evaluator| evaluator.reset_txn_bytes());
+                    let retry = self.add_to_pending_block_evaluator_once(txgroup, inner);
+                    if retry.is_err() {
+                        // The group was not added, so it did not start another
+                        // block. Left in place, the count would raise the fee
+                        // threshold for a group that is never in the pool, and
+                        // the cleared byte count would understate how full the
+                        // pending blocks are (go v5.1.1).
+                        inner.num_pending_whole_blocks -= 1;
+                        if let (Some(evaluator), Some(txn_bytes)) =
+                            (inner.evaluator.as_mut(), txn_bytes)
+                        {
+                            evaluator.restore_txn_bytes(txn_bytes);
+                        }
                     }
-                    self.add_to_pending_block_evaluator_once(txgroup, inner)
+                    retry
                 } else {
                     Err(e)
                 }
@@ -1744,7 +1759,11 @@ mod tests {
             Ok(Block::default())
         }
 
-        fn reset_txn_bytes(&mut self) {}
+        fn reset_txn_bytes(&mut self) -> usize {
+            0
+        }
+
+        fn restore_txn_bytes(&mut self, _txn_bytes: usize) {}
     }
 
     /// Create a pool with an evaluator already installed.
@@ -2692,7 +2711,11 @@ mod tests {
             Ok(Block::default())
         }
 
-        fn reset_txn_bytes(&mut self) {}
+        fn reset_txn_bytes(&mut self) -> usize {
+            0
+        }
+
+        fn restore_txn_bytes(&mut self, _txn_bytes: usize) {}
     }
 
     /// Create a test transaction with specific `last_valid`.
@@ -3229,7 +3252,11 @@ mod tests {
                 })
             }
 
-            fn reset_txn_bytes(&mut self) {}
+            fn reset_txn_bytes(&mut self) -> usize {
+                0
+            }
+
+            fn restore_txn_bytes(&mut self, _txn_bytes: usize) {}
         }
 
         /// A `PoolLedger` whose `start_evaluator` produces
@@ -3854,7 +3881,11 @@ mod tests {
             Ok(Block::default())
         }
 
-        fn reset_txn_bytes(&mut self) {}
+        fn reset_txn_bytes(&mut self) -> usize {
+            0
+        }
+
+        fn restore_txn_bytes(&mut self, _txn_bytes: usize) {}
     }
 
     /// Port of go's `TestPoolLeaseReevalClassification` (`data/pools/
@@ -3921,7 +3952,11 @@ mod tests {
         fn generate_block(&mut self, _voting_accounts: &[Address]) -> Result<Block, AlgoError> {
             Ok(Block::default())
         }
-        fn reset_txn_bytes(&mut self) {}
+        fn reset_txn_bytes(&mut self) -> usize {
+            0
+        }
+
+        fn restore_txn_bytes(&mut self, _txn_bytes: usize) {}
     }
 
     /// A framed rejection from the evaluator stays a typed `TxnRejected` with
@@ -4096,5 +4131,87 @@ mod tests {
             crate::error::classify_pool_error(&err),
             crate::error::PoolErrorTag::TxnDead
         );
+    }
+
+    /// An evaluator whose block is "full" (any group reports "no space") until
+    /// `reset_txn_bytes` clears its byte count; a group whose note starts with
+    /// `0xEE` is then rejected. `bytes` is shared so a test sees the restore.
+    struct FullBlockEvaluator {
+        bytes: Arc<AtomicU64>,
+    }
+
+    impl BlockEvaluator for FullBlockEvaluator {
+        fn round(&self) -> Round {
+            Round(2)
+        }
+
+        fn pay_set_size(&self) -> usize {
+            0
+        }
+
+        fn test_transaction_group(&self, _txgroup: &[SignedTransaction]) -> Result<(), AlgoError> {
+            Ok(())
+        }
+
+        fn transaction_group(&mut self, txgroup: &[SignedTransaction]) -> Result<(), AlgoError> {
+            if self.bytes.load(Ordering::SeqCst) > 0 {
+                return Err(AlgoError::Eval {
+                    message: "no space in block".into(),
+                });
+            }
+            if txgroup[0].txn.note.first() == Some(&0xEE) {
+                return Err(AlgoError::Eval {
+                    message: "rejected by the next block".into(),
+                });
+            }
+            self.bytes.store(10, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn generate_block(&mut self, _voting_accounts: &[Address]) -> Result<Block, AlgoError> {
+            Ok(Block::default())
+        }
+
+        fn reset_txn_bytes(&mut self) -> usize {
+            self.bytes.swap(0, Ordering::SeqCst) as usize
+        }
+
+        fn restore_txn_bytes(&mut self, txn_bytes: usize) {
+            self.bytes.store(txn_bytes as u64, Ordering::SeqCst);
+        }
+    }
+
+    /// go v5.1.1 `addToPendingBlockEvaluator`: a group that finds the block
+    /// full starts another pending block only if it is added there. When the
+    /// retry fails, the group is not in the pool, so the whole-block count
+    /// goes back down (it would raise the fee threshold for a group that is
+    /// never admitted) and the cleared byte count is restored (it would
+    /// understate how full the pending blocks are).
+    #[test]
+    fn failed_retry_after_no_space_undoes_the_new_pending_block() {
+        let pool = make_pool_with_evaluator(10);
+        let bytes = Arc::new(AtomicU64::new(500));
+        let mut inner = pool.mu.lock();
+        inner.evaluator = Some(Box::new(FullBlockEvaluator {
+            bytes: bytes.clone(),
+        }));
+        assert_eq!(inner.num_pending_whole_blocks, 0);
+
+        // The retry is rejected: nothing changed.
+        let err = pool
+            .add_to_pending_block_evaluator(&[make_test_txn(0xEE)], &mut inner)
+            .expect_err("the retry fails");
+        assert!(
+            err.to_string().contains("rejected by the next block"),
+            "{err}"
+        );
+        assert_eq!(inner.num_pending_whole_blocks, 0);
+        assert_eq!(bytes.load(Ordering::SeqCst), 500, "byte count restored");
+
+        // Control: a retry that succeeds keeps the new pending block.
+        pool.add_to_pending_block_evaluator(&[make_test_txn(1)], &mut inner)
+            .expect("the retry succeeds");
+        assert_eq!(inner.num_pending_whole_blocks, 1);
+        assert_eq!(bytes.load(Ordering::SeqCst), 10, "the new block's bytes");
     }
 }
