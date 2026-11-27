@@ -1380,6 +1380,7 @@ mod tests {
         part.voting.delete_before(37, dilution);
         let id = store.insert(&part).unwrap();
         let mut live = subkey_seeds(&part.voting);
+        assert!(!live.is_empty(), "the SK marker no longer matches the encoding");
         // the detector must see live subkeys, else finding no retired one is vacuous
         assert_eq!(seeds_on_disk(&path, &live), live.len());
 
