@@ -1326,6 +1326,93 @@ mod tests {
         }
     }
 
+    // -- go `data/account/walErase_test.go`: no retired subkey is recoverable
+    // from the registry file or its journal / write-ahead log ---------------
+
+    /// The 32-byte seed of every ephemeral subkey in an encoded voting blob:
+    /// the msgpack `SK` key followed by the header of a 64-byte bin (the
+    /// ed25519 private key, whose first half is the seed). go's detector,
+    /// `subkeySeedMarker`.
+    fn subkey_seeds(voting: &OneTimeSignatureSecrets) -> std::collections::HashSet<Vec<u8>> {
+        const MARKER: [u8; 5] = [0xa2, b'S', b'K', 0xc4, 0x40];
+        let blob = voting.to_msgpack();
+        let mut seeds = std::collections::HashSet::new();
+        let mut i = 0;
+        while i + MARKER.len() + 32 <= blob.len() {
+            if blob[i..i + MARKER.len()] == MARKER {
+                seeds.insert(blob[i + MARKER.len()..i + MARKER.len() + 32].to_vec());
+                i += MARKER.len() + 32;
+            } else {
+                i += 1;
+            }
+        }
+        seeds
+    }
+
+    /// How many of `seeds` appear in the database file or any of its sidecar
+    /// files (`-wal`, `-journal`).
+    fn seeds_on_disk(db: &Path, seeds: &std::collections::HashSet<Vec<u8>>) -> usize {
+        let mut found = 0;
+        for suffix in ["", "-wal", "-journal"] {
+            let mut name = db.as_os_str().to_owned();
+            name.push(suffix);
+            let Ok(data) = std::fs::read(std::path::PathBuf::from(name)) else {
+                continue;
+            };
+            for seed in seeds {
+                if data.windows(seed.len()).any(|w| w == seed.as_slice()) {
+                    found += 1;
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn retired_subkeys_are_not_recoverable_from_the_registry_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.sqlite");
+        let store = ParticipationStore::open(&path).unwrap();
+
+        let dilution = 10;
+        let mut part = make_test_participation(1, 1, 309, dilution);
+        part.voting = OneTimeSignatureSecrets::generate(0, 31);
+        part.voting.delete_before(37, dilution);
+        let id = store.insert(&part).unwrap();
+        let mut live = subkey_seeds(&part.voting);
+        assert!(!live.is_empty(), "the SK marker no longer matches the encoding");
+        // the detector must see live subkeys, else finding no retired one is vacuous
+        assert_eq!(seeds_on_disk(&path, &live), live.len());
+
+        let mut retired = std::collections::HashSet::new();
+        for round in (38..=82).chain([150, 300, 309]) {
+            part.voting.delete_before(round, dilution);
+            store.update_voting_secrets(&id, &part.voting).unwrap();
+            let now = subkey_seeds(&part.voting);
+            retired.extend(live.difference(&now).cloned());
+            live = now;
+            assert_eq!(
+                seeds_on_disk(&path, &retired),
+                0,
+                "a retired subkey is recoverable after round {round}"
+            );
+        }
+        assert!(retired.len() > 60, "{} retired", retired.len());
+
+        // deleting a live key retires every subkey it had
+        let mut part2 = make_test_participation(2, 1, 309, dilution);
+        part2.voting = OneTimeSignatureSecrets::generate(0, 31);
+        let id2 = store.insert(&part2).unwrap();
+        let seeds2 = subkey_seeds(&part2.voting);
+        assert_eq!(seeds_on_disk(&path, &seeds2), seeds2.len());
+        assert!(store.delete(&id2).unwrap());
+        assert_eq!(
+            seeds_on_disk(&path, &seeds2),
+            0,
+            "a deleted key's subkeys are recoverable"
+        );
+    }
+
     #[test]
     fn roundtrip_insert_get() {
         let store = ParticipationStore::open_in_memory().unwrap();
