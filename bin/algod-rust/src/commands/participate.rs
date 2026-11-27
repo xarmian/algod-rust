@@ -2210,9 +2210,10 @@ impl SimpleBlockEvaluator {
         // group-wide rules (a heartbeat grouped with an application call or an
         // asset creation, unless AllowGroupedHeartbeats, and the state proof
         // payload rules; go v5.1 dropped the box-index, unknown-type and
-        // missing-heartbeat-body checks from here). A failure is a `TxGroupError` with the not-well-formed
-        // reason, returned bare (issue #2196). The gossip test stage does not
-        // run it (go's `TestTransactionGroup` does not).
+        // missing-heartbeat-body checks from here). A failure is a
+        // `TxGroupError` with the not-well-formed reason, returned bare (issue
+        // #2196). The gossip test stage does not run it (go's
+        // `TestTransactionGroup` does not).
         algo_validate::check_txn_group(txgroup, params.allow_grouped_heartbeats)
             .map_err(|e| Self::verify_rejection(algo_error::VerifyKind::NotWell, None, e))?;
 

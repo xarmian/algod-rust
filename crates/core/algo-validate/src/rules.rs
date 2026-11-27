@@ -785,7 +785,8 @@ fn check_txn_type_field_isolation(txn: &Transaction) -> Result<(), AlgoError> {
         || txn.global_state_schema.is_some()
         || txn.local_state_schema.is_some()
         || txn.extra_program_pages != 0
-        || txn.access.is_some()
+        // go tests the length (`MsgIsZero`): an empty Access list is absent
+        || txn.access.as_ref().is_some_and(|a| !a.is_empty())
         || txn.reject_version != 0;
     let is_stpf_nonzero =
         txn.state_proof_type != 0 || txn.state_proof.is_some() || txn.state_proof_message.is_some();
@@ -3383,6 +3384,20 @@ mod tests {
         let txn = make_valid_txn();
         let params = v42_params();
         assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    /// go's `nonZeroFields` uses `MsgIsZero`, which tests `len(Access)`: a
+    /// payment carrying a present but empty Access list is not carrying
+    /// application fields (go v5.1 treats an empty list as an absent one).
+    #[test]
+    fn an_empty_access_list_is_not_a_non_zero_application_field() {
+        let mut txn = make_valid_txn();
+        txn.access = Some(vec![]);
+        let params = v42_params();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+        txn.access = Some(vec![algo_types::ResourceRef::default()]);
+        let e = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(e.to_string().contains("non-zero fields for type appl"), "{e}");
     }
 
     #[test]
