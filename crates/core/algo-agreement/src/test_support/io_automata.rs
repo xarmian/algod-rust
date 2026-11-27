@@ -225,17 +225,6 @@ impl IoAutomataConcretePlayer {
         period_router.update(crate::step::Step(0));
     }
 
-    /// Insert (or overwrite) a `BlockAssembler` for `(round, value)` in the
-    /// per-round `ProposalStore`. Mirrors Go's
-    /// `pM.Children[r].ProposalStore.Assemblers[pV] = blockAssembler{...}`.
-    ///
-    /// Writes to both per-round stores: the canonical one in
-    /// `ProposalManager.stores[r]` (consulted by vote/payload dispatch) and
-    /// the legacy mirror in `RoundRouter.children[r].proposal_store`
-    /// (consulted by `staged_value()` / `pinned_value()` helpers). The Rust
-    /// port maintains both because the original architecture didn't
-    /// consolidate the duplicate hierarchies; mirroring keeps the test
-    /// observable from either lookup path.
     /// Mark `value` relevant to `period` in the proposalStore of `round`: go
     /// v5.1.1 holds a payload (`proposalStore.held`) that no started period is
     /// interested in, so a test that injects an assembler also injects this
@@ -248,6 +237,17 @@ impl IoAutomataConcretePlayer {
             .insert(period, value);
     }
 
+    /// Insert (or overwrite) a `BlockAssembler` for `(round, value)` in the
+    /// per-round `ProposalStore`. Mirrors Go's
+    /// `pM.Children[r].ProposalStore.Assemblers[pV] = blockAssembler{...}`.
+    ///
+    /// Writes to both per-round stores: the canonical one in
+    /// `ProposalManager.stores[r]` (consulted by vote/payload dispatch) and
+    /// the legacy mirror in `RoundRouter.children[r].proposal_store`
+    /// (consulted by `staged_value()` / `pinned_value()` helpers). The Rust
+    /// port maintains both because the original architecture didn't
+    /// consolidate the duplicate hierarchies; mirroring keeps the test
+    /// observable from either lookup path.
     pub fn set_proposal_assembler(
         &mut self,
         round: Round,

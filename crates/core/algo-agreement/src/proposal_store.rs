@@ -313,7 +313,7 @@ impl ProposalStore {
     /// `cur`, and clears its held flag. Returns a zero event if there is no
     /// such payload. A payload stays held only while its proposal-value is
     /// relevant to the next period alone, so at most one blockAssembler is held
-    /// at a time.
+    /// at a time. Like go's, the scan order over the assemblers is unspecified.
     ///
     /// Mirrors Go's `proposalStore.resumeHeld`.
     fn resume_held(&mut self, cur: Period) -> PayloadProcessedEvent {
