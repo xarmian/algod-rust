@@ -6655,15 +6655,13 @@ err
     }
 
     /// Issue #2470: every request-validation failure of `POST
-    /// /v2/transactions/simulate` answers with go v5.0.5-stable's exact HTTP
+    /// /v2/transactions/simulate` answers with go v5.1.1-stable's exact HTTP
     /// status and body. The expected responses come from go's own
     /// `Handlers.SimulateTransaction` over a real simulator
     /// (`tools/simulate-request-text-oracle`, re-checked in CI by
     /// `simulate-rewards-oracle.yml`); here the same request bytes go through
     /// the full REST router onto the real adapter and simulator.
-    #[tokio::test]
-    #[ignore = "Phase 26 carve-out: go v5.1 decodes the simulate request with generated msgp / strict JSON and checks group counts first; the REST decode moves with #2555"]
-    async fn simulate_request_validation_responses_match_go() {
+    async fn simulate_request_responses_match_go(is_msgpack: bool, min_cases: usize) {
         use tower::ServiceExt;
 
         const FIXTURE: &str = include_str!(
@@ -6684,6 +6682,9 @@ err
         for line in FIXTURE.lines().filter(|l| !l.trim().is_empty()) {
             let case: serde_json::Value = serde_json::from_str(line).expect("fixture line");
             let name = case["name"].as_str().expect("name");
+            if name.starts_with("msgpack_") != is_msgpack {
+                continue;
+            }
             let mut body = hex::decode(case["body_hex"].as_str().expect("body_hex")).expect("hex");
             if let Some(pad_to) = case["pad_to"].as_u64() {
                 body.resize(pad_to as usize, b' ');
@@ -6712,14 +6713,30 @@ err
             }
             cases += 1;
         }
-        // the malformed bodies of issue #2477 come in the hundreds
-        assert!(cases >= 400, "fixture has {cases} cases");
+        assert!(cases >= min_cases, "fixture has {cases} cases");
         assert!(
             mismatches.is_empty(),
             "{} of {cases} cases differ from go:\n{}",
             mismatches.len(),
             mismatches.join("\n")
         );
+    }
+
+    /// The msgpack bodies (issue #2555): go v5.1.1 decodes them with the
+    /// generated msgp decoder of `SimulateRequest`, texts and context path
+    /// included, and checks the group count before any transaction.
+    #[tokio::test]
+    async fn simulate_msgpack_request_responses_match_go() {
+        simulate_request_responses_match_go(true, 100).await;
+    }
+
+    /// The JSON bodies: go v5.1.1 decodes the request with each transaction
+    /// as raw JSON first, checks the group count and size, then decodes each
+    /// transaction on its own (positions relative to it).
+    #[tokio::test]
+    #[ignore = "go v5.1.1's JSON request decode (raw transactions, counts first, per-transaction positions) is not ported yet (#2555)"]
+    async fn simulate_json_request_responses_match_go() {
+        simulate_request_responses_match_go(false, 400).await;
     }
 
     /// Build a simulate request with one dummy transaction and an

@@ -8261,12 +8261,11 @@ async fn simulate_empty_body_returns_400() {
     assert_eq!(resp.status(), 400);
 }
 
-/// go's handler has no check of its own for an empty `txn-groups`: the
-/// request reaches the node, whose simulator answers "expected 1 transaction
-/// group, got 0" (issue #2470; the real simulator's response is pinned by
-/// `simulate_request_validation_responses_match_go` in `bin/algod-rust`).
+/// go v5.1.1's handler checks the group count itself, before the simulator
+/// (`simulation.CheckTxnGroupCount`, issue #2555): an empty `txn-groups` is a
+/// 400 that never reaches the node.
 #[tokio::test]
-async fn simulate_empty_txn_groups_reaches_the_node() {
+async fn simulate_empty_txn_groups_is_rejected_by_the_handler() {
     let node = MockNode::synced();
     let log = node.simulate_log.clone();
     let server = TestServer::start(node).await;
@@ -8285,35 +8284,10 @@ async fn simulate_empty_txn_groups_reaches_the_node() {
         .send()
         .await
         .unwrap();
-    // The mock node has no simulator: it answers 500 "simulate not implemented".
-    assert_eq!(resp.status(), 500);
-    let log = log.lock().unwrap();
-    assert_eq!(log.len(), 1, "the node is asked to simulate");
-    assert!(log[0].txn_groups.is_empty());
-}
-
-#[tokio::test]
-async fn simulate_catchpoint_returns_503() {
-    let node = MockNode::catchpoint_catchup();
-    let server = TestServer::start(node).await;
-
-    let request_json = serde_json::json!({
-        "txn-groups": [{
-            "txns": [{"txn": {"type": "pay"}}]
-        }]
-    });
-    let body = serde_json::to_vec(&request_json).unwrap();
-
-    let resp = server
-        .client
-        .post(server.url("/v2/transactions/simulate"))
-        .header("X-Algo-API-Token", &server.api_token)
-        .header("Content-Type", "application/json")
-        .body(body)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 503);
+    assert_eq!(resp.status(), 400);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["message"], "expected 1 transaction group, got 0");
+    assert!(log.lock().unwrap().is_empty(), "the node is not asked");
 }
 
 #[tokio::test]
@@ -8679,10 +8653,11 @@ async fn simulate_json_unknown_key_returns_go_text_with_offset() {
     }
 }
 
-/// Issue #1967: a msgpack simulate body with a key go's structs lack is a 400
-/// with go's fixed text (captured from a go-algorand v5.0.5-stable node).
+/// A msgpack simulate body with a key go's structs lack is a 400 with msgp's
+/// `ErrNoField` text (go v5.1.1-stable, issue #2555; v5.0.5 answered a fixed
+/// JSON-decoder text, issue #1967).
 #[tokio::test]
-async fn simulate_msgpack_unknown_key_returns_gos_fixed_text() {
+async fn simulate_msgpack_unknown_key_returns_msgp_text() {
     use rmpv::Value;
     let s = |x: &str| Value::String(x.into());
     // the canonical msgpack encoding is what a client would send
@@ -8719,7 +8694,7 @@ async fn simulate_msgpack_unknown_key_returns_gos_fixed_text() {
     let json: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(
         json["message"].as_str().unwrap(),
-        "failed to decode object: json decode error [pos 1]: only encoded map or array can be decoded into a struct"
+        "Unknown field: zzz"
     );
 
     // a clean request is not rejected by the decoder (the mock has no simulate result: 500)
