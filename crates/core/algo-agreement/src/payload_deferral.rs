@@ -458,9 +458,18 @@ pub fn proposal_encoding(encoded: &[u8]) -> Result<Vec<u8>> {
 pub fn payload_encoding_digest(encoded: &[u8]) -> Result<Digest> {
     let mut h = Sha512_256::new();
     h.update(b"PL");
-    let mut body = Vec::with_capacity(encoded.len());
-    write_proposal_encoding(encoded, &mut body)?;
-    h.update(&body);
+    // the same bytes as `write_proposal_encoding`, hashed in place instead of
+    // copied (a payload can be megabytes)
+    let pp = parse_payload_prefix(encoded)?;
+    if pp.vote_end_idx == 0 {
+        h.update(encoded);
+    } else {
+        let mut header = Vec::with_capacity(5);
+        append_map_header(&mut header, pp.num_entries - 1);
+        h.update(&header);
+        h.update(&encoded[pp.entries_start_idx..pp.vote_start_idx]);
+        h.update(&encoded[pp.vote_end_idx..]);
+    }
     let mut d = [0u8; 32];
     d.copy_from_slice(&h.finalize());
     Ok(Digest(d))

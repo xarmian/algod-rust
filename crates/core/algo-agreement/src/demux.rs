@@ -1478,12 +1478,10 @@ mod tests {
 
     #[test]
     fn demux_raw_proposal_with_unknown_txn_type_is_not_screened_before_validation() {
-        // go-algorand v4.7.2-stable: `agreement/message.go`'s
-        // `proposalCarriesInvalidTxn`, called from `demux.go`'s
-        // `tokenizeMessages`. A proposal that decodes fine but whose block
-        // payset fails the group-level `CheckPayset` screen is silently
-        // dropped — logged, but NOT a disconnect-worthy malformed message
-        // like an actual decode failure is.
+        // go-algorand v5.1.1-stable: `checkTxnGroup` no longer rejects an
+        // unknown transaction type (#6728); `WellFormed` does, later. The
+        // demux passes the payload on, the deferred decode accepts it, and no
+        // peer is disconnected.
         use crate::stubs::StubNetwork;
         use algo_types::{SignedTransaction, Transaction, TxnType};
 
@@ -1544,7 +1542,7 @@ mod tests {
         assert!(crate::payload_deferral::decode_deferred_payload(&received, &[wanted]).is_ok());
         assert!(
             stub.disconnected.lock().unwrap().is_empty(),
-            "a malformed-payset proposal must be dropped, not disconnect the peer"
+            "a proposal that is passed on must not disconnect the peer"
         );
     }
 
