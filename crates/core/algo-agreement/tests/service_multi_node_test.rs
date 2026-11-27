@@ -2344,7 +2344,7 @@ fn future_bundles_do_not_cancel_payload_verification_five_node() {
     trigger_global_timeout(&cluster, TimeoutType::Deadline);
     assert!(
         current_round(&cluster).0 > round.0,
-        "the round did not end after validation resumed: its payload verifications          must have been cancelled by the injected bundles"
+        "the round did not end after validation resumed: its payload verifications must have been cancelled by the injected bundles"
     );
     round = current_round(&cluster);
     // one more ordinary round to show the network is healthy afterwards
