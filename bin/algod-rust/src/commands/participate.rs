@@ -4151,11 +4151,12 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         }
 
         if self.txn_bytes + exact_bytes > max_bytes {
+            // go's `ledgercore.ErrNoSpace` (`ledger/eval`: `blockTxBytes +
+            // groupTxBytes > maxTxnBytesPerBlock`), verbatim: the pool answers
+            // it by starting another pending block and finishes the assembly
+            // of a full one (issue #2626).
             return Err(algo_error::AlgoError::Ledger {
-                message: format!(
-                    "transaction group would exceed block byte limit ({} + {} > {})",
-                    self.txn_bytes, exact_bytes, max_bytes,
-                ),
+                message: "block does not have space for transaction".to_string(),
             });
         }
 
@@ -12968,8 +12969,8 @@ mod tests {
         let stx = make_signed_pay(&key, &sender, &receiver, 100, 1000, 100);
         let err = eval.transaction_group(&[stx]).unwrap_err();
         assert!(
-            err.to_string().contains("block byte limit") || err.to_string().contains("exceed"),
-            "expected block byte limit error, got: {err}"
+            err.to_string().contains("block does not have space for transaction"),
+            "expected go's ErrNoSpace, got: {err}"
         );
     }
 
@@ -13014,8 +13015,8 @@ mod tests {
         };
         let err = eval.transaction_group(&[stx2]).unwrap_err();
         assert!(
-            err.to_string().contains("exceed") || err.to_string().contains("block byte limit"),
-            "expected byte limit error, got: {err}"
+            err.to_string().contains("block does not have space for transaction"),
+            "expected go's ErrNoSpace, got: {err}"
         );
     }
 
