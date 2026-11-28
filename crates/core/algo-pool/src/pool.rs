@@ -234,6 +234,13 @@ struct PendingState {
     txids: HashMap<Digest, SignedTransaction>,
 }
 
+/// go's `ledgercore.ErrEvaluatorCorruptedState`, as the assembly's error.
+fn corrupted_evaluator_error() -> AlgoError {
+    AlgoError::Ledger {
+        message: PoolError::EvaluatorCorruptedState.to_string(),
+    }
+}
+
 /// Whether an evaluator error is "the block is full": go's
 /// `ledgercore.ErrNoSpace` (`block does not have space for transaction`), which
 /// the pool answers by starting another pending block.
@@ -869,7 +876,12 @@ impl TransactionPool {
                     // Looked up again, so a key installed while the
                     // transactions were re-evaluated counts.
                     let proposers = self.voting_accounts_for_round(eval_rnd).unwrap_or_default();
-                    match evaluator.generate_block(&proposers) {
+                    let generated = if inner.evaluator_corrupted {
+                        Err(corrupted_evaluator_error())
+                    } else {
+                        evaluator.generate_block(&proposers)
+                    };
+                    match generated {
                         Ok(block) => {
                             asm.results.block = Some(block);
                         }
@@ -941,7 +953,13 @@ impl TransactionPool {
             AssembleStopReason::Timeout
         });
         let proposers = self.voting_accounts_for_round(eval_rnd).unwrap_or_default();
-        match evaluator.generate_block(&proposers) {
+        // go's `GenerateBlock` refuses a corrupted evaluator.
+        let generated = if inner.evaluator_corrupted {
+            Err(corrupted_evaluator_error())
+        } else {
+            evaluator.generate_block(&proposers)
+        };
+        match generated {
             Ok(block) => asm.results.block = Some(block),
             Err(e) => asm.results.err = Some(e),
         }
@@ -1043,6 +1061,9 @@ impl TransactionPool {
         let fed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             evaluator.transaction_group(txgroup)
         }));
+        if fed.is_err() {
+            inner.evaluator_corrupted = true;
+        }
         if recomputing {
             let no_space = matches!(&fed, Ok(Err(e)) if is_no_space_text(&e.to_string()));
             self.assembly_checkpoint(inner, no_space);
@@ -1065,7 +1086,6 @@ impl TransactionPool {
                 }
             }
             Err(payload) => {
-                inner.evaluator_corrupted = true;
                 tracing::error!(
                     round = round.0,
                     "pool: block evaluator panicked; refusing groups until it is rebuilt"
@@ -5090,6 +5110,85 @@ mod tests {
         let (r, stop) = reason(&pool, 2, Duration::ZERO);
         assert!(r.is_ok(), "{r:?}");
         assert_eq!(stop, Some(AssembleStopReason::TimeoutEmpty));
+    }
+
+    /// A panic of the evaluator while the pool re-evaluates leaves it corrupted:
+    /// go's `GenerateBlock` then refuses it, so the assembly ends in an error
+    /// (which `AssembleBlock` answers with an empty block) instead of a block
+    /// built from half-applied state.
+    #[test]
+    fn a_panic_during_recompute_does_not_generate_from_the_evaluator() {
+        struct FlagLedger {
+            panic_now: Arc<AtomicBool>,
+        }
+        struct FlagEvaluator {
+            panic_now: Arc<AtomicBool>,
+        }
+        impl BlockEvaluator for FlagEvaluator {
+            fn round(&self) -> Round {
+                Round(2)
+            }
+            fn pay_set_size(&self) -> usize {
+                0
+            }
+            fn test_transaction_group(&self, _g: &[SignedTransaction]) -> Result<(), AlgoError> {
+                Ok(())
+            }
+            fn transaction_group(&mut self, _g: &[SignedTransaction]) -> Result<(), AlgoError> {
+                if self.panic_now.load(Ordering::SeqCst) {
+                    panic!("half applied");
+                }
+                Ok(())
+            }
+            fn generate_block(&mut self, _v: &[Address]) -> Result<Block, AlgoError> {
+                Ok(Block::default())
+            }
+            fn reset_txn_bytes(&mut self) -> usize {
+                0
+            }
+            fn restore_txn_bytes(&mut self, _n: usize) {}
+        }
+        impl PoolLedger for FlagLedger {
+            fn latest(&self) -> Round {
+                Round(1)
+            }
+            fn block_hdr(&self, _round: Round) -> Result<BlockHeader, AlgoError> {
+                Ok(BlockHeader::default())
+            }
+            fn consensus_params(&self, _round: Round) -> Result<ConsensusParams, AlgoError> {
+                Ok(ConsensusParams::default())
+            }
+            fn start_evaluator(
+                &self,
+                _hdr: BlockHeader,
+                _hint: usize,
+                _max: usize,
+            ) -> Result<Box<dyn BlockEvaluator>, AlgoError> {
+                Ok(Box::new(FlagEvaluator {
+                    panic_now: self.panic_now.clone(),
+                }))
+            }
+        }
+        let panic_now = Arc::new(AtomicBool::new(false));
+        let pool = TransactionPool::new(
+            PoolConfig::default(),
+            Arc::new(FlagLedger {
+                panic_now: panic_now.clone(),
+            }),
+        );
+        recompute(&pool, false);
+        pool.remember(vec![make_test_txn(1)]).expect("remembered");
+
+        panic_now.store(true, Ordering::SeqCst);
+        recompute(&pool, false);
+        let asm = pool.assembly_mu.lock();
+        assert!(asm.results.ok);
+        assert!(
+            asm.results.block.is_none(),
+            "no block from a corrupted evaluator"
+        );
+        let err = asm.results.err.as_ref().expect("the assembly failed");
+        assert!(err.to_string().contains("corrupted"), "{err}");
     }
 
     /// go `TestPoolDevModeForcesGeneration`: dev mode generates although
