@@ -64,9 +64,7 @@ use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
-use crate::compression::{
-    is_zstd_compressed, zstd_compress_msg, zstd_decompress, MAX_DECOMPRESSED_MESSAGE_SIZE,
-};
+use crate::compression::{decompress_proposal, zstd_compress_msg};
 use crate::errors::PeerError;
 use crate::forwarding_policy::ForwardingPolicy;
 use crate::framing::{decode_frame, encode_frame};
@@ -75,7 +73,8 @@ use crate::handler::Multiplexer;
 use crate::identity::{verify_identity_verification, IdentityChallengeValue, IdentityDedupHook};
 use crate::message::{IncomingMessage, OutgoingMessage};
 use crate::message_filter::{
-    dedup_safe_tag, generate_message_digest, MessageFilter, MESSAGE_FILTER_SIZE,
+    dedup_safe_tag, digest_filtered_tag, generate_message_digest, MessageFilter,
+    MESSAGE_FILTER_SIZE,
 };
 use crate::metrics::NetworkTagMetrics;
 use crate::msg_of_interest::unmarshal_msg_of_interest;
@@ -1007,13 +1006,8 @@ impl PeerHandle {
                                     // too, or every Go-sourced proposal reaches
                                     // agreement as raw zstd and gets the peer
                                     // disconnected — issue #478.
-                                    let payload = if tag == Tag::ProposalPayload
-                                        && is_zstd_compressed(payload)
-                                    {
-                                        match zstd_decompress(
-                                            payload,
-                                            MAX_DECOMPRESSED_MESSAGE_SIZE,
-                                        ) {
+                                    let payload = if tag == Tag::ProposalPayload {
+                                        match decompress_proposal(payload) {
                                             Ok(d) => d,
                                             Err(e) => {
                                                 tracing::warn!(
@@ -1507,9 +1501,9 @@ fn outgoing_filter_suppresses(
     let Some(of) = outgoing_filter else {
         return false;
     };
-    // go `innerBroadcast`: the digest is computed for every message of at least
-    // `messageFilterSize` bytes except `MsgDigestSkip` itself.
-    if msg.tag == Tag::MsgDigestSkip || msg.payload.len() < MESSAGE_FILTER_SIZE {
+    // go `innerBroadcast`: the digest is computed for every broadcast message of
+    // at least `messageFilterSize` bytes; unicast writes carry a zero digest.
+    if !digest_filtered_tag(&msg.tag) || msg.payload.len() < MESSAGE_FILTER_SIZE {
         return false;
     }
     let digest = generate_message_digest(&msg.tag, &msg.payload);
@@ -2305,8 +2299,8 @@ async fn read_loop<St>(
                 // negotiate features) arrived as raw zstd, failed the
                 // msgpack decode in `agreement::demux`, and got the peer
                 // disconnected — issue #478.
-                let payload = if tag == Tag::ProposalPayload && is_zstd_compressed(payload) {
-                    match zstd_decompress(payload, MAX_DECOMPRESSED_MESSAGE_SIZE) {
+                let payload = if tag == Tag::ProposalPayload {
+                    match decompress_proposal(payload) {
                         Ok(decompressed) => decompressed,
                         Err(e) => {
                             tracing::warn!(
@@ -2864,8 +2858,8 @@ where
             // peer already has this message (via a prior MsgDigestSkip
             // notification). Reference: Go's writeNonBlock() in wsPeer.go.
             if let Some(ref of) = outgoing_filter {
-                // go `innerBroadcast`/`writeNonBlock`: any tag but `MsgDigestSkip`.
-                if tag != Tag::MsgDigestSkip && send_msg.msg.payload.len() >= MESSAGE_FILTER_SIZE {
+                // go `innerBroadcast`/`writeNonBlock`: broadcast tags only.
+                if digest_filtered_tag(&tag) && send_msg.msg.payload.len() >= MESSAGE_FILTER_SIZE {
                     let digest = generate_message_digest(&tag, &send_msg.msg.payload);
                     if of.check_digest(&digest, false, false) {
                         // Peer already has this message; skip sending.
@@ -3260,6 +3254,7 @@ async fn keepalive_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compression::{is_zstd_compressed, zstd_decompress, MAX_DECOMPRESSED_MESSAGE_SIZE};
     use crate::framing::encode_frame;
     use crate::msg_of_interest::marshal_msg_of_interest;
     use crate::tag::Tag;
@@ -6624,5 +6619,25 @@ mod tests {
         assert!(!identity_already_verified(&slot));
         slot.lock().unwrap().1 = true;
         assert!(identity_already_verified(&slot));
+    }
+
+    /// go `innerBroadcast` computes a digest only for broadcast messages (unicast
+    /// writes carry a zero digest): a peer's skip for the bytes of a large
+    /// broadcast tag suppresses the send, a large unicast response with the same
+    /// bytes is still delivered.
+    #[test]
+    fn outgoing_filter_suppresses_broadcast_tags_only() {
+        let filter = Arc::new(MessageFilter::new(3, 128));
+        let payload = vec![7u8; MESSAGE_FILTER_SIZE];
+        for tag in [Tag::VoteBundle, Tag::TopicMsgResp, Tag::UniEnsBlockReq] {
+            filter.check_digest(&generate_message_digest(&tag, &payload), true, false);
+        }
+        let of = Some(filter);
+        let suppresses =
+            |tag| outgoing_filter_suppresses(&OutgoingMessage::new(tag, payload.clone()), &of);
+        assert!(suppresses(Tag::VoteBundle));
+        assert!(!suppresses(Tag::TopicMsgResp));
+        assert!(!suppresses(Tag::UniEnsBlockReq));
+        assert!(!suppresses(Tag::MsgDigestSkip));
     }
 }

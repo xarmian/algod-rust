@@ -78,7 +78,8 @@ use crate::identity::{attach_response_header, verify_challenge_and_respond, Iden
 use crate::mesh::{ConnectFn, MeshRequest, MeshThread, PeerCounter};
 use crate::message::OutgoingMessage;
 use crate::message_filter::{
-    dedup_safe_tag, generate_message_digest, MessageFilter, MESSAGE_FILTER_SIZE,
+    dedup_safe_tag, digest_filtered_tag, generate_message_digest, MessageFilter,
+    MESSAGE_FILTER_SIZE,
 };
 use crate::msg_of_interest::marshal_msg_of_interest;
 use crate::peer_role::{ARCHIVAL_ROLE, RELAY_ROLE};
@@ -610,7 +611,8 @@ pub struct WebsocketNetwork {
     /// The monitor task drains this on each cycle.
     pending_disconnects: Arc<std::sync::Mutex<Vec<String>>>,
     /// Set by [`GossipNode::stop`] under the `peers` write lock (go's
-    /// `peersClosed`): once set, `add_peer` registers nothing.
+    /// `peersClosed`): once set, `add_peer` registers nothing. Like `cancel`,
+    /// it is single-use: a stopped network is not restarted.
     peers_closed: Arc<AtomicBool>,
 
     /// Background task handles, stored so they are not dropped prematurely.
@@ -1314,7 +1316,12 @@ impl WebsocketNetwork {
                                                                let mut guard = peers.write().await;
                                                                if let Some(entry) = guard.remove(&peer_addr) {
                                                                    entry.handle.close();
-                    release_peer_claims(&throttled_outgoing_connections, &identity_hook_for_release, &peer_addr, &entry);
+                    release_peer_claims(
+                        &throttled_outgoing_connections,
+                        &identity_hook_for_release,
+                        &peer_addr,
+                        &entry,
+                    );
                                                                }
                                                                break;
                                                            }
@@ -1327,7 +1334,12 @@ impl WebsocketNetwork {
                                                        let mut guard = peers.write().await;
                                                        if let Some(entry) = guard.remove(&peer_addr) {
                                                            entry.handle.close();
-                    release_peer_claims(&throttled_outgoing_connections, &identity_hook_for_release, &peer_addr, &entry);
+                    release_peer_claims(
+                        &throttled_outgoing_connections,
+                        &identity_hook_for_release,
+                        &peer_addr,
+                        &entry,
+                    );
                                                        }
                                                        break;
                                                    }
@@ -2098,12 +2110,12 @@ impl WebsocketNetwork {
 }
 
 /// go v5.1.1 `messageHandlerThread`: a filter message is sent as every large
-/// message arrives, except a proposal payload, whose filter message `Relay`
-/// sends over the uncompressed data (the payload is compressed on arrival in
-/// go; see [`WebsocketNetwork::relay`]). Not restricted to the tags the
-/// incoming filter dedups (`AV`/`TX`, go's `dedupSafeTag`).
+/// broadcast message arrives, except a proposal payload, whose filter message
+/// `Relay` sends over the uncompressed data (the payload is compressed on
+/// arrival in go; see [`WebsocketNetwork::relay`]). Not restricted to the tags
+/// the incoming filter dedups (`AV`/`TX`, go's `dedupSafeTag`).
 fn filter_message_on_arrival(tag: &Tag) -> bool {
-    *tag != Tag::ProposalPayload
+    *tag != Tag::ProposalPayload && digest_filtered_tag(tag)
 }
 
 /// Broadcast a `MsgDigestSkip` notification (a 32-byte digest) to every
@@ -2702,7 +2714,12 @@ impl ConnectFn for NetworkConnectFn {
                                                                                        let mut guard = recv_peers.write().await;
                                                                                        if let Some(entry) = guard.remove(&recv_addr) {
                                                                                            entry.handle.close();
-                                release_peer_claims(&recv_throttled_outgoing_connections, &recv_identity_hook, &recv_addr, &entry);
+                                release_peer_claims(
+                                    &recv_throttled_outgoing_connections,
+                                    &recv_identity_hook,
+                                    &recv_addr,
+                                    &entry,
+                                );
                                                                                        }
                                                                                        break;
                                                                                    }
@@ -2714,7 +2731,12 @@ impl ConnectFn for NetworkConnectFn {
                                                                                let mut guard = recv_peers.write().await;
                                                                                if let Some(entry) = guard.remove(&recv_addr) {
                                                                                    entry.handle.close();
-                                release_peer_claims(&recv_throttled_outgoing_connections, &recv_identity_hook, &recv_addr, &entry);
+                                release_peer_claims(
+                                    &recv_throttled_outgoing_connections,
+                                    &recv_identity_hook,
+                                    &recv_addr,
+                                    &entry,
+                                );
                                                                                }
                                                                                break;
                                                                            }

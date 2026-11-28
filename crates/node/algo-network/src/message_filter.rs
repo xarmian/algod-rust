@@ -95,6 +95,23 @@ pub fn dedup_safe_tag(tag: &Tag) -> bool {
     matches!(tag, Tag::AgreementVote | Tag::Transaction)
 }
 
+/// Returns `true` for the tags go broadcasts with a digest (`innerBroadcast`
+/// computes one for every broadcast message of at least [`MESSAGE_FILTER_SIZE`]
+/// bytes), i.e. the tags a peer's `MsgDigestSkip` can suppress and a filter
+/// message is sent for. Unicast traffic (`TS` responses, `UniEnsBlockReq`
+/// requests, `MI`, `NI`, `NP`, `MS` itself, deprecated pings) is written with a
+/// zero digest in go and is never filtered.
+pub fn digest_filtered_tag(tag: &Tag) -> bool {
+    matches!(
+        tag,
+        Tag::AgreementVote
+            | Tag::ProposalPayload
+            | Tag::StateProofSig
+            | Tag::Transaction
+            | Tag::VoteBundle
+    )
+}
+
 // ---------------------------------------------------------------------------
 // MessageFilter
 // ---------------------------------------------------------------------------

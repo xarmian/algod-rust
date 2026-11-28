@@ -569,7 +569,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "url",
  "void",
 ]
 
