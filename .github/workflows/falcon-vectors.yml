@@ -5,7 +5,8 @@
 name: Falcon det1024 vector corpus drift check
 
 # Issue #1928 (Phase 21, epic #1926, DIV-001): the committed deterministic
-# Falcon-1024 parity corpus
+# Falcon-1024 parity corpus (and, since #2546, the Falcon-512 corpus
+# crates/core/algo-falcon/tests/fixtures/falcon/vectors512.jsonl)
 # (crates/core/algo-falcon/tests/fixtures/falcon/vectors.jsonl) must be
 # exactly what go-algorand's own crypto package produces. The corpus is
 # generated locally from the vendored C library
@@ -92,6 +93,14 @@ jobs:
           echo "::group::go.mod / go.sum changes made by -mod=mod (commit these back)"
           git --no-pager diff -- tools/falcon-vector-capture/go.mod tools/falcon-vector-capture/go.sum || true
           echo "::endgroup::"
+          # Falcon-512 (det512, #2546): pure Rust only (the vendored C is v0.1.0
+          # and has no det512), so only the Rust port is compared with it; the
+          # capture tool writes both files and the Rust example does not
+          # regenerate vectors512.jsonl.
+          git diff --exit-code -- crates/core/algo-falcon/tests/fixtures/falcon/vectors512.jsonl || {
+            echo "::error::committed falcon vectors512.jsonl differs from what go-algorand's Falcon-512 produces -- regenerate with 'cd tools/falcon-vector-capture && go run .' and commit if the corpus definition changed; if it did not, the Rust det512 port and go-algorand disagree and that is a parity bug"
+            exit 1
+          }
           git diff --exit-code -- crates/core/algo-falcon/tests/fixtures/falcon/vectors.jsonl || {
             echo "::error::committed falcon vectors.jsonl differs from what go-algorand produces -- if the corpus definition changed, regenerate with 'cd tools/falcon-vector-capture && go run .' (or the Rust example) and commit; if it did not, the vendored C / Rust port and go-algorand disagree and that is a parity bug"
             exit 1
