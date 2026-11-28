@@ -785,6 +785,11 @@ mod tests {
                     }
                 } else if p.extension().is_some_and(|x| x == "rs")
                     && !p.ends_with("follow_timing.rs")
+                    // `ErasableDb::erase_wal` turns automatic checkpoints off on
+                    // the participation-key connection for the zero-page
+                    // transactions and puts the setting back (go's `overwriteWAL`);
+                    // that connection is never the ledger's
+                    && !p.ends_with("erasable_db.rs")
                     && !p.to_string_lossy().ends_with("_tests.rs")
                 {
                     let text = std::fs::read_to_string(&p).unwrap().to_lowercase();
