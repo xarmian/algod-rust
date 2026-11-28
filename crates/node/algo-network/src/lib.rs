@@ -101,7 +101,7 @@ pub use catchpoint_service::{
 
 // Compression
 pub use compression::{
-    is_zstd_compressed, zstd_compress, zstd_decompress, CompressionError,
+    is_zstd_compressed, zstd_compress, zstd_compress_msg, zstd_decompress, CompressionError,
     MAX_DECOMPRESSED_MESSAGE_SIZE, ZSTD_MAGIC,
 };
 

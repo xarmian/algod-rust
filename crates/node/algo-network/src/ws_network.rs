@@ -51,7 +51,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -153,6 +153,44 @@ fn reserve_throttled_slot(counter: &AtomicI32) -> bool {
 /// (`network/wsNetwork.go:2381-2382`).
 fn release_throttled_slot(counter: &AtomicI32, entry: &PeerEntry) {
     release_throttled_slot_if_held(counter, entry.throttled_outgoing_connection);
+}
+
+/// Give back everything a peer leaving the registry holds: its throttle slot
+/// and its identity claim (go v5.1.1 `unregisterPeerLocked`). Call it
+/// **after** the peer's connection was closed (`PeerHandle::close`): the
+/// inbound read loop re-checks `closing` after it claimed an identity (see
+/// `ws_peer.rs`), so with close-then-release exactly one of the two sides
+/// releases a claim that races with the removal. `IdentityDedupHook::release`
+/// is idempotent for the owning connection.
+fn release_peer_claims(
+    counter: &AtomicI32,
+    hook: &std::sync::Mutex<Option<Arc<dyn IdentityDedupHook>>>,
+    addr: &str,
+    entry: &PeerEntry,
+) {
+    release_throttled_slot(counter, entry);
+    release_identity_claim(hook, addr, &entry.handle);
+}
+
+/// Give back the identity claim a connection made when it was verified (in
+/// `try_connect` for a dialed peer), including for a peer that was never
+/// registered. Call it after the connection was closed.
+fn release_identity_claim(
+    hook: &std::sync::Mutex<Option<Arc<dyn IdentityDedupHook>>>,
+    addr: &str,
+    handle: &PeerHandle,
+) {
+    if handle.identity_verified() {
+        if let Some(identity) = handle.identity() {
+            let hook = hook
+                .lock()
+                .expect("identity_dedup_hook mutex poisoned")
+                .clone();
+            if let Some(hook) = hook {
+                hook.release(addr, &identity);
+            }
+        }
+    }
 }
 
 /// The pure counter-side logic behind [`release_throttled_slot`], split out
@@ -571,6 +609,9 @@ pub struct WebsocketNetwork {
     /// Addresses whose disconnect was deferred due to lock contention.
     /// The monitor task drains this on each cycle.
     pending_disconnects: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Set by [`GossipNode::stop`] under the `peers` write lock (go's
+    /// `peersClosed`): once set, `add_peer` registers nothing.
+    peers_closed: Arc<AtomicBool>,
 
     /// Background task handles, stored so they are not dropped prematurely.
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -749,6 +790,7 @@ impl WebsocketNetwork {
             cancel: CancellationToken::new(),
             mesh_update_tx: Mutex::new(None),
             pending_disconnects: Arc::new(std::sync::Mutex::new(Vec::new())),
+            peers_closed: Arc::new(AtomicBool::new(false)),
             tasks: Mutex::new(Vec::new()),
             node_random: node_random.to_string(),
             connection_tracker: Arc::new(ConnectionTracker::new(Duration::from_secs(1))),
@@ -795,6 +837,12 @@ impl WebsocketNetwork {
             .identity_dedup_hook
             .lock()
             .expect("identity_dedup_hook mutex poisoned") = Some(hook);
+    }
+
+    /// Free outgoing throttle slots (go's `wn.throttledOutgoingConnections`,
+    /// read under `peersLock` by go's test helper `availableThrottleSlots`).
+    pub fn available_throttle_slots(&self) -> i32 {
+        self.throttled_outgoing_connections.load(Ordering::SeqCst)
     }
 
     /// This node's own configured public address(es), for the identity
@@ -1110,15 +1158,24 @@ impl WebsocketNetwork {
         // sending Respond messages back (e.g. UniEnsBlockReq responses).
         let peer_sender = handle.sender();
 
-        // Issue #1105: only outgoing connections are ever eligible to hold a
-        // throttled-connection slot (go only assigns
-        // `throttledOutgoingConnection` on the outgoing-dial path).
-        let throttled_outgoing_connection = direction == PeerDirection::Outbound
-            && reserve_throttled_slot(&self.throttled_outgoing_connections);
-
         // Store the peer entry.
         {
             let mut peers = self.peers.write().await;
+            // go v5.1.1 `addPeer`: a stopped network registers nothing, and the
+            // throttle slot is claimed only together with the registration (a
+            // slot claimed earlier leaks when the peer is rejected).
+            if self.peers_closed.load(Ordering::SeqCst) {
+                drop(peers);
+                tracing::debug!(addr = %addr, "network is stopping, dropping peer");
+                handle.close();
+                release_identity_claim(&self.identity_dedup_hook, &addr, &handle);
+                return;
+            }
+            // Issue #1105: only outgoing connections are ever eligible to hold a
+            // throttled-connection slot (go only assigns
+            // `throttledOutgoingConnection` on the outgoing-dial path).
+            let throttled_outgoing_connection = direction == PeerDirection::Outbound
+                && reserve_throttled_slot(&self.throttled_outgoing_connections);
             peers.insert(
                 addr.clone(),
                 PeerEntry {
@@ -1163,125 +1220,120 @@ impl WebsocketNetwork {
             // Issue #1105: needed on every removal path below to release
             // this connection's throttled-connection slot, if it holds one.
             let throttled_outgoing_connections = Arc::clone(&self.throttled_outgoing_connections);
+            let identity_hook_for_release = Arc::clone(&self.identity_dedup_hook);
 
             let recv_task = tokio::spawn(async move {
                 loop {
                     tokio::select! {
-                        _ = cancel.cancelled() => {
-                            tracing::debug!(addr = %peer_addr, "receive loop cancelled");
-                            break;
-                        }
-                        msg = rx.recv() => {
-                            match msg {
-                                Some(incoming) => {
-                                    let tag = incoming.tag;
-                                    if let Some(ref mon) = conn_perf_monitor {
-                                        mon.lock()
-                                            .expect("conn_perf_monitor lock poisoned")
-                                            .notify(&incoming);
-                                    }
-                                    // Save request data for Respond (hash_topics
-                                    // needs the original payload).
-                                    let request_data = incoming.data.clone();
-                                    // Only clone data and sender when relay mode is
-                                    // active (broadcast_handle is Some), avoiding the
-                                    // allocation on non-relay nodes.
-                                    let relay_data = if broadcast_handle.is_some() {
-                                        Some((request_data.clone(), incoming.sender.clone()))
-                                    } else {
-                                        None
-                                    };
-                                    // Issue #798: tell every *other* connected peer
-                                    // "I already have this, don't re-send it" before
-                                    // dispatching — mirrors go's messageHandlerThread,
-                                    // which calls sendFilterMessage() unconditionally
-                                    // for any large dedup-safe message *before*
-                                    // wn.Handle() decides what to do with it
-                                    // (network/wsNetwork.go:1249-1251).
-                                    if outgoing_filtering_enabled
-                                        && dedup_safe_tag(&tag)
-                                        && request_data.len() >= MESSAGE_FILTER_SIZE
-                                    {
-                                        let digest =
-                                            generate_message_digest(&tag, &request_data);
-                                        send_digest_skip_notification(&peers, digest, &peer_addr)
-                                            .await;
-                                    }
-                                    // Dispatch to the multiplexer.
-                                    let out = multiplexer.handle(incoming).await;
-                                    // Act on forwarding policy.
-                                    match out.action {
-                                        ForwardingPolicy::Broadcast => {
-                                            if let (Some(ref bh), Some((data, sender))) =
-                                                (&broadcast_handle, relay_data)
-                                            {
-                                                if let Err(e) = bh.enqueue(tag, data, Some(sender)) {
-                                                    tracing::debug!(
-                                                        error = %e,
-                                                        "failed to enqueue relay message"
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        ForwardingPolicy::Respond => {
-                                            // Build TopicMsgResp matching Go's
-                                            // wsPeer.Respond(): hash the original
-                                            // request, append RequestHash topic,
-                                            // serialize, and send back to the peer.
-                                            let request_hash = hash_topics(&request_data);
-                                            let request_hash_data = encode_uvarint(request_hash);
-                                            let mut response_topics =
-                                                out.topics.unwrap_or_else(Topics::new);
-                                            response_topics.0.push(Topic::new(
-                                                RESPONSE_HASH_FIELD,
-                                                request_hash_data,
-                                            ));
-                                            let serialized = response_topics.marshal();
-                                            let resp_msg = OutgoingMessage {
-                                                action: ForwardingPolicy::Respond,
-                                                tag: Tag::TopicMsgResp,
-                                                payload: serialized,
-                                                topics: None,
-                                            };
-                                            if let Err(e) = peer_sender.send_priority(resp_msg) {
-                                                tracing::debug!(
-                                                    addr = %peer_addr,
-                                                    error = %e,
-                                                    "failed to send Respond message"
-                                                );
-                                            }
-                                        }
-                                        ForwardingPolicy::Disconnect => {
-                                            tracing::info!(addr = %peer_addr, "handler requested disconnect");
-                                            let mut guard = peers.write().await;
-                                            if let Some(entry) = guard.remove(&peer_addr) {
-                                                release_throttled_slot(
-                                                    &throttled_outgoing_connections,
-                                                    &entry,
-                                                );
-                                                entry.handle.close();
-                                            }
-                                            break;
-                                        }
-                                        _ => { /* Ignore, Accept — no relay action */ }
-                                    }
-                                }
-                                None => {
-                                    // Channel closed — peer disconnected.
-                                    tracing::info!(addr = %peer_addr, "peer incoming channel closed, removing");
-                                    let mut guard = peers.write().await;
-                                    if let Some(entry) = guard.remove(&peer_addr) {
-                                        release_throttled_slot(
-                                            &throttled_outgoing_connections,
-                                            &entry,
-                                        );
-                                        entry.handle.close();
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                                           _ = cancel.cancelled() => {
+                                               tracing::debug!(addr = %peer_addr, "receive loop cancelled");
+                                               break;
+                                           }
+                                           msg = rx.recv() => {
+                                               match msg {
+                                                   Some(incoming) => {
+                                                       let tag = incoming.tag;
+                                                       if let Some(ref mon) = conn_perf_monitor {
+                                                           mon.lock()
+                                                               .expect("conn_perf_monitor lock poisoned")
+                                                               .notify(&incoming);
+                                                       }
+                                                       // Save request data for Respond (hash_topics
+                                                       // needs the original payload).
+                                                       let request_data = incoming.data.clone();
+                                                       // Only clone data and sender when relay mode is
+                                                       // active (broadcast_handle is Some), avoiding the
+                                                       // allocation on non-relay nodes.
+                                                       let relay_data = if broadcast_handle.is_some() {
+                                                           Some((request_data.clone(), incoming.sender.clone()))
+                                                       } else {
+                                                           None
+                                                       };
+                                                       // Issue #798: tell every *other* connected peer
+                                                       // "I already have this, don't re-send it" before
+                                                       // dispatching — mirrors go's messageHandlerThread,
+                                                       // which calls sendFilterMessage() unconditionally
+                                                       // for any large dedup-safe message *before*
+                                                       // wn.Handle() decides what to do with it
+                                                       // (network/wsNetwork.go:1249-1251).
+                                                       if outgoing_filtering_enabled
+                                                           && filter_message_on_arrival(&tag)
+                                                           && request_data.len() >= MESSAGE_FILTER_SIZE
+                                                       {
+                                                           let digest =
+                                                               generate_message_digest(&tag, &request_data);
+                                                           send_digest_skip_notification(&peers, digest, &peer_addr)
+                                                               .await;
+                                                       }
+                                                       // Dispatch to the multiplexer.
+                                                       let out = multiplexer.handle(incoming).await;
+                                                       // Act on forwarding policy.
+                                                       match out.action {
+                                                           ForwardingPolicy::Broadcast => {
+                                                               if let (Some(ref bh), Some((data, sender))) =
+                                                                   (&broadcast_handle, relay_data)
+                                                               {
+                                                                   if let Err(e) = bh.enqueue(tag, data, Some(sender)) {
+                                                                       tracing::debug!(
+                                                                           error = %e,
+                                                                           "failed to enqueue relay message"
+                                                                       );
+                                                                   }
+                                                               }
+                                                           }
+                                                           ForwardingPolicy::Respond => {
+                                                               // Build TopicMsgResp matching Go's
+                                                               // wsPeer.Respond(): hash the original
+                                                               // request, append RequestHash topic,
+                                                               // serialize, and send back to the peer.
+                                                               let request_hash = hash_topics(&request_data);
+                                                               let request_hash_data = encode_uvarint(request_hash);
+                                                               let mut response_topics =
+                                                                   out.topics.unwrap_or_else(Topics::new);
+                                                               response_topics.0.push(Topic::new(
+                                                                   RESPONSE_HASH_FIELD,
+                                                                   request_hash_data,
+                                                               ));
+                                                               let serialized = response_topics.marshal();
+                                                               let resp_msg = OutgoingMessage {
+                                                                   action: ForwardingPolicy::Respond,
+                                                                   tag: Tag::TopicMsgResp,
+                                                                   payload: serialized,
+                                                                   topics: None,
+                                                               };
+                                                               if let Err(e) = peer_sender.send_priority(resp_msg) {
+                                                                   tracing::debug!(
+                                                                       addr = %peer_addr,
+                                                                       error = %e,
+                                                                       "failed to send Respond message"
+                                                                   );
+                                                               }
+                                                           }
+                                                           ForwardingPolicy::Disconnect => {
+                                                               tracing::info!(addr = %peer_addr, "handler requested disconnect");
+                                                               let mut guard = peers.write().await;
+                                                               if let Some(entry) = guard.remove(&peer_addr) {
+                                                                   entry.handle.close();
+                    release_peer_claims(&throttled_outgoing_connections, &identity_hook_for_release, &peer_addr, &entry);
+                                                               }
+                                                               break;
+                                                           }
+                                                           _ => { /* Ignore, Accept — no relay action */ }
+                                                       }
+                                                   }
+                                                   None => {
+                                                       // Channel closed — peer disconnected.
+                                                       tracing::info!(addr = %peer_addr, "peer incoming channel closed, removing");
+                                                       let mut guard = peers.write().await;
+                                                       if let Some(entry) = guard.remove(&peer_addr) {
+                                                           entry.handle.close();
+                    release_peer_claims(&throttled_outgoing_connections, &identity_hook_for_release, &peer_addr, &entry);
+                                                       }
+                                                       break;
+                                                   }
+                                               }
+                                           }
+                                       }
                 }
             });
 
@@ -1300,24 +1352,16 @@ impl WebsocketNetwork {
         };
 
         if let Some(entry) = entry {
-            release_throttled_slot(&self.throttled_outgoing_connections, &entry);
-            // Issue #1445: release this connection's identity claim (if
-            // any) so a future connection — e.g. this same peer
-            // reconnecting, or on the other transport leg in `Hybrid`
-            // mode — can claim it again.
-            if entry.handle.identity_verified() {
-                if let Some(identity) = entry.handle.identity() {
-                    if let Some(hook) = self
-                        .identity_dedup_hook
-                        .lock()
-                        .expect("identity_dedup_hook mutex poisoned")
-                        .clone()
-                    {
-                        hook.release(addr, &identity);
-                    }
-                }
-            }
+            // Issue #1445: give back the throttle slot and the identity claim
+            // so a future connection — e.g. this same peer reconnecting, or on
+            // the other transport leg in `Hybrid` mode — can claim it again.
             entry.handle.close();
+            release_peer_claims(
+                &self.throttled_outgoing_connections,
+                &self.identity_dedup_hook,
+                addr,
+                &entry,
+            );
             tracing::info!(addr = %addr, "peer removed from network");
             true
         } else {
@@ -2053,6 +2097,15 @@ impl WebsocketNetwork {
     }
 }
 
+/// go v5.1.1 `messageHandlerThread`: a filter message is sent as every large
+/// message arrives, except a proposal payload, whose filter message `Relay`
+/// sends over the uncompressed data (the payload is compressed on arrival in
+/// go; see [`WebsocketNetwork::relay`]). Not restricted to the tags the
+/// incoming filter dedups (`AV`/`TX`, go's `dedupSafeTag`).
+fn filter_message_on_arrival(tag: &Tag) -> bool {
+    *tag != Tag::ProposalPayload
+}
+
 /// Broadcast a `MsgDigestSkip` notification (a 32-byte digest) to every
 /// connected peer except `except`, telling them "I already have this exact
 /// message, don't bother re-sending it to me".
@@ -2122,6 +2175,23 @@ impl GossipNode for WebsocketNetwork {
         _wait: bool,
         except: Option<Arc<dyn Peer>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // go v5.1.1 `Relay` (`network/wsNetwork.go`): the filter message of a
+        // proposal payload is sent here, over the uncompressed data, because
+        // `messageHandlerThread` skips PP on receipt. It is sent even when this
+        // node does not relay messages.
+        if tag == Tag::ProposalPayload
+            && self.config.enable_outgoing_network_message_filtering
+            && data.len() >= MESSAGE_FILTER_SIZE
+        {
+            let except_addr = except.as_ref().map(|p| p.get_address().to_string());
+            send_digest_skip_notification(
+                &self.peers,
+                generate_message_digest(&tag, &data),
+                except_addr.as_deref().unwrap_or(""),
+            )
+            .await;
+        }
+
         if !self.effective_relay_messages() {
             return Ok(());
         }
@@ -2159,8 +2229,13 @@ impl GossipNode for WebsocketNetwork {
         let peers = self.peers.try_write();
         if let Ok(mut peers) = peers {
             if let Some(entry) = peers.remove(&addr) {
-                release_throttled_slot(&self.throttled_outgoing_connections, &entry);
                 entry.handle.close();
+                release_peer_claims(
+                    &self.throttled_outgoing_connections,
+                    &self.identity_dedup_hook,
+                    &addr,
+                    &entry,
+                );
                 tracing::info!(addr = %addr, "peer disconnected");
             }
         } else {
@@ -2177,8 +2252,13 @@ impl GossipNode for WebsocketNetwork {
     fn disconnect_peers(&self) {
         if let Ok(mut peers) = self.peers.try_write() {
             for (addr, entry) in peers.drain() {
-                release_throttled_slot(&self.throttled_outgoing_connections, &entry);
                 entry.handle.close();
+                release_peer_claims(
+                    &self.throttled_outgoing_connections,
+                    &self.identity_dedup_hook,
+                    &addr,
+                    &entry,
+                );
                 tracing::debug!(addr = %addr, "peer disconnected (disconnect_peers)");
             }
         } else {
@@ -2296,14 +2376,23 @@ impl GossipNode for WebsocketNetwork {
             let _ = task.await;
         }
 
-        // Disconnect all peers.
+        // Disconnect all peers. `peers_closed` is set under the same lock as the
+        // drain, so a peer added afterwards is rejected by `add_peer` instead of
+        // being registered with nothing left to close it (go `innerStop`).
         let entries: Vec<(String, PeerEntry)> = {
             let mut peers = self.peers.write().await;
+            self.peers_closed.store(true, Ordering::SeqCst);
             peers.drain().collect()
         };
 
         for (addr, entry) in entries {
             entry.handle.close();
+            release_peer_claims(
+                &self.throttled_outgoing_connections,
+                &self.identity_dedup_hook,
+                &addr,
+                &entry,
+            );
             tracing::debug!(addr = %addr, "peer closed during stop");
         }
     }
@@ -2418,6 +2507,8 @@ struct NetworkConnectFn {
     /// dial is an outgoing connection, so `try_dial` reserves a slot for it
     /// on connect and releases it on every removal path below.
     throttled_outgoing_connections: Arc<AtomicI32>,
+    /// Shared with [`WebsocketNetwork::peers_closed`].
+    peers_closed: Arc<AtomicBool>,
     /// Issue #1425: the network's shared per-wire-tag traffic-counter
     /// instance, threaded into every mesh-dialed peer's `WsPeerConfig` so
     /// mesh-dial traffic is counted alongside directly-dialed and inbound
@@ -2442,6 +2533,8 @@ impl ConnectFn for NetworkConnectFn {
         let phonebook = Arc::clone(&self.phonebook);
         let conn_perf_monitor = Arc::clone(&self.conn_perf_monitor);
         let throttled_outgoing_connections = Arc::clone(&self.throttled_outgoing_connections);
+        let peers_closed = Arc::clone(&self.peers_closed);
+        let recv_identity_hook_slot = Arc::clone(&self.identity_dedup_hook);
         let enable_vote_compression = self.enable_vote_compression;
         let network_protocol_version = self.network_protocol_version.clone();
         let network_metrics = Arc::clone(&self.network_metrics);
@@ -2494,14 +2587,22 @@ impl ConnectFn for NetworkConnectFn {
                     let peer_addr = handle.remote_addr().to_string();
                     let incoming_rx = handle.take_incoming();
 
-                    // Issue #1105: this dial path is always outbound, so
-                    // it's always eligible to reserve a throttled slot.
-                    let throttled_outgoing_connection =
-                        reserve_throttled_slot(&throttled_outgoing_connections);
-
                     // Store the peer entry.
                     {
                         let mut guard = peers.write().await;
+                        // go v5.1.1 `addPeer`: nothing is registered once the
+                        // network stopped, and the slot is claimed with the
+                        // registration.
+                        if peers_closed.load(Ordering::SeqCst) {
+                            drop(guard);
+                            handle.close();
+                            release_identity_claim(&recv_identity_hook_slot, &peer_addr, &handle);
+                            return false;
+                        }
+                        // Issue #1105: this dial path is always outbound, so
+                        // it's always eligible to reserve a throttled slot.
+                        let throttled_outgoing_connection =
+                            reserve_throttled_slot(&throttled_outgoing_connections);
                         guard.insert(
                             peer_addr.clone(),
                             PeerEntry {
@@ -2527,6 +2628,7 @@ impl ConnectFn for NetworkConnectFn {
                         let recv_addr = peer_addr;
                         let recv_throttled_outgoing_connections =
                             Arc::clone(&throttled_outgoing_connections);
+                        let recv_identity_hook = Arc::clone(&recv_identity_hook_slot);
                         let broadcast_handle: Option<BroadcastHandle> = {
                             let guard = broadcast_thread
                                 .lock()
@@ -2537,94 +2639,88 @@ impl ConnectFn for NetworkConnectFn {
                         let recv_task = tokio::spawn(async move {
                             loop {
                                 tokio::select! {
-                                    _ = recv_cancel.cancelled() => {
-                                        tracing::debug!(addr = %recv_addr, "receive loop cancelled");
-                                        break;
-                                    }
-                                    msg = rx.recv() => {
-                                        match msg {
-                                            Some(incoming) => {
-                                                let tag = incoming.tag;
-                                                // Issue #1101: this dial path is always
-                                                // outbound, so feed every message to the
-                                                // performance monitor unconditionally
-                                                // (mirrors go's `connMonitor` on outbound
-                                                // `wsPeer`s).
-                                                conn_perf_monitor
-                                                    .lock()
-                                                    .expect("conn_perf_monitor lock poisoned")
-                                                    .notify(&incoming);
-                                                let request_data = incoming.data.clone();
-                                                let relay_data = if broadcast_handle.is_some() {
-                                                    Some((request_data.clone(), incoming.sender.clone()))
-                                                } else {
-                                                    None
-                                                };
-                                                // Issue #798: broadcast a
-                                                // MsgDigestSkip to every other
-                                                // connected peer before
-                                                // dispatching — see the
-                                                // matching comment in
-                                                // `add_peer`'s recv task.
-                                                if recv_outgoing_message_filter.is_some()
-                                                    && dedup_safe_tag(&tag)
-                                                    && request_data.len() >= MESSAGE_FILTER_SIZE
-                                                {
-                                                    let digest = generate_message_digest(
-                                                        &tag,
-                                                        &request_data,
-                                                    );
-                                                    send_digest_skip_notification(
-                                                        &recv_peers,
-                                                        digest,
-                                                        &recv_addr,
-                                                    )
-                                                    .await;
-                                                }
-                                                let out = recv_multiplexer.handle(incoming).await;
-                                                match out.action {
-                                                    ForwardingPolicy::Broadcast => {
-                                                        if let (Some(ref bh), Some((data, sender))) =
-                                                            (&broadcast_handle, relay_data)
-                                                        {
-                                                            if let Err(e) = bh.enqueue(tag, data, Some(sender)) {
-                                                                tracing::debug!(
-                                                                    error = %e,
-                                                                    "failed to enqueue relay message (mesh)"
-                                                                );
-                                                            }
-                                                        }
-                                                    }
-                                                    ForwardingPolicy::Disconnect => {
-                                                        tracing::info!(addr = %recv_addr, "handler requested disconnect (mesh)");
-                                                        let mut guard = recv_peers.write().await;
-                                                        if let Some(entry) = guard.remove(&recv_addr) {
-                                                            release_throttled_slot(
-                                                                &recv_throttled_outgoing_connections,
-                                                                &entry,
-                                                            );
-                                                            entry.handle.close();
-                                                        }
-                                                        break;
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                            None => {
-                                                tracing::info!(addr = %recv_addr, "peer incoming channel closed, removing");
-                                                let mut guard = recv_peers.write().await;
-                                                if let Some(entry) = guard.remove(&recv_addr) {
-                                                    release_throttled_slot(
-                                                        &recv_throttled_outgoing_connections,
-                                                        &entry,
-                                                    );
-                                                    entry.handle.close();
-                                                }
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
+                                                                   _ = recv_cancel.cancelled() => {
+                                                                       tracing::debug!(addr = %recv_addr, "receive loop cancelled");
+                                                                       break;
+                                                                   }
+                                                                   msg = rx.recv() => {
+                                                                       match msg {
+                                                                           Some(incoming) => {
+                                                                               let tag = incoming.tag;
+                                                                               // Issue #1101: this dial path is always
+                                                                               // outbound, so feed every message to the
+                                                                               // performance monitor unconditionally
+                                                                               // (mirrors go's `connMonitor` on outbound
+                                                                               // `wsPeer`s).
+                                                                               conn_perf_monitor
+                                                                                   .lock()
+                                                                                   .expect("conn_perf_monitor lock poisoned")
+                                                                                   .notify(&incoming);
+                                                                               let request_data = incoming.data.clone();
+                                                                               let relay_data = if broadcast_handle.is_some() {
+                                                                                   Some((request_data.clone(), incoming.sender.clone()))
+                                                                               } else {
+                                                                                   None
+                                                                               };
+                                                                               // Issue #798: broadcast a
+                                                                               // MsgDigestSkip to every other
+                                                                               // connected peer before
+                                                                               // dispatching — see the
+                                                                               // matching comment in
+                                                                               // `add_peer`'s recv task.
+                                                                               if recv_outgoing_message_filter.is_some()
+                                                                                   && filter_message_on_arrival(&tag)
+                                                                                   && request_data.len() >= MESSAGE_FILTER_SIZE
+                                                                               {
+                                                                                   let digest = generate_message_digest(
+                                                                                       &tag,
+                                                                                       &request_data,
+                                                                                   );
+                                                                                   send_digest_skip_notification(
+                                                                                       &recv_peers,
+                                                                                       digest,
+                                                                                       &recv_addr,
+                                                                                   )
+                                                                                   .await;
+                                                                               }
+                                                                               let out = recv_multiplexer.handle(incoming).await;
+                                                                               match out.action {
+                                                                                   ForwardingPolicy::Broadcast => {
+                                                                                       if let (Some(ref bh), Some((data, sender))) =
+                                                                                           (&broadcast_handle, relay_data)
+                                                                                       {
+                                                                                           if let Err(e) = bh.enqueue(tag, data, Some(sender)) {
+                                                                                               tracing::debug!(
+                                                                                                   error = %e,
+                                                                                                   "failed to enqueue relay message (mesh)"
+                                                                                               );
+                                                                                           }
+                                                                                       }
+                                                                                   }
+                                                                                   ForwardingPolicy::Disconnect => {
+                                                                                       tracing::info!(addr = %recv_addr, "handler requested disconnect (mesh)");
+                                                                                       let mut guard = recv_peers.write().await;
+                                                                                       if let Some(entry) = guard.remove(&recv_addr) {
+                                                                                           entry.handle.close();
+                                release_peer_claims(&recv_throttled_outgoing_connections, &recv_identity_hook, &recv_addr, &entry);
+                                                                                       }
+                                                                                       break;
+                                                                                   }
+                                                                                   _ => {}
+                                                                               }
+                                                                           }
+                                                                           None => {
+                                                                               tracing::info!(addr = %recv_addr, "peer incoming channel closed, removing");
+                                                                               let mut guard = recv_peers.write().await;
+                                                                               if let Some(entry) = guard.remove(&recv_addr) {
+                                                                                   entry.handle.close();
+                                release_peer_claims(&recv_throttled_outgoing_connections, &recv_identity_hook, &recv_addr, &entry);
+                                                                               }
+                                                                               break;
+                                                                           }
+                                                                       }
+                                                                   }
+                                                               }
                             }
                         });
 
@@ -2744,6 +2840,7 @@ impl WebsocketNetwork {
             phonebook: Arc::clone(&self.phonebook),
             conn_perf_monitor: Arc::clone(&self.conn_perf_monitor),
             throttled_outgoing_connections: Arc::clone(&self.throttled_outgoing_connections),
+            peers_closed: Arc::clone(&self.peers_closed),
             network_metrics: Arc::clone(&self.network_metrics),
             // Issue #1445: share the live cells (not a snapshot) so a
             // `set_identity` call after `start_arc()` still takes effect on

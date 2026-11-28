@@ -66,6 +66,23 @@ pub fn zstd_compress(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
     zstd::stream::encode_all(data, ZSTD_COMPRESSION_LEVEL).map_err(CompressionError::CompressFailed)
 }
 
+/// Compress a message body the way go's `zstdCompressMsg`
+/// (`network/msgCompressor.go`, v5.1.1) does: the zstd frame, or `data` itself
+/// when compressing fails or does not make it shorter. Receivers accept both
+/// (they decompress only on the zstd magic), and a frame of incompressible
+/// data is longer than the data, which the receiver's per-tag
+/// `MaxMessageSize` check would count against the sender.
+pub fn zstd_compress_msg(data: &[u8]) -> Vec<u8> {
+    match zstd_compress(data) {
+        Ok(c) if c.len() < data.len() => c,
+        Ok(_) => data.to_vec(),
+        Err(e) => {
+            tracing::warn!(error = %e, len = data.len(), "failed to compress message, sending it as it is");
+            data.to_vec()
+        }
+    }
+}
+
 /// Decompress zstd-compressed `data` with a maximum output size guard.
 ///
 /// If the decompressed output would exceed `max_size` bytes, returns
@@ -90,6 +107,19 @@ pub fn zstd_decompress(data: &[u8], max_size: usize) -> Result<Vec<u8>, Compress
         output.extend_from_slice(&buf[..n]);
     }
     Ok(output)
+}
+
+/// go v5.1.1 `network.DecompressProposal` (`network/msgCompressor.go`): the
+/// body of a PP message is decompressed when it starts with the zstd magic and
+/// returned unchanged otherwise; it fails when the frame is malformed, truncated
+/// or followed by anything but whole frames, or when the content is larger than
+/// [`MAX_DECOMPRESSED_MESSAGE_SIZE`]. Pinned to go by
+/// `tests/zstd_proposal_oracle.rs`.
+pub fn decompress_proposal(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
+    if !is_zstd_compressed(data) {
+        return Ok(data.to_vec());
+    }
+    zstd_decompress(data, MAX_DECOMPRESSED_MESSAGE_SIZE)
 }
 
 #[cfg(test)]
@@ -196,5 +226,32 @@ mod tests {
         let decompressed =
             zstd_decompress(&compressed, MAX_DECOMPRESSED_MESSAGE_SIZE).expect("decompress");
         assert_eq!(decompressed, original);
+    }
+
+    /// go v5.1.1 `zstdCompressMsg` (network/msgCompressor.go) sends the data
+    /// as it is when the zstd frame is not shorter: a frame of incompressible
+    /// data is longer than the data and the receiver applies
+    /// `Tag.MaxMessageSize` to the bytes as sent.
+    #[test]
+    fn compress_msg_sends_incompressible_data_raw() {
+        // xorshift noise: incompressible
+        let mut x: u64 = 0x9e3779b97f4a7c15;
+        let noise: Vec<u8> = (0..4096)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect();
+        assert!(zstd_compress(&noise).unwrap().len() >= noise.len());
+        assert_eq!(zstd_compress_msg(&noise), noise);
+        // tiny input: the frame header alone exceeds it
+        assert_eq!(zstd_compress_msg(b"a"), b"a".to_vec());
+        // compressible input is still compressed
+        let zeros = vec![0u8; 4096];
+        let c = zstd_compress_msg(&zeros);
+        assert!(c.len() < zeros.len());
+        assert!(is_zstd_compressed(&c));
     }
 }

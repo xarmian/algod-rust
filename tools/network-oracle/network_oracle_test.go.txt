@@ -1,0 +1,126 @@
+// Copyright (C) 2019-2026 Algorand Foundation Ltd.
+// Modifications Copyright (C) 2026 Algod DAO
+// This file is part of algod-rust, a modified work based on go-algorand
+// (https://github.com/algorand/go-algorand).
+//
+// algod-rust is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// algod-rust is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with algod-rust.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// This file is NOT part of any Go module here: it is a template that
+// tools/network-oracle/run.sh copies, as zz_network_oracle_test.go, into the
+// pinned go-algorand checkout's network package and runs there. Issue #2554.
+//
+// TestZstdProposalOracle feeds go's real network.DecompressProposal
+// (msgCompressor.go, v5.1.1) a set of PP bodies -- plain data, the bare zstd
+// magic, truncated, trailing-byte, concatenated and skippable frames, frames
+// without a content size, frames of exactly MaxDecompressedMessageSize and one
+// byte more -- and writes {"name","hex","ok","len","sha256"} per case to
+// $NETORACLE_ZSTD_OUT. The rows are committed as
+// crates/node/algo-network/tests/fixtures/network_oracle/zstd_proposal.jsonl
+// and replayed by crates/node/algo-network/tests/zstd_proposal_oracle.rs.
+
+package network
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"os"
+	"testing"
+
+	"github.com/DataDog/zstd"
+)
+
+func TestZstdProposalOracle(t *testing.T) {
+	out := os.Getenv("NETORACLE_ZSTD_OUT")
+	if out == "" {
+		t.Skip("NETORACLE_ZSTD_OUT not set")
+	}
+	frame := func(d []byte) []byte {
+		c, err := zstd.CompressLevel(nil, d, zstdCompressionLevel)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	stream := func(d []byte) []byte {
+		var b bytes.Buffer
+		w := zstd.NewWriter(&b)
+		if _, err := w.Write(d); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return b.Bytes()
+	}
+	cat := func(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
+	payload := bytes.Repeat([]byte("proposal payload "), 100)
+	good := frame(payload)
+	skippable := []byte{0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0}
+	skippable3 := []byte{0x5f, 0x2a, 0x4d, 0x18, 3, 0, 0, 0, 1, 2, 3}
+	max := MaxDecompressedMessageSize
+	cases := []struct {
+		name string
+		in   []byte
+	}{
+		{"empty", nil},
+		{"plain", []byte("not compressed")},
+		{"magic_prefix_only_3", zstdCompressionMagic[:3]},
+		{"bare_magic", zstdCompressionMagic[:]},
+		{"magic_garbage", cat(zstdCompressionMagic[:], []byte{1, 2, 3, 4, 5, 6})},
+		{"valid", good},
+		{"valid_empty_content", frame(nil)},
+		{"valid_stream_no_content_size", stream(payload)},
+		{"truncated_half", good[:len(good)/2]},
+		{"truncated_last_byte", good[:len(good)-1]},
+		{"truncated_header", good[:6]},
+		{"trailing_zero", cat(good, []byte{0})},
+		{"trailing_garbage", cat(good, []byte("garbage"))},
+		{"trailing_magic", cat(good, zstdCompressionMagic[:])},
+		{"two_frames", cat(good, frame([]byte("second")))},
+		{"two_frames_stream", cat(stream(payload), stream([]byte("second")))},
+		{"skippable_only", skippable},
+		{"skippable_then_valid", cat(skippable, good)},
+		{"valid_then_skippable", cat(good, skippable3)},
+		{"max_zeros", frame(make([]byte, max))},
+		{"max_plus_one_zeros", frame(make([]byte, max+1))},
+		{"max_stream", stream(make([]byte, max))},
+		{"max_plus_one_stream", stream(make([]byte, max+1))},
+		{"two_frames_total_max", cat(frame(make([]byte, max-5)), frame(make([]byte, 5)))},
+		{"two_frames_total_max_plus_one", cat(frame(make([]byte, max-5)), frame(make([]byte, 6)))},
+	}
+	f, err := os.Create(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	for _, c := range cases {
+		res, err := DecompressProposal(c.in)
+		row := map[string]any{"name": c.name, "hex": hex.EncodeToString(c.in), "ok": err == nil}
+		if err == nil {
+			sum := sha256.Sum256(res)
+			row["len"] = len(res)
+			row["sha256"] = hex.EncodeToString(sum[:])
+		} else {
+			row["err"] = err.Error()
+		}
+		if err := enc.Encode(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
