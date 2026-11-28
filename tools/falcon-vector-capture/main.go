@@ -328,8 +328,19 @@ func generate512() []byte {
 			okRight := v.VerifyBytes(m.data, sig) == nil
 			wrong := append(clone(m.data), 0x01)
 			okWrong := v.VerifyBytes(wrong, sig) == nil
-			fmt.Fprintf(&sb, `{"kind":"sig","key":%q,"msg":%q,"msg_hex":"%s","sig":"%s","verifies":%t,"verifies_with_appended_byte":%t}`+"\n",
-				sd.name, m.name, hex.EncodeToString(m.data), hex.EncodeToString(sig), okRight, okWrong)
+			ct, err := sig.GetFixedLengthHashableRepresentation()
+			if err != nil {
+				panic(fmt.Sprintf("%s/%s: CT conversion: %v", sd.name, m.name, err))
+			}
+			saltVersion := -1
+			for sv := 0; sv < 256; sv++ {
+				if sig.IsSaltVersionEqual(byte(sv)) {
+					saltVersion = sv
+					break
+				}
+			}
+			fmt.Fprintf(&sb, `{"kind":"sig","key":%q,"msg":%q,"msg_hex":"%s","sig":"%s","verifies":%t,"verifies_with_appended_byte":%t,"sig_ct":"%s","salt_version":%d}`+"\n",
+				sd.name, m.name, hex.EncodeToString(m.data), hex.EncodeToString(sig), okRight, okWrong, hex.EncodeToString(ct), saltVersion)
 		}
 	}
 	return []byte(sb.String())

@@ -56,6 +56,20 @@ fn falcon512_matches_go_on_every_vector() {
                 appended.push(1);
                 let ok = algo_falcon::falcon512_verify_code(pk, &want, &appended).unwrap() == 0;
                 assert_eq!(ok, row["verifies_with_appended_byte"].as_bool().unwrap());
+                // go's `GetFixedLengthHashableRepresentation` (CT form) and
+                // `IsSaltVersionEqual` of the same signature.
+                let ct = algo_falcon::falcon512_convert_compressed_to_ct(&want).unwrap();
+                assert_eq!(
+                    hex::encode(ct),
+                    row["sig_ct"].as_str().unwrap(),
+                    "{}/{} CT form",
+                    row["key"],
+                    row["msg"]
+                );
+                assert_eq!(
+                    i64::from(algo_falcon::falcon512_salt_version(&want).unwrap()),
+                    row["salt_version"].as_i64().unwrap()
+                );
                 sigs += 1;
             }
             other => panic!("unknown row kind {other}"),
