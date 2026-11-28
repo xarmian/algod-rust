@@ -1413,6 +1413,28 @@ mod tests {
         (status, value)
     }
 
+    /// go's `protocol.EncodeJSON` sorts the keys of every object and indents by
+    /// two spaces; `encode_json` gets the order from `serde_json::Value`, which
+    /// keeps its objects sorted only while no crate enables `preserve_order`.
+    #[test]
+    fn encode_json_sorts_keys_and_indents_like_go() {
+        #[derive(serde::Serialize)]
+        struct Unsorted {
+            zebra: u8,
+            apple: Vec<u8>,
+            mid: Option<String>,
+        }
+        let json = encode_json(&Unsorted {
+            zebra: 1,
+            apple: vec![2, 3],
+            mid: None,
+        });
+        assert_eq!(
+            json,
+            "{\n  \"apple\": [\n    2,\n    3\n  ],\n  \"mid\": null,\n  \"zebra\": 1\n}"
+        );
+    }
+
     #[tokio::test]
     async fn empty_wallets_list_returns_empty_array_or_omitted() {
         let (router, _tmp) = make_router();
