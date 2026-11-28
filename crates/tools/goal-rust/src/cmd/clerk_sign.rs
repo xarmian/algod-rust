@@ -353,7 +353,10 @@ mod tests {
         // salted address.
         let mut wrong = with_sender(legacy_addr, None);
         let err = authorize_with_program(&mut wrong, lsig, true).unwrap_err();
-        assert!(err.starts_with("program authorizes "), "{err}");
+        assert_eq!(
+            err,
+            format!("program authorizes {salted_addr}, but the transaction is authorized by {legacy_addr}")
+        );
     }
 
     #[test]

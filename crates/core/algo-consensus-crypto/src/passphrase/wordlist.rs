@@ -60,6 +60,7 @@ mod tests {
     #[test]
     fn wordlist_has_2048_entries() {
         assert_eq!(wordlist().len(), 2048);
+        assert!(wordlist().iter().all(|w| !w.is_empty()));
         assert_eq!(wordlist()[0], "abandon");
         assert_eq!(wordlist()[2047], "zoo");
     }

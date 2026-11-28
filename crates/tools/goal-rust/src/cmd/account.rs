@@ -3594,6 +3594,14 @@ mod tests {
         assert!(!is_partkey_registered(&json!({}), &part));
         assert!(is_partkey_registered(&json!({ "participation": key }), &part));
 
+        // `[]byte` keys compare with `bytes.Equal`: absent and empty are equal.
+        let empty_part = json!({ "key": { "vote-first-valid": 1 } });
+        assert!(is_partkey_registered(
+            &json!({ "participation": { "vote-first-valid": 1, "vote-participation-key": "" } }),
+            &empty_part
+        ));
+        assert!(!is_partkey_registered(&json!({ "participation": key }), &empty_part));
+
         let mutations: [(&str, &str, serde_json::Value); 5] = [
             ("selection key", "selection-participation-key", json!("CQ==")),
             ("vote key", "vote-participation-key", json!("CQ==")),
