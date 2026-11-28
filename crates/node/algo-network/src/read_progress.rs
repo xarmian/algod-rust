@@ -144,7 +144,9 @@ impl FrameTracker {
                     // a continuation needs a message to continue, a data frame
                     // does not start one inside another, 2^63 bytes do not exist
                     let misplaced = (opcode == 0) != self.started.is_some() && data;
-                    if reserved || misplaced || ext >> 63 != 0 {
+                    // a control frame is final and at most 125 bytes
+                    let bad_control = !data && (!fin || ext > 125);
+                    if reserved || misplaced || bad_control || ext >> 63 != 0 {
                         self.lost = true;
                         self.started = None;
                         return;
@@ -569,6 +571,8 @@ mod tests {
         let now = Instant::now();
         for bad in [
             vec![0x83u8, 0],                            // reserved opcode
+            vec![0x09, 0],                              // a control frame without FIN
+            vec![0x89, 126, 0, 126],                    // a ping over 125 bytes
             vec![0x80, 0],                              // continuation, nothing to continue
             vec![0x82, 127, 0x80, 0, 0, 0, 0, 0, 0, 0], // length with the top bit
         ] {
