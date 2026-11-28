@@ -899,6 +899,9 @@ fn run_tealsign_inner(args: TealsignArgs) -> Result<(), String> {
     }
 
     let mut lsig_stxn: Option<SignedTransaction> = None;
+    // go v5.1's `lsig`: the program authorizing `stxn` and its arguments, which
+    // an `ls`-scheme SKsig carries instead of `stxn.Lsig`.
+    let mut lsig_of_stxn = algo_types::LogicSig::default();
     let program_hash: [u8; 32] =
         if let Some(path) = args.lsig_txn.as_ref() {
             let bytes = std::fs::read(path)
@@ -913,14 +916,15 @@ fn run_tealsign_inner(args: TealsignArgs) -> Result<(), String> {
             let stxn = stxns.into_iter().next().ok_or_else(|| {
                 format!("Cannot decode transactions from {}: empty", path.display())
             })?;
-            let program = match stxn.lsig.as_ref() {
-                Some(l) if !l.logic.is_empty() => l.logic.to_vec(),
-                _ => return Err(
+            lsig_of_stxn = tealsign_lsig(&stxn)
+                .map_err(|e| format!("Cannot decode transactions from {}: {e}", path.display()))?;
+            if lsig_of_stxn.logic.is_empty() {
+                return Err(
                     "The transaction's logic sig contains no program. Can't compute program hash"
                         .to_string(),
-                ),
-            };
-            let h = clerk_sign::hash_program(&program);
+                );
+            }
+            let h = clerk_sign::hash_program(&lsig_of_stxn.logic);
             lsig_stxn = Some(stxn);
             h
         } else {
@@ -983,15 +987,7 @@ fn run_tealsign_inner(args: TealsignArgs) -> Result<(), String> {
                 clerk_sign::EVAL_MAX_ARGS
             ));
         }
-        let lsig = stxn.lsig.get_or_insert_with(algo_types::LogicSig::default);
-        let mut existing = lsig.args.take().unwrap_or_default();
-        // go (`cmd/goal/tealsign.go`) pads with nil args, encoded as msgpack
-        // `nil` (issue #2430)
-        while existing.len() < idx + 1 {
-            existing.push(None);
-        }
-        existing[idx] = Some(serde_bytes::ByteBuf::from(signature.to_vec()));
-        lsig.args = Some(existing);
+        tealsign_set_arg(&mut stxn, lsig_of_stxn, idx, &signature);
 
         let path = args
             .lsig_txn
@@ -1012,6 +1008,49 @@ fn run_tealsign_inner(args: TealsignArgs) -> Result<(), String> {
         base64::engine::general_purpose::STANDARD.encode(signature)
     );
     Ok(())
+}
+
+/// go v5.1's `tealsign` `lsig`: the LogicSig authorizing `stxn`, `stxn.Lsig`
+/// or, for an `ls`-scheme SKsig, the one `SKsig.Lsig()` reads out of it (the
+/// program is the public key, the arguments the encoded signature).
+fn tealsign_lsig(stxn: &SignedTransaction) -> Result<algo_types::LogicSig, String> {
+    match stxn.pqsig.as_ref() {
+        Some(sk) if sk.scheme == algo_types::SIG_SCHEME_LOGIC_SIG => {
+            algo_validate::signature::logicsig_from_sksig(sk).map_err(|e| e.to_string())
+        }
+        _ => Ok(stxn.lsig.clone().unwrap_or_default()),
+    }
+}
+
+/// go v5.1's `--set-lsig-arg-idx`: argument `idx` of the program authorizing
+/// `stxn` becomes `signature`, padding earlier ones with nil (msgpack `nil`,
+/// issue #2430), and goes back where the arguments live: into the encoded
+/// signature of an `ls`-scheme SKsig, otherwise into `stxn.Lsig.Args`.
+fn tealsign_set_arg(
+    stxn: &mut SignedTransaction,
+    lsig: algo_types::LogicSig,
+    idx: usize,
+    signature: &[u8; 64],
+) {
+    let mut existing = lsig.args.unwrap_or_default();
+    while existing.len() < idx + 1 {
+        existing.push(None);
+    }
+    existing[idx] = Some(serde_bytes::ByteBuf::from(signature.to_vec()));
+    match stxn.pqsig.as_mut() {
+        Some(sk) if sk.scheme == algo_types::SIG_SCHEME_LOGIC_SIG => {
+            let args: Vec<Option<Vec<u8>>> = existing
+                .iter()
+                .map(|a| a.as_ref().map(|b| b.to_vec()))
+                .collect();
+            sk.signature = serde_bytes::ByteBuf::from(algo_codec::encode_logic_sig_args(&args));
+        }
+        _ => {
+            stxn.lsig
+                .get_or_insert_with(algo_types::LogicSig::default)
+                .args = Some(existing);
+        }
+    }
 }
 
 // ---- clerk compile --------------------------------------------------------
@@ -1927,6 +1966,19 @@ pub fn run_multisig_signprogram(
     }
 }
 
+/// go v5.1 `multisig signprogram`: a LogicSig delegated by a salted-key
+/// signature cannot be combined with a multisig.
+fn refuse_salted_key_lsig(lsig: &algo_types::LogicSig) -> Result<(), String> {
+    if lsig.pqsig.as_ref().is_some_and(|p| !p.blank()) {
+        return Err(
+            "LogicSig file contains a salted-key signature (pqsig); a LogicSig delegated \
+             by a salted-key signature cannot be combined with multisig"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn run_multisig_signprogram_inner(
     args: MultisigSignProgramArgs,
     wallet: Option<String>,
@@ -2003,6 +2055,7 @@ fn run_multisig_signprogram_inner(
 
     // Get or create the partial multisig (multisig.go:228-251).
     let partial: algo_types::MultisigSig = if got_partial {
+        refuse_salted_key_lsig(&lsig)?;
         if use_legacy_msig {
             if lsig.lmsig.as_ref().is_some_and(|m| !m.subsigs.is_empty()) {
                 return Err(
@@ -2775,13 +2828,18 @@ pub(crate) fn kmd_msg(e: &KmdError) -> String {
     }
 }
 
-/// Go `clerk group` (`cmd/goal/clerk.go`): `!Sig.Blank() || !Msig.Blank() ||
-/// !PQsig.Blank()`. The LogicSig is deliberately NOT part of the check (it is
-/// preserved so the group can be verified by a logicsig arg).
+/// Go `clerk group` (`cmd/goal/clerk.go`, v5.1): `!Sig.Blank() || !Msig.Blank()
+/// || (!SKsig.Blank() && !SKsig.IsLogicSig())`. The LogicSig is deliberately NOT
+/// part of the check (it is preserved so the group can be verified by a
+/// logicsig arg), and neither is an `ls`-scheme salted-key proof, which
+/// authorizes by program like a LogicSig does.
 fn group_input_already_signed(stxn: &SignedTransaction) -> bool {
     stxn.sig != [0u8; 64]
         || stxn.msig.as_ref().is_some_and(|m| !m.blank())
-        || stxn.pqsig.as_ref().is_some_and(|p| !p.blank())
+        || stxn
+            .pqsig
+            .as_ref()
+            .is_some_and(|p| !p.blank() && p.scheme != algo_types::SIG_SCHEME_LOGIC_SIG)
 }
 
 #[cfg(test)]
@@ -2802,6 +2860,13 @@ mod tests {
             ..Default::default()
         });
         assert!(group_input_already_signed(&s));
+        // An `ls`-scheme proof carries a program, like a LogicSig: kept.
+        s.pqsig = Some(algo_types::pq::SaltedKeySig {
+            scheme: *b"ls",
+            public_key: serde_bytes::ByteBuf::from(vec![2, 0x20, 1, 1, 0x22]),
+            ..Default::default()
+        });
+        assert!(!group_input_already_signed(&s));
         // LogicSig is preserved by go, never "already signed".
         let l = SignedTransaction {
             lsig: Some(algo_types::LogicSig {
@@ -2811,6 +2876,76 @@ mod tests {
             ..Default::default()
         };
         assert!(!group_input_already_signed(&l));
+    }
+
+    #[test]
+    fn multisig_signprogram_refuses_a_salted_key_delegated_lsig() {
+        let mut lsig = algo_types::LogicSig::default();
+        assert!(refuse_salted_key_lsig(&lsig).is_ok());
+        lsig.pqsig = Some(algo_types::pq::SaltedKeySig {
+            scheme: *b"f1",
+            public_key: serde_bytes::ByteBuf::from(vec![1]),
+            ..Default::default()
+        });
+        assert_eq!(
+            refuse_salted_key_lsig(&lsig).unwrap_err(),
+            "LogicSig file contains a salted-key signature (pqsig); a LogicSig delegated by a \
+             salted-key signature cannot be combined with multisig"
+        );
+    }
+
+    /// go v5.1 `tealsign`: the program and its arguments live in `stxn.Lsig` or,
+    /// for an `ls`-scheme proof, in the SKsig; `--set-lsig-arg-idx` writes the
+    /// signature back where they were found.
+    #[test]
+    fn tealsign_reads_and_writes_lsig_args_in_either_authorization() {
+        let program = vec![2u8, 0x20, 1, 1, 0x22];
+        let sig = [7u8; 64];
+
+        // a plain LogicSig
+        let mut plain = SignedTransaction {
+            lsig: Some(algo_types::LogicSig {
+                logic: serde_bytes::ByteBuf::from(program.clone()),
+                args: Some(vec![Some(serde_bytes::ByteBuf::from(b"a".to_vec()))]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let l = tealsign_lsig(&plain).unwrap();
+        assert_eq!(l.logic.as_ref(), program.as_slice());
+        tealsign_set_arg(&mut plain, l, 2, &sig);
+        let args = plain.lsig.as_ref().unwrap().args.clone().unwrap();
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0].as_ref().map(|b| b.as_ref()), Some(&b"a"[..]));
+        assert!(args[1].is_none(), "padded with nil");
+        assert_eq!(args[2].as_ref().map(|b| b.as_ref()), Some(&sig[..]));
+        assert!(plain.pqsig.is_none());
+
+        // an `ls`-scheme SKsig: the program is the public key, the arguments
+        // are in the signature
+        let encoded = algo_codec::encode_logic_sig_args(&[Some(b"x".to_vec())]);
+        let mut ls = SignedTransaction {
+            pqsig: Some(algo_types::pq::SaltedKeySig {
+                scheme: *b"ls",
+                public_key: serde_bytes::ByteBuf::from(program.clone()),
+                signature: serde_bytes::ByteBuf::from(encoded),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let l = tealsign_lsig(&ls).unwrap();
+        assert_eq!(l.logic.as_ref(), program.as_slice());
+        assert_eq!(l.args.as_ref().unwrap().len(), 1);
+        tealsign_set_arg(&mut ls, l, 1, &sig);
+        assert!(ls.lsig.is_none(), "the LogicSig field stays empty");
+        let decoded =
+            algo_codec::decode_logic_sig_args(&ls.pqsig.as_ref().unwrap().signature).unwrap();
+        assert_eq!(decoded, vec![Some(b"x".to_vec()), Some(sig.to_vec())]);
+        // the program is unchanged
+        assert_eq!(
+            ls.pqsig.as_ref().unwrap().public_key.as_ref(),
+            program.as_slice()
+        );
     }
 
     fn sample_payment(amount: u64, receiver: [u8; 32]) -> Transaction {

@@ -1368,7 +1368,13 @@ fn populate_method_call_txn_args(
             ));
         }
         let stxn = stxns.into_iter().next().expect("checked len == 1");
-        if stxn.sig != [0u8; 64] || stxn.msig.as_ref().is_some_and(|m| !m.blank()) {
+        // go v5.1: a normal, Msig or salted-key signature is a signature; a
+        // LogicSig or an `ls`-scheme salted-key proof (which authorize by
+        // program) is not.
+        if stxn.sig != [0u8; 64]
+            || stxn.msig.as_ref().is_some_and(|m| !m.blank())
+            || stxn.pqsig.as_ref().is_some_and(|p| !p.blank() && !is_ls_scheme(p))
+        {
             return Err(format!("Transaction from {path} has already been signed"));
         }
         if stxn.txn.group != [0u8; 32] {
@@ -1631,6 +1637,7 @@ fn run_method_inner(args: MethodArgs, wallet: Option<String>) -> Result<ExitCode
                 signed_group.push(SignedTransaction {
                     txn: unsigned_txn.clone(),
                     lsig: arg_stxn.lsig.clone(),
+                    pqsig: arg_stxn.pqsig.clone(),
                     auth_addr: arg_stxn.auth_addr,
                     ..SignedTransaction::default()
                 });
@@ -1960,9 +1967,17 @@ fn should_stop_after_page(limit_flag: u64, explicit_next: &str) -> bool {
     limit_flag > 0 || !explicit_next.is_empty()
 }
 
-/// Go `goal app method` (`cmd/goal/application.go`): `!txnFromArgs.Lsig.Blank()`.
+/// go's `SaltedKeySig.IsLogicSig()`: the `ls` scheme, a program standing in for
+/// the public key.
+fn is_ls_scheme(sksig: &algo_types::SaltedKeySig) -> bool {
+    sksig.scheme == algo_types::SIG_SCHEME_LOGIC_SIG
+}
+
+/// Go `goal app method` (`cmd/goal/application.go`, v5.1):
+/// `!txnFromArgs.Lsig.Blank() || txnFromArgs.SKsig.IsLogicSig()`.
 fn arg_has_logicsig(stxn: &SignedTransaction) -> bool {
     stxn.lsig.as_ref().is_some_and(|l| !l.is_blank())
+        || stxn.pqsig.as_ref().is_some_and(is_ls_scheme)
 }
 
 #[cfg(test)]
@@ -1981,6 +1996,27 @@ mod tests {
             ..Default::default()
         });
         assert!(arg_has_logicsig(&s));
+
+        // an `ls`-scheme proof authorizes by program too (go v5.1)
+        let ls = SignedTransaction {
+            pqsig: Some(algo_types::SaltedKeySig {
+                scheme: *b"ls",
+                public_key: serde_bytes::ByteBuf::from(vec![2, 0x20, 1, 1, 0x22]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(arg_has_logicsig(&ls));
+        // a key-scheme proof does not
+        let key = SignedTransaction {
+            pqsig: Some(algo_types::SaltedKeySig {
+                scheme: *b"f1",
+                public_key: serde_bytes::ByteBuf::from(vec![1]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!arg_has_logicsig(&key));
     }
 
     // --- apps.AppCallBytes-form parsing ---
@@ -2201,6 +2237,53 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("Cannot read file"));
+    }
+
+    /// go v5.1 `populateMethodCallTxnArgs`: a key-scheme salted-key signature
+    /// is "already signed", an `ls`-scheme proof (authorizes by program) is not.
+    #[test]
+    fn txn_arg_already_signed_check_follows_the_salted_key_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, scheme: [u8; 2]| {
+            // an `ls` proof carries its program; a key scheme its public key
+            let public_key = if scheme == *b"ls" {
+                vec![2u8, 0x20, 1, 1, 0x22]
+            } else {
+                vec![0u8; 1793]
+            };
+            let stxn = SignedTransaction {
+                txn: algo_types::Transaction {
+                    txn_type: algo_types::TxnType::Pay,
+                    sender: algo_types::Address([1u8; 32]),
+                    receiver: algo_types::Address([2u8; 32]),
+                    fee: 1000,
+                    first_valid: 1.into(),
+                    last_valid: 1001.into(),
+                    genesis_hash: [9u8; 32],
+                    amount: 5,
+                    ..Default::default()
+                },
+                pqsig: Some(algo_types::SaltedKeySig {
+                    scheme,
+                    signature: serde_bytes::ByteBuf::from(vec![3u8; 10]),
+                    public_key: serde_bytes::ByteBuf::from(public_key),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let path = dir.path().join(name);
+            std::fs::write(&path, algo_codec::canonical_encode_signed_transaction(&stxn)).unwrap();
+            path.display().to_string()
+        };
+        let key = write("key.stxn", *b"f1");
+        let err = populate_method_call_txn_args(&[TransactionType::Pay], std::slice::from_ref(&key))
+            .unwrap_err();
+        assert_eq!(err, format!("Transaction from {key} has already been signed"));
+
+        let ls = write("ls.stxn", *b"ls");
+        let ok = populate_method_call_txn_args(&[TransactionType::Pay], &[ls]).unwrap();
+        assert_eq!(ok.len(), 1);
+        assert!(arg_has_logicsig(&ok[0]), "the ls proof is kept in the group");
     }
 
     // --- method resolution ---
