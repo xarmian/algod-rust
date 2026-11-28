@@ -101,11 +101,15 @@ fn go_consensus_table_equals_the_built_in_table() {
     //   struct fields once permanently on, so a go dump carries no key and the
     //   override loader defaults them to true (`DefaultTrue`); algod-rust's
     //   built-in table keeps the historical per-version value.
-    const SKIP: [&str; 4] = [
+    //   (`support_signed_txn_in_block` is still a go field, so it IS compared.)
+    // * the `approved_upgrade` edges of `future`/`alpha*`/`fnet*` are not
+    //   modelled (algod-rust keeps only the one live edge, see
+    //   `HISTORICAL_APPROVED_UPGRADES`), so only Rust's edges are checked
+    //   against go's map, not the reverse.
+    const SKIP: [&str; 3] = [
         "approved_upgrade",
         "enable_fee_pooling",
         "enable_logicsig_size_pooling",
-        "support_signed_txn_in_block",
     ];
     let mut bad = Vec::new();
     for v in &go_versions {
@@ -137,13 +141,9 @@ fn go_consensus_table_equals_the_built_in_table() {
     }
     assert!(
         bad.is_empty(),
-        "{} differences:
-{}",
+        "{} differences:\n{}",
         bad.len(),
-        bad.join(
-            "
-"
-        )
+        bad.join("\n")
     );
 }
 
