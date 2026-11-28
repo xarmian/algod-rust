@@ -929,6 +929,8 @@ pub async fn resolve_addresses(
 /// (genuinely signed, e.g. replayed from another bootstrap domain), and
 /// hickory returns the whole answer section unfiltered when the queried name is
 /// present. A CNAME is not followed (go: "rejects a CNAME for a TXT query").
+/// A bootstrap SRV/TXT name served through a CNAME therefore yields nothing, as in
+/// go. Keep in sync with the copy in `algo-p2p/src/dnsaddr.rs` (algo-p2p cannot depend on algo-network).
 fn answers_for_query<'a>(
     query: &'a hickory_resolver::proto::op::Query,
     answers: &'a [hickory_resolver::proto::rr::Record],
