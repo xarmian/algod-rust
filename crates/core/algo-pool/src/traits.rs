@@ -91,7 +91,11 @@ pub trait BlockEvaluator: Send {
 /// call `generate_block` for that round: nothing here could propose.
 pub trait VotingAccountSupplier: Send + Sync {
     /// Addresses with a participation key valid for `round`.
-    fn voting_accounts_for_round(&self, round: Round) -> Vec<Address>;
+    ///
+    /// An `Err` means the registry could not be read: the pool then does not
+    /// treat the round as having no proposer (it generates the block as if
+    /// there were no supplier).
+    fn voting_accounts_for_round(&self, round: Round) -> Result<Vec<Address>, String>;
 }
 
 // ── PoolLedger ───────────────────────────────────────────────────

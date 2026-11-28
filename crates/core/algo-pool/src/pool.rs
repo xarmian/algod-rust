@@ -315,12 +315,18 @@ impl TransactionPool {
         self
     }
 
-    /// go's `getVotingAccountsForRound`: empty without a supplier.
-    fn voting_accounts_for_round(&self, round: Round) -> Vec<Address> {
-        self.voting_accounts
-            .as_ref()
-            .map(|v| v.voting_accounts_for_round(round))
-            .unwrap_or_default()
+    /// go's `getVotingAccountsForRound`: empty without a supplier. `None` when
+    /// the supplier could not read its registry (the round is then not
+    /// treated as having no proposer).
+    fn voting_accounts_for_round(&self, round: Round) -> Option<Vec<Address>> {
+        let supplier = self.voting_accounts.as_ref()?;
+        match supplier.voting_accounts_for_round(round) {
+            Ok(accounts) => Some(accounts),
+            Err(e) => {
+                tracing::warn!(round = round.0, error = %e, "pool: cannot read the voting accounts");
+                None
+            }
+        }
     }
 
     // ── Public query methods ─────────────────────────────────────
@@ -686,7 +692,7 @@ impl TransactionPool {
                 round_started_evaluating: eval_round,
                 ..Default::default()
             };
-            if !force_assembly && self.voting_accounts.is_some() && proposers.is_empty() {
+            if !force_assembly && proposers.as_ref().is_some_and(|p| p.is_empty()) {
                 asm.results.skipped = true;
                 asm.results.ok = true;
                 asm.results.assembly_completed_or_abandoned = true;
@@ -765,7 +771,7 @@ impl TransactionPool {
                     asm.results.assembly_completed_or_abandoned = true;
                     // Looked up again, so a key installed while the
                     // transactions were re-evaluated counts.
-                    let proposers = self.voting_accounts_for_round(eval_rnd);
+                    let proposers = self.voting_accounts_for_round(eval_rnd).unwrap_or_default();
                     match evaluator.generate_block(&proposers) {
                         Ok(block) => {
                             asm.results.block = Some(block);
@@ -1231,7 +1237,14 @@ impl TransactionPool {
         // Reset the deadline on return so that a later round's recompute does
         // not see an expired deadline and cut its block short (go's
         // `defer func() { pool.assemblyDeadline = time.Time{} }()`).
-        self.assembly_mu.lock().deadline = None;
+        // Only the deadline this call set: a newer round's request may have
+        // stored its own meanwhile.
+        {
+            let mut asm = self.assembly_mu.lock();
+            if asm.deadline == Some(deadline) {
+                asm.deadline = None;
+            }
+        }
         if self.config.enable_assemble_stats {
             if let Ok(ref block) = result {
                 self.emit_assemble_block_stats(round, block);
@@ -1501,7 +1514,7 @@ impl TransactionPool {
             ))
         })?;
 
-        let proposers = self.voting_accounts_for_round(round);
+        let proposers = self.voting_accounts_for_round(round).unwrap_or_default();
         evaluator.generate_block(&proposers).map_err(|e| {
             PoolError::Evaluator(format!(
                 "TransactionPool.assembleEmptyBlock: cannot generate block for {}: {}",
@@ -4361,9 +4374,9 @@ mod tests {
     }
 
     impl crate::traits::VotingAccountSupplier for CountingSupplier {
-        fn voting_accounts_for_round(&self, _round: Round) -> Vec<Address> {
+        fn voting_accounts_for_round(&self, _round: Round) -> Result<Vec<Address>, String> {
             self.queries.fetch_add(1, Ordering::SeqCst);
-            self.accounts.clone()
+            Ok(self.accounts.clone())
         }
     }
 
@@ -4504,12 +4517,12 @@ mod tests {
     }
 
     impl crate::traits::VotingAccountSupplier for ExpiringSupplier {
-        fn voting_accounts_for_round(&self, round: Round) -> Vec<Address> {
-            if round.0 <= 2 {
+        fn voting_accounts_for_round(&self, round: Round) -> Result<Vec<Address>, String> {
+            Ok(if round.0 <= 2 {
                 vec![self.proposer]
             } else {
                 Vec::new()
-            }
+            })
         }
     }
 
@@ -4552,5 +4565,28 @@ mod tests {
         assert!(pool.has_evaluator());
         assert!(pool.assembly_mu.lock().results.skipped);
         assert_eq!(log.calls.lock().unwrap().len(), 1, "nothing generated");
+    }
+
+    struct FailingSupplier;
+
+    impl crate::traits::VotingAccountSupplier for FailingSupplier {
+        fn voting_accounts_for_round(&self, _round: Round) -> Result<Vec<Address>, String> {
+            Err("registry locked".into())
+        }
+    }
+
+    /// A registry that cannot be read is not "no keys": the round is not
+    /// skipped.
+    #[test]
+    fn an_unreadable_registry_does_not_skip_generation() {
+        let log = Arc::new(GenLog::default());
+        let ledger = Arc::new(GenLedger {
+            round: std::sync::atomic::AtomicU64::new(1),
+            log,
+        });
+        let pool = TransactionPool::new(PoolConfig::default(), ledger)
+            .with_voting_accounts(Arc::new(FailingSupplier));
+        recompute(&pool, false);
+        assert!(!pool.assembly_mu.lock().results.skipped);
     }
 }
