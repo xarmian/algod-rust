@@ -16,6 +16,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with algod-rust.  If not, see <https://www.gnu.org/licenses/>.
 //
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Issue #2543: the whole `config.Consensus` table of go-algorand
 //! `v5.1.1-stable` (every version, every `ConsensusParams` field), dumped by
