@@ -3992,7 +3992,9 @@ mod backlog_queue_tests {
                 .await;
         }
         for _ in 0..400 {
-            if calls.load(Ordering::SeqCst) as u64 + handler.backlog_dropped_count() == total {
+            if calls.load(Ordering::SeqCst) as u64 + handler.backlog_dropped_count() == total
+                && handler.backlog_bytes() == 0
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
