@@ -95,6 +95,11 @@ pub enum Ty {
     Slice(&'static Ty, &'static str),
     /// A struct.
     Struct(&'static [Field]),
+    /// `codec.Raw` (`[]byte`, but decoded by `Decoder.rawBytes`): the text of
+    /// the next value as it stands in the body (`nextValueBytes`, a
+    /// `swallow` of it, `null` leaves it empty), printed as the base64 of
+    /// those bytes, `null` when empty. Only the JSON decoder reads it.
+    Raw,
     /// `interface{}` (go-codec's `DecodeNaked`): any value; a JSON object
     /// as a `map[string]interface{}`, an array as `[]interface{}`, a number
     /// as a `float64` (or the integer it holds), printed as decoded. Only the
@@ -209,7 +214,9 @@ fn zero(ty: &'static Ty) -> Value {
         Ty::Str => Value::String(String::new()),
         Ty::U64 | Ty::U32 | Ty::U16 | Ty::U8 | Ty::I64 => Value::from(0u64),
         Ty::Bool => Value::Bool(false),
-        Ty::Bytes | Ty::Strings | Ty::FastSlice(_) | Ty::Slice(..) | Ty::Map(..) => Value::Null,
+        Ty::Bytes | Ty::Raw | Ty::Strings | Ty::FastSlice(_) | Ty::Slice(..) | Ty::Map(..) => {
+            Value::Null
+        }
         Ty::ByteArray(n) => {
             Value::String(base64::engine::general_purpose::STANDARD.encode(vec![0u8; *n]))
         }
@@ -287,7 +294,12 @@ struct Dec<'a> {
     /// unfiltered: only the REST client's decode ([`Mode::Io`]); the
     /// request decoding of the node keeps its lossy strings.
     raw_strings: bool,
+    /// `Decoder.depth`: containers entered and not yet left.
+    depth: u32,
 }
+
+/// go-codec's `decDefMaxDepth`.
+const MAX_DEPTH: u32 = 1024;
 
 fn is_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | b'\n')
@@ -320,6 +332,7 @@ impl<'a> Dec<'a> {
             hit_end: false,
             raw_strings: mode == Mode::Io,
             guard: None,
+            depth: 0,
         }
     }
 
@@ -502,6 +515,16 @@ impl<'a> Dec<'a> {
         Ok(())
     }
 
+    /// `depthIncr`, right after a container's start is read: the container
+    /// that makes the depth reach `decDefMaxDepth` panics.
+    fn depth_incr(&mut self) -> Result<(), Error> {
+        self.depth += 1;
+        if self.depth >= MAX_DEPTH {
+            return self.err("maximum decoding depth exceeded");
+        }
+        Ok(())
+    }
+
     fn read_map_start(&mut self) -> Result<(), Error> {
         self.ensure_tok()?;
         if self.tok != b'{' {
@@ -512,7 +535,7 @@ impl<'a> Dec<'a> {
         }
         self.tok = 0;
         self.c = Container::MapStart;
-        Ok(())
+        self.depth_incr()
     }
 
     fn read_array_start(&mut self) -> Result<(), Error> {
@@ -525,7 +548,7 @@ impl<'a> Dec<'a> {
         }
         self.tok = 0;
         self.c = Container::ArrayStart;
-        Ok(())
+        self.depth_incr()
     }
 
     fn check_break(&mut self) -> Result<bool, Error> {
@@ -580,6 +603,7 @@ impl<'a> Dec<'a> {
         }
         self.tok = 0;
         self.c = Container::ArrayEnd;
+        self.depth = self.depth.saturating_sub(1);
         Ok(())
     }
 
@@ -621,6 +645,7 @@ impl<'a> Dec<'a> {
         }
         self.tok = 0;
         self.c = Container::MapEnd;
+        self.depth = self.depth.saturating_sub(1);
         Ok(())
     }
 
@@ -947,8 +972,64 @@ impl<'a> Dec<'a> {
             Ty::FastSlice(elem) => self.decode_fast_slice(elem, v)?,
             Ty::Map(key, val) => self.decode_map(key, val, v)?,
             Ty::Any => *v = self.decode_naked()?,
+            Ty::Raw => {
+                let raw = self.raw_bytes()?;
+                *v = if raw.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(base64::engine::general_purpose::STANDARD.encode(raw))
+                };
+            }
         }
         Ok(())
+    }
+
+    /// `Decoder.rawBytes`: `nextValueBytes` (`uncacheRead`, track, `swallow`,
+    /// stop tracking). The cached token is handed back first, so the bytes
+    /// are the value's text from its first byte; a lookahead byte still
+    /// cached at the end is not part of it.
+    fn raw_bytes(&mut self) -> Result<Vec<u8>, Error> {
+        if self.tok != 0 {
+            self.unreadn1()?;
+            self.tok = 0;
+        }
+        let start = self.n;
+        self.swallow()?;
+        let end = if self.tok != 0 { self.n - 1 } else { self.n };
+        Ok(self.src[start..end].to_vec())
+    }
+
+    /// `Decoder.swallow`: read one value and drop it, the structure and the
+    /// scalars checked as a decode into an `interface{}` would.
+    fn swallow(&mut self) -> Result<(), Error> {
+        if self.try_decode_as_nil()? {
+            return Ok(());
+        }
+        match self.container_type()? {
+            VALUE_TYPE_MAP => {
+                self.read_map_start()?;
+                let mut rounds = 0u64;
+                while self.more(&mut rounds, 0)? {
+                    self.read_map_elem_key()?;
+                    self.swallow()?;
+                    self.read_map_elem_value()?;
+                    self.swallow()?;
+                }
+                self.read_map_end()
+            }
+            VALUE_TYPE_ARRAY => {
+                self.read_array_start()?;
+                let mut rounds = 0u64;
+                while self.more(&mut rounds, 0)? {
+                    self.read_array_elem()?;
+                    self.swallow()?;
+                }
+                self.read_array_end()
+            }
+            VALUE_TYPE_STRING => self.append_string_as_bytes().map(|_| ()),
+            // a number, `true` or `false`: `DecodeNaked`
+            _ => self.decode_naked().map(|_| ()),
+        }
     }
 
     /// go-codec's `DecodeNaked` of a JSON value into an `interface{}`.

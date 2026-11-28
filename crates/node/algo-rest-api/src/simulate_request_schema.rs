@@ -292,5 +292,25 @@ pub const V2_PREENCODEDSIMULATEREQUEST: Ty = Ty::Struct(&[
     Field("fix-signers", Ty::Bool),
 ]);
 
-/// The body go decodes: `v2.PreEncodedSimulateRequest`.
+/// `v2.simulateRequestJSONGroup`.
+pub const V2_SIMULATEREQUESTJSONGROUP: Ty = Ty::Struct(&[
+    Field("txns", Ty::Slice(&Ty::Raw, "[]codec.Raw")),
+]);
+
+/// `v2.simulateRequestJSON`.
+pub const V2_SIMULATEREQUESTJSON: Ty = Ty::Struct(&[
+    Field("round", Ty::U64),
+    Field("allow-empty-signatures", Ty::Bool),
+    Field("allow-more-logging", Ty::Bool),
+    Field("allow-unnamed-resources", Ty::Bool),
+    Field("extra-opcode-budget", Ty::I64),
+    Field("exec-trace-config", SIMULATION_EXECTRACECONFIG),
+    Field("fix-signers", Ty::Bool),
+    Field("txn-groups", Ty::Slice(&V2_SIMULATEREQUESTJSONGROUP, "[]v2.simulateRequestJSONGroup")),
+]);
+
+/// The body of a msgpack request, as go-codec's reflection sees it: `v2.PreEncodedSimulateRequest`.
 pub const SIMULATE_REQUEST: Ty = V2_PREENCODEDSIMULATEREQUEST;
+
+/// The body of a JSON request go decodes first, each transaction kept as raw JSON: `v2.simulateRequestJSON`.
+pub const SIMULATE_REQUEST_JSON: Ty = V2_SIMULATEREQUESTJSON;

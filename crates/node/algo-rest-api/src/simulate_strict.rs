@@ -604,17 +604,65 @@ pub fn parse_json_request(body: &[u8]) -> JsonSimulate {
     parse_request_pairs(pairs).map_or(JsonSimulate::NotGoForm, JsonSimulate::Decoded)
 }
 
-/// go's `decode(protocol.JSONStrictHandle, body, &simulateRequest)` (issue
-/// #2477): go-codec's JSON decode of the body into `PreEncodedSimulateRequest`,
-/// the decoded value, or go's response text for it
-/// (`failed to decode object: <go-codec error>`, as bytes: the text quotes the
-/// body's own tokens).
-pub fn go_json_decode(body: &[u8]) -> Result<serde_json::Value, Vec<u8>> {
-    algo_codec::go_codec_json::decode_slice(body, &crate::simulate_request_schema::SIMULATE_REQUEST)
-        .map_err(|e| [b"failed to decode object: ".as_slice(), &e.to_bytes()].concat())
+/// go's `decodeSimulateRequest` for a JSON body (issues #2477, #2608):
+/// `decode(protocol.JSONStrictHandle, body, &simulateRequestJSON)` with each
+/// transaction kept as `codec.Raw`, then `simulation.CheckTxnGroupCount`, then
+/// `bounds.MaxTxGroupSize` per group, and only then each transaction decoded
+/// on its own (`SignedTxn`; an empty one, from `null`, stays zero), so that
+/// go-codec's error positions are relative to the transaction. Returns the
+/// request as the typed [`crate::simulate_request_schema::SIMULATE_REQUEST`]
+/// value, or go's response text for the failure (as bytes: the text quotes
+/// the body's own tokens).
+pub fn go_json_decode_request(body: &[u8]) -> Result<serde_json::Value, Vec<u8>> {
+    use crate::simulate_request_schema::{SIMULATE_REQUEST_JSON, TRANSACTIONS_SIGNEDTXN};
+    use algo_codec::go_codec_json::decode_slice;
+    use base64::Engine as _;
+    // `decode`: `failed to decode object: <go-codec error>`
+    let failed = |e: algo_codec::go_codec_json::Error| {
+        [b"failed to decode object: ".as_slice(), &e.to_bytes()].concat()
+    };
+    let mut value = decode_slice(body, &SIMULATE_REQUEST_JSON).map_err(failed)?;
+    let groups = match value.get("txn-groups") {
+        Some(serde_json::Value::Array(groups)) => groups.clone(),
+        _ => Vec::new(),
+    };
+    // `simulation.CheckTxnGroupCount`: `MaxTxnGroups` is 1
+    if groups.len() != 1 {
+        return Err(format!("expected 1 transaction group, got {}", groups.len()).into_bytes());
+    }
+    let raw_txns = |group: &serde_json::Value| -> Vec<serde_json::Value> {
+        match group.get("txns") {
+            Some(serde_json::Value::Array(txns)) => txns.clone(),
+            _ => Vec::new(),
+        }
+    };
+    for group in &groups {
+        let n = raw_txns(group).len();
+        if n > 16 {
+            return Err(format!("transaction group size {n} exceeds limit 16").into_bytes());
+        }
+    }
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut decoded_groups = Vec::with_capacity(groups.len());
+    for group in &groups {
+        let mut txns = Vec::new();
+        for raw in raw_txns(group) {
+            let bytes = match &raw {
+                serde_json::Value::String(text) => {
+                    b64.decode(text).expect("a value this decoder encoded")
+                }
+                // `len(raw) == 0`: a `null`, which leaves the transaction empty
+                _ => b"null".to_vec(),
+            };
+            txns.push(decode_slice(&bytes, &TRANSACTIONS_SIGNEDTXN).map_err(failed)?);
+        }
+        decoded_groups.push(serde_json::json!({ "txns": txns }));
+    }
+    value["txn-groups"] = serde_json::Value::Array(decoded_groups);
+    Ok(value)
 }
 
-/// A request go-codec decoded ([`go_json_decode`]) as the msgpack go would
+/// A request go-codec decoded ([`go_json_decode_request`]) as the msgpack go would
 /// encode it, through the same pipeline as a msgpack body: for the JSON go
 /// accepts beyond its own JSON form (a quoted number, `1e3`, a struct from an
 /// array, a string from a number, text after the first value).
@@ -660,8 +708,9 @@ fn go_value_to_msgpack(
         Ty::Strings => list(v, &Ty::Str)?,
         Ty::FastSlice(elem) | Ty::Slice(elem, _) => list(v, elem)?,
         Ty::Ptr(t) => go_value_to_msgpack(v, t)?,
-        // no request type holds an `interface{}`
-        Ty::Any => return None,
+        // no request type holds an `interface{}`, and `codec.Raw` is only in
+        // the JSON-form request, never in the value this converts
+        Ty::Any | Ty::Raw => return None,
         Ty::Map(key, val) => match v {
             J::Null => Value::Nil,
             J::Object(m) => {
@@ -1050,13 +1099,10 @@ mod tests {
             if !matches!(parse_msgpack_request(body), MsgpackSimulate::NotMsgpack) {
                 return true;
             }
-            let Ok(value) = go_json_decode(body) else {
+            let Ok(value) = go_json_decode_request(body) else {
                 return true;
             };
-            match parse_json_request(body) {
-                JsonSimulate::NotGoForm => request_from_go_value(&value).is_some(),
-                _ => true,
-            }
+            request_from_go_value(&value).is_some()
         };
         let mut checked = 0;
         for line in FIXTURE.lines() {
@@ -1295,13 +1341,15 @@ mod tests {
     #[test]
     fn go_codec_leniency_reaches_the_msgpack_pipeline() {
         for body in [
-            r#"{"txn-groups":[{"txns":[{"sig":"AAAA"}]},{"txns":[{}]}]}"#,
-            r#"{"txn-groups":[{"txns":[{"txn":{"fee":"12"}}]},{"txns":[{}]}]}"#,
-            r#"{"txn-groups":[{"txns":[{"txn":{"type":5}}]},{"txns":[{}]}]}"#,
-            r#"{"txn-groups":[{"txns":[[]]},{"txns":[{}]}]}"#,
-            r#"{"txn-groups":[]}xyz"#,
+            r#"{"txn-groups":[{"txns":[{"sig":"AAAA"}]}]}"#,
+            r#"{"txn-groups":[{"txns":[{"txn":{"fee":"12"}}]}]}"#,
+            r#"{"txn-groups":[{"txns":[{"txn":{"type":5}}]}]}"#,
+            r#"{"txn-groups":[{"txns":[[]]}]}"#,
+            r#"{"txn-groups":[{"txns":[null]}]}"#,
+            r#"{"txn-groups":[{"txns":[{}]}]}xyz"#,
         ] {
-            let value = go_json_decode(body.as_bytes()).expect(body);
+            let value = go_json_decode_request(body.as_bytes())
+                .unwrap_or_else(|e| panic!("{body}: {}", String::from_utf8_lossy(&e)));
             let decoded = request_from_go_value(&value);
             assert!(decoded.is_some(), "{body}: {value}");
         }

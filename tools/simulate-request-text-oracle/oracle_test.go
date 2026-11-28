@@ -536,6 +536,55 @@ func decodeEdgeBodies() []simulateRequestTextCase {
 	} {
 		add(fmt.Sprintf("json_utf8_%02d", i), b)
 	}
+
+	// Issue #2608: a JSON request keeps each transaction as codec.Raw
+	// (go-codec's swallow), so a transaction's own errors surface only after
+	// the group count and size checks, with positions relative to it, and a
+	// value that is not a transaction is swallowed first.
+	nested := func(open, mid, close string, n int) string {
+		return strings.Repeat(open, n) + mid + strings.Repeat(close, n)
+	}
+	oneGroup := func(txns ...string) []byte {
+		return []byte(`{"txn-groups":[{"txns":[` + strings.Join(txns, ",") + `]}]}`)
+	}
+	rawBodies := [][]byte{
+		oneGroup(compact.String()),
+		oneGroup(` ` + compact.String() + ` `),
+		oneGroup(`null`), oneGroup(`null`, `null`), oneGroup(`{}`, `5`, `{}`), oneGroup(`5`),
+		oneGroup(`"x"`), oneGroup(`true`), oneGroup(`tru`), oneGroup(`[`), oneGroup(`[1,`), oneGroup(`{"a":`),
+		oneGroup(`{"a":1 "b":2}`), oneGroup(`{"a" 1}`), oneGroup(`{1:2}`), oneGroup(`[1 2]`), oneGroup(`1.2.3`),
+		oneGroup(`-`), oneGroup(`"\u12"`), oneGroup(`"\x"`), oneGroup(`["a",{"b":[null,true,1e5,"c"]}]`),
+		oneGroup(`{"txn":{"type":"pay"}}`, `{"foo":1}`), oneGroup(`{"foo":1}`, `{"txn":{"type":"pay"}}`),
+		oneGroup(`{"txn":{"type":"pay","foo":1}}`), oneGroup(`{"txn":{"type":"pay"},"foo":1}`),
+		oneGroup(`{"sig":"!!"}`), oneGroup(`{"sig":"AAAA"}`, `{"sig":"!!"}`),
+		oneGroup(strings.Repeat(`null,`, 15) + `null`), oneGroup(strings.Repeat(`null,`, 16) + `null`),
+		oneGroup(strings.Repeat(`{},`, 16) + `{}`), oneGroup(strings.Repeat(`5,`, 16) + `5`),
+		[]byte(`{"txn-groups":[{"txns":[` + strings.Repeat(`5,`, 16) + `5]}],"foo":1}`),
+		[]byte(`{"txn-groups":[{"txns":[5]}],"round":"x"}`),
+		[]byte(`{"txn-groups":[{"txns":[{"txn":{"type":5}}]}],"round":"x"}`),
+		[]byte(`{"txn-groups":[{"txns":[{}]},{"txns":[5]}]}`),
+		[]byte(`{"txn-groups":[{"txns":[5]},{"txns":[{}]}]}`),
+		[]byte(`{"txn-groups":[{"txns":null}]}`), []byte(`{"txn-groups":[null]}`),
+		[]byte(`{"txn-groups":[{"txns":[]}]}`), []byte(`{"txn-groups":[{}]}`),
+		[]byte(`{"txn-groups":[{"txns":[{}]}],"txn-groups":[]}`),
+		[]byte(`{"txn-groups":[{"txns":[{}]},{"txns":[{}]}],"txn-groups":[{"txns":[{}]}]}`),
+		[]byte(`[[],[],[],[],[],[],[],[[]]]`),
+		[]byte(`[null,null,null,null,null,null,null,[{"txns":[5]}]]`),
+		[]byte(`[1,2,3,4,5,6,7,[{"txns":[5]}]]`),
+		[]byte(`[null,null,null,null,null,null,null,[{"txns":[5]}],1]`),
+	}
+	// swallow's depth: the decoder is about 4 containers deep when it reaches
+	// a transaction, and go-codec gives up at depth 1024.
+	for _, n := range []int{1, 100, 1015, 1016, 1017, 1018, 1019, 1020, 1021, 1022, 1030} {
+		rawBodies = append(rawBodies,
+			oneGroup(nested(`[`, ``, `]`, n)),
+			oneGroup(nested(`{"a":`, `1`, `}`, n)),
+			oneGroup(nested(`[`, ``, `]`, n)+`,5`),
+		)
+	}
+	for i, b := range rawBodies {
+		add(fmt.Sprintf("json_raw_%02d", i), b)
+	}
 	return cases
 }
 
@@ -550,13 +599,34 @@ func TestAlgodRustSimulateRequestSchema(t *testing.T) {
 	}
 	g := schemaGen{named: map[reflect.Type]string{}}
 	root := g.ty(reflect.TypeOf(v2.PreEncodedSimulateRequest{}))
+	rootJSON := g.ty(reflect.TypeOf(simulateRequestJSON{}))
 	var b strings.Builder
 	b.WriteString(schemaHeader)
 	for _, d := range g.decls {
 		b.WriteString(d)
 	}
-	fmt.Fprintf(&b, "/// The body go decodes: `%s`.\npub const SIMULATE_REQUEST: Ty = %s;\n", reflect.TypeOf(v2.PreEncodedSimulateRequest{}), root)
+	fmt.Fprintf(&b, "/// The body of a msgpack request, as go-codec's reflection sees it: `%s`.\npub const SIMULATE_REQUEST: Ty = %s;\n\n", reflect.TypeOf(v2.PreEncodedSimulateRequest{}), root)
+	fmt.Fprintf(&b, "/// The body of a JSON request go decodes first, each transaction kept as raw JSON: `v2.simulateRequestJSON`.\npub const SIMULATE_REQUEST_JSON: Ty = %s;\n", rootJSON)
 	require.NoError(t, os.WriteFile(out, []byte(b.String()), 0o644))
+}
+
+// simulateRequestJSONGroup and simulateRequestJSON mirror the unexported types
+// of the same names in daemon/algod/api/server/v2/handlers.go (issue #2608):
+// a JSON request is decoded with each transaction as codec.Raw, and the
+// transactions are decoded one by one afterwards.
+type simulateRequestJSONGroup struct {
+	Txns []codec.Raw `codec:"txns"`
+}
+
+type simulateRequestJSON struct {
+	v2.PreEncodedSimulateRequest
+	TxnGroups []simulateRequestJSONGroup `codec:"txn-groups"`
+}
+
+// goName is t as go prints it: the two local mirrors above live in package
+// v2 there.
+func goName(t reflect.Type) string {
+	return strings.ReplaceAll(t.String(), "test.simulateRequestJSON", "v2.simulateRequestJSON")
 }
 
 const schemaHeader = `// Copyright (C) 2019-2026 Algorand Foundation Ltd.
@@ -624,6 +694,10 @@ func (g *schemaGen) ty(t reflect.Type) string {
 		}
 		return "Ty::Address"
 	}
+	if t == reflect.TypeOf(codec.Raw{}) {
+		// decodeValue -> (*Decoder).raw: nextValueBytes (swallow)
+		return "Ty::Raw"
+	}
 	switch t.Kind() {
 	case reflect.Bool:
 		return "Ty::Bool"
@@ -661,7 +735,7 @@ func (g *schemaGen) ty(t reflect.Type) string {
 			}
 			panic("unexpected fast-path slice " + t.String())
 		}
-		return fmt.Sprintf("Ty::Slice(&%s, %q)", g.ty(e), t.String())
+		return fmt.Sprintf("Ty::Slice(&%s, %q)", g.ty(e), goName(t))
 	case reflect.Map:
 		if t.Key().Kind() != reflect.Uint64 || t.Key().PkgPath() != "" {
 			panic("unexpected map " + t.String())
@@ -671,19 +745,27 @@ func (g *schemaGen) ty(t reflect.Type) string {
 		if name, ok := g.named[t]; ok {
 			return name
 		}
-		name := strings.ToUpper(strings.NewReplacer(".", "_", "/", "_").Replace(t.String()))
+		name := strings.ToUpper(strings.NewReplacer(".", "_", "/", "_").Replace(goName(t)))
 		g.named[t] = name
-		var fields []string
-		g.fields(t, &fields, map[string]bool{})
-		g.decls = append(g.decls, fmt.Sprintf("/// `%s`.\npub const %s: Ty = Ty::Struct(&[\n%s]);\n\n", t.String(), name, strings.Join(fields, "")))
+		var entries []schemaField
+		g.fields(t, 0, &entries)
+		g.decls = append(g.decls, fmt.Sprintf("/// `%s`.\npub const %s: Ty = Ty::Struct(&[\n%s]);\n\n", goName(t), name, strings.Join(resolveFields(t, entries), "")))
 		return name
 	}
 	panic("unexpected kind " + t.String())
 }
 
+// schemaField is one field go-codec's rget collects, with the depth of the
+// embedded struct it came from.
+type schemaField struct {
+	name  string
+	depth int
+	line  string
+}
+
 // fields lists t's fields as go-codec's rget does: unexported and `-` fields
 // skipped, an embedded struct without a tag name inlined at its place.
-func (g *schemaGen) fields(t reflect.Type, out *[]string, seen map[string]bool) {
+func (g *schemaGen) fields(t reflect.Type, depth int, out *[]schemaField) {
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
 		tag := f.Tag.Get("codec")
@@ -703,7 +785,7 @@ func (g *schemaGen) fields(t reflect.Type, out *[]string, seen map[string]bool) 
 				if f.Type.Kind() == reflect.Ptr {
 					panic("unexpected embedded pointer in " + t.String())
 				}
-				g.fields(ft, out, seen)
+				g.fields(ft, depth+1, out)
 				continue
 			}
 		}
@@ -713,10 +795,31 @@ func (g *schemaGen) fields(t reflect.Type, out *[]string, seen map[string]bool) 
 		if name == "" {
 			name = f.Name
 		}
-		if seen[name] {
-			panic("duplicate field name " + name + " in " + t.String())
-		}
-		seen[name] = true
-		*out = append(*out, fmt.Sprintf("    Field(%q, %s),\n", name, g.ty(f.Type)))
+		*out = append(*out, schemaField{name, depth, fmt.Sprintf("    Field(%q, %s),\n", name, g.ty(f.Type))})
 	}
+}
+
+// resolveFields is go-codec's rgetResolveSFI: of several fields of one name
+// the one from the shallowest embedding wins and keeps its own place in the
+// order; two of the same depth would both stay, which no request type has.
+func resolveFields(t reflect.Type, entries []schemaField) []string {
+	var out []string
+	for i, e := range entries {
+		keep := true
+		for j, o := range entries {
+			if i == j || o.name != e.name {
+				continue
+			}
+			if o.depth == e.depth {
+				panic("duplicate field name " + e.name + " in " + t.String())
+			}
+			if o.depth < e.depth {
+				keep = false
+			}
+		}
+		if keep {
+			out = append(out, e.line)
+		}
+	}
+	return out
 }
