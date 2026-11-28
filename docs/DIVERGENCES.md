@@ -55,7 +55,7 @@ consensus-compatible. It exists for three readers:
 | DIV-001 | Falcon-1024 `det1024` implemented in pure Rust; vendored C kept as a runtime-selectable backend (`config.json` `FalconBackend`) | crypto / state proofs / PQ accounts / AVM `falcon_verify` | landed | 2026-10-14 | none (bit-identical keys, signatures, verify decisions, CT conversion) | `crates/core/algo-falcon/`, `crates/node/algo-config/src/lib.rs` (`FalconBackend`), `bin/algod-rust/src/commands/node.rs`, `crates/tools/algokey-rust` | `crypto/falconWrapper.go`, module `github.com/algorand/falcon` v0.1.0 (`falcon.go`, `deterministic.c`, Pornin's reference C) | Go-generated vector corpus diffed in CI, per-function differential tests vs the vendored C, fuzz target (epic #1926) |
 | DIV-002 | `goal node pendingtxns` prints each pending transaction in the REST API's JSON form instead of Go's `encoding/json` dump of its decoded `SignedTxn` structs | goal-rust CLI output | landed | 2026-10-17 | none (client-side formatting of data the node already serves) | `crates/tools/goal-rust/src/cmd/node.rs` (`format_pending_txns`) | `cmd/goal/node.go` (`pendingTxnsCmd`), `libgoal/libgoal.go` (`GetParsedPendingTransactions`) | unit test of the exact text for the empty and non-empty pool, mock-node end-to-end test |
 | DIV-003 | `algo-abi` rejects ABI types whose encoded head size overflows `usize` at parse time, and caps zero-size array element expansion in `decode` | ABI type parsing / decoding (REST `abi:` box names, goal CLI) | landed | 2026-10-24 | none (no such type can be encoded; valid ARC-4 vectors byte-identical) | `crates/core/algo-abi/src/lib.rs` (`check_static_size`, `MAX_ZERO_SIZE_ELEMS`) | `github.com/algorand/avm-abi` `abi/abi_type.go` (`TypeOf`, `GetEncodedSize`), `abi/abi_encode.go` | `algo-abi` unit tests (overflow/huge-array/zero-size cases) plus the unchanged ARC-4 vector suite (#2057) |
-| DIV-004 | (retired) Map-form-only decoders of non-wire forms: the agreement codec's authenticated-form decoders and algokey's PQ key-file reader read only the map form, go also reads a struct sent as an array | none: every reader now reads go's array form | retired | 2026-10-24 (narrowed 2026-11-18 by #2424, 2026-11-21 by #2426; retired 2026-11-21 by #2521) | none | none (the authenticated-form decoders were deleted; `crates/tools/algokey-rust/src/commands/pq/key.rs` reads the key file through `rmp_decode::struct_keys`) | `data/transactions/msgp_gen.go` (`SignedTxn.UnmarshalMsgWithState` struct-from-array branch), `cmd/algokey/msgp_gen.go` (`pqSigningMaterial`), algorand/msgp `msgp/read_bytes.go` | `docs/BYTES_DECODE_PARITY.md` "Issue #2065: final disposition", "Issue #2424", "Issue #2426", "Issue #2521"; `strict_unknown_fields_go_parity` (array cases of every wire entry point, 100000-case fuzz); the `algokey` strict-decode fixture set (`the_key_file_decoder_matches_go_on_every_mutated_file`) |
+| DIV-004 | (retired) Map-form-only decoders of non-wire forms: the agreement codec's authenticated-form decoders and algokey's PQ key-file reader read only the map form, go also reads a struct sent as an array | none: every reader follows go v5.1.1 (map only; the array form only under go-codec's reflection decode) | retired | 2026-10-24 (narrowed 2026-11-18 by #2424, 2026-11-21 by #2426; retired 2026-11-21 by #2521) | none | none (the authenticated-form decoders were deleted; `crates/tools/algokey-rust/src/commands/pq/key.rs` reads the key file through `rmp_decode::struct_keys`) | `data/transactions/msgp_gen.go` (`SignedTxn.UnmarshalMsgWithState` struct-from-array branch), `cmd/algokey/msgp_gen.go` (`pqSigningMaterial`), algorand/msgp `msgp/read_bytes.go` | `docs/BYTES_DECODE_PARITY.md` "Issue #2065: final disposition", "Issue #2424", "Issue #2426", "Issue #2521"; `strict_unknown_fields_go_parity` (go v5.1.1 array-form rows of every wire entry point, all rejections, 100000-case fuzz); the `algokey` strict-decode fixture set (`the_key_file_decoder_matches_go_on_every_mutated_file`) |
 | DIV-005 | `algokey keyreg` and the `--network` presets accept `voimain` (Voi mainnet) and `aramidmain` (Aramid mainnet), networks absent from go-algorand's `validNetworks` map | network presets / algokey genesis-hash table | landed | 2026-10-25 | none (additive preset; the four go networks resolve exactly as before) | `crates/core/algo-types/src/networks.rs`, `bin/algod-rust/src/commands/network_common.rs` | `cmd/algokey/keyreg.go` (`validNetworks`) | genesis-hash pin tests (`networks_parity`, `genesis_test::test_voimain_genesis_hash_matches_fixture`) against the live Voi `/genesis` and `/versions` (epic #2068, #2069, #2070) |
 | DIV-006 | A network preset's bundled `consensus.json` (aramidmain) contributes only protocol versions the binary does not already define; go loads every entry of a `consensus.json` wholesale | `--network aramidmain` consensus table | landed | 2026-10-25 | none (the aramidmain chain only ever uses `aramidmain-v1.0/1..3`, which are loaded exactly as go loads them; the file's stale copies of `future`/`v7`..`v12`/spec-URL protocols are never used by that chain) | `crates/core/algo-types/src/consensus.rs` (`preload_consensus_protocols_with_bundle`), `bin/algod-rust/src/commands/network_common.rs` | `config/config.go` (`PreloadConfigurableConsensusProtocols`), `config/consensus.go` (`ConsensusProtocols.Merge`) | `aramidmain_consensus_test.rs` (`custom_protocols_merge_like_go`, `bundle_adds_only_unknown_protocols`, `data_dir_file_overrides_bundle`) and the live aramidmain catchup + follow (#2070) |
 | DIV-007 | `simulate` serves a past `Request.Round` only from undo data held in memory for at most the last 320 rounds and at most a 16 MiB budget (whichever is fewer rounds), which starts empty at every node start; go serves back to its tracker `dbRound` (about `MaxAcctLookback` behind the latest round) at once after a restart | simulate (`POST /v2/transactions/simulate` with `round`) | landed | 2026-10-31 | none (affects only whether a simulate request with a past round is served; no block, state or consensus path) | `crates/core/algo-ledger/src/undo_journal.rs` (`UndoJournal`), `crates/core/algo-ledger/src/simulation/mod.rs` (`Simulator::rewind`), `crates/core/algo-ledger/src/sqlite.rs` (`undo_note_*`) | `ledger/simulation/simulator.go` (`Simulate`, `simulatorLedger.start`), `ledger/acctupdates.go` (`RoundOffsetError`) | `simulate_past_round_oracle_test.rs` (go oracle: rounds 1, 2 and the latest on a rewards-accruing chain), `simulate_past_round_test.rs` (state, window edge, header rewards state incl. a recalculation round), `undo_journal` unit tests, `simulation_gaps_test.rs` (store without undo data); the latest-round path stays proven by the #2118 go oracle (`simulation_rewards_oracle_test.rs`) |
@@ -232,32 +232,37 @@ by #2521: nothing reads only the map form any more, so algod-rust and
 go-algorand no longer differ here. The entry stays as history and as the
 record of what parity now rests on; it has no source marker.
 
-**What go-algorand does.** Every generated `UnmarshalMsgWithState` first
-calls `msgp.ReadMapHeaderBytes`; on a `TypeError` it retries
-`ReadArrayHeaderBytes` and decodes the fields positionally in Go declaration
-order ("struct-from-array", `ErrTooManyArrayFields` on excess). go-codec
-(`protocol.DecodeReflect`) reads a struct from an array too (`kStruct`):
-positionally in the source order of the struct's encodable fields, a `nil`
-element zeroing the field, an element more than the fields an error.
+**What go-algorand does.** Up to v5.0.5 every generated
+`UnmarshalMsgWithState` first called `msgp.ReadMapHeaderBytes`; on a
+`TypeError` it retried `ReadArrayHeaderBytes` and decoded the fields
+positionally in Go declaration order ("struct-from-array",
+`ErrTooManyArrayFields` on excess). **go v5.1.1 (algorand/msgp 1.1.66, go
+#6774) generates map-only decoders**: an array where a struct is expected is
+the `TypeError` (`msgp: attempted to decode type "array" with method for
+"map"`), empty or not, deep or truncated. go-codec (`protocol.DecodeReflect`)
+still reads a struct from an array (`kStruct`): positionally in the source
+order of the struct's encodable fields, a `nil` element zeroing the field, an
+element more than the fields an error. Since go #6729 the tx-sync response is
+generated msgp (`protocol.Decode`, `rpcs/httpTxSync.go`), so go-codec is left
+with `DecodeReflect` callers (libgoal / goal reading a node's answer, the
+simulate request body, the agreement crash-state file).
 
-**What algod-rust does.** Every reader of bytes a peer, a request or a file
-can carry reads go's array form through `rmp_decode::struct_keys` (#2426,
-#2521): the transaction readers of `algo-types`, the block, its header and the
-block response, the agreement codec's network messages, the tx-sync response
-(go-codec), the identity-handshake messages and algokey's PQ key-file reader
-(`decode_pq_signing_material`, now `protocol.Decode` of `pqSigningMaterial`
-value for value: array form, repeated keys, a missing field left zero, an
-unknown key `ErrNoField`). The positions come from
+**What algod-rust does.** Matches v5.1.1 (#2609; #2426's array reading was
+correct for v5.0.5 and is superseded). `rmp_decode::struct_keys` takes the
+array branch only under `go_codec_reflect` (the simulate request,
+`simulate_strict.rs`); every other reader (the transaction, block, header and
+block-response readers of `algo-types`, the agreement codec, the tx-sync
+response, the identity-handshake messages, algokey's PQ key-file reader and
+the catchpoint file readers of `algo-ledger`) rejects an array. The positions
+for the go-codec branch come from
 `crates/core/algo-types/src/go_struct_order.json`, dumped from go's types by
-`tools/strict-decode-oracle` (checked against go's generated decoders). The
-agreement codec's decoders of its own authenticated forms
-(`decode_credential`, `decode_authenticated_vote`,
-`decode_authenticated_bundle`, with their encoders and tests) had no caller
-outside tests and were deleted in #2521. The one remaining difference is
-invisible: go's `[]byte` field is nil after a `nil` and empty after an empty
-`bin`; the key-file reader holds a `Vec`, and `validate()` only reads the
-length.
-
+`tools/strict-decode-oracle`. Proof: the go-generated rows of every
+`strict_decode` fixture set (`map` -2 rows: array forms of every struct, an
+array under a struct-valued key, headers cut short, arrays nested up to 300
+deep), all `go_ok: false`.
+One difference is invisible: go's `[]byte` field is nil after a `nil` and
+empty after an empty `bin`; algokey's key-file reader holds a `Vec`, and
+`validate()` only reads the length.
 
 Everything else about a struct decode is go's. Since #2424 every consensus
 reader (transactions, blocks, headers, the PQ and state-proof structs, the
@@ -267,12 +272,12 @@ does: the field is decoded again INTO its current value (a nested struct
 merges and `nil` resets it; a slice is re-sliced within go's capacity, hidden
 elements coming back; a `[N]byte` keeps the bytes past a shorter value; a map
 gains entries), and the `required` checks run on the merged result. `dt` and
-`spt` are kept as go's canonical re-encode of what go decodes. The tx-sync
-response is decoded the way go's go-codec (`protocol.DecodeReflect`) decodes
-it: no `required` or `allocbound` checks, and a repeated `Reveals` entry is
-decoded into the existing, unaddressable map value. The non-consensus
-catchpoint, identity-handshake and peer-meta readers do too (#2421), and the
-catchpoint readers also read the array form.
+`spt` are kept as go's canonical re-encode of what go decodes. The simulate
+request body is decoded the way go's go-codec (`protocol.DecodeReflect`)
+decodes it: no `required` or `allocbound` checks, and a repeated `Reveals`
+entry is decoded into the existing, unaddressable map value. The tx-sync
+response, the non-consensus catchpoint, identity-handshake and peer-meta
+readers decode a repeated key like go's generated code too (#2421).
 
 Since #2394 the catchup `decode_block_response` uses the hand-written reader too
 (`decode_block_response_serde` is the old path).

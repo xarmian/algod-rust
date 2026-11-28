@@ -102,23 +102,6 @@ fn entries(b: &[u8]) -> Option<Vec<(&[u8], &[u8])>> {
     Some(out)
 }
 
-/// The elements of the array at the start of `b`, if it is one.
-fn array_items(b: &[u8]) -> Option<Vec<&[u8]>> {
-    let (mut j, n) = match b[0] {
-        c @ 0x90..=0x9f => (1, (c & 0x0f) as usize),
-        0xdc => (3, be(b, 1, 2)),
-        0xdd => (5, be(b, 1, 4)),
-        _ => return None,
-    };
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        let e = skip(b, j);
-        out.push(&b[j..e]);
-        j = e;
-    }
-    Some(out)
-}
-
 fn map_len_header(n: usize) -> Vec<u8> {
     if n < 16 {
         vec![0x80 | n as u8]
@@ -147,7 +130,8 @@ fn wrap_in_stxn(kind: &str, b: &[u8], txn: &[u8]) -> Option<Vec<u8>> {
         stxn.extend_from_slice(b);
         return Some(stxn);
     }
-    if array_items(b).is_some() {
+    if matches!(b.first(), Some(0x90..=0x9f | 0xdc | 0xdd)) {
+        // (an array header, however cut short or deep: nothing is walked)
         // go v5.1 (msgp 1.1.66, #6774) decodes a struct from a map only: `ApplyData`
         // as an array is `ReadMapHeaderBytes`'s TypeError, whatever it holds.
         return None;

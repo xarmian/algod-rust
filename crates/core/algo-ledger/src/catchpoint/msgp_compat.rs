@@ -21,16 +21,16 @@
 //! Go `msgp`-compatible decoders for catchpoint raw blobs.
 //!
 //! Go's `protocol.Encode` uses the `msgp` library's `MarshalMsg` method which
-//! emits **map-encoded msgpack** (string keys, omitempty). The `UnmarshalMsg`
-//! supports both map and positional-array formats as a fallback.
+//! emits **map-encoded msgpack** (string keys, omitempty). Since msgp 1.1.66
+//! (go-algorand v5.1.1, go #6774) the generated `UnmarshalMsg` reads a struct
+//! from a map only: an array is a `TypeError` (issue #2609).
 //!
 //! The raw blobs stored inside catchpoint `BalanceRecordV6.account_data`,
 //! `BalanceRecordV6.resources[idx]`, `OnlineAccountRecordV6.data`, and
 //! `OnlineRoundParamsRecordV6.data` are all map-encoded msgpack produced by
 //! `protocol.Encode`.
 //!
-//! This module provides decoders that handle the map format (primary) and the
-//! positional-array format (fallback, for forward compatibility).
+//! This module provides decoders that handle the map format only, like go.
 
 use super::types::{
     AccountTotals, AlgoCount, BalanceRecordV6, CatchpointBaseAccountData,
@@ -208,6 +208,7 @@ fn read_bool(rd: &mut &[u8]) -> Result<bool, CatchpointError> {
 /// issue #2063): `bin`/`str`/`nil` (zeroed)/uint8-array, and `min(len, N)`
 /// bytes are copied -- go does not enforce the length (the strict check is
 /// commented out in `read_bytes.go`), so a wrong-length value is not an error.
+#[cfg(test)]
 fn read_bytes_fixed<const N: usize>(rd: &mut &[u8]) -> Result<[u8; N], CatchpointError> {
     algo_types::go_msgp::read_fixed_bytes_go_compat::<N>(rd)
         .map_err(|e| CatchpointError::DecodeError(e.to_string()))
@@ -518,15 +519,17 @@ fn skip_value(rd: &mut &[u8]) -> Result<(), CatchpointError> {
     Ok(())
 }
 
-/// Try to read a map header. Returns Ok(Some(n)) for map, Ok(None) if it's an
-/// array (caller should use read_array_header), or Err on other types.
-fn try_read_map_header(rd: &mut &[u8]) -> Result<Option<u32>, CatchpointError> {
+/// go `msgp.ReadMapHeaderBytes` (a generated struct decoder's first read): a
+/// map header, `nil` as an empty map, and anything else a `TypeError`, an
+/// array included (go v5.1.1 generated decoders have no struct-from-array
+/// branch since msgp 1.1.66, go #6774; issue #2609).
+fn read_map_header(rd: &mut &[u8]) -> Result<u32, CatchpointError> {
     let marker = peek_byte(rd)?;
     match marker {
         // fixmap
         m @ 0x80..=0x8f => {
             *rd = &rd[1..];
-            Ok(Some((m & 0x0f) as u32))
+            Ok((m & 0x0f) as u32)
         }
         // map16
         0xde => {
@@ -535,7 +538,7 @@ fn try_read_map_header(rd: &mut &[u8]) -> Result<Option<u32>, CatchpointError> {
             }
             let n = u16::from_be_bytes([rd[1], rd[2]]) as u32;
             *rd = &rd[3..];
-            Ok(Some(n))
+            Ok(n)
         }
         // map32
         0xdf => {
@@ -544,17 +547,19 @@ fn try_read_map_header(rd: &mut &[u8]) -> Result<Option<u32>, CatchpointError> {
             }
             let n = u32::from_be_bytes([rd[1], rd[2], rd[3], rd[4]]);
             *rd = &rd[5..];
-            Ok(Some(n))
+            Ok(n)
         }
-        // fixarray, array16, array32 -- not a map
-        0x90..=0x9f | 0xdc | 0xdd => Ok(None),
         // nil -> empty
         0xc0 => {
             *rd = &rd[1..];
-            Ok(Some(0))
+            Ok(0)
         }
+        // fixarray, array16, array32: msgp.TypeError
+        0x90..=0x9f | 0xdc | 0xdd => Err(CatchpointError::DecodeError(
+            "msgp: attempted to decode type \"array\" with method for \"map\"".into(),
+        )),
         _ => Err(CatchpointError::DecodeError(format!(
-            "expected map or array header, got marker 0x{marker:02x}"
+            "expected map header, got marker 0x{marker:02x}"
         ))),
     }
 }
@@ -598,8 +603,8 @@ fn read_array_header(rd: &mut &[u8]) -> Result<u32, CatchpointError> {
 
 /// Decode a raw msgpack blob into `CatchpointBaseAccountData`.
 ///
-/// Handles both map-encoded (primary, used by `protocol.Encode`) and
-/// array-encoded (fallback) formats.
+/// Map-encoded only, like go v5.1.1's generated decoder (an array is a
+/// `TypeError`, issue #2609).
 ///
 /// Map keys (from Go `trackerdb.BaseAccountData` codec tags):
 ///   a=Status, b=MicroAlgos, c=RewardsBase, d=RewardedMicroAlgos,
@@ -609,14 +614,6 @@ fn read_array_header(rd: &mut &[u8]) -> Result<u32, CatchpointError> {
 ///   o=IncentiveEligible, p=LastProposed, q=LastHeartbeat,
 ///   A=VoteID, B=SelectionID, C=VoteFirstValid, D=VoteLastValid,
 ///   E=VoteKeyDilution, F=StateProofID, z=UpdateRound
-///
-/// Array order (from Go struct declaration order):
-///   Status, MicroAlgos, RewardsBase, RewardedMicroAlgos, AuthAddr,
-///   TotalAppSchemaNumUint, TotalAppSchemaNumByteSlice, TotalExtraAppPages,
-///   TotalAssetParams, TotalAssets, TotalAppParams, TotalAppLocalStates,
-///   TotalBoxes, TotalBoxBytes, IncentiveEligible, LastProposed, LastHeartbeat,
-///   VoteID, SelectionID, VoteFirstValid, VoteLastValid, VoteKeyDilution,
-///   StateProofID, UpdateRound
 pub fn decode_base_account_data(raw: &[u8]) -> Result<CatchpointBaseAccountData, CatchpointError> {
     if raw.is_empty() {
         return Ok(CatchpointBaseAccountData::default());
@@ -625,114 +622,37 @@ pub fn decode_base_account_data(raw: &[u8]) -> Result<CatchpointBaseAccountData,
     let mut rd: &[u8] = raw;
     let mut result = CatchpointBaseAccountData::default();
 
-    match try_read_map_header(&mut rd)? {
-        Some(n) => {
-            // Map-encoded format
-            for _ in 0..n {
-                let key = read_map_key(&mut rd)?;
-                match key.as_str() {
-                    "a" => result.status = read_u8(&mut rd)?,
-                    "b" => result.micro_algos = read_u64(&mut rd)?,
-                    "c" => result.rewards_base = read_u64(&mut rd)?,
-                    "d" => result.rewarded_micro_algos = read_u64(&mut rd)?,
-                    "e" => read_fixed_into(&mut rd, &mut result.auth_addr)?,
-                    "f" => result.total_app_schema_num_uint = read_u64(&mut rd)?,
-                    "g" => result.total_app_schema_num_byte_slice = read_u64(&mut rd)?,
-                    "h" => result.total_extra_app_pages = read_u32(&mut rd)?,
-                    "i" => result.total_asset_params = read_u64(&mut rd)?,
-                    "j" => result.total_assets = read_u64(&mut rd)?,
-                    "k" => result.total_app_params = read_u64(&mut rd)?,
-                    "l" => result.total_app_local_states = read_u64(&mut rd)?,
-                    "m" => result.total_boxes = read_u64(&mut rd)?,
-                    "n" => result.total_box_bytes = read_u64(&mut rd)?,
-                    "o" => result.incentive_eligible = read_bool(&mut rd)?,
-                    "p" => result.last_proposed = read_u64(&mut rd)?,
-                    "q" => result.last_heartbeat = read_u64(&mut rd)?,
-                    "A" => read_fixed_into(&mut rd, &mut result.vote_id)?,
-                    "B" => read_fixed_into(&mut rd, &mut result.selection_id)?,
-                    "C" => result.vote_first_valid = read_u64(&mut rd)?,
-                    "D" => result.vote_last_valid = read_u64(&mut rd)?,
-                    "E" => result.vote_key_dilution = read_u64(&mut rd)?,
-                    "F" => read_fixed_into(&mut rd, &mut result.state_proof_id)?,
-                    "z" => result.update_round = read_u64(&mut rd)?,
-                    // go's msgp decoder: msgp.ErrNoField (issue #2394)
-                    other => return Err(unknown_field(other)),
-                }
-            }
-        }
-        None => {
-            // Array-encoded format (fallback).
-            // Field order matches Go struct declaration order.
-            let len = read_array_header(&mut rd)?;
-            let mut idx = 0u32;
-
-            macro_rules! next_field {
-                ($field:expr, u64) => {
-                    if idx < len {
-                        idx += 1;
-                        $field = read_u64(&mut rd)?;
-                    }
-                };
-                ($field:expr, u32) => {
-                    if idx < len {
-                        idx += 1;
-                        $field = read_u32(&mut rd)?;
-                    }
-                };
-                ($field:expr, u8) => {
-                    if idx < len {
-                        idx += 1;
-                        $field = read_u8(&mut rd)?;
-                    }
-                };
-                ($field:expr, bool) => {
-                    if idx < len {
-                        idx += 1;
-                        $field = read_bool(&mut rd)?;
-                    }
-                };
-                ($field:expr, bytes32) => {
-                    if idx < len {
-                        idx += 1;
-                        $field = read_bytes_fixed::<32>(&mut rd)?;
-                    }
-                };
-                ($field:expr, bytes64) => {
-                    if idx < len {
-                        idx += 1;
-                        $field = read_bytes_fixed::<64>(&mut rd)?;
-                    }
-                };
-            }
-
-            // Go struct declaration order:
-            next_field!(result.status, u8);
-            next_field!(result.micro_algos, u64);
-            next_field!(result.rewards_base, u64);
-            next_field!(result.rewarded_micro_algos, u64);
-            next_field!(result.auth_addr, bytes32);
-            next_field!(result.total_app_schema_num_uint, u64);
-            next_field!(result.total_app_schema_num_byte_slice, u64);
-            next_field!(result.total_extra_app_pages, u32);
-            next_field!(result.total_asset_params, u64);
-            next_field!(result.total_assets, u64);
-            next_field!(result.total_app_params, u64);
-            next_field!(result.total_app_local_states, u64);
-            next_field!(result.total_boxes, u64);
-            next_field!(result.total_box_bytes, u64);
-            next_field!(result.incentive_eligible, bool);
-            next_field!(result.last_proposed, u64);
-            next_field!(result.last_heartbeat, u64);
-            // Embedded BaseVotingData fields:
-            next_field!(result.vote_id, bytes32);
-            next_field!(result.selection_id, bytes32);
-            next_field!(result.vote_first_valid, u64);
-            next_field!(result.vote_last_valid, u64);
-            next_field!(result.vote_key_dilution, u64);
-            next_field!(result.state_proof_id, bytes64);
-            // UpdateRound:
-            next_field!(result.update_round, u64);
-            _ = idx;
+    let n = read_map_header(&mut rd)?;
+    // Map-encoded format
+    for _ in 0..n {
+        let key = read_map_key(&mut rd)?;
+        match key.as_str() {
+            "a" => result.status = read_u8(&mut rd)?,
+            "b" => result.micro_algos = read_u64(&mut rd)?,
+            "c" => result.rewards_base = read_u64(&mut rd)?,
+            "d" => result.rewarded_micro_algos = read_u64(&mut rd)?,
+            "e" => read_fixed_into(&mut rd, &mut result.auth_addr)?,
+            "f" => result.total_app_schema_num_uint = read_u64(&mut rd)?,
+            "g" => result.total_app_schema_num_byte_slice = read_u64(&mut rd)?,
+            "h" => result.total_extra_app_pages = read_u32(&mut rd)?,
+            "i" => result.total_asset_params = read_u64(&mut rd)?,
+            "j" => result.total_assets = read_u64(&mut rd)?,
+            "k" => result.total_app_params = read_u64(&mut rd)?,
+            "l" => result.total_app_local_states = read_u64(&mut rd)?,
+            "m" => result.total_boxes = read_u64(&mut rd)?,
+            "n" => result.total_box_bytes = read_u64(&mut rd)?,
+            "o" => result.incentive_eligible = read_bool(&mut rd)?,
+            "p" => result.last_proposed = read_u64(&mut rd)?,
+            "q" => result.last_heartbeat = read_u64(&mut rd)?,
+            "A" => read_fixed_into(&mut rd, &mut result.vote_id)?,
+            "B" => read_fixed_into(&mut rd, &mut result.selection_id)?,
+            "C" => result.vote_first_valid = read_u64(&mut rd)?,
+            "D" => result.vote_last_valid = read_u64(&mut rd)?,
+            "E" => result.vote_key_dilution = read_u64(&mut rd)?,
+            "F" => read_fixed_into(&mut rd, &mut result.state_proof_id)?,
+            "z" => result.update_round = read_u64(&mut rd)?,
+            // go's msgp decoder: msgp.ErrNoField (issue #2394)
+            other => return Err(unknown_field(other)),
         }
     }
 
@@ -755,16 +675,6 @@ pub fn decode_base_account_data(raw: &[u8]) -> Result<CatchpointBaseAccountData,
 ///   v=GlobalStateSchemaNumUint, w=GlobalStateSchemaNumByteSlice,
 ///   x=ExtraProgramPages, y=ResourceFlags, z=UpdateRound,
 ///   A=Version, B=SizeSponsor, C=ForeignBoxReads, D=FamilyBoxAccess
-///
-/// Array order (from Go struct declaration):
-///   Total, Decimals, DefaultFrozen, UnitName, AssetName, URL, MetadataHash,
-///   Manager, Reserve, Freeze, Clawback, Amount, Frozen,
-///   SchemaNumUint, SchemaNumByteSlice, KeyValue,
-///   ApprovalProgram, ClearStateProgram, GlobalState,
-///   LocalStateSchemaNumUint, LocalStateSchemaNumByteSlice,
-///   GlobalStateSchemaNumUint, GlobalStateSchemaNumByteSlice,
-///   ExtraProgramPages, ResourceFlags, UpdateRound, Version, SizeSponsor,
-///   ForeignBoxReads, FamilyBoxAccess
 pub fn decode_resources_data(raw: &[u8]) -> Result<CatchpointResourcesData, CatchpointError> {
     if raw.is_empty() {
         return Ok(CatchpointResourcesData::default());
@@ -773,147 +683,46 @@ pub fn decode_resources_data(raw: &[u8]) -> Result<CatchpointResourcesData, Catc
     let mut rd: &[u8] = raw;
     let mut result = CatchpointResourcesData::default();
 
-    match try_read_map_header(&mut rd)? {
-        Some(n) => {
-            for _ in 0..n {
-                let key = read_map_key(&mut rd)?;
-                match key.as_str() {
-                    "a" => result.total = read_u64(&mut rd)?,
-                    "b" => result.decimals = read_u32(&mut rd)?,
-                    "c" => result.default_frozen = read_bool(&mut rd)?,
-                    // Issue #1608: raw bytes, not `read_string` -- go's
-                    // `string`-typed UnitName/AssetName/URL are not
-                    // UTF-8-validated on the wire, and real mainnet catchpoints
-                    // contain non-UTF-8 bytes in these fields.
-                    "d" => result.unit_name = read_go_str_bytes(&mut rd)?,
-                    "e" => result.asset_name = read_go_str_bytes(&mut rd)?,
-                    "f" => result.url = read_go_str_bytes(&mut rd)?,
-                    "g" => read_fixed_into(&mut rd, &mut result.metadata_hash)?,
-                    "h" => read_fixed_into(&mut rd, &mut result.manager)?,
-                    "i" => read_fixed_into(&mut rd, &mut result.reserve)?,
-                    "j" => read_fixed_into(&mut rd, &mut result.freeze)?,
-                    "k" => read_fixed_into(&mut rd, &mut result.clawback)?,
-                    "l" => result.amount = read_u64(&mut rd)?,
-                    "m" => result.frozen = read_bool(&mut rd)?,
-                    "n" => result.schema_num_uint = read_u64(&mut rd)?,
-                    "o" => result.schema_num_byte_slice = read_u64(&mut rd)?,
-                    "p" => merge_teal_key_value(&mut rd, &mut result.key_value)?,
-                    "q" => result.approval_program = read_bytes_vec(&mut rd)?,
-                    "r" => result.clear_state_program = read_bytes_vec(&mut rd)?,
-                    "s" => merge_teal_key_value(&mut rd, &mut result.global_state)?,
-                    "t" => result.local_state_schema_num_uint = read_u64(&mut rd)?,
-                    "u" => result.local_state_schema_num_byte_slice = read_u64(&mut rd)?,
-                    "v" => result.global_state_schema_num_uint = read_u64(&mut rd)?,
-                    "w" => result.global_state_schema_num_byte_slice = read_u64(&mut rd)?,
-                    "x" => result.extra_program_pages = read_u32(&mut rd)?,
-                    "y" => result.resource_flags = read_u8(&mut rd)?,
-                    "z" => result.update_round = read_u64(&mut rd)?,
-                    "A" => result.version = read_u64(&mut rd)?,
-                    "B" => read_fixed_into(&mut rd, &mut result.size_sponsor)?,
-                    "C" => result.foreign_box_reads = read_bool(&mut rd)?,
-                    "D" => result.family_box_access = read_bool(&mut rd)?,
-                    // go's msgp decoder: msgp.ErrNoField (issue #2394)
-                    other => return Err(unknown_field(other)),
-                }
-            }
-        }
-        None => {
-            let len = read_array_header(&mut rd)?;
-            let mut idx = 0u32;
-
-            macro_rules! next_field {
-                ($field:expr, u64) => {
-                    if idx < len {
-                        idx += 1;
-                        $field = read_u64(&mut rd)?;
-                    }
-                };
-                ($field:expr, u32) => {
-                    if idx < len {
-                        idx += 1;
-                        $field = read_u32(&mut rd)?;
-                    }
-                };
-                ($field:expr, u8) => {
-                    if idx < len {
-                        idx += 1;
-                        $field = read_u8(&mut rd)?;
-                    }
-                };
-                ($field:expr, bool) => {
-                    if idx < len {
-                        idx += 1;
-                        $field = read_bool(&mut rd)?;
-                    }
-                };
-                ($field:expr, string) => {
-                    if idx < len {
-                        idx += 1;
-                        $field = read_string(&mut rd)?;
-                    }
-                };
-                ($field:expr, bytes32) => {
-                    if idx < len {
-                        idx += 1;
-                        $field = read_bytes_fixed::<32>(&mut rd)?;
-                    }
-                };
-                ($field:expr, bytes_vec) => {
-                    if idx < len {
-                        idx += 1;
-                        $field = read_bytes_vec(&mut rd)?;
-                    }
-                };
-                ($field:expr, raw_value) => {
-                    if idx < len {
-                        idx += 1;
-                        merge_teal_key_value(&mut rd, &mut $field)?;
-                    }
-                };
-                // Issue #1608: like `bytes_vec`, but documents that the
-                // source field is a go `string` msgpack-encoded as "str"
-                // (not "bin") -- used for UnitName/AssetName/URL, which are
-                // not UTF-8-validated on the wire.
-                ($field:expr, bytes_str) => {
-                    if idx < len {
-                        idx += 1;
-                        $field = read_go_str_bytes(&mut rd)?;
-                    }
-                };
-            }
-
-            // Go struct declaration order:
-            next_field!(result.total, u64);
-            next_field!(result.decimals, u32);
-            next_field!(result.default_frozen, bool);
-            next_field!(result.unit_name, bytes_str);
-            next_field!(result.asset_name, bytes_str);
-            next_field!(result.url, bytes_str);
-            next_field!(result.metadata_hash, bytes32);
-            next_field!(result.manager, bytes32);
-            next_field!(result.reserve, bytes32);
-            next_field!(result.freeze, bytes32);
-            next_field!(result.clawback, bytes32);
-            next_field!(result.amount, u64);
-            next_field!(result.frozen, bool);
-            next_field!(result.schema_num_uint, u64);
-            next_field!(result.schema_num_byte_slice, u64);
-            next_field!(result.key_value, raw_value);
-            next_field!(result.approval_program, bytes_vec);
-            next_field!(result.clear_state_program, bytes_vec);
-            next_field!(result.global_state, raw_value);
-            next_field!(result.local_state_schema_num_uint, u64);
-            next_field!(result.local_state_schema_num_byte_slice, u64);
-            next_field!(result.global_state_schema_num_uint, u64);
-            next_field!(result.global_state_schema_num_byte_slice, u64);
-            next_field!(result.extra_program_pages, u32);
-            next_field!(result.resource_flags, u8);
-            next_field!(result.update_round, u64);
-            next_field!(result.version, u64);
-            next_field!(result.size_sponsor, bytes32);
-            next_field!(result.foreign_box_reads, bool);
-            next_field!(result.family_box_access, bool);
-            _ = idx;
+    let n = read_map_header(&mut rd)?;
+    for _ in 0..n {
+        let key = read_map_key(&mut rd)?;
+        match key.as_str() {
+            "a" => result.total = read_u64(&mut rd)?,
+            "b" => result.decimals = read_u32(&mut rd)?,
+            "c" => result.default_frozen = read_bool(&mut rd)?,
+            // Issue #1608: raw bytes, not `read_string` -- go's
+            // `string`-typed UnitName/AssetName/URL are not
+            // UTF-8-validated on the wire, and real mainnet catchpoints
+            // contain non-UTF-8 bytes in these fields.
+            "d" => result.unit_name = read_go_str_bytes(&mut rd)?,
+            "e" => result.asset_name = read_go_str_bytes(&mut rd)?,
+            "f" => result.url = read_go_str_bytes(&mut rd)?,
+            "g" => read_fixed_into(&mut rd, &mut result.metadata_hash)?,
+            "h" => read_fixed_into(&mut rd, &mut result.manager)?,
+            "i" => read_fixed_into(&mut rd, &mut result.reserve)?,
+            "j" => read_fixed_into(&mut rd, &mut result.freeze)?,
+            "k" => read_fixed_into(&mut rd, &mut result.clawback)?,
+            "l" => result.amount = read_u64(&mut rd)?,
+            "m" => result.frozen = read_bool(&mut rd)?,
+            "n" => result.schema_num_uint = read_u64(&mut rd)?,
+            "o" => result.schema_num_byte_slice = read_u64(&mut rd)?,
+            "p" => merge_teal_key_value(&mut rd, &mut result.key_value)?,
+            "q" => result.approval_program = read_bytes_vec(&mut rd)?,
+            "r" => result.clear_state_program = read_bytes_vec(&mut rd)?,
+            "s" => merge_teal_key_value(&mut rd, &mut result.global_state)?,
+            "t" => result.local_state_schema_num_uint = read_u64(&mut rd)?,
+            "u" => result.local_state_schema_num_byte_slice = read_u64(&mut rd)?,
+            "v" => result.global_state_schema_num_uint = read_u64(&mut rd)?,
+            "w" => result.global_state_schema_num_byte_slice = read_u64(&mut rd)?,
+            "x" => result.extra_program_pages = read_u32(&mut rd)?,
+            "y" => result.resource_flags = read_u8(&mut rd)?,
+            "z" => result.update_round = read_u64(&mut rd)?,
+            "A" => result.version = read_u64(&mut rd)?,
+            "B" => read_fixed_into(&mut rd, &mut result.size_sponsor)?,
+            "C" => result.foreign_box_reads = read_bool(&mut rd)?,
+            "D" => result.family_box_access = read_bool(&mut rd)?,
+            // go's msgp decoder: msgp.ErrNoField (issue #2394)
+            other => return Err(unknown_field(other)),
         }
     }
 
@@ -931,11 +740,6 @@ pub fn decode_resources_data(raw: &[u8]) -> Result<CatchpointResourcesData, Catc
 ///   E=VoteKeyDilution, F=StateProofID,
 ///   V=LastProposed, W=LastHeartbeat, X=IncentiveEligible,
 ///   Y=MicroAlgos, Z=RewardsBase
-///
-/// Array order (from Go struct declaration, embedded BaseVotingData first):
-///   VoteID, SelectionID, VoteFirstValid, VoteLastValid, VoteKeyDilution,
-///   StateProofID, LastProposed, LastHeartbeat, IncentiveEligible,
-///   MicroAlgos, RewardsBase
 pub fn decode_base_online_account_data(
     raw: &[u8],
 ) -> Result<CatchpointBaseOnlineAccountData, CatchpointError> {
@@ -946,71 +750,23 @@ pub fn decode_base_online_account_data(
     let mut rd: &[u8] = raw;
     let mut result = CatchpointBaseOnlineAccountData::default();
 
-    match try_read_map_header(&mut rd)? {
-        Some(n) => {
-            for _ in 0..n {
-                let key = read_map_key(&mut rd)?;
-                match key.as_str() {
-                    "A" => read_fixed_into(&mut rd, &mut result.vote_id)?,
-                    "B" => read_fixed_into(&mut rd, &mut result.selection_id)?,
-                    "C" => result.vote_first_valid = read_u64(&mut rd)?,
-                    "D" => result.vote_last_valid = read_u64(&mut rd)?,
-                    "E" => result.vote_key_dilution = read_u64(&mut rd)?,
-                    "F" => read_fixed_into(&mut rd, &mut result.state_proof_id)?,
-                    "V" => result.last_proposed = read_u64(&mut rd)?,
-                    "W" => result.last_heartbeat = read_u64(&mut rd)?,
-                    "X" => result.incentive_eligible = read_bool(&mut rd)?,
-                    "Y" => result.micro_algos = read_u64(&mut rd)?,
-                    "Z" => result.rewards_base = read_u64(&mut rd)?,
-                    // go's msgp decoder: msgp.ErrNoField (issue #2394)
-                    other => return Err(unknown_field(other)),
-                }
-            }
-        }
-        None => {
-            let len = read_array_header(&mut rd)?;
-            let mut idx = 0u32;
-
-            macro_rules! next_field {
-                ($field:expr, u64) => {
-                    if idx < len {
-                        idx += 1;
-                        $field = read_u64(&mut rd)?;
-                    }
-                };
-                ($field:expr, bool) => {
-                    if idx < len {
-                        idx += 1;
-                        $field = read_bool(&mut rd)?;
-                    }
-                };
-                ($field:expr, bytes32) => {
-                    if idx < len {
-                        idx += 1;
-                        $field = read_bytes_fixed::<32>(&mut rd)?;
-                    }
-                };
-                ($field:expr, bytes64) => {
-                    if idx < len {
-                        idx += 1;
-                        $field = read_bytes_fixed::<64>(&mut rd)?;
-                    }
-                };
-            }
-
-            // Embedded BaseVotingData first, then own fields:
-            next_field!(result.vote_id, bytes32);
-            next_field!(result.selection_id, bytes32);
-            next_field!(result.vote_first_valid, u64);
-            next_field!(result.vote_last_valid, u64);
-            next_field!(result.vote_key_dilution, u64);
-            next_field!(result.state_proof_id, bytes64);
-            next_field!(result.last_proposed, u64);
-            next_field!(result.last_heartbeat, u64);
-            next_field!(result.incentive_eligible, bool);
-            next_field!(result.micro_algos, u64);
-            next_field!(result.rewards_base, u64);
-            _ = idx;
+    let n = read_map_header(&mut rd)?;
+    for _ in 0..n {
+        let key = read_map_key(&mut rd)?;
+        match key.as_str() {
+            "A" => read_fixed_into(&mut rd, &mut result.vote_id)?,
+            "B" => read_fixed_into(&mut rd, &mut result.selection_id)?,
+            "C" => result.vote_first_valid = read_u64(&mut rd)?,
+            "D" => result.vote_last_valid = read_u64(&mut rd)?,
+            "E" => result.vote_key_dilution = read_u64(&mut rd)?,
+            "F" => read_fixed_into(&mut rd, &mut result.state_proof_id)?,
+            "V" => result.last_proposed = read_u64(&mut rd)?,
+            "W" => result.last_heartbeat = read_u64(&mut rd)?,
+            "X" => result.incentive_eligible = read_bool(&mut rd)?,
+            "Y" => result.micro_algos = read_u64(&mut rd)?,
+            "Z" => result.rewards_base = read_u64(&mut rd)?,
+            // go's msgp decoder: msgp.ErrNoField (issue #2394)
+            other => return Err(unknown_field(other)),
         }
     }
 
@@ -1025,9 +781,6 @@ pub fn decode_base_online_account_data(
 ///
 /// Map keys (from Go `ledgercore.OnlineRoundParamsData` codec tags):
 ///   "online"=OnlineSupply, "rwdlvl"=RewardsLevel, "proto"=CurrentProtocol
-///
-/// Array order (from Go struct declaration):
-///   OnlineSupply, RewardsLevel, CurrentProtocol
 pub fn decode_online_round_params_data(
     raw: &[u8],
 ) -> Result<CatchpointOnlineRoundParamsData, CatchpointError> {
@@ -1038,35 +791,15 @@ pub fn decode_online_round_params_data(
     let mut rd: &[u8] = raw;
     let mut result = CatchpointOnlineRoundParamsData::default();
 
-    match try_read_map_header(&mut rd)? {
-        Some(n) => {
-            for _ in 0..n {
-                let key = read_map_key(&mut rd)?;
-                match key.as_str() {
-                    "online" => result.online_supply = read_u64(&mut rd)?,
-                    "rwdlvl" => result.rewards_level = read_u64(&mut rd)?,
-                    "proto" => result.current_protocol = read_string(&mut rd)?,
-                    // go's msgp decoder: msgp.ErrNoField (issue #2394)
-                    other => return Err(unknown_field(other)),
-                }
-            }
-        }
-        None => {
-            let len = read_array_header(&mut rd)?;
-            let mut idx = 0u32;
-
-            if idx < len {
-                idx += 1;
-                result.online_supply = read_u64(&mut rd)?;
-            }
-            if idx < len {
-                idx += 1;
-                result.rewards_level = read_u64(&mut rd)?;
-            }
-            if idx < len {
-                let _ = idx;
-                result.current_protocol = read_string(&mut rd)?;
-            }
+    let n = read_map_header(&mut rd)?;
+    for _ in 0..n {
+        let key = read_map_key(&mut rd)?;
+        match key.as_str() {
+            "online" => result.online_supply = read_u64(&mut rd)?,
+            "rwdlvl" => result.rewards_level = read_u64(&mut rd)?,
+            "proto" => result.current_protocol = read_string(&mut rd)?,
+            // go's msgp decoder: msgp.ErrNoField (issue #2394)
+            other => return Err(unknown_field(other)),
         }
     }
 
@@ -1081,7 +814,7 @@ pub fn decode_online_round_params_data(
 // generated msgp decoders (`ledger/catchupaccessor.go`, `protocol.Decode`):
 // a key the struct lacks is `msgp.ErrNoField`, a slice / map longer than its
 // `allocbound` is `msgp.ErrOverflow`, `nil` is an empty value, a `string` is
-// arbitrary bytes and a struct may also be written as a positional array. The
+// arbitrary bytes and a struct is read from a map only. The
 // readers below follow exactly that, for `content.msgpack`
 // (`CatchpointFileHeader`), `balances.N.msgpack` (`CatchpointSnapshotChunkV6`)
 // and `stateProofVerificationContext.msgpack`
@@ -1108,36 +841,18 @@ fn overflow(what: &str, n: usize, bound: usize) -> CatchpointError {
     CatchpointError::DecodeError(format!("{what}: msgp: {n} overflows the bound of {bound}"))
 }
 
-/// One go msgp struct: map form, a key dispatched to `field` (which returns
-/// `false` for a key the struct lacks), or the positional array form, element
-/// `i` read as field `names[i]` (more elements than fields is go's
-/// `ErrTooManyArrayFields`).
+/// One go msgp struct: a map, a key dispatched to `field` (which returns
+/// `false` for a key the struct lacks). go v5.1.1's generated decoders read a
+/// struct from a map only (msgp 1.1.66, go #6774): an array, empty or not, is
+/// `ReadMapHeaderBytes`'s `TypeError` (issue #2609).
 fn decode_struct(
     rd: &mut &[u8],
-    what: &str,
-    names: &[&str],
     mut field: impl FnMut(&str, &mut &[u8]) -> Result<bool, CatchpointError>,
 ) -> Result<(), CatchpointError> {
-    match try_read_map_header(rd)? {
-        Some(n) => {
-            for _ in 0..n {
-                let key = read_map_key(rd)?;
-                if !field(&key, rd)? {
-                    return Err(unknown_field(&key));
-                }
-            }
-        }
-        None => {
-            let n = read_array_header(rd)? as usize;
-            if n > names.len() {
-                return Err(CatchpointError::DecodeError(format!(
-                    "{what}: too many array fields: {n} > {}",
-                    names.len()
-                )));
-            }
-            for name in &names[..n] {
-                field(name, rd)?;
-            }
+    for _ in 0..read_map_header(rd)? {
+        let key = read_map_key(rd)?;
+        if !field(&key, rd)? {
+            return Err(unknown_field(&key));
         }
     }
     Ok(())
@@ -1149,8 +864,6 @@ fn decode_struct(
 /// `nil` map header resets the whole value to `zero` (go: `(*z) = T{}`).
 fn decode_struct_into<T>(
     rd: &mut &[u8],
-    what: &str,
-    names: &[&str],
     v: &mut T,
     zero: impl FnOnce() -> T,
     mut field: impl FnMut(&mut T, &str, &mut &[u8]) -> Result<bool, CatchpointError>,
@@ -1160,7 +873,7 @@ fn decode_struct_into<T>(
         *v = zero();
         return Ok(());
     }
-    decode_struct(rd, what, names, |k, rd| field(v, k, rd))
+    decode_struct(rd, |k, rd| field(v, k, rd))
 }
 
 /// A slice field with an `allocbound`, decoded into its already decoded value
@@ -1188,9 +901,9 @@ fn read_bounded_vec_into<T>(
             spare.clear();
             return Ok(());
         }
-        0x80..=0x8f | 0xde | 0xdf => {
-            2 * try_read_map_header(rd)?.expect("a map marker reads as a map") as usize
-        }
+        0x80..=0x8f | 0xde | 0xdf => 2 * read_map_header(rd)? as usize,
+        // a slice value (go's `msgp.ReadArrayHeaderBytes`), not a struct: only
+        // struct values lost their array form in go v5.1.1
         _ => read_array_header(rd)? as usize,
     };
     if n > bound {
@@ -1279,81 +992,50 @@ fn zero_address() -> serde_bytes::ByteBuf {
 }
 
 fn decode_algo_count(rd: &mut &[u8], v: &mut AlgoCount) -> Result<(), CatchpointError> {
-    decode_struct_into(
-        rd,
-        "AlgoCount",
-        &["mon", "rwd"],
-        v,
-        AlgoCount::default,
-        |v, k, rd| {
-            match k {
-                "mon" => v.money = read_u64(rd)?,
-                "rwd" => v.reward_units = read_u64(rd)?,
-                _ => return Ok(false),
-            }
-            Ok(true)
-        },
-    )
+    decode_struct_into(rd, v, AlgoCount::default, |v, k, rd| {
+        match k {
+            "mon" => v.money = read_u64(rd)?,
+            "rwd" => v.reward_units = read_u64(rd)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })
 }
 
 fn decode_account_totals(rd: &mut &[u8], v: &mut AccountTotals) -> Result<(), CatchpointError> {
-    decode_struct_into(
-        rd,
-        "AccountTotals",
-        &["online", "offline", "notpart", "rwdlvl"],
-        v,
-        AccountTotals::default,
-        |v, k, rd| {
-            match k {
-                "online" => decode_algo_count(rd, &mut v.online)?,
-                "offline" => decode_algo_count(rd, &mut v.offline)?,
-                "notpart" => decode_algo_count(rd, &mut v.not_participating)?,
-                "rwdlvl" => v.rewards_level = read_u64(rd)?,
-                _ => return Ok(false),
-            }
-            Ok(true)
-        },
-    )
+    decode_struct_into(rd, v, AccountTotals::default, |v, k, rd| {
+        match k {
+            "online" => decode_algo_count(rd, &mut v.online)?,
+            "offline" => decode_algo_count(rd, &mut v.offline)?,
+            "notpart" => decode_algo_count(rd, &mut v.not_participating)?,
+            "rwdlvl" => v.rewards_level = read_u64(rd)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })
 }
 
 /// Decode `content.msgpack`: go `CatchpointFileHeader` (`ledger/catchpointfileheader.go`).
 pub fn decode_catchpoint_file_header(raw: &[u8]) -> Result<CatchpointFileHeader, CatchpointError> {
     let mut rd = raw;
     let mut v = CatchpointFileHeader::default();
-    decode_struct(
-        &mut rd,
-        "CatchpointFileHeader",
-        &[
-            "version",
-            "balancesRound",
-            "blocksRound",
-            "accountTotals",
-            "accountsCount",
-            "chunksCount",
-            "kvsCount",
-            "onlineAccountsCount",
-            "onlineRoundParamsCount",
-            "catchpoint",
-            "blockHeaderDigest",
-        ],
-        |k, rd| {
-            match k {
-                "version" => v.version = read_u64(rd)?,
-                "balancesRound" => v.balances_round = read_u64(rd)?,
-                "blocksRound" => v.blocks_round = read_u64(rd)?,
-                "accountTotals" => decode_account_totals(rd, &mut v.totals)?,
-                "accountsCount" => v.total_accounts = read_u64(rd)?,
-                "chunksCount" => v.total_chunks = read_u64(rd)?,
-                "kvsCount" => v.total_kvs = read_u64(rd)?,
-                "onlineAccountsCount" => v.total_online_accounts = read_u64(rd)?,
-                "onlineRoundParamsCount" => v.total_online_round_params = read_u64(rd)?,
-                "catchpoint" => v.catchpoint = read_go_string(rd)?,
-                "blockHeaderDigest" => read_address_into(rd, &mut v.block_header_digest)?,
-                _ => return Ok(false),
-            }
-            Ok(true)
-        },
-    )?;
+    decode_struct(&mut rd, |k, rd| {
+        match k {
+            "version" => v.version = read_u64(rd)?,
+            "balancesRound" => v.balances_round = read_u64(rd)?,
+            "blocksRound" => v.blocks_round = read_u64(rd)?,
+            "accountTotals" => decode_account_totals(rd, &mut v.totals)?,
+            "accountsCount" => v.total_accounts = read_u64(rd)?,
+            "chunksCount" => v.total_chunks = read_u64(rd)?,
+            "kvsCount" => v.total_kvs = read_u64(rd)?,
+            "onlineAccountsCount" => v.total_online_accounts = read_u64(rd)?,
+            "onlineRoundParamsCount" => v.total_online_round_params = read_u64(rd)?,
+            "catchpoint" => v.catchpoint = read_go_string(rd)?,
+            "blockHeaderDigest" => read_address_into(rd, &mut v.block_header_digest)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
     Ok(v)
 }
 
@@ -1365,71 +1047,54 @@ fn zero_balance_record() -> BalanceRecordV6 {
 }
 
 fn decode_balance_record(rd: &mut &[u8], v: &mut BalanceRecordV6) -> Result<(), CatchpointError> {
-    decode_struct_into(
-        rd,
-        "BalanceRecordV6",
-        &["a", "b", "c", "e"],
-        v,
-        zero_balance_record,
-        |v, k, rd| {
-            match k {
-                "a" => read_address_into(rd, &mut v.address)?,
-                "b" => v.account_data = read_msgp_raw(rd)?,
-                "c" => {
-                    // go: a nil map clears it, any other map is decoded into
-                    // the existing one (entries added, a repeated index
-                    // replaced)
-                    let nil = peek_byte(rd)? == 0xc0;
-                    let n = try_read_map_header(rd)?.ok_or_else(|| {
-                        CatchpointError::DecodeError("BalanceRecordV6.c: expected a map".into())
-                    })? as usize;
-                    if n > RESOURCES_PER_CATCHPOINT_FILE_CHUNK_BACKWARD_COMPATIBLE {
-                        return Err(overflow(
-                            "BalanceRecordV6.c",
-                            n,
-                            RESOURCES_PER_CATCHPOINT_FILE_CHUNK_BACKWARD_COMPATIBLE,
-                        ));
-                    }
-                    if nil {
-                        v.resources.clear();
-                    }
-                    v.resources.reserve(n.min(1024));
-                    for _ in 0..n {
-                        let aidx = read_u64(rd)?;
-                        let res = read_msgp_raw(rd)?;
-                        v.resources.insert(aidx, res);
-                    }
+    decode_struct_into(rd, v, zero_balance_record, |v, k, rd| {
+        match k {
+            "a" => read_address_into(rd, &mut v.address)?,
+            "b" => v.account_data = read_msgp_raw(rd)?,
+            "c" => {
+                // go: a nil map clears it, any other map is decoded into
+                // the existing one (entries added, a repeated index
+                // replaced)
+                let nil = peek_byte(rd)? == 0xc0;
+                let n = read_map_header(rd)? as usize;
+                if n > RESOURCES_PER_CATCHPOINT_FILE_CHUNK_BACKWARD_COMPATIBLE {
+                    return Err(overflow(
+                        "BalanceRecordV6.c",
+                        n,
+                        RESOURCES_PER_CATCHPOINT_FILE_CHUNK_BACKWARD_COMPATIBLE,
+                    ));
                 }
-                "e" => v.expecting_more_entries = read_bool(rd)?,
-                _ => return Ok(false),
+                if nil {
+                    v.resources.clear();
+                }
+                v.resources.reserve(n.min(1024));
+                for _ in 0..n {
+                    let aidx = read_u64(rd)?;
+                    let res = read_msgp_raw(rd)?;
+                    v.resources.insert(aidx, res);
+                }
             }
-            Ok(true)
-        },
-    )
+            "e" => v.expecting_more_entries = read_bool(rd)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })
 }
 
 fn decode_kv_record(rd: &mut &[u8], v: &mut KVRecordV6) -> Result<(), CatchpointError> {
-    decode_struct_into(
-        rd,
-        "KVRecordV6",
-        &["k", "v"],
-        v,
-        KVRecordV6::default,
-        |v, k, rd| {
-            match k {
-                "k" => {
-                    v.key =
-                        read_bounded_bytes(rd, "KVRecordV6.k", KV_RECORD_V6_MAX_KEY_LENGTH)?.into()
-                }
-                "v" => {
-                    v.value = read_bounded_bytes(rd, "KVRecordV6.v", KV_RECORD_V6_MAX_VALUE_LENGTH)?
-                        .into()
-                }
-                _ => return Ok(false),
+    decode_struct_into(rd, v, KVRecordV6::default, |v, k, rd| {
+        match k {
+            "k" => {
+                v.key = read_bounded_bytes(rd, "KVRecordV6.k", KV_RECORD_V6_MAX_KEY_LENGTH)?.into()
             }
-            Ok(true)
-        },
-    )
+            "v" => {
+                v.value =
+                    read_bounded_bytes(rd, "KVRecordV6.v", KV_RECORD_V6_MAX_VALUE_LENGTH)?.into()
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })
 }
 
 fn zero_online_account_record() -> OnlineAccountRecordV6 {
@@ -1443,45 +1108,31 @@ fn decode_online_account_record(
     rd: &mut &[u8],
     v: &mut OnlineAccountRecordV6,
 ) -> Result<(), CatchpointError> {
-    decode_struct_into(
-        rd,
-        "OnlineAccountRecordV6",
-        &["addr", "upd", "nob", "vlv", "data"],
-        v,
-        zero_online_account_record,
-        |v, k, rd| {
-            match k {
-                "addr" => read_address_into(rd, &mut v.address)?,
-                "upd" => v.updated_round = read_u64(rd)?,
-                "nob" => v.normalized_online_balance = read_u64(rd)?,
-                "vlv" => v.vote_last_valid = read_u64(rd)?,
-                "data" => v.data = read_msgp_raw(rd)?,
-                _ => return Ok(false),
-            }
-            Ok(true)
-        },
-    )
+    decode_struct_into(rd, v, zero_online_account_record, |v, k, rd| {
+        match k {
+            "addr" => read_address_into(rd, &mut v.address)?,
+            "upd" => v.updated_round = read_u64(rd)?,
+            "nob" => v.normalized_online_balance = read_u64(rd)?,
+            "vlv" => v.vote_last_valid = read_u64(rd)?,
+            "data" => v.data = read_msgp_raw(rd)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })
 }
 
 fn decode_online_round_params_record(
     rd: &mut &[u8],
     v: &mut OnlineRoundParamsRecordV6,
 ) -> Result<(), CatchpointError> {
-    decode_struct_into(
-        rd,
-        "OnlineRoundParamsRecordV6",
-        &["rnd", "data"],
-        v,
-        OnlineRoundParamsRecordV6::default,
-        |v, k, rd| {
-            match k {
-                "rnd" => v.round = read_u64(rd)?,
-                "data" => v.data = read_msgp_raw(rd)?,
-                _ => return Ok(false),
-            }
-            Ok(true)
-        },
-    )
+    decode_struct_into(rd, v, OnlineRoundParamsRecordV6::default, |v, k, rd| {
+        match k {
+            "rnd" => v.round = read_u64(rd)?,
+            "data" => v.data = read_msgp_raw(rd)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })
 }
 
 /// Decode one (decompressed) `balances.N.msgpack`: go `CatchpointSnapshotChunkV6`.
@@ -1495,53 +1146,48 @@ pub fn decode_catchpoint_snapshot_chunk(
     // go's hidden slice capacity per field (see `read_bounded_vec_into`)
     let (mut bl, mut kv, mut oa, mut orp) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let bound = BALANCES_PER_CATCHPOINT_FILE_CHUNK;
-    decode_struct(
-        &mut rd,
-        "CatchpointSnapshotChunkV6",
-        &["bl", "kv", "oa", "orp"],
-        |k, rd| {
-            match k {
-                "bl" => read_bounded_vec_into(
-                    rd,
-                    "bl",
-                    bound,
-                    &mut v.balances,
-                    &mut bl,
-                    zero_balance_record,
-                    decode_balance_record,
-                )?,
-                "kv" => read_bounded_vec_into(
-                    rd,
-                    "kv",
-                    bound,
-                    &mut v.kvs,
-                    &mut kv,
-                    KVRecordV6::default,
-                    decode_kv_record,
-                )?,
-                "oa" => read_bounded_vec_into(
-                    rd,
-                    "oa",
-                    bound,
-                    &mut v.online_accounts,
-                    &mut oa,
-                    zero_online_account_record,
-                    decode_online_account_record,
-                )?,
-                "orp" => read_bounded_vec_into(
-                    rd,
-                    "orp",
-                    bound,
-                    &mut v.online_round_params,
-                    &mut orp,
-                    OnlineRoundParamsRecordV6::default,
-                    decode_online_round_params_record,
-                )?,
-                _ => return Ok(false),
-            }
-            Ok(true)
-        },
-    )?;
+    decode_struct(&mut rd, |k, rd| {
+        match k {
+            "bl" => read_bounded_vec_into(
+                rd,
+                "bl",
+                bound,
+                &mut v.balances,
+                &mut bl,
+                zero_balance_record,
+                decode_balance_record,
+            )?,
+            "kv" => read_bounded_vec_into(
+                rd,
+                "kv",
+                bound,
+                &mut v.kvs,
+                &mut kv,
+                KVRecordV6::default,
+                decode_kv_record,
+            )?,
+            "oa" => read_bounded_vec_into(
+                rd,
+                "oa",
+                bound,
+                &mut v.online_accounts,
+                &mut oa,
+                zero_online_account_record,
+                decode_online_account_record,
+            )?,
+            "orp" => read_bounded_vec_into(
+                rd,
+                "orp",
+                bound,
+                &mut v.online_round_params,
+                &mut orp,
+                OnlineRoundParamsRecordV6::default,
+                decode_online_round_params_record,
+            )?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
     Ok(v)
 }
 
@@ -1551,8 +1197,6 @@ fn decode_sp_verification_context(
 ) -> Result<(), CatchpointError> {
     decode_struct_into(
         rd,
-        "StateProofVerificationContext",
-        &["spround", "vc", "pw", "v"],
         v,
         algo_codec::StateProofVerificationContext::default,
         |v, k, rd| {
@@ -1576,26 +1220,21 @@ pub fn decode_catchpoint_sp_verification(
     let mut rd = raw;
     let mut v = CatchpointStateProofVerificationWrapper::default();
     let mut spare = Vec::new();
-    decode_struct(
-        &mut rd,
-        "catchpointStateProofVerificationContext",
-        &["spd"],
-        |k, rd| {
-            match k {
-                "spd" => read_bounded_vec_into(
-                    rd,
-                    "spd",
-                    SP_CONTEXT_PER_CATCHPOINT_FILE,
-                    &mut v.data,
-                    &mut spare,
-                    algo_codec::StateProofVerificationContext::default,
-                    decode_sp_verification_context,
-                )?,
-                _ => return Ok(false),
-            }
-            Ok(true)
-        },
-    )?;
+    decode_struct(&mut rd, |k, rd| {
+        match k {
+            "spd" => read_bounded_vec_into(
+                rd,
+                "spd",
+                SP_CONTEXT_PER_CATCHPOINT_FILE,
+                &mut v.data,
+                &mut spare,
+                algo_codec::StateProofVerificationContext::default,
+                decode_sp_verification_context,
+            )?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
     Ok(v)
 }
 
@@ -1608,14 +1247,13 @@ pub fn decode_catchpoint_sp_verification(
 fn read_teal_entries<'a>(
     rd: &mut &'a [u8],
 ) -> Result<Vec<(Vec<u8>, &'a [u8], &'a [u8])>, CatchpointError> {
-    let n = try_read_map_header(rd)?
-        .ok_or_else(|| CatchpointError::DecodeError("TealKeyValue: expected a map".into()))?;
+    let n = read_map_header(rd)?;
     let mut out = Vec::with_capacity((n as usize).min(1024));
     for _ in 0..n {
         let ks = *rd;
         let key = read_go_str_bytes(rd)?;
         let vs = *rd;
-        decode_struct(rd, "TealValue", &["tt", "tb", "ui"], |k, rd| {
+        decode_struct(rd, |k, rd| {
             match k {
                 "tt" | "ui" => {
                     read_u64(rd)?;
@@ -1688,14 +1326,6 @@ mod tests {
             .map(|(k, v)| (rmpv::Value::String((*k).into()), v.clone()))
             .collect();
         let val = rmpv::Value::Map(map_pairs);
-        let mut buf = Vec::new();
-        rmpv::encode::write_value(&mut buf, &val).expect("encode");
-        buf
-    }
-
-    // Helper: build a msgpack array manually.
-    fn encode_array(values: &[rmpv::Value]) -> Vec<u8> {
-        let val = rmpv::Value::Array(values.to_vec());
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, &val).expect("encode");
         buf
@@ -1803,83 +1433,6 @@ mod tests {
         ]);
         let err = decode_base_account_data(&raw).unwrap_err();
         assert!(err.to_string().contains("zzz_future"), "{err}");
-    }
-
-    #[test]
-    fn decode_base_account_data_array_format() {
-        // Positional array with all 24 fields
-        let values: Vec<rmpv::Value> = vec![
-            rmpv::Value::from(2u64),               // status
-            rmpv::Value::from(3_000_000u64),       // micro_algos
-            rmpv::Value::from(50u64),              // rewards_base
-            rmpv::Value::from(25u64),              // rewarded_micro_algos
-            rmpv::Value::Binary(vec![0xBBu8; 32]), // auth_addr
-            rmpv::Value::from(1u64),               // total_app_schema_num_uint
-            rmpv::Value::from(2u64),               // total_app_schema_num_byte_slice
-            rmpv::Value::from(1u64),               // total_extra_app_pages
-            rmpv::Value::from(3u64),               // total_asset_params
-            rmpv::Value::from(5u64),               // total_assets
-            rmpv::Value::from(2u64),               // total_app_params
-            rmpv::Value::from(4u64),               // total_app_local_states
-            rmpv::Value::from(1u64),               // total_boxes
-            rmpv::Value::from(256u64),             // total_box_bytes
-            rmpv::Value::Boolean(true),            // incentive_eligible
-            rmpv::Value::from(800u64),             // last_proposed
-            rmpv::Value::from(799u64),             // last_heartbeat
-            rmpv::Value::Binary(vec![0x44u8; 32]), // vote_id
-            rmpv::Value::Binary(vec![0x55u8; 32]), // selection_id
-            rmpv::Value::from(10u64),              // vote_first_valid
-            rmpv::Value::from(20u64),              // vote_last_valid
-            rmpv::Value::from(100u64),             // vote_key_dilution
-            rmpv::Value::Binary(vec![0x66u8; 64]), // state_proof_id
-            rmpv::Value::from(77u64),              // update_round
-        ];
-        let raw = encode_array(&values);
-        let result = decode_base_account_data(&raw).unwrap();
-
-        assert_eq!(result.status, 2);
-        assert_eq!(result.micro_algos, 3_000_000);
-        assert_eq!(result.rewards_base, 50);
-        assert_eq!(result.rewarded_micro_algos, 25);
-        assert_eq!(result.auth_addr, [0xBBu8; 32]);
-        assert_eq!(result.total_app_schema_num_uint, 1);
-        assert_eq!(result.total_app_schema_num_byte_slice, 2);
-        assert_eq!(result.total_extra_app_pages, 1);
-        assert_eq!(result.total_asset_params, 3);
-        assert_eq!(result.total_assets, 5);
-        assert_eq!(result.total_app_params, 2);
-        assert_eq!(result.total_app_local_states, 4);
-        assert_eq!(result.total_boxes, 1);
-        assert_eq!(result.total_box_bytes, 256);
-        assert!(result.incentive_eligible);
-        assert_eq!(result.last_proposed, 800);
-        assert_eq!(result.last_heartbeat, 799);
-        assert_eq!(result.vote_id, [0x44u8; 32]);
-        assert_eq!(result.selection_id, [0x55u8; 32]);
-        assert_eq!(result.vote_first_valid, 10);
-        assert_eq!(result.vote_last_valid, 20);
-        assert_eq!(result.vote_key_dilution, 100);
-        assert_eq!(result.state_proof_id, [0x66u8; 64]);
-        assert_eq!(result.update_round, 77);
-    }
-
-    #[test]
-    fn decode_base_account_data_short_array() {
-        // Array with only 3 fields -- remaining should be defaults
-        let values: Vec<rmpv::Value> = vec![
-            rmpv::Value::from(1u64),   // status
-            rmpv::Value::from(999u64), // micro_algos
-            rmpv::Value::from(10u64),  // rewards_base
-        ];
-        let raw = encode_array(&values);
-        let result = decode_base_account_data(&raw).unwrap();
-
-        assert_eq!(result.status, 1);
-        assert_eq!(result.micro_algos, 999);
-        assert_eq!(result.rewards_base, 10);
-        assert_eq!(result.rewarded_micro_algos, 0);
-        assert_eq!(result.auth_addr, [0u8; 32]);
-        assert_eq!(result.update_round, 0);
     }
 
     #[test]
@@ -2040,52 +1593,6 @@ mod tests {
     }
 
     #[test]
-    fn decode_resources_data_array_format() {
-        let values: Vec<rmpv::Value> = vec![
-            rmpv::Value::from(1_000_000u64),                // total
-            rmpv::Value::from(6u64),                        // decimals
-            rmpv::Value::Boolean(false),                    // default_frozen
-            rmpv::Value::String("TST".into()),              // unit_name
-            rmpv::Value::String("Test".into()),             // asset_name
-            rmpv::Value::String("https://test.com".into()), // url
-            rmpv::Value::Binary(vec![0u8; 32]),             // metadata_hash
-            rmpv::Value::Binary(vec![0u8; 32]),             // manager
-            rmpv::Value::Binary(vec![0u8; 32]),             // reserve
-            rmpv::Value::Binary(vec![0u8; 32]),             // freeze
-            rmpv::Value::Binary(vec![0u8; 32]),             // clawback
-            rmpv::Value::from(500u64),                      // amount
-            rmpv::Value::Boolean(true),                     // frozen
-            rmpv::Value::from(0u64),                        // schema_num_uint
-            rmpv::Value::from(0u64),                        // schema_num_byte_slice
-            rmpv::Value::Nil,                               // key_value (nil)
-            rmpv::Value::Nil,                               // approval_program (nil)
-            rmpv::Value::Nil,                               // clear_state_program (nil)
-            rmpv::Value::Nil,                               // global_state (nil)
-            rmpv::Value::from(0u64),                        // local_state_schema_num_uint
-            rmpv::Value::from(0u64),                        // local_state_schema_num_byte_slice
-            rmpv::Value::from(0u64),                        // global_state_schema_num_uint
-            rmpv::Value::from(0u64),                        // global_state_schema_num_byte_slice
-            rmpv::Value::from(0u64),                        // extra_program_pages
-            rmpv::Value::from(0u64),                        // resource_flags
-            rmpv::Value::from(42u64),                       // update_round
-            rmpv::Value::from(0u64),                        // version
-            rmpv::Value::Binary(vec![0u8; 32]),             // size_sponsor
-        ];
-        let raw = encode_array(&values);
-        let result = decode_resources_data(&raw).unwrap();
-
-        assert_eq!(result.total, 1_000_000);
-        assert_eq!(result.decimals, 6);
-        assert!(!result.default_frozen);
-        assert_eq!(result.unit_name, b"TST");
-        assert_eq!(result.asset_name, b"Test");
-        assert_eq!(result.url, b"https://test.com");
-        assert_eq!(result.amount, 500);
-        assert!(result.frozen);
-        assert_eq!(result.update_round, 42);
-    }
-
-    #[test]
     fn decode_resources_data_unknown_keys_rejected() {
         // go's generated decoder: msgp.ErrNoField (issue #2394)
         let raw = encode_map(&[
@@ -2145,37 +1652,6 @@ mod tests {
         assert!(result.incentive_eligible);
         assert_eq!(result.micro_algos, 2_000_000);
         assert_eq!(result.rewards_base, 300);
-    }
-
-    #[test]
-    fn decode_base_online_account_data_array_format() {
-        let values: Vec<rmpv::Value> = vec![
-            rmpv::Value::Binary(vec![0x11u8; 32]), // vote_id
-            rmpv::Value::Binary(vec![0x22u8; 32]), // selection_id
-            rmpv::Value::from(10u64),              // vote_first_valid
-            rmpv::Value::from(20u64),              // vote_last_valid
-            rmpv::Value::from(100u64),             // vote_key_dilution
-            rmpv::Value::Binary(vec![0x33u8; 64]), // state_proof_id
-            rmpv::Value::from(5u64),               // last_proposed
-            rmpv::Value::from(4u64),               // last_heartbeat
-            rmpv::Value::Boolean(false),           // incentive_eligible
-            rmpv::Value::from(1_000u64),           // micro_algos
-            rmpv::Value::from(50u64),              // rewards_base
-        ];
-        let raw = encode_array(&values);
-        let result = decode_base_online_account_data(&raw).unwrap();
-
-        assert_eq!(result.vote_id, [0x11u8; 32]);
-        assert_eq!(result.selection_id, [0x22u8; 32]);
-        assert_eq!(result.vote_first_valid, 10);
-        assert_eq!(result.vote_last_valid, 20);
-        assert_eq!(result.vote_key_dilution, 100);
-        assert_eq!(result.state_proof_id, [0x33u8; 64]);
-        assert_eq!(result.last_proposed, 5);
-        assert_eq!(result.last_heartbeat, 4);
-        assert!(!result.incentive_eligible);
-        assert_eq!(result.micro_algos, 1_000);
-        assert_eq!(result.rewards_base, 50);
     }
 
     #[test]
@@ -2256,21 +1732,6 @@ mod tests {
     }
 
     #[test]
-    fn decode_online_round_params_data_array_format() {
-        let values: Vec<rmpv::Value> = vec![
-            rmpv::Value::from(5_000_000u64),   // online_supply
-            rmpv::Value::from(999u64),         // rewards_level
-            rmpv::Value::String("v41".into()), // current_protocol
-        ];
-        let raw = encode_array(&values);
-        let result = decode_online_round_params_data(&raw).unwrap();
-
-        assert_eq!(result.online_supply, 5_000_000);
-        assert_eq!(result.rewards_level, 999);
-        assert_eq!(result.current_protocol, "v41");
-    }
-
-    #[test]
     fn decode_online_round_params_data_partial() {
         // Only online_supply set
         let raw = encode_map(&[("online", rmpv::Value::from(42u64))]);
@@ -2312,6 +1773,39 @@ mod tests {
                 rd.is_empty(),
                 "skip_value did not consume all bytes for {name}"
             );
+        }
+    }
+
+    /// go v5.1.1 (msgp 1.1.66, go #6774) generates struct decoders that read a
+    /// map only: an array, however it is shaped, is a `TypeError` (issue #2609).
+    #[test]
+    fn array_form_is_a_type_error_like_go_v5_1_1() {
+        let arrays: [&[u8]; 7] = [
+            &[0x90],
+            &[0x91, 0xc0],
+            &[0x92, 0x01, 0x02],
+            &[0x91, 0x80],
+            &[0xdc, 0x00, 0x00],
+            &[0xdd, 0x00, 0x00, 0x00, 0x00],
+            &[0x93, 0x01],
+        ];
+        for raw in arrays {
+            let results = [
+                ("base account", decode_base_account_data(raw).map(|_| ())),
+                ("resources", decode_resources_data(raw).map(|_| ())),
+                (
+                    "online account",
+                    decode_base_online_account_data(raw).map(|_| ()),
+                ),
+                (
+                    "online round params",
+                    decode_online_round_params_data(raw).map(|_| ()),
+                ),
+            ];
+            for (what, r) in results {
+                let e = r.expect_err(what).to_string();
+                assert!(e.contains("array"), "{what} {raw:02x?}: {e}");
+            }
         }
     }
 

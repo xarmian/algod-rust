@@ -2164,8 +2164,10 @@ impl StateProofBody {
 // already there, which reflection sees as an unaddressable value: it can
 // still write integers (and copy into an existing `[]byte`), but any `nil`,
 // any `[N]byte` and any slice it would have to grow fail the whole decode.
-// Read from go v5.0.5-stable's tx-sync decoder with the strict-decode
-// oracle; only the tx-sync response (`go_codec_reflect`) decodes this way.
+// Read from go's go-codec decoder with the strict-decode oracle; only a body
+// go reads with `protocol.DecodeReflect` (`go_codec_reflect`: the simulate
+// request, #2555) decodes this way. go v5.1.1's tx-sync response is generated
+// msgp (`protocol.Decode`, rpcs/httpTxSync.go) and has no such path (#2609).
 
 /// go-codec's error for a value it cannot set.
 fn unaddressable() -> algo_error::AlgoError {

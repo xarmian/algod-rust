@@ -1463,16 +1463,21 @@ pub(crate) fn read_checked_optional_rmpv(
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
 
-// ── Struct from array (issue #2426) ──────────────────────────────────
+// ── Struct from array (issues #2426, #2609) ──────────────────────────
 //
-// go's generated `UnmarshalMsgWithState` reads a struct from either a map or,
-// when the value is not a map, an ARRAY whose elements are the fields in go's
-// declaration order (embedded structs flattened in place); more elements than
-// fields is `ErrTooManyArrayFields`, fewer leave the remaining fields alone.
-// `go_struct_order.json` holds that order of every struct (dumped from go's
-// types by `tools/strict-decode-oracle`, checked against the generated
-// decoders), and [`struct_keys`] yields a struct's keys the same way for both
-// forms, so a reader's `match key { ... }` serves both.
+// go-codec's reflection decode (`protocol.DecodeReflect`, `kStruct`) reads a
+// struct from an ARRAY whose elements are the fields in go's declaration order
+// (embedded structs flattened in place); more elements than fields is an
+// error, fewer leave the remaining fields alone. go's GENERATED msgp decoders
+// read it too up to v5.0.5 (`UnmarshalMsgWithState`'s "struct-from-array"
+// branch), but v5.1.1 (algorand/msgp 1.1.66, go #6774) generates map-only
+// decoders: an array is `ReadMapHeaderBytes`'s TypeError there. So the array
+// form is read only under [`go_codec_reflect`] (its one caller is the simulate
+// request, `simulate_strict.rs`); every other reader rejects an array like any
+// non-map. `go_struct_order.json` holds that order of every struct (dumped from
+// go's types by `tools/strict-decode-oracle`), and [`struct_keys`] yields a
+// struct's keys the same way for both forms, so a reader's `match key { ... }`
+// serves both.
 
 /// `type name -> keys in go's positional order` of `go_struct_order.json`.
 fn go_struct_orders() -> &'static std::collections::HashMap<String, Vec<Vec<u8>>> {
@@ -1536,8 +1541,8 @@ impl StructKeys {
 /// The header of a struct value of go type `go_type` decoded into `s`: a
 /// `nil` resets `s` to its zero value and reads as no fields (go
 /// `(*z) = T{}`), a map yields its keys, an array yields go's positional
-/// field order (go-codec reflection only; go v5.1's generated decoders reject
-/// an array like any other non-map value).
+/// field order under [`go_codec_reflect`] only (go v5.1.1's generated decoders
+/// reject an array like any other non-map value, issue #2609).
 #[inline]
 pub fn struct_keys<T: Default>(
     rd: &mut &[u8],
@@ -1565,14 +1570,12 @@ pub fn struct_keys_with<T>(
                 pos: 0,
             })
         }
-        // go-codec's struct decode (`reflect_mode`, the tx-sync response)
-        // reads the array form the same way: positionally in the source
-        // order of the struct's encodable fields (`kStruct`, `sfiSrc`), a `nil`
-        // element zeroing the field like a `nil` map value does, and an
-        // element more than the fields an error (`ErrorIfNoField`)
-        // go v5.1 (msgp 1.1.66, #6774) generates map-only struct decoders: an
-        // array is `ReadMapHeaderBytes`'s TypeError, as any non-map. Only go-codec's
-        // reflection decode (the tx-sync response) still reads the array form.
+        // go-codec's struct decode (`reflect_mode`) reads the array form:
+        // positionally in the source order of the struct's encodable fields
+        // (`kStruct`, `sfiSrc`), a `nil` element zeroing the field like a `nil`
+        // map value does, and an element more than the fields an error
+        // (`ErrorIfNoField`). Any other array is `ReadMapHeaderBytes`'s
+        // TypeError (go v5.1.1, msgp 1.1.66, #6774), as any non-map.
         Some(0x90..=0x9f | 0xdc | 0xdd) if reflect_mode() => array_struct_keys(rd, go_type),
         _ => Ok(StructKeys {
             left: rmp::decode::read_map_len(rd)

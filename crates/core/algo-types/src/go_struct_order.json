@@ -1049,6 +1049,32 @@
    }
   }
  ],
+ "basics.TealValue": [
+  {
+   "go": "Type",
+   "key": "tt",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Bytes",
+   "key": "tb",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "Uint",
+   "key": "ui",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  }
+ ],
  "basics.ValueDelta": [
   {
    "go": "Action",
@@ -1847,6 +1873,356 @@
    }
   }
  ],
+ "encoded.BalanceRecordV6": [
+  {
+   "go": "Address",
+   "key": "a",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "AccountData",
+   "key": "b",
+   "type": {
+    "k": "struct",
+    "t": "trackerdb.BaseAccountData"
+   }
+  },
+  {
+   "go": "Resources",
+   "key": "c",
+   "type": {
+    "e": {
+     "k": "struct",
+     "t": "trackerdb.ResourcesData"
+    },
+    "k": "map"
+   }
+  },
+  {
+   "go": "ExpectingMoreEntries",
+   "key": "e",
+   "type": {
+    "k": "leaf",
+    "t": "bool"
+   }
+  }
+ ],
+ "encoded.KVRecordV6": [
+  {
+   "go": "Key",
+   "key": "k",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  },
+  {
+   "go": "Value",
+   "key": "v",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  }
+ ],
+ "encoded.OnlineAccountRecordV6": [
+  {
+   "go": "Address",
+   "key": "addr",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "UpdateRound",
+   "key": "upd",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "NormalizedOnlineBalance",
+   "key": "nob",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "VoteLastValid",
+   "key": "vlv",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Data",
+   "key": "data",
+   "type": {
+    "k": "leaf",
+    "t": "raw"
+   }
+  }
+ ],
+ "encoded.OnlineRoundParamsRecordV6": [
+  {
+   "go": "Round",
+   "key": "rnd",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Data",
+   "key": "data",
+   "type": {
+    "k": "leaf",
+    "t": "raw"
+   }
+  }
+ ],
+ "ledger.CatchpointFileHeader": [
+  {
+   "go": "Version",
+   "key": "version",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "BalancesRound",
+   "key": "balancesRound",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "BlocksRound",
+   "key": "blocksRound",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Totals",
+   "key": "accountTotals",
+   "type": {
+    "k": "struct",
+    "t": "ledgercore.AccountTotals"
+   }
+  },
+  {
+   "go": "TotalAccounts",
+   "key": "accountsCount",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "TotalChunks",
+   "key": "chunksCount",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "TotalKVs",
+   "key": "kvsCount",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "TotalOnlineAccounts",
+   "key": "onlineAccountsCount",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "TotalOnlineRoundParams",
+   "key": "onlineRoundParamsCount",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Catchpoint",
+   "key": "catchpoint",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "BlockHeaderDigest",
+   "key": "blockHeaderDigest",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  }
+ ],
+ "ledger.CatchpointSnapshotChunkV6": [
+  {
+   "go": "Balances",
+   "key": "bl",
+   "type": {
+    "e": {
+     "k": "struct",
+     "t": "encoded.BalanceRecordV6"
+    },
+    "k": "list"
+   }
+  },
+  {
+   "go": "KVs",
+   "key": "kv",
+   "type": {
+    "e": {
+     "k": "struct",
+     "t": "encoded.KVRecordV6"
+    },
+    "k": "list"
+   }
+  },
+  {
+   "go": "OnlineAccounts",
+   "key": "oa",
+   "type": {
+    "e": {
+     "k": "struct",
+     "t": "encoded.OnlineAccountRecordV6"
+    },
+    "k": "list"
+   }
+  },
+  {
+   "go": "OnlineRoundParams",
+   "key": "orp",
+   "type": {
+    "e": {
+     "k": "struct",
+     "t": "encoded.OnlineRoundParamsRecordV6"
+    },
+    "k": "list"
+   }
+  }
+ ],
+ "ledger.catchpointStateProofVerificationContext": [
+  {
+   "go": "Data",
+   "key": "spd",
+   "type": {
+    "e": {
+     "k": "struct",
+     "t": "ledgercore.StateProofVerificationContext"
+    },
+    "k": "list"
+   }
+  }
+ ],
+ "ledgercore.AccountTotals": [
+  {
+   "go": "Online",
+   "key": "online",
+   "type": {
+    "k": "struct",
+    "t": "ledgercore.AlgoCount"
+   }
+  },
+  {
+   "go": "Offline",
+   "key": "offline",
+   "type": {
+    "k": "struct",
+    "t": "ledgercore.AlgoCount"
+   }
+  },
+  {
+   "go": "NotParticipating",
+   "key": "notpart",
+   "type": {
+    "k": "struct",
+    "t": "ledgercore.AlgoCount"
+   }
+  },
+  {
+   "go": "RewardsLevel",
+   "key": "rwdlvl",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  }
+ ],
+ "ledgercore.AlgoCount": [
+  {
+   "go": "Money",
+   "key": "mon",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "RewardUnits",
+   "key": "rwd",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  }
+ ],
+ "ledgercore.StateProofVerificationContext": [
+  {
+   "go": "LastAttestedRound",
+   "key": "spround",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "VotersCommitment",
+   "key": "vc",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  },
+  {
+   "go": "OnlineTotalWeight",
+   "key": "pw",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Version",
+   "key": "v",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  }
+ ],
  "main.saltedPublicMaterial": [
   {
    "go": "Scheme",
@@ -2274,6 +2650,448 @@
    "type": {
     "k": "leaf",
     "t": "uint64"
+   }
+  }
+ ],
+ "trackerdb.BaseAccountData": [
+  {
+   "go": "Status",
+   "key": "a",
+   "type": {
+    "k": "leaf",
+    "t": "uint8"
+   }
+  },
+  {
+   "go": "MicroAlgos",
+   "key": "b",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "RewardsBase",
+   "key": "c",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "RewardedMicroAlgos",
+   "key": "d",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "AuthAddr",
+   "key": "e",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "TotalAppSchemaNumUint",
+   "key": "f",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "TotalAppSchemaNumByteSlice",
+   "key": "g",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "TotalExtraAppPages",
+   "key": "h",
+   "type": {
+    "k": "leaf",
+    "t": "uint32"
+   }
+  },
+  {
+   "go": "TotalAssetParams",
+   "key": "i",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "TotalAssets",
+   "key": "j",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "TotalAppParams",
+   "key": "k",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "TotalAppLocalStates",
+   "key": "l",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "TotalBoxes",
+   "key": "m",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "TotalBoxBytes",
+   "key": "n",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "IncentiveEligible",
+   "key": "o",
+   "type": {
+    "k": "leaf",
+    "t": "bool"
+   }
+  },
+  {
+   "go": "LastProposed",
+   "key": "p",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "LastHeartbeat",
+   "key": "q",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "VoteID",
+   "key": "A",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "SelectionID",
+   "key": "B",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "VoteFirstValid",
+   "key": "C",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "VoteLastValid",
+   "key": "D",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "VoteKeyDilution",
+   "key": "E",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "StateProofID",
+   "key": "F",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[64]"
+   }
+  },
+  {
+   "go": "UpdateRound",
+   "key": "z",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  }
+ ],
+ "trackerdb.ResourcesData": [
+  {
+   "go": "Total",
+   "key": "a",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Decimals",
+   "key": "b",
+   "type": {
+    "k": "leaf",
+    "t": "uint32"
+   }
+  },
+  {
+   "go": "DefaultFrozen",
+   "key": "c",
+   "type": {
+    "k": "leaf",
+    "t": "bool"
+   }
+  },
+  {
+   "go": "UnitName",
+   "key": "d",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "AssetName",
+   "key": "e",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "URL",
+   "key": "f",
+   "type": {
+    "k": "leaf",
+    "t": "string"
+   }
+  },
+  {
+   "go": "MetadataHash",
+   "key": "g",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Manager",
+   "key": "h",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Reserve",
+   "key": "i",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Freeze",
+   "key": "j",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Clawback",
+   "key": "k",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "Amount",
+   "key": "l",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Frozen",
+   "key": "m",
+   "type": {
+    "k": "leaf",
+    "t": "bool"
+   }
+  },
+  {
+   "go": "SchemaNumUint",
+   "key": "n",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "SchemaNumByteSlice",
+   "key": "o",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "KeyValue",
+   "key": "p",
+   "type": {
+    "e": {
+     "k": "struct",
+     "t": "basics.TealValue"
+    },
+    "k": "map"
+   }
+  },
+  {
+   "go": "ApprovalProgram",
+   "key": "q",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  },
+  {
+   "go": "ClearStateProgram",
+   "key": "r",
+   "type": {
+    "k": "leaf",
+    "t": "bytes"
+   }
+  },
+  {
+   "go": "GlobalState",
+   "key": "s",
+   "type": {
+    "e": {
+     "k": "struct",
+     "t": "basics.TealValue"
+    },
+    "k": "map"
+   }
+  },
+  {
+   "go": "LocalStateSchemaNumUint",
+   "key": "t",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "LocalStateSchemaNumByteSlice",
+   "key": "u",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "GlobalStateSchemaNumUint",
+   "key": "v",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "GlobalStateSchemaNumByteSlice",
+   "key": "w",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "ExtraProgramPages",
+   "key": "x",
+   "type": {
+    "k": "leaf",
+    "t": "uint32"
+   }
+  },
+  {
+   "go": "ResourceFlags",
+   "key": "y",
+   "type": {
+    "k": "leaf",
+    "t": "uint8"
+   }
+  },
+  {
+   "go": "UpdateRound",
+   "key": "z",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "Version",
+   "key": "A",
+   "type": {
+    "k": "leaf",
+    "t": "uint64"
+   }
+  },
+  {
+   "go": "SizeSponsor",
+   "key": "B",
+   "type": {
+    "k": "leaf",
+    "t": "bytes[32]"
+   }
+  },
+  {
+   "go": "ForeignBoxReads",
+   "key": "C",
+   "type": {
+    "k": "leaf",
+    "t": "bool"
+   }
+  },
+  {
+   "go": "FamilyBoxAccess",
+   "key": "D",
+   "type": {
+    "k": "leaf",
+    "t": "bool"
    }
   }
  ],
