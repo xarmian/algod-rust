@@ -611,6 +611,28 @@ impl P2pHost {
         use futures_util::StreamExt;
         let event = self.swarm.select_next_some().await;
 
+        // go v5.1.1 `namespaceProviderStore`: records arrive unstored
+        // (`StoreInserts::FilterBoth`, see `dht_config`); keep a provider
+        // record only for a capability key and with a bounded address list,
+        // and no value record at all.
+        if let SwarmEvent::Behaviour(P2pBehaviourEvent::Kad(kad::Event::InboundRequest {
+            request:
+                kad::InboundRequest::AddProvider {
+                    record: Some(record),
+                },
+        })) = &event
+        {
+            use libp2p::kad::store::RecordStore;
+            if let Some(record) = crate::dht::accept_provider_record(record.clone()) {
+                let _ = self
+                    .swarm
+                    .behaviour_mut()
+                    .kad
+                    .store_mut()
+                    .add_provider(record);
+            }
+        }
+
         // Feed a newly-established connection's observed remote address
         // into the DHT routing table immediately, so a peer is at least
         // minimally routable (e.g. for the side that dialed it, where the
@@ -900,7 +922,9 @@ impl P2pHost {
             .gossipsub
             .report_message_validation_result(msg_id, propagation_source, result.into())
         {
-            tracing::debug!("gossipsub message validation result not applied (message not in cache)");
+            tracing::debug!(
+                "gossipsub message validation result not applied (message not in cache)"
+            );
         }
     }
 

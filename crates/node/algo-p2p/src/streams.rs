@@ -221,6 +221,9 @@ pub struct StreamManager<S> {
     /// established (go v5.1.1 `gsPeer.RoutingAddr` asks the service for the
     /// peer's connections instead).
     routing: HashMap<PeerId, Vec<u8>>,
+    /// When `close_without_stream` first saw each connection dialed for gossip
+    /// without a gossip stream (go `noStreamSince`).
+    no_stream_since: HashMap<PeerId, std::time::Instant>,
 }
 
 impl<S> Default for StreamManager<S> {
@@ -235,7 +238,40 @@ impl<S> StreamManager<S> {
             streams: HashMap::new(),
             inflight: HashMap::new(),
             routing: HashMap::new(),
+            no_stream_since: HashMap::new(),
         }
+    }
+
+    /// go v5.1.1 `closeWithoutStream`: of `dialed`, the peers whose connection
+    /// was dialed for gossip, return those that have had no gossip stream since
+    /// a call at least `timeout` earlier (go `streamSetupTimeout`, 30 s); the
+    /// caller closes their connections. The first call that sees a peer
+    /// without a stream starts its clock; a peer that has a stream, or is not in
+    /// `dialed`, is forgotten. An attempt still in flight does not keep a
+    /// connection: stream negotiation and the handshake are each bounded at
+    /// about 10 seconds, so an attempt that has not produced a stream by then is
+    /// not going to.
+    pub fn close_without_stream(
+        &mut self,
+        dialed: &[PeerId],
+        now: std::time::Instant,
+        timeout: std::time::Duration,
+    ) -> Vec<PeerId> {
+        let mut closed = Vec::new();
+        let mut seen = HashMap::with_capacity(dialed.len());
+        for peer in dialed {
+            if self.streams.contains_key(peer) {
+                continue;
+            }
+            let since = self.no_stream_since.get(peer).copied().unwrap_or(now);
+            if now.saturating_duration_since(since) < timeout {
+                seen.insert(*peer, since);
+                continue;
+            }
+            closed.push(*peer);
+        }
+        self.no_stream_since = seen;
+        closed
     }
 
     /// Record the routing address of the IP `remote` is connected from.
@@ -357,6 +393,42 @@ impl<S> StreamManager<S> {
 
 #[cfg(test)]
 mod tests {
+
+    /// go v5.1.1 `closeWithoutStream`: a connection dialed for gossip that has no
+    /// gossip stream `timeout` after the first pass that saw it is returned for
+    /// closing; a stream, or dropping out of the dialed set, resets the clock.
+    #[test]
+    fn close_without_stream_closes_a_dialed_peer_only_after_the_timeout() {
+        use std::time::{Duration, Instant};
+        let timeout = Duration::from_secs(30);
+        let mut m: StreamManager<u8> = StreamManager::new();
+        let (a, b, c) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let t0 = Instant::now();
+        m.set_stream(b, 1);
+        // first pass: nothing is old enough; b has a stream
+        assert!(m.close_without_stream(&[a, b, c], t0, timeout).is_empty());
+        // just before the timeout, still nothing
+        let almost = t0 + timeout - Duration::from_millis(1);
+        assert!(m
+            .close_without_stream(&[a, b, c], almost, timeout)
+            .is_empty());
+        // at the timeout a and c are due (b has a stream)
+        let due = m.close_without_stream(&[a, b, c], t0 + timeout, timeout);
+        assert_eq!(due.len(), 2);
+        assert!(due.contains(&a) && due.contains(&c));
+        // a peer that left the dialed set is forgotten, its clock starts over
+        let mut m: StreamManager<u8> = StreamManager::new();
+        m.close_without_stream(&[a], t0, timeout);
+        m.close_without_stream(&[], t0 + Duration::from_secs(20), timeout);
+        assert!(m
+            .close_without_stream(&[a], t0 + timeout, timeout)
+            .is_empty());
+        // an attempt in flight does not keep the connection
+        let mut m: StreamManager<u8> = StreamManager::new();
+        m.begin_peer_attempt(a);
+        m.close_without_stream(&[a], t0, timeout);
+        assert_eq!(m.close_without_stream(&[a], t0 + timeout, timeout), vec![a]);
+    }
     use super::*;
 
     fn peer(byte: u8) -> PeerId {
