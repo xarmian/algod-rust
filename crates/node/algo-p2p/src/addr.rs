@@ -39,7 +39,6 @@
 use std::str::FromStr;
 
 use libp2p::Multiaddr;
-use url::Url;
 
 /// Matches go's `HostColonPortPattern = regexp.MustCompile(`^[-a-zA-Z0-9.]+:\d+$`)`.
 ///
@@ -74,212 +73,548 @@ pub enum AddrParseError {
     /// Go: `errMultiaddrParse = errors.New("failed to parse multiaddr")`.
     #[error("failed to parse multiaddr: {0}")]
     MultiaddrParse(String),
-    /// The input could not be parsed as a URL at all (go returns the
-    /// underlying `url.Parse` error in this case; we don't have a 1:1
-    /// error type for Rust's `url` crate, so this wraps its message).
-    #[error("could not parse url: {0}")]
+    /// The `url.Parse` error go returns, with go's text
+    /// (`parse "<url>": <reason>`).
+    #[error("{0}")]
     UrlParse(String),
+}
+
+/// The two fields of go's `*url.URL` that `ParseHostOrURL` callers use:
+/// `Scheme` (lower-cased) and `Host` (including any port, as go keeps it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoUrl {
+    /// `url.URL.Scheme`.
+    pub scheme: String,
+    /// `url.URL.Host`.
+    pub host: String,
 }
 
 /// Parses `addr` as either a bare `host:port` pair or a full URL.
 ///
-/// Mirrors go's `ParseHostOrURL`: Rust's `url` crate (like Go's
-/// `net/url.Parse`) doesn't handle a bare `host:port` — it interprets
-/// `foo.com:1234` as scheme `foo.com` with an empty path — so a `host:port`
-/// shape is detected up front via [`HOST_COLON_PORT_PATTERN`] and given an
-/// explicit `http://` scheme before parsing.
-pub fn parse_host_or_url(addr: &str) -> Result<Url, AddrParseError> {
-    parse_host_or_url_with_literal_port(addr).map(|(url, _, _)| url)
+/// A port of go's `ParseHostOrURL` (`network/addr/addr.go`) on top of a port of
+/// the part of go 1.27's `net/url.Parse` it depends on ([`go_url_parse`]); the
+/// `url` crate is WHATWG-strict and differs from go on host shapes, default
+/// ports and error texts, so it is not used. Pinned to go by
+/// `tests/addr_oracle.rs`.
+pub fn parse_host_or_url(addr: &str) -> Result<GoUrl, AddrParseError> {
+    // If the entire addr is "host:port" grab that right away.
+    if matches_host_colon_port(addr) {
+        return Ok(GoUrl {
+            scheme: "http".to_string(),
+            host: addr.to_string(),
+        });
+    }
+    let first_err = match go_url_parse(addr) {
+        Ok(parsed) => {
+            if parsed.host.is_empty() {
+                return Err(AddrParseError::NoHost);
+            }
+            return Ok(parsed);
+        }
+        Err(e) => e,
+    };
+    if ["http:", "https:", "ws:", "wss:", "://", "//"]
+        .iter()
+        .any(|p| addr.starts_with(p))
+    {
+        return Err(AddrParseError::UrlParse(first_err));
+    }
+    // This turns "[::]:4601" into "http://[::]:4601" which url.Parse can do
+    match go_url_parse(&format!("http://{addr}")) {
+        Ok(parsed) => {
+            // https://datatracker.ietf.org/doc/html/rfc1123#section-2
+            // first character is relaxed to allow either a letter or a digit
+            let h = parsed.host.as_bytes();
+            if h.first() == Some(&b':') && (h.len() < 2 || h[1] != b':') {
+                return Err(AddrParseError::ColonHost);
+            }
+            Ok(parsed)
+        }
+        // return original err, not our prefix altered try
+        Err(_) => Err(AddrParseError::UrlParse(first_err)),
+    }
 }
 
-/// Like [`parse_host_or_url`], but also returns the literal, as-written port
-/// from `addr` when one is present — including one that equals its scheme's
-/// WHATWG default and that the returned `Url`'s own `port()`/`set_port()`
-/// therefore cannot represent (see [`literal_port`]'s doc comment).
-///
-/// Also returns the literal host override for go's unbracketed-IPv6-with-
-/// trailing-port host quirk (issue #1437) as its third element — see
-/// [`unbracketed_ipv6_with_port_host`] — since `url::Url` has no way to
-/// represent that host at all (the WHATWG URL Standard forbids a bare `:`
-/// in a host, bracketed-IPv6 or not, so `Url::host_str()` cannot carry it).
-/// `None` for every other input shape, in which case callers fall back to
-/// `Url::host_str()` as before.
-///
-/// [`parse_host_or_url_or_multiaddr`] uses this (instead of `Url::port()`
-/// alone) to build its returned "host:port" string, so that an explicit
-/// default port survives end to end (issue #1436). `parse_host_or_url`
-/// itself still returns a plain `Url` unchanged: nothing else in this crate
-/// inspects `.port()` on its result for a "special"-scheme default-port
-/// input, and preserving `Url`'s ordinary semantics elsewhere avoids
-/// widening this fix beyond the actual bug.
-#[allow(clippy::type_complexity)]
-fn parse_host_or_url_with_literal_port(
-    addr: &str,
-) -> Result<(Url, Option<u16>, Option<String>), AddrParseError> {
-    if matches_host_colon_port(addr) {
-        let joined = format!("http://{addr}");
-        return Url::parse(&joined)
-            .map(|parsed| {
-                let port = literal_port(&joined);
-                (parsed, port, None)
-            })
-            .map_err(|e| AddrParseError::UrlParse(e.to_string()));
-    }
+// --- go 1.27 net/url.Parse, the part ParseHostOrURL depends on ---------------
 
-    if let Ok(parsed) = Url::parse(addr) {
-        if parsed.host_str().is_none() {
-            return Err(AddrParseError::NoHost);
-        }
-        let port = literal_port(addr);
-        return Ok((parsed, port, None));
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Enc {
+    Host,
+    Zone,
+    Path,
+    UserPassword,
+    Fragment,
+}
 
-    if addr.starts_with("http:")
-        || addr.starts_with("https:")
-        || addr.starts_with("ws:")
-        || addr.starts_with("wss:")
-        || addr.starts_with("://")
+/// go's `shouldEscape` (reference implementation of its encoding table).
+fn should_escape(c: u8, mode: Enc) -> bool {
+    if c.is_ascii_alphanumeric() {
+        return false;
+    }
+    if matches!(mode, Enc::Host | Enc::Zone)
+        && matches!(
+            c,
+            b'!' | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'['
+                | b']'
+                | b'<'
+                | b'>'
+                | b'"'
+        )
     {
-        // Go returns the original (parsed, err) pair here — both nil/zero
-        // on this path in practice, since these prefixes are exactly the
-        // ones `url.Parse` already accepts. We already know `Url::parse`
-        // failed above, so surface that failure directly.
-        return Err(AddrParseError::UrlParse(
-            "failed to parse url with recognized scheme prefix".to_string(),
+        return false;
+    }
+    match c {
+        b'-' | b'_' | b'.' | b'~' => return false,
+        b'$' | b'&' | b'+' | b',' | b'/' | b':' | b';' | b'=' | b'?' | b'@' => match mode {
+            Enc::Path => return c == b'?',
+            Enc::UserPassword => return matches!(c, b'@' | b'/' | b'?' | b':'),
+            Enc::Fragment => return false,
+            _ => {}
+        },
+        _ => {}
+    }
+    if mode == Enc::Fragment && matches!(c, b'!' | b'(' | b')' | b'*') {
+        return false;
+    }
+    true
+}
+
+fn unhex(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        _ => c - b'A' + 10,
+    }
+}
+
+/// go's `unescape`: validates `%XX` escapes (and, for host/zone, characters)
+/// and returns the unescaped bytes.
+fn go_unescape(s: &[u8], mode: Enc) -> Result<Vec<u8>, String> {
+    let quote = go_quote_bytes;
+    let mut i = 0;
+    let mut out = Vec::with_capacity(s.len());
+    while i < s.len() {
+        match s[i] {
+            b'%' => {
+                if i + 2 >= s.len()
+                    || !s[i + 1].is_ascii_hexdigit()
+                    || !s[i + 2].is_ascii_hexdigit()
+                {
+                    let end = (i + 3).min(s.len());
+                    return Err(format!("invalid URL escape {}", quote(&s[i..end])));
+                }
+                if mode == Enc::Host && unhex(s[i + 1]) < 8 && &s[i..i + 3] != b"%25" {
+                    return Err(format!("invalid URL escape {}", quote(&s[i..i + 3])));
+                }
+                let v = unhex(s[i + 1]) << 4 | unhex(s[i + 2]);
+                if mode == Enc::Zone
+                    && &s[i..i + 3] != b"%25"
+                    && v != b' '
+                    && should_escape(v, Enc::Host)
+                {
+                    return Err(format!("invalid URL escape {}", quote(&s[i..i + 3])));
+                }
+                out.push(v);
+                i += 3;
+            }
+            c => {
+                if matches!(mode, Enc::Host | Enc::Zone) && c < 0x80 && should_escape(c, mode) {
+                    return Err(format!(
+                        "invalid character {} in host name",
+                        quote(&s[i..i + 1])
+                    ));
+                }
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// go's `strconv.Quote` (`%q`) of a string that may hold invalid UTF-8:
+/// printable runes as they are, the usual escapes, `\xNN` for ASCII control
+/// bytes and for every byte of an invalid sequence, `\uNNNN` / `\UNNNNNNNN` for
+/// non-printable runes. Go's `IsPrint` is [`go_is_print`].
+fn go_quote_bytes(mut b: &[u8]) -> String {
+    let mut out = String::with_capacity(b.len() + 2);
+    out.push('"');
+    while !b.is_empty() {
+        let (valid, bad) = match std::str::from_utf8(b) {
+            Ok(s) => (s, 0),
+            Err(e) => {
+                let n = e.valid_up_to();
+                (
+                    std::str::from_utf8(&b[..n]).unwrap_or(""),
+                    e.error_len().unwrap_or(b.len() - n),
+                )
+            }
+        };
+        for c in valid.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\u{7}' => out.push_str("\\a"),
+                '\u{8}' => out.push_str("\\b"),
+                '\u{c}' => out.push_str("\\f"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\u{b}' => out.push_str("\\v"),
+                ' '..='~' => out.push(c),
+                c if (c as u32) < 0x80 => out.push_str(&format!("\\x{:02x}", c as u32)),
+                c if go_is_print(c) => out.push(c),
+                c if (c as u32) < 0x10000 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push_str(&format!("\\U{:08x}", c as u32)),
+            }
+        }
+        let n = valid.len();
+        for byte in &b[n..n + bad] {
+            out.push_str(&format!("\\x{byte:02x}"));
+        }
+        b = &b[n + bad..];
+    }
+    out.push('"');
+    out
+}
+
+fn go_quote(s: &str) -> String {
+    go_quote_bytes(s.as_bytes())
+}
+
+/// go 1.27 `unicode.IsPrint` for a rune >= 0x80, from the table the go oracle
+/// wrote (`go_print_table.rs`, `tools/network-oracle`).
+fn go_is_print(c: char) -> bool {
+    let c = c as u32;
+    crate::go_print_table::NON_PRINT
+        .binary_search_by(|&(lo, hi)| {
+            if c < lo {
+                std::cmp::Ordering::Greater
+            } else if c > hi {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_err()
+}
+
+/// go's `getScheme`: `Ok((scheme, rest))`.
+fn go_get_scheme(raw: &str) -> Result<(&str, &str), String> {
+    for (i, c) in raw.bytes().enumerate() {
+        match c {
+            b'a'..=b'z' | b'A'..=b'Z' => {}
+            b'0'..=b'9' | b'+' | b'-' | b'.' => {
+                if i == 0 {
+                    return Ok(("", raw));
+                }
+            }
+            b':' => {
+                if i == 0 {
+                    return Err("missing protocol scheme".to_string());
+                }
+                return Ok((&raw[..i], &raw[i + 1..]));
+            }
+            _ => return Ok(("", raw)),
+        }
+    }
+    Ok(("", raw))
+}
+
+/// go's `validOptionalPort`.
+fn valid_optional_port(port: &str) -> bool {
+    match port.as_bytes().split_first() {
+        None => true,
+        Some((b':', digits)) => digits.iter().all(u8::is_ascii_digit),
+        Some(_) => false,
+    }
+}
+
+/// go's `validUserinfo`.
+fn valid_userinfo(s: &str) -> bool {
+    s.chars().all(|r| {
+        r.is_ascii_alphanumeric()
+            || matches!(
+                r,
+                '-' | '.'
+                    | '_'
+                    | ':'
+                    | '~'
+                    | '!'
+                    | '$'
+                    | '&'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '*'
+                    | '+'
+                    | ','
+                    | ';'
+                    | '='
+                    | '%'
+                    | '@'
+            )
+    })
+}
+
+/// go's `netip.ParseAddr` for the IPv6 shapes `parseHost` can hand it: the
+/// address is accepted only when its first `.`, `:` or `%` is a `:` and
+/// `parseIPv6` succeeds (anything else is an IPv4 address or an error, which
+/// `parseHost` rejects either way).
+fn go_ip_literal_is_ipv6(s: &str) -> Result<(), String> {
+    match s.bytes().find(|b| matches!(b, b'.' | b':' | b'%')) {
+        Some(b':') => go_parse_ipv6(s),
+        _ => Err(format!("ParseAddr({s:?}): unable to parse IP")),
+    }
+}
+
+/// go's `netip` `parseIPv6`.
+fn go_parse_ipv6(input: &str) -> Result<(), String> {
+    let err = |msg: &str| Err(format!("ParseAddr({input:?}): {msg}"));
+    let mut s = input.as_bytes();
+    if let Some(i) = s.iter().position(|&b| b == b'%') {
+        if i + 1 == s.len() {
+            return err("zone must be a non-empty string");
+        }
+        s = &s[..i];
+    }
+    let mut ellipsis: i32 = -1;
+    if s.len() >= 2 && s[0] == b':' && s[1] == b':' {
+        ellipsis = 0;
+        s = &s[2..];
+        if s.is_empty() {
+            return Ok(());
+        }
+    }
+    let mut i: i32 = 0;
+    while i < 16 {
+        let mut off = 0usize;
+        let mut acc: u32 = 0;
+        while off < s.len() && s[off].is_ascii_hexdigit() {
+            acc = (acc << 4) + u32::from(unhex(s[off]));
+            if off > 3 {
+                return err("each group must have 4 or less digits");
+            }
+            if acc > 0xffff {
+                return err("IPv6 field has value >=2^16");
+            }
+            off += 1;
+        }
+        if off == 0 {
+            return err("each colon-separated field must have at least one digit");
+        }
+        if off < s.len() && s[off] == b'.' {
+            if ellipsis < 0 && i != 12 {
+                return err("embedded IPv4 address must replace the final 2 fields of the address");
+            }
+            if i + 4 > 16 {
+                return err(
+                    "too many hex fields to fit an embedded IPv4 at the end of the address",
+                );
+            }
+            let v4 = std::str::from_utf8(s).unwrap_or("");
+            go_parse_ipv4_fields(v4).map_err(|m| format!("ParseAddr({input:?}): {m}"))?;
+            s = &[];
+            i += 4;
+            break;
+        }
+        i += 2;
+        s = &s[off..];
+        if s.is_empty() {
+            break;
+        }
+        if s[0] != b':' {
+            return err("unexpected character, want colon");
+        } else if s.len() == 1 {
+            return err("colon must be followed by more characters");
+        }
+        s = &s[1..];
+        if s[0] == b':' {
+            if ellipsis >= 0 {
+                return err("multiple :: in address");
+            }
+            ellipsis = i;
+            s = &s[1..];
+            if s.is_empty() {
+                break;
+            }
+        }
+    }
+    if !s.is_empty() {
+        return err("trailing garbage after address");
+    }
+    if i < 16 {
+        if ellipsis < 0 {
+            return err("address string too short");
+        }
+    } else if ellipsis >= 0 {
+        return err("the :: must expand to at least one field of zeros");
+    }
+    Ok(())
+}
+
+/// go's `parseIPv4Fields`: four dot-separated decimal fields, each at most 255
+/// without a leading zero.
+fn go_parse_ipv4_fields(s: &str) -> Result<(), String> {
+    let fields: Vec<&str> = s.split('.').collect();
+    if fields.len() != 4 {
+        return Err("IPv4 address too short or too long".to_string());
+    }
+    for f in fields {
+        if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("unexpected character in IPv4 field".to_string());
+        }
+        if f.len() > 1 && f.starts_with('0') {
+            return Err("IPv4 field has octet with leading zero".to_string());
+        }
+        if f.parse::<u32>().map_or(true, |v| v > 255) {
+            return Err("IPv4 field has value >255".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// go's `parseHost` (go 1.27: colons in an `http`/`https` host are strict, the
+/// default for a module with `go 1.27`).
+fn go_parse_host(scheme: &str, host: &str) -> Result<String, String> {
+    let lossy = |b: Vec<u8>| String::from_utf8_lossy(&b).into_owned();
+    let open = host.rfind('[');
+    if matches!(open, Some(i) if i > 0) {
+        return Err("invalid IP-literal".to_string());
+    }
+    if open == Some(0) {
+        // an IP-Literal, e.g. "[fe80::1]", "[fe80::1%25en0]", "[fe80::1]:80"
+        let Some(close) = host.rfind(']') else {
+            return Err("missing ']' in host".to_string());
+        };
+        let colon_port = &host[close + 1..];
+        if !valid_optional_port(colon_port) {
+            return Err(format!("invalid port {colon_port:?} after host"));
+        }
+        let unescaped_colon_port = go_unescape(colon_port.as_bytes(), Enc::Host)?;
+        let hostname = &host[1..close];
+        let unescaped_hostname = if let Some(z) = hostname.find("%25") {
+            let hb = hostname.as_bytes();
+            let mut h = go_unescape(&hb[..z], Enc::Host)?;
+            h.extend(go_unescape(&hb[z..], Enc::Zone)?);
+            h
+        } else {
+            go_unescape(hostname.as_bytes(), Enc::Host)?
+        };
+        let unescaped_hostname = lossy(unescaped_hostname);
+        go_ip_literal_is_ipv6(&unescaped_hostname).map_err(|e| format!("invalid host: {e}"))?;
+        return Ok(format!(
+            "[{unescaped_hostname}]{}",
+            lossy(unescaped_colon_port)
         ));
     }
-
-    // Protocol-relative URL ("//host[:port][/path]", e.g. "//somewhere.tld"
-    // or "//somewhere.tld:4601" — two of go's `TestParseHostOrURL` valid
-    // cases). Go's permissive `net/url.Parse` accepts this directly,
-    // yielding `url.URL{Scheme: "", Host: "host[:port]"}`; Rust's `url`
-    // crate requires an absolute URL with a non-empty scheme (and can't
-    // represent an empty one at all), so give it a temporary one the same
-    // way the "[::]:port" fallback below does, purely to reuse the crate's
-    // authority/port parsing and validation (e.g. still rejecting
-    // "//localhost:WAT" for its non-numeric port, matching go).
-    if let Some(rest) = addr.strip_prefix("//") {
-        let joined = format!("http://{rest}");
-        return Url::parse(&joined)
-            .map(|parsed| {
-                let port = literal_port(&joined);
-                (parsed, port, None)
-            })
-            .map_err(|e| AddrParseError::UrlParse(e.to_string()));
-    }
-
-    // Go's `net/url.Parse` is far more permissive than Rust's `url` crate:
-    // it happily parses a bare relative-reference-shaped string like
-    // "ip4/127.0.0.1/tcp/8080" (no scheme, no host) instead of erroring,
-    // which is exactly how go's real `ParseHostOrURL` reaches its
-    // `errURLNoHost` case for that shape — the "http://" + addr fallback
-    // below is never reached in go for such inputs. Rust's `Url::parse`
-    // instead returns `Err` outright for anything scheme-less that isn't a
-    // recognized-prefix case above, so without this check we'd wrongly
-    // fall into the "http://" fallback and mint a host out of what should
-    // be a path-only, host-less reference. The fallback's real purpose
-    // (per go's own comment) is narrower: turning a bracketed-IPv6-with-port
-    // shape like "[::]:4601" into something the URL parser accepts — such
-    // shapes always contain a ':' (the port separator), so gate the
-    // fallback on that.
-    if !addr.contains(':') {
-        return Err(AddrParseError::NoHost);
-    }
-
-    // RFC 1123 section 2: the first character of a host is relaxed to allow
-    // either a letter or a digit — but a bare leading colon (e.g. ":1234",
-    // meaning a missing host with only a port) is invalid, unless it's the
-    // start of an IPv6 literal ("::..."). Go detects this *after* a
-    // successful (permissive) `url.Parse`, by checking `parsed.Host[0]`.
-    // Rust's `url` crate instead rejects "http://:1234" outright as an
-    // "empty host" parse error, so check for this shape up front.
-    if addr.starts_with(':') && !addr.starts_with("::") {
-        return Err(AddrParseError::ColonHost);
-    }
-
-    // Go's `net/url.Parse` -> `parseHost` only validates the *last*
-    // colon-separated segment of a host as an optional numeric port; it
-    // never validates that the rest of the host forms a real IPv6 literal.
-    // So a bare, unbracketed, multi-colon "IPv6-looking" host followed by a
-    // numeric port (e.g. "::11.22.33.44:123") parses successfully in go,
-    // while the identical host without a trailing numeric segment
-    // ("::11.22.33.44") does not. Rust's WHATWG-strict `url` crate has no
-    // way to accept an unbracketed multi-colon host at all — even an
-    // "opaque" non-special-scheme host still forbids a bare `:` as a
-    // forbidden host code point — so detect this one specific shape here
-    // and split the literal host/port off the raw text ourselves, bypassing
-    // `url::Url`'s host parsing/validation entirely for it (issue #1437).
-    // `[::]:4601`-style bracketed hosts (handled below) are excluded via
-    // the `!host.starts_with('[')` guard.
-    if let Some((host, port_str)) = unbracketed_ipv6_with_port_host(addr) {
-        // `url::Url` can't represent the real host, so this placeholder is
-        // only used for its scheme/port; the literal host is carried
-        // separately as this function's third return element.
-        let placeholder = format!("http://placeholder-host:{port_str}");
-        if let Ok(parsed) = Url::parse(&placeholder) {
-            let port = literal_port(&placeholder);
-            return Ok((parsed, port, Some(host.to_string())));
+    if let Some(first) = host.find(':') {
+        let last = host.rfind(':').unwrap_or(first);
+        let i = if last != first && !(scheme == "http" || scheme == "https") {
+            last
+        } else {
+            first
+        };
+        let colon_port = &host[i..];
+        if !valid_optional_port(colon_port) {
+            return Err(format!("invalid port {colon_port:?} after host"));
         }
     }
-
-    // This turns "[::]:4601" into "http://[::]:4601", which the url crate
-    // (like Go's net/url) can parse directly.
-    let joined = format!("http://{addr}");
-    Url::parse(&joined)
-        .map(|parsed| {
-            let port = literal_port(&joined);
-            (parsed, port, None)
-        })
-        .map_err(|e| AddrParseError::UrlParse(e.to_string()))
+    go_unescape(host.as_bytes(), Enc::Host).map(lossy)
 }
 
-/// Detects go's unbracketed-IPv6-with-trailing-port host quirk (issue
-/// #1437): `addr` has multiple ':'-separated segments, the *last* segment
-/// is a non-empty run of ASCII digits (a valid port), and everything before
-/// it is non-empty, contains at least one more ':' (so it "looks like"
-/// unbracketed IPv6, not a plain `host:port` pair — that shape is already
-/// handled earlier by [`matches_host_colon_port`]) and isn't already
-/// bracketed (`[...]`, handled by the normal fallback below). Returns
-/// `(host, port_str)` on a match.
-fn unbracketed_ipv6_with_port_host(addr: &str) -> Option<(&str, &str)> {
-    let (host, port_str) = addr.rsplit_once(':')?;
-    if host.is_empty() || port_str.is_empty() {
-        return None;
+/// go's `parseAuthority`, returning the host.
+fn go_parse_authority(scheme: &str, authority: &str) -> Result<String, String> {
+    let (userinfo, host) = match authority.rfind('@') {
+        Some(i) => (Some(&authority[..i]), &authority[i + 1..]),
+        None => (None, authority),
+    };
+    let host = go_parse_host(scheme, host)?;
+    if let Some(userinfo) = userinfo {
+        if !valid_userinfo(userinfo) {
+            return Err("net/url: invalid userinfo".to_string());
+        }
+        let (user, pass) = match userinfo.split_once(':') {
+            Some((u, p)) => (u, Some(p)),
+            None => (userinfo, None),
+        };
+        go_unescape(user.as_bytes(), Enc::UserPassword)?;
+        if let Some(p) = pass {
+            go_unescape(p.as_bytes(), Enc::UserPassword)?;
+        }
     }
-    if !port_str.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    if port_str.parse::<u16>().is_err() {
-        return None;
-    }
-    if !host.contains(':') || host.starts_with('[') {
-        return None;
-    }
-    Some((host, port_str))
+    Ok(host)
 }
 
-/// Recovers the literal, as-written port from `url_str` (the exact string
-/// that was fed to `Url::parse` to obtain a successful parse), even when it
-/// equals the WHATWG default for the URL's "special" scheme (`ws`=80,
-/// `wss`=443, `http`=80, `https`=443, `ftp`=21) — in which case `Url::port()`
-/// (and even calling `Url::set_port()` again with that same value) returns
-/// `None`: the WHATWG URL parsing *and* port-setter algorithms both null out
-/// a special scheme's default port unconditionally, so `url::Url` has no way
-/// to represent "an explicit port was written that happens to equal the
-/// default" — that information is only recoverable from the original text.
-///
-/// Go's `net/url.Parse` has no such normalization at all — `url.URL.Host`
-/// always contains the literal parsed authority, port included — so
-/// `ParseHostOrURL("wss://localhost:443")` keeps `:443` (issue #1436).
-///
-/// Implementation: re-parses the same `scheme://host[:port]...` authority
-/// under a synthetic non-"special" scheme name, which the `url` crate never
-/// elides a port for regardless of value, and reads the port back off that.
-fn literal_port(url_str: &str) -> Option<u16> {
-    let scheme_end = url_str.find("://")?;
-    let rest = &url_str[scheme_end..];
-    let probe = format!("x-algod-rust-literal-port{rest}");
-    Url::parse(&probe).ok()?.port()
+/// go 1.27 `net/url.Parse` as far as `ParseHostOrURL` uses it: the lower-cased
+/// scheme and the host, with go's validation (control characters, scheme,
+/// first path segment, authority, `%` escapes in the path and fragment) and go's
+/// error text (`parse "<url>": <reason>`).
+fn go_url_parse(raw: &str) -> Result<GoUrl, String> {
+    // Cut off #frag
+    let (u, frag) = match raw.split_once('#') {
+        Some((u, f)) => (u, f),
+        None => (raw, ""),
+    };
+    let url = go_url_parse_no_frag(u).map_err(|e| format!("parse {}: {e}", go_quote(u)))?;
+    if !frag.is_empty() {
+        go_unescape(frag.as_bytes(), Enc::Fragment)
+            .map_err(|e| format!("parse {}: {e}", go_quote(raw)))?;
+    }
+    Ok(url)
+}
+
+fn go_url_parse_no_frag(raw: &str) -> Result<GoUrl, String> {
+    if raw.bytes().any(|b| b < b' ' || b == 0x7f) {
+        return Err("net/url: invalid control character in URL".to_string());
+    }
+    if raw == "*" {
+        return Ok(GoUrl {
+            scheme: String::new(),
+            host: String::new(),
+        });
+    }
+    let (scheme, rest) = go_get_scheme(raw)?;
+    let scheme = scheme.to_ascii_lowercase();
+    // the query is not validated
+    let rest = rest.split('?').next().unwrap_or("");
+    if !rest.starts_with('/') {
+        if !scheme.is_empty() {
+            // rootless paths per RFC 3986 are opaque
+            return Ok(GoUrl {
+                scheme,
+                host: String::new(),
+            });
+        }
+        // Avoid confusion with malformed schemes, like cache_object:foo/bar.
+        if rest.split('/').next().is_some_and(|seg| seg.contains(':')) {
+            return Err("first path segment in URL cannot contain colon".to_string());
+        }
+    }
+    let mut host = String::new();
+    let mut path = rest;
+    if (!scheme.is_empty() || !rest.starts_with("///")) && rest.starts_with("//") {
+        let authority = &rest[2..];
+        let (authority, p) = match authority.find('/') {
+            Some(i) => (&authority[..i], &authority[i..]),
+            None => (authority, ""),
+        };
+        path = p;
+        host = go_parse_authority(&scheme, authority)?;
+    }
+    go_unescape(path.as_bytes(), Enc::Path)?;
+    Ok(GoUrl { scheme, host })
 }
 
 /// Returns `true` if `addr` looks like (and validates as) a libp2p multiaddr.
@@ -304,21 +639,7 @@ pub fn parse_host_or_url_or_multiaddr(addr: &str) -> Result<String, AddrParseErr
             .map(|_| addr.to_string())
             .map_err(|e| AddrParseError::MultiaddrParse(e.to_string()));
     }
-    let (url, literal_port, literal_host) = parse_host_or_url_with_literal_port(addr)?;
-    let port = literal_port.or_else(|| url.port());
-    if let Some(host) = literal_host {
-        return Ok(match port {
-            Some(p) => format!("{host}:{p}"),
-            None => host,
-        });
-    }
-    Ok(url
-        .host_str()
-        .map(|h| match port {
-            Some(p) => format!("{h}:{p}"),
-            None => h.to_string(),
-        })
-        .unwrap_or_default())
+    Ok(parse_host_or_url(addr)?.host)
 }
 
 #[cfg(test)]
@@ -391,47 +712,26 @@ mod tests {
     #[test]
     fn host_colon_port_parses_as_http() {
         let url = parse_host_or_url("relay.example.com:4160").unwrap();
-        assert_eq!(url.scheme(), "http");
-        assert_eq!(url.host_str(), Some("relay.example.com"));
-        assert_eq!(url.port(), Some(4160));
+        assert_eq!(url.scheme, "http");
+        assert_eq!(url.host, "relay.example.com:4160");
     }
 
     #[test]
     fn ipv6_bracket_host_port_parses() {
         let url = parse_host_or_url("[::]:4601").unwrap();
-        // The `url` crate's `host_str()` keeps the IPv6 literal's brackets
-        // (unlike go's `url.URL.Hostname()`, which strips them) — the
-        // joined "host:port" form below is still correct either way, since
-        // `format!("{h}:{p}")` reproduces the original address exactly.
-        assert_eq!(url.host_str(), Some("[::]"));
-        assert_eq!(url.port(), Some(4601));
-
-        let joined = parse_host_or_url_or_multiaddr("[::]:4601").unwrap();
-        assert_eq!(joined, "[::]:4601");
+        assert_eq!(url.scheme, "http");
+        assert_eq!(url.host, "[::]:4601");
+        assert_eq!(
+            parse_host_or_url_or_multiaddr("[::]:4601").unwrap(),
+            "[::]:4601"
+        );
     }
 
-    // Mirrors go's `TestParseHostOrURL` (network/addr/addr_test.go:33-104),
-    // porting its valid-cases table (13 of go's 14 entries — see the note
-    // below) and its full bad-URL table verbatim (issue #1436). Each valid
-    // case checks both `parse_host_or_url`'s `(scheme, host)` and
-    // `parse_host_or_url_or_multiaddr`'s joined `host:port` string, matching
-    // go's per-case `t.Run(tc.text, ...)` / `t.Run(tc.text+"-multiaddr", ...)`
-    // subtests.
+    // go's `TestParseHostOrURL` (network/addr/addr_test.go, v5.1.1) valid
+    // table: `(text, Scheme, Host)`. v5.1.1 replaced the unbracketed
+    // `::11.22.33.44:123` case by `[::11.22.33.44]:123`.
     #[test]
     fn parse_host_or_url_matches_go_valid_cases_table() {
-        // (input, expected scheme, expected host [go's url.URL.Host, i.e.
-        // including an explicit port])
-        //
-        // go's 14th case, `{"::11.22.33.44:123", url.URL{Scheme: "http",
-        // Host: "::11.22.33.44:123"}}`, is intentionally kept in its own
-        // test (`unbracketed_ipv6_looking_host_with_trailing_port_parses`
-        // above) rather than folded into this shared table: it relies on a
-        // Go net/url stdlib quirk (`parseHost` only validates the *last*
-        // colon-separated host segment as a port, never checking whether
-        // the rest forms a real IPv6 literal) that needed a dedicated
-        // bypass of the WHATWG-strict `url` crate's host parser (issue
-        // #1437) whose extra return value (`literal_host`) this table's
-        // assertions don't otherwise exercise.
         let cases: &[(&str, &str, &str)] = &[
             ("localhost:123", "http", "localhost:123"),
             ("http://localhost:123", "http", "localhost:123"),
@@ -450,139 +750,65 @@ mod tests {
                 "http",
                 "r2-devnet.devnet.algodev.network:4560",
             ),
+            ("[::11.22.33.44]:123", "http", "[::11.22.33.44]:123"),
         ];
-
-        for (input, expected_scheme, expected_host) in cases {
-            // `parse_host_or_url` itself is unavoidably lossy for a URL like
-            // "wss://localhost:443": `url::Url` implements WHATWG default-port
-            // elision on *both* parsing and `set_port()`, so a special
-            // scheme's (ws/wss/http/https/ftp) explicit-but-default port can
-            // never be represented on the `Url` object itself — only the
-            // original text carries that information (see `literal_port`'s
-            // doc comment). So this checks scheme/host (sans port) against
-            // the bare `Url`, and checks the full "host:port" string — the
-            // part go's real callers, and this module's own
-            // `parse_host_or_url_or_multiaddr`, actually consume — via the
-            // literal-port-aware helper, matching go's `url.URL.Host` exactly.
-            let (url, literal_port, literal_host) = parse_host_or_url_with_literal_port(input)
-                .unwrap_or_else(|e| panic!("expected {input:?} to parse, got {e:?}"));
+        for (input, scheme, host) in cases {
+            let url = parse_host_or_url(input).unwrap_or_else(|e| panic!("{input:?}: {e:?}"));
             assert_eq!(
-                literal_host, None,
-                "none of this table's cases use the quirky unbracketed-IPv6-with-port host override for {input:?}"
+                (url.scheme.as_str(), url.host.as_str()),
+                (*scheme, *host),
+                "{input:?}"
             );
-            if !expected_scheme.is_empty() {
-                // Go's protocol-relative "//host" cases parse to an empty
-                // `url.URL.Scheme`; `url::Url` cannot represent an empty
-                // scheme at all (see `parse_host_or_url_with_literal_port`'s
-                // "//"-prefix branch), so those two cases are exempted here
-                // and instead validated purely on their host:port string
-                // below, which is what this module's real callers consume.
-                assert_eq!(
-                    url.scheme(),
-                    *expected_scheme,
-                    "scheme mismatch for {input:?}"
-                );
-            }
-            let port = literal_port.or_else(|| url.port());
-            let host = url
-                .host_str()
-                .map(|h| match port {
-                    Some(p) => format!("{h}:{p}"),
-                    None => h.to_string(),
-                })
-                .unwrap_or_default();
-            assert_eq!(host, *expected_host, "host mismatch for {input:?}");
-
-            let joined = parse_host_or_url_or_multiaddr(input).unwrap_or_else(|e| {
-                panic!("expected {input:?} to parse (multiaddr path), got {e:?}")
-            });
-            assert_eq!(joined, *expected_host, "joined host mismatch for {input:?}");
+            assert_eq!(
+                parse_host_or_url_or_multiaddr(input).unwrap(),
+                *host,
+                "{input:?}"
+            );
         }
     }
 
+    // go's bad-URL table with the error text v5.1.1 asserts (`ErrorContains`).
     #[test]
     fn parse_host_or_url_rejects_go_bad_url_table() {
-        let bad_urls = [
-            "justahost",
-            "localhost:WAT",
-            "http://localhost:WAT",
-            "https://localhost:WAT",
-            "ws://localhost:WAT",
-            "wss://localhost:WAT",
-            "//localhost:WAT",
-            "://badaddress",
-            "://localhost:1234",
-            ":xxx",
-            ":xxx:1234",
-            "::11.22.33.44",
-            ":a:1",
-            ":a:",
-            ":1",
-            ":a",
-            ":",
-            "",
+        const BAD_PORT: &str = "invalid port";
+        const NO_SCHEME: &str = "missing protocol scheme";
+        const NO_HOST: &str = "could not parse a host from url";
+        const COLON_HOST: &str = "host name starts with a colon";
+        let bad: &[(&str, &str)] = &[
+            ("justahost", NO_HOST),
+            ("localhost:WAT", NO_HOST),
+            ("http://localhost:WAT", BAD_PORT),
+            ("https://localhost:WAT", BAD_PORT),
+            ("ws://localhost:WAT", BAD_PORT),
+            ("wss://localhost:WAT", BAD_PORT),
+            ("//localhost:WAT", BAD_PORT),
+            ("://badaddress", NO_SCHEME),
+            ("://localhost:1234", NO_SCHEME),
+            (":xxx", NO_SCHEME),
+            (":xxx:1234", NO_SCHEME),
+            ("::11.22.33.44", NO_SCHEME),
+            ("::11.22.33.44:123", NO_SCHEME),
+            (":a:1", NO_SCHEME),
+            (":a:", NO_SCHEME),
+            (":1", COLON_HOST),
+            (":a", NO_SCHEME),
+            (":", COLON_HOST),
+            ("", NO_HOST),
         ];
-        for addr in bad_urls {
-            assert!(
-                parse_host_or_url(addr).is_err(),
-                "expected {addr:?} to fail to parse"
-            );
-            assert!(
-                !is_multiaddr(addr),
-                "expected {addr:?} to not be a multiaddr"
-            );
-            assert!(
-                parse_host_or_url_or_multiaddr(addr).is_err(),
-                "expected {addr:?} to fail to parse (multiaddr path)"
-            );
+        for (addr, want) in bad {
+            let e = parse_host_or_url(addr).expect_err(addr);
+            assert!(e.to_string().contains(want), "{addr:?}: {e}");
+            assert!(!is_multiaddr(addr), "{addr:?}");
+            let e = parse_host_or_url_or_multiaddr(addr).expect_err(addr);
+            assert!(e.to_string().contains(want), "{addr:?}: {e}");
         }
-    }
-
-    // Mirrors go's `TestParseHostOrURL` 14th valid case (issue #1437):
-    // `{"::11.22.33.44:123", url.URL{Scheme: "http", Host:
-    // "::11.22.33.44:123"}}`. Go's `net/url.Parse` -> `parseHost` only
-    // validates the *last* colon-separated segment of a host as an
-    // optional numeric port; it never checks whether the rest forms a
-    // real IPv6 literal, so this unbracketed, not-actually-valid-IPv6
-    // host string followed by ":123" parses successfully. This is the one
-    // case `parse_host_or_url_matches_go_valid_cases_table` above
-    // intentionally excludes (see its comment).
-    #[test]
-    fn unbracketed_ipv6_looking_host_with_trailing_port_parses() {
-        let (url, literal_port, literal_host) =
-            parse_host_or_url_with_literal_port("::11.22.33.44:123")
-                .expect("expected go's quirky unbracketed-IPv6-with-port host shape to parse");
-        assert_eq!(url.scheme(), "http");
-        assert_eq!(literal_port, Some(123));
-        assert_eq!(literal_host.as_deref(), Some("::11.22.33.44"));
-
-        // `parse_host_or_url` itself just needs to succeed.
-        assert!(parse_host_or_url("::11.22.33.44:123").is_ok());
-
-        // The real consumer: the joined "host:port" string must match go's
-        // `url.URL.Host` exactly.
-        let joined = parse_host_or_url_or_multiaddr("::11.22.33.44:123")
-            .expect("expected the quirky host shape to parse via the multiaddr-dispatch path");
-        assert_eq!(joined, "::11.22.33.44:123");
-    }
-
-    // Must not regress: without a trailing all-digit segment, this must
-    // keep failing exactly like go's bad-URL table entry
-    // `"::11.22.33.44"` (already covered by
-    // `parse_host_or_url_rejects_go_bad_url_table` below, restated here for
-    // direct contrast with the case above).
-    #[test]
-    fn unbracketed_ipv6_looking_host_without_port_still_rejected() {
-        assert!(parse_host_or_url("::11.22.33.44").is_err());
-        assert!(parse_host_or_url_or_multiaddr("::11.22.33.44").is_err());
     }
 
     #[test]
     fn full_urls_pass_through() {
         let url = parse_host_or_url("ws://relay.example.com:4160/v1/net/gossip").unwrap();
-        assert_eq!(url.scheme(), "ws");
-        assert_eq!(url.host_str(), Some("relay.example.com"));
-        assert_eq!(url.port(), Some(4160));
+        assert_eq!(url.scheme, "ws");
+        assert_eq!(url.host, "relay.example.com:4160");
     }
 
     // -------------------------------------------------------------------

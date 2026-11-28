@@ -101,8 +101,8 @@ pub use catchpoint_service::{
 
 // Compression
 pub use compression::{
-    is_zstd_compressed, zstd_compress, zstd_decompress, CompressionError,
-    MAX_DECOMPRESSED_MESSAGE_SIZE, ZSTD_MAGIC,
+    decompress_proposal, is_zstd_compressed, zstd_compress, zstd_compress_msg, zstd_decompress,
+    CompressionError, MAX_DECOMPRESSED_MESSAGE_SIZE, ZSTD_MAGIC,
 };
 
 // Framing
@@ -209,7 +209,8 @@ pub use handler::{
 
 // Digest-based seen-message cache
 pub use message_filter::{
-    dedup_safe_tag, generate_message_digest, MessageFilter, MESSAGE_FILTER_SIZE,
+    dedup_safe_tag, digest_filtered_tag, generate_message_digest, MessageFilter,
+    MESSAGE_FILTER_SIZE,
 };
 
 // ---------------------------------------------------------------------------

@@ -64,9 +64,7 @@ use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
-use crate::compression::{
-    is_zstd_compressed, zstd_compress, zstd_decompress, MAX_DECOMPRESSED_MESSAGE_SIZE,
-};
+use crate::compression::{decompress_proposal, zstd_compress_msg};
 use crate::errors::PeerError;
 use crate::forwarding_policy::ForwardingPolicy;
 use crate::framing::{decode_frame, encode_frame};
@@ -75,7 +73,8 @@ use crate::handler::Multiplexer;
 use crate::identity::{verify_identity_verification, IdentityChallengeValue, IdentityDedupHook};
 use crate::message::{IncomingMessage, OutgoingMessage};
 use crate::message_filter::{
-    dedup_safe_tag, generate_message_digest, MessageFilter, MESSAGE_FILTER_SIZE,
+    dedup_safe_tag, digest_filtered_tag, generate_message_digest, MessageFilter,
+    MESSAGE_FILTER_SIZE,
 };
 use crate::metrics::NetworkTagMetrics;
 use crate::msg_of_interest::unmarshal_msg_of_interest;
@@ -369,6 +368,13 @@ pub struct WsPeerConfig {
 /// [`PeerHandle::identity_verified`] read the same cell, so callers always
 /// see the current state regardless of which side resolved it or when.
 pub(crate) type IdentitySlot = Arc<std::sync::Mutex<(Option<VerifyingKey>, bool)>>;
+
+/// go `identityVerificationHandler`'s first check: "avoid doing work (crypto and
+/// potentially taking a lock) if the peer is already verified" -- a further
+/// `NI` message on a verified peer is a no-op.
+fn identity_already_verified(slot: &IdentitySlot) -> bool {
+    slot.lock().expect("identity mutex poisoned").1
+}
 
 /// Everything [`PeerHandle::new_inbound`] needs to verify an inbound
 /// connection's message 3 (`NetIDVerification`) once it arrives on the
@@ -1000,13 +1006,8 @@ impl PeerHandle {
                                     // too, or every Go-sourced proposal reaches
                                     // agreement as raw zstd and gets the peer
                                     // disconnected — issue #478.
-                                    let payload = if tag == Tag::ProposalPayload
-                                        && is_zstd_compressed(payload)
-                                    {
-                                        match zstd_decompress(
-                                            payload,
-                                            MAX_DECOMPRESSED_MESSAGE_SIZE,
-                                        ) {
+                                    let payload = if tag == Tag::ProposalPayload {
+                                        match decompress_proposal(payload) {
                                             Ok(d) => d,
                                             Err(e) => {
                                                 tracing::warn!(
@@ -1060,6 +1061,9 @@ impl PeerHandle {
                                     // against, so it's silently dropped
                                     // (never forwarded to the multiplexer).
                                     if tag == Tag::NetIDVerification {
+                                        if identity_already_verified(&read_identity) {
+                                            continue;
+                                        }
                                         if let Some(pending) = read_identity_pending.as_ref() {
                                             match verify_identity_verification(
                                                 &payload,
@@ -1079,6 +1083,19 @@ impl PeerHandle {
                                                             .lock()
                                                             .expect("identity mutex poisoned") =
                                                             (Some(pending.peer_public_key), true);
+                                                        // go v5.1.1: a verification handled after the peer
+                                                        // left the registry must not keep the identity.
+                                                        // Removal closes the peer *before* it checks
+                                                        // `identity_verified`, so either it releases this
+                                                        // claim or this check sees the close.
+                                                        if read_closing.is_cancelled() {
+                                                            if let Some(hook) = &pending.dedup_hook {
+                                                                hook.release(
+                                                                    &read_addr,
+                                                                    &pending.peer_public_key,
+                                                                );
+                                                            }
+                                                        }
                                                         tracing::debug!(
                                                             addr = %read_addr,
                                                             peer_key = ?pending.peer_public_key,
@@ -1484,7 +1501,9 @@ fn outgoing_filter_suppresses(
     let Some(of) = outgoing_filter else {
         return false;
     };
-    if !dedup_safe_tag(&msg.tag) || msg.payload.len() < MESSAGE_FILTER_SIZE {
+    // go `innerBroadcast`: the digest is computed for every broadcast message of
+    // at least `messageFilterSize` bytes; unicast writes carry a zero digest.
+    if !digest_filtered_tag(&msg.tag) || msg.payload.len() < MESSAGE_FILTER_SIZE {
         return false;
     }
     let digest = generate_message_digest(&msg.tag, &msg.payload);
@@ -1513,12 +1532,11 @@ fn encode_inbound_frame(msg: &OutgoingMessage) -> Result<Vec<u8>, NetworkError> 
     };
 
     if msg.tag == Tag::ProposalPayload && !payload.is_empty() {
-        if let Ok(compressed) = zstd_compress(payload) {
-            let mut frame = Vec::with_capacity(2 + compressed.len());
-            frame.extend_from_slice(&msg.tag.as_bytes());
-            frame.extend_from_slice(&compressed);
-            return Ok(frame);
-        }
+        let compressed = zstd_compress_msg(payload);
+        let mut frame = Vec::with_capacity(2 + compressed.len());
+        frame.extend_from_slice(&msg.tag.as_bytes());
+        frame.extend_from_slice(&compressed);
+        return Ok(frame);
     }
 
     encode_frame(&msg.tag, payload)
@@ -2281,8 +2299,8 @@ async fn read_loop<St>(
                 // negotiate features) arrived as raw zstd, failed the
                 // msgpack decode in `agreement::demux`, and got the peer
                 // disconnected — issue #478.
-                let payload = if tag == Tag::ProposalPayload && is_zstd_compressed(payload) {
-                    match zstd_decompress(payload, MAX_DECOMPRESSED_MESSAGE_SIZE) {
+                let payload = if tag == Tag::ProposalPayload {
+                    match decompress_proposal(payload) {
                         Ok(decompressed) => decompressed,
                         Err(e) => {
                             tracing::warn!(
@@ -2840,7 +2858,8 @@ where
             // peer already has this message (via a prior MsgDigestSkip
             // notification). Reference: Go's writeNonBlock() in wsPeer.go.
             if let Some(ref of) = outgoing_filter {
-                if dedup_safe_tag(&tag) && send_msg.msg.payload.len() >= MESSAGE_FILTER_SIZE {
+                // go `innerBroadcast`/`writeNonBlock`: broadcast tags only.
+                if digest_filtered_tag(&tag) && send_msg.msg.payload.len() >= MESSAGE_FILTER_SIZE {
                     let digest = generate_message_digest(&tag, &send_msg.msg.payload);
                     if of.check_digest(&digest, false, false) {
                         // Peer already has this message; skip sending.
@@ -2913,34 +2932,13 @@ where
                 && features.contains(PeerFeatureFlags::COMPRESSED_PROPOSAL)
                 && !payload.is_empty()
             {
-                match zstd_compress(payload) {
-                    Ok(compressed) => {
-                        // Prepend the tag to the compressed payload.
-                        let mut frame = Vec::with_capacity(2 + compressed.len());
-                        frame.extend_from_slice(&tag.as_bytes());
-                        frame.extend_from_slice(&compressed);
-                        frame
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            peer = %remote_addr,
-                            error = %e,
-                            "write_loop: PP compression failed, sending uncompressed"
-                        );
-                        match encode_frame(&tag, payload) {
-                            Ok(frame) => frame,
-                            Err(e) => {
-                                tracing::warn!(
-                                    peer = %remote_addr,
-                                    tag = %tag,
-                                    error = %e,
-                                    "write_loop: dropping oversized outbound message"
-                                );
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
+                // go's `zstdCompressMsg`: the frame, or the data as it is
+                // when compression fails or does not shorten it.
+                let compressed = zstd_compress_msg(payload);
+                let mut frame = Vec::with_capacity(2 + compressed.len());
+                frame.extend_from_slice(&tag.as_bytes());
+                frame.extend_from_slice(&compressed);
+                frame
             } else {
                 match encode_frame(&tag, payload) {
                     Ok(frame) => frame,
@@ -3256,6 +3254,7 @@ async fn keepalive_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compression::{is_zstd_compressed, zstd_decompress, MAX_DECOMPRESSED_MESSAGE_SIZE};
     use crate::framing::encode_frame;
     use crate::msg_of_interest::marshal_msg_of_interest;
     use crate::tag::Tag;
@@ -3830,7 +3829,11 @@ mod tests {
 
         let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
 
-        let msg = OutgoingMessage::new(Tag::ProposalPayload, b"data".to_vec());
+        // compressible: go v5.1.1 sends the zstd frame only when it is shorter
+        // than the data (a 4-byte payload is sent raw, see
+        // `write_command_proposal_payload_that_does_not_shrink_is_sent_raw`)
+        let original = b"data".repeat(64);
+        let msg = OutgoingMessage::new(Tag::ProposalPayload, original.clone());
         let cmd = WriteCommand::Data(SendMessage {
             msg,
             enqueued: Instant::now(),
@@ -3860,7 +3863,44 @@ mod tests {
                 let (tag, payload) = decode_frame(&data).unwrap();
                 assert_eq!(tag, Tag::ProposalPayload);
                 let decompressed = zstd_decompress(payload, MAX_DECOMPRESSED_MESSAGE_SIZE).unwrap();
-                assert_eq!(decompressed, b"data");
+                assert_eq!(decompressed, original);
+            }
+            other => panic!("expected binary message, got: {other:?}"),
+        }
+    }
+
+    /// go v5.1.1 `zstdCompressMsg`: a proposal whose zstd frame is not shorter
+    /// is sent as it is (receivers accept both), so the receiver's
+    /// `MaxMessageSize` check never sees more bytes than the data.
+    #[tokio::test]
+    async fn write_command_proposal_payload_that_does_not_shrink_is_sent_raw() {
+        let (client_ws, server_ws) = ws_raw_pair().await;
+        let (mut sink, _client_stream) = client_ws.split();
+        let (_server_sink, mut server_stream) = server_ws.split();
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+        let cmd = WriteCommand::Data(SendMessage {
+            msg: OutgoingMessage::new(Tag::ProposalPayload, b"data".to_vec()),
+            enqueued: Instant::now(),
+            on_release: None,
+        });
+        let result = process_write_command(
+            cmd,
+            &mut sink,
+            &send_message_tags,
+            "test",
+            PeerFeatureFlags::COMPRESSED_PROPOSAL,
+            &None,
+            0,
+            &Arc::new(AtomicBool::new(false)),
+            &mut None,
+            &None,
+        )
+        .await;
+        assert!(result.is_ok());
+        match server_stream.next().await.unwrap().unwrap() {
+            WsMessage::Binary(data) => {
+                assert_eq!(&data[..2], Tag::ProposalPayload.as_bytes());
+                assert_eq!(&data[2..], b"data");
             }
             other => panic!("expected binary message, got: {other:?}"),
         }
@@ -6567,5 +6607,37 @@ mod tests {
         );
 
         closing.cancel();
+    }
+
+    /// go `TestIdentityTrackerHandlerGuard`: a peer that is already verified
+    /// makes the verification handler return at once (go's test passes a
+    /// `WebsocketNetwork{}` that would panic if touched).
+    #[test]
+    fn identity_guard_is_set_only_for_a_verified_peer() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+        let slot: IdentitySlot = Arc::new(std::sync::Mutex::new((Some(key), false)));
+        assert!(!identity_already_verified(&slot));
+        slot.lock().unwrap().1 = true;
+        assert!(identity_already_verified(&slot));
+    }
+
+    /// go `innerBroadcast` computes a digest only for broadcast messages (unicast
+    /// writes carry a zero digest): a peer's skip for the bytes of a large
+    /// broadcast tag suppresses the send, a large unicast response with the same
+    /// bytes is still delivered.
+    #[test]
+    fn outgoing_filter_suppresses_broadcast_tags_only() {
+        let filter = Arc::new(MessageFilter::new(3, 128));
+        let payload = vec![7u8; MESSAGE_FILTER_SIZE];
+        for tag in [Tag::VoteBundle, Tag::TopicMsgResp, Tag::UniEnsBlockReq] {
+            filter.check_digest(&generate_message_digest(&tag, &payload), true, false);
+        }
+        let of = Some(filter);
+        let suppresses =
+            |tag| outgoing_filter_suppresses(&OutgoingMessage::new(tag, payload.clone()), &of);
+        assert!(suppresses(Tag::VoteBundle));
+        assert!(!suppresses(Tag::TopicMsgResp));
+        assert!(!suppresses(Tag::UniEnsBlockReq));
+        assert!(!suppresses(Tag::MsgDigestSkip));
     }
 }

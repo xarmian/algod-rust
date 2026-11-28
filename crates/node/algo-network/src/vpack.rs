@@ -565,7 +565,10 @@ fn parse_msgp_vote(msgp_data: &[u8], state: &mut EncodeState) -> Result<(), Vpac
         .read_bin_n()
         .map_err(|e| VpackError::Parse(format!("reading ps: {e}")))?;
     if val != [0u8; 64] {
-        return Err(VpackError::Parse("expected empty array for ps".into()));
+        return Err(VpackError::Parse(format!(
+            "expected empty array for ps, got {}",
+            val.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        )));
     }
 
     p.expect_string("s")?;
@@ -2025,6 +2028,15 @@ mod tests {
         v.p = vec![]; // silence unused-mut warning path
         let err = compress_vote(&buf).unwrap_err();
         assert!(matches!(err, VpackError::Parse(_)));
+        // go v5.1.1 prints the bytes as hex (`%x`), not as a Go array
+        // (`expected empty array for ps, got %x`, network/vpack/parse.go).
+        assert!(
+            err.to_string().ends_with(&format!(
+                "expected empty array for ps, got {}",
+                "01".repeat(64)
+            )),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2043,6 +2055,18 @@ mod tests {
         assert!(matches!(err, VpackError::Decompress(_)));
     }
 
+    /// go `TestUncompressedMsgpackDetection/corrupted_vpack_not_detected`
+    /// (v5.1.1 asserts the "not enough data" cause): a truncated vpack vote
+    /// is a decompress error, not `LikelyUncompressed`.
+    #[test]
+    fn decompress_truncated_vpack_is_not_flagged_uncompressed() {
+        let msgp = build_msgp_vote(&base_spec());
+        let compressed = compress_vote(&msgp).unwrap();
+        let err = decompress_vote(&compressed[..compressed.len() / 2]).unwrap_err();
+        assert!(!matches!(err, VpackError::LikelyUncompressed(_)), "{err}");
+        assert!(err.to_string().contains("not enough data"), "{err}");
+    }
+
     #[test]
     fn decompress_flags_likely_uncompressed_input() {
         // A plausible-looking (but not actually valid) uncompressed msgpack
@@ -2051,6 +2075,9 @@ mod tests {
         let msgp = build_msgp_vote(&v);
         let err = decompress_vote(&msgp).unwrap_err();
         assert!(matches!(err, VpackError::LikelyUncompressed(_)));
+        assert!(err
+            .to_string()
+            .contains("data appears to be uncompressed msgpack"));
     }
 
     #[test]

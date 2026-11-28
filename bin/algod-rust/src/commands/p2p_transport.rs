@@ -414,7 +414,7 @@ fn compress_outgoing_proposal(
     {
         return Ok(None);
     }
-    let compressed = algo_network::compression::zstd_compress(payload)?;
+    let compressed = algo_network::compression::zstd_compress_msg(payload);
     let mut frame = Vec::with_capacity(2 + compressed.len());
     frame.extend_from_slice(&Tag::ProposalPayload.as_bytes());
     frame.extend_from_slice(&compressed);
