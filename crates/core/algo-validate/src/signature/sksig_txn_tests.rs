@@ -660,3 +660,50 @@ int {cost}
         .unwrap_err()
         .contains("rejected by logic"));
 }
+
+// go's `TestProcessBatchEd25519SaltedKeySigAttribution`: groups verified through
+// one shared cache, a failing ed25519 salted-key group between two good ones.
+// Each group's result is its own: the bad one reports the batch failure, the
+// others verify, and only the good groups end up cached.
+#[test]
+fn process_batch_ed25519_salted_key_sig_attribution() {
+    use crate::verified_txn_cache::{
+        verify_transaction_group_cached, VerificationContext, VerifiedTransactionCache,
+    };
+    use ed25519_dalek::Signer as _;
+    let regular = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let regular_txn = pay(
+        Address(regular.verifying_key().to_bytes()),
+        Address([1u8; 32]),
+    );
+    let regular_group = vec![SignedTransaction {
+        sig: regular.sign(&tx_message(&regular_txn)).to_bytes(),
+        txn: regular_txn,
+        ..Default::default()
+    }];
+    let good_ed = sksig_txn(7, *b"ed");
+    let mut bad_ed = sksig_txn(8, *b"ed");
+    let sk = bad_ed.pqsig.as_mut().unwrap();
+    sk.signature = flip_first(&sk.signature);
+
+    let proto = future_proto();
+    let ctx = VerificationContext {
+        spec_addrs: Default::default(),
+        consensus_version: "future".into(),
+    };
+    let cache = VerifiedTransactionCache::new(1000);
+    let run = |g: &[SignedTransaction]| verify_transaction_group_cached(g, &ctx, &proto, &cache);
+    assert!(run(&regular_group).is_ok());
+    let err = run(std::slice::from_ref(&bad_ed)).unwrap_err();
+    assert_eq!(validation_text(err), algo_error::BATCH_HAS_FAILED_SIGS);
+    assert!(run(std::slice::from_ref(&good_ed)).is_ok());
+
+    let cached = |g: &[SignedTransaction]| {
+        cache
+            .get_unverified_transaction_groups(&[g.to_vec()], &ctx)
+            .is_empty()
+    };
+    assert!(cached(&regular_group));
+    assert!(cached(std::slice::from_ref(&good_ed)));
+    assert!(!cached(std::slice::from_ref(&bad_ed)));
+}

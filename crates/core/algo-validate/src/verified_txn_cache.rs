@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex};
 use algo_avm::group::GroupBudget;
 use algo_codec::compute_txn_id;
 use algo_error::AlgoError;
-use algo_types::{Digest, SignedTransaction};
+use algo_types::{Address, Digest, LogicSig, MultisigSig, SaltedKeySig, SignedTransaction};
 
 use crate::rules::{ConsensusParams, SpecialAddresses};
 use crate::signature::verify_transaction_signature;
@@ -118,15 +118,190 @@ impl GroupContext {
     }
 }
 
+/// Maximum `retained_size` total of the entries in one bucket (Go:
+/// `maxBucketRetainedBytes`, `verifiedTxnCache.go`), in addition to the limit
+/// on their number.
+const MAX_BUCKET_RETAINED_BYTES: usize = 64 << 20;
+
+// The in-memory sizes go's `retainedSize` counts (`unsafe.Sizeof` of its
+// types on a 64-bit target). They are go's numbers on purpose: the byte limit
+// decides when a bucket rotates, and that has to happen at the same point.
+const SLICE_HEADER_SIZE: usize = 24;
+const MULTISIG_SUBSIG_SIZE: usize = 96;
+const LOGIC_SIG_SIZE: usize = 232;
+const MULTISIG_SIG_SIZE: usize = 32;
+const SALTED_KEY_SIG_SIZE: usize = 56;
+
+/// What a cache entry remembers of one verified transaction (Go:
+/// `verifiedTxnCtx`): the context it was verified under and the
+/// authorization material that was checked. The key is the transaction ID,
+/// which covers none of that material.
+///
+/// `lsig`, `msig` and `pqsig` are `Some` only when the transaction carried
+/// them, exactly as go keeps them out of line behind pointers (`txnAuth`).
+#[derive(Debug, Clone, PartialEq)]
+struct Entry {
+    context: Arc<VerificationContext>,
+    sig: [u8; 64],
+    auth_addr: Address,
+    lsig: Option<LogicSig>,
+    msig: Option<MultisigSig>,
+    pqsig: Option<SaltedKeySig>,
+}
+
+// ---------------------------------------------------------------------------
+// Authorization comparison, with go's `Blank`/`Equal` semantics
+// ---------------------------------------------------------------------------
+
+/// Go's `MultisigSig.Equal`: version, threshold, and the subsigs by length and
+/// element. Rust spells go's "no multisig" as `None`, which equals the zero
+/// value here exactly as `Equal` treats a nil `Subsigs`.
+fn multisig_equal(a: Option<&MultisigSig>, b: Option<&MultisigSig>) -> bool {
+    let zero = MultisigSig::default();
+    let a = a.unwrap_or(&zero);
+    let b = b.unwrap_or(&zero);
+    a.version == b.version && a.threshold == b.threshold && a.subsigs == b.subsigs
+}
+
+/// Go's `SaltedKeySig.Equal` (`bytes.Equal` on the keys: nil equals empty).
+fn salted_key_sig_equal(a: Option<&SaltedKeySig>, b: Option<&SaltedKeySig>) -> bool {
+    let zero = SaltedKeySig::default();
+    *a.unwrap_or(&zero) == *b.unwrap_or(&zero)
+}
+
+/// Go's `LogicSig.Equal`: the signatures, then the program, then the
+/// arguments. Arguments matter because the cache is keyed by the transaction
+/// ID, which does not cover them. Like go it tells a nil argument (`None`)
+/// from an empty one (`Some(empty)`), and compares only the number of
+/// arguments (`len`), not whether the list itself is nil.
+fn logic_sig_equal(a: &LogicSig, b: &LogicSig) -> bool {
+    if a.sig != b.sig
+        || !multisig_equal(a.msig.as_ref(), b.msig.as_ref())
+        || !multisig_equal(a.lmsig.as_ref(), b.lmsig.as_ref())
+        || !salted_key_sig_equal(a.pqsig.as_ref(), b.pqsig.as_ref())
+        || a.logic.as_slice() != b.logic.as_slice()
+    {
+        return false;
+    }
+    let none: Vec<Option<serde_bytes::ByteBuf>> = Vec::new();
+    let a_args = a.args.as_ref().unwrap_or(&none);
+    let b_args = b.args.as_ref().unwrap_or(&none);
+    a_args == b_args
+}
+
+/// The `LogicSig` a cache entry keeps: `None` when `lsig` equals the zero
+/// value. Deliberately `Equal` against the zero value, as go's
+/// `outOfLineAuth` does, so an `lsig` that go would tell from an absent one
+/// is kept and compared.
+fn out_of_line_lsig(lsig: &Option<LogicSig>) -> Option<&LogicSig> {
+    lsig.as_ref()
+        .filter(|l| !logic_sig_equal(l, &LogicSig::default()))
+}
+
+/// The salted-key signature a cache entry keeps: `None` when blank.
+fn out_of_line_pqsig(pqsig: &Option<SaltedKeySig>) -> Option<&SaltedKeySig> {
+    pqsig.as_ref().filter(|p| !p.blank())
+}
+
+/// Go's `retainedSize`: the heap a cache entry keeps alive through its
+/// out-of-line parts. Go counts slice capacities; this counts lengths, as a
+/// Rust decode allocates exactly what it holds.
+fn retained_size(
+    lsig: Option<&LogicSig>,
+    msig: Option<&MultisigSig>,
+    pqsig: Option<&SaltedKeySig>,
+) -> usize {
+    let mut n = 0;
+    if let Some(l) = lsig {
+        n += LOGIC_SIG_SIZE + l.logic.len();
+        if let Some(args) = &l.args {
+            n += SLICE_HEADER_SIZE * args.len();
+            n += args
+                .iter()
+                .map(|a| a.as_ref().map_or(0, |b| b.len()))
+                .sum::<usize>();
+        }
+        n += MULTISIG_SUBSIG_SIZE
+            * (l.msig.as_ref().map_or(0, |m| m.subsigs.len())
+                + l.lmsig.as_ref().map_or(0, |m| m.subsigs.len()));
+        if let Some(p) = &l.pqsig {
+            n += p.public_key.len() + p.signature.len();
+        }
+    }
+    if let Some(m) = msig {
+        n += MULTISIG_SIG_SIZE + MULTISIG_SUBSIG_SIZE * m.subsigs.len();
+    }
+    if let Some(p) = pqsig {
+        n += SALTED_KEY_SIG_SIZE + p.public_key.len() + p.signature.len();
+    }
+    n
+}
+
+impl Entry {
+    fn new(context: Arc<VerificationContext>, txn: &SignedTransaction) -> Self {
+        Entry {
+            context,
+            sig: txn.sig,
+            auth_addr: txn.auth_addr.unwrap_or(Address::ZERO),
+            lsig: out_of_line_lsig(&txn.lsig).cloned(),
+            msig: txn.msig.clone(),
+            pqsig: out_of_line_pqsig(&txn.pqsig).cloned(),
+        }
+    }
+
+    fn retained_size(&self) -> usize {
+        retained_size(self.lsig.as_ref(), self.msig.as_ref(), self.pqsig.as_ref())
+    }
+
+    /// Whether this entry records a verification that still applies to `txn`
+    /// under `context` (Go: `verifiedTxnCtx.matches`). Both halves are
+    /// required: the same context, and the same authorization material that
+    /// was verified back then.
+    fn matches(&self, context: &VerificationContext, txn: &SignedTransaction) -> bool {
+        if *self.context != *context
+            || self.sig != txn.sig
+            || self.auth_addr != txn.auth_addr.unwrap_or(Address::ZERO)
+        {
+            return false;
+        }
+        // Presence has to agree before the contents are compared: the entry
+        // holds an `lsig`/`pqsig` only when the transaction carried one that
+        // is not equal to the zero value / blank, and a `msig` only when it
+        // was not blank (go's nil `Subsigs`).
+        match (self.lsig.as_ref(), out_of_line_lsig(&txn.lsig)) {
+            (None, None) => {}
+            (Some(cached), Some(probe)) if logic_sig_equal(cached, probe) => {}
+            _ => return false,
+        }
+        match (self.msig.as_ref(), txn.msig.as_ref()) {
+            (None, None) => {}
+            (Some(cached), Some(probe)) if multisig_equal(Some(cached), Some(probe)) => {}
+            _ => return false,
+        }
+        match (self.pqsig.as_ref(), out_of_line_pqsig(&txn.pqsig)) {
+            (None, None) => {}
+            (Some(cached), Some(probe)) if salted_key_sig_equal(Some(cached), Some(probe)) => {}
+            _ => return false,
+        }
+        true
+    }
+}
+
 /// The mutable cache state, guarded by [`VerifiedTransactionCache`]'s mutex.
 struct Inner {
     /// Number of entries allowed in each bucket before rotation (Go:
     /// `entriesPerBucket`).
     entries_per_bucket: usize,
+    /// Limit on the `retained_size` total of one bucket (Go:
+    /// `bytesPerBucket`).
+    bytes_per_bucket: usize,
+    /// The `retained_size` total of the entries in `buckets[base]` (Go:
+    /// `retainedBytes`).
+    retained_bytes: usize,
     /// The circular cache buckets buffer (Go: `buckets`).
-    buckets: Vec<HashMap<Digest, Arc<GroupContext>>>,
+    buckets: Vec<HashMap<Digest, Arc<Entry>>>,
     /// The pinned transactions tier (Go: `pinned`).
-    pinned: HashMap<Digest, Arc<GroupContext>>,
+    pinned: HashMap<Digest, Arc<Entry>>,
     /// Index into `buckets` where the next entry is written (Go: `base`).
     base: usize,
 }
@@ -136,17 +311,17 @@ struct Inner {
 /// `GetUnverifiedTransactionGroups`/`Pin`/`UpdatePinned`. Returns the bucket
 /// index the entry was found in (so callers can continue subsequent
 /// per-transaction lookups from there, exactly like go's `baseBucket`
-/// threading) and a clone of the cached group pointer.
+/// threading) and the cached entry.
 fn find_in_buckets(
-    buckets: &[HashMap<Digest, Arc<GroupContext>>],
+    buckets: &[HashMap<Digest, Arc<Entry>>],
     base: usize,
     id: &Digest,
-) -> Option<(usize, Arc<GroupContext>)> {
+) -> Option<(usize, Arc<Entry>)> {
     let n = buckets.len();
     for offset in 0..n {
         let bucket_idx = (base + n - offset) % n;
-        if let Some(ctx) = buckets[bucket_idx].get(id) {
-            return Some((bucket_idx, ctx.clone()));
+        if let Some(entry) = buckets[bucket_idx].get(id) {
+            return Some((bucket_idx, entry.clone()));
         }
     }
     None
@@ -154,17 +329,50 @@ fn find_in_buckets(
 
 /// Add `group_ctx` to the currently-active bucket, rotating to the next
 /// bucket first if it doesn't have room (Go: `verifiedTransactionCache.add`).
-fn add_locked(inner: &mut Inner, group_ctx: Arc<GroupContext>) {
-    if inner.buckets[inner.base].len() + group_ctx.signed_group_txns.len()
-        > inner.entries_per_bucket
+fn add_locked(inner: &mut Inner, group_ctx: &GroupContext) {
+    let txns = &group_ctx.signed_group_txns;
+    let mut group_bytes: usize = txns
+        .iter()
+        .map(|t| {
+            retained_size(
+                out_of_line_lsig(&t.lsig),
+                t.msig.as_ref(),
+                out_of_line_pqsig(&t.pqsig),
+            )
+        })
+        .sum();
+    // A group that exceeds the byte limit by itself still goes into the
+    // current bucket when nothing there counts against the limit, so every
+    // group is cached and a bucket goes over the limit by at most one group.
+    if inner.buckets[inner.base].len() + txns.len() > inner.entries_per_bucket
+        || (inner.retained_bytes > 0 && inner.retained_bytes + group_bytes > inner.bytes_per_bucket)
     {
         inner.base = (inner.base + 1) % inner.buckets.len();
-        inner.buckets[inner.base] = HashMap::with_capacity(inner.entries_per_bucket);
+        let base = inner.base;
+        inner.buckets[base].clear();
+        inner.retained_bytes = 0;
     }
-    for txn in &group_ctx.signed_group_txns {
+    let context = Arc::new(group_ctx.context.clone());
+    for txn in txns {
+        let entry = Arc::new(Entry::new(context.clone(), txn));
         let id = compute_txn_id(&txn.txn);
-        inner.buckets[inner.base].insert(id, group_ctx.clone());
+        // Lookups consult the pinned entries first and do not fall back to
+        // the buckets when a pinned entry does not match. So when the pool
+        // verifies a pending transaction again, under a new consensus version
+        // or because the pinned entry is for a different signing of it (a
+        // LogicSig's args are not part of its ID), the new entry must replace
+        // the pinned one, or the pool's copy would never be found verified.
+        if let std::collections::hash_map::Entry::Occupied(mut pinned) = inner.pinned.entry(id) {
+            group_bytes -= entry.retained_size();
+            pinned.insert(entry);
+            continue;
+        }
+        let base = inner.base;
+        if let Some(old) = inner.buckets[base].insert(id, entry) {
+            inner.retained_bytes -= old.retained_size();
+        }
     }
+    inner.retained_bytes += group_bytes;
 }
 
 /// A cached store of recently verified transaction groups. See the module
@@ -186,6 +394,8 @@ impl VerifiedTransactionCache {
         VerifiedTransactionCache {
             inner: Mutex::new(Inner {
                 entries_per_bucket,
+                bytes_per_bucket: MAX_BUCKET_RETAINED_BYTES,
+                retained_bytes: 0,
                 buckets,
                 pinned: HashMap::with_capacity(cache_size),
                 base: 0,
@@ -201,7 +411,7 @@ impl VerifiedTransactionCache {
             .inner
             .lock()
             .expect("verified txn cache mutex poisoned");
-        add_locked(&mut inner, group_ctx);
+        add_locked(&mut inner, &group_ctx);
     }
 
     /// Add several transaction groups at once. Mirrors go's `AddPayset`.
@@ -211,7 +421,7 @@ impl VerifiedTransactionCache {
             .lock()
             .expect("verified txn cache mutex poisoned");
         for group_ctx in group_ctxs {
-            add_locked(&mut inner, group_ctx.clone());
+            add_locked(&mut inner, group_ctx);
         }
     }
 
@@ -222,9 +432,10 @@ impl VerifiedTransactionCache {
     ///
     /// A group counts as covered only when every one of its transactions is
     /// found (pinned or bucketed) under the same [`VerificationContext`],
-    /// with authorization fields (`sig`/`msig`/`lsig`/`pqsig`/`auth_addr`)
-    /// byte-identical to what's cached — the transaction ID alone doesn't
-    /// cover the signature envelope, since the ID hashes only the txn body.
+    /// with its authorization material (`sig`/`msig`/`lsig`/`pqsig`/
+    /// `auth_addr`) equal, by go's `Equal` rules, to what was cached for that
+    /// transaction ID — the ID alone doesn't cover the signature envelope,
+    /// since it hashes only the txn body.
     pub fn get_unverified_transaction_groups(
         &self,
         txn_groups: &[Vec<SignedTransaction>],
@@ -240,44 +451,24 @@ impl VerifiedTransactionCache {
             let mut verified_txn = 0usize;
             let mut base_bucket = inner.base;
 
-            for (txn_idx, txn) in signed_txn_group.iter().enumerate() {
+            for txn in signed_txn_group {
                 let id = compute_txn_id(&txn.txn);
 
                 // Check pinned first, then fall back to the bucket ring.
-                let mut entry_group = inner.pinned.get(&id).cloned();
-                if entry_group.is_none() {
-                    if let Some((bucket_idx, ctx)) =
+                let mut entry = inner.pinned.get(&id).cloned();
+                if entry.is_none() {
+                    if let Some((bucket_idx, found)) =
                         find_in_buckets(&inner.buckets, base_bucket, &id)
                     {
-                        entry_group = Some(ctx);
+                        entry = Some(found);
                         base_bucket = bucket_idx;
                     }
                 }
 
-                let entry_group = match entry_group {
-                    Some(e) => e,
-                    None => break,
-                };
-
-                if entry_group.context != *context {
-                    break;
+                match entry {
+                    Some(e) if e.matches(context, txn) => verified_txn += 1,
+                    _ => break,
                 }
-
-                let cached_txn = match entry_group.signed_group_txns.get(txn_idx) {
-                    Some(t) => t,
-                    None => break,
-                };
-
-                if cached_txn.sig != txn.sig
-                    || cached_txn.msig != txn.msig
-                    || cached_txn.lsig != txn.lsig
-                    || cached_txn.pqsig != txn.pqsig
-                    || cached_txn.auth_addr != txn.auth_addr
-                {
-                    break;
-                }
-
-                verified_txn += 1;
             }
 
             if verified_txn != signed_txn_group.len() || verified_txn == 0 {
@@ -312,18 +503,11 @@ impl VerifiedTransactionCache {
                 continue;
             }
 
-            let mut found = false;
-            let n = inner.buckets.len();
-            for offset in 0..n {
-                let bucket_idx = (inner.base + n - offset) % n;
-                if let Some(ctx) = inner.buckets[bucket_idx].get(txid) {
-                    pinned.insert(*txid, ctx.clone());
-                    found = true;
-                    break;
+            match find_in_buckets(&inner.buckets, inner.base, txid) {
+                Some((_, entry)) => {
+                    pinned.insert(*txid, entry);
                 }
-            }
-            if !found {
-                err = Some(VerifiedTxnCacheError::MissingPinnedEntry);
+                None => err = Some(VerifiedTxnCacheError::MissingPinnedEntry),
             }
         }
 
@@ -357,9 +541,12 @@ impl VerifiedTransactionCache {
                 continue;
             }
 
-            if let Some((bucket_idx, ctx)) = find_in_buckets(&inner.buckets, base_bucket, &id) {
-                inner.pinned.insert(id, ctx);
+            if let Some((bucket_idx, entry)) = find_in_buckets(&inner.buckets, base_bucket, &id) {
                 inner.buckets[bucket_idx].remove(&id);
+                if bucket_idx == inner.base {
+                    inner.retained_bytes -= entry.retained_size();
+                }
+                inner.pinned.insert(id, entry);
                 base_bucket = bucket_idx;
             } else {
                 transaction_missing = true;
@@ -540,7 +727,17 @@ mod tests {
         let entry = inner.buckets[inner.base]
             .get(&id)
             .expect("txn should be in the active bucket");
-        assert_eq!(entry.signed_group_txns, ctx.signed_group_txns);
+        assert_eq!(
+            **entry,
+            Entry {
+                context: Arc::new(ctx.context.clone()),
+                sig: stxn.sig,
+                auth_addr: Address::ZERO,
+                lsig: None,
+                msig: None,
+                pqsig: None,
+            }
+        );
     }
 
     #[test]
@@ -699,11 +896,11 @@ mod tests {
         cache.add(group_ctx(filler_group));
         {
             let mut inner = cache.inner.lock().unwrap();
-            let filler_ctx = Arc::new(GroupContext::new(test_context(), vec![]));
+            let filler = Arc::new(Entry::new(Arc::new(test_context()), &test_stxn(0)));
             for i in 0..(MAX_PINNED_ENTRIES - 1) as u64 {
                 let mut bytes = [0u8; 32];
                 bytes[0..8].copy_from_slice(&i.to_be_bytes());
-                inner.pinned.insert(Digest(bytes), filler_ctx.clone());
+                inner.pinned.insert(Digest(bytes), filler.clone());
             }
         }
 
@@ -1124,5 +1321,325 @@ mod tests {
         };
         verify_transaction_group_cached(&group, &context, &pooled, &cache)
             .expect("pooled group budget must cover the expensive LogicSig");
+    }
+
+    // ---- go v5.1.1 verified-cache behaviour (#2551) ----------------------
+
+    use serde_bytes::ByteBuf;
+
+    type TxnMutation = Box<dyn Fn(&mut SignedTransaction)>;
+    type PqMutation = Box<dyn Fn(&mut SaltedKeySig)>;
+
+    fn miss(cache: &VerifiedTransactionCache, probe: &SignedTransaction) -> bool {
+        cache
+            .get_unverified_transaction_groups(&[vec![probe.clone()]], &test_context())
+            .len()
+            == 1
+    }
+
+    fn hit(cache: &VerifiedTransactionCache, probe: &SignedTransaction) -> bool {
+        !miss(cache, probe)
+    }
+
+    fn cached_with(stxn: &SignedTransaction) -> VerifiedTransactionCache {
+        let cache = VerifiedTransactionCache::new(50);
+        cache.add(group_ctx(vec![stxn.clone()]));
+        assert!(hit(&cache, stxn), "the group as cached must hit");
+        cache
+    }
+
+    fn lsig_txn(note: u64) -> SignedTransaction {
+        let mut s = test_stxn(note);
+        s.sig = [0u8; 64];
+        s.lsig = Some(LogicSig {
+            logic: ByteBuf::from(vec![0x06, 0x81, 0x01]),
+            args: Some(vec![
+                Some(ByteBuf::from(b"arg0".to_vec())),
+                Some(ByteBuf::from(b"arg1".to_vec())),
+            ]),
+            ..Default::default()
+        });
+        s
+    }
+
+    /// go `TestGetUnverifiedTransactionGroupsAuthChanges`.
+    #[test]
+    fn altered_authorization_misses_the_cache() {
+        let mut base = test_stxn(1);
+        base.msig = Some(MultisigSig {
+            version: 1,
+            threshold: 1,
+            subsigs: vec![],
+        });
+        base.sig = [0u8; 64];
+        let cache = cached_with(&base);
+        let mutate: Vec<(&str, TxnMutation)> = vec![
+            ("sig", Box::new(|s| s.sig[0] ^= 1)),
+            (
+                "auth-addr",
+                Box::new(|s| s.auth_addr = Some(Address([9u8; 32]))),
+            ),
+            (
+                "msig-version",
+                Box::new(|s| s.msig.as_mut().unwrap().version ^= 1),
+            ),
+            (
+                "lsig-logic",
+                Box::new(|s| {
+                    s.lsig = Some(LogicSig {
+                        logic: ByteBuf::from(vec![0x06, 0x81, 0x01]),
+                        ..Default::default()
+                    })
+                }),
+            ),
+            (
+                "lsig-args",
+                Box::new(|s| {
+                    s.lsig = Some(LogicSig {
+                        args: Some(vec![Some(ByteBuf::from(b"arg".to_vec()))]),
+                        ..Default::default()
+                    })
+                }),
+            ),
+        ];
+        for (name, m) in mutate {
+            let mut probe = base.clone();
+            m(&mut probe);
+            assert_eq!(compute_txn_id(&probe.txn), compute_txn_id(&base.txn));
+            assert!(miss(&cache, &probe), "{name}: altered auth was accepted");
+        }
+
+        // lsig args: a changed and an appended-empty argument and a changed
+        // delegation signature all miss
+        let lsig = lsig_txn(2);
+        let cache = cached_with(&lsig);
+        let mut changed = lsig.clone();
+        changed.lsig.as_mut().unwrap().args = Some(vec![Some(ByteBuf::from(b"x".to_vec()))]);
+        assert!(miss(&cache, &changed), "lsig-args");
+        let mut appended = lsig.clone();
+        appended
+            .lsig
+            .as_mut()
+            .unwrap()
+            .args
+            .as_mut()
+            .unwrap()
+            .push(Some(ByteBuf::new()));
+        assert!(miss(&cache, &appended), "lsig-args-empty-appended");
+        let mut delegated = lsig.clone();
+        delegated.lsig.as_mut().unwrap().sig[0] ^= 1;
+        assert!(miss(&cache, &delegated), "lsig-sig");
+    }
+
+    /// go `TestGetUnverifiedTransactionGroupsSaltedKeySigProofChanges` and
+    /// `...LogicSigSaltedKeySigChanges` (the ls scheme keeps the program in
+    /// `pk` and the encoded arguments in `sig`).
+    #[test]
+    fn altered_salted_key_sig_misses_the_cache() {
+        let mut base = test_stxn(3);
+        base.sig = [0u8; 64];
+        base.pqsig = Some(SaltedKeySig {
+            scheme: *b"f5",
+            salt: algo_types::AddressSalt(4),
+            public_key: ByteBuf::from(vec![1; 8]),
+            signature: ByteBuf::from(vec![2; 8]),
+        });
+        let cache = cached_with(&base);
+        let muts: Vec<PqMutation> = vec![
+            Box::new(|p| p.signature[0] ^= 1),
+            Box::new(|p| p.public_key[0] ^= 1),
+            Box::new(|p| p.salt.0 ^= 1),
+            Box::new(|p| p.scheme = *b"x1"),
+            Box::new(|p| p.signature = ByteBuf::new()),
+            Box::new(|p| p.public_key.push(0)),
+        ];
+        for m in muts {
+            let mut probe = base.clone();
+            m(probe.pqsig.as_mut().unwrap());
+            assert!(miss(&cache, &probe));
+        }
+    }
+
+    /// go `TestAddingToCacheBlankLsigNilVsEmpty`, in the one place Rust keeps
+    /// go's nil/empty distinction: a nil argument is `None`, an empty one
+    /// `Some(empty)`. An absent lsig and an all-zero one are the same thing.
+    #[test]
+    fn nil_and_empty_lsig_arguments_are_told_apart() {
+        let mut cached = lsig_txn(4);
+        cached.lsig.as_mut().unwrap().args = Some(vec![Some(ByteBuf::new())]);
+        let cache = cached_with(&cached);
+        let mut nil_arg = cached.clone();
+        nil_arg.lsig.as_mut().unwrap().args = Some(vec![None]);
+        assert!(miss(&cache, &nil_arg));
+
+        // Equal() compares len(Args): a missing list equals an empty one
+        let mut a = lsig_txn(5);
+        a.lsig.as_mut().unwrap().args = None;
+        let cache = cached_with(&a);
+        let mut b = a.clone();
+        b.lsig.as_mut().unwrap().args = Some(vec![]);
+        assert!(hit(&cache, &b));
+
+        // an lsig equal to the zero value is no lsig
+        let plain = test_stxn(6);
+        let cache = cached_with(&plain);
+        let mut zero_lsig = plain.clone();
+        zero_lsig.lsig = Some(LogicSig::default());
+        assert!(hit(&cache, &zero_lsig));
+        let mut blank_pq = plain.clone();
+        blank_pq.pqsig = Some(SaltedKeySig::default());
+        assert!(hit(&cache, &blank_pq));
+    }
+
+    /// go `TestAddingToCacheBlankMsigNilVsEmpty`: a non-nil empty `Subsigs`
+    /// is stored out of line, so a nil one misses (the conservative way).
+    #[test]
+    fn empty_msig_is_not_the_absent_msig() {
+        let mut cached = test_stxn(7);
+        cached.msig = Some(MultisigSig::default());
+        let cache = cached_with(&cached);
+        let mut absent = cached.clone();
+        absent.msig = None;
+        assert!(miss(&cache, &absent));
+        // and the other way: cached without, probed with
+        let cache = cached_with(&absent);
+        assert!(miss(&cache, &cached));
+    }
+
+    /// go `TestGetUnverifiedTransactionGroupsContextChanges`.
+    #[test]
+    fn changed_context_misses_and_leaves_the_entry_alone() {
+        let stxn = test_stxn(8);
+        let cache = cached_with(&stxn);
+        let base = test_context();
+        let mut fee = base.clone();
+        fee.spec_addrs.fee_sink.0[0] += 1;
+        let mut pool = base.clone();
+        pool.spec_addrs.rewards_pool.0[0] += 1;
+        let mut ver = base.clone();
+        ver.consensus_version = "future".into();
+        let mut all = fee.clone();
+        all.spec_addrs.rewards_pool.0[0] += 1;
+        all.consensus_version = "future".into();
+        for ctx in [fee, pool, ver, all] {
+            let r = cache.get_unverified_transaction_groups(&[vec![stxn.clone()]], &ctx);
+            assert_eq!(r, vec![vec![stxn.clone()]]);
+        }
+        assert!(hit(&cache, &stxn));
+    }
+
+    /// go keeps one entry per transaction ID, so where a transaction sits in
+    /// the group it is asked about does not matter.
+    #[test]
+    fn entries_are_per_transaction_not_per_group_position() {
+        let (a, b) = (test_stxn(10), test_stxn(11));
+        let cache = VerifiedTransactionCache::new(50);
+        cache.add(group_ctx(vec![a.clone(), b.clone()]));
+        assert!(hit(&cache, &b));
+        assert!(hit(&cache, &a));
+        let swapped = vec![b.clone(), a.clone()];
+        assert!(cache
+            .get_unverified_transaction_groups(&[swapped], &test_context())
+            .is_empty());
+    }
+
+    /// go `add`: a re-verified transaction replaces its pinned entry, or the
+    /// pool's copy would never be found verified again.
+    #[test]
+    fn add_replaces_a_pinned_entry() {
+        let lsig = lsig_txn(12);
+        let cache = cached_with(&lsig);
+        cache.pin(std::slice::from_ref(&lsig)).unwrap();
+        let mut other = lsig.clone();
+        other.lsig.as_mut().unwrap().args = Some(vec![Some(ByteBuf::from(b"new".to_vec()))]);
+        assert!(miss(&cache, &other));
+        cache.add(group_ctx(vec![other.clone()]));
+        assert!(hit(&cache, &other));
+        assert!(miss(&cache, &lsig));
+        // it stayed pinned: the bucket ring holds nothing for it
+        let inner = cache.inner.lock().unwrap();
+        assert!(inner.pinned.contains_key(&compute_txn_id(&lsig.txn)));
+        assert!(inner.buckets.iter().all(|b| b.is_empty()));
+        assert_eq!(inner.retained_bytes, 0);
+    }
+
+    /// go `add`/`Pin`: a bucket also rotates once its entries retain more
+    /// than `bytesPerBucket`, but a group that is over the limit by itself
+    /// still lands in an empty bucket.
+    #[test]
+    fn bucket_rotates_on_retained_bytes() {
+        let cache = VerifiedTransactionCache::new(1000);
+        cache.inner.lock().unwrap().bytes_per_bucket = 1000;
+        let big = |note| {
+            let mut s = lsig_txn(note);
+            s.lsig.as_mut().unwrap().logic = ByteBuf::from(vec![0u8; 600]);
+            s
+        };
+        let size = Entry::new(Arc::new(test_context()), &big(20)).retained_size();
+        assert_eq!(size, 232 + 600 + 24 * 2 + 8);
+        cache.add(group_ctx(vec![big(20)]));
+        assert_eq!(cache.inner.lock().unwrap().base, 0);
+        cache.add(group_ctx(vec![big(21)]));
+        {
+            let inner = cache.inner.lock().unwrap();
+            assert_eq!(inner.base, 1, "second group overflows the byte limit");
+            assert_eq!(inner.retained_bytes, size);
+        }
+        // pinning from the current bucket releases its bytes
+        cache.pin(&[big(21)]).unwrap();
+        assert_eq!(cache.inner.lock().unwrap().retained_bytes, 0);
+        // a group over the limit by itself goes in while the bucket is empty
+        let huge = vec![big(22), big(23)];
+        cache.add(group_ctx(huge));
+        let inner = cache.inner.lock().unwrap();
+        assert_eq!(inner.base, 1);
+        assert_eq!(inner.retained_bytes, 2 * size);
+    }
+
+    /// go `TestAddingToCacheOutOfLineSigs`: the entry keeps `lsig`, `msig`
+    /// and `pqsig` only for a transaction that carries them (the entry owns
+    /// its copy; Rust ownership makes aliasing the caller's data impossible).
+    #[test]
+    fn entry_keeps_out_of_line_auth_only_when_present() {
+        let plain = test_stxn(30);
+        let mut delegated = test_stxn(31);
+        delegated.lsig = Some(LogicSig {
+            logic: ByteBuf::from(vec![6, 0x81, 1]),
+            pqsig: Some(SaltedKeySig {
+                scheme: *b"f5",
+                public_key: ByteBuf::from(vec![1; 4]),
+                signature: ByteBuf::from(vec![2; 4]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut salted = test_stxn(32);
+        salted.pqsig = Some(SaltedKeySig {
+            scheme: *b"ed",
+            public_key: ByteBuf::from(vec![3; 4]),
+            ..Default::default()
+        });
+        for (stxn, has_lsig, has_pq) in [
+            (plain, false, false),
+            (lsig_txn(33), true, false),
+            (salted, false, true),
+            (delegated, true, false),
+        ] {
+            let group = vec![stxn];
+            let cache = VerifiedTransactionCache::new(500);
+            cache.add(group_ctx(group.clone()));
+            let id = compute_txn_id(&group[0].txn);
+            let entry = {
+                let inner = cache.inner.lock().unwrap();
+                inner.buckets[inner.base][&id].clone()
+            };
+            assert_eq!(entry.lsig.is_some(), has_lsig);
+            assert_eq!(entry.pqsig.is_some(), has_pq);
+            assert!(entry.msig.is_none());
+            assert_eq!(
+                entry.lsig.as_ref(),
+                group[0].lsig.as_ref().filter(|_| has_lsig)
+            );
+        }
     }
 }
