@@ -20,13 +20,27 @@
 
 use std::collections::HashMap;
 
-use algo_types::Digest;
+use algo_codec::{canonical_encode_signed_transaction, compute_txn_id, decode_signed_txn_stream};
+use algo_types::{Digest, SignedTransaction};
 
-/// Status of a transaction that was previously in the pool.
+/// What the cache keeps of a transaction that left the pool.
 ///
-/// Mirrors go-algorand's `statusCacheEntry` from `data/pools/statusCache.go`.
+/// Mirrors go-algorand's `statusCacheEntry` (`data/pools/statusCache.go`),
+/// which since v5.1.1 holds the transaction's encoding rather than the
+/// decoded value, to keep the cache small.
 #[derive(Debug, Clone)]
+struct StatusEntry {
+    /// The encoded `SignedTxn`.
+    tx: Vec<u8>,
+    /// The error string if the transaction was rejected, or empty if confirmed.
+    txn_err: String,
+}
+
+/// A transaction's recorded status, as [`StatusCache::check`] returns it.
+#[derive(Debug, Clone, PartialEq)]
 pub struct TxnStatus {
+    /// The transaction as it was cached.
+    pub tx: SignedTransaction,
     /// The error string if the transaction was rejected, or empty if confirmed.
     pub txn_err: String,
 }
@@ -41,8 +55,8 @@ pub struct TxnStatus {
 /// so this type does not use internal synchronization.
 #[derive(Debug)]
 pub struct StatusCache {
-    cur: HashMap<Digest, TxnStatus>,
-    prev: Option<HashMap<Digest, TxnStatus>>,
+    cur: HashMap<Digest, StatusEntry>,
+    prev: Option<HashMap<Digest, StatusEntry>>,
     capacity: usize,
 }
 
@@ -62,33 +76,43 @@ impl StatusCache {
 
     /// Look up a transaction's status by its ID (digest).
     ///
-    /// Returns `Some(TxnStatus)` if the transaction is found in either
-    /// `cur` or `prev`, `None` otherwise.
+    /// Returns the transaction and its error text if it is found in either
+    /// `cur` or `prev`, `None` otherwise (a miss never fabricates a
+    /// transaction). An entry that cannot be decoded reads as a miss, as in go.
     ///
     /// Mirrors `statusCache.check()` in Go.
-    pub fn check(&self, txid: &Digest) -> Option<&TxnStatus> {
-        if let Some(entry) = self.cur.get(txid) {
-            return Some(entry);
+    pub fn check(&self, txid: &Digest) -> Option<TxnStatus> {
+        let entry = self
+            .cur
+            .get(txid)
+            .or_else(|| self.prev.as_ref().and_then(|prev| prev.get(txid)))?;
+        let mut txns = decode_signed_txn_stream(&entry.tx).ok()?;
+        if txns.len() != 1 {
+            return None;
         }
-        if let Some(ref prev) = self.prev {
-            if let Some(entry) = prev.get(txid) {
-                return Some(entry);
-            }
-        }
-        None
+        Some(TxnStatus {
+            tx: txns.remove(0),
+            txn_err: entry.txn_err.clone(),
+        })
     }
 
     /// Record a transaction's status (rejection reason) in the cache.
     ///
     /// If `cur` has reached capacity, it is rotated into `prev` before
     /// the new entry is inserted. This matches Go's `statusCache.put()`.
-    pub fn put(&mut self, txid: Digest, txn_err: String) {
+    pub fn put(&mut self, tx: &SignedTransaction, txn_err: String) {
         if self.cur.len() >= self.capacity {
             let old_cur = std::mem::replace(&mut self.cur, HashMap::with_capacity(self.capacity));
             self.prev = Some(old_cur);
         }
 
-        self.cur.insert(txid, TxnStatus { txn_err });
+        self.cur.insert(
+            compute_txn_id(&tx.txn),
+            StatusEntry {
+                tx: canonical_encode_signed_transaction(tx),
+                txn_err,
+            },
+        );
     }
 
     /// Reset the cache, clearing both generations.
@@ -103,138 +127,152 @@ impl StatusCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use algo_types::{Address, Round, Transaction};
 
-    fn test_digest(byte: u8) -> Digest {
-        let mut bytes = [0u8; 32];
-        bytes[0] = byte;
-        Digest(bytes)
+    /// A distinct signed payment per `n` (go's `makeStatusCacheTxn`).
+    fn txn(n: u8) -> SignedTransaction {
+        SignedTransaction {
+            txn: Transaction {
+                txn_type: "pay".into(),
+                sender: Address([n; 32]),
+                receiver: Address([n.wrapping_add(1); 32]),
+                fee: 1000,
+                amount: n as u64 + 1,
+                first_valid: Round(1),
+                last_valid: Round(1000),
+                note: serde_bytes::ByteBuf::from(vec![n; 3]),
+                ..Default::default()
+            },
+            sig: [n; 64],
+            ..Default::default()
+        }
+    }
+
+    fn id(t: &SignedTransaction) -> Digest {
+        compute_txn_id(&t.txn)
     }
 
     #[test]
     fn put_and_check() {
         let mut cache = StatusCache::new(10);
-        let txid = test_digest(1);
+        let t = txn(1);
 
-        assert!(cache.check(&txid).is_none());
+        assert!(cache.check(&id(&t)).is_none());
 
-        cache.put(txid, "some error".to_string());
+        cache.put(&t, "some error".to_string());
 
-        let status = cache.check(&txid).expect("should find entry");
+        let status = cache.check(&id(&t)).expect("should find entry");
         assert_eq!(status.txn_err, "some error");
+    }
+
+    /// go `TestStatusCacheRoundTrip`: what goes in comes back unchanged, and a
+    /// miss reports itself as one without fabricating a transaction.
+    #[test]
+    fn status_cache_round_trip() {
+        let mut cache = StatusCache::new(64);
+        let mut t = txn(1);
+        t.auth_addr = Some(Address([9; 32]));
+        cache.put(&t, "some error".to_string());
+
+        let got = cache.check(&id(&t)).expect("found");
+        assert_eq!(got.txn_err, "some error");
+        assert_eq!(got.tx, t);
+
+        assert!(
+            cache.check(&Digest([0xee; 32])).is_none(),
+            "a transaction that was never cached must not be found"
+        );
     }
 
     #[test]
     fn check_returns_none_for_missing() {
         let cache = StatusCache::new(10);
-        let txid = test_digest(42);
-        assert!(cache.check(&txid).is_none());
+        assert!(cache.check(&Digest([42; 32])).is_none());
     }
 
     #[test]
     fn rotation_on_capacity() {
         // Capacity of 2: after inserting 2 entries, the 3rd triggers rotation.
         let mut cache = StatusCache::new(2);
+        let (t1, t2, t3) = (txn(1), txn(2), txn(3));
 
-        let txid1 = test_digest(1);
-        let txid2 = test_digest(2);
-        let txid3 = test_digest(3);
-
-        cache.put(txid1, "err1".to_string());
-        cache.put(txid2, "err2".to_string());
+        cache.put(&t1, "err1".to_string());
+        cache.put(&t2, "err2".to_string());
 
         // cur is now full (2 entries). Next put rotates cur -> prev.
-        cache.put(txid3, "err3".to_string());
+        cache.put(&t3, "err3".to_string());
 
-        // txid3 should be in cur
-        let s3 = cache.check(&txid3).expect("txid3 in cur");
-        assert_eq!(s3.txn_err, "err3");
-
-        // txid1 and txid2 should be in prev (still findable)
-        let s1 = cache.check(&txid1).expect("txid1 in prev");
-        assert_eq!(s1.txn_err, "err1");
-
-        let s2 = cache.check(&txid2).expect("txid2 in prev");
-        assert_eq!(s2.txn_err, "err2");
+        assert_eq!(cache.check(&id(&t3)).expect("t3 in cur").txn_err, "err3");
+        assert_eq!(cache.check(&id(&t1)).expect("t1 in prev").txn_err, "err1");
+        assert_eq!(cache.check(&id(&t2)).expect("t2 in prev").txn_err, "err2");
     }
 
     #[test]
     fn double_rotation_evicts_oldest() {
         let mut cache = StatusCache::new(1);
+        let (t1, t2, t3) = (txn(1), txn(2), txn(3));
 
-        let txid1 = test_digest(1);
-        let txid2 = test_digest(2);
-        let txid3 = test_digest(3);
+        cache.put(&t1, "err1".to_string());
+        cache.put(&t2, "err2".to_string());
+        assert!(cache.check(&id(&t1)).is_some());
+        assert!(cache.check(&id(&t2)).is_some());
 
-        // Insert txid1 -> cur = {1}
-        cache.put(txid1, "err1".to_string());
-
-        // Insert txid2 -> rotation: prev = {1}, cur = {2}
-        cache.put(txid2, "err2".to_string());
-
-        // txid1 is now in prev, still findable
-        assert!(cache.check(&txid1).is_some());
-        assert!(cache.check(&txid2).is_some());
-
-        // Insert txid3 -> rotation: prev = {2}, cur = {3}
-        // txid1 is gone (was in old prev, which is dropped)
-        cache.put(txid3, "err3".to_string());
-
-        assert!(cache.check(&txid1).is_none(), "txid1 should be evicted");
-        assert!(cache.check(&txid2).is_some(), "txid2 should be in prev");
-        assert!(cache.check(&txid3).is_some(), "txid3 should be in cur");
+        cache.put(&t3, "err3".to_string());
+        assert!(cache.check(&id(&t1)).is_none(), "t1 should be evicted");
+        assert!(cache.check(&id(&t2)).is_some(), "t2 should be in prev");
+        assert!(cache.check(&id(&t3)).is_some(), "t3 should be in cur");
     }
 
     #[test]
     fn reset_clears_everything() {
         let mut cache = StatusCache::new(10);
-        let txid = test_digest(1);
-
-        cache.put(txid, "error".to_string());
-        assert!(cache.check(&txid).is_some());
-
+        let t = txn(1);
+        cache.put(&t, "error".to_string());
+        assert!(cache.check(&id(&t)).is_some());
         cache.reset();
-        assert!(cache.check(&txid).is_none());
+        assert!(cache.check(&id(&t)).is_none());
     }
 
     #[test]
     fn reset_clears_prev_too() {
         let mut cache = StatusCache::new(1);
-        let txid1 = test_digest(1);
-        let txid2 = test_digest(2);
-
-        cache.put(txid1, "err1".to_string());
-        cache.put(txid2, "err2".to_string()); // rotates txid1 to prev
-
-        assert!(cache.check(&txid1).is_some());
-        assert!(cache.check(&txid2).is_some());
-
+        let (t1, t2) = (txn(1), txn(2));
+        cache.put(&t1, "err1".to_string());
+        cache.put(&t2, "err2".to_string()); // rotates t1 to prev
+        assert!(cache.check(&id(&t1)).is_some());
+        assert!(cache.check(&id(&t2)).is_some());
         cache.reset();
-
-        assert!(cache.check(&txid1).is_none());
-        assert!(cache.check(&txid2).is_none());
+        assert!(cache.check(&id(&t1)).is_none());
+        assert!(cache.check(&id(&t2)).is_none());
     }
 
     #[test]
     fn empty_error_string_for_confirmed() {
         let mut cache = StatusCache::new(10);
-        let txid = test_digest(1);
-
+        let t = txn(1);
         // An empty txn_err means the transaction was confirmed (not rejected).
-        cache.put(txid, String::new());
-
-        let status = cache.check(&txid).expect("should find entry");
+        cache.put(&t, String::new());
+        let status = cache.check(&id(&t)).expect("should find entry");
         assert!(status.txn_err.is_empty());
     }
 
     #[test]
     fn overwrite_existing_entry() {
         let mut cache = StatusCache::new(10);
-        let txid = test_digest(1);
-
-        cache.put(txid, "first error".to_string());
-        cache.put(txid, "second error".to_string());
-
-        let status = cache.check(&txid).expect("should find entry");
+        let t = txn(1);
+        cache.put(&t, "first error".to_string());
+        cache.put(&t, "second error".to_string());
+        let status = cache.check(&id(&t)).expect("should find entry");
         assert_eq!(status.txn_err, "second error");
+    }
+
+    /// go logs and reports a miss for an entry it cannot decode.
+    #[test]
+    fn undecodable_entry_reads_as_a_miss() {
+        let mut cache = StatusCache::new(10);
+        let t = txn(1);
+        cache.put(&t, "err".to_string());
+        cache.cur.get_mut(&id(&t)).unwrap().tx = vec![0xc1];
+        assert!(cache.check(&id(&t)).is_none());
     }
 }

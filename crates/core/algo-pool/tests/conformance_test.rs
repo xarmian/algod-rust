@@ -192,6 +192,8 @@ fn make_txn(note_byte: u8) -> SignedTransaction {
     let mut txn = SignedTransaction::default();
     txn.txn.txn_type = TxnType::Pay;
     txn.txn.fee = 1_000_000; // high fee to pass any fee check
+                             // The status cache keeps the encoding; a transaction without a sender does not decode.
+    txn.txn.sender = Address([0x77; 32]);
     txn.txn.first_valid = Round(1);
     txn.txn.last_valid = Round(1000);
     txn.txn.note = serde_bytes::ByteBuf::from(vec![note_byte]);
@@ -217,6 +219,7 @@ fn make_txn_with_note(note: &[u8]) -> SignedTransaction {
     let mut txn = SignedTransaction::default();
     txn.txn.txn_type = TxnType::Pay;
     txn.txn.fee = 1_000_000;
+    txn.txn.sender = Address([0x77; 32]);
     txn.txn.first_valid = Round(1);
     txn.txn.last_valid = Round(1000);
     txn.txn.note = serde_bytes::ByteBuf::from(note.to_vec());
