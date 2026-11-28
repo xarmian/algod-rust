@@ -3988,14 +3988,12 @@ mod tests {
                             .to_string(),
                         class: RejectClass::Framed(FramedKind::MinBalance),
                     },
-                    _ => || {
-                        AlgoError::Rejected {
+                    _ => || AlgoError::Rejected {
                         source: None,
                         message:
                             "transaction X: should have been authorized by A but was actually authorized by B"
                                 .to_string(),
                         class: RejectClass::Framed(FramedKind::Other),
-                    }
                     },
                 },
             }));
@@ -4102,13 +4100,12 @@ mod tests {
             guard.evaluator = Some(Box::new(ErrEvaluator {
                 round: Round(2),
                 make: || AlgoError::Validation {
-                    message: "transaction has too many foreign references".to_string(),
+                    message: "transaction has too many foreign references"
+                        .to_string(),
                 },
             }));
         }
-        let err = pool
-            .remember(vec![make_test_txn(9)])
-            .expect_err("validation");
+        let err = pool.remember(vec![make_test_txn(9)]).expect_err("validation");
         assert_eq!(
             err.to_string(),
             "TransactionPool.Remember: TransactionPool.ingest: validation error: transaction has too many foreign references"

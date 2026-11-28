@@ -275,4 +275,53 @@ mod tests {
         cache.cur.get_mut(&id(&t)).unwrap().tx = vec![0xc1];
         assert!(cache.check(&id(&t)).is_none());
     }
+
+    /// Every authorization shape that can reach the pool survives the
+    /// encode/decode the cache does (a transaction that did not would read as
+    /// never seen).
+    #[test]
+    fn every_authorization_shape_round_trips() {
+        use algo_types::{LogicSig, MultisigSig, SaltedKeySig};
+        let mut cache = StatusCache::new(64);
+        let mut shapes = Vec::new();
+        shapes.push(txn(1));
+        let mut m = txn(2);
+        m.sig = [0; 64];
+        m.msig = Some(MultisigSig {
+            version: 1,
+            threshold: 1,
+            subsigs: vec![algo_types::MultisigSubsig {
+                public_key: [5; 32],
+                signature: [6; 64],
+            }],
+        });
+        shapes.push(m);
+        let mut l = txn(3);
+        l.sig = [0; 64];
+        l.lsig = Some(LogicSig {
+            logic: serde_bytes::ByteBuf::from(vec![6, 0x81, 1]),
+            args: Some(vec![Some(serde_bytes::ByteBuf::from(vec![1, 2])), None]),
+            ..Default::default()
+        });
+        shapes.push(l);
+        let mut p = txn(4);
+        p.sig = [0; 64];
+        p.pqsig = Some(SaltedKeySig {
+            scheme: *b"f5",
+            public_key: serde_bytes::ByteBuf::from(vec![1; 9]),
+            signature: serde_bytes::ByteBuf::from(vec![2; 9]),
+            ..Default::default()
+        });
+        shapes.push(p);
+        let mut r = txn(5);
+        r.auth_addr = Some(Address([8; 32]));
+        shapes.push(r);
+        for (i, t) in shapes.iter().enumerate() {
+            cache.put(t, "e".to_string());
+            let enc = canonical_encode_signed_transaction(t);
+            let dec = decode_signed_txn_stream(&enc);
+            assert!(dec.is_ok(), "shape {i}: {dec:?}");
+            assert_eq!(&cache.check(&id(t)).expect("decodes").tx, t, "shape {i}");
+        }
+    }
 }
