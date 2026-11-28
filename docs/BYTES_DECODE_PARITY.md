@@ -480,7 +480,7 @@ Entry points (go v5.1.1 `protocol.Decode` = generated msgp, map only;
 | `libgoal` / `goal` reads of a node's answer, agreement crash state | go-codec | goal-rust (client side), own crash-state format | not a wire entry of the node |
 
 The ledger set had no array rows before #2609 (its schema was not dumped) and
-its readers still read the array form; the ledger oracle now dumps its schema
+its readers read the array form then; the ledger oracle now dumps its schema
 (`TestStrictDecodeSchemaLedger`, the msgp.Raw fields `b` / `c` typed as
 `BaseAccountData` / `ResourcesData`), and every set got rows for an array
 under a struct-valued key, array headers cut short, arrays nested up to 300

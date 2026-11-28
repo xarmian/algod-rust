@@ -902,6 +902,8 @@ fn read_bounded_vec_into<T>(
             return Ok(());
         }
         0x80..=0x8f | 0xde | 0xdf => 2 * read_map_header(rd)? as usize,
+        // a slice value (go's `msgp.ReadArrayHeaderBytes`), not a struct: only
+        // struct values lost their array form in go v5.1.1
         _ => read_array_header(rd)? as usize,
     };
     if n > bound {
