@@ -777,7 +777,6 @@ pub struct TxTagHandler {
     check_counter: Arc<TxPoolCheckCounter>,
     backlog_peer_limiter: Option<Arc<TxBacklogPeerLimiter>>,
     net: Option<Arc<dyn GossipNode>>,
-    strict_canonical_reencode_check: bool,
 }
 
 /// Minimal [`Peer`] wrapper carrying only an address string, used as the
@@ -821,10 +820,6 @@ impl std::fmt::Debug for TxTagHandler {
                 &self.backlog_peer_limiter.is_some(),
             )
             .field("relay_enabled", &self.net.is_some())
-            .field(
-                "strict_canonical_reencode_check",
-                &self.strict_canonical_reencode_check,
-            )
             .finish()
     }
 }
@@ -874,7 +869,6 @@ impl TxTagHandler {
             check_counter: Arc::new(TxPoolCheckCounter::new()),
             backlog_peer_limiter: None,
             net: None,
-            strict_canonical_reencode_check: true,
         }
     }
 
@@ -969,21 +963,6 @@ impl TxTagHandler {
     #[must_use]
     pub fn with_canonical_cache(mut self, cache: Arc<SeenTxCache>) -> Self {
         self.canonical_cache = Some(cache);
-        self
-    }
-
-    /// Enable the non-canonical raw-encoding disconnect gate. Since go
-    /// v5.1.1 both of go's entry points perform it (`processIncomingTxn`
-    /// through `checkCanonicalEncoding`, `validateIncomingTxMessage` the
-    /// same way), so the gate is on by default and this builder is kept only
-    /// so existing call sites stay valid. (Before v5.1.1 only the libp2p
-    /// entry point checked, which issue #1645 mirrored; a live mainnet-soak
-    /// run showed WS-gossip relay traffic then still carried non-canonical
-    /// encodings. go v5.1.1 disconnects such a peer on WS-gossip too, and so
-    /// does this handler.)
-    #[must_use]
-    pub fn with_strict_canonical_reencode_check(mut self) -> Self {
-        self.strict_canonical_reencode_check = true;
         self
     }
 
@@ -1260,11 +1239,8 @@ impl MessageHandler for TxTagHandler {
         // unconditionally (falling back to a fresh `reencode()` call)
         // rather than only when `txCanonicalCache != nil`.
         //
-        // go only wires this comparison into `validateIncomingTxMessage`
-        // (the libp2p/P2P entry point), not `processIncomingTxn` (the
-        // WS-gossip entry point) -- the two diverge on this one check.
         // go v5.1.1 `checkCanonicalEncoding`, run by both entry points.
-        if self.strict_canonical_reencode_check {
+        {
             let canonical_bytes = canonical_group_bytes(&group);
             if msg.data.as_slice() != canonical_bytes.as_slice() {
                 warn!(
@@ -3453,10 +3429,10 @@ mod canonical_cache_wiring_tests {
     /// encoding of the exact same signed transaction `encode_group`'s
     /// canonical form above decodes fine.
     #[tokio::test]
-    async fn non_canonical_raw_encoding_disconnects_peer_when_strict_check_enabled() {
+    async fn non_canonical_raw_encoding_disconnects_peer() {
         let (pool, _fail, calls) = make_pool();
         let seen = Arc::new(SeenTxCache::new(1024));
-        let handler = TxTagHandler::new(pool.clone(), seen).with_strict_canonical_reencode_check();
+        let handler = TxTagHandler::new(pool.clone(), seen);
 
         let tx = make_payment_txn(9, 1, 1_000_000);
         let non_canonical = rmp_serde::to_vec_named(&tx).expect("encode stxn (non-canonical)");
@@ -3565,7 +3541,11 @@ mod canonical_cache_wiring_tests {
                 .collect();
             let out = handler.handle(incoming(&group, "9.9.9.9:4160")).await;
             assert_ne!(out.action, ForwardingPolicy::Disconnect, "group of {n}");
-            assert!(calls.load(Ordering::SeqCst) <= 1);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "group of {n} reaches the pool"
+            );
         }
 
         let group: Vec<SignedTransaction> = (0..16)
