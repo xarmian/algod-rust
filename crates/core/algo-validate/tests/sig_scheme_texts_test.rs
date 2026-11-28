@@ -28,7 +28,7 @@
 //! go-encoded bytes with the full error text. Each case is decoded here from
 //! go's bytes, must re-encode byte for byte, and must give go's verdict and
 //! text through the verified-group path (go's `verify.TxnGroup`) and the same
-//! verdict through the per-transaction path.
+//! verdict and text through the per-transaction path.
 
 use algo_avm::group::GroupBudget;
 use algo_error::AlgoError;
@@ -111,21 +111,21 @@ fn sig_scheme_cases_match_go_on_the_pool_path() {
             .map(|e| text(&group[0], e))
             .unwrap_or_default();
 
-        if cached != want || got.is_empty() != want.is_empty() {
+        if cached != want || got != want {
             mismatches.push(format!(
                 "{name}:\n    go:     {want:?}\n    rust:   {got:?}\n    cached: {cached:?}"
             ));
         }
     }
-    assert_eq!(
-        accepted, 7,
-        "go accepts the six valid key-scheme cases and the valid ls case"
-    );
     assert!(
         mismatches.is_empty(),
         "{} of {} cases differ from go v5.1.1:\n{}",
         mismatches.len(),
         cases.len(),
         mismatches.join("\n")
+    );
+    assert_eq!(
+        accepted, 7,
+        "go accepts the six valid key-scheme cases and the valid ls case"
     );
 }

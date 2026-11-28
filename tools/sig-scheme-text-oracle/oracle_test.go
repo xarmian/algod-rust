@@ -18,7 +18,6 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-
 // Parity oracle for algod-rust issue #2546: go-algorand v5.1.1-stable's
 // SaltedKeySig for every signature scheme (f1, f5, ed, ls) under the `future`
 // protocol, which enables them all. For each scheme and each variant of the
