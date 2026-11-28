@@ -781,6 +781,7 @@ dependencies = [
 name = "algokey-rust"
 version = "0.1.0"
 dependencies = [
+ "algo-avm",
  "algo-codec",
  "algo-consensus-crypto",
  "algo-error",
@@ -792,6 +793,7 @@ dependencies = [
  "assert_cmd",
  "base64 0.23.1",
  "clap",
+ "curve25519-dalek 5.0.0",
  "data-encoding",
  "ed25519-dalek",
  "hex",

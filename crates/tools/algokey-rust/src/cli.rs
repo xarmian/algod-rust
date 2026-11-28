@@ -49,7 +49,7 @@ use clap::{Args, Parser, Subcommand};
     version
 )]
 pub struct Cli {
-    /// Which Falcon-1024 implementation to use for `pq` keys: "rust" (the
+    /// Which Falcon implementation to use for `salted` Falcon keys: "rust" (the
     /// pure-Rust port) or "c" (the vendored go-algorand C library).
     ///
     /// DIVERGENCE DIV-001: algod-rust-only flag (`docs/DIVERGENCES.md`).
@@ -79,8 +79,9 @@ pub enum Command {
     Multisig(MultisigCli),
     /// Manage participation keys.
     Part(PartCli),
-    /// Manage post-quantum account keys.
-    Pq(PqCli),
+    /// Manage salted-address account keys.
+    #[command(alias = "pq")]
+    Salted(SaltedCli),
 }
 
 // ---------------------------------------------------------------------------
@@ -319,95 +320,88 @@ pub struct KeyregArgs {
 }
 
 // ---------------------------------------------------------------------------
-// pq
+// salted
 // ---------------------------------------------------------------------------
 
-/// `pq` command tree (`pq.go:84-153`). Go's `pqCmd.Run` (`pq.go:88-90`)
-/// falls back to printing help when invoked with no subcommand.
+/// `salted` command tree (`salted.go`), also reachable as `pq`, the name the
+/// group shipped with (`Aliases: []string{"pq"}`). Go's `saltedCmd.Run` falls
+/// back to printing help when invoked with no subcommand.
 #[derive(Debug, Args)]
-pub struct PqCli {
+pub struct SaltedCli {
     #[command(subcommand)]
-    pub command: Option<PqSub>,
+    pub command: Option<SaltedSub>,
 }
 
 #[derive(Debug, Subcommand)]
-pub enum PqSub {
-    /// Generate a post-quantum account key.
-    Generate(PqGenerateArgs),
-    /// Print post-quantum key information.
-    Info(PqInfoArgs),
-    /// Import a post-quantum private key from a mnemonic.
-    Import(PqImportArgs),
-    /// Sign transactions with a post-quantum private key.
-    Sign(PqSignArgs),
-    /// Sign a LogicSig program with a post-quantum private key.
+pub enum SaltedSub {
+    /// Generate a salted-address account key.
+    Generate(SaltedGenerateArgs),
+    /// Print salted-address account key information.
+    Info(SaltedInfoArgs),
+    /// Import a salted-address account private key from a mnemonic.
+    Import(SaltedImportArgs),
+    /// Sign transactions with a salted-address account private key.
+    Sign(SaltedSignArgs),
+    /// Sign a LogicSig program with a salted-address account private key.
     #[command(name = "sign-program")]
-    SignProgram(PqSignProgramArgs),
-    /// Check that an address is PQ compliant.
+    SignProgram(SaltedSignProgramArgs),
+    /// Check that an address is off the Ed25519 curve.
     #[command(name = "check-address")]
-    CheckAddress(PqCheckAddressArgs),
+    CheckAddress(SaltedCheckAddressArgs),
 }
 
-/// The only currently supported PQ scheme name (`pqSchemeFalcon1024Name`,
-/// `pq_scheme.go:29`).
-pub const PQ_SCHEME_FALCON1024_NAME: &str = "falcon-1024";
-
-/// Flags for `algokey pq generate` — matches `pq.go:155-157`.
-///
-/// `--keyfile` is required (matches `MarkFlagRequired("keyfile")`).
+/// Flags for `algokey salted generate`. `--scheme` has no default and, like
+/// `--keyfile`, is required (`mustMarkFlagRequired`).
 #[derive(Debug, Args)]
-pub struct PqGenerateArgs {
-    /// Post-quantum signature scheme: falcon-1024 (f1).
-    #[arg(short = 'S', long = "scheme", default_value = PQ_SCHEME_FALCON1024_NAME)]
+pub struct SaltedGenerateArgs {
+    /// Signature scheme: falcon-1024 (f1), falcon-512 (f5), ed25519 (ed); required
+    #[arg(short = 'S', long = "scheme", required = true)]
     pub scheme: String,
     /// Private key filename.
     #[arg(short = 'k', long = "keyfile", required = true)]
     pub keyfile: PathBuf,
 }
 
-/// Flags for `algokey pq info` — matches `pq.go:159-160`.
-///
-/// `--keyfile` is required.
+/// Flags for `algokey salted info`; `--keyfile` is required.
 #[derive(Debug, Args)]
-pub struct PqInfoArgs {
+pub struct SaltedInfoArgs {
     /// Private key filename.
     #[arg(short = 'k', long = "keyfile", required = true)]
     pub keyfile: PathBuf,
 }
 
-/// Flags for `algokey pq import` — matches `pq.go:162-166`.
-///
-/// `--mnemonic` and `--keyfile` are both required.
+/// Flags for `algokey salted import`; `--mnemonic`, `--scheme` and
+/// `--keyfile` are all required.
 #[derive(Debug, Args)]
-pub struct PqImportArgs {
-    /// Private key mnemonic.
+pub struct SaltedImportArgs {
+    /// Scheme key mnemonic.
     #[arg(short = 'm', long = "mnemonic", required = true)]
     pub mnemonic: String,
-    /// Post-quantum signature scheme: falcon-1024 (f1).
-    #[arg(short = 'S', long = "scheme", default_value = PQ_SCHEME_FALCON1024_NAME)]
+    /// Signature scheme: falcon-1024 (f1), falcon-512 (f5), ed25519 (ed); required
+    #[arg(short = 'S', long = "scheme", required = true)]
     pub scheme: String,
     /// Private key filename.
     #[arg(short = 'k', long = "keyfile", required = true)]
     pub keyfile: PathBuf,
 }
 
-/// Flags for `algokey pq sign` — matches `pq.go:168-176`.
+/// Flags for `algokey salted sign`.
 ///
 /// `--txfile` and `--outfile` are required; `--keyfile`/`--mnemonic` are
-/// mutually exclusive and neither is clap-required — Go enforces "exactly
-/// one" at runtime (`resolvePQSigningContext`), which we mirror.
+/// mutually exclusive and neither is clap-required: go enforces "exactly
+/// one" at runtime (`resolveSaltedSigningContext`), which we mirror, as the
+/// rule that `--scheme` goes with `--mnemonic` and never with `--keyfile`.
 #[derive(Debug, Args)]
-pub struct PqSignArgs {
+pub struct SaltedSignArgs {
     /// Private key filename.
     #[arg(short = 'k', long = "keyfile")]
     pub keyfile: Option<PathBuf>,
-    /// Private key mnemonic.
+    /// Scheme key mnemonic.
     #[arg(short = 'm', long = "mnemonic")]
     pub mnemonic: Option<String>,
-    /// Post-quantum signature scheme: falcon-1024 (f1); used with
-    /// --mnemonic.
-    #[arg(short = 'S', long = "scheme", default_value = PQ_SCHEME_FALCON1024_NAME)]
-    pub scheme: String,
+    /// Signature scheme: falcon-1024 (f1), falcon-512 (f5), ed25519 (ed); required with --mnemonic, not allowed with --keyfile
+    #[arg(short = 'S', long = "scheme")]
+    pub scheme: Option<String>,
     /// Transaction input filename.
     #[arg(short = 't', long = "txfile", required = true)]
     pub txfile: PathBuf,
@@ -419,23 +413,22 @@ pub struct PqSignArgs {
     pub overwrite: bool,
 }
 
-/// Flags for `algokey pq sign-program` — matches `pq.go:177-183`.
+/// Flags for `algokey salted sign-program`.
 ///
 /// `--program` and `--outfile` are required; `--keyfile`/`--mnemonic` are
-/// mutually exclusive and neither is clap-required (same runtime rule as
-/// `pq sign`).
+/// mutually exclusive and neither is clap-required (same runtime rules as
+/// `salted sign`).
 #[derive(Debug, Args)]
-pub struct PqSignProgramArgs {
+pub struct SaltedSignProgramArgs {
     /// Private key filename.
     #[arg(short = 'k', long = "keyfile")]
     pub keyfile: Option<PathBuf>,
-    /// Private key mnemonic.
+    /// Scheme key mnemonic.
     #[arg(short = 'm', long = "mnemonic")]
     pub mnemonic: Option<String>,
-    /// Post-quantum signature scheme: falcon-1024 (f1); used with
-    /// --mnemonic.
-    #[arg(short = 'S', long = "scheme", default_value = PQ_SCHEME_FALCON1024_NAME)]
-    pub scheme: String,
+    /// Signature scheme: falcon-1024 (f1), falcon-512 (f5), ed25519 (ed); required with --mnemonic, not allowed with --keyfile
+    #[arg(short = 'S', long = "scheme")]
+    pub scheme: Option<String>,
     /// Compiled LogicSig program input filename.
     #[arg(short = 'p', long = "program", required = true)]
     pub program: PathBuf,
@@ -444,10 +437,10 @@ pub struct PqSignProgramArgs {
     pub outfile: PathBuf,
 }
 
-/// Flags for `algokey pq check-address` — matches `pq.go:138-145`.
-/// The address is a positional argument (`cobra.ExactArgs(1)`).
+/// Flags for `algokey salted check-address`. The address is a positional
+/// argument (`cobra.ExactArgs(1)`).
 #[derive(Debug, Args)]
-pub struct PqCheckAddressArgs {
-    /// Address to check for PQ compliance.
+pub struct SaltedCheckAddressArgs {
+    /// Address to check for being off the Ed25519 curve.
     pub address: String,
 }

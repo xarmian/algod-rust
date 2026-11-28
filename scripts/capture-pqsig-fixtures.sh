@@ -43,8 +43,14 @@
 # same container, or any Linux host — the binary only needs to run, not
 # to match the dev box's OS).
 #
+# `$ALGOKEY` must be go-algorand v5.1.1-stable or later: the `algokey pq` group
+# of v5.0.x is `algokey salted` there (`pq` stays as an alias, but `--scheme`
+# is required and the printed text lost its `PQ ` labels). The fixtures below
+# were captured with v5.0.x `algokey pq`; the key derivation and signing are
+# the same.
+#
 # Fixture key material: derived deterministically via
-# `algokey pq import -m "<mnemonic>"` from the well-known all-zero test
+# `algokey salted import -S falcon-1024 -m "<mnemonic>"` from the well-known all-zero test
 # mnemonic (`abandon abandon abandon ... invest`, seed
 # `00000000...0000`) already used by
 # `crates/core/algo-consensus-crypto/tests/passphrase_parity.rs` — so
@@ -71,7 +77,7 @@ mkdir -p "$FIX_DIR"
 MNEMONIC="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon invest"
 
 # 1. Deterministic PQ (Falcon-1024) key from the well-known test mnemonic.
-"$ALGOKEY" pq import -m "$MNEMONIC" -k "$TMP/pqkey" >"$TMP/pq_import.stdout"
+"$ALGOKEY" salted import -S falcon-1024 -m "$MNEMONIC" -k "$TMP/pqkey" >"$TMP/pq_import.stdout"
 
 # 2. An *unsigned* SignedTxn (a plain "pay" transaction) to hand to
 # `algokey pq sign`. There's no `algokey`/`goal` one-liner to emit a raw
@@ -142,14 +148,14 @@ GOEOF
 rm -rf "$HARNESS_DIR"
 
 # 3. Sign the txn -> SignedTxn.PQsig (+ AuthAddr, since Sender != PQ addr).
-"$ALGOKEY" pq sign -k "$TMP/pqkey" -t "$TMP/unsigned_txn.msgp" -o "$TMP/signed_txn_pqsig.msgp"
+"$ALGOKEY" salted sign -k "$TMP/pqkey" -t "$TMP/unsigned_txn.msgp" -o "$TMP/signed_txn_pqsig.msgp"
 
 # 4. Sign a program -> LogicSig.PQsig. Bytes are a trivial "int 1"
 # compiled program (version byte 0x06 + pushint opcode 0x81 + value 0x01);
 # not valid printable-ASCII TEAL *source*, so `algokey` treats it as
 # compiled bytecode as required.
 printf '\x06\x81\x01' >"$TMP/program.bin"
-"$ALGOKEY" pq sign-program -k "$TMP/pqkey" -p "$TMP/program.bin" -o "$TMP/logicsig_pqsig.msgp"
+"$ALGOKEY" salted sign-program -k "$TMP/pqkey" -p "$TMP/program.bin" -o "$TMP/logicsig_pqsig.msgp"
 
 # 5. Hex-encode into the committed fixture files.
 xxd -p "$TMP/signed_txn_pqsig.msgp" | tr -d '\n' >"$FIX_DIR/signed_txn_with_pqsig.canonical.hex"

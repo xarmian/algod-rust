@@ -72,8 +72,9 @@ ROUND_RE = re.compile(r"committed in round (\d+)")
 APP_ID_RE = re.compile(r"Created app with app index (\d+)")
 ASSET_ID_RE = re.compile(r"Created asset with asset index (\d+)")
 NEW_ACCOUNT_RE = re.compile(r"Created new account with address (\S+)")
-# `algokey pq generate` prints "PQ address: <addr>" (issue #1958)
-PQ_ADDR_RE = re.compile(r"PQ address: ([A-Z2-7]{58})")
+# `algokey salted generate` prints "Address: <addr>" (issue #1958; go v5.1.1 renamed
+# `algokey pq` to `salted`, kept as an alias, and dropped the "PQ " labels)
+PQ_ADDR_RE = re.compile(r"(?m)^Address: ([A-Z2-7]{58})")
 # A Falcon-1024 authorized txn pays 2 extra basic min fees (config.ConsensusParams.
 # PQSchemeFeeContribution) which `goal clerk send` does not add; pay this multiple of
 # the node's min fee (overpaying is harmless).
@@ -897,7 +898,7 @@ class Workload:
 
     def sc_pq(self):
         """Falcon-1024 (PQ) account payments, issue #1958: one PQ account
-        (created on first use with go-algorand's `algokey pq`, then reused and
+        (created on first use with go-algorand's `algokey salted`, then reused and
         topped up) pays an actor twice -- the first signed payment is
         submitted through a Go node, the second through the Rust node (REST).
         Both must be admitted and committed; the rich soak's block comparison
@@ -905,10 +906,10 @@ class Workload:
         byte-identically."""
         if getattr(self, "pq_account", None) is None:
             key = "{}/pq.key".format(WORK_DIR)
-            rc, out = self.env.sh("mkdir -p {} && algokey pq generate -k {}".format(WORK_DIR, key))
+            rc, out = self.env.sh("mkdir -p {} && algokey salted generate -S falcon-1024 -k {}".format(WORK_DIR, key))
             m = PQ_ADDR_RE.search(out) if rc == 0 else None
             if not m:
-                raise ScenarioAbort("algokey pq generate failed (rc={}): {}".format(rc, out[-200:]))
+                raise ScenarioAbort("algokey salted generate failed (rc={}): {}".format(rc, out[-200:]))
             self.pq_account = (key, m.group(1))
             self.fund(m.group(1), 2000000)
         key, pq = self.pq_account
@@ -924,7 +925,7 @@ class Workload:
             rc, out = self.env.goal("clerk send -f {} -t {} -a {} --fee {} --note {} -o {}".format(
                 pq, dest, PQ_PAY_AMOUNT, fee, self.note(op), unsigned))
             if rc == 0:
-                rc, out = self.env.sh("algokey pq sign -k {} -t {} -o {}".format(key, unsigned, signed))
+                rc, out = self.env.sh("algokey salted sign -k {} -t {} -o {}".format(key, unsigned, signed))
             if rc != 0:
                 self.record_step(op, "error", "confirmed", {}, "build/sign failed (rc={}): {}".format(rc, out),
                                  submissions=[])

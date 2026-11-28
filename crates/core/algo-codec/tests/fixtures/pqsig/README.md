@@ -1,6 +1,8 @@
 # PQSig fixtures (issue #707)
 
-Real go-algorand `v5.0.0-stable` `algokey pq`-produced msgpack fixtures,
+Real go-algorand `v5.0.0-stable` `algokey pq`-produced msgpack fixtures (go
+`v5.1.1-stable` renamed the group `algokey salted`, `pq` is kept as an alias and
+`scripts/capture-pqsig-fixtures.sh` now calls `salted`),
 replacing the hand-computed byte oracle from issue #660 with byte-exact
 conformance against a live encoder run.
 
