@@ -274,15 +274,6 @@ impl<S> StreamManager<S> {
         closed
     }
 
-    /// Gossip stream slots `remote` occupies: its live stream plus the attempts
-    /// in flight. go v5.1.1 bounds the inbound gossip streams one peer may hold
-    /// per protocol at 2 (`gossipStreamsInboundPerPeer`: one stream, plus one
-    /// more for a peer that opens a new stream before its old one has closed).
-    pub fn slots_in_use(&self, remote: &PeerId) -> usize {
-        usize::from(self.streams.contains_key(remote))
-            + self.inflight.get(remote).copied().unwrap_or(0) as usize
-    }
-
     /// Record the routing address of the IP `remote` is connected from.
     pub fn set_routing_addr(&mut self, remote: PeerId, routing: Vec<u8>) {
         self.routing.insert(remote, routing);
@@ -685,23 +676,5 @@ mod tests {
         let mut expected = vec![(a, "stream-a"), (b, "stream-b")];
         expected.sort_by_key(|(p, _)| *p);
         assert_eq!(collected, expected);
-    }
-
-    /// go v5.1.1 per-peer inbound gossip stream cap: the live stream plus the
-    /// attempts in flight are the slots a peer occupies.
-    #[test]
-    fn slots_in_use_counts_the_live_stream_and_attempts_in_flight() {
-        let mut m: StreamManager<u8> = StreamManager::new();
-        let peer = PeerId::random();
-        assert_eq!(m.slots_in_use(&peer), 0);
-        m.begin_peer_attempt(peer);
-        assert_eq!(m.slots_in_use(&peer), 1);
-        m.begin_peer_attempt(peer);
-        assert_eq!(m.slots_in_use(&peer), 2);
-        m.end_peer_attempt(peer);
-        m.set_stream(peer, 7);
-        assert_eq!(m.slots_in_use(&peer), 2);
-        m.end_peer_attempt(peer);
-        assert_eq!(m.slots_in_use(&peer), 1);
     }
 }

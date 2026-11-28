@@ -2336,6 +2336,7 @@ impl P2pTransport {
             let gen_counter = Arc::clone(&stream_generation);
             let headers = our_ws_headers.clone();
             let blocked = Arc::clone(&blocked_inbound_gossip_peers);
+            let inbound_limit = PerPeerLimit::default();
             let cmd_tx = cmd_tx.clone();
             let connection_is_dialer = Arc::clone(&connection_is_dialer);
             dedicated_rt_handle.spawn(async move {
@@ -2362,19 +2363,25 @@ impl P2pTransport {
                         drop(stream);
                         continue;
                     }
-                    if sp
-                        .lock()
-                        .expect("stream_peers mutex poisoned")
-                        .slots_in_use(&peer_id)
-                        >= GOSSIP_STREAMS_INBOUND_PER_PEER
-                    {
+                    // go's resource manager bounds the inbound streams of one peer
+                    // per gossip protocol: a live stream, plus one more being set up
+                    // (a peer that opens a new stream before its old one has closed).
+                    let live = usize::from(
+                        sp.lock()
+                            .expect("stream_peers mutex poisoned")
+                            .get(&peer_id)
+                            .is_some(),
+                    );
+                    let Some(slot) = inbound_limit
+                        .acquire(peer_id, GOSSIP_STREAMS_INBOUND_PER_PEER.saturating_sub(live))
+                    else {
                         tracing::debug!(
                             %peer_id,
                             "P2P: rejecting gossip stream — the peer holds its inbound stream limit"
                         );
                         drop(stream);
                         continue;
-                    }
+                    };
                     sp.lock()
                         .expect("stream_peers mutex poisoned")
                         .begin_peer_attempt(peer_id);
@@ -2394,7 +2401,7 @@ impl P2pTransport {
                         .get(&peer_id)
                         .copied()
                         .unwrap_or(false);
-                    tokio::spawn(handle_inbound_ws_stream(
+                    let handler = handle_inbound_ws_stream(
                         peer_id,
                         stream,
                         headers.clone(),
@@ -2404,7 +2411,11 @@ impl P2pTransport {
                         Arc::clone(&gen_counter),
                         cmd_tx.clone(),
                         we_dialed_connection,
-                    ));
+                    );
+                    tokio::spawn(async move {
+                        handler.await;
+                        drop(slot);
+                    });
                 }
             });
         }
@@ -2418,6 +2429,7 @@ impl P2pTransport {
             let sp = Arc::clone(&stream_peers);
             let gen_counter = Arc::clone(&stream_generation);
             let blocked = Arc::clone(&blocked_inbound_gossip_peers);
+            let inbound_limit = PerPeerLimit::default();
             let cmd_tx = cmd_tx.clone();
             let connection_is_dialer = Arc::clone(&connection_is_dialer);
             dedicated_rt_handle.spawn(async move {
@@ -2434,19 +2446,25 @@ impl P2pTransport {
                         drop(stream);
                         continue;
                     }
-                    if sp
-                        .lock()
-                        .expect("stream_peers mutex poisoned")
-                        .slots_in_use(&peer_id)
-                        >= GOSSIP_STREAMS_INBOUND_PER_PEER
-                    {
+                    // go's resource manager bounds the inbound streams of one peer
+                    // per gossip protocol: a live stream, plus one more being set up
+                    // (a peer that opens a new stream before its old one has closed).
+                    let live = usize::from(
+                        sp.lock()
+                            .expect("stream_peers mutex poisoned")
+                            .get(&peer_id)
+                            .is_some(),
+                    );
+                    let Some(slot) = inbound_limit
+                        .acquire(peer_id, GOSSIP_STREAMS_INBOUND_PER_PEER.saturating_sub(live))
+                    else {
                         tracing::debug!(
                             %peer_id,
                             "P2P: rejecting gossip stream — the peer holds its inbound stream limit"
                         );
                         drop(stream);
                         continue;
-                    }
+                    };
                     sp.lock()
                         .expect("stream_peers mutex poisoned")
                         .begin_peer_attempt(peer_id);
@@ -2458,7 +2476,7 @@ impl P2pTransport {
                         .get(&peer_id)
                         .copied()
                         .unwrap_or(false);
-                    tokio::spawn(handle_inbound_ws_v1_stream(
+                    let handler = handle_inbound_ws_v1_stream(
                         peer_id,
                         stream,
                         Arc::clone(&mux),
@@ -2466,7 +2484,11 @@ impl P2pTransport {
                         Arc::clone(&gen_counter),
                         cmd_tx.clone(),
                         we_dialed_connection,
-                    ));
+                    );
+                    tokio::spawn(async move {
+                        handler.await;
+                        drop(slot);
+                    });
                 }
             });
         }
@@ -2577,7 +2599,15 @@ impl P2pTransport {
             // `P2pCommand::Stop`: no more redials, and the acknowledgement owed
             // once the last connection has closed.
             let mut bootstrap_redial_targets = bootstrap_redial_targets;
-            let mut stop_ack: Option<tokio::sync::oneshot::Sender<()>> = None;
+            let mut stop_acks: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
+            // The peers this node dials for gossip: its bootstrap peers and the
+            // peers its DHT Gossip-capability lookups discover (go's
+            // `DialPeersUntilTargetCount` set). `closeWithoutStream` only ever
+            // closes these, never a connection opened for an HTTP fetch.
+            let mut gossip_dialed: std::collections::HashSet<PeerId> = bootstrap_redial_targets
+                .iter()
+                .map(|(_, peer)| *peer)
+                .collect();
             // Tracks this task's own in-flight DHT queries so the
             // `event = host.next_event()` arm below can recognize their
             // results as they stream in, without ever blocking this select
@@ -2639,7 +2669,10 @@ impl P2pTransport {
                             cp.lock()
                                 .expect("connected_peers mutex poisoned")
                                 .iter()
-                                .filter(|p| is_dialer.get(*p).copied().unwrap_or(false))
+                                .filter(|p| {
+                                    is_dialer.get(*p).copied().unwrap_or(false)
+                                        && gossip_dialed.contains(*p)
+                                })
                                 .copied()
                                 .collect()
                         };
@@ -2716,7 +2749,10 @@ impl P2pTransport {
                                     // this to it), so no extra bookkeeping is
                                     // needed here beyond that.
                                     match host.dial_peer(peer_id) {
-                                        Ok(()) => tracing::info!(%peer_id, "P2P: dialing peer discovered via DHT Gossip-capability lookup"),
+                                        Ok(()) => {
+                                            gossip_dialed.insert(peer_id);
+                                            tracing::info!(%peer_id, "P2P: dialing peer discovered via DHT Gossip-capability lookup")
+                                        }
                                         Err(e) => tracing::debug!(%peer_id, error = %e, "P2P: skipped dialing DHT-discovered peer"),
                                     }
                                 }
@@ -2738,6 +2774,10 @@ impl P2pTransport {
                                 // redundant/losing connection still proves
                                 // this peer is currently reachable.
                                 bootstrap_backoff_state.remove(&peer_id);
+                                // A stopping transport takes no new peers.
+                                if !stop_acks.is_empty() {
+                                    host.disconnect_peer(peer_id);
+                                }
                                 // go v5.1.1 `gsPeer.RoutingAddr`: the IP the peer
                                 // is connected from (used to key the proposal
                                 // queue's fairness); a connection without one
@@ -2984,10 +3024,10 @@ impl P2pTransport {
                                     &mut bootstrap_backoff_state,
                                     &bootstrap_redial_attempts_for_task,
                                 );
-                                if stop_ack.is_some()
+                                if !stop_acks.is_empty()
                                     && cp.lock().expect("connected_peers mutex poisoned").is_empty()
                                 {
-                                    if let Some(ack) = stop_ack.take() {
+                                    for ack in stop_acks.drain(..) {
                                         let _ = ack.send(());
                                     }
                                     break;
@@ -3140,14 +3180,14 @@ impl P2pTransport {
                                     .lock()
                                     .expect("connected_peers mutex poisoned")
                                     .clone();
-                                if peers.is_empty() {
+                                if peers.is_empty() && stop_acks.is_empty() {
                                     let _ = ack.send(());
                                     break;
                                 }
                                 for peer_id in peers {
                                     host.disconnect_peer(peer_id);
                                 }
-                                stop_ack = Some(ack);
+                                stop_acks.push(ack);
                             }
                             None => break,
                         }
