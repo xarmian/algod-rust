@@ -211,7 +211,10 @@ async fn serve_block(
     let dir = state.dir.clone();
     let read = tokio::task::spawn_blocking(move || read_block_file(&dir, "1", &genesis_id, round))
         .await
-        .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "catchupsrv block read task failed");
+            Err(std::io::Error::other(e))
+        });
     match read {
         Ok(data) => (
             StatusCode::OK,
@@ -402,7 +405,7 @@ mod tests {
             read_block_file(dir.path(), "1", &format!("../../{outside_name}"), 1000).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         // the version is part of the path too
-        assert!(read_block_file(dir.path(), "../..", "x", 1000).is_err());
+        assert!(read_block_file(dir.path(), "1/../..", "x", 1000).is_err());
         assert!(read_block_file(dir.path(), "1", "/etc", 1000).is_err());
 
         // `filepath.IsLocal` on its own
