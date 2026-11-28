@@ -187,6 +187,19 @@
 //! behavior is unchanged from before issue #821: no per-app rate limiting
 //! is applied.
 //!
+//! ## Backlog byte bound (issue #2621)
+//!
+//! go v5.1.1 bounds the backlog by estimated memory as well as by count:
+//! `checkCanonicalEncoding` returns the message's raw length plus
+//! [`algo_types::signed_txn_size::signed_txn_size`] of every decoded
+//! transaction, `enqueueBacklog` charges it to `backlogBytes` and drops a group
+//! that would take it over `txBacklogMaxBytes` ([`TX_BACKLOG_MAX_BYTES`], 1 GiB;
+//! [`TxTagHandler::with_backlog_max_bytes`], `0` disables), the backlog worker
+//! returns the charge on dequeue, and `incomingMsgErlCheck` counts the backlog as
+//! congested above `TxBacklogRateLimitingCongestionPct` (50) percent of the bound.
+//! The size estimate is proven against go's by
+//! `tests/signed_txn_size_go_parity.rs`.
+//!
 //! ## Canonical-form dedup / anti-censoring cache and cache rotation (issue #1084)
 //!
 //! go-algorand's `TxHandler.processIncomingTxn` runs every decoded group
@@ -288,7 +301,7 @@
 //! [`TxSyncer`]: crate::tx_syncer::TxSyncer
 //! [`canonical_encode_signed_transaction`]: algo_codec::canonical_encode_signed_transaction
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -302,6 +315,7 @@ use algo_pool::{
     classify_pool_error, AppRateLimiter, CapacityGuard, ElasticRateLimiter,
     ElasticRateLimiterError, PoolErrorTag, TransactionPool,
 };
+use algo_types::signed_txn_size::signed_txn_size;
 use algo_types::{Digest, SignedTransaction};
 use algo_validate::{BatchVerifier, BatchVerifyRequest, SpecialAddresses, VerificationContext};
 
@@ -470,6 +484,10 @@ impl TxPoolCheckCounter {
 /// made for its own (differently-scoped) `CONGESTION_THRESHOLD_PCT`.
 const BACKLOG_CONGESTION_THRESHOLD_PCT: usize = 50;
 
+/// go's `txBacklogMaxBytes` (`data/txHandler.go`): the default bound on the
+/// estimated memory held by the transaction backlog.
+pub const TX_BACKLOG_MAX_BYTES: i64 = 1 << 30;
+
 /// Per-peer admission-fairness gate for [`TxTagHandler::with_backlog_queue`]
 /// (issue #1195), the push-side analogue of
 /// [`crate::tx_sync_service::TxSyncPeerLimiter`]'s pull-side gate. Both wrap
@@ -580,13 +598,19 @@ impl TxBacklogPeerLimiter {
     /// go's `incomingMsgErlCheck`'s congestion-control toggle (using
     /// free-shared-capacity rather than a raw queue-depth read as the
     /// signal — see this struct's doc comment).
-    fn admit(&self, peer_key: &str) -> Result<CapacityGuard<String>, ElasticRateLimiterError> {
+    fn admit(
+        &self,
+        peer_key: &str,
+        bytes_congested: bool,
+    ) -> Result<CapacityGuard<String>, ElasticRateLimiterError> {
         let mut erl = self
             .erl
             .lock()
             .expect("TxBacklogPeerLimiter mutex poisoned");
-        let was_congested =
-            Self::shared_pool_congested(erl.shared_capacity_len(), self.max_capacity);
+        // go's `congestedERL`: the backlog is congested by number of messages
+        // or by the estimated memory they hold (`backlogBytesThreshold`).
+        let was_congested = bytes_congested
+            || Self::shared_pool_congested(erl.shared_capacity_len(), self.max_capacity);
         let (is_cm_enabled, res) = erl.consume_capacity(&peer_key.to_string());
         if res.is_err() || (!is_cm_enabled && was_congested) {
             erl.enable_congestion_control();
@@ -773,6 +797,12 @@ pub struct TxTagHandler {
     canonical_cache: Option<Arc<SeenTxCache>>,
     backlog_tx: Option<mpsc::Sender<BacklogItem>>,
     backlog_dropped: Arc<AtomicU64>,
+    /// Estimated memory held by the groups in the backlog queue (go's
+    /// `TxHandler.backlogBytes`), see [`signed_txn_size`].
+    backlog_bytes: Arc<AtomicI64>,
+    /// `backlogBytes` above which a group is dropped, 0 for no bound (go's
+    /// `TxHandler.backlogMaxBytes`).
+    backlog_max_bytes: i64,
     remember_counter: Arc<TxPoolRememberCounter>,
     check_counter: Arc<TxPoolCheckCounter>,
     backlog_peer_limiter: Option<Arc<TxBacklogPeerLimiter>>,
@@ -841,6 +871,8 @@ struct BacklogItem {
     /// event if this item is constructed but never successfully enqueued
     /// (see [`TxTagHandler::handle`]'s backlog-submission block).
     peer_guard: Option<CapacityGuard<String>>,
+    /// The estimate charged to [`TxTagHandler::backlog_bytes`] while queued.
+    bytes: i64,
 }
 
 impl TxTagHandler {
@@ -865,6 +897,8 @@ impl TxTagHandler {
             canonical_cache: None,
             backlog_tx: None,
             backlog_dropped: Arc::new(AtomicU64::new(0)),
+            backlog_bytes: Arc::new(AtomicI64::new(0)),
+            backlog_max_bytes: TX_BACKLOG_MAX_BYTES,
             remember_counter: Arc::new(TxPoolRememberCounter::new()),
             check_counter: Arc::new(TxPoolCheckCounter::new()),
             backlog_peer_limiter: None,
@@ -991,6 +1025,7 @@ impl TxTagHandler {
             self.remember_counter.clone(),
             self.backlog_peer_limiter.clone(),
             self.net.clone(),
+            self.backlog_bytes.clone(),
         ));
         self.backlog_tx = Some(tx);
         self
@@ -1071,6 +1106,30 @@ impl TxTagHandler {
     #[must_use]
     pub fn seen_cache(&self) -> Arc<SeenTxCache> {
         self.seen.clone()
+    }
+
+    /// Bound the estimated memory held by the backlog queue (go's
+    /// `TxHandler.backlogMaxBytes`, `txBacklogMaxBytes` = 1 GiB by default);
+    /// `0` disables the bound.
+    #[must_use]
+    pub fn with_backlog_max_bytes(mut self, max_bytes: i64) -> Self {
+        self.backlog_max_bytes = max_bytes;
+        self
+    }
+
+    /// The estimated memory currently held by the backlog queue.
+    #[must_use]
+    pub fn backlog_bytes(&self) -> i64 {
+        self.backlog_bytes.load(Ordering::Relaxed)
+    }
+
+    /// go's `backlogBytesThreshold < backlogBytes` half of `incomingMsgErlCheck`'s
+    /// `congestedERL`.
+    fn backlog_bytes_congested(&self) -> bool {
+        self.backlog_max_bytes != 0
+            && ((self.backlog_max_bytes as f64 * BACKLOG_CONGESTION_THRESHOLD_PCT as f64 / 100.0)
+                as i64)
+                < self.backlog_bytes.load(Ordering::Relaxed)
     }
 
     /// Number of groups dropped for arriving while the backlog queue
@@ -1240,7 +1299,7 @@ impl MessageHandler for TxTagHandler {
         // rather than only when `txCanonicalCache != nil`.
         //
         // go v5.1.1 `checkCanonicalEncoding`, run by both entry points.
-        {
+        let backlog_size: i64 = {
             let canonical_bytes = canonical_group_bytes(&group);
             if msg.data.as_slice() != canonical_bytes.as_slice() {
                 warn!(
@@ -1255,7 +1314,10 @@ impl MessageHandler for TxTagHandler {
                     topics: None,
                 };
             }
-        }
+            // go's `checkCanonicalEncoding` size: the raw bytes plus the
+            // estimate of every decoded transaction.
+            msg.data.len() as i64 + group.iter().map(signed_txn_size).sum::<i64>()
+        };
 
         // Compute txids once up front — `compute_txn_id` hashes the
         // Transaction body (not the signature), so we can dedup
@@ -1409,7 +1471,7 @@ impl MessageHandler for TxTagHandler {
             let mut peer_guard: Option<CapacityGuard<String>> = None;
             if let Some(limiter) = &self.backlog_peer_limiter {
                 let peer_key = backlog_peer_key(&msg.sender);
-                match limiter.admit(&peer_key) {
+                match limiter.admit(&peer_key, self.backlog_bytes_congested()) {
                     Ok(guard) => peer_guard = Some(guard),
                     Err(_) => {
                         self.backlog_dropped.fetch_add(1, Ordering::Relaxed);
@@ -1438,12 +1500,27 @@ impl MessageHandler for TxTagHandler {
                 sender: msg.sender.clone(),
                 canonical_rollback: canonical_digest.zip(self.canonical_cache.clone()),
                 peer_guard,
+                bytes: backlog_size,
             };
+            // go's `enqueueBacklog`: charge the estimate first, and drop a
+            // group that would take the backlog over `backlogMaxBytes`.
+            let total = self
+                .backlog_bytes
+                .fetch_add(backlog_size, Ordering::Relaxed)
+                .saturating_add(backlog_size);
+            let over_bytes = self.backlog_max_bytes != 0 && total > self.backlog_max_bytes;
             // Non-blocking `try_send` mirrors go's `select { case
             // backlogQueue <- wi: ... default: ... }`: a full queue
             // drops the message rather than blocking this handler (and
             // therefore this peer's whole dispatch loop).
-            if let Err(err) = backlog_tx.try_send(item) {
+            let sent = if over_bytes {
+                Err(item)
+            } else {
+                backlog_tx.try_send(item).map_err(|e| e.into_inner())
+            };
+            if let Err(item) = sent {
+                self.backlog_bytes
+                    .fetch_sub(backlog_size, Ordering::Relaxed);
                 self.backlog_dropped.fetch_add(1, Ordering::Relaxed);
                 // Roll back the canonical-cache entry this group was
                 // just admitted under so it isn't permanently poisoned
@@ -1461,8 +1538,7 @@ impl MessageHandler for TxTagHandler {
                 // until this peer's *next* message, mirroring go's
                 // `processIncomingTxn` `defer`: `if !accepted &&
                 // capguard != nil { capguard.Release() }`.
-                if let (Some(limiter), Some(guard)) =
-                    (&self.backlog_peer_limiter, err.into_inner().peer_guard)
+                if let (Some(limiter), Some(guard)) = (&self.backlog_peer_limiter, item.peer_guard)
                 {
                     limiter.release_unserved(guard);
                 }
@@ -1676,6 +1752,7 @@ async fn ingest_group(
 /// `wi.capguard.Release()` then `wi.capguard.Served()` immediately after
 /// pulling a work item off `backlogQueue`, *before* `checkAlreadyCommitted`
 /// or any further processing (`data/txHandler.go:331-365`).
+#[allow(clippy::too_many_arguments)]
 async fn backlog_worker(
     mut rx: mpsc::Receiver<BacklogItem>,
     pool: Arc<TransactionPool>,
@@ -1684,6 +1761,7 @@ async fn backlog_worker(
     remember_counter: Arc<TxPoolRememberCounter>,
     peer_limiter: Option<Arc<TxBacklogPeerLimiter>>,
     net: Option<Arc<dyn GossipNode>>,
+    backlog_bytes: Arc<AtomicI64>,
 ) {
     while let Some(item) = rx.recv().await {
         let BacklogItem {
@@ -1692,7 +1770,9 @@ async fn backlog_worker(
             sender,
             canonical_rollback,
             peer_guard,
+            bytes,
         } = item;
+        backlog_bytes.fetch_sub(bytes, Ordering::Relaxed);
         if let (Some(limiter), Some(guard)) = (&peer_limiter, peer_guard) {
             limiter.release_and_serve(guard);
         }
@@ -3570,6 +3650,64 @@ mod canonical_cache_wiring_tests {
             assert_eq!(calls.load(Ordering::SeqCst), 0);
         }
     }
+
+    /// Re-encode `tx`'s canonical bytes with `edit` applied to its `txn` map.
+    fn with_edited_txn_map(
+        tx: &SignedTransaction,
+        edit: impl Fn(&mut Vec<(rmpv::Value, rmpv::Value)>),
+    ) -> Vec<u8> {
+        let canonical = canonical_encode_signed_transaction(tx);
+        let mut value = rmpv::decode::read_value(&mut canonical.as_slice()).expect("decode");
+        let rmpv::Value::Map(entries) = &mut value else {
+            panic!("signed txn is a map")
+        };
+        for (k, v) in entries.iter_mut() {
+            if k.as_str() == Some("txn") {
+                let rmpv::Value::Map(txn) = v else {
+                    panic!("txn is a map")
+                };
+                edit(txn);
+            }
+        }
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, &value).expect("encode");
+        out
+    }
+
+    /// go `TestCheckCanonicalEncoding` "zero value field" and "repeated field"
+    /// cases: an encoding that carries a field the canonical form omits (an
+    /// explicit empty `note`), or repeats a field, is not the canonical encoding
+    /// of what it decodes to, so the sender is disconnected and the group never
+    /// reaches the pool. (go decodes the repeated field last-wins and fails the
+    /// canonical comparison; either rejection disconnects.)
+    #[tokio::test]
+    async fn crafted_zero_value_and_repeated_field_encodings_disconnect() {
+        let tx = make_payment_txn(70, 1, 1_000_000);
+        let zero_note = with_edited_txn_map(&tx, |txn| {
+            txn.retain(|(k, _)| k.as_str() != Some("note"));
+            txn.insert(0, ("note".into(), rmpv::Value::Binary(Vec::new())));
+        });
+        let repeated_fee = with_edited_txn_map(&tx, |txn| {
+            let fee = txn
+                .iter()
+                .find(|(k, _)| k.as_str() == Some("fee"))
+                .cloned()
+                .expect("fee present");
+            txn.insert(0, fee);
+        });
+        for (name, data) in [
+            ("zero value field", zero_note),
+            ("repeated field", repeated_fee),
+        ] {
+            assert_ne!(data, canonical_encode_signed_transaction(&tx), "{name}");
+            let (pool, _fail, calls) = make_pool();
+            let handler = TxTagHandler::new(pool, Arc::new(SeenTxCache::new(1024)));
+            let msg = IncomingMessage::new(Tag::Transaction, data, "9.9.9.9:4160".to_string(), 0);
+            let out = handler.handle(msg).await;
+            assert_eq!(out.action, ForwardingPolicy::Disconnect, "{name}");
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "{name}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3756,6 +3894,114 @@ mod backlog_queue_tests {
             1,
             "drop counter must increment by exactly 1"
         );
+    }
+
+    /// go's `checkCanonicalEncoding` size of `group`: the raw bytes plus the
+    /// `signedTxnSize` of every transaction.
+    fn backlog_size_of(group: &[SignedTransaction]) -> i64 {
+        encode_group(group).len() as i64 + group.iter().map(signed_txn_size).sum::<i64>()
+    }
+
+    /// Issue #2621, go v5.1.1 `enqueueBacklog`: a group that would take the
+    /// estimated backlog memory over `backlogMaxBytes` is dropped even though the
+    /// queue has room by count, its charge is returned, and its canonical-cache
+    /// entry is rolled back.
+    #[tokio::test]
+    async fn backlog_byte_bound_drops_group_that_would_exceed_it() {
+        let (pool, _calls) = make_pool();
+        let canonical = Arc::new(SeenTxCache::new(1024));
+        let seen = Arc::new(SeenTxCache::new(1024));
+        let (tx, mut rx) = mpsc::channel(100);
+        let mut handler = TxTagHandler::new(pool, seen).with_canonical_cache(canonical.clone());
+        handler.backlog_tx = Some(tx);
+
+        let tx1 = make_payment_txn(1, 1);
+        let size = backlog_size_of(std::slice::from_ref(&tx1));
+        assert!(size > 2000, "the estimate is not just the encoded size");
+        // room for one group, not two
+        let mut handler = handler.with_backlog_max_bytes(size + size / 2);
+
+        handler
+            .handle(incoming(std::slice::from_ref(&tx1), "1.2.3.4:4160"))
+            .await;
+        assert_eq!(handler.backlog_dropped_count(), 0);
+        assert_eq!(handler.backlog_bytes(), size);
+
+        let tx2 = make_payment_txn(2, 2);
+        handler
+            .handle(incoming(std::slice::from_ref(&tx2), "1.2.3.4:4160"))
+            .await;
+        assert_eq!(handler.backlog_dropped_count(), 1, "over the byte bound");
+        assert_eq!(handler.backlog_bytes(), size, "the charge is returned");
+        assert_eq!(canonical.len(), 1, "the dropped group is rolled back");
+        assert_eq!(rx.recv().await.expect("first group queued").bytes, size);
+
+        // 0 disables the bound, as in go
+        handler = handler.with_backlog_max_bytes(0);
+        handler
+            .handle(incoming(std::slice::from_ref(&tx2), "1.2.3.4:4160"))
+            .await;
+        assert_eq!(handler.backlog_dropped_count(), 1);
+        assert_eq!(handler.backlog_bytes(), 2 * size);
+    }
+
+    /// Issue #2621: `incomingMsgErlCheck` treats the backlog as congested above
+    /// `TxBacklogRateLimitingCongestionPct` percent (50) of `backlogMaxBytes`.
+    #[tokio::test]
+    async fn backlog_bytes_congestion_threshold_is_half_the_bound() {
+        let (pool, _calls) = make_pool();
+        let seen = Arc::new(SeenTxCache::new(1024));
+        let (tx, _rx) = mpsc::channel(100);
+        let mut handler = TxTagHandler::new(pool, seen);
+        handler.backlog_tx = Some(tx);
+        let tx1 = make_payment_txn(1, 1);
+        let size = backlog_size_of(std::slice::from_ref(&tx1));
+
+        // threshold = max / 2: one group of `size` is above it when max < 2 * size
+        let handler = handler.with_backlog_max_bytes(2 * size - 2);
+        assert!(!handler.backlog_bytes_congested());
+        handler
+            .handle(incoming(std::slice::from_ref(&tx1), "1.2.3.4:4160"))
+            .await;
+        assert_eq!(handler.backlog_bytes(), size);
+        assert!(handler.backlog_bytes_congested());
+        // exactly at the threshold is not congested (`threshold < bytes`)
+        let handler = handler.with_backlog_max_bytes(2 * size);
+        assert!(!handler.backlog_bytes_congested());
+        // no bound, no byte congestion
+        let handler = handler.with_backlog_max_bytes(0);
+        assert!(!handler.backlog_bytes_congested());
+    }
+
+    /// Issue #2621, `TestTxHandlerIncomingTxHandleDrops`: with a backlog too small
+    /// for the load every group is either processed or counted as dropped, and the
+    /// byte charge returns to zero once the queue has drained.
+    #[tokio::test]
+    async fn backlog_drops_account_for_every_group_and_release_bytes() {
+        let (pool, calls) = make_pool();
+        let seen = Arc::new(SeenTxCache::new(4096));
+        let one = backlog_size_of(&[make_payment_txn(1, 1)]);
+        let handler = TxTagHandler::new(pool, seen)
+            .with_backlog_queue(1000)
+            .with_backlog_max_bytes(3 * one);
+        let total = 300u64;
+        for i in 0..total {
+            let tx = make_payment_txn((i / 200) as u8 + 20, (i % 200) as u8);
+            handler
+                .handle(incoming(std::slice::from_ref(&tx), "1.2.3.4:4160"))
+                .await;
+        }
+        for _ in 0..400 {
+            if calls.load(Ordering::SeqCst) as u64 + handler.backlog_dropped_count() == total {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst) as u64 + handler.backlog_dropped_count(),
+            total
+        );
+        assert_eq!(handler.backlog_bytes(), 0);
     }
 
     /// Proves the rollback in the test above actually un-poisons the

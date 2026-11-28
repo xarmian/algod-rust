@@ -1,0 +1,313 @@
+// Copyright (C) 2019-2026 Algorand Foundation Ltd.
+// Modifications Copyright (C) 2026 Algod DAO
+// This file is part of algod-rust, a modified work based on go-algorand
+// (https://github.com/algorand/go-algorand).
+//
+// algod-rust is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// algod-rust is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with algod-rust.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// This file is NOT part of any Go module here: it is the oracle of algod-rust
+// issue #2621. Copy it, as zz_signed_txn_size_oracle_test.go, into the pinned
+// go-algorand checkout's data package (signedTxnSize is unexported) and run it:
+//
+//	cp tools/signed-txn-size-oracle/txsize_oracle_test.go.txt \
+//	   ../go-algorand/data/zz_signed_txn_size_oracle_test.go
+//	(cd ../go-algorand && make libsodium && \
+//	   TXSIZE_OUT=$PWD/../algod-rust/crates/node/algo-network/tests/fixtures/signed_txn_size_go.jsonl \
+//	   go test ./data -run TestSignedTxnSizeOracle -count=1)
+//	rm ../go-algorand/data/zz_signed_txn_size_oracle_test.go
+//
+// It writes one {"name","stxn","size"} JSON line per transaction: `stxn` is the
+// base64 of go's canonical encoding (protocol.Encode) and `size` go's
+// signedTxnSize (data/txHandler.go), the estimate checkCanonicalEncoding adds
+// to the backlog byte bound. The cases give every variable-length field of a
+// SignedTxn a value, and the empty transaction pins every fixed one.
+
+package data
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"os"
+	"testing"
+
+	"github.com/algorand/go-algorand/config/bounds"
+	"github.com/algorand/go-algorand/crypto"
+	"github.com/algorand/go-algorand/crypto/merklearray"
+	"github.com/algorand/go-algorand/crypto/merklesignature"
+	"github.com/algorand/go-algorand/crypto/stateproof"
+	"github.com/algorand/go-algorand/data/basics"
+	"github.com/algorand/go-algorand/data/stateproofmsg"
+	"github.com/algorand/go-algorand/data/transactions"
+	"github.com/algorand/go-algorand/protocol"
+	"github.com/stretchr/testify/require"
+)
+
+type txSizeRow struct {
+	Name string `json:"name"`
+	Stxn string `json:"stxn"`
+	Size int64  `json:"size"`
+}
+
+func rb(n int) []byte {
+	b := make([]byte, n)
+	crypto.RandBytes(b)
+	return b
+}
+
+func ra() (a basics.Address) {
+	crypto.RandBytes(a[:])
+	return
+}
+
+func digests(n int, size int) []crypto.GenericDigest {
+	out := make([]crypto.GenericDigest, n)
+	for i := range out {
+		out[i] = rb(size)
+	}
+	return out
+}
+
+func base(typ protocol.TxType) transactions.SignedTxn {
+	var s transactions.SignedTxn
+	s.Txn.Type = typ
+	s.Txn.Sender = ra()
+	s.Txn.Fee = basics.MicroAlgos{Raw: 1000}
+	s.Txn.FirstValid = 10
+	s.Txn.LastValid = 1010
+	return s
+}
+
+func TestSignedTxnSizeOracle(t *testing.T) {
+	var rows []txSizeRow
+	add := func(name string, s transactions.SignedTxn) {
+		rows = append(rows, txSizeRow{
+			Name: name,
+			Stxn: base64.StdEncoding.EncodeToString(protocol.Encode(&s)),
+			Size: signedTxnSize(&s),
+		})
+	}
+
+	// minimal and header fields
+	add("minimal", base(protocol.PaymentTx))
+	{
+		s := base(protocol.PaymentTx)
+		s.Txn.Receiver = ra()
+		s.Txn.Amount = basics.MicroAlgos{Raw: 123456789012}
+		s.Txn.CloseRemainderTo = ra()
+		s.Txn.Note = rb(777)
+		s.Txn.GenesisID = "testnet-v1.0"
+		crypto.RandBytes(s.Txn.GenesisHash[:])
+		crypto.RandBytes(s.Txn.Group[:])
+		crypto.RandBytes(s.Txn.Lease[:])
+		s.Txn.RekeyTo = ra()
+		crypto.RandBytes(s.Sig[:])
+		s.AuthAddr = ra()
+		add("payment_full_header", s)
+	}
+	// random payment groups of go's test helper
+	for _, n := range []int{1, 3, bounds.MaxTxGroupSize} {
+		stxns, _ := makeRandomTransactions(n)
+		for i := range stxns {
+			add("random_payment", stxns[i])
+		}
+	}
+	// application call: every slice
+	{
+		s := base(protocol.ApplicationCallTx)
+		s.Txn.ApplicationID = 7777
+		s.Txn.OnCompletion = transactions.OptInOC
+		s.Txn.ApplicationArgs = [][]byte{rb(1), rb(33), {}, rb(100)}
+		s.Txn.Accounts = []basics.Address{ra(), ra(), ra()}
+		s.Txn.ForeignAssets = []basics.AssetIndex{1, 2, 3, 4}
+		s.Txn.ForeignApps = []basics.AppIndex{5, 6}
+		s.Txn.Boxes = []transactions.BoxRef{{Index: 1, Name: rb(9)}, {Index: 0, Name: rb(64)}, {}}
+		s.Txn.LocalStateSchema = basics.StateSchema{NumUint: 3, NumByteSlice: 4}
+		s.Txn.GlobalStateSchema = basics.StateSchema{NumUint: 30, NumByteSlice: 40}
+		s.Txn.ApprovalProgram = rb(1500)
+		s.Txn.ClearStateProgram = rb(200)
+		s.Txn.ExtraProgramPages = 2
+		s.Txn.RejectVersion = 5
+		add("app_call_legacy_refs", s)
+	}
+	{
+		s := base(protocol.ApplicationCallTx)
+		s.Txn.ApplicationID = 7777
+		s.Txn.Access = []transactions.ResourceRef{
+			{Address: ra()},
+			{Asset: 12},
+			{App: 13},
+			{Holding: transactions.HoldingRef{Address: 1, Asset: 2}},
+			{Locals: transactions.LocalsRef{Address: 3, App: 4}},
+			{Box: transactions.BoxRef{Index: 5, Name: rb(17)}},
+			{},
+		}
+		add("app_call_access", s)
+	}
+	// asset config: strings and four addresses
+	{
+		s := base(protocol.AssetConfigTx)
+		s.Txn.ConfigAsset = 99
+		s.Txn.AssetParams = basics.AssetParams{
+			Total:         1 << 40,
+			Decimals:      6,
+			DefaultFrozen: true,
+			UnitName:      "UNIT",
+			AssetName:     "A rather long asset name",
+			URL:           "https://example.invalid/asset/metadata.json",
+			Manager:       ra(),
+			Reserve:       ra(),
+			Freeze:        ra(),
+			Clawback:      ra(),
+		}
+		crypto.RandBytes(s.Txn.AssetParams.MetadataHash[:])
+		add("asset_config", s)
+	}
+	{
+		s := base(protocol.AssetTransferTx)
+		s.Txn.XferAsset = 5
+		s.Txn.AssetAmount = 10
+		s.Txn.AssetSender = ra()
+		s.Txn.AssetReceiver = ra()
+		s.Txn.AssetCloseTo = ra()
+		add("asset_transfer", s)
+	}
+	{
+		s := base(protocol.AssetFreezeTx)
+		s.Txn.FreezeAccount = ra()
+		s.Txn.FreezeAsset = 8
+		s.Txn.AssetFrozen = true
+		add("asset_freeze", s)
+	}
+	{
+		s := base(protocol.KeyRegistrationTx)
+		crypto.RandBytes(s.Txn.VotePK[:])
+		crypto.RandBytes(s.Txn.SelectionPK[:])
+		crypto.RandBytes(s.Txn.StateProofPK[:])
+		s.Txn.VoteFirst = 100
+		s.Txn.VoteLast = 200
+		s.Txn.VoteKeyDilution = 10000
+		add("keyreg_online", s)
+		s2 := base(protocol.KeyRegistrationTx)
+		s2.Txn.Nonparticipation = true
+		add("keyreg_nonpart", s2)
+	}
+	// signatures
+	{
+		s := base(protocol.PaymentTx)
+		s.Msig.Version = 1
+		s.Msig.Threshold = 2
+		s.Msig.Subsigs = make([]crypto.MultisigSubsig, 3)
+		for i := range s.Msig.Subsigs {
+			crypto.RandBytes(s.Msig.Subsigs[i].Key[:])
+			if i != 1 {
+				crypto.RandBytes(s.Msig.Subsigs[i].Sig[:])
+			}
+		}
+		add("msig", s)
+	}
+	{
+		s := base(protocol.PaymentTx)
+		s.Lsig.Logic = rb(321)
+		crypto.RandBytes(s.Lsig.Sig[:])
+		s.Lsig.Args = [][]byte{rb(5), rb(0), rb(70)}
+		s.Lsig.Msig.Version = 1
+		s.Lsig.Msig.Threshold = 1
+		s.Lsig.Msig.Subsigs = make([]crypto.MultisigSubsig, 2)
+		s.Lsig.LMsig.Version = 1
+		s.Lsig.LMsig.Threshold = 1
+		s.Lsig.LMsig.Subsigs = make([]crypto.MultisigSubsig, 4)
+		for i := range s.Lsig.Msig.Subsigs {
+			crypto.RandBytes(s.Lsig.Msig.Subsigs[i].Key[:])
+		}
+		for i := range s.Lsig.LMsig.Subsigs {
+			crypto.RandBytes(s.Lsig.LMsig.Subsigs[i].Key[:])
+		}
+		s.Lsig.SKsig = transactions.SaltedKeySig{Scheme: protocol.SigScheme{1, 2}, Salt: 3, PublicKey: rb(1793), Signature: rb(1230)}
+		add("lsig_everything", s)
+	}
+	{
+		s := base(protocol.PaymentTx)
+		s.SKsig = transactions.SaltedKeySig{Scheme: protocol.SigScheme{0, 1}, Salt: 9, PublicKey: rb(1793), Signature: rb(1233)}
+		add("pqsig", s)
+	}
+	// state proof
+	{
+		s := base(protocol.StateProofTx)
+		sp := &s.Txn.StateProof
+		sp.SigCommit = rb(64)
+		sp.SignedWeight = 1 << 33
+		sp.SigProofs.Path = digests(100, 64)
+		sp.SigProofs.HashFactory.HashType = crypto.Sumhash
+		sp.SigProofs.TreeDepth = 7
+		sp.PartProofs.Path = digests(10, 32)
+		sp.PartProofs.HashFactory.HashType = crypto.Sha256
+		sp.PartProofs.TreeDepth = 4
+		sp.MerkleSignatureSaltVersion = 1
+		sp.PositionsToReveal = []uint64{1, 5, 9, 200, 300}
+		sp.Reveals = make(map[uint64]stateproof.Reveal)
+		for pos := range uint64(3) {
+			var reveal stateproof.Reveal
+			reveal.Part.PK.KeyLifetime = 256
+			crypto.RandBytes(reveal.Part.PK.Commitment[:])
+			reveal.Part.Weight = 1000 + pos
+			reveal.SigSlot.L = 77 + pos
+			reveal.SigSlot.Sig = merklesignature.Signature{
+				Signature:             rb(1230 + int(pos)),
+				VectorCommitmentIndex: 5 + pos,
+				Proof: merklearray.SingleLeafProof{Proof: merklearray.Proof{
+					Path:        digests(2+int(pos), 64),
+					HashFactory: crypto.HashFactory{HashType: crypto.Sumhash},
+					TreeDepth:   9,
+				}},
+			}
+			crypto.RandBytes(reveal.SigSlot.Sig.VerifyingKey.PublicKey[:])
+			sp.Reveals[pos*10+1] = reveal
+		}
+		s.Txn.StateProofType = protocol.StateProofBasic
+		s.Txn.Message = stateproofmsg.Message{
+			BlockHeadersCommitment: rb(32),
+			VotersCommitment:       rb(64),
+			LnProvenWeight:         123456,
+			FirstAttestedRound:     256,
+			LastAttestedRound:      511,
+		}
+		add("state_proof", s)
+	}
+	// heartbeat
+	{
+		s := base(protocol.HeartbeatTx)
+		s.Txn.HeartbeatTxnFields = &transactions.HeartbeatTxnFields{
+			HbAddress:     ra(),
+			HbKeyDilution: 10000,
+		}
+		crypto.RandBytes(s.Txn.HbProof.Sig[:])
+		crypto.RandBytes(s.Txn.HbProof.PK[:])
+		crypto.RandBytes(s.Txn.HbProof.PK2[:])
+		crypto.RandBytes(s.Txn.HbProof.PK1Sig[:])
+		crypto.RandBytes(s.Txn.HbProof.PK2Sig[:])
+		crypto.RandBytes(s.Txn.HbSeed[:])
+		crypto.RandBytes(s.Txn.HbVoteID[:])
+		add("heartbeat", s)
+	}
+
+	out, err := os.Create(os.Getenv("TXSIZE_OUT"))
+	require.NoError(t, err)
+	defer out.Close()
+	enc := json.NewEncoder(out)
+	for _, r := range rows {
+		require.NoError(t, enc.Encode(r))
+	}
+}

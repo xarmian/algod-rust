@@ -37,6 +37,7 @@ pub mod pq;
 pub mod raw_text;
 pub(crate) mod rmp_decode;
 mod round;
+pub mod signed_txn_size;
 pub mod serde_bytes_array;
 mod transaction;
 pub mod txtail;
