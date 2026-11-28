@@ -574,6 +574,10 @@ pub enum JsonSimulate {
     Decoded(DecodedMsgpackRequest),
 }
 
+/// Not used by the handler any more (issue #2608: go-codec's own decode, with
+/// per-transaction positions, is the answer; see [`go_json_decode_request`]);
+/// kept for the tests that pin its key tables.
+///
 /// Parse a JSON simulate body written in go's JSON form (issues #1972, #1971):
 /// an unknown key anywhere is reported with go's offset and text, otherwise the
 /// body goes through the same pipeline as a msgpack one.
@@ -622,29 +626,34 @@ pub fn go_json_decode_request(body: &[u8]) -> Result<serde_json::Value, Vec<u8>>
         [b"failed to decode object: ".as_slice(), &e.to_bytes()].concat()
     };
     let mut value = decode_slice(body, &SIMULATE_REQUEST_JSON).map_err(failed)?;
+    let no_values = Vec::new();
     let groups = match value.get("txn-groups") {
-        Some(serde_json::Value::Array(groups)) => groups.clone(),
-        _ => Vec::new(),
+        Some(serde_json::Value::Array(groups)) => groups,
+        _ => &no_values,
     };
     // `simulation.CheckTxnGroupCount`: `MaxTxnGroups` is 1
     if groups.len() != 1 {
         return Err(format!("expected 1 transaction group, got {}", groups.len()).into_bytes());
     }
+    let no_txns = Vec::new();
     let raw_txns = |group: &serde_json::Value| -> Vec<serde_json::Value> {
         match group.get("txns") {
             Some(serde_json::Value::Array(txns)) => txns.clone(),
-            _ => Vec::new(),
+            _ => no_txns.clone(),
         }
     };
-    for group in &groups {
-        let n = raw_txns(group).len();
+    for group in groups {
+        let n = group
+            .get("txns")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
         if n > 16 {
             return Err(format!("transaction group size {n} exceeds limit 16").into_bytes());
         }
     }
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut decoded_groups = Vec::with_capacity(groups.len());
-    for group in &groups {
+    for group in groups {
         let mut txns = Vec::new();
         for raw in raw_txns(group) {
             let bytes = match &raw {
@@ -658,7 +667,8 @@ pub fn go_json_decode_request(body: &[u8]) -> Result<serde_json::Value, Vec<u8>>
         }
         decoded_groups.push(serde_json::json!({ "txns": txns }));
     }
-    value["txn-groups"] = serde_json::Value::Array(decoded_groups);
+    let value_groups = serde_json::Value::Array(decoded_groups);
+    value["txn-groups"] = value_groups;
     Ok(value)
 }
 
