@@ -242,11 +242,19 @@ struct ParkedClaimHook {
 impl IdentityDedupHook for ParkedClaimHook {
     fn claim(&self, conn: &str, _identity: VerifyingKey) -> bool {
         *self.claimed_by.lock().unwrap() = Some(conn.to_string());
-        let (lock, cv) = &self.go;
-        let mut open = lock.lock().unwrap();
-        while !*open {
-            open = cv.wait(open).unwrap();
-        }
+        // `claim` is synchronous and runs on a runtime worker. Parking that
+        // worker outright strands every task in its local queue / LIFO slot
+        // (the other workers do not steal the LIFO slot), and the test then
+        // hangs forever on a task that can never run (#2646: a 1 in ~400 hang
+        // under CPU contention, 1200 s nextest timeout in CI). `block_in_place`
+        // hands the worker's queue to another thread before it blocks.
+        tokio::task::block_in_place(|| {
+            let (lock, cv) = &self.go;
+            let mut open = lock.lock().unwrap();
+            while !*open {
+                open = cv.wait(open).unwrap();
+            }
+        });
         true
     }
     fn release(&self, conn: &str, _identity: &VerifyingKey) {
@@ -269,7 +277,12 @@ impl Drop for OpenOnDrop {
 /// go `TestIdentityTrackerHandlerDepartedPeer`: a verification message handled
 /// after its peer left the registry must not keep the identity, because nothing
 /// would give it back.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+///
+/// One worker thread on purpose (#2646): the parked `claim` must not strand the
+/// runtime. With a plain blocking wait this test hangs on a single worker, and
+/// hung about 1 run in 400 on four under CPU contention.
+/// `ParkedClaimHook` needs the multi-thread flavor (`block_in_place`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn verification_handled_after_the_peer_departed_does_not_keep_the_identity() {
     let hook = Arc::new(ParkedClaimHook {
         claimed_by: Mutex::new(None),
