@@ -571,10 +571,11 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
     fn has_asset_holding(&self, addr: &Address, asset_id: u64) -> bool {
         // An existence probe is a lookup too: go's `OptedIn` / holding checks
         // go through `lookupAssetHolding` and so may note a miss.
-        if self.cross.is_some() {
-            return self.get_asset_holding(addr, asset_id).is_some();
+        let has = self.inner.has_asset_holding(addr, asset_id);
+        if !has && !self.touches.asset_holdings.contains_key(&(*addr, asset_id)) {
+            self.note_miss(addr, asset_id, false);
         }
-        self.inner.has_asset_holding(addr, asset_id)
+        has
     }
 
     fn has_asset_params(&self, asset_id: u64) -> bool {
@@ -587,10 +588,11 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
 
     fn has_app_local_state(&self, addr: &Address, app_id: u64) -> bool {
         // See `has_asset_holding`: `app_opted_in` reaches this.
-        if self.cross.is_some() {
-            return self.get_app_local_state(addr, app_id).is_some();
+        let has = self.inner.has_app_local_state(addr, app_id);
+        if !has && !self.touches.app_local_states.contains_key(&(*addr, app_id)) {
+            self.note_miss(addr, app_id, true);
         }
-        self.inner.has_app_local_state(addr, app_id)
+        has
     }
 
     fn box_len(&self, app_id: u64, key: &[u8]) -> Option<usize> {

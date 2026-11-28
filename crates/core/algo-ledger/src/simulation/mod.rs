@@ -1240,10 +1240,22 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     // go's `BlockEvaluator.transaction` frames a min-balance
                     // failure `transaction <txid>: ` and simulate reports it
                     // as is (`EvalFailureError`).
-                    applied.map_err(|e| {
-                        algo_error::frame_min_balance(e, || {
+                    applied.map_err(|e| match e {
+                        // go's generate-only `noteMiss` failure, framed the
+                        // same way by `BlockEvaluator.transaction`.
+                        AlgoError::Eval { message }
+                            if message.starts_with(crate::apply::CROSS_TYPE_LOOKUP_PREFIX) =>
+                        {
+                            AlgoError::Eval {
+                                message: format!(
+                                    "transaction {}: {message}",
+                                    algo_codec::compute_txn_id(&eval_group[i].txn)
+                                ),
+                            }
+                        }
+                        e => algo_error::frame_min_balance(e, || {
                             algo_codec::compute_txn_id(&eval_group[i].txn).to_string()
-                        })
+                        }),
                     })
                 }
             };
