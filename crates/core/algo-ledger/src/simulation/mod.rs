@@ -68,6 +68,7 @@ use crate::apply::{
 };
 use crate::avm_context::{NamedGroupResources, StoreSigBlockSource, UnnamedCapacityTracker};
 use crate::block_header::next_block_protocol;
+use crate::recording_store::{RecordingStore, ResourceTouches};
 use crate::rewards::{balance_with_rewards, next_rewards_state, RewardsState};
 use crate::store_trait::LedgerStore;
 
@@ -993,6 +994,14 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             &block.block_genesis_id,
             &block.block_genesis_hash,
         );
+        // go `BlockEvaluator.transaction` under `Generate: true` refuses a
+        // transaction that looked up an app id as an asset the account holds
+        // as of the previous block (or the reverse): `roundCowBase.noteMiss`.
+        // The base is the state before the group, so each transaction runs on
+        // a recording store that remembers what the group wrote so far (a key
+        // written earlier is answered by go's cow layers, not by its base).
+        let cross_type_base_counter = self.store.txn_counter();
+        let mut cross_type_touches = ResourceTouches::default();
         let apply_ctx = ApplyContext {
             rewards_level: block.rewards_level,
             fee_sink: block.fee_sink,
@@ -1212,8 +1221,13 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                         txid_cache: &group_txid_cache,
                         created: &group_created,
                     };
-                    apply_transaction_with_budget(
-                        self.store,
+                    let mut watched = RecordingStore::with_cross_type_base(
+                        &mut *self.store,
+                        std::mem::take(&mut cross_type_touches),
+                        cross_type_base_counter,
+                    );
+                    let applied = apply_transaction_with_budget(
+                        &mut watched,
                         &eval_group[i],
                         &apply_ctx,
                         0,
@@ -1221,11 +1235,12 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                         Some(&mut group_box_budget),
                         Some(&gi),
                         Some(&mut tracer),
-                    )
+                    );
+                    cross_type_touches = watched.into_touches();
                     // go's `BlockEvaluator.transaction` frames a min-balance
                     // failure `transaction <txid>: ` and simulate reports it
                     // as is (`EvalFailureError`).
-                    .map_err(|e| {
+                    applied.map_err(|e| {
                         algo_error::frame_min_balance(e, || {
                             algo_codec::compute_txn_id(&eval_group[i].txn).to_string()
                         })

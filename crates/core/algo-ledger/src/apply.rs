@@ -4675,7 +4675,13 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
     let cross_type = store.stop_watching_cross_types();
     let ad = result?;
     match cross_type {
-        Some(message) => Err(AlgoError::Eval { message }),
+        // go frames it like every `transaction()` failure: `transaction <txid>: ...`.
+        Some(message) => Err(AlgoError::Eval {
+            message: format!(
+                "transaction {}: {message}",
+                algo_codec::compute_txn_id(&stx.txn)
+            ),
+        }),
         None => Ok(ad),
     }
 }
