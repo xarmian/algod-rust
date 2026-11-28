@@ -100,6 +100,7 @@ pub use catchpoint_service::{
 };
 
 // Compression
+pub use ws_peer::routing_addr_for_ip;
 pub use compression::{
     decompress_proposal, is_zstd_compressed, zstd_compress, zstd_compress_msg, zstd_decompress,
     CompressionError, MAX_DECOMPRESSED_MESSAGE_SIZE, ZSTD_MAGIC,

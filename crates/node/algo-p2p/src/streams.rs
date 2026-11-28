@@ -216,6 +216,11 @@ pub fn should_initiate_stream(local: &PeerId, remote: &PeerId) -> bool {
 pub struct StreamManager<S> {
     streams: HashMap<PeerId, S>,
     inflight: HashMap<PeerId, u32>,
+    /// The routing address (see `algo_network::routing_addr_for_ip`) of the IP
+    /// each connected peer is connected from, recorded when its connection is
+    /// established (go v5.1.1 `gsPeer.RoutingAddr` asks the service for the
+    /// peer's connections instead).
+    routing: HashMap<PeerId, Vec<u8>>,
 }
 
 impl<S> Default for StreamManager<S> {
@@ -229,7 +234,28 @@ impl<S> StreamManager<S> {
         Self {
             streams: HashMap::new(),
             inflight: HashMap::new(),
+            routing: HashMap::new(),
         }
+    }
+
+    /// Record the routing address of the IP `remote` is connected from.
+    pub fn set_routing_addr(&mut self, remote: PeerId, routing: Vec<u8>) {
+        self.routing.insert(remote, routing);
+    }
+
+    /// Forget `remote`'s routing address (its last connection closed).
+    pub fn clear_routing_addr(&mut self, remote: &PeerId) {
+        self.routing.remove(remote);
+    }
+
+    /// `remote`'s routing address: the IP of its connection, or the bytes of
+    /// the peer ID when it has no connection with an IP address (go
+    /// `gsPeer.RoutingAddr`).
+    pub fn routing_addr(&self, remote: &PeerId) -> Vec<u8> {
+        self.routing
+            .get(remote)
+            .cloned()
+            .unwrap_or_else(|| remote.to_bytes())
     }
 
     /// Record that a stream-open/accept attempt for `remote` has started.

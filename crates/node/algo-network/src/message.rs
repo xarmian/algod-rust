@@ -56,6 +56,11 @@ pub struct IncomingMessage {
     /// Wrapped in `Arc` so it can be shared across handlers and tasks.
     /// `None` when the message was constructed synthetically (e.g. in tests).
     pub peer: Option<Arc<PeerSender>>,
+
+    /// The routing address of the sender when the transport knows it better
+    /// than the `sender` string does (a P2P peer: the IP of its connection,
+    /// go v5.1.1 `gsPeer.RoutingAddr`), `None` to derive it from `sender`.
+    pub sender_routing_addr: Option<Vec<u8>>,
 }
 
 impl PartialEq for IncomingMessage {
@@ -95,7 +100,14 @@ impl IncomingMessage {
             sender,
             received_at,
             peer: None,
+            sender_routing_addr: None,
         }
+    }
+
+    /// Set the sender's routing address (see [`Self::sender_routing_addr`]).
+    pub fn with_routing_addr(mut self, routing: Vec<u8>) -> Self {
+        self.sender_routing_addr = Some(routing);
+        self
     }
 
     /// Create a new `IncomingMessage` with a peer sender reference.
@@ -112,6 +124,7 @@ impl IncomingMessage {
             sender,
             received_at,
             peer: Some(peer),
+            sender_routing_addr: None,
         }
     }
 }

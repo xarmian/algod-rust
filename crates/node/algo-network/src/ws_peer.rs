@@ -1216,6 +1216,7 @@ impl PeerHandle {
                                         sender: read_addr.clone(),
                                         received_at: now_ns,
                                         peer: None,
+                                        sender_routing_addr: None,
                                     };
                                     if incoming_tx.send(incoming).await.is_err() {
                                         break;
@@ -1584,6 +1585,13 @@ impl Drop for PeerHandle {
 /// `wsPeer.ipAddr()`: unwrap a *standard* IPv4-mapped-in-IPv6 address to
 /// plain 4-byte IPv4; otherwise return the address's bytes unchanged (4 for
 /// IPv4, 16 for any other IPv6 form).
+/// The routing address of a connection from `ip`, go v5.1.1 `routingAddr`: the
+/// four bytes of an IPv4 address (also one embedded in IPv6), the top eight
+/// bytes of any other IPv6 address.
+pub fn routing_addr_for_ip(ip: std::net::IpAddr) -> Vec<u8> {
+    truncate_to_routing_addr(&normalize_ip_addr(ip))
+}
+
 fn normalize_ip_addr(ip: std::net::IpAddr) -> Vec<u8> {
     match ip {
         std::net::IpAddr::V4(v4) => v4.octets().to_vec(),

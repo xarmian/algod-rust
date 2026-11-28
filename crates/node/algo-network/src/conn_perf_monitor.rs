@@ -531,6 +531,7 @@ mod tests {
             sender: sender.to_string(),
             received_at,
             peer: None,
+            sender_routing_addr: None,
         }
     }
 
@@ -693,6 +694,7 @@ mod tests {
                 sender: self.sender.clone(),
                 received_at: self.received_at,
                 peer: self.peer.clone(),
+                sender_routing_addr: self.sender_routing_addr.clone(),
             }
         }
     }
