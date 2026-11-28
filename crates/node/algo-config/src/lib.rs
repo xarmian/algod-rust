@@ -4678,27 +4678,39 @@ impl Local {
         let is_ws_or_p2p_listen = self.is_ws_listen_server(net_address)
             || self.is_p2p_listen_server(net_address, p2p_net_address);
 
-        if self.rest_connections_hard_limit <= diff + RESERVED_REST_CONNS {
-            let rest_delta = diff + RESERVED_REST_CONNS - self.rest_connections_hard_limit;
+        // go's uint64 arithmetic wraps; a `required_fds` near `u64::MAX` must not
+        // panic a debug build.
+        let needed = diff.wrapping_add(RESERVED_REST_CONNS);
+        if self.rest_connections_hard_limit <= needed {
+            let rest_delta = needed.wrapping_sub(self.rest_connections_hard_limit);
             self.rest_connections_hard_limit = RESERVED_REST_CONNS;
             let split_ratio: i64 = if is_hybrid { 2 } else { 1 };
 
+            // go v5.1: the limits are compared with the delta as unsigned numbers
+            // (`limit > 0 && uint64(limit) > restDelta`); v5.0 converted the
+            // delta to an int, which wraps negative for a delta above `i64::MAX`.
+            // The subtraction below only runs when the delta is below the limit,
+            // so `int(restDelta)` is exact there.
             if is_ws_or_p2p_listen {
-                if self.incoming_connections_limit > rest_delta as i64 {
+                if self.incoming_connections_limit > 0
+                    && self.incoming_connections_limit as u64 > rest_delta
+                {
                     self.incoming_connections_limit -= rest_delta as i64 / split_ratio;
                 } else {
                     self.incoming_connections_limit = 0;
                 }
             }
             if is_hybrid {
-                if self.p2p_hybrid_incoming_connections_limit > rest_delta as i64 {
+                if self.p2p_hybrid_incoming_connections_limit > 0
+                    && self.p2p_hybrid_incoming_connections_limit as u64 > rest_delta
+                {
                     self.p2p_hybrid_incoming_connections_limit -= rest_delta as i64 / split_ratio;
                 } else {
                     self.p2p_hybrid_incoming_connections_limit = 0;
                 }
             }
         } else {
-            self.rest_connections_hard_limit -= diff;
+            self.rest_connections_hard_limit = self.rest_connections_hard_limit.wrapping_sub(diff);
         }
 
         if self.rest_connections_soft_limit > self.rest_connections_hard_limit {
@@ -6885,6 +6897,48 @@ mod tests {
             cfg.validate_p2p_hybrid_config(Some(":4160"), Some(":4190")),
             Err(P2PHybridConfigError::MissingPublicAddress)
         );
+    }
+
+    /// go v5.1.1's `Local.AdjustConnectionLimits` on the go-generated rows
+    /// (`tools/config-adjust-oracle`, `tests/fixtures/adjust_connection_limits.jsonl`):
+    /// every combination of required/max descriptors (including deltas above
+    /// `i64::MAX`, where v5.0's int conversion wrapped), REST limits, incoming
+    /// limits (negative, huge) and listen modes.
+    #[test]
+    fn adjust_connection_limits_matches_go_on_every_oracle_row() {
+        const ROWS: &str = include_str!("../tests/fixtures/adjust_connection_limits.jsonl");
+        let u = |v: &serde_json::Value, k: &str| v[k].as_u64().unwrap_or_else(|| panic!("{k}: {v}"));
+        let i = |v: &serde_json::Value, k: &str| v[k].as_i64().unwrap_or_else(|| panic!("{k}: {v}"));
+        let mut n = 0;
+        for line in ROWS.lines() {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            let mut cfg = Local::default();
+            cfg.enable_p2p = row["enable_p2p"].as_bool().unwrap();
+            cfg.enable_p2p_hybrid_mode = row["hybrid"].as_bool().unwrap();
+            cfg.rest_connections_soft_limit = u(&row, "soft");
+            cfg.rest_connections_hard_limit = u(&row, "hard");
+            cfg.incoming_connections_limit = i(&row, "incoming");
+            cfg.p2p_hybrid_incoming_connections_limit = i(&row, "p2p_incoming");
+            let net = row["net"].as_str().unwrap();
+            let p2p_net = row["p2p_net"].as_str().unwrap();
+            let updated = cfg.adjust_connection_limits(
+                u(&row, "required"),
+                u(&row, "max"),
+                Some(net),
+                Some(p2p_net),
+            );
+            assert_eq!(updated, row["updated"].as_bool().unwrap(), "{row}");
+            assert_eq!(cfg.rest_connections_soft_limit, u(&row, "soft_out"), "{row}");
+            assert_eq!(cfg.rest_connections_hard_limit, u(&row, "hard_out"), "{row}");
+            assert_eq!(cfg.incoming_connections_limit, i(&row, "incoming_out"), "{row}");
+            assert_eq!(
+                cfg.p2p_hybrid_incoming_connections_limit,
+                i(&row, "p2p_incoming_out"),
+                "{row}"
+            );
+            n += 1;
+        }
+        assert!(n > 3000, "only {n} oracle rows");
     }
 
     // --- AdjustConnectionLimits (issue #949) --------------------------------
