@@ -368,4 +368,26 @@ mod tests {
         );
         assert_eq!(&bytes[b"PQProgram".len() + 32..], &[1, 2, 3]);
     }
+
+    /// go `TestSKsigDelegatedProgramToBeHashed` (`data/transactions/logic/program_test.go`):
+    /// same inputs (`Addr{1,2,3}`, program `{4,5,6}`), the hash id is `"PQProgram"` and is
+    /// neither `protocol.Program` (`"Program"`) nor `protocol.MultisigProgram` (`"MsigProgram"`),
+    /// and the hashed bytes are `Addr || Program`.
+    #[test]
+    fn sksig_delegated_program_to_be_hashed() {
+        let mut a = [0u8; 32];
+        a[..3].copy_from_slice(&[1, 2, 3]);
+        let dp = SKsigDelegatedProgram {
+            addr: Address(a),
+            program: vec![4, 5, 6],
+        };
+        assert_eq!(PQ_DELEGATED_PROGRAM_HASH_PREFIX, b"PQProgram");
+        assert_ne!(PQ_DELEGATED_PROGRAM_HASH_PREFIX, b"Program");
+        assert_ne!(PQ_DELEGATED_PROGRAM_HASH_PREFIX, b"MsigProgram");
+        let mut want = a.to_vec();
+        want.extend_from_slice(&[4, 5, 6]);
+        let signed = dp.to_be_signed();
+        assert_eq!(&signed[..9], b"PQProgram");
+        assert_eq!(&signed[9..], &want[..]);
+    }
 }
