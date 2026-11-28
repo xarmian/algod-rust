@@ -42,7 +42,7 @@ use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use axum::{Json, Router};
+use axum::Router;
 
 use algo_kmd_api_types::common::{
     APIV1ResponseEnvelope, APIV1Wallet, APIV1WalletHandle, MultisigSig as WireMultisigSig,
@@ -201,10 +201,23 @@ fn err_response(status: StatusCode, message: impl Into<String>) -> Response {
         error: true,
         message: message.into(),
     };
-    // Use Json so the response carries `application/json`.  The
-    // body shape matches Go exactly (a bare envelope, no nested
-    // object).
-    (status, Json(body)).into_response()
+    // The body shape matches Go exactly (a bare envelope, no nested
+    // object), written as `protocol.EncodeJSON` writes it.
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/json")],
+        encode_json(&body),
+    )
+        .into_response()
+}
+
+/// go's `protocol.EncodeJSON`, which every kmd response goes through: indented
+/// by two spaces with the keys of every object sorted (go-codec `Canonical`).
+/// `serde_json`'s `Value` keeps its objects in key order (the workspace does not
+/// enable `preserve_order`), so a round trip through it sorts them.
+pub(crate) fn encode_json<T: serde::Serialize>(body: &T) -> String {
+    let value = serde_json::to_value(body).expect("response always serializes");
+    serde_json::to_string_pretty(&value).expect("a JSON value always prints")
 }
 
 /// Decode an incoming JSON body, returning Go's `errCouldNotDecode`
@@ -345,11 +358,10 @@ where
 }
 
 fn ok_json<T: serde::Serialize>(body: T) -> Response {
-    let json = serde_json::to_vec(&body).expect("response always serializes");
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
-        json,
+        encode_json(&body),
     )
         .into_response()
 }
