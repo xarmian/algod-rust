@@ -344,6 +344,9 @@ pub fn falcon512_sign(privkey: &[u8], data: &[u8]) -> Result<Vec<u8>, FalconErro
     Ok(sig)
 }
 
+/// The f5 twin of `check_sig`: go's `Falcon512Signature` wrappers reject `len < 2`
+/// themselves (`errInvalidNumberOfSignature`), and cfalcon's compressed maximum
+/// bounds the rest.
 fn check_sig512(sig: &[u8]) -> Result<(), FalconError> {
     if sig.len() < 2 || sig.len() > FALCON_DET512_SIG_COMPRESSED_MAXSIZE {
         return Err(FalconError::InvalidSignatureSize(sig.len()));
@@ -899,7 +902,9 @@ mod tests {
         assert_eq!(falcon512_verify_code(&pk, &sig, msg).unwrap(), 0);
         assert_ne!(falcon512_verify_code(&pk, &sig, b"other").unwrap(), 0);
 
-        // go's `HashRep(TestingHashable{data})` is `hashID || data`.
+        // Rust has no `Hashable` wrapper at this layer (f5 verifies raw
+        // to-be-signed bytes, as `verify_falcon512` does); go's
+        // `HashRep(TestingHashable{data})` is `hashID || data`, built here by hand.
         let hash_rep = [b"TestingHashable".as_slice(), msg.as_slice()].concat();
         let sig = falcon512_sign(&sk, &hash_rep).unwrap();
         assert_eq!(falcon512_verify_code(&pk, &sig, &hash_rep).unwrap(), 0);
@@ -943,14 +948,21 @@ mod tests {
         let mut sig = falcon512_sign(&sk, b"salt version").unwrap();
         let version = falcon512_salt_version(&sig).unwrap();
         assert_eq!(version, 0, "`Det512CurrentSaltVersion`");
+        // The salt version is byte 1 of the unsalted wire format
+        // (`[0xB9, version, ...]`).
         sig[1] = sig[1].wrapping_add(1);
-        assert_ne!(falcon512_salt_version(&sig).unwrap(), version);
+        assert_eq!(
+            falcon512_salt_version(&sig).unwrap(),
+            version.wrapping_add(1)
+        );
     }
 
-    /// `TestVerificationBytes`, f5: go's `Falcon512Verifier` is a msgpack
-    /// wrapper whose fixed-length representation is the raw public key;
-    /// algod-rust verifies f5 from the raw key bytes (there is no wrapper
-    /// type), so the key `falcon512_keygen` returns is that representation.
+    /// `TestVerificationBytes`, f5 (size pin only): go's `Falcon512Verifier`
+    /// is a msgpack wrapper whose fixed-length representation is the raw
+    /// public key; algod-rust verifies f5 from the raw key bytes (there is no
+    /// wrapper type), so the key `falcon512_keygen` returns is that
+    /// representation. That it equals go's `signer.PublicKey` byte for byte is
+    /// proven by `falcon512_matches_go_on_every_vector` (`tests/falcon512_vectors.rs`).
     #[test]
     fn falcon512_verifier_representation_is_the_raw_public_key() {
         let (pk, _) = falcon512_keygen(&[1u8; FALCON_SEED_SIZE]).unwrap();
