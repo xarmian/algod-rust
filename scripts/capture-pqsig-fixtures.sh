@@ -71,7 +71,7 @@ mkdir -p "$FIX_DIR"
 MNEMONIC="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon invest"
 
 # 1. Deterministic PQ (Falcon-1024) key from the well-known test mnemonic.
-"$ALGOKEY" pq import -m "$MNEMONIC" -k "$TMP/pqkey" >"$TMP/pq_import.stdout"
+"$ALGOKEY" salted import -S falcon-1024 -m "$MNEMONIC" -k "$TMP/pqkey" >"$TMP/pq_import.stdout"
 
 # 2. An *unsigned* SignedTxn (a plain "pay" transaction) to hand to
 # `algokey pq sign`. There's no `algokey`/`goal` one-liner to emit a raw
@@ -142,14 +142,14 @@ GOEOF
 rm -rf "$HARNESS_DIR"
 
 # 3. Sign the txn -> SignedTxn.PQsig (+ AuthAddr, since Sender != PQ addr).
-"$ALGOKEY" pq sign -k "$TMP/pqkey" -t "$TMP/unsigned_txn.msgp" -o "$TMP/signed_txn_pqsig.msgp"
+"$ALGOKEY" salted sign -k "$TMP/pqkey" -t "$TMP/unsigned_txn.msgp" -o "$TMP/signed_txn_pqsig.msgp"
 
 # 4. Sign a program -> LogicSig.PQsig. Bytes are a trivial "int 1"
 # compiled program (version byte 0x06 + pushint opcode 0x81 + value 0x01);
 # not valid printable-ASCII TEAL *source*, so `algokey` treats it as
 # compiled bytecode as required.
 printf '\x06\x81\x01' >"$TMP/program.bin"
-"$ALGOKEY" pq sign-program -k "$TMP/pqkey" -p "$TMP/program.bin" -o "$TMP/logicsig_pqsig.msgp"
+"$ALGOKEY" salted sign-program -k "$TMP/pqkey" -p "$TMP/program.bin" -o "$TMP/logicsig_pqsig.msgp"
 
 # 5. Hex-encode into the committed fixture files.
 xxd -p "$TMP/signed_txn_pqsig.msgp" | tr -d '\n' >"$FIX_DIR/signed_txn_with_pqsig.canonical.hex"

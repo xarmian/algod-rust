@@ -48,11 +48,11 @@ fn help(args: &[&str]) -> String {
 #[test]
 fn root_help_lists_all_seven_top_level_commands() {
     // Top-level subcommand order matches main.go:45-52 — generate, import,
-    // export, sign, multisig, part, pq. `keyreg` is intentionally nested
+    // export, sign, multisig, part, salted. `keyreg` is intentionally nested
     // under `part` to mirror Go (`part.go:185`).
     let h = help(&[]);
     for cmd in [
-        "generate", "import", "export", "sign", "multisig", "part", "pq",
+        "generate", "import", "export", "sign", "multisig", "part", "salted",
     ] {
         assert!(h.contains(cmd), "root --help missing `{cmd}`:\n{h}");
     }
@@ -180,14 +180,20 @@ fn part_keyreg_help_has_required_flags() {
     }
 }
 
-/// Mirrors Go's `pqCmd.Run` (pq.go:88-90): invoking `pq` with no
-/// subcommand falls back to printing the help text and exits 0.
+/// Mirrors Go's `saltedCmd.Run` (salted.go): invoking `salted` (or its `pq`
+/// alias) with no subcommand falls back to printing the help text and exits 0.
 #[test]
-fn pq_with_no_subcommand_prints_help_and_exits_zero() {
-    let out = algokey().arg("pq").output().expect("run algokey-rust");
+fn salted_with_no_subcommand_prints_help_and_exits_zero() {
+    for group in ["salted", "pq"] {
+        salted_group_prints_help(group);
+    }
+}
+
+fn salted_group_prints_help(group: &str) {
+    let out = algokey().arg(group).output().expect("run algokey-rust");
     assert!(
         out.status.success(),
-        "expected `pq` (no subcommand) to succeed; got {:?}, stderr={}",
+        "expected `{group}` (no subcommand) to succeed; got {:?}, stderr={}",
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
@@ -202,14 +208,14 @@ fn pq_with_no_subcommand_prints_help_and_exits_zero() {
     ] {
         assert!(
             stdout.contains(sub),
-            "`pq` help should list subcommand `{sub}`:\n{stdout}"
+            "`{group}` help should list subcommand `{sub}`:\n{stdout}"
         );
     }
 }
 
 #[test]
-fn pq_help_has_all_subcommands() {
-    let h = help(&["pq"]);
+fn salted_help_has_all_subcommands() {
+    let h = help(&["salted"]);
     for sub in [
         "generate",
         "info",
@@ -218,34 +224,34 @@ fn pq_help_has_all_subcommands() {
         "sign-program",
         "check-address",
     ] {
-        assert!(h.contains(sub), "pq missing subcommand `{sub}`:\n{h}");
+        assert!(h.contains(sub), "salted missing subcommand `{sub}`:\n{h}");
     }
 }
 
 #[test]
-fn pq_generate_help_has_scheme_and_keyfile() {
-    let h = help(&["pq", "generate"]);
+fn salted_generate_help_has_scheme_and_keyfile() {
+    let h = help(&["salted", "generate"]);
     assert!(h.contains("-S, --scheme"), "missing -S, --scheme:\n{h}");
     assert!(h.contains("-k, --keyfile"), "missing -k, --keyfile:\n{h}");
 }
 
 #[test]
-fn pq_info_help_has_keyfile() {
-    let h = help(&["pq", "info"]);
+fn salted_info_help_has_keyfile() {
+    let h = help(&["salted", "info"]);
     assert!(h.contains("-k, --keyfile"), "missing -k, --keyfile:\n{h}");
 }
 
 #[test]
-fn pq_import_help_has_mnemonic_scheme_and_keyfile() {
-    let h = help(&["pq", "import"]);
+fn salted_import_help_has_mnemonic_scheme_and_keyfile() {
+    let h = help(&["salted", "import"]);
     assert!(h.contains("-m, --mnemonic"), "missing -m, --mnemonic:\n{h}");
     assert!(h.contains("-S, --scheme"), "missing -S, --scheme:\n{h}");
     assert!(h.contains("-k, --keyfile"), "missing -k, --keyfile:\n{h}");
 }
 
 #[test]
-fn pq_sign_help_has_all_flags() {
-    let h = help(&["pq", "sign"]);
+fn salted_sign_help_has_all_flags() {
+    let h = help(&["salted", "sign"]);
     for flag in [
         "-k, --keyfile",
         "-m, --mnemonic",
@@ -254,13 +260,13 @@ fn pq_sign_help_has_all_flags() {
         "-o, --outfile",
         "--overwrite",
     ] {
-        assert!(h.contains(flag), "pq sign missing `{flag}`:\n{h}");
+        assert!(h.contains(flag), "salted sign missing `{flag}`:\n{h}");
     }
 }
 
 #[test]
-fn pq_sign_program_help_has_all_flags() {
-    let h = help(&["pq", "sign-program"]);
+fn salted_sign_program_help_has_all_flags() {
+    let h = help(&["salted", "sign-program"]);
     for flag in [
         "-k, --keyfile",
         "-m, --mnemonic",
@@ -268,13 +274,13 @@ fn pq_sign_program_help_has_all_flags() {
         "-p, --program",
         "-o, --outfile",
     ] {
-        assert!(h.contains(flag), "pq sign-program missing `{flag}`:\n{h}");
+        assert!(h.contains(flag), "salted sign-program missing `{flag}`:\n{h}");
     }
 }
 
 #[test]
-fn pq_check_address_help_runs() {
-    let h = help(&["pq", "check-address"]);
+fn salted_check_address_help_runs() {
+    let h = help(&["salted", "check-address"]);
     assert!(h.contains("ADDRESS") || h.contains("address"), "{h}");
 }
 
@@ -294,12 +300,12 @@ fn required_flags_are_enforced() {
         &["part", "reparent"],                    // missing --keyfile/--parent
         &["part", "keyreg"],                      // missing --firstvalid AND --network
         &["part", "keyreg", "--firstvalid", "1"], // missing --network (mirrors Go's MarkFlagRequired)
-        &["pq", "generate"],                      // missing --keyfile
-        &["pq", "info"],                          // missing --keyfile
-        &["pq", "import"],                        // missing --mnemonic/--keyfile
-        &["pq", "sign"],                          // missing --txfile/--outfile
-        &["pq", "sign-program"],                  // missing --program/--outfile
-        &["pq", "check-address"],                 // missing positional ADDRESS
+        &["salted", "generate"],                  // missing --scheme/--keyfile
+        &["salted", "info"],                          // missing --keyfile
+        &["salted", "import"],                        // missing --mnemonic/--keyfile
+        &["salted", "sign"],                          // missing --txfile/--outfile
+        &["salted", "sign-program"],                  // missing --program/--outfile
+        &["salted", "check-address"],                 // missing positional ADDRESS
     ];
     for argv in cases {
         let out = algokey().args(*argv).output().expect("run algokey-rust");

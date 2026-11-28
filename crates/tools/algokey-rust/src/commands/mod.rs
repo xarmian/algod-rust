@@ -27,5 +27,5 @@ pub mod import;
 pub mod keyreg;
 pub mod multisig;
 pub mod part;
-pub mod pq;
+pub mod salted;
 pub mod sign;

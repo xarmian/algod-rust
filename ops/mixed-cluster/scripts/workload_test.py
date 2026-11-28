@@ -63,10 +63,10 @@ class FakeEnv:
         for f in self.fail:
             if f in cmd:
                 return 1, "goal: boom ({})".format(f)
-        if "algokey pq generate" in cmd:
+        if "algokey salted generate" in cmd:
             self.pq_keys += 1
-            return 0, ("PQ private key mnemonic: a b c\nPQ scheme: falcon-1024\nPQ public key: AAAA\n"
-                       "PQ address salt: 0\nPQ address: {}\n").format("P" + "A" * 56 + "ABCDEFGHIJ"[self.pq_keys])
+            return 0, ("Private key mnemonic: a b c\nScheme: falcon-1024\nPublic key: AAAA\n"
+                       "Address salt: 0\nAddress: {}\n").format("P" + "A" * 56 + "ABCDEFGHIJ"[self.pq_keys])
         t = self._next_tx()
         if "rawsend" in cmd:
             self.round += 1
@@ -371,7 +371,7 @@ class PqScenarioTest(unittest.TestCase):
         return [r for r in records(out) if r["kind"] == "workload_step"]
 
     def test_pq_addr_regex_reads_algokey_output(self):
-        m = wl.PQ_ADDR_RE.search("PQ address salt: 0\nPQ address: " + ADDR + "\n")
+        m = wl.PQ_ADDR_RE.search("Address salt: 0\nAddress: " + ADDR + "\n")
         self.assertEqual(m.group(1), ADDR)
 
     def test_pq_is_in_the_standard_mix(self):
@@ -400,14 +400,14 @@ class PqScenarioTest(unittest.TestCase):
         w, out = self.run_pq(env)
         w.sc_pq()
         cmds = env.cmds
-        gen = [i for i, c in enumerate(cmds) if "algokey pq generate" in c]
+        gen = [i for i, c in enumerate(cmds) if "algokey salted generate" in c]
         self.assertEqual(len(gen), 1)
         pq_addr = "P" + "A" * 56 + "B"
         fund = [i for i, c in enumerate(cmds) if "clerk send" in c and "-t " + pq_addr in c]
         self.assertTrue(fund, cmds)
         self.assertGreater(fund[0], gen[0])
         builds = [i for i, c in enumerate(cmds) if "clerk send -f " + pq_addr in c and " -o " in c]
-        signs = [i for i, c in enumerate(cmds) if "algokey pq sign" in c]
+        signs = [i for i, c in enumerate(cmds) if "algokey salted sign" in c]
         self.assertEqual(len(builds), 2)
         self.assertEqual(len(signs), 2)
         self.assertGreater(builds[0], fund[0])
@@ -442,7 +442,7 @@ class PqScenarioTest(unittest.TestCase):
         w, out = self.run_pq(env)
         w.sc_pq()
         w.sc_pq()
-        self.assertEqual(sum("algokey pq generate" in c for c in env.cmds), 1)
+        self.assertEqual(sum("algokey salted generate" in c for c in env.cmds), 1)
         self.assertEqual(len(env.posts), 4)
         pq_addr = "P" + "A" * 56 + "B"
         funding = [c for c in env.cmds if "clerk send" in c and "-t " + pq_addr in c]
@@ -515,14 +515,14 @@ class PqScenarioTest(unittest.TestCase):
         self.assertTrue(all("--fee 20000" in c for c in builds), builds)
 
     def test_key_generation_failure_aborts_before_anything_is_submitted(self):
-        env = FakeEnv(fail=("pq generate",), post_status=dict(ACCEPT))
+        env = FakeEnv(fail=("salted generate",), post_status=dict(ACCEPT))
         w, out = self.run_pq(env)
         with self.assertRaises(wl.ScenarioAbort):
             w.sc_pq()
         self.assertEqual(env.posts, [])
 
     def test_signing_failure_aborts_without_submitting(self):
-        env = FakeEnv(fail=("pq sign",), post_status=dict(ACCEPT))
+        env = FakeEnv(fail=("salted sign",), post_status=dict(ACCEPT))
         w, out = self.run_pq(env)
         with self.assertRaises(wl.ScenarioAbort):
             w.sc_pq()

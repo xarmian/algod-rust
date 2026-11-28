@@ -34,7 +34,7 @@ use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser};
 
-use crate::cli::{Cli, Command, MultisigSub, PartSub, PqSub};
+use crate::cli::{Cli, Command, MultisigSub, PartSub, SaltedSub};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -73,24 +73,24 @@ fn main() -> ExitCode {
             Some(PartSub::Generate(args)) => commands::part::generate::run(args),
             Some(PartSub::Reparent(args)) => commands::part::reparent::run(args),
         },
-        Command::Pq(p) => match p.command {
-            // Go's `pqCmd.Run` (pq.go:88-90) prints help when `pq` is
-            // invoked with no subcommand. Mirror that exactly.
+        Command::Salted(p) => match p.command {
+            // Go's `saltedCmd.Run` prints help when `salted` is invoked
+            // with no subcommand. Mirror that exactly.
             None => {
                 let mut root = Cli::command();
-                let pq = root
-                    .find_subcommand_mut("pq")
-                    .expect("`pq` is a registered subcommand");
-                let _ = pq.print_help();
+                let salted = root
+                    .find_subcommand_mut("salted")
+                    .expect("`salted` is a registered subcommand");
+                let _ = salted.print_help();
                 println!();
                 ExitCode::SUCCESS
             }
-            Some(PqSub::Generate(args)) => commands::pq::generate::run(args),
-            Some(PqSub::Info(args)) => commands::pq::info::run(args),
-            Some(PqSub::Import(args)) => commands::pq::import::run(args),
-            Some(PqSub::Sign(args)) => commands::pq::sign::run(args),
-            Some(PqSub::SignProgram(args)) => commands::pq::sign_program::run(args),
-            Some(PqSub::CheckAddress(args)) => commands::pq::check_address::run(args),
+            Some(SaltedSub::Generate(args)) => commands::salted::generate::run(args),
+            Some(SaltedSub::Info(args)) => commands::salted::info::run(args),
+            Some(SaltedSub::Import(args)) => commands::salted::import::run(args),
+            Some(SaltedSub::Sign(args)) => commands::salted::sign::run(args),
+            Some(SaltedSub::SignProgram(args)) => commands::salted::sign_program::run(args),
+            Some(SaltedSub::CheckAddress(args)) => commands::salted::check_address::run(args),
         },
     }
 }

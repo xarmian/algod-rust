@@ -25,9 +25,9 @@
 //! `algokey pq`. Falcon-1024 det1024 signing is deterministic, so
 //!
 //! * the same 24-word mnemonic must give the byte-identical address, salt,
-//!   public key and private key (`algokey pq import`), and
+//!   public key and private key (`algokey salted import`), and
 //! * signing the same transaction must give the byte-identical signed
-//!   transaction (`algokey pq sign`), whose signature must verify.
+//!   transaction (`algokey salted sign`), whose signature must verify.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -38,7 +38,7 @@ use serde::Deserialize;
 
 const ALGOKEY: &str = env!("CARGO_BIN_EXE_algokey-rust");
 
-/// The mnemonic `algokey pq generate` printed for the key that signed
+/// The mnemonic `algokey salted generate` printed for the key that signed
 /// `algokey-pq-signed-*.stxn` (golden values from the SDK's PQSignatureTests.cs,
 /// with the public key and canonical-salt-0 address algokey printed).
 const GOLDEN_MNEMONIC: &str = "office route parade much super sphere wheel morning spawn true wire already siren unveil planet damage basket depend undo deer acquire popular what about clay";
@@ -77,7 +77,7 @@ fn accounts() -> Vec<Account> {
     serde_json::from_str(&text).expect("accounts json")
 }
 
-/// The on-disk key file `algokey pq import` writes (go's `pqSigningMaterial`).
+/// The on-disk key file `algokey salted import` writes (go's `saltedSigningMaterial`).
 #[derive(Deserialize)]
 struct KeyFile {
     #[serde(rename = "private-key", with = "serde_bytes")]
@@ -94,13 +94,13 @@ struct KeyFilePublic {
     scheme: Vec<u8>,
 }
 
-/// Runs `algokey pq import` for `mnemonic`; returns the written key file and
-/// the printed `PQ address:` line.
+/// Runs `algokey salted import` for `mnemonic`; returns the written key file and
+/// the printed `Address:` line.
 fn import(dir: &Path, backend: &str, mnemonic: &str) -> (KeyFile, String) {
     let keyfile = dir.join("key");
     let _ = std::fs::remove_file(&keyfile);
     let out = Command::new(ALGOKEY)
-        .args(["--falcon-backend", backend, "pq", "import", "-m", mnemonic, "-k"])
+        .args(["--falcon-backend", backend, "salted", "import", "-S", "falcon-1024", "-m", mnemonic, "-k"])
         .arg(&keyfile)
         .output()
         .expect("run algokey-rust");
@@ -108,8 +108,8 @@ fn import(dir: &Path, backend: &str, mnemonic: &str) -> (KeyFile, String) {
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let address = stdout
         .lines()
-        .find_map(|l| l.strip_prefix("PQ address: "))
-        .unwrap_or_else(|| panic!("no 'PQ address:' line in: {stdout}"))
+        .find_map(|l| l.strip_prefix("Address: "))
+        .unwrap_or_else(|| panic!("no 'Address:' line in: {stdout}"))
         .trim()
         .to_string();
     let bytes = std::fs::read(&keyfile).expect("key file");
@@ -206,7 +206,7 @@ fn sign_and_compare(n: usize) {
 }
 
 fn sign_with(backend: &str, n: usize, unsigned: &[u8], txfile: &Path, outfile: &Path, expected: &[u8]) {
-    // `algokey pq sign` reads a SignedTransaction file that holds only `txn`
+    // `algokey salted sign` reads a SignedTransaction file that holds only `txn`
     // (what `goal clerk send --outfile` writes unsigned)
     let mut envelope = Vec::new();
     rmp::encode::write_map_len(&mut envelope, 1).unwrap();
@@ -215,7 +215,7 @@ fn sign_with(backend: &str, n: usize, unsigned: &[u8], txfile: &Path, outfile: &
     std::fs::write(txfile, &envelope).unwrap();
     let _ = std::fs::remove_file(outfile);
     let out = Command::new(ALGOKEY)
-        .args(["--falcon-backend", backend, "pq", "sign", "-m", GOLDEN_MNEMONIC, "-t"])
+        .args(["--falcon-backend", backend, "salted", "sign", "-m", GOLDEN_MNEMONIC, "-S", "falcon-1024", "-t"])
         .arg(txfile)
         .arg("-o")
         .arg(outfile)
