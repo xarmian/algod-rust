@@ -227,17 +227,17 @@ mod tests {
         assert_ne!(addr1.0, [0u8; 32]);
     }
 
-    /// Port of go-algorand's `TestHeartbeatAcceptingSenderIsPQCompliant`
+    /// Port of go-algorand's `TestHeartbeatAcceptingSenderIsOffEd25519Curve`
     /// (`heartbeat/service_test.go`): the accepting LogicSig's contract
     /// account address must not decompress to a valid Edwards25519 point,
-    /// so it can never coincide with a real (or PQ) spending key -- this is
+    /// so it can never coincide with a real Ed25519 spending key -- this is
     /// the whole reason the program ends in an unreachable `intcblock 2`
     /// (see `ACCEPTING_TEAL_SOURCE`'s doc comment).
     #[test]
-    fn accepting_sender_is_pq_compliant() {
+    fn accepting_sender_is_off_ed25519_curve() {
         assert!(
             accepting_sender().is_off_ed25519_curve(),
-            "heartbeat accepting LogicSig sender must be PQ compliant"
+            "heartbeat accepting LogicSig sender must be off the Ed25519 curve"
         );
     }
 
