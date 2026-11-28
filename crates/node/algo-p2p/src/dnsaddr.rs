@@ -94,14 +94,26 @@ pub trait DnsaddrResolver: Send + Sync {
 /// `algo-network`'s [`HickorySrvResolver`](https://docs.rs/algo-network)
 /// (mirroring go's `MultiaddrDNSResolveController`).
 pub struct HickoryDnsaddrResolver {
-    fallback_dns: Option<String>,
+    system: HickoryStage,
+    /// Only with a configured fallback address (go: `fallbackDNSResolverAddress != ""`).
+    fallback: Option<HickoryStage>,
+    default: HickoryStage,
 }
 
 impl HickoryDnsaddrResolver {
     /// Create a new resolver. `fallback_dns` is an optional IP address used
     /// as a fallback when the system resolver fails.
     pub fn new(fallback_dns: Option<String>) -> Self {
-        Self { fallback_dns }
+        Self {
+            system: HickoryStage::new(|| Self::system_resolver().map_err(|e| e.to_string())),
+            fallback: fallback_dns.map(|addr| {
+                HickoryStage::new(move || {
+                    Self::fallback_resolver(&addr)
+                        .ok_or_else(|| "fallback address could not be parsed".to_string())
+                })
+            }),
+            default: HickoryStage::new(|| Ok(Self::default_resolver())),
+        }
     }
 
     fn build_resolver(config: ResolverConfig) -> TokioResolver {
@@ -164,6 +176,76 @@ impl HickoryDnsaddrResolver {
     }
 }
 
+/// One resolver of the chain: a TXT lookup that either answers or fails with a
+/// message. go's `MultiaddrDNSResolveController` hands out one resolver per
+/// stage (`Resolver` / `NextResolver`).
+pub(crate) trait TxtStage: Send + Sync {
+    fn lookup<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + 'a>>;
+}
+
+/// Try each stage once, in order of preference, starting with the first one:
+/// go v5.1.1 `MultiaddrDNSResolveController` starts a new pass through its
+/// resolvers for every lookup (`Resolver()` resets the position), so a resolver
+/// that failed in an earlier lookup is tried again. Returns the first answer, or
+/// every stage's error in order.
+pub(crate) async fn lookup_txt_chain(
+    name: &str,
+    stages: &[&dyn TxtStage],
+) -> Result<Vec<String>, Vec<String>> {
+    let mut errors = Vec::with_capacity(stages.len());
+    for stage in stages {
+        match stage.lookup(name).await {
+            Ok(values) => return Ok(values),
+            Err(e) => errors.push(e),
+        }
+    }
+    Err(errors)
+}
+
+/// A hickory resolver that is built on first use and then kept, so its cache
+/// (including the DNSSEC trust chain) survives across lookups, as go v5.1.1's
+/// controller keeps the resolvers it has created.
+struct HickoryStage {
+    build: Box<dyn Fn() -> Result<TokioResolver, String> + Send + Sync>,
+    resolver: std::sync::Mutex<Option<std::sync::Arc<TokioResolver>>>,
+}
+
+impl HickoryStage {
+    fn new(build: impl Fn() -> Result<TokioResolver, String> + Send + Sync + 'static) -> Self {
+        Self {
+            build: Box::new(build),
+            resolver: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn get(&self) -> Result<std::sync::Arc<TokioResolver>, String> {
+        let mut guard = self.resolver.lock().expect("resolver mutex poisoned");
+        if let Some(r) = guard.as_ref() {
+            return Ok(std::sync::Arc::clone(r));
+        }
+        let r = std::sync::Arc::new((self.build)()?);
+        *guard = Some(std::sync::Arc::clone(&r));
+        Ok(r)
+    }
+}
+
+impl TxtStage for HickoryStage {
+    fn lookup<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let resolver = self.get()?;
+            HickoryDnsaddrResolver::do_lookup(&resolver, name)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+}
+
 impl DnsaddrResolver for HickoryDnsaddrResolver {
     fn resolve_txt(
         &self,
@@ -172,40 +254,33 @@ impl DnsaddrResolver for HickoryDnsaddrResolver {
         let domain = domain.to_string();
         Box::pin(async move {
             let name = format!("_dnsaddr.{domain}");
-
-            let sys_err = match Self::system_resolver() {
-                Ok(resolver) => match Self::do_lookup(&resolver, &name).await {
-                    Ok(values) => return Ok(values),
-                    Err(e) => e.to_string(),
-                },
-                Err(e) => e.to_string(),
-            };
-
-            let fb_err = if let Some(ref fallback_addr) = self.fallback_dns {
-                match Self::fallback_resolver(fallback_addr) {
-                    Some(resolver) => match Self::do_lookup(&resolver, &name).await {
-                        Ok(values) => return Ok(values),
-                        Err(e) => e.to_string(),
-                    },
-                    None => "fallback address could not be parsed".to_string(),
-                }
-            } else {
-                "not configured".to_string()
-            };
-
-            match Self::do_lookup(&Self::default_resolver(), &name).await {
+            let mut stages: Vec<&dyn TxtStage> = vec![&self.system];
+            if let Some(fallback) = &self.fallback {
+                stages.push(fallback);
+            }
+            stages.push(&self.default);
+            match lookup_txt_chain(&name, &stages).await {
                 Ok(values) => Ok(values),
-                Err(e) => {
-                    let default_err = e.to_string();
+                Err(errors) => {
+                    let system = errors.first().cloned().unwrap_or_default();
+                    let default = errors.last().cloned().unwrap_or_default();
+                    let fallback = if self.fallback.is_some() {
+                        errors.get(1).cloned().unwrap_or_default()
+                    } else {
+                        "not configured".to_string()
+                    };
                     warn!(
                         domain,
-                        sys_err, fb_err, default_err, "dnsaddr TXT lookup failed"
+                        sys_err = system,
+                        fb_err = fallback,
+                        default_err = default,
+                        "dnsaddr TXT lookup failed"
                     );
                     Err(DnsaddrError::AllResolversFailed {
                         domain,
-                        system: sys_err,
-                        fallback: fb_err,
-                        default: default_err,
+                        system,
+                        fallback,
+                        default,
                     }
                     .to_string())
                 }
@@ -434,5 +509,120 @@ mod tests {
 
         let resolved = resolve_multiaddrs("example.algorand.network", &resolver).await;
         assert!(resolved.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // go v5.1.1 `network/p2p/dnsaddr/resolveController_test.go`:
+    // `TestControllerRecoversAfterOutage`, `TestControllerTriesEachResolverPerLookup`,
+    // `TestControllerBackupAfterPrimaryFailure`.
+    // -------------------------------------------------------------------
+
+    const TEST_DNSADDR: &str =
+        "dnsaddr=/ip4/1.2.3.4/tcp/4190/p2p/12D3KooWSH9L2dT6GYUg2HKXDzNiY3tjH75ibU4yJsWVWGaQRZ2x";
+
+    /// go's `fakeDNS`: answers dnsaddr TXT lookups and counts them; fails while
+    /// `down` is set and always for names starting with `_dnsaddr.down.`.
+    #[derive(Default)]
+    struct FakeStage {
+        down: std::sync::atomic::AtomicBool,
+        lookups: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeStage {
+        fn set_down(&self, down: bool) {
+            self.down.store(down, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn lookups(&self) -> usize {
+            self.lookups.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl TxtStage for FakeStage {
+        fn lookup<'a>(
+            &'a self,
+            name: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.lookups
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.down.load(std::sync::atomic::Ordering::SeqCst)
+                    || name.starts_with("_dnsaddr.down.")
+                {
+                    return Err("i/o timeout".to_string());
+                }
+                Ok(vec![TEST_DNSADDR.to_string()])
+            })
+        }
+    }
+
+    async fn chain(stages: &[&FakeStage], domain: &str) -> Result<Vec<String>, Vec<String>> {
+        let stages: Vec<&dyn TxtStage> = stages.iter().map(|s| *s as &dyn TxtStage).collect();
+        lookup_txt_chain(&format!("_dnsaddr.{domain}"), &stages).await
+    }
+
+    /// A lookup after an outage tries the resolvers again instead of failing
+    /// because the outage used them all up, and every lookup starts with the
+    /// preferred resolver (`TestControllerRecoversAfterOutage` /
+    /// `TestControllerTriesEachResolverPerLookup`).
+    #[tokio::test]
+    async fn every_lookup_starts_a_new_pass_through_the_resolvers() {
+        let (a, b) = (FakeStage::default(), FakeStage::default());
+        assert!(chain(&[&a, &b], "example.com").await.is_ok());
+        assert_eq!((a.lookups(), b.lookups()), (1, 0));
+
+        a.set_down(true);
+        b.set_down(true);
+        let err = chain(&[&a, &b], "example.com").await.unwrap_err();
+        assert_eq!(err, vec!["i/o timeout".to_string(); 2]);
+        assert_eq!((a.lookups(), b.lookups()), (2, 1));
+
+        // the outage is over for b only: a is tried first and fails, b answers
+        a.set_down(true);
+        b.set_down(false);
+        assert!(chain(&[&a, &b], "example.com").await.is_ok());
+        assert_eq!((a.lookups(), b.lookups()), (3, 2));
+
+        // both recovered: the next lookup starts again with a
+        a.set_down(false);
+        assert!(chain(&[&a, &b], "example.com").await.is_ok());
+        assert_eq!((a.lookups(), b.lookups()), (4, 2));
+    }
+
+    /// A failed lookup of the primary bootstrap domain does not prevent the
+    /// lookup of the backup domain on the same resolver
+    /// (`TestControllerBackupAfterPrimaryFailure`).
+    #[tokio::test]
+    async fn backup_domain_is_resolved_after_the_primary_failed() {
+        let dns = FakeStage::default();
+        assert!(chain(&[&dns, &dns], "down.example.com").await.is_err());
+        let txts = chain(&[&dns, &dns], "example.com").await.unwrap();
+        assert_eq!(txts.len(), 1);
+    }
+
+    /// go: "each resolver is created on first use and then reused" (a DNSSEC
+    /// resolver keeps its trust chain cache across lookups).
+    #[test]
+    fn resolvers_are_created_on_first_use_and_then_reused() {
+        let created = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&created);
+        let stage = HickoryStage::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(HickoryDnsaddrResolver::default_resolver())
+        });
+        assert_eq!(created.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let first = stage.get().unwrap();
+        let second = stage.get().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(created.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// go: "It should not include fallback if none was specified"
+    /// (`TestDnsAddrResolveController`).
+    #[test]
+    fn fallback_stage_exists_only_when_configured() {
+        assert!(HickoryDnsaddrResolver::new(None).fallback.is_none());
+        assert!(HickoryDnsaddrResolver::new(Some("1.2.3.4".into()))
+            .fallback
+            .is_some());
     }
 }

@@ -115,14 +115,74 @@ struct ServerState {
     dir: PathBuf,
 }
 
-/// Builds the on-disk path to a served block file:
-/// `<dir>/v<version>/<genesis_id>/block/<block_to_path(round)>`, matching
-/// go's `blockFullPath`/the inline path join in `main.go`'s handler.
-fn block_full_path(dir: &Path, version: &str, genesis_id: &str, round: u64) -> PathBuf {
-    dir.join(format!("v{version}"))
-        .join(genesis_id)
-        .join("block")
-        .join(block_to_path(round))
+/// go's `filepath.Clean` for `/`-separated paths.
+fn go_clean(path: &str) -> String {
+    let rooted = path.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if matches!(out.last(), Some(l) if *l != "..") {
+                    out.pop();
+                } else if !rooted {
+                    out.push("..");
+                }
+            }
+            p => out.push(p),
+        }
+    }
+    let joined = out.join("/");
+    match (rooted, joined.is_empty()) {
+        (true, _) => format!("/{joined}"),
+        (false, true) => ".".to_string(),
+        (false, false) => joined,
+    }
+}
+
+/// go 1.27 `filepath.IsLocal` (unix flavour; on Windows the backslash is a
+/// separator too and a drive colon is not local): the path is relative, not
+/// empty and does not escape its root lexically.
+fn is_local(path: &str) -> bool {
+    #[cfg(windows)]
+    let owned = path.replace('\\', "/");
+    #[cfg(windows)]
+    let path = owned.as_str();
+    #[cfg(windows)]
+    if path.contains(':') {
+        return false;
+    }
+    if path.is_empty() || path.starts_with('/') {
+        return false;
+    }
+    let has_dots = path.split('/').any(|p| p == "." || p == "..");
+    let cleaned = if has_dots {
+        go_clean(path)
+    } else {
+        path.to_string()
+    };
+    !(cleaned == ".." || cleaned.starts_with("../"))
+}
+
+/// go v5.1.1 `readBlockFile` (`cmd/catchupsrv/main.go`): reads
+/// `<dir>/v<version>/<genesis_id>/block/<block_to_path(round)>`, refusing (as
+/// "not found") a relative path that lexically escapes `dir` (`filepath.IsLocal`).
+/// Symlinks under `dir` are followed (they are trusted), like go's `os.ReadFile`.
+fn read_block_file(
+    dir: &Path,
+    version: &str,
+    genesis_id: &str,
+    round: u64,
+) -> std::io::Result<Vec<u8>> {
+    // `filepath.Join` cleans the joined path
+    let rel = go_clean(&format!(
+        "v{version}/{genesis_id}/block/{}",
+        block_to_path(round)
+    ));
+    if !is_local(&rel) {
+        return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+    }
+    std::fs::read(dir.join(rel))
 }
 
 /// Byte-identical response to Go's `net/http` `http.NotFound(w, r)` — status
@@ -140,15 +200,19 @@ fn go_http_not_found() -> Response {
 
 async fn serve_block(
     State(state): State<ServerState>,
-    AxumPath((version, genesis_id, round_str)): AxumPath<(String, String, String)>,
+    AxumPath((genesis_id, round_str)): AxumPath<(String, String)>,
 ) -> Response {
     let round = match string_to_block(&round_str) {
         Ok(r) => r,
         Err(_) => return go_http_not_found(),
     };
 
-    let path = block_full_path(&state.dir, &version, &genesis_id, round);
-    match tokio::fs::read(&path).await {
+    // `BlockServiceBlockPath` only matches version 1
+    let dir = state.dir.clone();
+    let read = tokio::task::spawn_blocking(move || read_block_file(&dir, "1", &genesis_id, round))
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+    match read {
         Ok(data) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, BLOCK_CONTENT_TYPE)],
@@ -160,10 +224,10 @@ async fn serve_block(
 }
 
 /// Builds the axum router serving go-algorand's `rpcs.BlockServiceBlockPath`
-/// route (`/v{version}/{genesisID}/block/{round}`) from `dir`.
+/// route (`/v1/{genesisID}/block/{round}`) from `dir`.
 pub fn router(dir: PathBuf) -> Router {
     Router::new()
-        .route("/v{version}/{genesis_id}/block/{round}", get(serve_block))
+        .route("/v1/{genesis_id}/block/{round}", get(serve_block))
         .with_state(ServerState { dir })
 }
 
@@ -305,5 +369,156 @@ mod tests {
         );
         let body = resp.bytes().await.unwrap();
         assert_eq!(&body[..], b"404 page not found\n");
+    }
+
+    // go v5.1.1 `TestReadBlockFile` (cmd/catchupsrv/main_test.go): a genesis ID
+    // taken from the URL must not lead outside the served directory.
+    #[test]
+    fn read_block_file_stays_inside_the_directory() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let block = b"block data".to_vec();
+        let block_path = dir
+            .path()
+            .join("v1")
+            .join("test-v1")
+            .join("block")
+            .join(block_to_path(1000));
+        fs::create_dir_all(block_path.parent().unwrap()).unwrap();
+        fs::write(&block_path, &block).unwrap();
+        assert_eq!(
+            read_block_file(dir.path(), "1", "test-v1", 1000).unwrap(),
+            block
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_block_dir = outside.path().join("block");
+        let outside_block_path = outside_block_dir.join(block_to_path(1000));
+        fs::create_dir_all(outside_block_path.parent().unwrap()).unwrap();
+        fs::write(&outside_block_path, b"outside data").unwrap();
+
+        let outside_name = outside.path().file_name().unwrap().to_str().unwrap();
+        let err =
+            read_block_file(dir.path(), "1", &format!("../../{outside_name}"), 1000).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        // the version is part of the path too
+        assert!(read_block_file(dir.path(), "../..", "x", 1000).is_err());
+        assert!(read_block_file(dir.path(), "1", "/etc", 1000).is_err());
+
+        // `filepath.IsLocal` on its own
+        assert!(is_local("a/b"));
+        assert!(is_local("a/../b"));
+        assert!(!is_local(""));
+        assert!(!is_local("/a"));
+        assert!(!is_local(".."));
+        assert!(!is_local("../a"));
+        assert!(!is_local("a/../../b"));
+
+        // Backslashes are literal filename characters on unix: mux accepts them
+        // within one genesisID segment and go reads that literal directory.
+        #[cfg(unix)]
+        {
+            let genesis_id = format!("..\\..\\{outside_name}");
+            let literal = dir
+                .path()
+                .join("v1")
+                .join(&genesis_id)
+                .join("block")
+                .join(block_to_path(1000));
+            fs::create_dir_all(literal.parent().unwrap()).unwrap();
+            fs::write(&literal, &block).unwrap();
+            assert_eq!(
+                read_block_file(dir.path(), "1", &genesis_id, 1000).unwrap(),
+                block
+            );
+
+            // symlinks under the directory are trusted and followed
+            use std::os::unix::fs::symlink;
+            let inside_block_dir = dir.path().join("v1").join("test-v1").join("block");
+            for (name, target, want) in [
+                (
+                    "relative",
+                    outside_block_dir.clone(),
+                    b"outside data".to_vec(),
+                ),
+                (
+                    "absolute",
+                    outside_block_dir.clone(),
+                    b"outside data".to_vec(),
+                ),
+                ("absolute-inside", inside_block_dir, block.clone()),
+            ] {
+                let link_dir = dir.path().join("v1").join(name);
+                fs::create_dir_all(&link_dir).unwrap();
+                let target = if name == "relative" {
+                    // relative to the link's directory
+                    let mut rel = std::path::PathBuf::new();
+                    for _ in link_dir.strip_prefix("/").unwrap().components() {
+                        rel.push("..");
+                    }
+                    rel.join(target.strip_prefix("/").unwrap())
+                } else {
+                    target
+                };
+                symlink(&target, link_dir.join("block")).unwrap();
+                assert_eq!(
+                    read_block_file(dir.path(), "1", name, 1000).unwrap(),
+                    want,
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    /// The route only matches version 1 (go: `BlockServiceBlockPath`), so a
+    /// request for another version is not served from `<dir>/v<other>`.
+    #[tokio::test]
+    async fn only_version_one_is_routed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("v2")
+            .join("g")
+            .join("block")
+            .join(block_to_path(7));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"v2 block").unwrap();
+        let app = router(tmp.path().to_path_buf());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let resp = reqwest::get(format!("http://{addr}/v2/g/block/{}", block_to_string(7)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    /// A percent-encoded `..` in the genesis ID (axum decodes it) cannot leave
+    /// the served directory.
+    #[tokio::test]
+    async fn percent_encoded_traversal_in_the_genesis_id_is_not_found() {
+        let parent = tempfile::tempdir().unwrap();
+        let served = parent.path().join("served");
+        std::fs::create_dir_all(&served).unwrap();
+        let secret = parent.path().join("block").join(block_to_path(7));
+        std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
+        std::fs::write(&secret, b"secret").unwrap();
+        let app = router(served);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        // <served>/v1/../block/<path> would be <served>/block/..., and
+        // `%2e%2e%2f..` climbs further: served/v1/../../block/<path> is the secret
+        let resp = reqwest::get(format!(
+            "http://{addr}/v1/%2e%2e%2f%2e%2e/block/{}",
+            block_to_string(7)
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
     }
 }
