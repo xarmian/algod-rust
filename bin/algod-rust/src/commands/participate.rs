@@ -7520,15 +7520,9 @@ pub async fn run(
             .with_batch_verifier(batch_verifier.clone())
             .with_remember_counter(tx_pool_remember_counter.clone())
             .with_check_counter(tx_pool_check_counter.clone())
-            // Issue #1645: deliberately does NOT call
-            // `.with_strict_canonical_reencode_check()` here -- go's
-            // WS-gossip entry point (`processIncomingTxn`) never performs
-            // the non-canonical-raw-encoding disconnect check (only the
-            // P2P/libp2p entry point, `validateIncomingTxMessage`, does).
-            // See `TxTagHandler::with_strict_canonical_reencode_check`'s
-            // doc comment for the live mainnet-soak evidence this split
-            // is based on, and the P2P handler registration below (which
-            // does opt in) for the other side of the split.
+            // go v5.1.1's `processIncomingTxn` rejects a non-canonical raw
+            // encoding like the P2P entry point does, so the handler's
+            // canonical-encoding gate (on by default) covers WS-gossip too.
             //
             // Phase 17 network-parity deep pass (`TestLineNetwork` row,
             // `docs/phase17/parity_network.md`): relay an inbound gossip
