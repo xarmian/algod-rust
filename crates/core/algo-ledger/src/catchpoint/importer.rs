@@ -1435,7 +1435,7 @@ fn migrate_online_tables_from_balances(
         let address: Vec<u8> = row.get(0)?;
         let nob: Option<i64> = row.get(1)?;
         let data: Vec<u8> = row.get(2)?;
-        // Tolerant decoder: handles map/array encodings and an empty blob.
+        // go-compatible decoder: a map (go v5.1.1 reads no array form) or an empty blob.
         let ba = decode_base_account_data(&data)?;
         if AccountStatus::from(ba.status) != AccountStatus::Online {
             continue;
@@ -1573,9 +1573,9 @@ fn tidy_state_proof_ids(conn: &Connection) -> Result<u64, CatchpointError> {
 }
 
 /// `accountbase` blob without its `StateProofID`: a map-encoded blob (what go
-/// writes) just loses its `"F"` entry, byte-for-byte otherwise; any other
-/// encoding the tolerant decoder accepts (array form) is re-encoded
-/// canonically from the decoded fields.
+/// writes) just loses its `"F"` entry, byte-for-byte otherwise; an empty blob
+/// (the one other encoding the decoder accepts) is re-encoded canonically from
+/// the decoded fields.
 fn strip_state_proof_id(
     raw: &[u8],
     decoded: &super::types::CatchpointBaseAccountData,
@@ -2995,29 +2995,6 @@ mod tests {
         assert_eq!(
             map_keys(&with_sp),
             vec!["A", "B", "C", "D", "E", "F", "Y", "Z"]
-        );
-    }
-
-    /// Array-encoded `baseAccountData` is accepted by the tolerant decoder
-    /// and so must also be tidied (re-encoded canonically), not abort.
-    #[test]
-    fn strip_state_proof_id_handles_array_encoded_blob() {
-        let mut blob = vec![0xdc, 0x00, 0x17, 0x00, 0x05, 0x00, 0x00, 0xc4, 32];
-        blob.extend([0u8; 32]); // auth_addr
-        blob.extend([0u8; 9]); // f..n
-        blob.extend([0xc2, 0x00, 0x00]); // o (bool), p, q
-        blob.extend([0xc4, 32]);
-        blob.extend([0u8; 32]); // vote_id
-        blob.extend([0xc4, 32]);
-        blob.extend([0u8; 32]); // selection_id
-        blob.extend([0x00, 0x00, 0x00]); // C, D, E
-        blob.extend([0xc4, 64]);
-        blob.extend(std::iter::repeat_n(1u8, 64)); // F
-        let decoded = decode_base_account_data(&blob).unwrap();
-        assert_eq!(decoded.state_proof_id, [1u8; 64]);
-        assert_eq!(
-            strip_state_proof_id(&blob, &decoded).unwrap(),
-            vec![0x81, 0xa1, b'b', 0x05]
         );
     }
 
