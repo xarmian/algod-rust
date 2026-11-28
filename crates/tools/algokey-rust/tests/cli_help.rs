@@ -274,7 +274,10 @@ fn salted_sign_program_help_has_all_flags() {
         "-p, --program",
         "-o, --outfile",
     ] {
-        assert!(h.contains(flag), "salted sign-program missing `{flag}`:\n{h}");
+        assert!(
+            h.contains(flag),
+            "salted sign-program missing `{flag}`:\n{h}"
+        );
     }
 }
 
@@ -301,11 +304,11 @@ fn required_flags_are_enforced() {
         &["part", "keyreg"],                      // missing --firstvalid AND --network
         &["part", "keyreg", "--firstvalid", "1"], // missing --network (mirrors Go's MarkFlagRequired)
         &["salted", "generate"],                  // missing --scheme/--keyfile
-        &["salted", "info"],                          // missing --keyfile
-        &["salted", "import"],                        // missing --mnemonic/--keyfile
-        &["salted", "sign"],                          // missing --txfile/--outfile
-        &["salted", "sign-program"],                  // missing --program/--outfile
-        &["salted", "check-address"],                 // missing positional ADDRESS
+        &["salted", "info"],                      // missing --keyfile
+        &["salted", "import"],                    // missing --mnemonic/--keyfile
+        &["salted", "sign"],                      // missing --txfile/--outfile
+        &["salted", "sign-program"],              // missing --program/--outfile
+        &["salted", "check-address"],             // missing positional ADDRESS
     ];
     for argv in cases {
         let out = algokey().args(*argv).output().expect("run algokey-rust");
