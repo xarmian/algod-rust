@@ -201,7 +201,7 @@ fn unhex(c: u8) -> u8 {
 /// go's `unescape`: validates `%XX` escapes (and, for host/zone, characters)
 /// and returns the unescaped bytes.
 fn go_unescape(s: &[u8], mode: Enc) -> Result<Vec<u8>, String> {
-    let quote = |b: &[u8]| format!("{:?}", String::from_utf8_lossy(b));
+    let quote = |b: &[u8]| go_quote(&String::from_utf8_lossy(b));
     let mut i = 0;
     let mut out = Vec::with_capacity(s.len());
     while i < s.len() {
@@ -241,6 +241,45 @@ fn go_unescape(s: &[u8], mode: Enc) -> Result<Vec<u8>, String> {
         }
     }
     Ok(out)
+}
+
+/// go's `strconv.Quote` (`%q`): printable runes as they are, the usual escapes,
+/// `\xNN` for other ASCII control bytes and `\uNNNN` / `\UNNNNNNNN` for
+/// non-printable runes. Go's `IsPrint` is approximated for non-ASCII: controls,
+/// spaces other than ASCII space and the common format characters are not
+/// printable.
+fn go_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{7}' => out.push_str("\\a"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{b}' => out.push_str("\\v"),
+            ' '..='~' => out.push(c),
+            c if (c as u32) < 0x80 => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c if go_is_print(c) => out.push(c),
+            c if (c as u32) < 0x10000 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push_str(&format!("\\U{:08x}", c as u32)),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn go_is_print(c: char) -> bool {
+    !(c.is_control()
+        || c.is_whitespace()
+        || matches!(
+            c as u32,
+            0xad | 0x200b..=0x200f | 0x2028..=0x202e | 0x2060..=0x2064 | 0xfeff | 0xfff9..=0xfffb
+        ))
 }
 
 /// go's `getScheme`: `Ok((scheme, rest))`.
@@ -500,9 +539,9 @@ fn go_url_parse(raw: &str) -> Result<GoUrl, String> {
         Some((u, f)) => (u, f),
         None => (raw, ""),
     };
-    let url = go_url_parse_no_frag(u).map_err(|e| format!("parse {u:?}: {e}"))?;
+    let url = go_url_parse_no_frag(u).map_err(|e| format!("parse {}: {e}", go_quote(u)))?;
     if !frag.is_empty() {
-        go_unescape(frag.as_bytes(), Enc::Fragment).map_err(|e| format!("parse {raw:?}: {e}"))?;
+        go_unescape(frag.as_bytes(), Enc::Fragment).map_err(|e| format!("parse {}: {e}", go_quote(raw)))?;
     }
     Ok(url)
 }

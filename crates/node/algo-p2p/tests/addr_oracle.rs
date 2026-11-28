@@ -44,8 +44,13 @@ fn addr_parsing_matches_go_rows() {
                 Ok(u) if u.scheme == row["scheme"] && u.host == row["host"] => {}
                 other => bad.push(format!("{addr:?}: url {other:?} want {row}")),
             }
-        } else if parse_host_or_url(addr).is_ok() {
-            bad.push(format!("{addr:?}: go rejects, rust parses"));
+        } else {
+            // the error text agrees byte for byte
+            match parse_host_or_url(addr) {
+                Ok(_) => bad.push(format!("{addr:?}: go rejects, rust parses")),
+                Err(e) if e.to_string() == row["err"].as_str().unwrap() => {}
+                Err(e) => bad.push(format!("{addr:?}: err {e:?} want {}", row["err"])),
+            }
         }
         let got = parse_host_or_url_or_multiaddr(addr);
         let go_ok = row["multi_ok"].as_bool().unwrap();
@@ -72,7 +77,7 @@ fn addr_parsing_matches_go_rows() {
             _ => bad.push(format!("{addr:?}: go ok={go_ok}, rust {got:?}")),
         }
     }
-    assert_eq!(n, 115);
+    assert_eq!(n, 121);
     assert!(
         bad.is_empty(),
         "{} mismatches:

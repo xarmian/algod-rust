@@ -109,6 +109,12 @@
 {"addr":"[:1]:80","err":"parse \"[:1]:80\": first path segment in URL cannot contain colon","is_multiaddr":false,"multi_err":"parse \"[:1]:80\": first path segment in URL cannot contain colon","multi_ok":false,"ok":false}
 {"addr":"[1:]:80","err":"parse \"[1:]:80\": first path segment in URL cannot contain colon","is_multiaddr":false,"multi_err":"parse \"[1:]:80\": first path segment in URL cannot contain colon","multi_ok":false,"ok":false}
 {"addr":"[::1:]:80","err":"parse \"[::1:]:80\": first path segment in URL cannot contain colon","is_multiaddr":false,"multi_err":"parse \"[::1:]:80\": first path segment in URL cannot contain colon","multi_ok":false,"ok":false}
+{"addr":"host​:80","host":"host​:80","is_multiaddr":false,"multi":"host​:80","multi_ok":true,"ok":true,"scheme":"http"}
+{"addr":"hést:80","host":"hést:80","is_multiaddr":false,"multi":"hést:80","multi_ok":true,"ok":true,"scheme":"http"}
+{"addr":"host\u0001:80","err":"parse \"host\\x01:80\": net/url: invalid control character in URL","is_multiaddr":false,"multi_err":"parse \"host\\x01:80\": net/url: invalid control character in URL","multi_ok":false,"ok":false}
+{"addr":"host :80","host":"host :80","is_multiaddr":false,"multi":"host :80","multi_ok":true,"ok":true,"scheme":"http"}
+{"addr":"ho­s:80","host":"ho­s:80","is_multiaddr":false,"multi":"ho­s:80","multi_ok":true,"ok":true,"scheme":"http"}
+{"addr":"\u2028host:80","host":"\u2028host:80","is_multiaddr":false,"multi":"\u2028host:80","multi_ok":true,"ok":true,"scheme":"http"}
 {"addr":"HTTP://Host:80","host":"Host:80","is_multiaddr":false,"multi":"Host:80","multi_ok":true,"ok":true,"scheme":"http"}
 {"addr":"http://host%80:80","host":"host�:80","is_multiaddr":false,"multi":"host�:80","multi_ok":true,"ok":true,"scheme":"http"}
 {"addr":"http://host%2Fx:80","err":"parse \"http://host%2Fx:80\": invalid URL escape \"%2F\"","is_multiaddr":false,"multi_err":"parse \"http://host%2Fx:80\": invalid URL escape \"%2F\"","multi_ok":false,"ok":false}
