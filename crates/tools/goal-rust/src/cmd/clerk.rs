@@ -1966,6 +1966,19 @@ pub fn run_multisig_signprogram(
     }
 }
 
+/// go v5.1 `multisig signprogram`: a LogicSig delegated by a salted-key
+/// signature cannot be combined with a multisig.
+fn refuse_salted_key_lsig(lsig: &algo_types::LogicSig) -> Result<(), String> {
+    if lsig.pqsig.as_ref().is_some_and(|p| !p.blank()) {
+        return Err(
+            "LogicSig file contains a salted-key signature (pqsig); a LogicSig delegated \
+             by a salted-key signature cannot be combined with multisig"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn run_multisig_signprogram_inner(
     args: MultisigSignProgramArgs,
     wallet: Option<String>,
@@ -2042,13 +2055,7 @@ fn run_multisig_signprogram_inner(
 
     // Get or create the partial multisig (multisig.go:228-251).
     let partial: algo_types::MultisigSig = if got_partial {
-        if lsig.pqsig.as_ref().is_some_and(|p| !p.blank()) {
-            return Err(
-                "LogicSig file contains a salted-key signature (pqsig); a LogicSig delegated \
-                 by a salted-key signature cannot be combined with multisig"
-                    .into(),
-            );
-        }
+        refuse_salted_key_lsig(&lsig)?;
         if use_legacy_msig {
             if lsig.lmsig.as_ref().is_some_and(|m| !m.subsigs.is_empty()) {
                 return Err(
@@ -2869,6 +2876,22 @@ mod tests {
             ..Default::default()
         };
         assert!(!group_input_already_signed(&l));
+    }
+
+    #[test]
+    fn multisig_signprogram_refuses_a_salted_key_delegated_lsig() {
+        let mut lsig = algo_types::LogicSig::default();
+        assert!(refuse_salted_key_lsig(&lsig).is_ok());
+        lsig.pqsig = Some(algo_types::pq::SaltedKeySig {
+            scheme: *b"f1",
+            public_key: serde_bytes::ByteBuf::from(vec![1]),
+            ..Default::default()
+        });
+        assert_eq!(
+            refuse_salted_key_lsig(&lsig).unwrap_err(),
+            "LogicSig file contains a salted-key signature (pqsig); a LogicSig delegated by a \
+             salted-key signature cannot be combined with multisig"
+        );
     }
 
     /// go v5.1 `tealsign`: the program and its arguments live in `stxn.Lsig` or,

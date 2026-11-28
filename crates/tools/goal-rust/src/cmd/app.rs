@@ -2239,6 +2239,39 @@ mod tests {
         assert!(err.contains("Cannot read file"));
     }
 
+    /// go v5.1 `populateMethodCallTxnArgs`: a key-scheme salted-key signature
+    /// is "already signed", an `ls`-scheme proof (authorizes by program) is not.
+    #[test]
+    fn txn_arg_already_signed_check_follows_the_salted_key_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, scheme: [u8; 2]| {
+            let stxn = SignedTransaction {
+                txn: algo_types::Transaction {
+                    txn_type: algo_types::TxnType::Pay,
+                    ..Default::default()
+                },
+                pqsig: Some(algo_types::SaltedKeySig {
+                    scheme,
+                    public_key: serde_bytes::ByteBuf::from(vec![1]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let path = dir.path().join(name);
+            std::fs::write(&path, algo_codec::canonical_encode_signed_transaction(&stxn)).unwrap();
+            path.display().to_string()
+        };
+        let key = write("key.stxn", *b"f1");
+        let err = populate_method_call_txn_args(&[TransactionType::Pay], &[key.clone()])
+            .unwrap_err();
+        assert_eq!(err, format!("Transaction from {key} has already been signed"));
+
+        let ls = write("ls.stxn", *b"ls");
+        let ok = populate_method_call_txn_args(&[TransactionType::Pay], &[ls]).unwrap();
+        assert_eq!(ok.len(), 1);
+        assert!(arg_has_logicsig(&ok[0]), "the ls proof is kept in the group");
+    }
+
     // --- method resolution ---
 
     #[test]
