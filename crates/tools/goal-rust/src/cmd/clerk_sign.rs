@@ -299,6 +299,63 @@ pub fn tealsign_payload(program_hash: &[u8; 32], data: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// Port of go `cmd/goal` `TestAuthorizeWithProgram` (`clerk_test.go`).
+    #[test]
+    fn authorize_with_program_picks_the_form_like_go() {
+        use algo_types::{Address, LogicSig, SignedTransaction, SIG_SCHEME_LOGIC_SIG};
+        let program = vec![0x06u8, 0x81, 0x01]; // #pragma version 6; int 1
+        let lsig = LogicSig {
+            logic: serde_bytes::ByteBuf::from(program.clone()),
+            args: Some(vec![Some(serde_bytes::ByteBuf::from(b"arg".to_vec()))]),
+            ..LogicSig::default()
+        };
+        let legacy_addr = program_address(&program);
+        let (salted_salt, salted_addr) = salted_program_authorizer(&program).unwrap();
+        assert_ne!(legacy_addr, salted_addr);
+        assert!(salted_addr.is_off_ed25519_curve());
+        let with_sender = |sender: Address, auth: Option<Address>| {
+            let mut s = SignedTransaction::default();
+            s.txn.sender = sender;
+            s.auth_addr = auth;
+            s
+        };
+
+        // Without the flag, a program authorizes from its hash, as it always has.
+        let mut legacy = with_sender(legacy_addr, None);
+        authorize_with_program(&mut legacy, lsig.clone(), false).unwrap();
+        assert_eq!(legacy.lsig.as_ref(), Some(&lsig));
+        assert!(legacy.pqsig.is_none());
+
+        // The flag moves it to the salted form, which carries the args in
+        // place of signature bytes.
+        let mut salted = with_sender(salted_addr, None);
+        authorize_with_program(&mut salted, lsig.clone(), true).unwrap();
+        assert!(salted.lsig.is_none());
+        let sk = salted.pqsig.clone().expect("SKsig set");
+        assert_eq!(sk.scheme, SIG_SCHEME_LOGIC_SIG);
+        assert_eq!(sk.salt, salted_salt);
+        assert_eq!(sk.public_key.as_ref(), program.as_slice());
+        let decoded = algo_codec::decode_logic_sig_args(&sk.signature).unwrap();
+        assert_eq!(decoded, vec![Some(b"arg".to_vec())]);
+
+        // A sender that is already the salted address picks that form alone.
+        let mut inferred = with_sender(salted_addr, None);
+        authorize_with_program(&mut inferred, lsig.clone(), false).unwrap();
+        assert_eq!(inferred.pqsig, salted.pqsig);
+
+        // Rekeying names the authorizer somewhere other than the sender, and
+        // that is what the form is read from.
+        let mut rekeyed = with_sender(Address([1u8; 32]), Some(salted_addr));
+        authorize_with_program(&mut rekeyed, lsig.clone(), false).unwrap();
+        assert_eq!(rekeyed.pqsig, salted.pqsig);
+
+        // go's reportErrorf: --salted with an authorizer that is not the
+        // salted address.
+        let mut wrong = with_sender(legacy_addr, None);
+        let err = authorize_with_program(&mut wrong, lsig, true).unwrap_err();
+        assert!(err.starts_with("program authorizes "), "{err}");
+    }
+
     #[test]
     fn parse_arg_b64_handles_empty_and_values() {
         let args = vec!["".to_string(), "AQID".to_string()];

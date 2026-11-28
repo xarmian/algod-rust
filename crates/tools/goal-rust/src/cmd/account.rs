@@ -3577,6 +3577,40 @@ mod tests {
     use super::*;
     use crate::formatting::asset_decimals_fmt;
 
+    /// Port of go `cmd/goal` `TestIsPartkeyRegistered` (`account_test.go`).
+    #[test]
+    fn is_partkey_registered_requires_every_field_to_match() {
+        use serde_json::json;
+        // selection {1,2,3} = "AQID", vote {4,5,6} = "BAUG"; {9} = "CQ=="
+        let key = json!({
+            "selection-participation-key": "AQID",
+            "vote-participation-key": "BAUG",
+            "vote-first-valid": 10,
+            "vote-last-valid": 1000,
+            "vote-key-dilution": 100,
+        });
+        let part = json!({ "key": key });
+
+        assert!(!is_partkey_registered(&json!({}), &part));
+        assert!(is_partkey_registered(&json!({ "participation": key }), &part));
+
+        let mutations: [(&str, &str, serde_json::Value); 5] = [
+            ("selection key", "selection-participation-key", json!("CQ==")),
+            ("vote key", "vote-participation-key", json!("CQ==")),
+            ("first valid", "vote-first-valid", json!(11)),
+            ("last valid", "vote-last-valid", json!(1001)),
+            ("key dilution", "vote-key-dilution", json!(101)),
+        ];
+        for (name, field, value) in mutations {
+            let mut other = key.clone();
+            other[field] = value;
+            assert!(
+                !is_partkey_registered(&json!({ "participation": other }), &part),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn build_algod_endpoint_prefers_admin_token() {
         let admin = "a".repeat(64);
