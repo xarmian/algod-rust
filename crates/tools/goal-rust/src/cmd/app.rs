@@ -1998,20 +1998,24 @@ mod tests {
         assert!(arg_has_logicsig(&s));
 
         // an `ls`-scheme proof authorizes by program too (go v5.1)
-        let mut ls = SignedTransaction::default();
-        ls.pqsig = Some(algo_types::SaltedKeySig {
-            scheme: *b"ls",
-            public_key: serde_bytes::ByteBuf::from(vec![2, 0x20, 1, 1, 0x22]),
+        let ls = SignedTransaction {
+            pqsig: Some(algo_types::SaltedKeySig {
+                scheme: *b"ls",
+                public_key: serde_bytes::ByteBuf::from(vec![2, 0x20, 1, 1, 0x22]),
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         assert!(arg_has_logicsig(&ls));
         // a key-scheme proof does not
-        let mut key = SignedTransaction::default();
-        key.pqsig = Some(algo_types::SaltedKeySig {
-            scheme: *b"f1",
-            public_key: serde_bytes::ByteBuf::from(vec![1]),
+        let key = SignedTransaction {
+            pqsig: Some(algo_types::SaltedKeySig {
+                scheme: *b"f1",
+                public_key: serde_bytes::ByteBuf::from(vec![1]),
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         assert!(!arg_has_logicsig(&key));
     }
 
