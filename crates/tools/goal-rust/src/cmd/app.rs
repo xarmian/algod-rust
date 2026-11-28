@@ -2254,10 +2254,18 @@ mod tests {
             let stxn = SignedTransaction {
                 txn: algo_types::Transaction {
                     txn_type: algo_types::TxnType::Pay,
+                    sender: algo_types::Address([1u8; 32]),
+                    receiver: algo_types::Address([2u8; 32]),
+                    fee: 1000,
+                    first_valid: 1.into(),
+                    last_valid: 1001.into(),
+                    genesis_hash: [9u8; 32],
+                    amount: 5,
                     ..Default::default()
                 },
                 pqsig: Some(algo_types::SaltedKeySig {
                     scheme,
+                    signature: serde_bytes::ByteBuf::from(vec![3u8; 10]),
                     public_key: serde_bytes::ByteBuf::from(public_key),
                     ..Default::default()
                 }),
