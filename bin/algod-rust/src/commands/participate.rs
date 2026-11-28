@@ -131,6 +131,26 @@ impl LiveKeySource for Mutex<ParticipationStore> {
     }
 }
 
+/// The accounts with a participation key valid for a round, for the
+/// transaction pool (go `AlgorandFullNode.VotingAccountsForRound`, i.e.
+/// `AccountManager.Keys(round)`): a superset of the eligible proposers.
+struct PartkeyVotingAccounts(Mutex<ParticipationStore>);
+
+impl algo_pool::traits::VotingAccountSupplier for PartkeyVotingAccounts {
+    fn voting_accounts_for_round(&self, round: Round) -> Result<Vec<algo_types::Address>, String> {
+        let store = self
+            .0
+            .lock()
+            .map_err(|_| "participation store lock poisoned".to_string())?;
+        let records = store.get_all().map_err(|e| e.to_string())?;
+        Ok(records
+            .into_iter()
+            .filter(|r| r.first_valid <= round && round <= r.last_valid)
+            .map(|r| r.account)
+            .collect())
+    }
+}
+
 /// [`ParticipationNodeInfo`] before its first successful registry read.
 const PARTICIPATION_UNDECIDED: u8 = 0;
 const PARTICIPATION_NO: u8 = 1;
@@ -7324,10 +7344,24 @@ pub async fn run(
     // verified here is therefore a cache *hit*, not redundant work, when
     // `pool.remember()`'s evaluator verifies it again.
     let verified_txn_cache = pool_ledger_adapter.verified_txn_cache.clone();
-    let pool = Arc::new(TransactionPool::new(
+    // go v5.1.1 skips `GenerateBlock` for a round in which no local account
+    // holds a participation key; the pool asks the registry for them.
+    let mut pool = TransactionPool::new(
         pool_config_from_local(&node_config),
         pool_ledger_adapter as Arc<dyn algo_pool::traits::PoolLedger>,
-    ));
+    );
+    match ParticipationStore::open(partkey_path) {
+        Ok(store) => {
+            pool = pool.with_voting_accounts(Arc::new(PartkeyVotingAccounts(Mutex::new(store))));
+        }
+        // Without the registry the pool generates a block every round, as
+        // before go v5.1.1's skip.
+        Err(e) => tracing::warn!(
+            "cannot open the participation key store for the transaction pool at {}: {e}",
+            partkey_path.display()
+        ),
+    }
+    let pool = Arc::new(pool);
     // Issue #1134: inbound-gossip tx-handler per-tag `pool.remember()`
     // failure counters, shared across every `TxTagHandler` this node
     // registers (WS-gossip and P2P both route inbound TX traffic through

@@ -84,6 +84,20 @@ pub trait BlockEvaluator: Send {
     }
 }
 
+// ── VotingAccountSupplier ────────────────────────────────────────
+
+/// The accounts of this node that hold participation keys for a round (go's
+/// `pools.VotingAccountSupplier`). If the list is empty, the pool does not
+/// call `generate_block` for that round: nothing here could propose.
+pub trait VotingAccountSupplier: Send + Sync {
+    /// Addresses with a participation key valid for `round`.
+    ///
+    /// An `Err` means the registry could not be read: the pool then does not
+    /// treat the round as having no proposer (it generates the block as if
+    /// there were no supplier).
+    fn voting_accounts_for_round(&self, round: Round) -> Result<Vec<Address>, String>;
+}
+
 // ── PoolLedger ───────────────────────────────────────────────────
 
 /// What the pool needs from the ledger.
