@@ -502,9 +502,7 @@ impl HickorySrvResolver {
         srv_name: &str,
     ) -> Result<Vec<SrvRecord>, ResolveError> {
         let lookup = resolver.srv_lookup(srv_name).await?;
-        let mut records: Vec<SrvRecord> = lookup
-            .answers()
-            .iter()
+        let mut records: Vec<SrvRecord> = answers_for_query(lookup.query(), lookup.answers())
             .filter_map(|record| match &record.data {
                 RData::SRV(srv) => Some(srv),
                 _ => None,
@@ -925,8 +923,74 @@ pub async fn resolve_addresses(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// The answer records that belong to `query`: those owned by the queried name
+/// and of its class. go v5.1.1 binds every DNSSEC answer to its query
+/// (`selectRRSet`, #6783): a response may also carry RRsets of other names
+/// (genuinely signed, e.g. replayed from another bootstrap domain), and
+/// hickory returns the whole answer section unfiltered when the queried name is
+/// present. A CNAME is not followed (go: "rejects a CNAME for a TXT query").
+/// A bootstrap SRV/TXT name served through a CNAME therefore yields nothing, as in
+/// go. Keep in sync with the copy in `algo-p2p/src/dnsaddr.rs` (algo-p2p cannot depend on algo-network).
+fn answers_for_query<'a>(
+    query: &'a hickory_resolver::proto::op::Query,
+    answers: &'a [hickory_resolver::proto::rr::Record],
+) -> impl Iterator<Item = &'a hickory_resolver::proto::rr::Record> {
+    answers
+        .iter()
+        .filter(move |r| r.dns_class == query.query_class() && r.name == *query.name())
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// go v5.1.1 `TestQueryAdvertisesReducedEDNSBuffer` /
+    /// `TestQueryServerFallsBackToTCPOn{UDPError,Truncation}`: go's DNSSEC client
+    /// advertises a 1232-byte EDNS UDP buffer (DNS Flag Day 2020), sets the DO
+    /// bit and retries over TCP on a UDP error or a truncated answer. The
+    /// delegated hickory resolvers get the same through their options.
+    #[test]
+    fn resolver_opts_match_gos_dnssec_client() {
+        let mut opts = ResolverOpts::default();
+        apply_resolver_opts(&mut opts, true);
+        assert!(opts.validate, "DO bit and validation");
+        assert!(opts.edns0);
+        assert_eq!(opts.edns_payload_len, 1232);
+        assert!(opts.try_tcp_on_error);
+    }
+
+    /// go v5.1.1 `TestSelectRRSet`: only the records of the queried name are
+    /// used; a signed RRset of another name in the same answer is not.
+    #[test]
+    fn answers_for_query_keeps_only_the_queried_name() {
+        use hickory_resolver::proto::op::Query;
+        use hickory_resolver::proto::rr::rdata::SRV;
+        use hickory_resolver::proto::rr::{Name, Record};
+        let srv = |owner: &str, target: &str| {
+            Record::from_rdata(
+                Name::from_ascii(owner).unwrap(),
+                60,
+                RData::SRV(SRV::new(1, 1, 4160, Name::from_ascii(target).unwrap())),
+            )
+        };
+        let wanted = srv("_algobootstrap._tcp.wanted.test.", "relay.wanted.test.");
+        let foreign = srv("_algobootstrap._tcp.foreign.test.", "relay.foreign.test.");
+        let answers = vec![foreign.clone(), wanted.clone()];
+        // the query name's case does not matter
+        for qname in [
+            "_algobootstrap._tcp.wanted.test.",
+            "_ALGOBOOTSTRAP._tcp.WANTED.Test.",
+        ] {
+            let query = Query::query(Name::from_ascii(qname).unwrap(), RecordType::SRV);
+            let kept: Vec<&Record> = answers_for_query(&query, &answers).collect();
+            assert_eq!(kept, vec![&wanted], "{qname}");
+        }
+        // an answer that only has another name's records yields nothing
+        let query = Query::query(
+            Name::from_ascii("_algobootstrap._tcp.wanted.test.").unwrap(),
+            RecordType::SRV,
+        );
+        assert_eq!(answers_for_query(&query, &[foreign]).count(), 0);
+    }
     use super::*;
 
     // -----------------------------------------------------------------------
