@@ -266,7 +266,10 @@ const BOOTSTRAP_REDIAL_MAX_BACKOFF: Duration = Duration::from_secs(120);
 /// `handle_inbound_ws_stream`/`handle_outbound_ws_stream`/
 /// `handle_inbound_ws_v1_stream`/`handle_outbound_ws_v1_stream`) turns this
 /// into an ordinary, redial-eligible disconnect instead.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// 10 s like go v5.1.1's `p2pHandshakeTimeout` (`network/p2pNetwork.go`; it was
+/// 30 s here), which bounds the V1 initial byte and the V22 metadata exchange.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One outbound `(tag, payload)` pair queued for a stream peer's writer
 /// task, plus the `Instant` it was enqueued at (issue #1220) — the P2P
@@ -3578,6 +3581,12 @@ impl algo_rest_client::http_over_stream::HttpPeerTransport for P2pHttpPeerTransp
 
 #[cfg(test)]
 mod tests {
+    /// go v5.1.1 `p2pHandshakeTimeout`.
+    #[test]
+    fn handshake_timeout_matches_go() {
+        assert_eq!(super::HANDSHAKE_TIMEOUT, std::time::Duration::from_secs(10));
+    }
+
     use super::*;
 
     // -----------------------------------------------------------------------
