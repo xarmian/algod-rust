@@ -6899,14 +6899,7 @@ mod tests {
         );
     }
 
-    // --- AdjustConnectionLimits (issue #949) --------------------------------
-    //
-    // Ported verbatim from go's `TestLocal_RecalculateConnectionLimits`
-    // (`config/config_test.go:736`) — same rows, same expected outputs — so
-    // any future edit to `adjust_connection_limits` that silently diverges
-    // from go's FD-pressure rebalancing algorithm fails this test, not just
-    // a freshly invented one.
-    /// go v5.1.1's `Local.AdjustConnectionLimits` on 3000 go-generated rows
+    /// go v5.1.1's `Local.AdjustConnectionLimits` on the go-generated rows
     /// (`tools/config-adjust-oracle`, `tests/fixtures/adjust_connection_limits.jsonl`):
     /// every combination of required/max descriptors (including deltas above
     /// `i64::MAX`, where v5.0's int conversion wrapped), REST limits, incoming
@@ -6945,9 +6938,16 @@ mod tests {
             );
             n += 1;
         }
-        assert_eq!(n, 3000);
+        assert!(n > 3000, "only {n} oracle rows");
     }
 
+    // --- AdjustConnectionLimits (issue #949) --------------------------------
+    //
+    // Ported verbatim from go's `TestLocal_RecalculateConnectionLimits`
+    // (`config/config_test.go:736`) — same rows, same expected outputs — so
+    // any future edit to `adjust_connection_limits` that silently diverges
+    // from go's FD-pressure rebalancing algorithm fails this test, not just
+    // a freshly invented one.
     #[test]
     fn adjust_connection_limits_matches_go_table() {
         struct Case {

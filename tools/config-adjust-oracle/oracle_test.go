@@ -27,7 +27,8 @@
 // crates/node/algo-config/src/lib.rs
 // (`adjust_connection_limits_matches_go_on_every_oracle_row`) replays them.
 //
-// The test is staged into config/ of a go-algorand checkout at the pin:
+// The test is staged into config/ of a go-algorand checkout at the pin
+// (`make libsodium` first, as for every go-algorand build here):
 //
 //	cp tools/config-adjust-oracle/oracle_test.go \
 //	   ../go-algorand/config/zz_algod_rust_adjust_oracle_test.go
@@ -70,6 +71,45 @@ func TestAlgodRustAdjustOracle(t *testing.T) {
 		{":4160", ":4190", false, true},
 		{":4160", ":4190", true, true},
 	}
+	emit := func(req, max, s, h uint64, inc, p2pInc int, m struct {
+		net, p2pNet string
+		p2p, hybrid bool
+	}) {
+		cfg := GetDefaultLocal()
+		cfg.NetAddress = m.net
+		cfg.P2PHybridNetAddress = m.p2pNet
+		cfg.EnableP2P = m.p2p
+		cfg.EnableP2PHybridMode = m.hybrid
+		cfg.RestConnectionsSoftLimit = s
+		cfg.RestConnectionsHardLimit = h
+		cfg.IncomingConnectionsLimit = inc
+		cfg.P2PHybridIncomingConnectionsLimit = p2pInc
+		updated := cfg.AdjustConnectionLimits(req, max)
+		require.NoError(t, enc.Encode(map[string]any{
+			"required": req, "max": max, "soft": s, "hard": h, "incoming": inc, "p2p_incoming": p2pInc,
+			"net": m.net, "p2p_net": m.p2pNet, "enable_p2p": m.p2p, "hybrid": m.hybrid,
+			"updated": updated, "soft_out": cfg.RestConnectionsSoftLimit, "hard_out": cfg.RestConnectionsHardLimit,
+			"incoming_out": cfg.IncomingConnectionsLimit, "p2p_incoming_out": cfg.P2PHybridIncomingConnectionsLimit,
+		}))
+	}
+
+	// the boundaries: the REST hard limit at diff+10 (+-2) and the incoming limits at
+	// restDelta (+-1)
+	for _, pair := range [][2]uint64{{200, 100}, {1000, 150}, {500, 0}} {
+		diff := pair[0] - pair[1]
+		for k := -2; k <= 1; k++ {
+			h := uint64(int64(diff) + 10 + int64(k))
+			restDelta := int64(diff) + 10 - int64(h)
+			for j := -1; j <= 1; j++ {
+				limit := int(restDelta) + j
+				for _, m := range modes {
+					emit(pair[0], pair[1], 5, h, limit, limit, m)
+					emit(pair[0], pair[1], 100, h, limit+7, limit, m)
+				}
+			}
+		}
+	}
+
 	for _, req := range required {
 		for _, max := range maxFDs {
 			for _, s := range soft {
@@ -77,22 +117,7 @@ func TestAlgodRustAdjustOracle(t *testing.T) {
 					for _, inc := range incoming {
 						for _, p2pInc := range p2pIncoming {
 							for _, m := range modes {
-								cfg := GetDefaultLocal()
-								cfg.NetAddress = m.net
-								cfg.P2PHybridNetAddress = m.p2pNet
-								cfg.EnableP2P = m.p2p
-								cfg.EnableP2PHybridMode = m.hybrid
-								cfg.RestConnectionsSoftLimit = s
-								cfg.RestConnectionsHardLimit = h
-								cfg.IncomingConnectionsLimit = inc
-								cfg.P2PHybridIncomingConnectionsLimit = p2pInc
-								updated := cfg.AdjustConnectionLimits(req, max)
-								require.NoError(t, enc.Encode(map[string]any{
-									"required": req, "max": max, "soft": s, "hard": h, "incoming": inc, "p2p_incoming": p2pInc,
-									"net": m.net, "p2p_net": m.p2pNet, "enable_p2p": m.p2p, "hybrid": m.hybrid,
-									"updated": updated, "soft_out": cfg.RestConnectionsSoftLimit, "hard_out": cfg.RestConnectionsHardLimit,
-									"incoming_out": cfg.IncomingConnectionsLimit, "p2p_incoming_out": cfg.P2PHybridIncomingConnectionsLimit,
-								}))
+								emit(req, max, s, h, inc, p2pInc, m)
 							}
 						}
 					}
