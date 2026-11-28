@@ -115,7 +115,7 @@ fn real_vfuture_fixture_load_is_visible_globally_through_consensus_params_for_ve
     let future_after = consensus_params_for_version(CONSENSUS_FUTURE)
         .expect("\"future\" must still resolve after the fixture overrides it");
     assert_eq!(future_after.min_balance, 100_000);
-    assert_eq!(future_after.logic_sig_version, 13);
+    assert_eq!(future_after.logic_sig_version, 14);
     assert_eq!(future_after.max_tx_group_size, 16);
     assert!(future_after.enable_heartbeat);
     // Issue #814 live-verification finding: `EnableFeePooling`/

@@ -234,15 +234,15 @@ fn real_vfuture_consensus_json_fixture_loads_and_merges_correctly() {
     // those three JSON shapes silently stopped deserializing correctly.
     assert_eq!(future.min_balance, 100_000);
     assert_eq!(future.min_txn_fee, 1_000);
-    assert_eq!(future.logic_sig_version, 13);
+    assert_eq!(future.logic_sig_version, 14);
     assert_eq!(future.max_tx_group_size, 16);
     assert!(
         future.enable_heartbeat,
         "\"Heartbeat\": true in the fixture"
     );
     assert!(
-        !future.enable_pq_scheme_falcon1024,
-        "the fixture never sets \"EnablePQSchemeFalcon1024\" -- must default to false"
+        future.enable_pq_scheme_falcon1024,
+        "go v5.1.1's future sets \"EnablePQSchemeFalcon1024\" (v42 base)"
     );
     assert_eq!(
         future.agreement_filter_timeout,
