@@ -90,7 +90,40 @@ pub fn dht_protocol_name(network_id: &str) -> StreamProtocol {
 /// `go-libp2p-kad-dht`'s own refresh cadence either, so both sides simply
 /// inherit their underlying Kademlia library's default.
 pub fn dht_config(network_id: &str) -> libp2p::kad::Config {
-    libp2p::kad::Config::new(dht_protocol_name(network_id))
+    let mut config = libp2p::kad::Config::new(dht_protocol_name(network_id));
+    // go v5.1.1 `makeNamespaceProviderStore`: inbound records are not stored
+    // as they arrive; `P2pHost::next_event` hands each `AddProvider` to
+    // [`accept_provider_record`] and stores only what it returns (no value
+    // records at all, like go's `DisableValues`).
+    config.set_record_filtering(libp2p::kad::StoreInserts::FilterBoth);
+    config
+}
+
+/// The addresses of one provider the DHT keeps, go v5.1.1 `maxProviderAddrs`:
+/// the peerstore limits the addresses of all peers together, so one peer must
+/// not use it up.
+pub const MAX_PROVIDER_ADDRS: usize = 16;
+
+/// go v5.1.1 `namespaceProviderStore.AddProvider`: a provider record is kept
+/// only for the DHT keys of the capabilities this node knows (go: the keys
+/// derived from the discovery namespaces `archival`, `catchpointStoring` and
+/// `gossip`), and with at most [`MAX_PROVIDER_ADDRS`] addresses. Any other
+/// record (a peer announcing itself as provider of an arbitrary key) is
+/// dropped, so a remote peer cannot fill the store.
+pub fn accept_provider_record(mut record: kad::ProviderRecord) -> Option<kad::ProviderRecord> {
+    use crate::capabilities::Capability;
+    let known = [
+        Capability::Archival,
+        Capability::Catchpoints,
+        Capability::Gossip,
+    ]
+    .iter()
+    .any(|c| c.record_key() == record.key);
+    if !known {
+        return None;
+    }
+    record.addresses.truncate(MAX_PROVIDER_ADDRS);
+    Some(record)
 }
 
 /// Resolve go's `DHTMode` config string (`config.Local.DHTMode`,
@@ -121,6 +154,41 @@ pub fn resolve_dht_mode(dht_mode: &str, has_listen_address: bool) -> Option<kad:
 
 #[cfg(test)]
 mod tests {
+
+    fn provider(key: kad::RecordKey, addrs: usize) -> kad::ProviderRecord {
+        let addresses = (0..addrs)
+            .map(|i| format!("/ip4/10.0.0.1/tcp/{}", 1000 + i).parse().unwrap())
+            .collect();
+        kad::ProviderRecord::new(key, libp2p::PeerId::random(), addresses)
+    }
+
+    /// go v5.1.1 `namespaceProviderStore`: only the capability keys are kept.
+    #[test]
+    fn provider_records_are_kept_only_for_the_capability_keys() {
+        use crate::capabilities::Capability;
+        for cap in [
+            Capability::Archival,
+            Capability::Catchpoints,
+            Capability::Gossip,
+        ] {
+            let kept = accept_provider_record(provider(cap.record_key(), 1)).expect("kept");
+            assert_eq!(kept.key, cap.record_key());
+        }
+        assert!(accept_provider_record(provider(kad::RecordKey::new(&"arbitrary"), 1)).is_none());
+        // the raw namespace bytes are not the DHT key
+        assert!(accept_provider_record(provider(kad::RecordKey::new(&"gossip"), 1)).is_none());
+    }
+
+    /// ... with at most 16 addresses per provider.
+    #[test]
+    fn provider_addresses_are_capped() {
+        use crate::capabilities::Capability;
+        let kept =
+            accept_provider_record(provider(Capability::Gossip.record_key(), 40)).expect("kept");
+        assert_eq!(kept.addresses.len(), MAX_PROVIDER_ADDRS);
+        let kept = accept_provider_record(provider(Capability::Gossip.record_key(), 3)).unwrap();
+        assert_eq!(kept.addresses.len(), 3);
+    }
     use super::*;
 
     #[test]

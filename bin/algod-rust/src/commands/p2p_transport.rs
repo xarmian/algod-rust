@@ -271,6 +271,72 @@ const BOOTSTRAP_REDIAL_MAX_BACKOFF: Duration = Duration::from_secs(120);
 /// 30 s here), which bounds the V1 initial byte and the V22 metadata exchange.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Inbound gossip streams one peer may hold per protocol, go v5.1.1
+/// `gossipStreamsInboundPerPeer` (`network/p2p/p2p.go`): one stream, plus one more
+/// for a peer that opens a new stream before its old one has closed. A
+/// handshake that never completes holds its slot for [`HANDSHAKE_TIMEOUT`].
+const GOSSIP_STREAMS_INBOUND_PER_PEER: usize = 2;
+
+/// How long a connection dialed for gossip may go without a gossip stream before
+/// the redial sweep closes it and another peer takes its place, go v5.1.1
+/// `streamSetupTimeout` (`network/p2p/streams.go`).
+const STREAM_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Inbound HTTP streams one peer may hold at once, go v5.1.1
+/// `httpStreamsInboundPerPeer`: catchup fetches up to `CatchupParallelBlocks`
+/// blocks at a time (16 by default), possibly all from one peer, and the same
+/// peer may also request a catchpoint file or a transaction sync.
+const HTTP_STREAMS_INBOUND_PER_PEER: usize = 32;
+
+/// How long a peer has to deliver the head of its HTTP request on an inbound
+/// stream, go v5.1.1 `httpServerReadTimeout` (it matches the websocket
+/// network's `httpServerReadHeaderTimeout`).
+const HTTP_SERVER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A per-peer cap on concurrent holders of a resource (inbound HTTP streams).
+#[derive(Clone, Default)]
+struct PerPeerLimit {
+    counts: Arc<Mutex<std::collections::HashMap<PeerId, usize>>>,
+}
+
+/// A slot of a [`PerPeerLimit`], given back on drop.
+struct PerPeerSlot {
+    limit: PerPeerLimit,
+    peer: PeerId,
+}
+
+impl PerPeerLimit {
+    /// Take a slot for `peer` unless it already holds `cap` of them.
+    fn acquire(&self, peer: PeerId, cap: usize) -> Option<PerPeerSlot> {
+        let mut counts = self.counts.lock().expect("per-peer limit mutex poisoned");
+        let n = counts.entry(peer).or_insert(0);
+        if *n >= cap {
+            return None;
+        }
+        *n += 1;
+        Some(PerPeerSlot {
+            limit: self.clone(),
+            peer,
+        })
+    }
+}
+
+impl Drop for PerPeerSlot {
+    fn drop(&mut self) {
+        let mut counts = self
+            .limit
+            .counts
+            .lock()
+            .expect("per-peer limit mutex poisoned");
+        if let Some(n) = counts.get_mut(&self.peer) {
+            *n -= 1;
+            if *n == 0 {
+                counts.remove(&self.peer);
+            }
+        }
+    }
+}
+
 /// One outbound `(tag, payload)` pair queued for a stream peer's writer
 /// task, plus the `Instant` it was enqueued at (issue #1220) — the P2P
 /// stream's counterpart of `ws_peer.rs`'s `SendMessage::enqueued`, used to
@@ -601,18 +667,21 @@ fn spawn_ws_peer(
                 // frames share this same per-peer write queue/task with
                 // time-critical agreement votes, so a large uncompressed
                 // proposal write can delay a vote queued right behind it.
-                let proposal_compressed =
-                    match compress_outgoing_proposal(tag, &payload, negotiated_features) {
-                        Ok(frame) => frame,
-                        Err(e) => {
-                            tracing::warn!(
-                                %peer_id,
-                                error = %e,
-                                "P2P algorand-ws stream: PP compression failed, sending uncompressed"
-                            );
-                            None
-                        }
-                    };
+                let proposal_compressed = match compress_outgoing_proposal(
+                    tag,
+                    &payload,
+                    negotiated_features,
+                ) {
+                    Ok(frame) => frame,
+                    Err(e) => {
+                        tracing::warn!(
+                            %peer_id,
+                            error = %e,
+                            "P2P algorand-ws stream: PP compression failed, sending uncompressed"
+                        );
+                        None
+                    }
+                };
 
                 let frame = if let Some(frame) = vote_compressed {
                     frame
@@ -1965,6 +2034,11 @@ enum P2pCommand {
     /// — exercises the exact same `SwarmEvent::ConnectionClosed` path a
     /// genuine disconnect (or a handshake-timeout disconnect) would.
     DisconnectPeer(PeerId),
+    /// go `P2PNetwork.innerStop`: close every peer (their identities are
+    /// released by the connection-closed handling), stop redialing bootstrap
+    /// peers, and end the swarm task once the last connection is gone; the
+    /// sender is told when that happened.
+    Stop(tokio::sync::oneshot::Sender<()>),
 }
 
 impl P2pTransport {
@@ -2288,6 +2362,19 @@ impl P2pTransport {
                         drop(stream);
                         continue;
                     }
+                    if sp
+                        .lock()
+                        .expect("stream_peers mutex poisoned")
+                        .slots_in_use(&peer_id)
+                        >= GOSSIP_STREAMS_INBOUND_PER_PEER
+                    {
+                        tracing::debug!(
+                            %peer_id,
+                            "P2P: rejecting gossip stream — the peer holds its inbound stream limit"
+                        );
+                        drop(stream);
+                        continue;
+                    }
                     sp.lock()
                         .expect("stream_peers mutex poisoned")
                         .begin_peer_attempt(peer_id);
@@ -2347,6 +2434,19 @@ impl P2pTransport {
                         drop(stream);
                         continue;
                     }
+                    if sp
+                        .lock()
+                        .expect("stream_peers mutex poisoned")
+                        .slots_in_use(&peer_id)
+                        >= GOSSIP_STREAMS_INBOUND_PER_PEER
+                    {
+                        tracing::debug!(
+                            %peer_id,
+                            "P2P: rejecting gossip stream — the peer holds its inbound stream limit"
+                        );
+                        drop(stream);
+                        continue;
+                    }
                     sp.lock()
                         .expect("stream_peers mutex poisoned")
                         .begin_peer_attempt(peer_id);
@@ -2384,10 +2484,20 @@ impl P2pTransport {
         // picked up by the next request.
         {
             let hr = Arc::clone(&http_router);
+            let http_limit = PerPeerLimit::default();
             dedicated_rt_handle.spawn(async move {
                 while let Some((peer_id, stream)) = incoming_http_streams.next().await {
+                    let Some(slot) = http_limit.acquire(peer_id, HTTP_STREAMS_INBOUND_PER_PEER)
+                    else {
+                        tracing::debug!(%peer_id, "P2P: rejecting HTTP stream — the peer holds its inbound stream limit");
+                        drop(stream);
+                        continue;
+                    };
                     let router = hr.lock().expect("http_router mutex poisoned").clone();
-                    tokio::spawn(serve_p2p_http_stream(peer_id, stream, router));
+                    tokio::spawn(async move {
+                        serve_p2p_http_stream(peer_id, stream, router).await;
+                        drop(slot);
+                    });
                 }
             });
         }
@@ -2464,6 +2574,10 @@ impl P2pTransport {
             );
             let mut bootstrap_backoff_state: std::collections::HashMap<PeerId, RedialBackoff> =
                 std::collections::HashMap::new();
+            // `P2pCommand::Stop`: no more redials, and the acknowledgement owed
+            // once the last connection has closed.
+            let mut bootstrap_redial_targets = bootstrap_redial_targets;
+            let mut stop_ack: Option<tokio::sync::oneshot::Sender<()>> = None;
             // Tracks this task's own in-flight DHT queries so the
             // `event = host.next_event()` arm below can recognize their
             // results as they stream in, without ever blocking this select
@@ -2514,6 +2628,29 @@ impl P2pTransport {
                     // lost, nothing ever redialed it — see this file's
                     // `redial_disconnected_bootstrap_peers` doc comment).
                     _ = bootstrap_redial_interval.tick() => {
+                        // go v5.1.1 `DialPeersUntilTargetCount` ->
+                        // `closeWithoutStream`: a connection we dialed that has
+                        // not set up a gossip stream in time gives its place to
+                        // another peer.
+                        let dialed: Vec<PeerId> = {
+                            let is_dialer = connection_is_dialer_for_task
+                                .lock()
+                                .expect("connection_is_dialer mutex poisoned");
+                            cp.lock()
+                                .expect("connected_peers mutex poisoned")
+                                .iter()
+                                .filter(|p| is_dialer.get(*p).copied().unwrap_or(false))
+                                .copied()
+                                .collect()
+                        };
+                        let stale = sp_for_task
+                            .lock()
+                            .expect("stream_peers mutex poisoned")
+                            .close_without_stream(&dialed, Instant::now(), STREAM_SETUP_TIMEOUT);
+                        for peer_id in stale {
+                            tracing::info!(%peer_id, "P2P: no gossip stream after {STREAM_SETUP_TIMEOUT:?}, closing the connection");
+                            host.disconnect_peer(peer_id);
+                        }
                         redial_disconnected_bootstrap_peers(
                             &mut host,
                             &bootstrap_redial_targets,
@@ -2847,6 +2984,14 @@ impl P2pTransport {
                                     &mut bootstrap_backoff_state,
                                     &bootstrap_redial_attempts_for_task,
                                 );
+                                if stop_ack.is_some()
+                                    && cp.lock().expect("connected_peers mutex poisoned").is_empty()
+                                {
+                                    if let Some(ack) = stop_ack.take() {
+                                        let _ = ack.send(());
+                                    }
+                                    break;
+                                }
                             }
                             SwarmEvent::Behaviour(P2pBehaviourEvent::Gossipsub(
                                 gossipsub::Event::Message {
@@ -2988,6 +3133,21 @@ impl P2pTransport {
                             }
                             Some(P2pCommand::DisconnectPeer(peer_id)) => {
                                 host.disconnect_peer(peer_id);
+                            }
+                            Some(P2pCommand::Stop(ack)) => {
+                                bootstrap_redial_targets.clear();
+                                let peers = cp
+                                    .lock()
+                                    .expect("connected_peers mutex poisoned")
+                                    .clone();
+                                if peers.is_empty() {
+                                    let _ = ack.send(());
+                                    break;
+                                }
+                                for peer_id in peers {
+                                    host.disconnect_peer(peer_id);
+                                }
+                                stop_ack = Some(ack);
                             }
                             None => break,
                         }
@@ -3520,7 +3680,15 @@ impl GossipNode for P2pTransport {
         Ok(())
     }
 
-    async fn stop(&self) {}
+    async fn stop(&self) {
+        // go `P2PNetwork.innerStop`: close the peers (releasing their
+        // identities) and end the swarm task. Bounded like go's
+        // `peerDisconnectionAckDuration`.
+        let (ack, done) = tokio::sync::oneshot::channel();
+        if self.cmd_tx.send(P2pCommand::Stop(ack)).is_ok() {
+            let _ = tokio::time::timeout(Duration::from_secs(5), done).await;
+        }
+    }
 
     fn register_handlers(&self, dispatch: Vec<TaggedMessageHandler>) {
         self.multiplexer.register_handlers(dispatch);
@@ -3602,9 +3770,22 @@ impl GossipNode for P2pTransport {
 /// connection" is a libp2p stream instead, adapted to `tokio`'s
 /// `AsyncRead`/`AsyncWrite` via `tokio_util::compat`.
 async fn serve_p2p_http_stream(peer_id: PeerId, stream: P2pRawStream, router: Router) {
-    let io = TokioIo::new(stream.compat());
+    serve_http_io(peer_id, stream.compat(), router, HTTP_SERVER_READ_TIMEOUT).await;
+}
+
+/// [`serve_p2p_http_stream`] over any byte stream, with the head of the request
+/// bounded by `header_read_timeout` (go v5.1.1 gives an inbound stream a 10 s
+/// read deadline counted from its opening, so a peer that opens a stream and
+/// never sends a request cannot hold it, and its per-peer slot, forever).
+async fn serve_http_io<S>(peer_id: PeerId, io: S, router: Router, header_read_timeout: Duration)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let io = TokioIo::new(io);
     let hyper_svc = TowerToHyperService::new(router);
     if let Err(e) = hyper::server::conn::http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(header_read_timeout)
         .serve_connection(io, hyper_svc)
         .await
     {
@@ -6348,5 +6529,100 @@ mod tests {
             "no connection was closed"
         );
         drop(dialer);
+    }
+
+    /// go v5.1.1 `TestStream_CloseWaitsForHandlers` / `TestP2PPeerSweep`
+    /// (#2554): `stop` closes the peers, gives back their identities and ends
+    /// the swarm task before it returns. It used to do nothing: the transport
+    /// kept its connections, claims and tasks after "stop".
+    #[tokio::test]
+    async fn stop_closes_the_peers_and_releases_the_identities_before_returning() {
+        let (listener, dialer) = connected_pair().await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (listener.connected_peer_count() == 0 || listener.stream_peer_count() == 0)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let counter = Arc::new(ReleaseCounter::default());
+        listener.set_identity_dedup_hook(counter.clone());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            GossipNode::stop(&listener),
+        )
+        .await
+        .expect("stop returns");
+        assert_eq!(listener.connected_peer_count(), 0);
+        assert_eq!(listener.stream_peer_count(), 0);
+        assert!(counter.0.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        // the swarm task has ended: a second stop returns at once
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            GossipNode::stop(&listener),
+        )
+        .await
+        .expect("second stop returns at once");
+        drop(dialer);
+    }
+
+    // go v5.1.1 stream limits (#2554): per-peer inbound caps and the HTTP
+    // request read timeout.
+
+    #[test]
+    fn per_peer_limit_caps_one_peer_and_frees_slots_on_drop() {
+        let limit = PerPeerLimit::default();
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let held: Vec<_> = (0..HTTP_STREAMS_INBOUND_PER_PEER)
+            .map(|_| {
+                limit
+                    .acquire(a, HTTP_STREAMS_INBOUND_PER_PEER)
+                    .expect("slot")
+            })
+            .collect();
+        assert!(limit.acquire(a, HTTP_STREAMS_INBOUND_PER_PEER).is_none());
+        // another peer is not affected
+        assert!(limit.acquire(b, HTTP_STREAMS_INBOUND_PER_PEER).is_some());
+        drop(held);
+        assert!(limit.acquire(a, HTTP_STREAMS_INBOUND_PER_PEER).is_some());
+    }
+
+    #[test]
+    fn stream_limits_match_go() {
+        assert_eq!(GOSSIP_STREAMS_INBOUND_PER_PEER, 2);
+        assert_eq!(HTTP_STREAMS_INBOUND_PER_PEER, 32);
+        assert_eq!(HTTP_SERVER_READ_TIMEOUT, Duration::from_secs(10));
+    }
+
+    /// A peer that opens an HTTP stream and stalls in the middle of its request
+    /// does not hold it: the stream is closed once the read timeout passes.
+    #[tokio::test]
+    async fn stalled_http_request_is_closed_after_the_read_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut client, server) = tokio::io::duplex(4096);
+        let served = tokio::spawn(serve_http_io(
+            PeerId::random(),
+            server,
+            Router::new(),
+            Duration::from_millis(200),
+        ));
+        client
+            .write_all(b"GET /x HTTP/1.1\r\nHost: p")
+            .await
+            .unwrap();
+        // no more bytes: the server must give up and close its side
+        let mut buf = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut buf))
+            .await
+            .expect("the stalled stream was not closed");
+        assert!(read.is_ok());
+        tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .expect("the serve task ended")
+            .unwrap();
+    }
+
+    #[test]
+    fn stream_setup_timeout_matches_go() {
+        assert_eq!(STREAM_SETUP_TIMEOUT, Duration::from_secs(30));
     }
 }

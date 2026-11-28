@@ -173,6 +173,17 @@ pub async fn read_http_response_head(
         if let Some(pos) = find_header_terminator(&buf) {
             let head = &buf[..pos];
             let body_start = pos + 4;
+            // go v5.1.1 `maxResponseHeaderBytes`: the status line and headers
+            // may not exceed 64 KiB, whatever the read chunking.
+            if body_start > MAX_HEADER_BYTES {
+                return Err(AlgoError::RestClient {
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("response headers exceeded {MAX_HEADER_BYTES} bytes"),
+                    )),
+                    context: "reading HTTP response head over P2P stream".into(),
+                });
+            }
             let prefetched_body = buf[body_start..].to_vec();
             let (status, headers) = parse_head(head)?;
             return Ok(RawHttpResponseHead {
@@ -332,6 +343,28 @@ mod tests {
         let mut boxed: BoxedDuplexStream = Box::new(client);
         let result = read_http_response_head(&mut boxed).await;
         assert!(result.is_err());
+    }
+
+    /// go v5.1.1 `maxResponseHeaderBytes` (#2554): a response head of more than
+    /// 64 KiB is refused even when its terminator arrives in the same read.
+    #[tokio::test]
+    async fn read_http_response_head_enforces_the_64_kib_head_limit() {
+        async fn head_of(len: usize) -> Result<RawHttpResponseHead> {
+            let (client, mut server) = duplex(256 * 1024);
+            let mut head = b"HTTP/1.1 200 OK\r\nX-Pad: ".to_vec();
+            let pad = len - head.len() - 4;
+            head.extend(std::iter::repeat_n(b'a', pad));
+            head.extend_from_slice(b"\r\n\r\n");
+            assert_eq!(head.len(), len);
+            tokio::spawn(async move {
+                server.write_all(&head).await.unwrap();
+            });
+            let mut boxed: BoxedDuplexStream = Box::new(client);
+            read_http_response_head(&mut boxed).await
+        }
+        assert!(head_of(MAX_HEADER_BYTES).await.is_ok());
+        assert!(head_of(MAX_HEADER_BYTES + 1).await.is_err());
+        assert!(head_of(MAX_HEADER_BYTES + 3000).await.is_err());
     }
 
     #[tokio::test]
