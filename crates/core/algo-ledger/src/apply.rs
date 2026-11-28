@@ -4635,6 +4635,11 @@ pub fn apply_transaction_with_tracer<L: crate::store_trait::LedgerStore>(
     apply_transaction_inner(store, stx, ctx, depth, None, None, None, Some(tracer))
 }
 
+/// The start of the generate-only cross-type lookup failure (go's `noteMiss`
+/// text). It leaves apply bare, as go's `BlockEvaluator.transaction` frames it
+/// (`transaction <txid>: ...`) in its caller; simulate frames it on that prefix.
+pub const CROSS_TYPE_LOOKUP_PREFIX: &str = "cannot look up ";
+
 /// Core transaction application logic, shared by `apply_transaction`,
 /// `apply_transaction_with_tracer`, and `apply_transaction_with_budget`.
 ///

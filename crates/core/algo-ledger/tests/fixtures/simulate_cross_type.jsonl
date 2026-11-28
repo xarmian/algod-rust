@@ -1,0 +1,9 @@
+{"name":"app_id_looked_up_as_an_asset_it_holds","failed_at":[0],"failure_message":"transaction $TXID0: cannot look up $A's app 1001 as an asset"}
+{"name":"asset_id_looked_up_as_an_app_it_holds","failed_at":[0],"failure_message":"transaction $TXID0: cannot look up $A's asset 1003 as an app"}
+{"name":"asset_id_created_by_the_sender_looked_up_as_an_app","failed_at":[0],"failure_message":"transaction $TXID0: cannot look up $A's asset 1005 as an app"}
+{"name":"id_of_the_type_asked_for_is_an_ordinary_miss","failed_at":[],"failure_message":""}
+{"name":"other_account_does_not_hold_the_id","failed_at":[],"failure_message":""}
+{"name":"held_as_the_type_asked_for_is_a_hit","failed_at":[],"failure_message":""}
+{"name":"id_above_the_counter","failed_at":[],"failure_message":""}
+{"name":"second_txn_of_a_group_after_clear_state_removed_the_local_state","failed_at":[1],"failure_message":"transaction $TXID1: cannot look up $A's app 1001 as an asset"}
+{"name":"second_txn_of_a_group_after_a_clean_first","failed_at":[1],"failure_message":"transaction $TXID1: cannot look up $A's asset 1003 as an app"}

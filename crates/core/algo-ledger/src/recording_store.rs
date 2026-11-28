@@ -92,6 +92,21 @@ pub(crate) struct ResourceTouches {
 pub(crate) struct RecordingStore<'a, L: LedgerStore> {
     inner: &'a mut L,
     pub touches: ResourceTouches,
+    /// Set by [`Self::with_cross_type_base`]: the simulator's generate-only
+    /// cross-type check (go `roundCowBase.noteMiss`, issue #2606).
+    cross: Option<CrossTypeWatch>,
+}
+
+/// State of go's `roundCowBase.watchCrossType` / `crossTypeHit` for a store
+/// whose "base" is itself: a read reaches go's base exactly when no earlier
+/// write of this evaluation touched the key (`touches`), and the base value
+/// is then the live value, or the recorded pre-touch value for the other
+/// type's key.
+struct CrossTypeWatch {
+    /// The base's transaction counter (go `roundCowBase.txnCount`).
+    base_txn_counter: u64,
+    watching: std::cell::Cell<bool>,
+    hit: std::cell::RefCell<Option<String>>,
 }
 
 impl<'a, L: LedgerStore> RecordingStore<'a, L> {
@@ -99,6 +114,96 @@ impl<'a, L: LedgerStore> RecordingStore<'a, L> {
         Self {
             inner,
             touches: ResourceTouches::default(),
+            cross: None,
+        }
+    }
+
+    /// Wrap `inner` for one simulated transaction: `touches` carries what the
+    /// earlier transactions of the group wrote (see [`Self::into_touches`]) and
+    /// the store answers `watch_cross_types` itself, treating the state before
+    /// the group as go's base (`base_txn_counter` is its transaction counter).
+    pub fn with_cross_type_base(
+        inner: &'a mut L,
+        touches: ResourceTouches,
+        base_txn_counter: u64,
+    ) -> Self {
+        Self {
+            inner,
+            touches,
+            cross: Some(CrossTypeWatch {
+                base_txn_counter,
+                watching: std::cell::Cell::new(false),
+                hit: std::cell::RefCell::new(None),
+            }),
+        }
+    }
+
+    /// The writes recorded so far, to carry into the next transaction's store.
+    pub fn into_touches(self) -> ResourceTouches {
+        self.touches
+    }
+
+    /// go `noteMiss`: a read of `addr`'s `id` as one type found nothing and
+    /// reached the base (the key was never written by this evaluation).
+    fn note_miss(&self, addr: &Address, id: u64, is_app: bool) {
+        let Some(cross) = &self.cross else { return };
+        if !cross.watching.get() || cross.hit.borrow().is_some() {
+            return;
+        }
+        let message = crate::pending_overlay::cross_type_miss(
+            addr,
+            id,
+            is_app,
+            cross.base_txn_counter,
+            || {
+                if is_app {
+                    self.base_app_params(id).is_some()
+                } else {
+                    self.base_asset_params(id).is_some()
+                }
+            },
+            || {
+                if is_app {
+                    self.base_asset_holding(addr, id).is_some()
+                        || self
+                            .base_asset_params(id)
+                            .is_some_and(|r| r.creator == *addr)
+                } else {
+                    self.base_app_local_state(addr, id).is_some()
+                        || self.base_app_params(id).is_some_and(|p| p.creator == *addr)
+                }
+            },
+        );
+        if message.is_some() {
+            *cross.hit.borrow_mut() = message;
+        }
+    }
+
+    fn base_asset_holding(&self, addr: &Address, id: u64) -> Option<AssetHolding> {
+        match self.touches.asset_holdings.get(&(*addr, id)) {
+            Some(pre) => pre.clone(),
+            None => self.inner.get_asset_holding(addr, id),
+        }
+    }
+
+    fn base_asset_params(&self, id: u64) -> Option<AssetParamsRecord> {
+        match self.touches.asset_params.get(&id) {
+            Some(pre) => pre.clone(),
+            None => self.inner.get_asset_params(id),
+        }
+    }
+
+    fn base_app_params(&self, id: u64) -> Option<AppParams> {
+        match self.touches.app_params.get(&id) {
+            Some(pre) => pre.clone(),
+            None => self.inner.get_app_params(id),
+        }
+    }
+
+    fn base_app_local_state(&self, addr: &Address, id: u64) -> Option<AppLocalState> {
+        match self.touches.app_local_states.get(&(*addr, id)) {
+            Some(pre) => pre.clone(),
+            None => self.inner.get_app_local_state(addr, id),
         }
     }
 }
@@ -127,15 +232,31 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
     // ---- Asset Holdings ----
 
     fn watch_cross_types(&self) {
-        self.inner.watch_cross_types()
+        match &self.cross {
+            Some(cross) => {
+                cross.watching.set(true);
+                *cross.hit.borrow_mut() = None;
+            }
+            None => self.inner.watch_cross_types(),
+        }
     }
 
     fn stop_watching_cross_types(&self) -> Option<String> {
-        self.inner.stop_watching_cross_types()
+        match &self.cross {
+            Some(cross) => {
+                cross.watching.set(false);
+                cross.hit.borrow_mut().take()
+            }
+            None => self.inner.stop_watching_cross_types(),
+        }
     }
 
     fn get_asset_holding(&self, addr: &Address, asset_id: u64) -> Option<AssetHolding> {
-        self.inner.get_asset_holding(addr, asset_id)
+        let held = self.inner.get_asset_holding(addr, asset_id);
+        if held.is_none() && !self.touches.asset_holdings.contains_key(&(*addr, asset_id)) {
+            self.note_miss(addr, asset_id, false);
+        }
+        held
     }
 
     fn set_asset_holding(&mut self, addr: &Address, asset_id: u64, holding: AssetHolding) {
@@ -206,7 +327,11 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
     // ---- App Local States ----
 
     fn get_app_local_state(&self, addr: &Address, app_id: u64) -> Option<AppLocalState> {
-        self.inner.get_app_local_state(addr, app_id)
+        let state = self.inner.get_app_local_state(addr, app_id);
+        if state.is_none() && !self.touches.app_local_states.contains_key(&(*addr, app_id)) {
+            self.note_miss(addr, app_id, true);
+        }
+        state
     }
 
     fn set_app_local_state(&mut self, addr: &Address, app_id: u64, local_state: AppLocalState) {
@@ -444,7 +569,13 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
     }
 
     fn has_asset_holding(&self, addr: &Address, asset_id: u64) -> bool {
-        self.inner.has_asset_holding(addr, asset_id)
+        // An existence probe is a lookup too: go's `OptedIn` / holding checks
+        // go through `lookupAssetHolding` and so may note a miss.
+        let has = self.inner.has_asset_holding(addr, asset_id);
+        if !has && !self.touches.asset_holdings.contains_key(&(*addr, asset_id)) {
+            self.note_miss(addr, asset_id, false);
+        }
+        has
     }
 
     fn has_asset_params(&self, asset_id: u64) -> bool {
@@ -456,7 +587,12 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
     }
 
     fn has_app_local_state(&self, addr: &Address, app_id: u64) -> bool {
-        self.inner.has_app_local_state(addr, app_id)
+        // See `has_asset_holding`: `app_opted_in` reaches this.
+        let has = self.inner.has_app_local_state(addr, app_id);
+        if !has && !self.touches.app_local_states.contains_key(&(*addr, app_id)) {
+            self.note_miss(addr, app_id, true);
+        }
+        has
     }
 
     fn box_len(&self, app_id: u64, key: &[u8]) -> Option<usize> {

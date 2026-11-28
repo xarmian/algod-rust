@@ -438,42 +438,67 @@ impl<'a, B: OverlayBase + ?Sized> OverlayStore<'a, B> {
         if !self.watch_cross_type.get() || self.cross_type_hit.borrow().is_some() {
             return;
         }
-        if id > self.base.base_txn_counter() {
-            return;
-        }
-        let known = if is_app {
-            self.base.base_get_app_params(id).is_some()
-        } else {
-            self.base.base_get_asset_params(id).is_some()
-        };
-        if known {
-            return;
-        }
-        // The other type's resource: params (the account created it) or the
-        // holding / local state.
-        let held = if is_app {
-            self.base.base_get_asset_holding(addr, id).is_some()
-                || self
-                    .base
-                    .base_get_asset_params(id)
-                    .is_some_and(|r| r.creator == *addr)
-        } else {
-            self.base.base_get_app_local_state(addr, id).is_some()
-                || self
-                    .base
-                    .base_get_app_params(id)
-                    .is_some_and(|p| p.creator == *addr)
-        };
-        if held {
-            let (other, wanted) = if is_app {
-                ("asset", "an app")
-            } else {
-                ("app", "an asset")
-            };
-            *self.cross_type_hit.borrow_mut() =
-                Some(format!("cannot look up {addr}'s {other} {id} as {wanted}"));
+        let base = &self.base;
+        let message = cross_type_miss(
+            addr,
+            id,
+            is_app,
+            base.base_txn_counter(),
+            || {
+                if is_app {
+                    base.base_get_app_params(id).is_some()
+                } else {
+                    base.base_get_asset_params(id).is_some()
+                }
+            },
+            || {
+                // The other type's resource: params (the account created it)
+                // or the holding / local state.
+                if is_app {
+                    base.base_get_asset_holding(addr, id).is_some()
+                        || base
+                            .base_get_asset_params(id)
+                            .is_some_and(|r| r.creator == *addr)
+                } else {
+                    base.base_get_app_local_state(addr, id).is_some()
+                        || base
+                            .base_get_app_params(id)
+                            .is_some_and(|p| p.creator == *addr)
+                }
+            },
+        );
+        if message.is_some() {
+            *self.cross_type_hit.borrow_mut() = message;
         }
     }
+}
+
+/// go `roundCowBase.noteMiss`'s decision, shared by every store that has a
+/// base to consult (`OverlayStore`, and the simulator's recording store): a
+/// lookup of `addr`'s resource `id` as one creatable type (`is_app`) reached
+/// the base and found nothing. Returns go's error text when `addr` held `id`
+/// as the other type as of the base round. IDs above the base's transaction
+/// counter cannot be held at all (go's `absent`), and an id the base knows as
+/// the type asked for cannot be held as the other (go's `knownAs`: one
+/// counter assigns both). `known` (the id exists as the type asked for) and
+/// `held` (`addr` holds it as the other type) are asked lazily, in that order.
+pub(crate) fn cross_type_miss(
+    addr: &Address,
+    id: u64,
+    is_app: bool,
+    base_txn_counter: u64,
+    known: impl FnOnce() -> bool,
+    held: impl FnOnce() -> bool,
+) -> Option<String> {
+    if id > base_txn_counter || known() || !held() {
+        return None;
+    }
+    let (other, wanted) = if is_app {
+        ("asset", "an app")
+    } else {
+        ("app", "an asset")
+    };
+    Some(format!("cannot look up {addr}'s {other} {id} as {wanted}"))
 }
 
 macro_rules! put {
