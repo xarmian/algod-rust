@@ -44,5 +44,5 @@ pub use elastic_rate_limiter::{
 };
 pub use error::{classify_pool_error, PoolError, PoolErrorTag};
 pub use metrics::TxPoolReevalCounter;
-pub use pool::TransactionPool;
+pub use pool::{AssembleBlockStats, AssembleStopReason, TransactionPool};
 pub use status_cache::StatusCache;

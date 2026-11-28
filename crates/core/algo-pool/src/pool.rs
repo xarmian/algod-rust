@@ -50,9 +50,68 @@ pub struct TxnLocation {
     pub intra_index: usize,
 }
 
+/// Why block assembly stopped, go's `telemetryspec.AssembleBlock*` stop
+/// reasons (`logging/telemetryspec/metric.go`, issue #2626).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssembleStopReason {
+    /// The assembly deadline passed while evaluating the pending groups.
+    Timeout,
+    /// `AssembleBlock` gave up after the deadline and returned an empty block.
+    TimeoutEmpty,
+    /// The block was full.
+    Full,
+    /// Every pending group fit: no more transactions.
+    Empty,
+    /// The pool was more than two rounds behind the request.
+    PoolBehind,
+    /// The assembled block was a round too old.
+    EvalOld,
+    /// The block generation was abandoned since it is not needed.
+    Abandon,
+    /// An empty block was assembled because the pending evaluator could not
+    /// generate one.
+    GenerationError,
+    /// An empty block was assembled because no local account could propose in
+    /// the round and `GenerateBlock` was skipped.
+    NoProposers,
+}
+
+impl AssembleStopReason {
+    /// go's constant value (`AssembleBlockFull` is `"block-full"`, ...).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::TimeoutEmpty => "timeout-empty",
+            Self::Full => "block-full",
+            Self::Empty => "pool-empty",
+            Self::PoolBehind => "pool-behind",
+            Self::EvalOld => "eval-old",
+            Self::Abandon => "block-abandon",
+            Self::GenerationError => "generation-error",
+            Self::NoProposers => "no-proposers",
+        }
+    }
+}
+
+/// The part of go's `telemetryspec.AssembleBlockMetrics` the pool computes
+/// while it re-evaluates its pending groups (issue #2626).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AssembleBlockStats {
+    /// Why assembly stopped (go's `StopReason`; `None` is go's empty string).
+    pub stop_reason: Option<AssembleStopReason>,
+    /// Number of pending groups re-evaluated (`StartCount`).
+    pub start_count: usize,
+    /// Groups pending in the pool that an earlier block already included
+    /// (`EarlyCommittedCount`).
+    pub early_committed_count: u64,
+}
+
 /// Results of an asynchronous block-assembly attempt.
 #[derive(Default)]
 struct AssemblyResults {
+    /// Stats of the assembly (go's `assemblyResults.stats`).
+    stats: AssembleBlockStats,
     /// Whether assembly completed (or was abandoned).
     ok: bool,
     /// The generated block, if successful.
@@ -139,6 +198,10 @@ struct PoolInner {
     /// [`TransactionPool::remember_verified`] and the recompute loop.
     groups_pre_verified: bool,
 
+    /// Stats of the recompute in progress (`Some` only inside
+    /// `recompute_block_evaluator`'s loop, go's `recomputing` flag).
+    recompute_stats: Option<AssembleBlockStats>,
+
     /// A panic of the evaluator was recovered and left it half-applied: it
     /// refuses further work until it is rebuilt (go `ErrEvaluatorCorruptedState`).
     evaluator_corrupted: bool,
@@ -169,6 +232,15 @@ struct PendingState {
 
     /// All pending transaction IDs mapped to their signed txn.
     txids: HashMap<Digest, SignedTransaction>,
+}
+
+/// Whether an evaluator error is "the block is full": go's
+/// `ledgercore.ErrNoSpace` (`block does not have space for transaction`), which
+/// the pool answers by starting another pending block.
+fn is_no_space_text(text: &str) -> bool {
+    text.contains("does not have space for transaction")
+        || text.contains("no space")
+        || text.contains("NoSpace")
 }
 
 /// The [`PoolError`] for an evaluator's rejection `e` of a group. A lease
@@ -283,6 +355,7 @@ impl TransactionPool {
             reprime_attempt: None,
             last_rebuild_error: None,
             groups_pre_verified: false,
+            recompute_stats: None,
             evaluator_corrupted: false,
             num_pending_whole_blocks: 0,
             fee_threshold_multiplier: 0,
@@ -740,6 +813,11 @@ impl TransactionPool {
         inner.remembered_txids = HashMap::new();
 
         // Re-feed surviving transactions through the new evaluator.
+        inner.recompute_stats = Some(AssembleBlockStats {
+            start_count: txgroups.len(),
+            stop_reason: Some(AssembleStopReason::Empty),
+            ..Default::default()
+        });
         for txgroup in &txgroups {
             if txgroup.is_empty() {
                 continue;
@@ -749,6 +827,9 @@ impl TransactionPool {
             // In Go, committed txids are checked by the first txn in the group.
             let first_txid = compute_txn_id(&txgroup[0].txn);
             if committed_txids.contains(&first_txid) {
+                if let Some(stats) = inner.recompute_stats.as_mut() {
+                    stats.early_committed_count += 1;
+                }
                 // Record committed transactions in the status cache
                 // with an empty error string (meaning "confirmed").
                 for txn in txgroup {
@@ -775,7 +856,9 @@ impl TransactionPool {
         }
 
         // After re-feeding all txns, generate the block if assembly is
-        // waiting for this round.  Mirrors Go lines 797-819.
+        // waiting for this round and a full block or the deadline has not
+        // generated it already.  Mirrors Go lines 797-819.
+        let stats = inner.recompute_stats.take().unwrap_or_default();
         {
             let mut asm = self.assembly_mu.lock();
             if let Some(ref mut evaluator) = inner.evaluator {
@@ -794,6 +877,7 @@ impl TransactionPool {
                             asm.results.err = Some(e);
                         }
                     }
+                    asm.results.stats = stats;
                     self.assembly_cond.notify_all();
                 }
             }
@@ -806,6 +890,63 @@ impl TransactionPool {
 
         // Flush remembered (surviving) groups into pending, replacing old state.
         self.remember_commit(inner, true);
+    }
+
+    /// go `addToPendingBlockEvaluatorOnce`'s `recomputing` epilogue: after a
+    /// group went through the evaluator, finish the assembly an `AssembleBlock`
+    /// is waiting for as soon as the block is full (`no_space`) or the deadline
+    /// is near (`TransactionPool.isAssemblyTimedOut`), generating the block from
+    /// what the evaluator holds then, and drop it when the request is for a
+    /// later round than the evaluator's (issue #2626). The groups that come
+    /// after still go through the evaluator, for the pool's own state.
+    fn assembly_checkpoint(&self, inner: &mut PoolInner, no_space: bool) {
+        let (Some(evaluator), Some(stats)) =
+            (inner.evaluator.as_mut(), inner.recompute_stats.as_mut())
+        else {
+            return;
+        };
+        let mut asm = self.assembly_mu.lock();
+        if asm.results.assembly_completed_or_abandoned {
+            return;
+        }
+        let eval_rnd = evaluator.round();
+        if asm.round > eval_rnd {
+            // The block being assembled is not the one AssembleBlock waits
+            // for: finish the loop quickly, a block would not be used.
+            asm.results.ok = true;
+            asm.results.assembly_completed_or_abandoned = true;
+            stats.stop_reason = Some(AssembleStopReason::Abandon);
+            asm.results.stats = stats.clone();
+            self.assembly_cond.notify_all();
+            return;
+        }
+        let timed_out = !no_space
+            && asm.deadline.is_some_and(|deadline| {
+                Self::is_assembly_timed_out(
+                    Instant::now(),
+                    deadline,
+                    self.config.generate_block_base_duration,
+                    self.config.generate_block_transaction_duration,
+                    evaluator.pay_set_size(),
+                )
+            });
+        if !(no_space || timed_out) {
+            return;
+        }
+        asm.results.ok = true;
+        asm.results.assembly_completed_or_abandoned = true;
+        stats.stop_reason = Some(if no_space {
+            AssembleStopReason::Full
+        } else {
+            AssembleStopReason::Timeout
+        });
+        let proposers = self.voting_accounts_for_round(eval_rnd).unwrap_or_default();
+        match evaluator.generate_block(&proposers) {
+            Ok(block) => asm.results.block = Some(block),
+            Err(e) => asm.results.err = Some(e),
+        }
+        asm.results.stats = stats.clone();
+        self.assembly_cond.notify_all();
     }
 
     /// Feed a transaction group to the pending block evaluator, handling
@@ -827,8 +968,7 @@ impl TransactionPool {
         match self.add_to_pending_block_evaluator_once(txgroup, inner) {
             Ok(()) => Ok(()),
             Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("no space") || err_str.contains("NoSpace") {
+                if is_no_space_text(&e.to_string()) {
                     inner.num_pending_whole_blocks += 1;
                     let txn_bytes = inner
                         .evaluator
@@ -897,11 +1037,16 @@ impl TransactionPool {
             return Err(PoolError::NoPendingBlockEvaluator);
         };
         let round = evaluator.round();
+        let recomputing = inner.recompute_stats.is_some();
         // go's evaluator recovers a panic into `EvalPanicError` and refuses
         // further work afterwards (`ErrEvaluatorCorruptedState`).
         let fed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             evaluator.transaction_group(txgroup)
         }));
+        if recomputing {
+            let no_space = matches!(&fed, Ok(Err(e)) if is_no_space_text(&e.to_string()));
+            self.assembly_checkpoint(inner, no_space);
+        }
         match fed {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
@@ -1312,7 +1457,8 @@ impl TransactionPool {
     /// telemetryspec.AssembleBlockMetrics{...}, ...)` call in
     /// `AssembleBlock()` (`../go-algorand/data/pools/transactionPool.go:839`).
     pub fn assemble_block(&self, round: Round, deadline: Instant) -> Result<Block, PoolError> {
-        let result = self.assemble_block_inner(round, deadline);
+        let mut stop_reason = None;
+        let result = self.assemble_block_inner(round, deadline, &mut stop_reason);
         // Reset the deadline on return so that a later round's recompute does
         // not see an expired deadline and cut its block short (go's
         // `defer func() { pool.assemblyDeadline = time.Time{} }()`).
@@ -1326,7 +1472,7 @@ impl TransactionPool {
         }
         if self.config.enable_assemble_stats {
             if let Ok(ref block) = result {
-                self.emit_assemble_block_stats(round, block);
+                self.emit_assemble_block_stats(round, block, stop_reason);
             }
         }
         result
@@ -1352,13 +1498,20 @@ impl TransactionPool {
     /// verification context for it (mirroring go's `err != nil` early
     /// return leaving `ProvenWeight: 0`), only the coarser
     /// `state_proof_txn_count` is emitted.
-    fn emit_assemble_block_stats(&self, round: Round, block: &Block) {
+    fn emit_assemble_block_stats(
+        &self,
+        round: Round,
+        block: &Block,
+        stop_reason: Option<AssembleStopReason>,
+    ) {
+        let stop_reason = stop_reason.map_or("", AssembleStopReason::as_str);
         let payset = &block.payset;
         if payset.is_empty() {
             tracing::info!(
                 target: "algo_pool::assemble_block_stats",
                 round = round.0,
                 included_count = 0u64,
+                stop_reason,
                 "assemble_block_stats"
             );
             return;
@@ -1439,6 +1592,7 @@ impl TransactionPool {
                 target: "algo_pool::assemble_block_stats",
                 round = round.0,
                 included_count,
+                stop_reason,
                 min_fee,
                 max_fee,
                 average_fee,
@@ -1459,6 +1613,7 @@ impl TransactionPool {
             target: "algo_pool::assemble_block_stats",
             round = round.0,
             included_count,
+            stop_reason,
             min_fee,
             max_fee,
             average_fee,
@@ -1470,13 +1625,20 @@ impl TransactionPool {
         );
     }
 
-    fn assemble_block_inner(&self, round: Round, deadline: Instant) -> Result<Block, PoolError> {
+    /// `stop_reason` is go's `stats.StopReason` of this call (issue #2626).
+    fn assemble_block_inner(
+        &self,
+        round: Round,
+        deadline: Instant,
+        stop_reason: &mut Option<AssembleStopReason>,
+    ) -> Result<Block, PoolError> {
         {
             let mut asm = self.assembly_mu.lock();
 
             // If the pool is more than two rounds behind, assemble an empty block.
             if asm.results.round_started_evaluating <= round.sub_saturate(2) {
                 drop(asm);
+                *stop_reason = Some(AssembleStopReason::PoolBehind);
                 return self.assemble_empty_block(round);
             }
 
@@ -1525,6 +1687,7 @@ impl TransactionPool {
                 if !asm.results.ok {
                     // Still no full block — return the empty block.
                     asm.deadline = None;
+                    *stop_reason = Some(AssembleStopReason::TimeoutEmpty);
                     return empty_result;
                 }
                 // Fall through — re-acquire the lock below to extract results.
@@ -1538,10 +1701,15 @@ impl TransactionPool {
         asm.deadline = None;
 
         if let Some(ref e) = asm.results.err {
-            return Err(PoolError::Evaluator(format!(
-                "AssembleBlock: encountered error for round {}: {}",
-                round, e
-            )));
+            // go: warn, then assemble an empty block instead.
+            tracing::warn!(
+                round = round.0,
+                error = %e,
+                "AssembleBlock: encountered error, assembling empty block instead"
+            );
+            drop(asm);
+            *stop_reason = Some(AssembleStopReason::GenerationError);
+            return self.assemble_empty_block(round);
         }
 
         if asm.results.round_started_evaluating > round {
@@ -1549,6 +1717,7 @@ impl TransactionPool {
         } else if asm.results.round_started_evaluating == round.sub_saturate(1) {
             // Assembled block didn't catch up to requested round.
             drop(asm);
+            *stop_reason = Some(AssembleStopReason::EvalOld);
             return self.assemble_empty_block(round);
         } else if asm.results.round_started_evaluating < round {
             return Err(PoolError::Evaluator(format!(
@@ -1562,10 +1731,12 @@ impl TransactionPool {
             // this round, so this rare case only happens if a key was added
             // between the pool's recompute and agreement asking for keys.
             drop(asm);
+            *stop_reason = Some(AssembleStopReason::NoProposers);
             return self.assemble_empty_block(round);
         }
 
         // Success — return the assembled block.
+        *stop_reason = asm.results.stats.stop_reason;
         asm.results
             .block
             .clone()
@@ -3691,7 +3862,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(layer);
 
         tracing::subscriber::with_default(subscriber, || {
-            pool.emit_assemble_block_stats(Round(1), &block);
+            pool.emit_assemble_block_stats(Round(1), &block, None);
         });
 
         let events = captured.lock();
@@ -4638,6 +4809,287 @@ mod tests {
                 _ => assert_eq!(calls, vec![Vec::<Address>::new()], "{name}"),
             }
         }
+    }
+
+    // ---- go v5.1.1 stop reasons and small-block overflow (#2626) ----------
+
+    /// Every `generate_block` call: the addresses it got and how many
+    /// transactions the evaluator held then.
+    #[derive(Default)]
+    struct SizedLog {
+        gens: std::sync::Mutex<Vec<(Vec<Address>, usize)>>,
+    }
+
+    /// An evaluator whose block holds `max_bytes` of encoded transactions: a
+    /// group that does not fit gets go's `ErrNoSpace` and nothing is added, and
+    /// `reset_txn_bytes` clears the count as go's `ResetTxnBytes` does, so the
+    /// pool can keep feeding groups into the following pending blocks.
+    struct SizedEvaluator {
+        round: Round,
+        log: Arc<SizedLog>,
+        max_bytes: usize,
+        bytes: usize,
+        payset: usize,
+        total: usize,
+    }
+
+    impl BlockEvaluator for SizedEvaluator {
+        fn round(&self) -> Round {
+            self.round
+        }
+        fn pay_set_size(&self) -> usize {
+            self.total
+        }
+        fn test_transaction_group(&self, _g: &[SignedTransaction]) -> Result<(), AlgoError> {
+            Ok(())
+        }
+        fn transaction_group(&mut self, g: &[SignedTransaction]) -> Result<(), AlgoError> {
+            let size: usize = g
+                .iter()
+                .map(|t| algo_codec::canonical_encode_signed_transaction(t).len())
+                .sum();
+            if self.bytes + size > self.max_bytes {
+                return Err(AlgoError::Ledger {
+                    message: "block does not have space for transaction".to_string(),
+                });
+            }
+            self.bytes += size;
+            self.payset += g.len();
+            self.total += g.len();
+            Ok(())
+        }
+        fn generate_block(&mut self, voting_accounts: &[Address]) -> Result<Block, AlgoError> {
+            self.log
+                .gens
+                .lock()
+                .unwrap()
+                .push((voting_accounts.to_vec(), self.payset));
+            Ok(Block {
+                round: self.round,
+                ..Block::default()
+            })
+        }
+        fn reset_txn_bytes(&mut self) -> usize {
+            // the groups that follow still count, but not in this block
+            self.payset = 0;
+            std::mem::take(&mut self.bytes)
+        }
+        fn restore_txn_bytes(&mut self, n: usize) {
+            self.bytes = n;
+        }
+    }
+
+    struct SizedLedger {
+        log: Arc<SizedLog>,
+        max_bytes: usize,
+    }
+
+    impl PoolLedger for SizedLedger {
+        fn latest(&self) -> Round {
+            Round(1)
+        }
+        fn block_hdr(&self, _round: Round) -> Result<BlockHeader, AlgoError> {
+            Ok(BlockHeader::default())
+        }
+        fn consensus_params(&self, _round: Round) -> Result<ConsensusParams, AlgoError> {
+            Ok(ConsensusParams::default())
+        }
+        fn start_evaluator(
+            &self,
+            _hdr: BlockHeader,
+            _hint: usize,
+            _max: usize,
+        ) -> Result<Box<dyn BlockEvaluator>, AlgoError> {
+            Ok(Box::new(SizedEvaluator {
+                round: Round(2),
+                log: self.log.clone(),
+                max_bytes: self.max_bytes,
+                bytes: 0,
+                payset: 0,
+                total: 0,
+            }))
+        }
+    }
+
+    /// go `TestPoolBlockGeneration` (v5.1.1): over a block that holds ten of
+    /// the pool's transactions, the scenarios `empty` (nothing pending),
+    /// `partial` (two), `full` (thirty) and `timeout` (the deadline passed) with
+    /// the three suppliers; every scenario's `AssembleBlockStats.StopReason`, the
+    /// number of key lookups, the evaluator keeping every group and the pool's
+    /// pending state unchanged are checked as in go.
+    #[test]
+    fn pool_block_generation_stop_reasons_over_a_small_block() {
+        let proposer = Address([5; 32]);
+        let unit = algo_codec::canonical_encode_signed_transaction(&make_test_txn(0)).len();
+        for (name, count, timeout, reason) in [
+            ("empty", 0usize, false, AssembleStopReason::Empty),
+            ("partial", 2, false, AssembleStopReason::Empty),
+            ("full", 30, false, AssembleStopReason::Full),
+            ("timeout", 2, true, AssembleStopReason::Timeout),
+        ] {
+            for supplier in ["noKeys", "voting", "unspecified"] {
+                let case = format!("{name}/{supplier}");
+                let log = Arc::new(SizedLog::default());
+                let ledger = Arc::new(SizedLedger {
+                    log: log.clone(),
+                    max_bytes: unit * 10 + 5,
+                });
+                let mut pool = TransactionPool::new(PoolConfig::default(), ledger);
+                // the constructor does not generate a block without keys
+                let none = Arc::new(CountingSupplier {
+                    queries: AtomicU64::new(0),
+                    accounts: vec![],
+                });
+                pool = pool.with_voting_accounts(none);
+                recompute(&pool, false);
+                assert!(pool.assembly_mu.lock().results.skipped, "{case}");
+                for i in 0..count {
+                    pool.remember(vec![make_test_txn(i as u8)])
+                        .unwrap_or_else(|e| panic!("{case}: remember {i}: {e}"));
+                }
+                assert!(log.gens.lock().unwrap().is_empty(), "{case}");
+
+                let counting = Arc::new(CountingSupplier {
+                    queries: AtomicU64::new(0),
+                    accounts: if supplier == "voting" {
+                        vec![proposer]
+                    } else {
+                        vec![]
+                    },
+                });
+                pool.voting_accounts = match supplier {
+                    "unspecified" => None,
+                    _ => Some(counting.clone()),
+                };
+                if timeout {
+                    pool.assembly_mu.lock().deadline =
+                        Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
+                }
+                let before = pool.pending_tx_ids();
+                let fee = pool.fee_per_byte();
+                recompute(&pool, false);
+                let after = pool.pending_tx_ids();
+                assert_eq!(
+                    before.iter().collect::<HashSet<_>>(),
+                    after.iter().collect::<HashSet<_>>(),
+                    "{case}"
+                );
+                assert_eq!(fee, pool.fee_per_byte(), "{case}");
+                {
+                    let inner = pool.mu.lock();
+                    assert_eq!(
+                        inner.evaluator.as_ref().unwrap().pay_set_size(),
+                        count,
+                        "{case}: the evaluator keeps every group"
+                    );
+                    if name == "full" {
+                        assert!(inner.num_pending_whole_blocks > 0, "{case}");
+                    }
+                }
+                if supplier != "unspecified" {
+                    // The prologue looks up keys to decide whether to skip.
+                    // Generation looks them up again.
+                    let expected = if supplier == "voting" { 2 } else { 1 };
+                    assert_eq!(
+                        counting.queries.load(Ordering::SeqCst),
+                        expected,
+                        "{case}: key lookups"
+                    );
+                }
+                let gens = log.gens.lock().unwrap().clone();
+                let asm = pool.assembly_mu.lock();
+                if supplier == "noKeys" {
+                    assert!(gens.is_empty(), "{case}: no block without keys");
+                    assert!(asm.results.block.is_none(), "{case}");
+                    continue;
+                }
+                assert_eq!(gens.len(), 1, "{case}: generated once");
+                assert!(asm.results.err.is_none(), "{case}");
+                assert!(asm.results.block.is_some(), "{case}");
+                assert_eq!(asm.results.stats.stop_reason, Some(reason), "{case}");
+                let in_block = gens[0].1;
+                match name {
+                    "full" => assert_eq!(in_block, 10, "{case}: a block's worth"),
+                    "timeout" => assert_eq!(in_block, 1, "{case}: cut after the first group"),
+                    _ => assert_eq!(in_block, count, "{case}"),
+                }
+                if supplier == "voting" {
+                    assert_eq!(gens[0].0, vec![proposer], "{case}");
+                }
+            }
+        }
+    }
+
+    /// go v5.1.1 `AssembleBlock` stop reasons (`stats.StopReason`): an
+    /// assembly request more than two rounds ahead is `pool-behind`, one for a
+    /// round whose block the pool evaluated one round late is `eval-old`, a
+    /// skipped generation answered with an empty block is `no-proposers`, a
+    /// block the evaluator could not generate is `generation-error` (an empty
+    /// block is returned, not an error), and a request that outlives its
+    /// deadline is `timeout-empty`.
+    #[test]
+    fn assemble_block_reports_go_stop_reasons() {
+        fn reason(
+            pool: &TransactionPool,
+            round: u64,
+            wait: Duration,
+        ) -> (Result<Block, PoolError>, Option<AssembleStopReason>) {
+            let mut stop = None;
+            let r = pool.assemble_block_inner(Round(round), Instant::now() + wait, &mut stop);
+            (r, stop)
+        }
+        let second = Duration::from_secs(1);
+
+        // pool-behind
+        let (pool, _log, _s, _l) = gen_pool(None);
+        recompute(&pool, false); // evaluating round 2
+        let (r, stop) = reason(&pool, 4, second);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(stop, Some(AssembleStopReason::PoolBehind));
+
+        // eval-old: the pool evaluated round 2, round 3 is requested
+        let (pool, _log, _s, _l) = gen_pool(None);
+        recompute(&pool, false);
+        let (r, stop) = reason(&pool, 3, second);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(stop, Some(AssembleStopReason::EvalOld));
+
+        // no-proposers: skipped generation, answered with an empty block
+        let (pool, _log, _s, _l) = gen_pool(Some(vec![]));
+        recompute(&pool, false);
+        let (r, stop) = reason(&pool, 2, second);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(stop, Some(AssembleStopReason::NoProposers));
+
+        // the assembled block's own reason
+        let (pool, _log, _s, _l) = gen_pool(None);
+        recompute(&pool, false);
+        let (r, stop) = reason(&pool, 2, second);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(stop, Some(AssembleStopReason::Empty));
+
+        // generation-error: an empty block instead of an error
+        let (pool, _log, _s, _l) = gen_pool(None);
+        recompute(&pool, false);
+        pool.assembly_mu.lock().results.err = Some(AlgoError::Ledger {
+            message: "cannot generate".to_string(),
+        });
+        let (r, stop) = reason(&pool, 2, second);
+        assert!(r.is_ok(), "an empty block, not an error: {r:?}");
+        assert_eq!(stop, Some(AssembleStopReason::GenerationError));
+
+        // timeout-empty: nothing finished the assembly before the deadline
+        let (pool, _log, _s, _l) = gen_pool(None);
+        recompute(&pool, false);
+        {
+            let mut asm = pool.assembly_mu.lock();
+            asm.results.ok = false;
+            asm.results.assembly_completed_or_abandoned = false;
+            asm.results.block = None;
+        }
+        let (r, stop) = reason(&pool, 2, Duration::ZERO);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(stop, Some(AssembleStopReason::TimeoutEmpty));
     }
 
     /// go `TestPoolDevModeForcesGeneration`: dev mode generates although
