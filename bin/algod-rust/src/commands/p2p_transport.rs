@@ -503,6 +503,7 @@ fn spawn_ws_peer(
         tracing::trace!(%peer_id, "P2P algorand-ws stream attempt settled with no in-flight/live stream remaining");
     }
 
+    let stream_manager_for_routing = Arc::clone(&stream_manager);
     tokio::spawn(async move {
         let (mut read_half, mut write_half) = stream.split();
         let remote_addr = peer_id.to_string();
@@ -757,6 +758,12 @@ fn spawn_ws_peer(
                         payload,
                         peer_id.to_string(),
                         crate::timefmt::now_unix_nanos(),
+                    )
+                    .with_routing_addr(
+                        stream_manager_for_routing
+                            .lock()
+                            .expect("stream_peers mutex poisoned")
+                            .routing_addr(&peer_id),
                     );
                     // Issue #1987 diagnostics: what arrived on the stream and what
                     // the handler did with it (agreement traffic only; votes/
@@ -1273,6 +1280,7 @@ fn topic_to_tag(topic: &str) -> Option<Tag> {
 /// return the same "unknown" defaults [`GossipNode`]'s doc comment allows.
 struct P2pPeerRef {
     peer_id: String,
+    routing: Vec<u8>,
 }
 
 impl Peer for P2pPeerRef {
@@ -1285,8 +1293,24 @@ impl Peer for P2pPeerRef {
     }
 
     fn routing_addr(&self) -> &[u8] {
-        &[]
+        &self.routing
     }
+}
+
+/// The routing address of the IP a connection to `addr` is made from (go
+/// v5.1.1 `gsPeer.RoutingAddr`: `manet.ToIP` of the connection's remote
+/// multiaddr, then `routingAddr`); `None` when the multiaddr has no IP part
+/// (a DNS name), in which case the peer ID is used.
+fn routing_addr_of_multiaddr(addr: &Multiaddr) -> Option<Vec<u8>> {
+    addr.iter().find_map(|p| match p {
+        libp2p::multiaddr::Protocol::Ip4(ip) => {
+            Some(algo_network::routing_addr_for_ip(std::net::IpAddr::V4(ip)))
+        }
+        libp2p::multiaddr::Protocol::Ip6(ip) => {
+            Some(algo_network::routing_addr_for_ip(std::net::IpAddr::V6(ip)))
+        }
+        _ => None,
+    })
 }
 
 /// A [`UnicastPeer`] backed by one peer's `/algorand-ws/2.2.0` stream
@@ -1299,6 +1323,9 @@ impl Peer for P2pPeerRef {
 /// this module (`algo-p2p` deliberately has no `algo-network` dependency —
 /// see `algo_p2p::wsproto`'s doc comment).
 struct P2pUnicastPeer {
+    /// The routing address of the peer's connection, see
+    /// [`routing_addr_of_multiaddr`].
+    routing: Vec<u8>,
     /// `PeerId`'s string form, cached at construction since
     /// [`Peer::get_address`] returns `&str` and `PeerId::to_string()`
     /// allocates.
@@ -1322,7 +1349,7 @@ impl Peer for P2pUnicastPeer {
     }
 
     fn routing_addr(&self) -> &[u8] {
-        &[]
+        &self.routing
     }
 }
 
@@ -2574,6 +2601,20 @@ impl P2pTransport {
                                 // redundant/losing connection still proves
                                 // this peer is currently reachable.
                                 bootstrap_backoff_state.remove(&peer_id);
+                                // go v5.1.1 `gsPeer.RoutingAddr`: the IP the peer
+                                // is connected from (used to key the proposal
+                                // queue's fairness); a connection without one
+                                // keeps the peer-ID fallback.
+                                match routing_addr_of_multiaddr(endpoint.get_remote_address()) {
+                                    Some(routing) => sp_for_task
+                                        .lock()
+                                        .expect("stream_peers mutex poisoned")
+                                        .set_routing_addr(peer_id, routing),
+                                    None => sp_for_task
+                                        .lock()
+                                        .expect("stream_peers mutex poisoned")
+                                        .clear_routing_addr(&peer_id),
+                                }
 
                                 // Connection-identity dedup (issue #952):
                                 // go's `baseWsStreamHandler` runs
@@ -2742,7 +2783,7 @@ impl P2pTransport {
                                     }
                                 }
                             }
-                            SwarmEvent::ConnectionClosed { peer_id, connection_id, .. } => {
+                            SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
                                 identity_tracker_for_task
                                     .lock()
                                     .expect("identity_tracker mutex poisoned")
@@ -2768,6 +2809,12 @@ impl P2pTransport {
                                     .lock()
                                     .expect("stream_peers mutex poisoned")
                                     .remove_stream(&peer_id);
+                                if num_established == 0 {
+                                    sp_for_task
+                                        .lock()
+                                        .expect("stream_peers mutex poisoned")
+                                        .clear_routing_addr(&peer_id);
+                                }
                                 // Issue #1442: drop any stale block entry so
                                 // a later reconnect (e.g. after this peer
                                 // starts dialing *us* instead, or after our
@@ -2828,6 +2875,12 @@ impl P2pTransport {
                                         message.data,
                                         propagation_source.to_string(),
                                         crate::timefmt::now_unix_nanos(),
+                                    )
+                                    .with_routing_addr(
+                                        sp_for_task
+                                            .lock()
+                                            .expect("stream_peers mutex poisoned")
+                                            .routing_addr(&propagation_source),
                                     );
                                     let out = mux.handle(msg).await;
                                     // Issue #1491: a registered handler
@@ -3069,12 +3122,15 @@ impl P2pTransport {
     /// equivalent of `WebsocketNetwork::get_unicast_peers()`. Empty until at
     /// least one peer's stream handshake completes.
     pub fn unicast_peers(&self) -> Vec<Arc<dyn UnicastPeer>> {
-        self.stream_peers
+        let manager = self
+            .stream_peers
             .lock()
-            .expect("stream_peers mutex poisoned")
+            .expect("stream_peers mutex poisoned");
+        manager
             .iter()
             .map(|(peer_id, handle)| {
                 Arc::new(P2pUnicastPeer {
+                    routing: manager.routing_addr(peer_id),
                     peer_id_str: peer_id.to_string(),
                     tx: handle.tx.clone(),
                     request_tracker: Arc::clone(&handle.request_tracker),
@@ -3082,6 +3138,15 @@ impl P2pTransport {
                 }) as Arc<dyn UnicastPeer>
             })
             .collect()
+    }
+
+    /// `peer`'s routing address: the IP of its connection, else its peer ID
+    /// bytes (go v5.1.1 `gsPeer.RoutingAddr`).
+    pub fn routing_addr_of_peer(&self, peer: &PeerId) -> Vec<u8> {
+        self.stream_peers
+            .lock()
+            .expect("stream_peers mutex poisoned")
+            .routing_addr(peer)
     }
 
     /// The [`Multiplexer`] inbound gossipsub messages (for topics this
@@ -3358,12 +3423,32 @@ impl GossipNode for P2pTransport {
         self.broadcast(tag, data, wait, None).await
     }
 
-    fn disconnect(&self, _peer: Arc<dyn Peer>) {
-        // No peer-scoring/ban mechanism wired up at this layer yet; not
-        // required for this issue's traffic-routing scope.
+    fn disconnect(&self, peer: Arc<dyn Peer>) {
+        // go `P2PNetwork.Disconnect`: close the peer's connection (an upper
+        // layer drops a peer that sent bad data). The peer's address here is
+        // its peer ID; the connection-closed event releases its identity.
+        match peer.get_address().parse::<PeerId>() {
+            Ok(peer_id) => {
+                let _ = self.cmd_tx.send(P2pCommand::DisconnectPeer(peer_id));
+            }
+            Err(_) => tracing::debug!(
+                address = peer.get_address(),
+                "P2P disconnect: not a peer ID, ignoring"
+            ),
+        }
     }
 
-    fn disconnect_peers(&self) {}
+    fn disconnect_peers(&self) {
+        // go `P2PNetwork.DisconnectPeers`: close every connected peer.
+        let peers = self
+            .connected_peers
+            .lock()
+            .expect("connected_peers mutex poisoned")
+            .clone();
+        for peer_id in peers {
+            let _ = self.cmd_tx.send(P2pCommand::DisconnectPeer(peer_id));
+        }
+    }
 
     async fn request_connect_outgoing(&self, _replace: bool) {
         // Issue #1570: this used to be an explicit no-op — P2P
@@ -3421,6 +3506,7 @@ impl GossipNode for P2pTransport {
             .map(|p| {
                 Arc::new(P2pPeerRef {
                     peer_id: p.to_string(),
+                    routing: self.routing_addr_of_peer(p),
                 }) as Arc<dyn Peer>
             })
             .collect()
@@ -6141,5 +6227,126 @@ mod tests {
              vote/proposal broadcast path) is not running on p2p_critical_runtime's \
              dedicated worker pool; issue #1580's isolation fix is not wired up"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // go v5.1.1 `TestP2PPeerRoutingAddr` (#2554): a P2P peer's routing address
+    // is that of the IP it is connected from (like a websocket peer from that
+    // IP), and the peer ID's bytes when it has no IP connection.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn routing_addr_of_multiaddr_is_the_connection_ips_routing_address() {
+        let ma = |s: &str| s.parse::<Multiaddr>().unwrap();
+        // IPv4: the four bytes
+        assert_eq!(
+            routing_addr_of_multiaddr(&ma("/ip4/127.0.0.1/tcp/4160")),
+            Some(vec![127, 0, 0, 1])
+        );
+        // IPv6: the top 8 bytes (go `routingAddr`)
+        assert_eq!(
+            routing_addr_of_multiaddr(&ma("/ip6/2001:db8:1:2:3:4:5:6/tcp/4160")),
+            Some(vec![0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 2])
+        );
+        // IPv4 embedded in IPv6: the four bytes
+        assert_eq!(
+            routing_addr_of_multiaddr(&ma("/ip6/::ffff:1.2.3.4/tcp/1")),
+            Some(vec![1, 2, 3, 4])
+        );
+        // no IP (a DNS name): nothing, the caller falls back to the peer ID
+        assert_eq!(
+            routing_addr_of_multiaddr(&ma("/dns4/relay.example.com/tcp/4160")),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn connected_p2p_peers_have_the_routing_address_of_their_ip() {
+        let (listener, dialer) = connected_pair().await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (listener.stream_peer_count() == 0 || dialer.stream_peer_count() == 0)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // an incoming peer on the listener, an outgoing one on the dialer
+        for node in [&listener, &dialer] {
+            let unicast = node.unicast_peers();
+            assert_eq!(unicast.len(), 1);
+            assert_eq!(unicast[0].routing_addr(), &[127, 0, 0, 1][..]);
+            let peers = node.get_peers(&[]);
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].routing_addr(), &[127, 0, 0, 1][..]);
+        }
+        // a peer that is not connected: its peer ID bytes
+        let unknown = PeerId::random();
+        assert_eq!(listener.routing_addr_of_peer(&unknown), unknown.to_bytes());
+    }
+
+    /// Counts the identity releases the connection-closed handling makes.
+    #[derive(Default)]
+    struct ReleaseCounter(std::sync::atomic::AtomicUsize);
+
+    impl IdentityDedupHook for ReleaseCounter {
+        fn claim(&self, _conn: &str, _identity: ed25519_dalek::VerifyingKey) -> bool {
+            true
+        }
+        fn release(&self, _conn: &str, _identity: &ed25519_dalek::VerifyingKey) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    async fn wait_for_release(counter: &ReleaseCounter) -> usize {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while counter.0.load(std::sync::atomic::Ordering::SeqCst) == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        counter.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// go v5.1.1 `TestP2PPeerSweep` (#6750, #2554): `DisconnectPeers` closes
+    /// every peer and gives back its identity (`unregisterPeerLocked`). Before,
+    /// `disconnect_peers` and `disconnect` were no-ops here, so a peer an
+    /// upper layer asked to drop (agreement, tx handler) stayed connected.
+    /// (The dialer redials its bootstrap peer right away, so the close is
+    /// observed through the identity release, not through the peer count.)
+    #[tokio::test]
+    async fn disconnect_peers_closes_the_connections_and_releases_the_identities() {
+        let (listener, dialer) = connected_pair().await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while listener.connected_peer_count() == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let counter = Arc::new(ReleaseCounter::default());
+        listener.set_identity_dedup_hook(counter.clone());
+        GossipNode::disconnect_peers(&listener);
+        assert!(
+            wait_for_release(&counter).await >= 1,
+            "no connection was closed"
+        );
+        drop(dialer);
+    }
+
+    /// `Disconnect(peer)` (go: the agreement and tx handler drop a peer that
+    /// sent bad data) closes that peer's connection.
+    #[tokio::test]
+    async fn disconnect_closes_that_peers_connection() {
+        let (listener, dialer) = connected_pair().await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while listener.connected_peer_count() == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let counter = Arc::new(ReleaseCounter::default());
+        listener.set_identity_dedup_hook(counter.clone());
+        let peers = listener.get_peers(&[]);
+        assert_eq!(peers.len(), 1);
+        GossipNode::disconnect(&listener, peers[0].clone());
+        assert!(
+            wait_for_release(&counter).await >= 1,
+            "no connection was closed"
+        );
+        drop(dialer);
     }
 }

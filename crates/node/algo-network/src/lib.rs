@@ -162,7 +162,8 @@ pub use peer_features::{decode_peer_features, encode_peer_features, PeerFeatureF
 
 // WebSocket peer abstraction
 pub use ws_peer::{
-    InboundIdentityPending, PeerHandle, PeerSender, UnicastPeerRef, WsPeer, WsPeerConfig,
+    routing_addr_for_ip, InboundIdentityPending, PeerHandle, PeerSender, UnicastPeerRef, WsPeer,
+    WsPeerConfig,
 };
 
 // Reconnection supervisor with exponential backoff

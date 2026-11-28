@@ -1216,6 +1216,7 @@ impl PeerHandle {
                                         sender: read_addr.clone(),
                                         received_at: now_ns,
                                         peer: None,
+                                        sender_routing_addr: None,
                                     };
                                     if incoming_tx.send(incoming).await.is_err() {
                                         break;
@@ -1579,6 +1580,13 @@ impl Drop for PeerHandle {
 //   handling), `RoutingAddr()` normalizes *that* address instead of the
 //   peer's raw `ipAddr()` — `ipAddr()` itself is never affected by the
 //   origin-address override.
+
+/// The routing address of a connection from `ip`, go v5.1.1 `routingAddr`: the
+/// four bytes of an IPv4 address (also one embedded in IPv6), the top eight
+/// bytes of any other IPv6 address.
+pub fn routing_addr_for_ip(ip: std::net::IpAddr) -> Vec<u8> {
+    truncate_to_routing_addr(&normalize_ip_addr(ip))
+}
 
 /// Normalizes a raw IP address the way go's `net.IP.To4()`/`To16()` does for
 /// `wsPeer.ipAddr()`: unwrap a *standard* IPv4-mapped-in-IPv6 address to

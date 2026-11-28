@@ -105,6 +105,19 @@ impl PeerRef {
         let routing = routing_addr_of(&addr);
         Self { addr, routing }
     }
+
+    /// A reference to the sender of `msg`: its routing address is the one the
+    /// transport supplied (P2P: the IP of the connection), else derived from
+    /// the sender string.
+    fn of_message(msg: &IncomingMessage) -> Self {
+        match &msg.sender_routing_addr {
+            Some(routing) => Self {
+                addr: msg.sender.clone(),
+                routing: routing.clone(),
+            },
+            None => Self::new(msg.sender.clone()),
+        }
+    }
 }
 
 /// The routing address of a peer given its address string: the IP address
@@ -331,7 +344,7 @@ impl ChannelForwarder {
 impl MessageHandler for ChannelForwarder {
     async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
         let sender_peer: Option<Arc<dyn Peer>> = if !msg.sender.is_empty() {
-            Some(Arc::new(PeerRef::new(msg.sender.clone())))
+            Some(Arc::new(PeerRef::of_message(&msg)))
         } else {
             None
         };
@@ -375,7 +388,7 @@ struct ProposalForwarder {
 impl MessageHandler for ProposalForwarder {
     async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
         let sender_peer: Option<Arc<dyn Peer>> = if !msg.sender.is_empty() {
-            Some(Arc::new(PeerRef::new(msg.sender.clone())))
+            Some(Arc::new(PeerRef::of_message(&msg)))
         } else {
             None
         };
@@ -703,6 +716,22 @@ impl AgreementNetwork for AgreementNetworkBridge {
 
 #[cfg(test)]
 mod tests {
+
+    /// go v5.1.1 `gsPeer.RoutingAddr`: a message whose transport supplied the
+    /// sender's routing address (P2P: the IP of its connection) keys the
+    /// proposal queue by it, not by the sender string (a peer ID).
+    #[test]
+    fn message_routing_addr_overrides_the_sender_string() {
+        let plain = IncomingMessage::new(Tag::ProposalPayload, vec![], "12D3KooWPeer".into(), 0);
+        assert_eq!(
+            PeerRef::of_message(&plain).routing,
+            b"12D3KooWPeer".to_vec()
+        );
+        let routed = plain.clone().with_routing_addr(vec![10, 0, 0, 7]);
+        let peer = PeerRef::of_message(&routed);
+        assert_eq!(peer.routing, vec![10, 0, 0, 7]);
+        assert_eq!(peer.addr, "12D3KooWPeer");
+    }
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
