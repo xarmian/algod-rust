@@ -220,8 +220,9 @@ impl ErasableDb {
     }
 
     /// go's `walCheckpoint`: `PRAGMA wal_checkpoint(<mode>)` and its result,
-    /// `(busy, log frames (-1 when not in WAL mode), checkpointed frames)`.
-    pub fn wal_checkpoint(&self, mode: &str) -> Result<(i64, i64, i64), Error> {
+    /// `(busy, log frames (-1 when not in WAL mode), checkpointed frames)`. `mode`
+    /// is one of go's four constants, never caller input.
+    fn wal_checkpoint(&self, mode: &str) -> Result<(i64, i64, i64), Error> {
         self.conn
             .query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
