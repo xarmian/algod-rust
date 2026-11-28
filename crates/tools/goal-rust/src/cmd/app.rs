@@ -2245,6 +2245,12 @@ mod tests {
     fn txn_arg_already_signed_check_follows_the_salted_key_scheme() {
         let dir = tempfile::tempdir().unwrap();
         let write = |name: &str, scheme: [u8; 2]| {
+            // an `ls` proof carries its program; a key scheme its public key
+            let public_key = if scheme == *b"ls" {
+                vec![2u8, 0x20, 1, 1, 0x22]
+            } else {
+                vec![0u8; 1793]
+            };
             let stxn = SignedTransaction {
                 txn: algo_types::Transaction {
                     txn_type: algo_types::TxnType::Pay,
@@ -2252,7 +2258,7 @@ mod tests {
                 },
                 pqsig: Some(algo_types::SaltedKeySig {
                     scheme,
-                    public_key: serde_bytes::ByteBuf::from(vec![1]),
+                    public_key: serde_bytes::ByteBuf::from(public_key),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2262,7 +2268,7 @@ mod tests {
             path.display().to_string()
         };
         let key = write("key.stxn", *b"f1");
-        let err = populate_method_call_txn_args(&[TransactionType::Pay], &[key.clone()])
+        let err = populate_method_call_txn_args(&[TransactionType::Pay], std::slice::from_ref(&key))
             .unwrap_err();
         assert_eq!(err, format!("Transaction from {key} has already been signed"));
 
