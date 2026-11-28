@@ -364,7 +364,7 @@ pub struct WsPeerConfig {
     /// started and stalls drops the peer after
     /// [`crate::read_progress::MAX_MESSAGE_READ_DURATION`] (go v5.1.1
     /// `maxMessageReadDuration`, issue #2612). Set per connection by the dialer;
-    /// `None` (a `wss` connection, a test) leaves the read unbounded.
+    /// `None` (an outbound `wss` dial, a test) leaves the read unbounded.
     pub read_progress: Option<ReadProgress>,
     /// Overrides [`crate::read_progress::MAX_MESSAGE_READ_DURATION`] for the
     /// connection a dialer opens with this config (a test knob; the dialer reads
@@ -945,7 +945,7 @@ impl PeerHandle {
         // verification" section.
         identity_pending: Option<InboundIdentityPending>,
         // Issue #2612: follows the frames read from this connection (see
-        // [`crate::read_progress`]); `None` for a TLS connection.
+        // [`crate::read_progress`]).
         read_progress: Option<ReadProgress>,
     ) -> Self {
         use futures_util::{SinkExt, StreamExt};
@@ -1267,7 +1267,11 @@ impl PeerHandle {
                                 tracing::info!(addr = %read_addr, "inbound peer disconnected");
                                 break;
                             }
-                            Some(Ok(_)) => { /* Ping/Pong/Text — ignore */ }
+                            Some(Ok(axum::extract::ws::Message::Text(_))) => {
+                                // a data message (go drops the peer for it elsewhere)
+                                handled_data = true;
+                            }
+                            Some(Ok(_)) => { /* Ping/Pong — ignore */ }
                             Some(Err(e)) => {
                                 tracing::warn!(addr = %read_addr, error = %e, "inbound read error");
                                 break;
@@ -2218,13 +2222,8 @@ pub fn decompress_incoming_vote_core(
     }
 }
 
-/// Reads WebSocket frames, parses tag + payload, handles MI messages locally,
-/// and dispatches everything else to the incoming channel.
-///
-/// Mirrors Go's `wsPeer.readLoop()`.
-///
-/// Generic over `St` so that tests can use `WebSocketStream<TcpStream>` while
-/// production code uses `WebSocketStream<MaybeTlsStream<TcpStream>>`.
+/// [`read_loop_with_progress`] without a read deadline (the tests that drive
+/// the loop over a bare `WebSocketStream<TcpStream>`).
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 async fn read_loop<St>(
@@ -2268,9 +2267,15 @@ async fn read_loop<St>(
     .await
 }
 
-/// [`read_loop`] with go's per-message read deadline: a message that has
-/// started (see [`crate::read_progress`]) and is not complete after
-/// `maxMessageReadDuration` drops the peer, like go's read error.
+/// Reads WebSocket frames, parses tag + payload, handles MI messages locally,
+/// and dispatches everything else to the incoming channel.
+///
+/// Mirrors Go's `wsPeer.readLoop()`, including its per-message read deadline: a
+/// message that has started (see [`crate::read_progress`]) and is not complete
+/// after `maxMessageReadDuration` drops the peer, like go's read error.
+///
+/// Generic over `St` so that tests can use `WebSocketStream<TcpStream>` while
+/// production code uses `WebSocketStream<WsTransport>`.
 #[allow(clippy::too_many_arguments)]
 async fn read_loop_with_progress<St>(
     mut stream: SplitStream<St>,
@@ -2357,9 +2362,9 @@ async fn read_loop_with_progress<St>(
             }
         };
 
+        handled_data = matches!(ws_msg, WsMessage::Binary(_) | WsMessage::Text(_));
         match ws_msg {
             WsMessage::Binary(data) => {
-                handled_data = true;
                 // Update last packet time.
                 {
                     let mut lpt = last_packet_time.write().await;

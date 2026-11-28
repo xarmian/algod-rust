@@ -66,6 +66,11 @@ pub const PEER_DISCONNECTION_ACK_DURATION: Duration = Duration::from_secs(5);
 /// message has started and not yet completed.
 #[derive(Debug)]
 struct FrameTracker {
+    /// The bytes stopped being a valid frame sequence (a reserved opcode, an
+    /// impossible length, a continuation with nothing to continue): the tracker
+    /// has lost its place and follows nothing from here, rather than guess and
+    /// drop a healthy peer for it. The websocket library fails such a stream.
+    lost: bool,
     state: State,
     /// When the message in flight started (its first data frame header was read).
     started: Option<Instant>,
@@ -87,6 +92,7 @@ enum State {
 impl FrameTracker {
     fn new() -> Self {
         Self {
+            lost: false,
             state: State::Head {
                 buf: [0; 14],
                 have: 0,
@@ -107,7 +113,7 @@ impl FrameTracker {
     }
 
     fn feed(&mut self, mut bytes: &[u8], now: Instant) {
-        while !bytes.is_empty() {
+        while !bytes.is_empty() && !self.lost {
             match &mut self.state {
                 State::Head { buf, have } => {
                     // the header's length is known after its first two bytes
@@ -134,6 +140,15 @@ impl FrameTracker {
                         n => u64::from(n),
                     };
                     let data = opcode < 8;
+                    let reserved = (3..8).contains(&opcode) || opcode > 10;
+                    // a continuation needs a message to continue, a data frame
+                    // does not start one inside another, 2^63 bytes do not exist
+                    let misplaced = (opcode == 0) != self.started.is_some() && data;
+                    if reserved || misplaced || ext >> 63 != 0 {
+                        self.lost = true;
+                        self.started = None;
+                        return;
+                    }
                     // go: the deadline is set when `NextReader` returns, after the
                     // header of the first data frame of a message
                     if data && opcode != 0 && self.started.is_none() {
@@ -545,6 +560,28 @@ mod tests {
         progress.deadline_passed().await;
         assert_eq!(stalled_at.elapsed(), MAX);
         assert!(started < stalled_at);
+    }
+
+    /// A byte stream that is not a valid frame sequence makes the tracker give
+    /// up (the websocket library fails it) instead of guessing.
+    #[tokio::test(start_paused = true)]
+    async fn an_invalid_header_makes_the_tracker_follow_nothing() {
+        let now = Instant::now();
+        for bad in [
+            vec![0x83u8, 0],                            // reserved opcode
+            vec![0x80, 0],                              // continuation, nothing to continue
+            vec![0x82, 127, 0x80, 0, 0, 0, 0, 0, 0, 0], // length with the top bit
+        ] {
+            let mut t = FrameTracker::new();
+            t.feed(&bad, now);
+            t.feed(&frame(2, false, b"abc", false), now);
+            assert_eq!(t.started, None, "{bad:?}");
+        }
+        // a data frame inside an unfinished message
+        let mut t = FrameTracker::new();
+        t.feed(&frame(2, false, b"abc", false), now);
+        t.feed(&frame(2, true, b"abc", false), now);
+        assert_eq!(t.started, None);
     }
 
     /// go counts only the time the loop spends reading: a message whose first

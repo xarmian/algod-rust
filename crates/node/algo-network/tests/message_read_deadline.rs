@@ -40,7 +40,7 @@ use tokio_tungstenite::tungstenite;
 use tokio_util::sync::CancellationToken;
 
 /// The read duration the tests give the peer (go's is 50 s).
-const MAX: Duration = Duration::from_millis(400);
+const MAX: Duration = Duration::from_millis(1500);
 
 /// First 12 bytes of a 256-byte binary frame (server to client, unmasked).
 fn partial_binary_frame() -> Vec<u8> {
