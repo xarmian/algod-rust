@@ -38,6 +38,7 @@ pub mod raw_text;
 pub(crate) mod rmp_decode;
 mod round;
 pub mod serde_bytes_array;
+pub mod signed_txn_size;
 mod transaction;
 pub mod txtail;
 
