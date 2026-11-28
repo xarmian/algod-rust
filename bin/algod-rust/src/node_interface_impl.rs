@@ -2231,13 +2231,22 @@ impl NodeInterface for AlgodNodeInterface {
         let pool = self.pool("get_pending_transaction")?;
         let (txn, pool_error, found) = pool.lookup(txid);
         if let Some(status) = Self::map_pool_lookup(txn, pool_error, found) {
-            // Still pending, or evicted with an error — answer from the pool.
-            return Ok(Some(status));
+            // Still pending, or evicted with an error: answer from the pool.
+            if !status.pool_error.is_empty() || pool.is_pending(txid) {
+                return Ok(Some(status));
+            }
+            // Only the status cache remembers it (go v5.1.1 keeps the
+            // transaction there): a confirmed transaction takes precedence,
+            // as in go's `GetPendingTransaction`; otherwise the pool's record
+            // is the answer.
+            return match self.lookup_confirmed_txn(txid)? {
+                Some(confirmed) => Ok(Some(confirmed)),
+                None => Ok(Some(status)),
+            };
         }
         // Not in the pool: it may have been committed. Search recent blocks for
         // the txid and report its confirmed round. Mirrors go's
-        // `GetPendingTransaction` ledger fallback (the block-side confirmation
-        // lookup deferred from the original pool-only implementation).
+        // `GetPendingTransaction` ledger fallback.
         self.lookup_confirmed_txn(txid)
     }
 
@@ -3672,27 +3681,19 @@ impl AlgodNodeInterface {
     /// Translate a raw `(txn, pool_error, found)` tuple from
     /// [`TransactionPool::lookup`] into the trait-level response.
     ///
-    /// The pool's `lookup` distinguishes four states, which collapse to
-    /// three observable tuples:
+    /// The pool's `lookup` distinguishes these states:
     ///
-    /// | pool state                | tuple shape               | API response                        |
-    /// |---------------------------|---------------------------|-------------------------------------|
-    /// | pending (live in pool)    | `(txn,     "",   true)`   | `Some(TxnWithStatus { txn, ... })`  |
-    /// | recently evicted          | `(default, err,  true)`   | `Some(TxnWithStatus { pool_error })`|
-    /// | recently committed        | `(default, "",   true)`   | `None` — see note                   |
-    /// | never seen / miss         | `(default, "",   false)`  | `None`                              |
+    /// | pool state                | tuple shape            | API response                          |
+    /// |---------------------------|------------------------|---------------------------------------|
+    /// | pending (live in pool)    | `(txn, "",  true)`     | `Some(TxnWithStatus { txn, ... })`    |
+    /// | recently evicted          | `(txn, err, true)`     | `Some(TxnWithStatus { pool_error })`  |
+    /// | recently committed        | `(txn, "",  true)`     | resolved by `get_pending_transaction` |
+    /// | never seen / miss         | `(default, "", false)` | `None`                                |
     ///
-    /// The pool records committed-txid entries in its status cache with an
-    /// *empty* error string (see `pool.rs:on_new_block`), so the "recently
-    /// committed" tuple is indistinguishable from a pending-txn-with-empty
-    /// error except that the returned txn is `SignedTransaction::default()`.
-    /// Returning `Some(TxnWithStatus { txn: default, pool_error: "" })`
-    /// would be a bogus pending response (empty txn, no error). Go-algorand
-    /// handles this by then searching the last `MaxTxnLife` blocks for the
-    /// confirmation round; that block-side lookup is a follow-up outside
-    /// PLAN-74 TASK-76's scope, so we conservatively return `None` and let
-    /// the caller retry (or query the block directly) once the confirmation
-    /// path is wired.
+    /// Since go v5.1.1 the status cache keeps the transaction, so a found
+    /// record always carries it; whether an empty-error record is still pending
+    /// or already committed is decided by the caller (`TransactionPool::is_pending`
+    /// and the confirmed-block lookup), as go's `GetPendingTransaction` does.
     ///
     /// Extracted as an associated function so the branch logic can be
     /// unit-tested without staging real block commits through a live pool.
@@ -3702,11 +3703,6 @@ impl AlgodNodeInterface {
         found: bool,
     ) -> Option<TxnWithStatus> {
         if !found {
-            return None;
-        }
-        let txn_is_default = txn == SignedTransaction::default();
-        if txn_is_default && pool_error.is_empty() {
-            // Recently-committed case — see the method-level comment above.
             return None;
         }
         Some(TxnWithStatus {
@@ -5539,18 +5535,21 @@ mod tests {
     }
 
     #[test]
-    fn map_pool_lookup_recently_committed_returns_none_until_block_lookup_wired() {
-        // Committed txns land in the status cache with an empty error
-        // string — pool returns `(default, "", true)` which by itself is
-        // meaningless. Until the block-side confirmation lookup is wired,
-        // the adapter conservatively returns None rather than a bogus
-        // pending response.
-        let got =
-            AlgodNodeInterface::map_pool_lookup(SignedTransaction::default(), String::new(), true);
-        assert!(
-            got.is_none(),
-            "committed case without block-side lookup must not synthesize a pending response"
-        );
+    fn map_pool_lookup_status_cache_record_carries_the_cached_txn() {
+        // A committed txn sits in the status cache with an empty error and,
+        // since go v5.1.1, its transaction; `get_pending_transaction` decides
+        // between pending and confirmed with `TransactionPool::is_pending`.
+        let txn = SignedTransaction {
+            txn: algo_types::Transaction {
+                note: serde_bytes::ByteBuf::from(b"committed".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let got = AlgodNodeInterface::map_pool_lookup(txn.clone(), String::new(), true)
+            .expect("a found record maps to a status");
+        assert_eq!(got.txn, txn);
+        assert!(got.pool_error.is_empty());
     }
 
     // ---- Broadcast methods (TASK-77) ----

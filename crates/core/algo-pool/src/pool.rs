@@ -326,6 +326,12 @@ impl TransactionPool {
         pending.tx_groups.iter().map(|g| g.len()).sum()
     }
 
+    /// Whether `txid` is a transaction currently pending in the pool (as
+    /// opposed to one only remembered in the status cache).
+    pub fn is_pending(&self, txid: &Digest) -> bool {
+        self.pending_mu.read().txids.contains_key(txid)
+    }
+
     /// Return the number of pending transaction IDs.
     ///
     /// Mirrors `pendingTxIDsCount()` in go-algorand. Uses the txids map
@@ -680,8 +686,7 @@ impl TransactionPool {
                 // Record committed transactions in the status cache
                 // with an empty error string (meaning "confirmed").
                 for txn in txgroup {
-                    let txid = compute_txn_id(&txn.txn);
-                    inner.status_cache.put(txid, String::new());
+                    inner.status_cache.put(txn, String::new());
                 }
                 continue;
             }
@@ -698,8 +703,7 @@ impl TransactionPool {
                 // Record evicted transactions in the status cache.
                 let err_str = e.to_string();
                 for txn in txgroup {
-                    let txid = compute_txn_id(&txn.txn);
-                    inner.status_cache.put(txid, err_str.clone());
+                    inner.status_cache.put(txn, err_str.clone());
                 }
             }
         }
@@ -990,7 +994,7 @@ impl TransactionPool {
 
         // Check the status cache for recently evicted transactions.
         if let Some(status) = inner.status_cache.check(txid) {
-            return (SignedTransaction::default(), status.txn_err.clone(), true);
+            return (status.tx, status.txn_err, true);
         }
 
         (SignedTransaction::default(), String::new(), false)
@@ -1536,11 +1540,8 @@ impl TransactionPool {
             return 0;
         }
         // Only the dropped groups' members leave the txid indexes.
-        let mut evicted: Vec<Digest> = Vec::new();
         for stx in gone.iter().flatten() {
-            let id = compute_txn_id(&stx.txn);
-            pending.txids.remove(&id);
-            evicted.push(id);
+            pending.txids.remove(&compute_txn_id(&stx.txn));
         }
         drop(pending);
 
@@ -1554,8 +1555,8 @@ impl TransactionPool {
             self.reeval_counter.record(tag);
         }
         let text = reason.to_string();
-        for id in evicted {
-            inner.status_cache.put(id, text.clone());
+        for stx in gone.iter().flatten() {
+            inner.status_cache.put(stx, text.clone());
         }
         // The pending-block evaluator still holds the evicted group's
         // effects (its txids, leases and balance changes): rebuild it from
@@ -2109,6 +2110,9 @@ mod tests {
     fn make_test_txn(note_byte: u8) -> SignedTransaction {
         let mut txn = SignedTransaction::default();
         txn.txn.txn_type = TxnType::Pay;
+        // The status cache keeps the encoding, and a transaction without a
+        // sender does not decode.
+        txn.txn.sender = Address([0x77; 32]);
         txn.txn.fee = 1_000_000; // high fee to pass any fee check
         txn.txn.first_valid = Round(1);
         txn.txn.last_valid = Round(1000);
@@ -2792,7 +2796,7 @@ mod tests {
         let txn1 = make_test_txn(1);
         let txid1 = compute_txn_id(&txn1.txn);
 
-        pool.remember_one(txn1).unwrap();
+        pool.remember_one(txn1.clone()).unwrap();
 
         let mut committed = HashSet::new();
         committed.insert(txid1);
@@ -2805,8 +2809,10 @@ mod tests {
         pool.on_new_block(&block, &committed);
 
         // txn1 should be in the status cache as confirmed (empty error).
-        let (_txn, err_str, found) = pool.lookup(&txid1);
+        let (txn, err_str, found) = pool.lookup(&txid1);
         assert!(found, "confirmed txn should be in status cache");
+        // go v5.1.1 keeps the encoded transaction and hands it back.
+        assert_eq!(txn, txn1);
         assert!(
             err_str.is_empty(),
             "confirmed txn should have empty error string"
