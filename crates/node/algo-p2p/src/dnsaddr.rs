@@ -156,9 +156,7 @@ impl HickoryDnsaddrResolver {
 
     async fn do_lookup(resolver: &TokioResolver, name: &str) -> Result<Vec<String>, ResolveError> {
         let lookup = resolver.txt_lookup(name).await?;
-        let values = lookup
-            .answers()
-            .iter()
+        let values = answers_for_query(lookup.query(), lookup.answers())
             .filter_map(|record| match &record.data {
                 RData::TXT(txt) => Some(txt),
                 _ => None,
@@ -357,8 +355,64 @@ pub async fn resolve_multiaddrs(domain: &str, resolver: &dyn DnsaddrResolver) ->
     resolved
 }
 
+/// The answer records that belong to `query`: those owned by the queried name
+/// and of its class. go v5.1.1 binds every DNSSEC answer to its query
+/// (`selectRRSet`, #6783): a response may also carry RRsets of other names
+/// (genuinely signed, e.g. replayed from another bootstrap domain), and
+/// hickory returns the whole answer section unfiltered when the queried name is
+/// present. A CNAME is not followed (go: "rejects a CNAME for a TXT query").
+fn answers_for_query<'a>(
+    query: &'a hickory_resolver::proto::op::Query,
+    answers: &'a [hickory_resolver::proto::rr::Record],
+) -> impl Iterator<Item = &'a hickory_resolver::proto::rr::Record> {
+    answers
+        .iter()
+        .filter(move |r| r.dns_class == query.query_class() && r.name == *query.name())
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// go's dnsaddr resolvers use the same DNSSEC client as the SRV ones: a
+    /// 1232-byte EDNS buffer, DO bit, TCP retry (`TestQueryAdvertisesReducedEDNSBuffer`).
+    #[test]
+    fn dnsaddr_resolvers_validate_with_a_1232_byte_edns_buffer_and_tcp_retry() {
+        let resolver = HickoryDnsaddrResolver::default_resolver();
+        let opts = resolver.options();
+        assert!(opts.validate && opts.edns0 && opts.try_tcp_on_error);
+        assert_eq!(opts.edns_payload_len, 1232);
+    }
+
+    /// go v5.1.1 `TestSelectRRSet` / `TestLookupRejectsSignedRRSetFromAnotherName`:
+    /// a signed TXT RRset of another name carried in the answer is not a dnsaddr
+    /// of the queried domain.
+    #[test]
+    fn answers_for_query_keeps_only_the_queried_name() {
+        use hickory_resolver::proto::op::Query;
+        use hickory_resolver::proto::rr::rdata::TXT;
+        use hickory_resolver::proto::rr::{Name, Record, RecordType};
+        #[allow(deprecated)]
+        let txt = |owner: &str, text: &str| {
+            Record::from_rdata(
+                Name::from_ascii(owner).unwrap(),
+                60,
+                RData::TXT(TXT::new(vec![text.to_string()])),
+            )
+        };
+        let wanted = txt("_dnsaddr.wanted.test.", "dnsaddr=/ip4/1.2.3.4/tcp/1");
+        let foreign = txt("_dnsaddr.foreign.test.", "dnsaddr=/ip4/6.6.6.6/tcp/1");
+        let answers = vec![foreign.clone(), wanted.clone()];
+        for qname in ["_dnsaddr.wanted.test.", "_DNSADDR.Wanted.TEST."] {
+            let query = Query::query(Name::from_ascii(qname).unwrap(), RecordType::TXT);
+            let kept: Vec<&Record> = answers_for_query(&query, &answers).collect();
+            assert_eq!(kept, vec![&wanted], "{qname}");
+        }
+        let query = Query::query(
+            Name::from_ascii("_dnsaddr.wanted.test.").unwrap(),
+            RecordType::TXT,
+        );
+        assert_eq!(answers_for_query(&query, &[foreign]).count(), 0);
+    }
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
