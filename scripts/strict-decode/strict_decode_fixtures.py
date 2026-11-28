@@ -78,14 +78,23 @@ its bound and at bound + 1 elements / bytes, in a set's `bound_kinds`. go
 rejects the second with `msgp.ErrOverflow` on the length header; the tx-sync
 response (go-codec) checks no allocbound and accepts both.
 
-Struct-from-array cases (issue #2426) come last: go decodes a struct from an
-array too (elements are the fields in go's declaration order, embedded structs
-flattened, `ErrTooManyArrayFields` on one more, the fields past a shorter array
-left alone). A case carries its whole mutant in `hex` (`map` -2): some structs
-of a seed turned into arrays, type-directed by the field layout in
+Struct-from-array cases (issues #2426, #2609) come last: go up to v5.0.5 decoded
+a struct from an array too (elements are the fields in go's declaration order,
+embedded structs flattened, `ErrTooManyArrayFields` on one more, the fields past
+a shorter array left alone); go v5.1.1's generated decoders (msgp 1.1.66, go
+#6774) read a map only, so every such case is a go rejection now (go-codec, the
+simulate request, still reads the array form and has its own rows). A case
+carries its whole mutant in `hex` (`map` -2): some structs of a seed turned into
+arrays, type-directed by the field layout in
 crates/core/algo-types/src/go_struct_order.json (dumped from go's types by the
-rpcs oracle's `STRICT_SCHEMA_OUT`), for the structs whose algod-rust reader
-has the array form (`converted_types`). `--fuzz` writes more of them.
+oracles' `STRICT_SCHEMA_OUT`), for the structs `array_form_allowed` names
+(`converted_types`, plus every struct of the ledger set's roots).
+`--fuzz` writes more of them.
+
+The sections after them (issue #2609, `make_array_value_cases`,
+`make_array_shape_cases`) add a struct-valued key again with an array value,
+array headers cut short, arrays nested deep and an array form cut at a few
+points, appended so no older row moves.
 
 Nil-element cases (issue #2430) come after them: `apaa`, a proof's `pth` and
 a LogicSig's `arg` again, as lists mixing `nil`, empty and one-byte elements,
@@ -420,8 +429,9 @@ def run_go(go_algorand, rows, seeds_out=None, seed_tests=None):
 
 # ── cases ─────────────────────────────────────────────────────────────────
 
-# No empty array: go decodes a struct from an array (positionally), so `[]` is
-# accepted wherever a struct value is expected (the array form has its own cases).
+# No empty array: these values are inserted under a fresh key (`zz` / a donor
+# key), where go rejects any value; the array values have their own cases
+# (`ARRAY_VALUES`, issue #2609).
 VALUES = [
     bytes([0xC0]),  # nil
     bytes([0x01]),  # uint 1
@@ -449,8 +459,9 @@ def donor_entries(b):
     out = []
     for start, hl, entries, end in walk_maps(b):
         for ks, vs, ve in entries:
-            # An array-valued entry is left out: go decodes a struct from an
-            # array, so a dict of structs accepts it under any key.
+            # An array-valued entry is left out of the donors (their verdicts
+            # would depend on the destination's type, not only on the key);
+            # `make_array_value_cases` covers array values.
             if 0xA0 <= b[ks] <= 0xBF and not (0x90 <= b[vs] <= 0x9F or b[vs] in (0xDC, 0xDD)):
                 out.append((b[ks:vs], b[vs:ve]))
     return out

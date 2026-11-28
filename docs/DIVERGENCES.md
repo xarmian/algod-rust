@@ -232,32 +232,34 @@ by #2521: nothing reads only the map form any more, so algod-rust and
 go-algorand no longer differ here. The entry stays as history and as the
 record of what parity now rests on; it has no source marker.
 
-**What go-algorand does.** Every generated `UnmarshalMsgWithState` first
-calls `msgp.ReadMapHeaderBytes`; on a `TypeError` it retries
-`ReadArrayHeaderBytes` and decodes the fields positionally in Go declaration
-order ("struct-from-array", `ErrTooManyArrayFields` on excess). go-codec
-(`protocol.DecodeReflect`) reads a struct from an array too (`kStruct`):
-positionally in the source order of the struct's encodable fields, a `nil`
-element zeroing the field, an element more than the fields an error.
+**What go-algorand does.** Up to v5.0.5 every generated
+`UnmarshalMsgWithState` first called `msgp.ReadMapHeaderBytes`; on a
+`TypeError` it retried `ReadArrayHeaderBytes` and decoded the fields
+positionally in Go declaration order ("struct-from-array",
+`ErrTooManyArrayFields` on excess). **go v5.1.1 (algorand/msgp 1.1.66, go
+#6774) generates map-only decoders**: an array where a struct is expected is
+the `TypeError` (`msgp: attempted to decode type "array" with method for
+"map"`), empty or not, deep or truncated. go-codec (`protocol.DecodeReflect`)
+still reads a struct from an array (`kStruct`): positionally in the source
+order of the struct's encodable fields, a `nil` element zeroing the field, an
+element more than the fields an error. Since go #6729 the tx-sync response is
+generated msgp (`protocol.Decode`, `rpcs/httpTxSync.go`), so go-codec is left
+with `DecodeReflect` callers (libgoal / goal reading a node's answer, the
+simulate request body, the agreement crash-state file).
 
-**What algod-rust does.** Every reader of bytes a peer, a request or a file
-can carry reads go's array form through `rmp_decode::struct_keys` (#2426,
-#2521): the transaction readers of `algo-types`, the block, its header and the
-block response, the agreement codec's network messages, the tx-sync response
-(go-codec), the identity-handshake messages and algokey's PQ key-file reader
-(`decode_pq_signing_material`, now `protocol.Decode` of `pqSigningMaterial`
-value for value: array form, repeated keys, a missing field left zero, an
-unknown key `ErrNoField`). The positions come from
+**What algod-rust does.** Matches v5.1.1 (#2609; #2426's array reading was
+correct for v5.0.5 and is superseded). `rmp_decode::struct_keys` takes the
+array branch only under `go_codec_reflect` (the simulate request,
+`simulate_strict.rs`); every other reader (the transaction, block, header and
+block-response readers of `algo-types`, the agreement codec, the tx-sync
+response, the identity-handshake messages, algokey's PQ key-file reader and
+the catchpoint file readers of `algo-ledger`) rejects an array. The positions
+for the go-codec branch come from
 `crates/core/algo-types/src/go_struct_order.json`, dumped from go's types by
-`tools/strict-decode-oracle` (checked against go's generated decoders). The
-agreement codec's decoders of its own authenticated forms
-(`decode_credential`, `decode_authenticated_vote`,
-`decode_authenticated_bundle`, with their encoders and tests) had no caller
-outside tests and were deleted in #2521. The one remaining difference is
-invisible: go's `[]byte` field is nil after a `nil` and empty after an empty
-`bin`; the key-file reader holds a `Vec`, and `validate()` only reads the
-length.
-
+`tools/strict-decode-oracle`. Proof: the go-generated rows of every
+`strict_decode` fixture set (`map` -2 rows: array forms of every struct, an
+array under a struct-valued key, headers cut short, arrays nested up to 300
+deep), all `go_ok: false`.
 
 Everything else about a struct decode is go's. Since #2424 every consensus
 reader (transactions, blocks, headers, the PQ and state-proof structs, the
@@ -267,12 +269,12 @@ does: the field is decoded again INTO its current value (a nested struct
 merges and `nil` resets it; a slice is re-sliced within go's capacity, hidden
 elements coming back; a `[N]byte` keeps the bytes past a shorter value; a map
 gains entries), and the `required` checks run on the merged result. `dt` and
-`spt` are kept as go's canonical re-encode of what go decodes. The tx-sync
-response is decoded the way go's go-codec (`protocol.DecodeReflect`) decodes
-it: no `required` or `allocbound` checks, and a repeated `Reveals` entry is
-decoded into the existing, unaddressable map value. The non-consensus
-catchpoint, identity-handshake and peer-meta readers do too (#2421), and the
-catchpoint readers also read the array form.
+`spt` are kept as go's canonical re-encode of what go decodes. The simulate
+request body is decoded the way go's go-codec (`protocol.DecodeReflect`)
+decodes it: no `required` or `allocbound` checks, and a repeated `Reveals`
+entry is decoded into the existing, unaddressable map value. The tx-sync
+response, the non-consensus catchpoint, identity-handshake and peer-meta
+readers decode a repeated key like go's generated code too (#2421).
 
 Since #2394 the catchup `decode_block_response` uses the hand-written reader too
 (`decode_block_response_serde` is the old path).

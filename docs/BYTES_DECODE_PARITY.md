@@ -457,3 +457,32 @@ The last readers that took only the map form are gone, so `DIV-004` is
   after an empty `bin` (the msgp encoder writes them differently); the
   reader holds a `Vec` and nothing reads the distinction, so the oracle folds
   the two before re-encoding.
+
+## Issue #2609: go v5.1.1 reads a struct from a map only
+
+go v5.1.1 (algorand/msgp 1.1.66, go #6774) generates struct decoders without
+the "struct-from-array" branch: an array where a struct is expected is
+`ReadMapHeaderBytes`'s `TypeError`. The array form of #2426 is therefore a
+rejection now, in every reader but go-codec's.
+
+Entry points (go v5.1.1 `protocol.Decode` = generated msgp, map only;
+`DecodeReflect` = go-codec, array form kept):
+
+| go entry point | go decoder | algod-rust reader | fixture kind / set |
+| --- | --- | --- | --- |
+| gossip `TX` / `PP` / `VB` / `AV`, `BlockResponse`, block service | generated | `algo-types` / `algo-agreement` readers (`struct_keys`, map only) | consensus: `stxn` `txn` `payload` `vote` `bundle` `cert` `blockcert` `block` `header` `applydata` `evaldelta` `stxninblock` |
+| tx-sync response (`rpcs/httpTxSync.go`, go #6729) | generated | `algo-network` `tx_sync_client` | network: `txsync` |
+| identity challenge / response / verification | generated | `algo-network` `identity` | network: `idchal` `idresp` `idverify` |
+| peer-meta headers (`p2pMetainfo.go`) | generated | `algo-p2p` `wsproto` | p2p: `peermeta` (a map of string to string list, no struct) |
+| catchpoint `content.msgpack`, `balances.N.msgpack` (and the account / resource blobs inside), `stateProofVerificationContext.msgpack` | generated | `algo-ledger` `catchpoint/msgp_compat.rs` (array branches removed in #2609) | ledger: `cpheader` `cpchunk` `cpspver` |
+| algokey PQ key file | generated | `algokey-rust` `pq/key.rs` | algokey: `pqkey` |
+| simulate request body (`server/v2/utils.go`) | go-codec | `algo-rest-api` `simulate_strict.rs` under `go_codec_reflect` | `simulate_strict` rows (#2555, #2608) |
+| `libgoal` / `goal` reads of a node's answer, agreement crash state | go-codec | goal-rust (client side), own crash-state format | not a wire entry of the node |
+
+The ledger set had no array rows before #2609 (its schema was not dumped) and
+its readers still read the array form; the ledger oracle now dumps its schema
+(`TestStrictDecodeSchemaLedger`, the msgp.Raw fields `b` / `c` typed as
+`BaseAccountData` / `ResourcesData`), and every set got rows for an array
+under a struct-valued key, array headers cut short, arrays nested up to 300
+deep and the array form cut at a few points. All are rejected by go v5.1.1 and
+by the readers. The older rows were not touched (the new ones are appended).
