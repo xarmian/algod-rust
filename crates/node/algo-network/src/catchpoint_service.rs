@@ -320,8 +320,9 @@ async fn serve_round(
             .into_response();
     }
 
-    // go: `rc.SetWriteDeadline(now + 2 min + size / worst upload speed)`, from the
-    // size of the file on disk (the gzip-compressed bytes); a transport without a
+    // go: `rc.SetWriteDeadline(now + 2 min + size / worst upload speed)`, set before
+    // it decompresses and sized by the file on disk (the gzip-compressed bytes), the
+    // same as here; a transport without a
     // stream deadline (a plain HTTP server) has nothing to extend.
     if let Some(deadline) = write_deadline {
         deadline.set(

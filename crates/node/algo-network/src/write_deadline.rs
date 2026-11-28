@@ -137,6 +137,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for DeadlineIo<S> {
         Pin::new(&mut this.io).poll_flush(cx)
     }
 
+    /// Closing is deliberately exempt: it is how the stream is given up once a
+    /// write failed, and it must not be held by the deadline that failed it.
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
     }
@@ -186,6 +188,20 @@ mod tests {
         });
         io.write_all(&[7u8; 64]).await.unwrap();
         assert_eq!(reader.await.unwrap(), vec![7u8; 64]);
+    }
+
+    /// A deadline that already fired, with nothing being written, and is then
+    /// extended (a later request on the stream): the next write succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn extending_after_the_deadline_fired_rearms_it() {
+        let (_client, server) = tokio::io::duplex(1024);
+        let deadline = WriteDeadline::new(Instant::now() + Duration::from_secs(60));
+        let mut io = DeadlineIo::new(server, deadline.clone());
+        io.write_all(b"a").await.unwrap();
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert!(io.write_all(b"b").await.is_err());
+        deadline.set(Instant::now() + Duration::from_secs(60));
+        io.write_all(b"c").await.unwrap();
     }
 
     /// A deadline moved to the past fails the next write at once.
