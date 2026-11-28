@@ -921,6 +921,10 @@ impl TransactionPool {
             }
             Err(payload) => {
                 inner.evaluator_corrupted = true;
+                tracing::error!(
+                    round = round.0,
+                    "pool: block evaluator panicked; refusing groups until it is rebuilt"
+                );
                 let cause = payload
                     .downcast_ref::<&str>()
                     .map(|s| (*s).to_string())
@@ -4260,14 +4264,12 @@ mod tests {
                             .to_string(),
                         class: RejectClass::Framed(FramedKind::MinBalance),
                     },
-                    _ => || {
-                        AlgoError::Rejected {
+                    _ => || AlgoError::Rejected {
                         source: None,
                         message:
                             "transaction X: should have been authorized by A but was actually authorized by B"
                                 .to_string(),
                         class: RejectClass::Framed(FramedKind::Other),
-                    }
                     },
                 },
             }));
@@ -4374,13 +4376,12 @@ mod tests {
             guard.evaluator = Some(Box::new(ErrEvaluator {
                 round: Round(2),
                 make: || AlgoError::Validation {
-                    message: "transaction has too many foreign references".to_string(),
+                    message: "transaction has too many foreign references"
+                        .to_string(),
                 },
             }));
         }
-        let err = pool
-            .remember(vec![make_test_txn(9)])
-            .expect_err("validation");
+        let err = pool.remember(vec![make_test_txn(9)]).expect_err("validation");
         assert_eq!(
             err.to_string(),
             "TransactionPool.Remember: TransactionPool.ingest: validation error: transaction has too many foreign references"
@@ -4519,11 +4520,7 @@ mod tests {
             Ok(())
         }
         fn generate_block(&mut self, voting_accounts: &[Address]) -> Result<Block, AlgoError> {
-            self.log
-                .calls
-                .lock()
-                .unwrap()
-                .push(voting_accounts.to_vec());
+            self.log.calls.lock().unwrap().push(voting_accounts.to_vec());
             Ok(Block {
                 round: self.round,
                 ..Block::default()

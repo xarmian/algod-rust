@@ -969,10 +969,7 @@ mod tests {
             detail: None,
         };
         assert_eq!(
-            classify_pool_error(&rej(
-                RejectClass::Framed(FramedKind::MinBalance),
-                "anything"
-            )),
+            classify_pool_error(&rej(RejectClass::Framed(FramedKind::MinBalance), "anything")),
             PoolErrorTag::MinBalance
         );
         for class in [
