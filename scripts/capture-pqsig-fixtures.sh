@@ -43,8 +43,14 @@
 # same container, or any Linux host — the binary only needs to run, not
 # to match the dev box's OS).
 #
+# `$ALGOKEY` must be go-algorand v5.1.1-stable or later: the `algokey pq` group
+# of v5.0.x is `algokey salted` there (`pq` stays as an alias, but `--scheme`
+# is required and the printed text lost its `PQ ` labels). The fixtures below
+# were captured with v5.0.x `algokey pq`; the key derivation and signing are
+# the same.
+#
 # Fixture key material: derived deterministically via
-# `algokey pq import -m "<mnemonic>"` from the well-known all-zero test
+# `algokey salted import -S falcon-1024 -m "<mnemonic>"` from the well-known all-zero test
 # mnemonic (`abandon abandon abandon ... invest`, seed
 # `00000000...0000`) already used by
 # `crates/core/algo-consensus-crypto/tests/passphrase_parity.rs` — so

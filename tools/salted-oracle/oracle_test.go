@@ -466,6 +466,22 @@ func TestAlgodRustSaltedOracle(t *testing.T) {
 		}
 	}
 	{
+		// A SignedTxn whose map keys are spelled as arrays of uint8: the
+		// generated decoder reads them (`ReadMapKeyZC`), so go signs them.
+		sg := signings["ed1"]
+		kf := keyfileFor(sg)
+		own := oracleTxn(sg.Public.address(), "arraykey")
+		enc := protocol.Encode(&own)
+		topKey := append([]byte{0x81, 0x93, 't', 'x', 'n'}, enc[5:]...)
+		signCase("array-key-top", kf, "", "", topKey, false)
+		sndKey := bytes.Replace(enc, []byte{0xa3, 's', 'n', 'd'}, []byte{0x93, 's', 'n', 'd'}, 1)
+		signCase("array-key-nested", kf, "", "", sndKey, false)
+		binKey := bytes.Replace(enc, []byte{0xa3, 's', 'n', 'd'}, []byte{0xc4, 3, 's', 'n', 'd'}, 1)
+		signCase("bin-key-nested", kf, "", "", binKey, false)
+		badKey := bytes.Replace(enc, []byte{0xa3, 's', 'n', 'd'}, []byte{0x93, 's', 'n', 'e'}, 1)
+		signCase("array-key-unknown", kf, "", "", badKey, false)
+	}
+	{
 		// ed25519 key files whose tail disagrees with the seed.
 		edBase := signings["ed1"]
 		own := oracleTxn(edBase.Public.address(), "tail")

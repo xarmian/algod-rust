@@ -45,7 +45,11 @@ pub fn run_with_io<O: Write, E: Write>(
 pub fn run_salted_check_address<O: Write>(address: &str, stdout: &mut O) -> Result<(), String> {
     let bytes = algo_avm::assembler::unmarshal_checksum_address(address)
         .map_err(|e| format!("cannot parse address: {e}"))?;
-    let addr = algo_types::Address(bytes.try_into().expect("32 bytes"));
+    let addr = algo_types::Address(
+        bytes
+            .try_into()
+            .map_err(|_| format!("cannot parse address: decoded bad addr: {address}"))?,
+    );
     if !addr.is_off_ed25519_curve() {
         return Err(format!("address {addr} is on the Ed25519 curve"));
     }
