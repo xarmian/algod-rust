@@ -271,6 +271,11 @@ pub struct WebsocketNetworkConfig {
     /// Maximum peer inactivity before disconnection (default: 5 min).
     pub max_peer_inactivity: Duration,
 
+    /// How long a peer has to deliver the rest of a message once it has
+    /// started (go v5.1.1 `maxMessageReadDuration`, default 50 s; issue
+    /// #2612). A test knob: nothing configures it in `config.json`.
+    pub max_message_read_duration: Duration,
+
     /// How long a message can sit in the send queue before considering
     /// the peer slow (default: 25s).
     pub slow_write_threshold: Duration,
@@ -473,6 +478,7 @@ impl Default for WebsocketNetworkConfig {
             gossip_fanout: DEFAULT_GOSSIP_FANOUT,
             mesh_interval: DEFAULT_MESH_INTERVAL,
             max_peer_inactivity: DEFAULT_MAX_PEER_INACTIVITY,
+            max_message_read_duration: crate::read_progress::MAX_MESSAGE_READ_DURATION,
             slow_write_threshold: DEFAULT_SLOW_WRITE_THRESHOLD,
             genesis_id: String::new(),
             network_id: String::new(),
@@ -1576,6 +1582,7 @@ impl WebsocketNetwork {
                     // Issue #1425: share this network's single counter
                     // instance, matching the inbound path.
                     network_metrics: Some(self.network_metrics.clone()),
+                    max_message_read_duration: Some(self.config.max_message_read_duration),
                     ..crate::ws_peer::WsPeerConfig::default()
                 }),
                 network_protocol_version: self.config.network_protocol_version.clone(),
@@ -1951,6 +1958,7 @@ impl WebsocketNetwork {
         let app = self.build_relay_router();
         let mut make_service = app.into_make_service_with_connect_info::<SocketAddr>();
         let cancel = self.cancel.clone();
+        let max_message_read_duration = self.config.max_message_read_duration;
 
         let server_task = tokio::spawn(async move {
             loop {
@@ -1969,9 +1977,25 @@ impl WebsocketNetwork {
                                     Err(e) => match e {},
                                 };
 
+                                // Issue #2612: the connection's frames are followed (plain
+                                // or inside TLS) so the websocket read loop can bound a
+                                // message that started and stalled; the handle reaches the
+                                // upgrade handler through the request extensions.
+                                let (read_tap, progress) = crate::read_progress::ProgressTap::new(
+                                    max_message_read_duration,
+                                    false,
+                                );
+                                let read_progress_ext = InboundReadProgress(Some(progress));
+
                                 // Wrap the tower service so hyper 1.x can use it.
-                                let hyper_svc =
+                                let inner_svc =
                                     hyper_util::service::TowerToHyperService::new(svc);
+                                let hyper_svc = hyper::service::service_fn(
+                                    move |mut req: hyper::Request<hyper::body::Incoming>| {
+                                        req.extensions_mut().insert(read_progress_ext.clone());
+                                        hyper::service::Service::call(&inner_svc.clone(), req)
+                                    },
+                                );
 
                                 // Spawn a task to serve this connection.
                                 // The conn_guard is moved into the task so the
@@ -1982,7 +2006,11 @@ impl WebsocketNetwork {
                                         // TLS-wrapped connection.
                                         match acceptor.accept(stream).await {
                                             Ok(tls_stream) => {
-                                                let io = hyper_util::rt::TokioIo::new(tls_stream);
+                                                let io = hyper_util::rt::TokioIo::new(
+                                                    crate::read_progress::ProgressIo::with_tap(
+                                                        tls_stream, read_tap,
+                                                    ),
+                                                );
                                                 let conn = hyper::server::conn::http1::Builder::new()
                                                     .serve_connection(io, hyper_svc)
                                                     .with_upgrades();
@@ -2004,7 +2032,11 @@ impl WebsocketNetwork {
                                         }
                                     } else {
                                         // Plain TCP connection.
-                                        let io = hyper_util::rt::TokioIo::new(stream);
+                                        let io = hyper_util::rt::TokioIo::new(
+                                            crate::read_progress::ProgressIo::with_tap(
+                                                stream, read_tap,
+                                            ),
+                                        );
                                         let conn = hyper::server::conn::http1::Builder::new()
                                             .serve_connection(io, hyper_svc)
                                             .with_upgrades();
@@ -3170,6 +3202,11 @@ fn resolve_incoming_peer_address(
 // Gossip WebSocket upgrade handler (axum)
 // ---------------------------------------------------------------------------
 
+/// The handle on an accepted connection's frame follower, put in the request
+/// extensions by the accept loop (#2612).
+#[derive(Clone)]
+struct InboundReadProgress(Option<crate::read_progress::ReadProgress>);
+
 /// Axum handler for `GET /v1/:genesis_id/gossip`.
 ///
 /// Validates the incoming connection, then upgrades to WebSocket.  On
@@ -3182,8 +3219,11 @@ async fn gossip_upgrade_handler(
     Path(genesis_id): Path<String>,
     ws: WebSocketUpgrade,
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    read_progress: Option<axum::Extension<InboundReadProgress>>,
     headers: HeaderMap,
 ) -> axum::response::Response {
+    let read_progress = read_progress.and_then(|axum::Extension(p)| p.0);
+
     let remote_ip = remote_addr.ip();
 
     // Validate the incoming connection.
@@ -3347,6 +3387,14 @@ async fn gossip_upgrade_handler(
     // already spent by the time the application-level check rejects it.
     // Go's `wsPeer.go` readLoop enforces the equivalent bound
     // incrementally via `LimitedReaderSlurper`.
+    // The request is validated and everything the peer may send before our 101
+    // response has been read: from here the bytes on this connection are
+    // websocket frames (#2612). A client that pipelines frames behind its upgrade
+    // request, against the protocol, misaligns only its own tracking.
+    if let Some(progress) = &read_progress {
+        progress.arm();
+    }
+
     let ws = ws
         .max_message_size(crate::tag::MAX_MESSAGE_LENGTH)
         .max_frame_size(crate::tag::MAX_MESSAGE_LENGTH);
@@ -3368,6 +3416,7 @@ async fn gossip_upgrade_handler(
                 // per `resolve_incoming_peer_address`'s doc comment above.
                 Some(tracking_ip.to_string()),
                 identity_pending,
+                read_progress,
             )
         })
         .into_response();
@@ -3404,6 +3453,8 @@ async fn handle_gossip_websocket(
     // Issue #1445: message 1/2 result, if identity exchange started — see
     // `gossip_upgrade_handler`'s doc comment on this variable.
     identity_pending: Option<InboundIdentityPending>,
+    // Issue #2612: follows the frames read from this connection.
+    read_progress: Option<crate::read_progress::ReadProgress>,
 ) {
     // Connection is already tracked by validate_incoming_connection().
 
@@ -3443,6 +3494,7 @@ async fn handle_gossip_websocket(
         // `RoutingAddr()` normalization.
         origin_address,
         identity_pending,
+        read_progress,
     );
 
     // Register the inbound peer in the peer map via add_peer, which

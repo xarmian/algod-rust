@@ -338,10 +338,20 @@ async fn try_connect_inner(
     // body; an explicit match avoids that false-positive-shaped closure
     // signature without boxing the error type just for this call site.
     let max_header_bytes = config.max_header_bytes;
+    let max_message_read_duration = config
+        .peer_config
+        .as_ref()
+        .and_then(|c| c.max_message_read_duration)
+        .unwrap_or(crate::read_progress::MAX_MESSAGE_READ_DURATION);
     let dial = move || async move {
         match tokio::time::timeout(
             handshake_timeout,
-            dial_with_header_cap(request, ws_config, max_header_bytes),
+            dial_with_header_cap(
+                request,
+                ws_config,
+                max_header_bytes,
+                max_message_read_duration,
+            ),
         )
         .await
         {
@@ -494,6 +504,11 @@ async fn try_connect_inner(
     // Step 11: Create and start WsPeer
     let closing = CancellationToken::new();
     let mut peer_cfg = config.peer_config.clone().unwrap_or_default();
+    // Issue #2612: the frame follower under this connection's websocket
+    peer_cfg.read_progress = match ws_stream.get_ref() {
+        MaybeTlsStream::Plain(io) => io.progress(),
+        _ => None,
+    };
     if peer_cfg.request_tracker.is_none() {
         peer_cfg.request_tracker = Some(Arc::new(RequestTracker::new()));
     }
@@ -590,16 +605,37 @@ async fn dial_with_header_cap(
     request: tokio_tungstenite::tungstenite::handshake::client::Request,
     ws_config: WebSocketConfig,
     max_header_bytes: usize,
+    max_message_read_duration: Duration,
 ) -> Result<
     (
-        tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>,
+        tokio_tungstenite::WebSocketStream<crate::ws_peer::WsTransport>,
         tokio_tungstenite::tungstenite::handshake::client::Response,
     ),
     WsConnectError,
 > {
     let scheme = request.uri().scheme_str().unwrap_or("ws");
     if scheme != "ws" || max_header_bytes == 0 {
-        return tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false)
+        // `connect_async_with_config` with the TCP connect done here, so the stream
+        // has the transport type the peer is built on. It is not followed: a `wss`
+        // connection's bytes are TLS records, and a `ws` one without a header cap
+        // (a test setting) reads its handshake through the stream.
+        let host = request
+            .uri()
+            .host()
+            .ok_or_else(|| WsConnectError::TcpFailure("request URL has no host".to_string()))?
+            .to_string();
+        let port = request
+            .uri()
+            .port_u16()
+            .unwrap_or(if scheme == "wss" { 443 } else { 80 });
+        // a URL's IPv6 literal is bracketed, `connect` takes it bare
+        let bare_host = host.trim_start_matches('[').trim_end_matches(']');
+        let tcp = TcpStream::connect((bare_host, port))
+            .await
+            .map_err(|e| map_tungstenite_error(tokio_tungstenite::tungstenite::Error::Io(e)))?;
+        // the handshake's own bytes pass through this stream, so it is not followed
+        let io = crate::read_progress::ProgressIo::untracked(tcp);
+        return tokio_tungstenite::client_async_tls_with_config(request, io, Some(ws_config), None)
             .await
             .map_err(map_tungstenite_error);
     }
@@ -632,7 +668,11 @@ async fn dial_with_header_cap(
     verify_handshake_response(&response, &accept_key)?;
 
     let ws_stream = tokio_tungstenite::WebSocketStream::from_partially_read(
-        MaybeTlsStream::Plain(tcp),
+        MaybeTlsStream::Plain(crate::read_progress::ProgressIo::new_after(
+            tcp,
+            max_message_read_duration,
+            &leftover,
+        )),
         leftover,
         tokio_tungstenite::tungstenite::protocol::Role::Client,
         Some(ws_config),
@@ -1355,7 +1395,13 @@ Sec-WebSocket-Accept: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             .into_client_request()
             .unwrap();
         let ws_config = WebSocketConfig::default();
-        let result = dial_with_header_cap(request, ws_config, 0).await;
+        let result = dial_with_header_cap(
+            request,
+            ws_config,
+            0,
+            crate::read_progress::MAX_MESSAGE_READ_DURATION,
+        )
+        .await;
         assert!(
             !matches!(result, Err(WsConnectError::HeaderTooLarge { .. })),
             "max_header_bytes = 0 must disable the size cap, got: {result:?}"
