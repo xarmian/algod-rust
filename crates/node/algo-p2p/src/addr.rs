@@ -293,39 +293,21 @@ fn go_quote(s: &str) -> String {
     go_quote_bytes(s.as_bytes())
 }
 
-/// An approximation of go's `unicode.IsPrint` for non-ASCII runes: controls,
-/// spaces other than ASCII space, format characters (Cf) and private-use code
-/// points (Co) are not printable. Unassigned code points (Cn) are treated as
-/// printable, which differs from go's Unicode tables for them.
+/// go 1.27 `unicode.IsPrint` for a rune >= 0x80, from the table the go oracle
+/// wrote (`go_print_table.rs`, `tools/network-oracle`).
 fn go_is_print(c: char) -> bool {
-    !(c.is_control()
-        || c.is_whitespace()
-        || matches!(
-            c as u32,
-            0xad | 0x600..=0x605
-                | 0x61c
-                | 0x6dd
-                | 0x70f
-                | 0x890..=0x891
-                | 0x8e2
-                | 0x180e
-                | 0x200b..=0x200f
-                | 0x2028..=0x202e
-                | 0x2060..=0x2064
-                | 0x2066..=0x206f
-                | 0xe000..=0xf8ff
-                | 0xfeff
-                | 0xfff9..=0xfffb
-                | 0x110bd
-                | 0x110cd
-                | 0x13430..=0x1343f
-                | 0x1bca0..=0x1bca3
-                | 0x1d173..=0x1d17a
-                | 0xe0001
-                | 0xe0020..=0xe007f
-                | 0xf0000..=0xffffd
-                | 0x100000..=0x10fffd
-        ))
+    let c = c as u32;
+    crate::go_print_table::NON_PRINT
+        .binary_search_by(|&(lo, hi)| {
+            if c < lo {
+                std::cmp::Ordering::Greater
+            } else if c > hi {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_err()
 }
 
 /// go's `getScheme`: `Ok((scheme, rest))`.

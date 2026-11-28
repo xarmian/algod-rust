@@ -876,14 +876,14 @@ mod tests {
 
     #[tokio::test]
     async fn early_messages_are_delivered_in_order_once_the_handler_exists() {
-        let mux = Multiplexer::with_early_hold(&[Tag::AgreementVote], Duration::from_secs(30), 128);
+        let mux = Multiplexer::with_early_hold(
+            &[Tag::AgreementVote],
+            Duration::from_secs(30),
+            128,
+        );
         for n in 1..=3 {
             let out = mux.handle(msg(Tag::AgreementVote, n)).await;
-            assert_eq!(
-                out.action,
-                ForwardingPolicy::Ignore,
-                "still ignored for the caller"
-            );
+            assert_eq!(out.action, ForwardingPolicy::Ignore, "still ignored for the caller");
         }
         let rec = Arc::new(Recorder(Mutex::new(Vec::new())));
         mux.register_handlers(vec![TaggedMessageHandler {
@@ -906,10 +906,7 @@ mod tests {
         let mux = Multiplexer::with_early_hold(&[Tag::AgreementVote], Duration::from_secs(30), 8);
         mux.handle(msg(Tag::Transaction, 9)).await;
         let rec = Arc::new(Recorder(Mutex::new(Vec::new())));
-        mux.register_handlers(vec![TaggedMessageHandler {
-            tag: Tag::Transaction,
-            handler: rec.clone(),
-        }]);
+        mux.register_handlers(vec![TaggedMessageHandler { tag: Tag::Transaction, handler: rec.clone() }]);
         settle_until(&rec, 1).await;
         assert!(rec.0.lock().unwrap().is_empty());
     }
@@ -921,10 +918,7 @@ mod tests {
             mux.handle(msg(Tag::AgreementVote, n)).await;
         }
         let rec = Arc::new(Recorder(Mutex::new(Vec::new())));
-        mux.register_handlers(vec![TaggedMessageHandler {
-            tag: Tag::AgreementVote,
-            handler: rec.clone(),
-        }]);
+        mux.register_handlers(vec![TaggedMessageHandler { tag: Tag::AgreementVote, handler: rec.clone() }]);
         settle_until(&rec, 2).await;
         assert_eq!(*rec.0.lock().unwrap(), vec![4, 5]);
     }
@@ -935,10 +929,7 @@ mod tests {
         mux.handle(msg(Tag::AgreementVote, 1)).await;
         tokio::time::sleep(Duration::from_millis(40)).await;
         let rec = Arc::new(Recorder(Mutex::new(Vec::new())));
-        mux.register_handlers(vec![TaggedMessageHandler {
-            tag: Tag::AgreementVote,
-            handler: rec.clone(),
-        }]);
+        mux.register_handlers(vec![TaggedMessageHandler { tag: Tag::AgreementVote, handler: rec.clone() }]);
         settle_until(&rec, 1).await;
         assert!(rec.0.lock().unwrap().is_empty());
     }
@@ -948,13 +939,11 @@ mod tests {
         let mux = Multiplexer::new();
         mux.handle(msg(Tag::AgreementVote, 1)).await;
         let rec = Arc::new(Recorder(Mutex::new(Vec::new())));
-        mux.register_handlers(vec![TaggedMessageHandler {
-            tag: Tag::AgreementVote,
-            handler: rec.clone(),
-        }]);
+        mux.register_handlers(vec![TaggedMessageHandler { tag: Tag::AgreementVote, handler: rec.clone() }]);
         settle_until(&rec, 1).await;
         assert!(rec.0.lock().unwrap().is_empty());
     }
+
 
     /// The race the review found: the handler appears between `handle`'s
     /// lookup and its hold. `hold_or_handler` must hand the handler back so the
@@ -963,22 +952,13 @@ mod tests {
     async fn a_handler_registered_after_the_lookup_still_gets_the_message() {
         let mux = Multiplexer::with_early_hold(&[Tag::AgreementVote], Duration::from_secs(30), 8);
         let rec = Arc::new(Recorder(Mutex::new(Vec::new())));
-        mux.register_handlers(vec![TaggedMessageHandler {
-            tag: Tag::AgreementVote,
-            handler: rec.clone(),
-        }]);
+        mux.register_handlers(vec![TaggedMessageHandler { tag: Tag::AgreementVote, handler: rec.clone() }]);
         // (the lookup in `handle` already missed; now the hold step runs)
         let h = mux.hold_or_handler(&msg(Tag::AgreementVote, 7));
-        assert!(
-            h.is_some(),
-            "the registered handler must be returned, not the message parked"
-        );
+        assert!(h.is_some(), "the registered handler must be returned, not the message parked");
         h.unwrap().handle(msg(Tag::AgreementVote, 7)).await;
         assert_eq!(*rec.0.lock().unwrap(), vec![7]);
-        assert!(
-            mux.take_held(Tag::AgreementVote).is_empty(),
-            "nothing parked"
-        );
+        assert!(mux.take_held(Tag::AgreementVote).is_empty(), "nothing parked");
     }
 
     #[tokio::test]
@@ -987,15 +967,8 @@ mod tests {
         mux.handle(msg(Tag::AgreementVote, 1)).await;
         tokio::time::sleep(Duration::from_millis(40)).await;
         mux.handle(msg(Tag::AgreementVote, 2)).await;
-        let held: Vec<u8> = mux
-            .take_held(Tag::AgreementVote)
-            .iter()
-            .map(|m| m.data[0])
-            .collect();
-        assert_eq!(
-            held,
-            vec![2],
-            "the stale first message was evicted on insert"
-        );
+        let held: Vec<u8> = mux.take_held(Tag::AgreementVote).iter().map(|m| m.data[0]).collect();
+        assert_eq!(held, vec![2], "the stale first message was evicted on insert");
     }
+
 }

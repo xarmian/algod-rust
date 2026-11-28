@@ -34,7 +34,9 @@ package addr
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
+	"strconv"
 	"testing"
 )
 
@@ -70,6 +72,7 @@ func TestAddrOracle(t *testing.T) {
 		"[::1.2.3.256]:80", "[1:2:3:4:5:6:7:8::]:80", "[::g]:80", "[:1]:80", "[1:]:80", "[::1:]:80",
 		"host​:80", "hést:80", "host:80", "host :80", "ho­s:80", " host:80",
 		"http://h/%€", "http://h/%é", "host%€:80", "http://h/%zz", "http://h/󰀀%zz", "http://h/￼%zz", "http://h/⁠%zz", "http://h/😀%zz",
+		"http://h/\u0378%zz", "http://h/\U000e0100%zz", "http://h/\u0605%zz", "http://h/\U0001d173%zz", "http://h/\U0002fffe%zz", "http://h/\ufdd0%zz",
 		"HTTP://Host:80", "http://host%80:80", "http://host%2Fx:80", "http://[::1]%zz:80",
 	}
 	f, err := os.Create(out)
@@ -100,4 +103,37 @@ func TestAddrOracle(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
+
+// TestPrintTableOracle writes the runes >= 0x80 that go's strconv.IsPrint (used by
+// %q) reports as not printable, as ranges, to $NETORACLE_PRINT_OUT (Rust source
+// lines for crates/node/algo-p2p/src/go_print_table.rs).
+func TestPrintTableOracle(t *testing.T) {
+	out := os.Getenv("NETORACLE_PRINT_OUT")
+	if out == "" {
+		t.Skip("NETORACLE_PRINT_OUT not set")
+	}
+	f, err := os.Create(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	start := rune(-1)
+	flush := func(end rune) {
+		if start >= 0 {
+			fmt.Fprintf(f, "    (0x%x, 0x%x),\n", start, end)
+			start = -1
+		}
+	}
+	for r := rune(0x80); r <= 0x10ffff; r++ {
+		if r >= 0xd800 && r <= 0xdfff {
+			continue // surrogates are not Rust chars
+		}
+		if strconv.IsPrint(r) {
+			flush(r - 1)
+		} else if start < 0 {
+			start = r
+		}
+	}
+	flush(0x10ffff)
 }

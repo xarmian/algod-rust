@@ -49,6 +49,7 @@ pub mod dht;
 pub mod dnsaddr;
 pub mod errors;
 pub mod filtered_identify;
+mod go_print_table;
 pub mod host;
 pub mod httpproto;
 pub mod identity;

@@ -123,6 +123,12 @@
 {"addr":"http://h/￼%zz","err":"parse \"http://h/￼%zz\": invalid URL escape \"%zz\"","is_multiaddr":false,"multi_err":"parse \"http://h/￼%zz\": invalid URL escape \"%zz\"","multi_ok":false,"ok":false}
 {"addr":"http://h/⁠%zz","err":"parse \"http://h/\\u2060%zz\": invalid URL escape \"%zz\"","is_multiaddr":false,"multi_err":"parse \"http://h/\\u2060%zz\": invalid URL escape \"%zz\"","multi_ok":false,"ok":false}
 {"addr":"http://h/😀%zz","err":"parse \"http://h/😀%zz\": invalid URL escape \"%zz\"","is_multiaddr":false,"multi_err":"parse \"http://h/😀%zz\": invalid URL escape \"%zz\"","multi_ok":false,"ok":false}
+{"addr":"http://h/͸%zz","err":"parse \"http://h/\\u0378%zz\": invalid URL escape \"%zz\"","is_multiaddr":false,"multi_err":"parse \"http://h/\\u0378%zz\": invalid URL escape \"%zz\"","multi_ok":false,"ok":false}
+{"addr":"http://h/󠄀%zz","err":"parse \"http://h/󠄀%zz\": invalid URL escape \"%zz\"","is_multiaddr":false,"multi_err":"parse \"http://h/󠄀%zz\": invalid URL escape \"%zz\"","multi_ok":false,"ok":false}
+{"addr":"http://h/؅%zz","err":"parse \"http://h/\\u0605%zz\": invalid URL escape \"%zz\"","is_multiaddr":false,"multi_err":"parse \"http://h/\\u0605%zz\": invalid URL escape \"%zz\"","multi_ok":false,"ok":false}
+{"addr":"http://h/𝅳%zz","err":"parse \"http://h/\\U0001d173%zz\": invalid URL escape \"%zz\"","is_multiaddr":false,"multi_err":"parse \"http://h/\\U0001d173%zz\": invalid URL escape \"%zz\"","multi_ok":false,"ok":false}
+{"addr":"http://h/𯿾%zz","err":"parse \"http://h/\\U0002fffe%zz\": invalid URL escape \"%zz\"","is_multiaddr":false,"multi_err":"parse \"http://h/\\U0002fffe%zz\": invalid URL escape \"%zz\"","multi_ok":false,"ok":false}
+{"addr":"http://h/﷐%zz","err":"parse \"http://h/\\ufdd0%zz\": invalid URL escape \"%zz\"","is_multiaddr":false,"multi_err":"parse \"http://h/\\ufdd0%zz\": invalid URL escape \"%zz\"","multi_ok":false,"ok":false}
 {"addr":"HTTP://Host:80","host":"Host:80","is_multiaddr":false,"multi":"Host:80","multi_ok":true,"ok":true,"scheme":"http"}
 {"addr":"http://host%80:80","host":"host�:80","is_multiaddr":false,"multi":"host�:80","multi_ok":true,"ok":true,"scheme":"http"}
 {"addr":"http://host%2Fx:80","err":"parse \"http://host%2Fx:80\": invalid URL escape \"%2F\"","is_multiaddr":false,"multi_err":"parse \"http://host%2Fx:80\": invalid URL escape \"%2F\"","multi_ok":false,"ok":false}
