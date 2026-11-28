@@ -177,11 +177,14 @@
 //!   (`bookkeeping.TxnDeadError` — the txn's `LastValid` has already
 //!   passed, which can just mean this node fell behind, not the app's
 //!   fault — and `ledgercore.ErrEvaluatorCorruptedState`, an internal
-//!   fault); algod-rust's [`algo_pool::PoolError`] has no variants
-//!   corresponding to either today, so this port penalizes on every
-//!   `remember` failure. If/when those distinctions are added to
-//!   `PoolError`, this call site should skip penalizing them too, to stay
-//!   in parity.
+//!   fault) and, since v5.1.1, `pools.ErrTxPoolVerifyError` (the group
+//!   verified under the latest block but not under the one being
+//!   assembled, which the sender may not have reached yet); this port
+//!   skips the same three
+//!   ([`algo_pool::PoolError::VerifyForPendingBlock`] and
+//!   [`algo_pool::PoolError::EvaluatorCorruptedState`] by type, a dead or
+//!   early transaction by its `txn_dead`/`txn_early` pool tag, issue
+//!   #2624).
 //!
 //! Without a limiter attached (the default from [`TxTagHandler::new`]),
 //! behavior is unchanged from before issue #821: no per-app rate limiting
@@ -873,6 +876,8 @@ struct BacklogItem {
     peer_guard: Option<CapacityGuard<String>>,
     /// The estimate charged to [`TxTagHandler::backlog_bytes`] while queued.
     bytes: i64,
+    /// Verified against the latest committed block (see `handle`).
+    pre_verified: bool,
 }
 
 impl TxTagHandler {
@@ -1428,6 +1433,11 @@ impl MessageHandler for TxTagHandler {
         // drops the group without ever calling `pool.remember()` and
         // without penalizing the app rate limiter -- a bad signature is a
         // distinct failure kind from a `remember`/eval-error.
+        // The group was verified against the latest committed block, as go's
+        // `Remember` requires: the pool then reports a failure of its own
+        // verification under the pending block header as `ErrTxPoolVerifyError`
+        // (issue #2624).
+        let mut pre_verified = false;
         if let Some(verifier) = &self.batch_verifier {
             if let Some(request) = build_verify_request(&self.pool, &group) {
                 if let Err(e) = verifier.verify(request).await {
@@ -1451,6 +1461,7 @@ impl MessageHandler for TxTagHandler {
                         topics: None,
                     };
                 }
+                pre_verified = true;
             }
             // `None` means the ledger has no committed tip yet -- fall
             // through to `pool.remember()` below, which surfaces the
@@ -1501,6 +1512,7 @@ impl MessageHandler for TxTagHandler {
                 canonical_rollback: canonical_digest.zip(self.canonical_cache.clone()),
                 peer_guard,
                 bytes: backlog_size,
+                pre_verified,
             };
             // go's `enqueueBacklog`: charge the estimate first, and drop a
             // group that would take the backlog over `backlogMaxBytes`.
@@ -1558,6 +1570,7 @@ impl MessageHandler for TxTagHandler {
                 txids,
                 msg.sender.clone(),
                 canonical_digest.zip(self.canonical_cache.clone()),
+                pre_verified,
             )
             .await;
         }
@@ -1626,6 +1639,7 @@ async fn ingest_group(
     txids: Vec<Digest>,
     sender: String,
     canonical_rollback: Option<(Digest, Arc<SeenTxCache>)>,
+    pre_verified: bool,
 ) {
     // Cloned only when a limiter is attached: `penalize_eval_error` needs
     // the group's app ids after `remember` has moved `group` into the
@@ -1643,7 +1657,14 @@ async fn ingest_group(
     // below.
     let group_for_relay = net.is_some().then(|| group.clone());
     let pool_for_task = pool.clone();
-    let result = tokio::task::spawn_blocking(move || pool_for_task.remember(group)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        if pre_verified {
+            pool_for_task.remember_verified(group)
+        } else {
+            pool_for_task.remember(group)
+        }
+    })
+    .await;
     match result {
         Ok(Ok(())) => {
             for id in &txids {
@@ -1726,7 +1747,19 @@ async fn ingest_group(
             // `transactionMessageTxPoolRememberCounter.Add(ClassifyTxPoolError(err), 1)`
             // on a `Remember` failure.
             remember_counter.record(classify_pool_error(&e));
-            if let (Some(limiter), Some(group)) = (app_limiter, group_for_penalty) {
+            // go's `postProcessCheckedTxn` does not penalize a dead or early
+            // transaction (`TxnDeadError`: this node may be out of sync), a
+            // group that verified under the latest block but not under the one
+            // being assembled (`ErrTxPoolVerifyError`: the sender may not have
+            // reached the new protocol yet), nor one an evaluator refused after
+            // a recovered panic (`ErrEvaluatorCorruptedState`).
+            let penalize = !e.is_verify_for_pending_block()
+                && !e.is_evaluator_corrupted_state()
+                && !matches!(
+                    classify_pool_error(&e),
+                    PoolErrorTag::TxnDead | PoolErrorTag::TxnEarly
+                );
+            if let (true, Some(limiter), Some(group)) = (penalize, app_limiter, group_for_penalty) {
                 let origin = origin_bytes(&sender);
                 limiter.penalize_eval_error(&group, &origin);
             }
@@ -1771,6 +1804,7 @@ async fn backlog_worker(
             canonical_rollback,
             peer_guard,
             bytes,
+            pre_verified,
         } = item;
         backlog_bytes.fetch_sub(bytes, Ordering::Relaxed);
         if let (Some(limiter), Some(guard)) = (&peer_limiter, peer_guard) {
@@ -1786,6 +1820,7 @@ async fn backlog_worker(
             txids,
             sender,
             canonical_rollback,
+            pre_verified,
         )
         .await;
     }
@@ -2349,6 +2384,8 @@ mod app_rate_limiter_wiring_tests {
     struct StubLedger {
         round: Round,
         fail: std::sync::Arc<AtomicBool>,
+        /// With `fail`: fail as go's batch verifier does (a verification verdict).
+        verify_failure: std::sync::Arc<AtomicBool>,
     }
 
     impl PoolLedger for StubLedger {
@@ -2370,6 +2407,7 @@ mod app_rate_limiter_wiring_tests {
             Ok(Box::new(StubEvaluator {
                 round: self.round.next(),
                 fail: self.fail.clone(),
+                verify_failure: self.verify_failure.clone(),
             }))
         }
     }
@@ -2377,6 +2415,7 @@ mod app_rate_limiter_wiring_tests {
     struct StubEvaluator {
         round: Round,
         fail: std::sync::Arc<AtomicBool>,
+        verify_failure: std::sync::Arc<AtomicBool>,
     }
 
     impl BlockEvaluator for StubEvaluator {
@@ -2391,8 +2430,13 @@ mod app_rate_limiter_wiring_tests {
         }
         fn transaction_group(&mut self, _txgroup: &[SignedTransaction]) -> Result<(), AlgoError> {
             if self.fail.load(Ordering::SeqCst) {
+                let message = if self.verify_failure.load(Ordering::SeqCst) {
+                    algo_error::BATCH_HAS_FAILED_SIGS
+                } else {
+                    "stub eval failure"
+                };
                 Err(AlgoError::Validation {
-                    message: "stub eval failure".to_string(),
+                    message: message.to_string(),
                 })
             } else {
                 Ok(())
@@ -2411,14 +2455,27 @@ mod app_rate_limiter_wiring_tests {
     /// Build a pool with a stub evaluator wired via `on_new_block`, plus
     /// the shared `fail` flag that controls whether `remember` succeeds.
     fn make_pool() -> (Arc<TransactionPool>, std::sync::Arc<AtomicBool>) {
+        let (pool, fail, _) = make_pool_with_verify_flag();
+        (pool, fail)
+    }
+
+    /// [`make_pool`] plus the flag that makes the forced failure a
+    /// verification verdict.
+    fn make_pool_with_verify_flag() -> (
+        Arc<TransactionPool>,
+        std::sync::Arc<AtomicBool>,
+        std::sync::Arc<AtomicBool>,
+    ) {
         let fail = std::sync::Arc::new(AtomicBool::new(false));
+        let verify_failure = std::sync::Arc::new(AtomicBool::new(false));
         let ledger: Arc<dyn PoolLedger> = Arc::new(StubLedger {
             round: Round(1),
             fail: fail.clone(),
+            verify_failure: verify_failure.clone(),
         });
         let pool = Arc::new(TransactionPool::new(PoolConfig::default(), ledger));
         pool.on_new_block(&Block::default(), &HashSet::new());
-        (pool, fail)
+        (pool, fail, verify_failure)
     }
 
     /// An application-call transaction touching `app_id`, otherwise
@@ -2602,6 +2659,67 @@ mod app_rate_limiter_wiring_tests {
         );
     }
 
+    /// Issue #2624, go v5.1.1 `postProcessCheckedTxn`: a group that verified
+    /// under the latest block but not under the one being assembled
+    /// (`ErrTxPoolVerifyError`, tag `verify`) does not penalize the app's rate
+    /// limiter, since the sender may not have reached the new protocol yet; the
+    /// same verification failure of a group nobody verified does.
+    #[tokio::test]
+    async fn verify_for_pending_block_failure_does_not_penalize_the_app() {
+        for (pre_verified, admitted_after) in [(true, true), (false, false)] {
+            let (pool, fail, verify_failure) = make_pool_with_verify_flag();
+            let seen = Arc::new(SeenTxCache::new(1024));
+            let limiter = Arc::new(AppRateLimiter::new(1024, 0, Duration::from_secs(10)));
+            let handler = TxTagHandler::new(pool.clone(), seen.clone())
+                .with_app_rate_limiter(limiter.clone(), 0);
+
+            fail.store(true, Ordering::SeqCst);
+            verify_failure.store(true, Ordering::SeqCst);
+            let failing_tx = make_app_call_txn(9, 1);
+            let txids = vec![compute_txn_id(&failing_tx.txn)];
+            let counter = handler.remember_counter();
+            ingest_group(
+                &pool,
+                &seen,
+                &Some(limiter),
+                counter,
+                &None,
+                vec![failing_tx],
+                txids,
+                "5.6.7.8:4160".to_string(),
+                None,
+                pre_verified,
+            )
+            .await;
+            assert_eq!(
+                counter.count(algo_pool::PoolErrorTag::Verify),
+                u64::from(pre_verified),
+                "pre_verified {pre_verified}: `verify` tag"
+            );
+
+            fail.store(false, Ordering::SeqCst);
+            let filler = {
+                let mut stx = SignedTransaction::default();
+                stx.txn.txn_type = TxnType::Pay;
+                stx.txn.sender = Address([3u8; 32]);
+                stx.txn.fee = 1_000_000;
+                stx.txn.first_valid = Round(1);
+                stx.txn.last_valid = Round(1_000);
+                stx.txn.note = serde_bytes::ByteBuf::from(vec![0xBB]);
+                stx
+            };
+            pool.remember(vec![filler]).expect("filler txn admitted");
+            let tx = make_app_call_txn(9, 2);
+            let txid = compute_txn_id(&tx.txn);
+            handler.handle(incoming(&[tx], "5.6.7.8:4160")).await;
+            assert_eq!(
+                pool.pending_tx_ids().contains(&txid),
+                admitted_after,
+                "pre_verified {pre_verified}: later admission of the same app"
+            );
+        }
+    }
+
     /// Issue #1683: while the pool is paused for a live catchpoint catchup, an
     /// inbound group is dropped without penalising the peer or the app: no
     /// eval-error counter, no app-rate-limiter penalty -- so the same app
@@ -2639,6 +2757,7 @@ mod app_rate_limiter_wiring_tests {
             txids,
             "5.6.7.8:4160".to_string(),
             None,
+            false,
         )
         .await;
         for tag in algo_pool::PoolErrorTag::ALL {
@@ -3345,6 +3464,7 @@ mod canonical_cache_wiring_tests {
             vec![txid],
             "1.2.3.4:4160".to_string(),
             Some((digest, canonical.clone())),
+            false,
         )
         .await;
         assert!(

@@ -147,6 +147,26 @@ pub enum PoolError {
     #[error("{}", algo_error::BATCH_HAS_FAILED_SIGS)]
     SignatureBatchFailed,
 
+    /// The group, verified against the latest committed block, does not verify
+    /// under the header of the block being assembled, typically because that
+    /// block is the first of a new consensus protocol. Corresponds to go's
+    /// `ErrTxPoolVerifyError` (`data/pools/errors.go`), tag `verify`; the
+    /// sender may not have reached the new protocol yet, so the transaction
+    /// handler does not penalize it (issue #2624).
+    #[error("transaction group does not verify for round {round}: {err}")]
+    VerifyForPendingBlock { round: u64, err: Box<PoolError> },
+
+    /// The block evaluator panicked and the panic was recovered: go's
+    /// `ledgercore.EvalPanicError`, tag `panic`.
+    #[error("panic while evaluating block for round {round}: {cause}")]
+    EvalPanic { round: u64, cause: String },
+
+    /// The block evaluator refuses further work after a recovered panic left its
+    /// state half-applied: go's `ledgercore.ErrEvaluatorCorruptedState`, tag
+    /// `panic`. The refused group was not at fault.
+    #[error("block evaluator state was corrupted by a previously recovered panic")]
+    EvaluatorCorruptedState,
+
     /// Wraps an inner error with `"TransactionPool.Remember: "` prefix,
     /// matching Go's `fmt.Errorf("TransactionPool.Remember: %w", err)`.
     #[error("TransactionPool.Remember: {0}")]
@@ -167,6 +187,40 @@ impl From<algo_types::genesis_restore::InBlockOnlyFieldError> for PoolError {
 }
 
 impl PoolError {
+    /// Whether this is a verification verdict on the group (a signature, well-
+    /// formedness or group-ID failure the evaluator reports as go's
+    /// `verify.TxnGroup` would).
+    pub fn is_verification_failure(&self) -> bool {
+        matches!(
+            self,
+            PoolError::SignatureBatchFailed
+                | PoolError::TxnRejected {
+                    class: algo_error::RejectClass::Verify(_),
+                    ..
+                }
+        )
+    }
+
+    /// Whether this error, or one it wraps via `Remember`, is
+    /// [`PoolError::VerifyForPendingBlock`] (go's `errors.As` down the chain).
+    pub fn is_verify_for_pending_block(&self) -> bool {
+        match self {
+            PoolError::VerifyForPendingBlock { .. } => true,
+            PoolError::Remember(inner) => inner.is_verify_for_pending_block(),
+            _ => false,
+        }
+    }
+
+    /// Whether this error, or one it wraps via `Remember`, is
+    /// [`PoolError::EvaluatorCorruptedState`].
+    pub fn is_evaluator_corrupted_state(&self) -> bool {
+        match self {
+            PoolError::EvaluatorCorruptedState => true,
+            PoolError::Remember(inner) => inner.is_evaluator_corrupted_state(),
+            _ => false,
+        }
+    }
+
     /// Whether this error (or the one it wraps via `Remember`) is the
     /// transient [`PoolError::NodeCatchingUp`] -- the pool is paused for a
     /// live catchpoint catchup and the group was never judged (issue #1683).
@@ -232,6 +286,7 @@ pub enum PoolErrorTag {
     PendingEval,
     NoSpace,
     Fee,
+    Verify,
     TxnDead,
     TxnEarly,
     TooLarge,
@@ -247,6 +302,7 @@ pub enum PoolErrorTag {
     Overspend,
     AssetBalance,
     EvalGeneric,
+    Panic,
 }
 
 impl PoolErrorTag {
@@ -257,6 +313,7 @@ impl PoolErrorTag {
             Self::PendingEval => "pending_eval",
             Self::NoSpace => "no_space",
             Self::Fee => "fee",
+            Self::Verify => "verify",
             Self::TxnDead => "txn_dead",
             Self::TxnEarly => "txn_early",
             Self::TooLarge => "too_large",
@@ -272,6 +329,7 @@ impl PoolErrorTag {
             Self::Overspend => "overspend",
             Self::AssetBalance => "asset_bal",
             Self::EvalGeneric => "eval",
+            Self::Panic => "panic",
         }
     }
 
@@ -281,6 +339,7 @@ impl PoolErrorTag {
         Self::PendingEval,
         Self::NoSpace,
         Self::Fee,
+        Self::Verify,
         Self::TxnDead,
         Self::TxnEarly,
         Self::TooLarge,
@@ -296,6 +355,7 @@ impl PoolErrorTag {
         Self::Overspend,
         Self::AssetBalance,
         Self::EvalGeneric,
+        Self::Panic,
     ];
 }
 
@@ -326,6 +386,8 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
         PoolError::FeeBelowThreshold { .. } => PoolErrorTag::Fee,
         PoolError::StaleBlockAssemblyRequest => PoolErrorTag::EvalGeneric,
         PoolError::PoolShutdown => PoolErrorTag::EvalGeneric,
+        PoolError::VerifyForPendingBlock { .. } => PoolErrorTag::Verify,
+        PoolError::EvalPanic { .. } | PoolError::EvaluatorCorruptedState => PoolErrorTag::Panic,
         // go never sees this in the pool (its `SignedTxn` decoder already
         // failed the submission as malformed), so it classifies with the
         // other not-well-formed rejections.
@@ -619,6 +681,181 @@ mod tests {
         );
     }
 
+    /// go `TestClassifyTxPoolErrorGeneralCoverage` (v5.1.1): every tag of
+    /// `TxPoolErrTags` is the classification of some error, bare and wrapped by
+    /// `Remember`, and `ALL` stays in step with the table (go's `ElementsMatch`).
+    #[test]
+    fn classify_pool_error_covers_every_go_tag() {
+        use algo_error::RejectClass as RC;
+        let typed = |class: RC, message: &str| PoolError::TxnRejected {
+            message: message.to_string(),
+            class,
+            detail: None,
+        };
+        let digest = Digest([7u8; 32]);
+        let cases: Vec<(&str, PoolError, PoolErrorTag)> = vec![
+            ("cap", PoolError::PendingQueueFull, PoolErrorTag::Cap),
+            (
+                "pending_eval",
+                PoolError::NoPendingBlockEvaluator,
+                PoolErrorTag::PendingEval,
+            ),
+            (
+                "no_space",
+                PoolError::Evaluator("block does not have space for transaction".to_string()),
+                PoolErrorTag::NoSpace,
+            ),
+            (
+                "fee_escalation",
+                PoolError::FeeBelowThreshold {
+                    fee: 0,
+                    fee_threshold: 0,
+                    fee_per_byte: 0,
+                    encoded_len: 0,
+                },
+                PoolErrorTag::Fee,
+            ),
+            (
+                "verify",
+                PoolError::VerifyForPendingBlock {
+                    round: 0,
+                    err: Box::new(PoolError::Evaluator("rejected by logic".to_string())),
+                },
+                PoolErrorTag::Verify,
+            ),
+            (
+                "txn_dead",
+                typed(RC::Other, "txn dead: round 9 outside of 1--2"),
+                PoolErrorTag::TxnDead,
+            ),
+            (
+                "txn_early",
+                typed(RC::Other, "txn dead: round 3 outside of 500--900"),
+                PoolErrorTag::TxnEarly,
+            ),
+            (
+                "txid_ledger",
+                PoolError::AlreadyInLedger(digest),
+                PoolErrorTag::TxId,
+            ),
+            (
+                "txid_eval",
+                typed(RC::TxidInLedger { in_block: true }, "txid"),
+                PoolErrorTag::TxIdEval,
+            ),
+            (
+                "lease_ledger",
+                typed(RC::LeaseInLedger { in_block: false }, "lease"),
+                PoolErrorTag::Lease,
+            ),
+            (
+                "lease_eval",
+                typed(RC::LeaseInLedger { in_block: true }, "lease"),
+                PoolErrorTag::LeaseEval,
+            ),
+            (
+                "group_too_large",
+                typed(RC::TooLarge, "large"),
+                PoolErrorTag::TooLarge,
+            ),
+            (
+                "group_invalid_fee",
+                typed(
+                    RC::Other,
+                    "txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)",
+                ),
+                PoolErrorTag::Fee,
+            ),
+            (
+                "group_other",
+                typed(RC::GroupId, "group"),
+                PoolErrorTag::GroupId,
+            ),
+            (
+                "not_well",
+                typed(RC::NotWell, "bad txn"),
+                PoolErrorTag::NotWell,
+            ),
+            (
+                "overspend",
+                typed(RC::Overspend, "overspend"),
+                PoolErrorTag::Overspend,
+            ),
+            (
+                "min_balance",
+                typed(RC::MinBalance, "min"),
+                PoolErrorTag::MinBalance,
+            ),
+            (
+                "asset_balance",
+                PoolError::Evaluator("holding insufficient for transfer".to_string()),
+                PoolErrorTag::AssetBalance,
+            ),
+            (
+                "approval_reject",
+                typed(RC::TealReject, "rejected"),
+                PoolErrorTag::TealReject,
+            ),
+            (
+                "logic_eval",
+                typed(RC::TealErr, "logic"),
+                PoolErrorTag::TealErr,
+            ),
+            (
+                "eval_panic",
+                PoolError::EvalPanic {
+                    round: 5,
+                    cause: "x".to_string(),
+                },
+                PoolErrorTag::Panic,
+            ),
+            (
+                "evaluator_corrupted",
+                PoolError::EvaluatorCorruptedState,
+                PoolErrorTag::Panic,
+            ),
+            (
+                "unknown_error",
+                PoolError::Evaluator("unknown".to_string()),
+                PoolErrorTag::EvalGeneric,
+            ),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (name, err, tag) in cases {
+            assert_eq!(classify_pool_error(&err), tag, "{name}");
+            let wrapped = PoolError::Remember(Box::new(err));
+            assert_eq!(classify_pool_error(&wrapped), tag, "{name} wrapped");
+            seen.insert(tag);
+        }
+        let all: std::collections::HashSet<_> = PoolErrorTag::ALL.iter().copied().collect();
+        assert_eq!(seen, all, "ALL and the table must stay in sync");
+    }
+
+    /// go's `ErrTxPoolVerifyError.Error()` and the recovered-panic errors.
+    #[test]
+    fn verify_and_panic_errors_display_go_text() {
+        let verify = PoolError::VerifyForPendingBlock {
+            round: 7,
+            err: Box::new(PoolError::Evaluator("rejected by logic".to_string())),
+        };
+        assert_eq!(
+            verify.to_string(),
+            "transaction group does not verify for round 7: TransactionPool.ingest: rejected by logic"
+        );
+        assert_eq!(
+            PoolError::EvalPanic {
+                round: 5,
+                cause: "x".to_string()
+            }
+            .to_string(),
+            "panic while evaluating block for round 5: x"
+        );
+        assert_eq!(
+            PoolError::EvaluatorCorruptedState.to_string(),
+            "block evaluator state was corrupted by a previously recovered panic"
+        );
+    }
+
     /// Mirrors go's `TestClassifyTxPoolErrorGeneralCoverage`'s
     /// `"no_space"`/`"no_space_wrapped"` cases
     /// (`../go-algorand/data/pools/errors_test.go:51`): go's
@@ -675,12 +912,14 @@ mod tests {
         assert_eq!(PoolErrorTag::Overspend.as_str(), "overspend");
         assert_eq!(PoolErrorTag::AssetBalance.as_str(), "asset_bal");
         assert_eq!(PoolErrorTag::EvalGeneric.as_str(), "eval");
+        assert_eq!(PoolErrorTag::Verify.as_str(), "verify");
+        assert_eq!(PoolErrorTag::Panic.as_str(), "panic");
     }
 
     #[test]
     fn pool_error_tag_all_count() {
-        // Go has 19 tags in TxPoolErrTags
-        assert_eq!(PoolErrorTag::ALL.len(), 19);
+        // Go has 21 tags in TxPoolErrTags
+        assert_eq!(PoolErrorTag::ALL.len(), 21);
     }
 
     /// go: `fmt.Errorf("TransactionPool.Remember: %w", err)` around the
@@ -730,7 +969,10 @@ mod tests {
             detail: None,
         };
         assert_eq!(
-            classify_pool_error(&rej(RejectClass::Framed(FramedKind::MinBalance), "anything")),
+            classify_pool_error(&rej(
+                RejectClass::Framed(FramedKind::MinBalance),
+                "anything"
+            )),
             PoolErrorTag::MinBalance
         );
         for class in [
