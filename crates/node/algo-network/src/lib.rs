@@ -45,6 +45,7 @@ pub mod msg_of_interest;
 pub mod net_prio;
 pub mod peer_features;
 pub mod peer_ranker;
+pub mod read_progress;
 pub mod reconnect;
 pub mod request_logger;
 pub mod tag;

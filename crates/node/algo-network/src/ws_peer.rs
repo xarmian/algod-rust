@@ -79,6 +79,9 @@ use crate::message_filter::{
 use crate::metrics::NetworkTagMetrics;
 use crate::msg_of_interest::unmarshal_msg_of_interest;
 use crate::peer_features::{self, PeerFeatureFlags};
+use crate::read_progress::{
+    read_deadline_passed, ProgressIo, ReadProgress, PEER_DISCONNECTION_ACK_DURATION,
+};
 use crate::request_response::{
     encode_uvarint, hash_topics, RequestResponseError, RequestTracker, DEFAULT_REQUEST_TIMEOUT,
     RESPONSE_HASH_FIELD,
@@ -296,8 +299,13 @@ enum WriteCommand {
 // Type aliases
 // ---------------------------------------------------------------------------
 
-type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
-type WsStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
+/// The transport under an outbound websocket: the TCP stream (inside TLS for
+/// `wss`) with the frame follower that gives the per-message read deadline
+/// (go v5.1.1 `maxMessageReadDuration`, issue #2612).
+pub type WsTransport = MaybeTlsStream<ProgressIo<TcpStream>>;
+
+type WsSink = SplitSink<WebSocketStream<WsTransport>, WsMessage>;
+type WsStream = SplitStream<WebSocketStream<WsTransport>>;
 
 // ---------------------------------------------------------------------------
 // WsPeer
@@ -352,6 +360,16 @@ pub struct WsPeerConfig {
     /// `ipAddr()`, which this crate doesn't separately expose). `None` for
     /// outbound connections, matching go always passing `""` for them.
     pub origin_address: Option<String>,
+    /// Follows the frames read from this connection, so a message that has
+    /// started and stalls drops the peer after
+    /// [`crate::read_progress::MAX_MESSAGE_READ_DURATION`] (go v5.1.1
+    /// `maxMessageReadDuration`, issue #2612). Set per connection by the dialer;
+    /// `None` (a `wss` connection, a test) leaves the read unbounded.
+    pub read_progress: Option<ReadProgress>,
+    /// Overrides [`crate::read_progress::MAX_MESSAGE_READ_DURATION`] for the
+    /// connection a dialer opens with this config (a test knob; the dialer reads
+    /// it, [`WsPeer`] does not).
+    pub max_message_read_duration: Option<Duration>,
 }
 
 /// Shared identity state: `(verified public key if any, verified flag)`.
@@ -438,7 +456,7 @@ impl WsPeer {
     /// Call [`start`](WsPeer::start) to spawn the background tasks and get a
     /// [`PeerHandle`].
     pub fn new(
-        ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        ws_stream: WebSocketStream<WsTransport>,
         remote_addr: String,
         version: String,
         features: PeerFeatureFlags,
@@ -464,7 +482,7 @@ impl WsPeer {
     /// up a multiplexer, message filters, and a request tracker.
     #[allow(clippy::too_many_arguments)]
     pub fn with_config(
-        ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        ws_stream: WebSocketStream<WsTransport>,
         remote_addr: String,
         version: String,
         features: PeerFeatureFlags,
@@ -518,6 +536,7 @@ impl WsPeer {
         let request_tracker = self.config.request_tracker;
         let network_metrics = self.config.network_metrics;
         let origin_address = self.config.origin_address;
+        let read_progress = self.config.read_progress;
         let request_timeout = self
             .config
             .request_timeout
@@ -561,7 +580,7 @@ impl WsPeer {
             "vpack vote compression negotiated for this connection"
         );
 
-        let read_handle = tokio::spawn(read_loop(
+        let read_handle = tokio::spawn(read_loop_with_progress(
             stream,
             incoming_tx,
             self.send_high_prio_tx.clone(),
@@ -577,6 +596,7 @@ impl WsPeer {
             peer_sender,
             stateful_vote_enabled.clone(),
             network_metrics.clone(),
+            read_progress,
         ));
 
         let write_handle = tokio::spawn(write_loop(
@@ -924,6 +944,9 @@ impl PeerHandle {
         // Issue #1445: see this method's doc comment's "Identity
         // verification" section.
         identity_pending: Option<InboundIdentityPending>,
+        // Issue #2612: follows the frames read from this connection (see
+        // [`crate::read_progress`]); `None` for a TLS connection.
+        read_progress: Option<ReadProgress>,
     ) -> Self {
         use futures_util::{SinkExt, StreamExt};
 
@@ -977,10 +1000,19 @@ impl PeerHandle {
         let read_handle = tokio::spawn(async move {
             let vote_table_size = negotiated_table_size;
             let mut stateful_decoder: Option<StatefulDecoder> = None;
+            let mut read_progress = read_progress;
             loop {
                 tokio::select! {
                     _ = read_closing.cancelled() => {
                         tracing::debug!(addr = %read_addr, "inbound read loop cancelled");
+                        break;
+                    }
+                    _ = read_deadline_passed(read_progress.as_mut()) => {
+                        tracing::warn!(
+                            addr = %read_addr,
+                            "inbound read loop: a message started and was not completed in time;                              dropping the peer"
+                        );
+                        read_closing.cancel();
                         break;
                     }
                     msg = ws_reader.next() => {
@@ -1319,6 +1351,10 @@ impl PeerHandle {
                     }
                 }
             }
+            // go `CloseWithMessage(.., now + peerDisconnectionAckDuration)`: write the
+            // close frame, but a peer that does not read must not hold the socket:
+            // it is dropped when the deadline passes (#2612)
+            let _ = tokio::time::timeout(PEER_DISCONNECTION_ACK_DURATION, ws_writer.close()).await;
         });
 
         // No separate keepalive loop for inbound peers — the write loop
@@ -2182,7 +2218,53 @@ pub fn decompress_incoming_vote_core(
 /// Generic over `St` so that tests can use `WebSocketStream<TcpStream>` while
 /// production code uses `WebSocketStream<MaybeTlsStream<TcpStream>>`.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn read_loop<St>(
+    stream: SplitStream<St>,
+    incoming_tx: mpsc::Sender<IncomingMessage>,
+    send_high_prio_tx: mpsc::Sender<WriteCommand>,
+    send_message_tags: Arc<RwLock<HashSet<Tag>>>,
+    last_packet_time: Arc<RwLock<Instant>>,
+    closing: CancellationToken,
+    remote_addr: String,
+    features: PeerFeatureFlags,
+    multiplexer: Option<Arc<Multiplexer>>,
+    incoming_filter: Option<Arc<MessageFilter>>,
+    outgoing_filter: Option<Arc<MessageFilter>>,
+    request_tracker: Option<Arc<RequestTracker>>,
+    peer_sender: Arc<PeerSender>,
+    stateful_vote_enabled: Arc<AtomicBool>,
+    network_metrics: Option<Arc<NetworkTagMetrics>>,
+) where
+    St: futures_util::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    read_loop_with_progress(
+        stream,
+        incoming_tx,
+        send_high_prio_tx,
+        send_message_tags,
+        last_packet_time,
+        closing,
+        remote_addr,
+        features,
+        multiplexer,
+        incoming_filter,
+        outgoing_filter,
+        request_tracker,
+        peer_sender,
+        stateful_vote_enabled,
+        network_metrics,
+        None,
+    )
+    .await
+}
+
+/// [`read_loop`] with go's per-message read deadline: a message that has
+/// started (see [`crate::read_progress`]) and is not complete after
+/// `maxMessageReadDuration` drops the peer, like go's read error.
+#[allow(clippy::too_many_arguments)]
+async fn read_loop_with_progress<St>(
     mut stream: SplitStream<St>,
     incoming_tx: mpsc::Sender<IncomingMessage>,
     send_high_prio_tx: mpsc::Sender<WriteCommand>,
@@ -2208,6 +2290,7 @@ async fn read_loop<St>(
     // counting). Go: `networkReceivedBytesByTag`/`networkMessageReceivedByTag`/
     // `networkReceivedUncompressedBytesByTag`.
     network_metrics: Option<Arc<NetworkTagMetrics>>,
+    mut read_progress: Option<ReadProgress>,
 ) where
     St: futures_util::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
         + Unpin,
@@ -2221,6 +2304,14 @@ async fn read_loop<St>(
             biased;
             _ = closing.cancelled() => {
                 tracing::debug!(peer = %remote_addr, "read_loop: closing");
+                return;
+            }
+            _ = read_deadline_passed(read_progress.as_mut()) => {
+                tracing::warn!(
+                    peer = %remote_addr,
+                    "read_loop: a message started and was not completed in time; dropping the peer"
+                );
+                closing.cancel();
                 return;
             }
             msg = stream.next() => msg,
@@ -2745,7 +2836,10 @@ async fn write_loop<Sk>(
             _ = closing.cancelled() => {
                 tracing::debug!(peer = %remote_addr, "write_loop: closing");
                 // Try to send a close frame before returning.
-                let _ = sink.close().await;
+                // go `CloseWithMessage(.., now + peerDisconnectionAckDuration)`: a peer
+                // that does not read must not hold the close, the socket is dropped
+                // when the deadline passes (#2612)
+                let _ = tokio::time::timeout(PEER_DISCONNECTION_ACK_DURATION, sink.close()).await;
                 return;
             }
             cmd = send_high_prio_rx.recv() => {
@@ -6647,5 +6741,33 @@ mod tests {
         assert!(!suppresses(Tag::TopicMsgResp));
         assert!(!suppresses(Tag::UniEnsBlockReq));
         assert!(!suppresses(Tag::MsgDigestSkip));
+    }
+
+    /// go `CloseWithMessage(.., now + peerDisconnectionAckDuration)` (#2612): a
+    /// peer that does not read must not hold the close frame; the write loop
+    /// gives up and drops the socket once the acknowledgement deadline passes.
+    #[tokio::test(start_paused = true)]
+    async fn close_frame_write_is_bounded_by_the_disconnection_ack_duration() {
+        let (sink, _stream) = BlockedWsHalf.split();
+        let (_high_tx, high_rx) = mpsc::channel::<WriteCommand>(10);
+        let (_bulk_tx, bulk_rx) = mpsc::channel::<WriteCommand>(10);
+        let closing = CancellationToken::new();
+        let write_task = tokio::spawn(write_loop(
+            sink,
+            high_rx,
+            bulk_rx,
+            Arc::new(RwLock::new(default_send_message_tags())),
+            closing.clone(),
+            "test".to_string(),
+            PeerFeatureFlags::empty(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        ));
+        let started = tokio::time::Instant::now();
+        closing.cancel();
+        write_task.await.unwrap();
+        assert_eq!(started.elapsed(), PEER_DISCONNECTION_ACK_DURATION);
+        assert_eq!(PEER_DISCONNECTION_ACK_DURATION, Duration::from_secs(5));
     }
 }
