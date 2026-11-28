@@ -132,6 +132,17 @@ struct PoolInner {
     /// misleading "catching up".
     last_rebuild_error: Option<String>,
 
+    /// The group being fed to the evaluator was already verified against the
+    /// latest committed block (go `Remember`'s precondition), so a verification
+    /// failure of the evaluator, which verifies against the header of the block
+    /// being assembled, is go's `ErrTxPoolVerifyError` (issue #2624). Set around
+    /// [`TransactionPool::remember_verified`] and the recompute loop.
+    groups_pre_verified: bool,
+
+    /// A panic of the evaluator was recovered and left it half-applied: it
+    /// refuses further work until it is rebuilt (go `ErrEvaluatorCorruptedState`).
+    evaluator_corrupted: bool,
+
     /// Number of "whole blocks" worth of transactions that have accumulated.
     /// Drives the exponential fee ramp.
     num_pending_whole_blocks: u64,
@@ -271,6 +282,8 @@ impl TransactionPool {
             paused_last_round: None,
             reprime_attempt: None,
             last_rebuild_error: None,
+            groups_pre_verified: false,
+            evaluator_corrupted: false,
             num_pending_whole_blocks: 0,
             fee_threshold_multiplier: 0,
             stateproof_overflowed: false,
@@ -639,6 +652,7 @@ impl TransactionPool {
         force_assembly: bool,
     ) {
         inner.evaluator = None;
+        inner.evaluator_corrupted = false;
         if inner.evaluator_paused {
             // Issue #1683: paused for a live catchup -- build nothing. The
             // pending groups stay; `resume_evaluator` rebuilds from the
@@ -875,13 +889,52 @@ impl TransactionPool {
         }
 
         // Feed to the evaluator.
-        if let Some(ref mut evaluator) = inner.evaluator {
-            evaluator
-                .transaction_group(txgroup)
-                .map_err(|e| pool_error_from_evaluator(&e))?;
-            Ok(())
-        } else {
-            Err(PoolError::NoPendingBlockEvaluator)
+        if inner.evaluator_corrupted {
+            return Err(PoolError::EvaluatorCorruptedState);
+        }
+        let pre_verified = inner.groups_pre_verified;
+        let Some(evaluator) = inner.evaluator.as_mut() else {
+            return Err(PoolError::NoPendingBlockEvaluator);
+        };
+        let round = evaluator.round();
+        // go's evaluator recovers a panic into `EvalPanicError` and refuses
+        // further work afterwards (`ErrEvaluatorCorruptedState`).
+        let fed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            evaluator.transaction_group(txgroup)
+        }));
+        match fed {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                let err = pool_error_from_evaluator(&e);
+                // go verifies the group under the header of the block being
+                // assembled (`verifyForPendingBlock`) before the evaluator; the
+                // group already passed verification against the latest block,
+                // so a failure here is `ErrTxPoolVerifyError`.
+                if pre_verified && err.is_verification_failure() {
+                    Err(PoolError::VerifyForPendingBlock {
+                        round: round.0,
+                        err: Box::new(err),
+                    })
+                } else {
+                    Err(err)
+                }
+            }
+            Err(payload) => {
+                inner.evaluator_corrupted = true;
+                tracing::error!(
+                    round = round.0,
+                    "pool: block evaluator panicked; refusing groups until it is rebuilt"
+                );
+                let cause = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                Err(PoolError::EvalPanic {
+                    round: round.0,
+                    cause,
+                })
+            }
         }
     }
 
@@ -897,7 +950,12 @@ impl TransactionPool {
         txgroup: &[SignedTransaction],
         inner: &mut PoolInner,
     ) -> Result<(), PoolError> {
-        self.add_to_pending_block_evaluator(txgroup, inner)?;
+        // Pool groups were verified on arrival: go verifies them again under
+        // the header of the block being assembled (issue #2624).
+        let was_pre_verified = std::mem::replace(&mut inner.groups_pre_verified, true);
+        let fed = self.add_to_pending_block_evaluator(txgroup, inner);
+        inner.groups_pre_verified = was_pre_verified;
+        fed?;
 
         // Store in remembered collections (these get flushed to pending later).
         inner.remembered_tx_groups.push(txgroup.to_vec());
@@ -925,6 +983,25 @@ impl TransactionPool {
     /// 7. Store in remembered
     /// 8. Flush remembered to pending
     pub fn remember(&self, tx_group: Vec<SignedTransaction>) -> Result<(), PoolError> {
+        self.remember_impl(tx_group, false)
+    }
+
+    /// [`Self::remember`] for a group the caller has verified against the latest
+    /// committed block, as go's `Remember` requires of its caller (the
+    /// transaction handler's batch verifier, `node.broadcastSignedTxGroup`). The
+    /// evaluator verifies the group again under the header of the block being
+    /// assembled; a failure of that is go's `ErrTxPoolVerifyError`
+    /// ([`PoolError::VerifyForPendingBlock`], tag `verify`), not the bare
+    /// verification error (issue #2624).
+    pub fn remember_verified(&self, tx_group: Vec<SignedTransaction>) -> Result<(), PoolError> {
+        self.remember_impl(tx_group, true)
+    }
+
+    fn remember_impl(
+        &self,
+        tx_group: Vec<SignedTransaction>,
+        pre_verified: bool,
+    ) -> Result<(), PoolError> {
         // Client txns are go `SignedTxn`s, which have no hgi/hgh: the single
         // internal choke point for the in-block-only flags (issue #1727).
         algo_types::genesis_restore::reject_in_block_flags(&tx_group)?;
@@ -940,7 +1017,9 @@ impl TransactionPool {
 
         // Ingest: wait-for-OnNewBlock, fee check, duplicate check,
         // evaluator validation, store.
+        guard.groups_pre_verified = pre_verified;
         let result = self.ingest(&tx_group, &mut guard);
+        guard.groups_pre_verified = false;
         if let Err(e) = result {
             // go's `verify.TxnGroup` (signatures, well-formedness, group ID)
             // runs before `Remember` and its error is returned unwrapped
@@ -4039,6 +4118,121 @@ mod tests {
         }
 
         fn restore_txn_bytes(&mut self, _txn_bytes: usize) {}
+    }
+
+    /// Evaluator that panics on every group.
+    struct PanicEvaluator {
+        round: Round,
+    }
+
+    impl BlockEvaluator for PanicEvaluator {
+        fn round(&self) -> Round {
+            self.round
+        }
+        fn pay_set_size(&self) -> usize {
+            0
+        }
+        fn test_transaction_group(&self, _txgroup: &[SignedTransaction]) -> Result<(), AlgoError> {
+            Ok(())
+        }
+        fn transaction_group(&mut self, _txgroup: &[SignedTransaction]) -> Result<(), AlgoError> {
+            panic!("boom")
+        }
+        fn generate_block(&mut self, _voting_accounts: &[Address]) -> Result<Block, AlgoError> {
+            Ok(Block::default())
+        }
+        fn reset_txn_bytes(&mut self) -> usize {
+            0
+        }
+
+        fn restore_txn_bytes(&mut self, _txn_bytes: usize) {}
+    }
+
+    /// Issue #2624, go v5.1.1 `ErrTxPoolVerifyError`: a group that the caller
+    /// verified against the latest block but that does not verify under the
+    /// header of the block being assembled is `transaction group does not
+    /// verify for round N: <err>` behind the `Remember` frame, tagged `verify`.
+    /// A group nobody verified keeps the bare verification error.
+    #[test]
+    fn a_group_that_does_not_verify_for_the_pending_block_is_gos_verify_error() {
+        let pool = make_pool_with_evaluator(1000);
+        {
+            let mut guard = pool.mu.lock();
+            guard.evaluator = Some(Box::new(ErrEvaluator {
+                round: Round(2),
+                make: || AlgoError::Validation {
+                    message: algo_error::BATCH_HAS_FAILED_SIGS.to_string(),
+                },
+            }));
+        }
+        let txgroup = vec![make_test_txn(9)];
+
+        let err = pool
+            .remember_verified(txgroup.clone())
+            .expect_err("does not verify");
+        assert_eq!(
+            err.to_string(),
+            "TransactionPool.Remember: transaction group does not verify for round 2: \
+             At least one signature didn't pass verification"
+        );
+        assert!(err.is_verify_for_pending_block());
+        assert_eq!(
+            crate::error::classify_pool_error(&err),
+            crate::error::PoolErrorTag::Verify
+        );
+
+        // not verified by the caller: the bare verification error, as before
+        let err = pool.remember(txgroup).expect_err("bad signature");
+        assert!(matches!(err, PoolError::SignatureBatchFailed), "{err:?}");
+        assert!(!err.is_verify_for_pending_block());
+
+        // a failure that is not a verification verdict is not a verify error
+        {
+            let mut guard = pool.mu.lock();
+            guard.evaluator = Some(Box::new(ErrEvaluator {
+                round: Round(2),
+                make: || AlgoError::Ledger {
+                    message: "something else".to_string(),
+                },
+            }));
+        }
+        let err = pool
+            .remember_verified(vec![make_test_txn(9)])
+            .expect_err("rejected");
+        assert!(!err.is_verify_for_pending_block(), "{err:?}");
+    }
+
+    /// go v5.1.1: an evaluator panic is recovered into `EvalPanicError` (tag
+    /// `panic`) and the evaluator then refuses further work with
+    /// `ErrEvaluatorCorruptedState` (tag `panic`) until it is rebuilt.
+    #[test]
+    fn an_evaluator_panic_is_recovered_and_corrupts_the_evaluator() {
+        let pool = make_pool_with_evaluator(1000);
+        {
+            let mut guard = pool.mu.lock();
+            guard.evaluator = Some(Box::new(PanicEvaluator { round: Round(2) }));
+        }
+        let err = pool.remember(vec![make_test_txn(9)]).expect_err("panic");
+        assert_eq!(
+            err.to_string(),
+            "TransactionPool.Remember: panic while evaluating block for round 2: boom"
+        );
+        assert_eq!(
+            crate::error::classify_pool_error(&err),
+            crate::error::PoolErrorTag::Panic
+        );
+        assert!(!err.is_evaluator_corrupted_state());
+
+        let err = pool.remember(vec![make_test_txn(10)]).expect_err("refused");
+        assert_eq!(
+            err.to_string(),
+            "TransactionPool.Remember: block evaluator state was corrupted by a previously recovered panic"
+        );
+        assert!(err.is_evaluator_corrupted_state());
+        assert_eq!(
+            crate::error::classify_pool_error(&err),
+            crate::error::PoolErrorTag::Panic
+        );
     }
 
     /// A framed rejection from the evaluator stays a typed `TxnRejected` with
