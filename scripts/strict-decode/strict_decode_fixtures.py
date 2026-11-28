@@ -925,6 +925,10 @@ ROOT_TYPES = {
     # the tx-sync response: a list of signed transactions (go-codec)
     "txsync": ("list", "transactions.SignedTxn"),
     "pqkey": "main.saltedSigningMaterial",
+    # catchpoint file sections (ledger/catchupaccessor.go, issue #2609)
+    "cpheader": "ledger.CatchpointFileHeader",
+    "cpchunk": "ledger.CatchpointSnapshotChunkV6",
+    "cpspver": "ledger.catchpointStateProofVerificationContext",
 }
 
 
@@ -950,7 +954,7 @@ def schema_text(go_algorand):
     merged = {}
     with tempfile.TemporaryDirectory() as tmp:
         for pkg, (template, suffix) in sorted(TEMPLATES.items()):
-            if pkg not in ("rpcs", "agreement", "network", "cmd/algokey"):
+            if pkg not in ("rpcs", "agreement", "network", "cmd/algokey", "ledger"):
                 continue
             out = os.path.join(tmp, pkg.replace("/", "_") + ".json")
             dst = os.path.join(go_algorand, pkg, DST)
@@ -970,8 +974,35 @@ def schema_text(go_algorand):
     return json.dumps(merged, indent=1, sort_keys=True) + "\n"
 
 
+# Structs a set turns into arrays on top of `converted_types()` (see
+# `reachable_structs`); the ledger set's readers have no array form since go
+# v5.1.1 (issue #2609), so its array cases pin go's rejection of every struct.
+_EXTRA_ALLOWED = set()
+
+
+def reachable_structs(kinds):
+    """Every go struct reachable from the root types of `kinds`."""
+    schema = load_schema()
+    seen = set()
+
+    def walk(t):
+        if t["k"] == "struct":
+            if t["t"] in seen:
+                return
+            seen.add(t["t"])
+            for f in schema[t["t"]]:
+                walk(f["type"])
+        elif t["k"] in ("list", "map"):
+            walk(t["e"])
+
+    for k in sorted(kinds):
+        if k in ROOT_TYPES:
+            walk(root_descriptor(k))
+    return seen
+
+
 def array_form_allowed(tname):
-    return tname in load_schema() and tname in converted_types()
+    return tname in load_schema() and (tname in converted_types() or tname in _EXTRA_ALLOWED)
 
 
 def zero_encoding(t):
@@ -1225,6 +1256,77 @@ def finish_hex_cases(cases, first_id):
     return out
 
 
+# ── array-valued entries, truncated and deep array forms (issue #2609) ────────
+#
+# go v5.1.1's generated decoders read a struct from a map only: an array where a
+# struct is expected is `ReadMapHeaderBytes`'s TypeError, whatever it holds. The
+# sections below come after every older one (so no older row moves) and pin
+# that for the shapes the key-insertion cases leave out: a struct-valued key
+# again with an array value (empty, nil element, extra elements, array16 /
+# array32 headers), array headers cut short, and arrays nested deep.
+
+ARRAY_VALUES = [
+    bytes([0x90]),  # []
+    bytes([0x91, 0xC0]),  # [nil]
+    bytes([0x92, 0x01, 0x02]),  # [1, 2]
+    bytes([0x91, 0x90]),  # [[]]
+    bytes([0xDC, 0x00, 0x00]),  # array16 []
+    bytes([0xDD, 0x00, 0x00, 0x00, 0x00]),  # array32 []
+    bytes([0x91, 0x80]),  # [{}]
+]
+
+
+def make_array_value_cases(seeds, kinds, rng, cap=600):
+    """`finish_cases` tuples: a key whose value is a map, again, with an array."""
+    out = []
+    for s in seeds:
+        if s["kind"] not in kinds:
+            continue
+        b = bytes.fromhex(s["hex"])
+        for m, (start, hl, entries, end) in enumerate(walk_maps(b)):
+            for ks, vs, ve in entries:
+                if 0xA0 <= b[ks] <= 0xBF and map_header(b, vs) is not None:
+                    out.append((s, m, rng.randint(0, len(entries)), b[ks:vs], rng.choice(ARRAY_VALUES)))
+    rng.shuffle(out)
+    return out[:cap]
+
+
+def make_array_shape_cases(seeds, kinds, cap_per_kind=6):
+    """(seed, mutant bytes): array headers cut short, arrays nested deep and
+    the array form of a seed cut at a few points."""
+    out = []
+    seen = set()
+
+    def add(s, mut):
+        if mut not in seen:
+            seen.add(mut)
+            out.append((s, mut))
+
+    for kind in sorted(kinds):
+        of_kind = [s for s in seeds if s["kind"] == kind]
+        if not of_kind:
+            continue
+        s0 = of_kind[0]
+        b0 = bytes.fromhex(s0["hex"])
+        for head in ("93", "dc", "dc00", "dc0003", "dd000000", "dd00000003"):
+            add(s0, bytes.fromhex(head))
+        for depth in (1, 2, 20, 130, 300):
+            add(s0, bytes([0x91]) * depth + b0)
+            add(s0, bytes([0x91]) * depth + bytes([0xC0]))
+        if kind not in ROOT_TYPES:
+            continue
+        root = root_descriptor(kind)
+        for s in of_kind[:cap_per_kind]:
+            b = bytes.fromhex(s["hex"])
+            m = to_array_form(b, 0, root, lambda idx, start, name: "full", {"n": 0})
+            if m == b:
+                continue
+            for cut in sorted({1, 2, 3, len(m) // 2, len(m) - 1}):
+                if 0 < cut < len(m):
+                    add(s, m[:cut])
+    return out
+
+
 # ── non-consensus real seeds (issue #2396) ────────────────────────────────
 
 
@@ -1405,6 +1507,9 @@ SETS = {
         "repeat_kinds": {"cpheader", "cpchunk", "cpspver"},
         "bound_kinds": set(),
         "nil_kinds": set(),
+        # issue #2609: go v5.1.1 reads these structs from a map only
+        "array_kinds": {"cpheader", "cpchunk", "cpspver"},
+        "array_all_schema": True,
     },
     "network": {
         "dir": fixture_dir("node", "algo-network"),
@@ -1482,6 +1587,8 @@ def run_set(name, st, go, a):
         print(f"wrote {seeds_path(st)} ({len(seeds)} seeds)")
 
     seeds = read_seeds(st)
+    global _EXTRA_ALLOWED
+    _EXTRA_ALLOWED = reachable_structs(st["kinds"]) if st.get("array_all_schema") else set()
     if a.fuzz:
         n = int(a.fuzz[0])
         rng = random.Random(n ^ st["fuzz_xor"])
@@ -1499,6 +1606,8 @@ def run_set(name, st, go, a):
         cases += finish_hex_cases(arr, first_id=len(cases))
         rarr = make_repeat_array_cases(seeds, st.get("array_kinds", set()), rng, cap=max(200, n // 400))
         cases += finish_cases(rarr, first_id=len(cases))
+        cases += finish_cases(make_array_value_cases(seeds, st["kinds"], rng, cap=max(600, n // 100)), first_id=len(cases))
+        cases += finish_hex_cases(make_array_shape_cases(seeds, st["kinds"]), first_id=len(cases))
         cases = attach_verdicts(go, cases)
         out = a.fuzz[1] if name == "consensus" else f"{a.fuzz[1]}.{name}"
         with open(out, "w", encoding="utf-8", newline="\n") as f:
@@ -1518,6 +1627,10 @@ def run_set(name, st, go, a):
     cases += finish_hex_cases(arr, first_id=len(cases))
     rarr = make_repeat_array_cases(seeds, st.get("array_kinds", set()), random.Random(st["rng"] ^ 0x2427), cap=200)
     cases += finish_cases(rarr, first_id=len(cases))
+    cases += finish_cases(
+        make_array_value_cases(seeds, st["kinds"], random.Random(st["rng"] ^ 0x2609)), first_id=len(cases)
+    )
+    cases += finish_hex_cases(make_array_shape_cases(seeds, st["kinds"]), first_id=len(cases))
     cases = attach_verdicts(go, cases)
     text = dump(cases)
     path = cases_path(st)

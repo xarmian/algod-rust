@@ -38,7 +38,9 @@
 //	          catchpointStateProofVerificationContext
 //	          (processStagingStateProofVerificationContext)
 //
-// and, with $STRICT_SEEDS_OUT, writes fully populated random seeds.
+// and, with $STRICT_SEEDS_OUT, writes fully populated random seeds; with
+// $STRICT_SCHEMA_OUT (TestStrictDecodeSchemaLedger) the msgp field layout of the
+// types above (issue #2609: go v5.1.1 decodes none of them from an array).
 
 package ledger
 
@@ -49,7 +51,9 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/algorand/go-algorand/config"
@@ -221,5 +225,126 @@ func TestStrictDecodeSeedsLedger(t *testing.T) {
 			})
 		}
 		emit("cpchunk", i, &chunk)
+	}
+}
+
+// schemaType describes one field's value: a leaf (a scalar named by its Go
+// kind, "bytes", "bytes[N]", "raw" for a msgp.Raw go keeps undecoded), a
+// struct, or a list / map of those.
+type schemaType struct {
+	Kind string      `json:"k"`
+	Name string      `json:"t,omitempty"`
+	Elem *schemaType `json:"e,omitempty"`
+}
+
+type schemaField struct {
+	GoName string     `json:"go"`
+	Key    string     `json:"key"`
+	Type   schemaType `json:"type"`
+}
+
+// opaqueStructs are structs whose msgp codec is written by hand: they are one
+// value on the wire, not a map.
+var opaqueStructs = map[string]bool{"basics.MicroAlgos": true}
+
+// rawTypes: the type go decodes the msgp.Raw field of a struct into (the
+// catchpoint restore decodes `b` and `c` in prepareNormalizedBalancesV6; the
+// other msgp.Raw fields stay undecoded and are "raw" leaves).
+var rawTypes = map[string]schemaType{
+	"encoded.BalanceRecordV6.b": {Kind: "struct", Name: "trackerdb.BaseAccountData"},
+	"encoded.BalanceRecordV6.c": {Kind: "map", Elem: &schemaType{Kind: "struct", Name: "trackerdb.ResourcesData"}},
+}
+
+func schemaOfType(rt reflect.Type, out map[string][]schemaField) schemaType {
+	for rt.Kind() == reflect.Ptr {
+		rt = rt.Elem()
+	}
+	if rt == reflect.TypeOf(msgp.Raw{}) {
+		return schemaType{Kind: "leaf", Name: "raw"}
+	}
+	switch rt.Kind() {
+	case reflect.Struct:
+		name := rt.String()
+		if opaqueStructs[name] {
+			return schemaType{Kind: "leaf", Name: "uint64"}
+		}
+		if _, done := out[name]; !done {
+			out[name] = nil // cut recursion
+			out[name] = schemaFields(rt, out)
+		}
+		return schemaType{Kind: "struct", Name: name}
+	case reflect.Slice, reflect.Array:
+		if rt.Elem().Kind() == reflect.Uint8 {
+			if rt.Kind() == reflect.Array {
+				return schemaType{Kind: "leaf", Name: fmt.Sprintf("bytes[%d]", rt.Len())}
+			}
+			return schemaType{Kind: "leaf", Name: "bytes"}
+		}
+		e := schemaOfType(rt.Elem(), out)
+		return schemaType{Kind: "list", Elem: &e}
+	case reflect.Map:
+		e := schemaOfType(rt.Elem(), out)
+		return schemaType{Kind: "map", Elem: &e}
+	}
+	return schemaType{Kind: "leaf", Name: rt.Kind().String()}
+}
+
+// schemaFields lists a struct's msgp fields in declaration order: an embedded
+// struct without a codec name is flattened in place, a `codec:"-"` or
+// unexported field is skipped, and an empty codec name is the Go field name.
+func schemaFields(rt reflect.Type, out map[string][]schemaField) []schemaField {
+	var fs []schemaField
+	for i := 0; i < rt.NumField(); i++ {
+		f := rt.Field(i)
+		tag := f.Tag.Get("codec")
+		name := strings.Split(tag, ",")[0]
+		if name == "-" || f.Name == "_struct" || (f.PkgPath != "" && !f.Anonymous) {
+			continue
+		}
+		if f.Anonymous && name == "" {
+			ft := f.Type
+			for ft.Kind() == reflect.Ptr {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct {
+				fs = append(fs, schemaFields(ft, out)...)
+				continue
+			}
+		}
+		if name == "" {
+			name = f.Name
+		}
+		st := schemaOfType(f.Type, out)
+		if o, ok := rawTypes[rt.String()+"."+name]; ok {
+			st = o
+			if o.Kind == "struct" {
+				schemaOfType(reflect.TypeOf(trackerdb.BaseAccountData{}), out)
+			} else {
+				schemaOfType(reflect.TypeOf(trackerdb.ResourcesData{}), out)
+			}
+		}
+		fs = append(fs, schemaField{GoName: f.Name, Key: name, Type: st})
+	}
+	return fs
+}
+
+// TestStrictDecodeSchemaLedger writes $STRICT_SCHEMA_OUT.
+func TestStrictDecodeSchemaLedger(t *testing.T) {
+	path := os.Getenv("STRICT_SCHEMA_OUT")
+	if path == "" {
+		t.Skip("STRICT_SCHEMA_OUT not set")
+	}
+	out := map[string][]schemaField{}
+	for _, v := range []any{
+		CatchpointFileHeader{}, CatchpointSnapshotChunkV6{}, catchpointStateProofVerificationContext{},
+	} {
+		schemaOfType(reflect.TypeOf(v), out)
+	}
+	b, err := json.MarshalIndent(out, "", " ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(b, '\n'), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
