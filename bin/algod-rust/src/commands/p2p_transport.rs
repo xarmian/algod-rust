@@ -2605,13 +2605,15 @@ impl P2pTransport {
                                 // is connected from (used to key the proposal
                                 // queue's fairness); a connection without one
                                 // keeps the peer-ID fallback.
-                                if let Some(routing) =
-                                    routing_addr_of_multiaddr(endpoint.get_remote_address())
-                                {
-                                    sp_for_task
+                                match routing_addr_of_multiaddr(endpoint.get_remote_address()) {
+                                    Some(routing) => sp_for_task
                                         .lock()
                                         .expect("stream_peers mutex poisoned")
-                                        .set_routing_addr(peer_id, routing);
+                                        .set_routing_addr(peer_id, routing),
+                                    None => sp_for_task
+                                        .lock()
+                                        .expect("stream_peers mutex poisoned")
+                                        .clear_routing_addr(&peer_id),
                                 }
 
                                 // Connection-identity dedup (issue #952):
@@ -3425,8 +3427,14 @@ impl GossipNode for P2pTransport {
         // go `P2PNetwork.Disconnect`: close the peer's connection (an upper
         // layer drops a peer that sent bad data). The peer's address here is
         // its peer ID; the connection-closed event releases its identity.
-        if let Ok(peer_id) = peer.get_address().parse::<PeerId>() {
-            let _ = self.cmd_tx.send(P2pCommand::DisconnectPeer(peer_id));
+        match peer.get_address().parse::<PeerId>() {
+            Ok(peer_id) => {
+                let _ = self.cmd_tx.send(P2pCommand::DisconnectPeer(peer_id));
+            }
+            Err(_) => tracing::debug!(
+                address = peer.get_address(),
+                "P2P disconnect: not a peer ID, ignoring"
+            ),
         }
     }
 
