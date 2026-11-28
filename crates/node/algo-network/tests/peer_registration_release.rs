@@ -277,9 +277,11 @@ impl Drop for OpenOnDrop {
 /// go `TestIdentityTrackerHandlerDepartedPeer`: a verification message handled
 /// after its peer left the registry must not keep the identity, because nothing
 /// would give it back.
+///
 /// One worker thread on purpose (#2646): the parked `claim` must not strand the
 /// runtime. With a plain blocking wait this test hangs on a single worker, and
 /// hung about 1 run in 400 on four under CPU contention.
+/// `ParkedClaimHook` needs the multi-thread flavor (`block_in_place`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn verification_handled_after_the_peer_departed_does_not_keep_the_identity() {
     let hook = Arc::new(ParkedClaimHook {
