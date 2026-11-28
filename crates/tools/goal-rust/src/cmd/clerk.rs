@@ -2893,9 +2893,9 @@ mod tests {
         tealsign_set_arg(&mut plain, l, 2, &sig);
         let args = plain.lsig.as_ref().unwrap().args.clone().unwrap();
         assert_eq!(args.len(), 3);
-        assert_eq!(args[0].as_deref(), Some(&b"a"[..]));
+        assert_eq!(args[0].as_ref().map(|b| b.as_ref()), Some(&b"a"[..]));
         assert!(args[1].is_none(), "padded with nil");
-        assert_eq!(args[2].as_deref(), Some(&sig[..]));
+        assert_eq!(args[2].as_ref().map(|b| b.as_ref()), Some(&sig[..]));
         assert!(plain.pqsig.is_none());
 
         // an `ls`-scheme SKsig: the program is the public key, the arguments
