@@ -69,6 +69,7 @@ func TestAddrOracle(t *testing.T) {
 		"http://host/#frag", "host%41:80", "[1:2:3:4:5:6:1.2.3.4]:80", "[1:2:3:4:5:6:7:1.2.3.4]:80",
 		"[::1.2.3.256]:80", "[1:2:3:4:5:6:7:8::]:80", "[::g]:80", "[:1]:80", "[1:]:80", "[::1:]:80",
 		"host​:80", "hést:80", "host:80", "host :80", "ho­s:80", " host:80",
+		"http://h/%€", "http://h/%é", "host%€:80", "http://h/%zz", "http://h/󰀀%zz", "http://h/￼%zz", "http://h/⁠%zz", "http://h/😀%zz",
 		"HTTP://Host:80", "http://host%80:80", "http://host%2Fx:80", "http://[::1]%zz:80",
 	}
 	f, err := os.Create(out)

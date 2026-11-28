@@ -115,6 +115,14 @@
 {"addr":"host :80","host":"host :80","is_multiaddr":false,"multi":"host :80","multi_ok":true,"ok":true,"scheme":"http"}
 {"addr":"ho­s:80","host":"ho­s:80","is_multiaddr":false,"multi":"ho­s:80","multi_ok":true,"ok":true,"scheme":"http"}
 {"addr":"\u2028host:80","host":"\u2028host:80","is_multiaddr":false,"multi":"\u2028host:80","multi_ok":true,"ok":true,"scheme":"http"}
+{"addr":"http://h/%€","err":"parse \"http://h/%€\": invalid URL escape \"%\\xe2\\x82\"","is_multiaddr":false,"multi_err":"parse \"http://h/%€\": invalid URL escape \"%\\xe2\\x82\"","multi_ok":false,"ok":false}
+{"addr":"http://h/%é","err":"parse \"http://h/%é\": invalid URL escape \"%é\"","is_multiaddr":false,"multi_err":"parse \"http://h/%é\": invalid URL escape \"%é\"","multi_ok":false,"ok":false}
+{"addr":"host%€:80","err":"parse \"host%€:80\": first path segment in URL cannot contain colon","is_multiaddr":false,"multi_err":"parse \"host%€:80\": first path segment in URL cannot contain colon","multi_ok":false,"ok":false}
+{"addr":"http://h/%zz","err":"parse \"http://h/\\ue000%zz\": invalid URL escape \"%zz\"","is_multiaddr":false,"multi_err":"parse \"http://h/\\ue000%zz\": invalid URL escape \"%zz\"","multi_ok":false,"ok":false}
+{"addr":"http://h/󰀀%zz","err":"parse \"http://h/\\U000f0000%zz\": invalid URL escape \"%zz\"","is_multiaddr":false,"multi_err":"parse \"http://h/\\U000f0000%zz\": invalid URL escape \"%zz\"","multi_ok":false,"ok":false}
+{"addr":"http://h/￼%zz","err":"parse \"http://h/￼%zz\": invalid URL escape \"%zz\"","is_multiaddr":false,"multi_err":"parse \"http://h/￼%zz\": invalid URL escape \"%zz\"","multi_ok":false,"ok":false}
+{"addr":"http://h/⁠%zz","err":"parse \"http://h/\\u2060%zz\": invalid URL escape \"%zz\"","is_multiaddr":false,"multi_err":"parse \"http://h/\\u2060%zz\": invalid URL escape \"%zz\"","multi_ok":false,"ok":false}
+{"addr":"http://h/😀%zz","err":"parse \"http://h/😀%zz\": invalid URL escape \"%zz\"","is_multiaddr":false,"multi_err":"parse \"http://h/😀%zz\": invalid URL escape \"%zz\"","multi_ok":false,"ok":false}
 {"addr":"HTTP://Host:80","host":"Host:80","is_multiaddr":false,"multi":"Host:80","multi_ok":true,"ok":true,"scheme":"http"}
 {"addr":"http://host%80:80","host":"host�:80","is_multiaddr":false,"multi":"host�:80","multi_ok":true,"ok":true,"scheme":"http"}
 {"addr":"http://host%2Fx:80","err":"parse \"http://host%2Fx:80\": invalid URL escape \"%2F\"","is_multiaddr":false,"multi_err":"parse \"http://host%2Fx:80\": invalid URL escape \"%2F\"","multi_ok":false,"ok":false}

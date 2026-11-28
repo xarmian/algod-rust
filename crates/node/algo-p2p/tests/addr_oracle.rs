@@ -77,7 +77,7 @@ fn addr_parsing_matches_go_rows() {
             _ => bad.push(format!("{addr:?}: go ok={go_ok}, rust {got:?}")),
         }
     }
-    assert_eq!(n, 121);
+    assert_eq!(n, 129);
     assert!(
         bad.is_empty(),
         "{} mismatches:
