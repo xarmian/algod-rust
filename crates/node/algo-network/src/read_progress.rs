@@ -178,9 +178,21 @@ pub struct ReadProgress {
     rx: watch::Receiver<Option<Instant>>,
     armed: Arc<AtomicBool>,
     max_duration: Duration,
+    /// When the loop last came back from handling a data message: a message
+    /// that started earlier (its first bytes were read ahead while the loop was
+    /// busy) has its clock start here.
+    resume_at: Instant,
 }
 
 impl ReadProgress {
+    /// The read loop calls this when it comes back to wait for the next message
+    /// after handling a data message, not after a ping or pong: go sets its
+    /// deadline when `NextReader` returns, so time the loop spent busy does not
+    /// count, and control frames neither extend nor restart it.
+    pub fn resume(&mut self) {
+        self.resume_at = Instant::now();
+    }
+
     /// Start following the stream's bytes as websocket frames. An accepted
     /// connection's stream carries the HTTP upgrade request first; the upgrade
     /// handler arms it, when everything the peer may send before our `101`
@@ -206,25 +218,24 @@ impl ReadProgress {
 ///
 /// go sets its deadline when `NextReader` returns, so only time the loop spends
 /// reading counts: a message whose first bytes were read ahead while the loop
-/// was busy with the previous one starts its clock when the loop comes back to
-/// wait (this call), not when the bytes arrived.
+/// was busy with the previous one starts its clock when the loop is back
+/// ([`ReadProgress::resume`]), not when the bytes arrived.
 pub async fn read_deadline_passed(progress: Option<&mut ReadProgress>) {
     let Some(progress) = progress else {
         return std::future::pending().await;
     };
-    let entered = Instant::now();
     let max = progress.max_duration;
     loop {
         let started = *progress.rx.borrow_and_update();
         match started {
             Some(t0) => {
-                let at = t0.max(entered) + max;
+                let at = t0.max(progress.resume_at) + max;
                 tokio::select! {
                     _ = tokio::time::sleep_until(at) => {
                         // re-read: the message may have completed in the meantime
                         if progress
                             .started()
-                            .is_some_and(|s| s.max(entered) + max <= Instant::now())
+                            .is_some_and(|s| s.max(progress.resume_at) + max <= Instant::now())
                         {
                             return;
                         }
@@ -266,6 +277,7 @@ impl ProgressTap {
             rx,
             armed: armed.clone(),
             max_duration,
+            resume_at: Instant::now(),
         };
         (
             Self {
@@ -338,6 +350,7 @@ impl<S> ProgressIo<S> {
             rx: tap.tx.subscribe(),
             armed: tap.armed.clone(),
             max_duration: tap.max_duration,
+            resume_at: Instant::now(),
         })
     }
 }
@@ -551,8 +564,29 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(40)).await;
 
         // the loop is back: the peer has the whole duration from here
+        progress.resume();
         let back = Instant::now();
         progress.deadline_passed().await;
         assert_eq!(back.elapsed(), MAX);
+    }
+
+    /// go sets the deadline once, when `NextReader` returns: a ping or pong in
+    /// the middle of the message makes the read loop iterate again, and must not
+    /// give the peer a fresh duration (the loop does not `resume` for it).
+    #[tokio::test(start_paused = true)]
+    async fn control_frames_do_not_restart_the_clock() {
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let mut io = ProgressIo::new(server, MAX);
+        let mut progress = io.progress().unwrap();
+        let bytes = frame(2, false, &[1u8; 100], false);
+        let mut sink = vec![0u8; 1024];
+        let started = Instant::now();
+        client.write_all(&bytes[..20]).await.unwrap();
+        let _ = io.read(&mut sink).await.unwrap();
+        // a new wait future each 30 s, as the read loop makes one per iteration
+        let waited = tokio::time::timeout(Duration::from_secs(30), progress.deadline_passed());
+        assert!(waited.await.is_err());
+        progress.deadline_passed().await;
+        assert_eq!(started.elapsed(), MAX);
     }
 }

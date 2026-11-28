@@ -1001,7 +1001,14 @@ impl PeerHandle {
             let vote_table_size = negotiated_table_size;
             let mut stateful_decoder: Option<StatefulDecoder> = None;
             let mut read_progress = read_progress;
+            // whether the previous iteration handled a data message (see `resume`)
+            let mut handled_data = false;
             loop {
+                if std::mem::take(&mut handled_data) {
+                    if let Some(p) = read_progress.as_mut() {
+                        p.resume();
+                    }
+                }
                 tokio::select! {
                     _ = read_closing.cancelled() => {
                         tracing::debug!(addr = %read_addr, "inbound read loop cancelled");
@@ -1018,6 +1025,7 @@ impl PeerHandle {
                     msg = ws_reader.next() => {
                         match msg {
                             Some(Ok(axum::extract::ws::Message::Binary(data))) => {
+                                handled_data = true;
                                 if let Ok((mut tag, payload)) = crate::framing::decode_frame(&data) {
                                     // Issue #1425: count received bytes/
                                     // messages by tag, mirroring the
@@ -2298,8 +2306,15 @@ async fn read_loop_with_progress<St>(
     // vpack decompression state, owned exclusively by this task.
     let vote_table_size = peer_features::stateful_table_size(features);
     let mut stateful_decoder: Option<StatefulDecoder> = None;
+    // whether the previous iteration handled a data message (see `resume`)
+    let mut handled_data = false;
 
     loop {
+        if std::mem::take(&mut handled_data) {
+            if let Some(p) = read_progress.as_mut() {
+                p.resume();
+            }
+        }
         let ws_msg = tokio::select! {
             biased;
             _ = closing.cancelled() => {
@@ -2344,6 +2359,7 @@ async fn read_loop_with_progress<St>(
 
         match ws_msg {
             WsMessage::Binary(data) => {
+                handled_data = true;
                 // Update last packet time.
                 {
                     let mut lpt = last_packet_time.write().await;
