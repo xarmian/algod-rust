@@ -3382,8 +3382,7 @@ pub async fn simulate_transaction<N: NodeInterface>(
     // request carries `null` placeholders and each transaction's own msgpack
     // bytes travel alongside in `raw_txns`.
     use crate::simulate_strict::{
-        go_json_decode, parse_json_request, parse_msgpack_request, request_from_go_value,
-        JsonSimulate, MsgpackSimulate,
+        go_json_decode_request, parse_msgpack_request, request_from_go_value, MsgpackSimulate,
     };
     let is_msgpack = body.first().is_some_and(|b| *b >= 0x80);
     let (mut request, raw_txns) = if is_msgpack {
@@ -3404,30 +3403,24 @@ pub async fn simulate_transaction<N: NodeInterface>(
             },
         }
     } else {
-        // JSON, decoded with go-codec's strict handle (issue #2477)
-        let value = match go_json_decode(&body) {
+        // JSON (issues #2477, #2608): go-codec's strict handle with each
+        // transaction kept raw, the group count and sizes checked, then each
+        // transaction decoded on its own. Everything go-codec accepts goes
+        // through the msgpack pipeline as the msgpack go would encode from
+        // what it decoded.
+        let value = match go_json_decode_request(&body) {
             Ok(value) => value,
             Err(text) => return error::bad_request_bytes(&text),
         };
-        // go's own JSON form (base64 bytes, address strings) goes through
-        // the same pipeline as msgpack (issue #1972); the rest of what
-        // go-codec accepts goes through it as the msgpack go would
-        // encode from the decoded value.
-        match parse_json_request(&body) {
-            JsonSimulate::Decoded(d) => (d.request, d.raw_txns),
-            // go's strict JSON decode names the first unknown key and its
-            // offset (issue #1971).
-            JsonSimulate::UnknownField(u) => return error::bad_request(u.message()),
-            JsonSimulate::NotGoForm => match request_from_go_value(&value) {
-                Some(d) => (d.request, d.raw_txns),
-                // Unreachable: the msgpack go encodes from what go-codec
-                // decoded always decodes (issue #2494,
-                // `every_body_go_decodes_reaches_the_msgpack_pipeline`).
-                None => {
-                    tracing::error!("simulate: a request go decodes did not convert");
-                    return error::internal_error("failed to decode simulate request");
-                }
-            },
+        match request_from_go_value(&value) {
+            Some(d) => (d.request, d.raw_txns),
+            // Unreachable: the msgpack go encodes from what go-codec
+            // decoded always decodes (issue #2494,
+            // `every_body_go_decodes_reaches_the_msgpack_pipeline`).
+            None => {
+                tracing::error!("simulate: a request go decodes did not convert");
+                return error::internal_error("failed to decode simulate request");
+            }
         }
     };
 

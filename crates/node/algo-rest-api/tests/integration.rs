@@ -8634,15 +8634,19 @@ async fn simulate_in_block_only_field_returns_400() {
 }
 
 /// Issue #1971: a JSON simulate body with a key go's structs lack is a 400
-/// with go's exact text and offset (captured from a go-algorand v5.0.5-stable
-/// node for these bodies: just after the colon that follows the key).
+/// with go's exact text and offset: just after the colon that follows the key.
+/// go v5.1.1 (issue #2608) decodes each transaction on its own, so a key
+/// inside a transaction is counted from the transaction's first byte (v5.0.5
+/// counted from the body's), and the request's own keys are met before any
+/// transaction is decoded; the full set of cases is
+/// `simulate_json_request_responses_match_go`.
 #[tokio::test]
 async fn simulate_json_unknown_key_returns_go_text_with_offset() {
     let server = TestServer::start(MockNode::synced()).await;
     for (body, pos, key) in [
         (
             r#"{"txn-groups":[{"txns":[{"txn":{"type":"pay"},"zzz":1}]}]}"#,
-            52,
+            28,
             "zzz",
         ),
         (
@@ -8652,8 +8656,8 @@ async fn simulate_json_unknown_key_returns_go_text_with_offset() {
         ),
         (
             r#"{"txn-groups":[{"txns":[{"txn":{"type":"pay","aaa":1,"bbb":2}}]}],"ccc":3}"#,
-            51,
-            "aaa",
+            72,
+            "ccc",
         ),
     ] {
         let resp = server

@@ -6733,7 +6733,6 @@ err
     /// as raw JSON first, checks the group count and size, then decodes each
     /// transaction on its own (positions relative to it).
     #[tokio::test]
-    #[ignore = "go v5.1.1's JSON request decode (raw transactions, counts first, per-transaction positions) is not ported yet (#2555)"]
     async fn simulate_json_request_responses_match_go() {
         simulate_request_responses_match_go(false, 400).await;
     }
