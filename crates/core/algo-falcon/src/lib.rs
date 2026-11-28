@@ -344,6 +344,40 @@ pub fn falcon512_sign(privkey: &[u8], data: &[u8]) -> Result<Vec<u8>, FalconErro
     Ok(sig)
 }
 
+fn check_sig512(sig: &[u8]) -> Result<(), FalconError> {
+    if sig.len() < 2 || sig.len() > FALCON_DET512_SIG_COMPRESSED_MAXSIZE {
+        return Err(FalconError::InvalidSignatureSize(sig.len()));
+    }
+    Ok(())
+}
+
+/// Convert a compressed Falcon-512 signature to the fixed-width constant-time
+/// format (`Det512CompressedSignature.ConvertToCT`, which go's
+/// `Falcon512Signature.GetFixedLengthHashableRepresentation` returns).
+pub fn falcon512_convert_compressed_to_ct(
+    sig_compressed: &[u8],
+) -> Result<[u8; FALCON_DET512_SIG_CT_SIZE], FalconError> {
+    check_sig512(sig_compressed)?;
+    let mut sig_ct = [0u8; FALCON_DET512_SIG_CT_SIZE];
+    let rc = rs::det512::convert_compressed_to_ct(&mut sig_ct, sig_compressed);
+    if rc != 0 {
+        return Err(FalconError::ConvertToCtFailed(rc));
+    }
+    Ok(sig_ct)
+}
+
+/// The salt version embedded in a Falcon-512 signature
+/// (`Det512CompressedSignature.SaltVersion`, behind go's
+/// `Falcon512Signature.IsSaltVersionEqual`).
+pub fn falcon512_salt_version(sig: &[u8]) -> Result<u8, FalconError> {
+    check_sig512(sig)?;
+    let rc = rs::det512::get_salt_version(sig);
+    if rc < 0 {
+        return Err(FalconError::SaltVersionFailed(rc));
+    }
+    Ok(rc as u8)
+}
+
 /// Dispatch a size-checked verification to `backend`.
 fn verify_code_unchecked(backend: FalconBackend, pubkey: &[u8], sig: &[u8], data: &[u8]) -> i32 {
     match backend {
@@ -850,6 +884,77 @@ mod tests {
             corrupted_version, version,
             "corrupting the salt-version byte must change the parsed version"
         );
+    }
+
+    // ── Falcon-512 halves of go v5.1.1's two-scheme `falconWrapper_test.go`
+    // (`falconTestSchemes`, issue #2546): the same tests run for both schemes.
+
+    /// `TestSignAndVerifyFalcon` / `TestSignAndVerifyFalconHashable`, f5: raw
+    /// bytes and a `HashRep`-style prefixed message both sign and verify.
+    #[test]
+    fn falcon512_sign_and_verify_bytes_and_hashable() {
+        let (pk, sk) = falcon512_keygen(&[9u8; FALCON_SEED_SIZE]).unwrap();
+        let msg = b"Neque porro quisquam est qui dolorem ipsum quia dolor sit amet";
+        let sig = falcon512_sign(&sk, msg).unwrap();
+        assert_eq!(falcon512_verify_code(&pk, &sig, msg).unwrap(), 0);
+        assert_ne!(falcon512_verify_code(&pk, &sig, b"other").unwrap(), 0);
+
+        // go's `HashRep(TestingHashable{data})` is `hashID || data`.
+        let hash_rep = [b"TestingHashable".as_slice(), msg.as_slice()].concat();
+        let sig = falcon512_sign(&sk, &hash_rep).unwrap();
+        assert_eq!(falcon512_verify_code(&pk, &sig, &hash_rep).unwrap(), 0);
+        assert_ne!(falcon512_verify_code(&pk, &sig, msg).unwrap(), 0);
+    }
+
+    /// `TestFalconCanHandleNilSignature`, f5: an empty signature is rejected
+    /// without a panic.
+    #[test]
+    fn falcon512_empty_signature_is_rejected() {
+        let (pk, _) = falcon512_keygen(&[0u8; FALCON_SEED_SIZE]).unwrap();
+        assert_ne!(falcon512_verify_code(&pk, &[], b"test").unwrap(), 0);
+        assert!(matches!(
+            falcon512_convert_compressed_to_ct(&[]),
+            Err(FalconError::InvalidSignatureSize(0))
+        ));
+        assert!(matches!(
+            falcon512_salt_version(&[]),
+            Err(FalconError::InvalidSignatureSize(0))
+        ));
+    }
+
+    /// `TestFalconsFormatConversion`, f5: the CT form is deterministic,
+    /// fixed-width and differs from the compressed form.
+    #[test]
+    fn falcon512_convert_compressed_to_ct_is_deterministic_and_differs() {
+        let (_, sk) = falcon512_keygen(&[5u8; FALCON_SEED_SIZE]).unwrap();
+        let msg = b"Neque porro quisquam est qui dolorem ipsum quia dolor sit amet";
+        let sig = falcon512_sign(&sk, msg).unwrap();
+        let ct1 = falcon512_convert_compressed_to_ct(&sig).unwrap();
+        let ct2 = falcon512_convert_compressed_to_ct(&sig).unwrap();
+        assert_eq!(ct1, ct2);
+        assert_eq!(ct1.len(), FALCON_DET512_SIG_CT_SIZE);
+        assert_ne!(sig.as_slice(), &ct1[..]);
+    }
+
+    /// `TestFalconSignature_ValidateVersion`, f5.
+    #[test]
+    fn falcon512_salt_version_is_current_then_diverges_on_corruption() {
+        let (_, sk) = falcon512_keygen(&[3u8; FALCON_SEED_SIZE]).unwrap();
+        let mut sig = falcon512_sign(&sk, b"salt version").unwrap();
+        let version = falcon512_salt_version(&sig).unwrap();
+        assert_eq!(version, 0, "`Det512CurrentSaltVersion`");
+        sig[1] = sig[1].wrapping_add(1);
+        assert_ne!(falcon512_salt_version(&sig).unwrap(), version);
+    }
+
+    /// `TestVerificationBytes`, f5: go's `Falcon512Verifier` is a msgpack
+    /// wrapper whose fixed-length representation is the raw public key;
+    /// algod-rust verifies f5 from the raw key bytes (there is no wrapper
+    /// type), so the key `falcon512_keygen` returns is that representation.
+    #[test]
+    fn falcon512_verifier_representation_is_the_raw_public_key() {
+        let (pk, _) = falcon512_keygen(&[1u8; FALCON_SEED_SIZE]).unwrap();
+        assert_eq!(pk.len(), FALCON_DET512_PUBKEY_SIZE);
     }
 
     /// Pins the seed size to go-algorand's post-`569ae3d4b` value.

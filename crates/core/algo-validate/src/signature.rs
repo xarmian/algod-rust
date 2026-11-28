@@ -1557,6 +1557,8 @@ pub fn logic_sig_group_size_check_indexed(
 mod bv_compatible_vectors;
 
 #[cfg(test)]
+mod salted_address_tests;
+#[cfg(test)]
 mod sksig_tests;
 #[cfg(test)]
 mod sksig_txn_tests;
