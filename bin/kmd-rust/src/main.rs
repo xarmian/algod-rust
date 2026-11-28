@@ -79,9 +79,9 @@ enum Command {
         #[arg(short = 'a', long = "address")]
         address: Option<SocketAddr>,
 
-        /// Optional inactivity timeout in seconds.  Not implemented
-        /// yet (Go's watchdog timer); accepted for CLI parity but
-        /// currently has no effect.
+        /// Optional inactivity timeout in seconds (go's watchdog timer): kmd
+        /// shuts down once this long passes without an authenticated `/v1`
+        /// request.  0 (the default) never times out.
         #[arg(short = 't', long = "timeout")]
         timeout: Option<u64>,
 
@@ -190,12 +190,6 @@ fn run_serve(
     allowed_origins: Vec<String>,
     allow_header_pna: bool,
 ) -> ExitCode {
-    if timeout.is_some() {
-        tracing::warn!(
-            "kmd-rust: --timeout is accepted for CLI parity but not yet enforced \
-                     (Go's watchdog timer is not ported)",
-        );
-    }
     // Build a single-threaded tokio runtime — kmd is I/O-bound
     // and dispatches CPU-heavy SQLite/scrypt work to
     // `spawn_blocking`, so a single reactor thread is enough.
@@ -211,7 +205,14 @@ fn run_serve(
             return ExitCode::from(EXIT_CODE_KMD_ERROR);
         }
     };
-    match rt.block_on(serve(data_dir, address, allowed_origins, allow_header_pna)) {
+    match rt.block_on(serve(
+        data_dir,
+        address,
+        // go's `runKmd`: a timeout of 0 is no timeout
+        timeout.filter(|t| *t != 0).map(Duration::from_secs),
+        allowed_origins,
+        allow_header_pna,
+    )) {
         Ok(()) => ExitCode::SUCCESS,
         Err((code, err)) => {
             tracing::error!("couldn't start kmd: {err}");
@@ -224,6 +225,7 @@ fn run_serve(
 async fn serve(
     data_dir: PathBuf,
     cli_address: Option<SocketAddr>,
+    timeout: Option<Duration>,
     cli_allowed_origins: Vec<String>,
     cli_allow_header_pna: bool,
 ) -> Result<(), (u8, String)> {
@@ -282,6 +284,7 @@ async fn serve(
         allow_header_pna,
         session_manager: session_manager.clone(),
         wallet_driver: Arc::new(wallet_driver),
+        timeout,
     };
 
     let server = WalletServer::bind(server_cfg).await.map_err(|e| {
