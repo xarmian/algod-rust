@@ -628,9 +628,11 @@ async fn dial_with_header_cap(
             .uri()
             .port_u16()
             .unwrap_or(if scheme == "wss" { 443 } else { 80 });
-        let tcp = TcpStream::connect((host.as_str(), port))
+        // a URL's IPv6 literal is bracketed, `connect` takes it bare
+        let bare_host = host.trim_start_matches('[').trim_end_matches(']');
+        let tcp = TcpStream::connect((bare_host, port))
             .await
-            .map_err(WsConnectError::Io)?;
+            .map_err(|e| map_tungstenite_error(tokio_tungstenite::tungstenite::Error::Io(e)))?;
         // the handshake's own bytes pass through this stream, so it is not followed
         let io = crate::read_progress::ProgressIo::untracked(tcp);
         return tokio_tungstenite::client_async_tls_with_config(request, io, Some(ws_config), None)

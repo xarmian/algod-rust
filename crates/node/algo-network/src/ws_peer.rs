@@ -1010,7 +1010,7 @@ impl PeerHandle {
                     _ = read_deadline_passed(read_progress.as_mut()) => {
                         tracing::warn!(
                             addr = %read_addr,
-                            "inbound read loop: a message started and was not completed in time;                              dropping the peer"
+                            "inbound read loop: a message started and was not completed in time; dropping the peer"
                         );
                         read_closing.cancel();
                         break;

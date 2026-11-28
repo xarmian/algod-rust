@@ -1977,24 +1977,15 @@ impl WebsocketNetwork {
                                     Err(e) => match e {},
                                 };
 
-                                // Issue #2612: a plain connection's frames are followed
-                                // so the websocket read loop can bound a message that
-                                // started and stalled; its handle reaches the upgrade
-                                // handler through the request extensions. A TLS
-                                // connection's bytes are not websocket frames.
-                                let (tls_stream, plain_io) = if tls_acceptor.is_none() {
-                                    (
-                                        None,
-                                        Some(crate::read_progress::ProgressIo::new_unarmed(
-                                            stream,
-                                            max_message_read_duration,
-                                        )),
-                                    )
-                                } else {
-                                    (Some(stream), None)
-                                };
-                                let progress = plain_io.as_ref().and_then(|io| io.progress());
-                                let read_progress_ext = InboundReadProgress(progress);
+                                // Issue #2612: the connection's frames are followed (plain
+                                // or inside TLS) so the websocket read loop can bound a
+                                // message that started and stalled; the handle reaches the
+                                // upgrade handler through the request extensions.
+                                let (read_tap, progress) = crate::read_progress::ProgressTap::new(
+                                    max_message_read_duration,
+                                    false,
+                                );
+                                let read_progress_ext = InboundReadProgress(Some(progress));
 
                                 // Wrap the tower service so hyper 1.x can use it.
                                 let inner_svc =
@@ -2013,10 +2004,13 @@ impl WebsocketNetwork {
                                 tokio::spawn(async move {
                                     if let Some(acceptor) = tls {
                                         // TLS-wrapped connection.
-                                        let stream = tls_stream.expect("a TLS connection keeps its stream");
                                         match acceptor.accept(stream).await {
                                             Ok(tls_stream) => {
-                                                let io = hyper_util::rt::TokioIo::new(tls_stream);
+                                                let io = hyper_util::rt::TokioIo::new(
+                                                    crate::read_progress::ProgressIo::with_tap(
+                                                        tls_stream, read_tap,
+                                                    ),
+                                                );
                                                 let conn = hyper::server::conn::http1::Builder::new()
                                                     .serve_connection(io, hyper_svc)
                                                     .with_upgrades();
@@ -2038,8 +2032,11 @@ impl WebsocketNetwork {
                                         }
                                     } else {
                                         // Plain TCP connection.
-                                        let stream = plain_io.expect("a plain connection is followed");
-                                        let io = hyper_util::rt::TokioIo::new(stream);
+                                        let io = hyper_util::rt::TokioIo::new(
+                                            crate::read_progress::ProgressIo::with_tap(
+                                                stream, read_tap,
+                                            ),
+                                        );
                                         let conn = hyper::server::conn::http1::Builder::new()
                                             .serve_connection(io, hyper_svc)
                                             .with_upgrades();
@@ -3205,6 +3202,11 @@ fn resolve_incoming_peer_address(
 // Gossip WebSocket upgrade handler (axum)
 // ---------------------------------------------------------------------------
 
+/// The handle on an accepted connection's frame follower, put in the request
+/// extensions by the accept loop (#2612).
+#[derive(Clone)]
+struct InboundReadProgress(Option<crate::read_progress::ReadProgress>);
+
 /// Axum handler for `GET /v1/:genesis_id/gossip`.
 ///
 /// Validates the incoming connection, then upgrades to WebSocket.  On
@@ -3212,11 +3214,6 @@ fn resolve_incoming_peer_address(
 /// the peer registry.
 ///
 /// Mirrors Go's `WebsocketNetwork.ServeHTTP`.
-/// The handle on an accepted connection's frame follower (`None` for TLS),
-/// put in the request extensions by the accept loop.
-#[derive(Clone)]
-struct InboundReadProgress(Option<crate::read_progress::ReadProgress>);
-
 async fn gossip_upgrade_handler(
     State(network): State<NetworkState>,
     Path(genesis_id): Path<String>,
@@ -3226,11 +3223,7 @@ async fn gossip_upgrade_handler(
     headers: HeaderMap,
 ) -> axum::response::Response {
     let read_progress = read_progress.and_then(|axum::Extension(p)| p.0);
-    // everything the peer may send before our 101 response has been read: from
-    // here the bytes on this connection are websocket frames (#2612)
-    if let Some(progress) = &read_progress {
-        progress.arm();
-    }
+
     let remote_ip = remote_addr.ip();
 
     // Validate the incoming connection.
@@ -3394,6 +3387,14 @@ async fn gossip_upgrade_handler(
     // already spent by the time the application-level check rejects it.
     // Go's `wsPeer.go` readLoop enforces the equivalent bound
     // incrementally via `LimitedReaderSlurper`.
+    // The request is validated and everything the peer may send before our 101
+    // response has been read: from here the bytes on this connection are
+    // websocket frames (#2612). A client that pipelines frames behind its upgrade
+    // request, against the protocol, misaligns only its own tracking.
+    if let Some(progress) = &read_progress {
+        progress.arm();
+    }
+
     let ws = ws
         .max_message_size(crate::tag::MAX_MESSAGE_LENGTH)
         .max_frame_size(crate::tag::MAX_MESSAGE_LENGTH);

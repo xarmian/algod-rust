@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use algo_network::handshake::PROTOCOL_VERSION;
 use algo_network::peer_features::PeerFeatureFlags;
 use algo_network::phonebook::Phonebook;
-use algo_network::read_progress::ProgressIo;
+use algo_network::read_progress::{ProgressIo, ProgressTap};
 use algo_network::ws_network::{WebsocketNetwork, WebsocketNetworkConfig};
 use algo_network::ws_peer::{PeerHandle, WsPeer, WsPeerConfig};
 use algo_network::GossipNode;
@@ -70,8 +70,9 @@ async fn outbound_pair() -> (PeerHandle, TcpStream) {
         tokio_tungstenite::accept_async(tcp).await.unwrap()
     });
     let tcp = TcpStream::connect(addr).await.unwrap();
-    let io = ProgressIo::new_unarmed(tcp, MAX);
-    let progress = io.progress();
+    let (tap, progress) = ProgressTap::new(MAX, false);
+    let io = ProgressIo::with_tap(tcp, tap);
+    let progress = Some(progress);
     let (ws, _) = tokio_tungstenite::client_async(
         format!("ws://{addr}/"),
         tokio_tungstenite::MaybeTlsStream::Plain(io),
