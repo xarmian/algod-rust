@@ -71,6 +71,7 @@ use algo_network::peer_features::{
 };
 use algo_network::topics::{Topic, Topics};
 use algo_network::vpack::{StatefulDecoder, StatefulEncoder, VOTE_COMPRESSION_ABORT_BYTE};
+use algo_network::write_deadline::{DeadlineIo, WriteDeadline, HTTP_SERVER_WRITE_TIMEOUT};
 use algo_network::ws_network::{
     NodeInfo, WANT_TX_GOSSIP_NO, WANT_TX_GOSSIP_UNK, WANT_TX_GOSSIP_YES,
 };
@@ -3810,19 +3811,39 @@ impl GossipNode for P2pTransport {
 /// connection" is a libp2p stream instead, adapted to `tokio`'s
 /// `AsyncRead`/`AsyncWrite` via `tokio_util::compat`.
 async fn serve_p2p_http_stream(peer_id: PeerId, stream: P2pRawStream, router: Router) {
-    serve_http_io(peer_id, stream.compat(), router, HTTP_SERVER_READ_TIMEOUT).await;
+    serve_http_io(
+        peer_id,
+        stream.compat(),
+        router,
+        HTTP_SERVER_READ_TIMEOUT,
+        HTTP_SERVER_WRITE_TIMEOUT,
+    )
+    .await;
 }
 
 /// [`serve_p2p_http_stream`] over any byte stream, with the head of the request
 /// bounded by `header_read_timeout` (go v5.1.1 gives an inbound stream a 10 s
 /// read deadline counted from its opening, so a peer that opens a stream and
 /// never sends a request cannot hold it, and its per-peer slot, forever).
-async fn serve_http_io<S>(peer_id: PeerId, io: S, router: Router, header_read_timeout: Duration)
-where
+///
+/// The stream also gets go v5.1.1's write deadline (`write_timeout` from the
+/// moment it is opened, `httpServerWriteTimeout`): a peer that reads the
+/// response slower than that loses the stream. A handler that needs longer (the
+/// catchpoint service) moves it through the [`WriteDeadline`] it finds in the
+/// request extensions, like go's `http.ResponseController.SetWriteDeadline`
+/// (#2618).
+async fn serve_http_io<S>(
+    peer_id: PeerId,
+    io: S,
+    router: Router,
+    header_read_timeout: Duration,
+    write_timeout: Duration,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let io = TokioIo::new(io);
-    let hyper_svc = TowerToHyperService::new(router);
+    let write_deadline = WriteDeadline::new(tokio::time::Instant::now() + write_timeout);
+    let io = TokioIo::new(DeadlineIo::new(io, write_deadline.clone()));
+    let hyper_svc = TowerToHyperService::new(router.layer(axum::Extension(write_deadline)));
     if let Err(e) = hyper::server::conn::http1::Builder::new()
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(header_read_timeout)
@@ -6631,6 +6652,7 @@ mod tests {
         assert_eq!(GOSSIP_STREAMS_INBOUND_PER_PEER, 2);
         assert_eq!(HTTP_STREAMS_INBOUND_PER_PEER, 32);
         assert_eq!(HTTP_SERVER_READ_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(HTTP_SERVER_WRITE_TIMEOUT, Duration::from_secs(60));
     }
 
     /// A peer that opens an HTTP stream and stalls in the middle of its request
@@ -6644,6 +6666,7 @@ mod tests {
             server,
             Router::new(),
             Duration::from_millis(200),
+            HTTP_SERVER_WRITE_TIMEOUT,
         ));
         client
             .write_all(b"GET /x HTTP/1.1\r\nHost: p")
@@ -6659,6 +6682,94 @@ mod tests {
             .await
             .expect("the serve task ended")
             .unwrap();
+    }
+
+    /// A big response body and a `GET` for it, to read as slowly as the test
+    /// wants (#2618).
+    const BODY_LEN: usize = 64 * 1024;
+
+    fn big_body_router(extend_to: Option<Duration>) -> Router {
+        Router::new().route(
+            "/big",
+            axum::routing::get(move |req: axum::extract::Request| async move {
+                if let Some(extra) = extend_to {
+                    // what the catchpoint service does (go: `SetWriteDeadline`)
+                    req.extensions()
+                        .get::<WriteDeadline>()
+                        .expect("the stream's write deadline is in the request extensions")
+                        .set(tokio::time::Instant::now() + extra);
+                }
+                vec![7u8; BODY_LEN]
+            }),
+        )
+    }
+
+    /// Reads the response `chunk` bytes every `pause` until the server closes
+    /// the stream; returns what arrived.
+    async fn read_slowly(
+        client: &mut tokio::io::DuplexStream,
+        chunk: usize,
+        pause: Duration,
+    ) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        client
+            .write_all(b"GET /big HTTP/1.1\r\nHost: p\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; chunk];
+        loop {
+            tokio::time::sleep(pause).await;
+            match client.read(&mut buf).await {
+                Ok(0) | Err(_) => return got,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+            }
+        }
+    }
+
+    /// go `deadlineHost` (#2618): a peer that reads the response too slowly
+    /// loses the stream once the write deadline passes, and the stream is
+    /// closed without the rest of the body being written.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_response_reader_is_closed_after_the_write_timeout() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let started = tokio::time::Instant::now();
+        let served = tokio::spawn(serve_http_io(
+            PeerId::random(),
+            server,
+            big_body_router(None),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+        ));
+        // the first chunk after 10 s, the next one only after the deadline
+        let got = read_slowly(&mut client, 4096, Duration::from_secs(61)).await;
+        served.await.expect("the serve task ended");
+        assert!(got.len() < BODY_LEN, "the response was cut off");
+        assert!(started.elapsed() >= Duration::from_secs(60));
+        assert!(started.elapsed() < Duration::from_secs(125));
+    }
+
+    /// A handler that moves the deadline (the catchpoint service) keeps a
+    /// download that makes progress, however long it takes in total.
+    #[tokio::test(start_paused = true)]
+    async fn extended_write_deadline_keeps_a_progressing_download() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let served = tokio::spawn(serve_http_io(
+            PeerId::random(),
+            server,
+            big_body_router(Some(Duration::from_secs(3600))),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+        ));
+        // 16+ chunks, 20 s apart: well past the first 60 s
+        let got = read_slowly(&mut client, 4096, Duration::from_secs(20)).await;
+        served.await.expect("the serve task ended");
+        assert!(
+            got.len() > BODY_LEN,
+            "the whole body and its head arrived, got {}",
+            got.len()
+        );
+        assert!(got.ends_with(&vec![7u8; 1024]));
     }
 
     #[test]

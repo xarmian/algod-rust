@@ -60,6 +60,29 @@ use axum::Router;
 use http::{HeaderMap, StatusCode};
 
 use crate::block_service::parse_round_base36;
+use crate::write_deadline::WriteDeadline;
+
+/// go `rpcs.maxCatchpointFileSize`: the size assumed when the file's is unknown.
+const MAX_CATCHPOINT_FILE_SIZE: u64 = 512 * 1024 * 1024;
+
+/// go `rpcs.expectedWorstUploadSpeedBytesPerSecond`.
+const EXPECTED_WORST_UPLOAD_SPEED_BYTES_PER_SECOND: u64 = 20 * 1024;
+
+/// How long go's `LedgerService.ServeHTTP` allows the catchpoint file to be
+/// written: 2 minutes plus the file at the worst expected upload speed.
+pub fn catchpoint_file_writing_duration(file_size: u64) -> std::time::Duration {
+    let size = if file_size == 0 {
+        MAX_CATCHPOINT_FILE_SIZE
+    } else {
+        file_size
+    };
+    std::time::Duration::from_secs(120)
+        + std::time::Duration::from_secs(size / EXPECTED_WORST_UPLOAD_SPEED_BYTES_PER_SECOND)
+        + std::time::Duration::from_nanos(
+            (size % EXPECTED_WORST_UPLOAD_SPEED_BYTES_PER_SECOND) * 1_000_000_000
+                / EXPECTED_WORST_UPLOAD_SPEED_BYTES_PER_SECOND,
+        )
+}
 
 /// HTTP Content-Type for a raw catchpoint tarball response.
 ///
@@ -155,6 +178,20 @@ impl CatchpointService {
         method: Method,
         headers: HeaderMap,
     ) -> Response {
+        self.serve_ledger_query_with_deadline(genesis_id, query, method, headers, None)
+            .await
+    }
+
+    /// [`Self::serve_ledger_query`] on a stream with a write deadline the
+    /// handler may extend (go's `http.ResponseController`).
+    pub async fn serve_ledger_query_with_deadline(
+        &self,
+        genesis_id: &str,
+        query: &str,
+        method: Method,
+        headers: HeaderMap,
+        write_deadline: Option<WriteDeadline>,
+    ) -> Response {
         let state = CatchpointServiceState {
             ledger: std::sync::Arc::clone(&self.ledger),
             genesis_id: self.genesis_id.clone(),
@@ -201,7 +238,7 @@ impl CatchpointService {
             [v] => return plain_400(format!("unsupported version specified '{v}'")),
             vs => return plain_400(format!("invalid number of version specified {}", vs.len())),
         }
-        serve_round(state, &rounds[0], method, headers).await
+        serve_round(state, &rounds[0], method, headers, write_deadline).await
     }
 }
 
@@ -221,6 +258,7 @@ async fn serve_catchpoint(
     Path((genesis_id, round_str)): Path<(String, String)>,
     method: Method,
     headers: HeaderMap,
+    request: axum::extract::Request,
 ) -> Response {
     if genesis_id != state.genesis_id {
         return (
@@ -229,7 +267,8 @@ async fn serve_catchpoint(
         )
             .into_response();
     }
-    serve_round(state, &round_str, method, headers).await
+    let write_deadline = request.extensions().get::<WriteDeadline>().cloned();
+    serve_round(state, &round_str, method, headers, write_deadline).await
 }
 
 /// The rest of go's `ServeHTTP`, from the parsed round on.
@@ -238,6 +277,7 @@ async fn serve_round(
     round_str: &str,
     method: Method,
     headers: HeaderMap,
+    write_deadline: Option<WriteDeadline>,
 ) -> Response {
     let round = match parse_round_base36(round_str) {
         Some(r) => r,
@@ -278,6 +318,15 @@ async fn serve_round(
             .body(Body::empty())
             .unwrap()
             .into_response();
+    }
+
+    // go: `rc.SetWriteDeadline(now + 2 min + size / worst upload speed)`, from the
+    // size of the file on disk (the gzip-compressed bytes); a transport without a
+    // stream deadline (a plain HTTP server) has nothing to extend.
+    if let Some(deadline) = write_deadline {
+        deadline.set(
+            tokio::time::Instant::now() + catchpoint_file_writing_duration(gz_bytes.len() as u64),
+        );
     }
 
     let accepts_gzip = headers
@@ -369,6 +418,71 @@ mod tests {
     fn make_test_service(ledger: std::sync::Arc<MockCatchpointLedger>) -> Router {
         let service = CatchpointService::new(ledger, "testnet-v1.0".to_string());
         service.http_router()
+    }
+
+    /// go `rpcs.LedgerService.ServeHTTP`: `2 min + size / 20 KiB/s`, and the
+    /// 512 MiB default when the size is unknown (#2618).
+    #[test]
+    fn writing_duration_matches_go() {
+        use std::time::Duration;
+        assert_eq!(
+            catchpoint_file_writing_duration(20 * 1024),
+            Duration::from_secs(121)
+        );
+        assert_eq!(
+            catchpoint_file_writing_duration(1),
+            Duration::from_secs(120) + Duration::from_nanos(1_000_000_000 / 20480)
+        );
+        assert_eq!(
+            catchpoint_file_writing_duration(0),
+            Duration::from_millis(26_334_400)
+        );
+    }
+
+    /// go: serving a catchpoint file moves the stream's write deadline to
+    /// `now + 2 min + size / 20 KiB/s`; a HEAD, or an error, leaves it.
+    #[tokio::test(start_paused = true)]
+    async fn serving_a_catchpoint_extends_the_write_deadline() {
+        use std::time::Duration;
+        let ledger = std::sync::Arc::new(MockCatchpointLedger::new());
+        ledger.add_catchpoint(42, b"catchpoint-tar-bytes");
+        let gz_len = ledger.catchpoint_file_bytes(42).unwrap().len() as u64;
+        let uri = format!("/v1/testnet-v1.0/ledger/{}", format_round_base36(42));
+        let request = |method: Method, uri: &str, deadline: &WriteDeadline| {
+            let mut req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(deadline.clone());
+            req
+        };
+        let initial = tokio::time::Instant::now() + Duration::from_secs(60);
+
+        for (method, uri) in [
+            (Method::HEAD, uri.clone()),
+            (
+                Method::GET,
+                format!("/v1/testnet-v1.0/ledger/{}", format_round_base36(43)),
+            ),
+        ] {
+            let deadline = WriteDeadline::new(initial);
+            let app = make_test_service(ledger.clone());
+            app.oneshot(request(method, &uri, &deadline)).await.unwrap();
+            assert_eq!(deadline.get(), initial, "left alone");
+        }
+
+        let deadline = WriteDeadline::new(initial);
+        let app = make_test_service(ledger.clone());
+        let resp = app
+            .oneshot(request(Method::GET, &uri, &deadline))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            deadline.get(),
+            tokio::time::Instant::now() + catchpoint_file_writing_duration(gz_len)
+        );
     }
 
     #[tokio::test]

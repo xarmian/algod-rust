@@ -49,6 +49,7 @@ pub mod reconnect;
 pub mod request_logger;
 pub mod tag;
 pub mod topics;
+pub mod write_deadline;
 pub mod ws_peer;
 
 pub mod discovery;
