@@ -131,6 +131,30 @@ impl LiveKeySource for Mutex<ParticipationStore> {
     }
 }
 
+/// The accounts with a participation key valid for a round, for the
+/// transaction pool (go `AlgorandFullNode.VotingAccountsForRound`, i.e.
+/// `AccountManager.Keys(round)`): a superset of the eligible proposers.
+struct PartkeyVotingAccounts(Mutex<ParticipationStore>);
+
+impl algo_pool::traits::VotingAccountSupplier for PartkeyVotingAccounts {
+    fn voting_accounts_for_round(&self, round: Round) -> Vec<algo_types::Address> {
+        let Ok(store) = self.0.lock() else {
+            return Vec::new();
+        };
+        match store.get_all() {
+            Ok(records) => records
+                .into_iter()
+                .filter(|r| r.first_valid <= round && round <= r.last_valid)
+                .map(|r| r.account)
+                .collect(),
+            Err(e) => {
+                tracing::warn!("pool: cannot read participation keys for round {round}: {e}");
+                Vec::new()
+            }
+        }
+    }
+}
+
 /// [`ParticipationNodeInfo`] before its first successful registry read.
 const PARTICIPATION_UNDECIDED: u8 = 0;
 const PARTICIPATION_NO: u8 = 1;
@@ -7324,10 +7348,22 @@ pub async fn run(
     // verified here is therefore a cache *hit*, not redundant work, when
     // `pool.remember()`'s evaluator verifies it again.
     let verified_txn_cache = pool_ledger_adapter.verified_txn_cache.clone();
-    let pool = Arc::new(TransactionPool::new(
-        pool_config_from_local(&node_config),
-        pool_ledger_adapter as Arc<dyn algo_pool::traits::PoolLedger>,
-    ));
+    // go v5.1.1 skips `GenerateBlock` for a round in which no local account
+    // holds a participation key; the pool asks the registry for them.
+    let pool_voting_store = ParticipationStore::open(partkey_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to open a participation key store handle (for the transaction pool) at {}: {}",
+            partkey_path.display(),
+            e
+        )
+    })?;
+    let pool = Arc::new(
+        TransactionPool::new(
+            pool_config_from_local(&node_config),
+            pool_ledger_adapter as Arc<dyn algo_pool::traits::PoolLedger>,
+        )
+        .with_voting_accounts(Arc::new(PartkeyVotingAccounts(Mutex::new(pool_voting_store)))),
+    );
     // Issue #1134: inbound-gossip tx-handler per-tag `pool.remember()`
     // failure counters, shared across every `TxTagHandler` this node
     // registers (WS-gossip and P2P both route inbound TX traffic through

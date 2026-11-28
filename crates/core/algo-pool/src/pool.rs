@@ -63,6 +63,10 @@ struct AssemblyResults {
     round_started_evaluating: Round,
     /// Mirror of `ok` for lock-free inspection from the `on_new_block` path.
     assembly_completed_or_abandoned: bool,
+    /// No local account could propose when recomputation started (go's
+    /// `skipped`): `ok` is also set but `block` is `None`, so `assemble_block`
+    /// must build an empty block.
+    skipped: bool,
 }
 
 // ── Inner state (behind `mu`) ────────────────────────────────────
@@ -222,6 +226,11 @@ pub struct TransactionPool {
     /// Condvar signalled when assembly results become available.
     assembly_cond: Condvar,
 
+    /// The node's participation accounts (go's `pool.vac`). `None` (tools and
+    /// tests that call `assemble_block` directly) generates a block every
+    /// round.
+    voting_accounts: Option<Arc<dyn crate::traits::VotingAccountSupplier>>,
+
     /// Condvar associated with `mu`, signalled by `on_new_block()` after
     /// rebuilding the evaluator. Mirrors Go's `pool.cond`.
     cond: Condvar,
@@ -286,12 +295,32 @@ impl TransactionPool {
             pending_mu: RwLock::new(pending),
             assembly_mu: Mutex::new(assembly),
             assembly_cond: Condvar::new(),
+            voting_accounts: None,
             cond: Condvar::new(),
             fee_per_byte: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             paused_flag: AtomicBool::new(false),
             reeval_counter: crate::metrics::TxPoolReevalCounter::new(),
         }
+    }
+
+    /// Attach the supplier of the node's participation accounts (go's
+    /// `MakeTransactionPool(..., vac)`).
+    #[must_use]
+    pub fn with_voting_accounts(
+        mut self,
+        supplier: Arc<dyn crate::traits::VotingAccountSupplier>,
+    ) -> Self {
+        self.voting_accounts = Some(supplier);
+        self
+    }
+
+    /// go's `getVotingAccountsForRound`: empty without a supplier.
+    fn voting_accounts_for_round(&self, round: Round) -> Vec<Address> {
+        self.voting_accounts
+            .as_ref()
+            .map(|v| v.voting_accounts_for_round(round))
+            .unwrap_or_default()
     }
 
     // ── Public query methods ─────────────────────────────────────
@@ -594,7 +623,15 @@ impl TransactionPool {
     /// 6. Flush the surviving groups into pending (replacing old pending state)
     ///
     /// Assumes `mu` is held by the caller.
-    fn recompute_block_evaluator(&self, inner: &mut PoolInner, committed_txids: &HashSet<Digest>) {
+    ///
+    /// `force_assembly` generates a block even without possible proposers
+    /// (dev mode).
+    fn recompute_block_evaluator(
+        &self,
+        inner: &mut PoolInner,
+        committed_txids: &HashSet<Digest>,
+        force_assembly: bool,
+    ) {
         inner.evaluator = None;
         if inner.evaluator_paused {
             // Issue #1683: paused for a live catchup -- build nothing. The
@@ -639,13 +676,22 @@ impl TransactionPool {
 
         let eval_round = Round(latest.0 + 1);
 
-        // Reset assembly results for this new round.
+        // Reset assembly results for this new round. Without a possible
+        // proposer, go still evaluates the transactions but skips
+        // `GenerateBlock`, and wakes an `AssembleBlock` already waiting.
         {
+            let proposers = self.voting_accounts_for_round(eval_round);
             let mut asm = self.assembly_mu.lock();
             asm.results = AssemblyResults {
                 round_started_evaluating: eval_round,
                 ..Default::default()
             };
+            if !force_assembly && self.voting_accounts.is_some() && proposers.is_empty() {
+                asm.results.skipped = true;
+                asm.results.ok = true;
+                asm.results.assembly_completed_or_abandoned = true;
+                self.assembly_cond.notify_all();
+            }
         }
 
         // Reset pending whole blocks count for the new evaluator.
@@ -717,7 +763,10 @@ impl TransactionPool {
                 if !asm.results.ok && asm.round <= eval_rnd {
                     asm.results.ok = true;
                     asm.results.assembly_completed_or_abandoned = true;
-                    match evaluator.generate_block(&[]) {
+                    // Looked up again, so a key installed while the
+                    // transactions were re-evaluated counts.
+                    let proposers = self.voting_accounts_for_round(eval_rnd);
+                    match evaluator.generate_block(&proposers) {
                         Ok(block) => {
                             asm.results.block = Some(block);
                         }
@@ -1085,7 +1134,7 @@ impl TransactionPool {
             // Recompute the pool by starting from the new latest block.
             // This has the side-effect of discarding transactions that
             // have been committed (or that are otherwise no longer valid).
-            self.recompute_block_evaluator(&mut inner, committed_txids);
+            self.recompute_block_evaluator(&mut inner, committed_txids, false);
         }
 
         // Wake any threads waiting in ingest() for the evaluator to catch up.
@@ -1139,7 +1188,7 @@ impl TransactionPool {
             }
         }
         inner.reprime_attempt = Some((latest, Instant::now()));
-        self.recompute_block_evaluator(inner, &HashSet::new());
+        self.recompute_block_evaluator(inner, &HashSet::new(), false);
     }
 
     /// The error for "no evaluator": while paused for a catchup it is the
@@ -1179,6 +1228,10 @@ impl TransactionPool {
     /// `AssembleBlock()` (`../go-algorand/data/pools/transactionPool.go:839`).
     pub fn assemble_block(&self, round: Round, deadline: Instant) -> Result<Block, PoolError> {
         let result = self.assemble_block_inner(round, deadline);
+        // Reset the deadline on return so that a later round's recompute does
+        // not see an expired deadline and cut its block short (go's
+        // `defer func() { pool.assemblyDeadline = time.Time{} }()`).
+        self.assembly_mu.lock().deadline = None;
         if self.config.enable_assemble_stats {
             if let Ok(ref block) = result {
                 self.emit_assemble_block_stats(round, block);
@@ -1412,6 +1465,14 @@ impl TransactionPool {
             )));
         }
 
+        if asm.results.skipped {
+            // Agreement only calls AssembleBlock when it has voting keys for
+            // this round, so this rare case only happens if a key was added
+            // between the pool's recompute and agreement asking for keys.
+            drop(asm);
+            return self.assemble_empty_block(round);
+        }
+
         // Success — return the assembled block.
         asm.results
             .block
@@ -1440,7 +1501,8 @@ impl TransactionPool {
             ))
         })?;
 
-        evaluator.generate_block(&[]).map_err(|e| {
+        let proposers = self.voting_accounts_for_round(round);
+        evaluator.generate_block(&proposers).map_err(|e| {
             PoolError::Evaluator(format!(
                 "TransactionPool.assembleEmptyBlock: cannot generate block for {}: {}",
                 round, e
@@ -1483,7 +1545,7 @@ impl TransactionPool {
     pub fn ensure_evaluator_primed(&self) {
         let mut inner = self.mu.lock();
         if inner.evaluator.is_none() {
-            self.recompute_block_evaluator(&mut inner, &HashSet::new());
+            self.recompute_block_evaluator(&mut inner, &HashSet::new(), false);
         }
     }
 
@@ -1563,7 +1625,7 @@ impl TransactionPool {
         // the surviving groups, so a corrected resubmission is judged
         // against the ledger, not against the group it replaces.
         if inner.evaluator.is_some() {
-            self.recompute_block_evaluator(&mut inner, &HashSet::new());
+            self.recompute_block_evaluator(&mut inner, &HashSet::new(), false);
         }
         dropped
     }
@@ -1575,8 +1637,9 @@ impl TransactionPool {
     pub fn assemble_dev_mode_block(&self) -> Result<Block, PoolError> {
         let mut inner = self.mu.lock();
 
-        // Drop the current evaluator and rebuild from scratch.
-        self.recompute_block_evaluator(&mut inner, &HashSet::new());
+        // Drop the current evaluator and rebuild from scratch, generating a
+        // block even without possible proposers.
+        self.recompute_block_evaluator(&mut inner, &HashSet::new(), true);
 
         // Read the evaluator round while we still have the lock.
         let eval_round =
@@ -1674,7 +1737,7 @@ impl TransactionPool {
         inner.paused_last_round = None;
         if prime {
             inner.reprime_attempt = Some((self.ledger.latest(), Instant::now()));
-            self.recompute_block_evaluator(&mut inner, &HashSet::new());
+            self.recompute_block_evaluator(&mut inner, &HashSet::new(), false);
         }
         self.cond.notify_all();
     }
@@ -4219,5 +4282,275 @@ mod tests {
             .expect("the retry succeeds");
         assert_eq!(inner.num_pending_whole_blocks, 1);
         assert_eq!(bytes.load(Ordering::SeqCst), 10, "the new block's bytes");
+    }
+
+    // ---- go v5.1.1 block generation without proposers (#2551) ------------
+
+    /// Records every `generate_block` call (the addresses it got).
+    #[derive(Default)]
+    struct GenLog {
+        calls: std::sync::Mutex<Vec<Vec<Address>>>,
+    }
+
+    struct GenEvaluator {
+        round: Round,
+        log: Arc<GenLog>,
+        count: usize,
+    }
+
+    impl BlockEvaluator for GenEvaluator {
+        fn round(&self) -> Round {
+            self.round
+        }
+        fn pay_set_size(&self) -> usize {
+            self.count
+        }
+        fn test_transaction_group(&self, _g: &[SignedTransaction]) -> Result<(), AlgoError> {
+            Ok(())
+        }
+        fn transaction_group(&mut self, g: &[SignedTransaction]) -> Result<(), AlgoError> {
+            self.count += g.len();
+            Ok(())
+        }
+        fn generate_block(&mut self, voting_accounts: &[Address]) -> Result<Block, AlgoError> {
+            self.log.calls.lock().unwrap().push(voting_accounts.to_vec());
+            Ok(Block {
+                round: self.round,
+                ..Block::default()
+            })
+        }
+        fn reset_txn_bytes(&mut self) -> usize {
+            0
+        }
+        fn restore_txn_bytes(&mut self, _n: usize) {}
+    }
+
+    struct GenLedger {
+        round: std::sync::atomic::AtomicU64,
+        log: Arc<GenLog>,
+    }
+
+    impl PoolLedger for GenLedger {
+        fn latest(&self) -> Round {
+            Round(self.round.load(Ordering::SeqCst))
+        }
+        fn block_hdr(&self, _round: Round) -> Result<BlockHeader, AlgoError> {
+            Ok(BlockHeader::default())
+        }
+        fn consensus_params(&self, _round: Round) -> Result<ConsensusParams, AlgoError> {
+            Ok(ConsensusParams::default())
+        }
+        fn start_evaluator(
+            &self,
+            _hdr: BlockHeader,
+            _hint: usize,
+            _max: usize,
+        ) -> Result<Box<dyn BlockEvaluator>, AlgoError> {
+            Ok(Box::new(GenEvaluator {
+                round: self.latest().next(),
+                log: self.log.clone(),
+                count: 0,
+            }))
+        }
+    }
+
+    /// Supplier that counts its calls and answers from a closure.
+    struct CountingSupplier {
+        queries: AtomicU64,
+        accounts: Vec<Address>,
+    }
+
+    impl crate::traits::VotingAccountSupplier for CountingSupplier {
+        fn voting_accounts_for_round(&self, _round: Round) -> Vec<Address> {
+            self.queries.fetch_add(1, Ordering::SeqCst);
+            self.accounts.clone()
+        }
+    }
+
+    fn gen_pool(
+        accounts: Option<Vec<Address>>,
+    ) -> (
+        TransactionPool,
+        Arc<GenLog>,
+        Option<Arc<CountingSupplier>>,
+        Arc<GenLedger>,
+    ) {
+        let log = Arc::new(GenLog::default());
+        let ledger = Arc::new(GenLedger {
+            round: std::sync::atomic::AtomicU64::new(1),
+            log: log.clone(),
+        });
+        let mut pool = TransactionPool::new(PoolConfig::default(), ledger.clone());
+        let supplier = accounts.map(|accounts| {
+            Arc::new(CountingSupplier {
+                queries: AtomicU64::new(0),
+                accounts,
+            })
+        });
+        if let Some(s) = &supplier {
+            pool = pool.with_voting_accounts(s.clone());
+        }
+        (pool, log, supplier, ledger)
+    }
+
+    fn recompute(pool: &TransactionPool, force: bool) {
+        let mut inner = pool.mu.lock();
+        pool.recompute_block_evaluator(&mut inner, &HashSet::new(), force);
+    }
+
+    /// go `TestPoolBlockGeneration` (the supplier variants): without a
+    /// possible proposer the transactions are still evaluated but no block is
+    /// generated; with one, the block is generated for that proposer; without
+    /// a supplier a block is generated every round.
+    #[test]
+    fn recompute_skips_generation_without_proposers() {
+        let proposer = Address([5; 32]);
+        for (name, accounts) in [
+            ("noKeys", Some(vec![])),
+            ("voting", Some(vec![proposer])),
+            ("unspecified", None),
+        ] {
+            let (pool, log, supplier, _l) = gen_pool(accounts);
+            recompute(&pool, false);
+            let skipped = pool.assembly_mu.lock().results.skipped;
+            assert_eq!(skipped, name == "noKeys", "{name}");
+            assert!(pool.has_evaluator(), "{name}: transactions are evaluated");
+
+            // an AssembleBlock request is what triggers generation here
+            let r = pool.assemble_block(Round(2), Instant::now() + Duration::from_secs(1));
+            let blk = r.unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(blk.round, Round(2));
+            let calls = log.calls.lock().unwrap().clone();
+            match name {
+                // skipped: the empty block is built for whoever holds keys now
+                "noKeys" => assert_eq!(calls.len(), 1, "{name}: only the empty block"),
+                "voting" => {
+                    assert_eq!(calls, vec![vec![proposer]], "{name}");
+                    assert_eq!(supplier.unwrap().queries.load(Ordering::SeqCst), 2);
+                }
+                _ => assert_eq!(calls, vec![Vec::<Address>::new()], "{name}"),
+            }
+        }
+    }
+
+    /// go `TestPoolDevModeForcesGeneration`: dev mode generates although
+    /// nobody could propose, and the forcing does not persist.
+    #[test]
+    fn dev_mode_forces_generation_and_does_not_persist() {
+        let (pool, log, _s, _l) = gen_pool(Some(vec![]));
+        recompute(&pool, false);
+        assert!(pool.assembly_mu.lock().results.skipped);
+        let blk = pool.assemble_dev_mode_block().expect("dev block");
+        assert_eq!(blk.round, Round(2));
+        assert_eq!(log.calls.lock().unwrap().len(), 1);
+        assert!(!pool.assembly_mu.lock().results.skipped);
+        recompute(&pool, false);
+        assert!(
+            pool.assembly_mu.lock().results.skipped,
+            "forcing dev-mode assembly must not persist"
+        );
+        assert_eq!(log.calls.lock().unwrap().len(), 1);
+    }
+
+    /// go `TestPoolSkippedAssemblyWakesWaiter`: an AssembleBlock already
+    /// waiting for a round is woken when that round's recompute skips
+    /// generation, and gets an empty block for the round.
+    #[test]
+    fn skipped_assembly_wakes_a_waiting_assemble_block() {
+        let (pool, _log, _s, ledger) = gen_pool(Some(vec![]));
+        let pool = Arc::new(pool);
+        recompute(&pool, false); // evaluating round 2
+        ledger.round.store(2, Ordering::SeqCst); // round 2 committed elsewhere
+        let waiter = {
+            let pool = pool.clone();
+            std::thread::spawn(move || {
+                pool.assemble_block(Round(3), Instant::now() + Duration::from_secs(10))
+            })
+        };
+        // wait until the request is registered
+        let start = Instant::now();
+        while pool.assembly_mu.lock().round != Round(3) {
+            assert!(start.elapsed() < Duration::from_secs(5), "request not seen");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        pool.on_new_block(&block_at(2), &HashSet::new());
+        let blk = waiter
+            .join()
+            .expect("no panic")
+            .expect("skipping generation wakes the assembly request");
+        assert_eq!(blk.round, Round(3));
+        assert!(blk.payset.is_empty());
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    /// go `TestPoolAssemblyTimeoutClearsDeadline`: an AssembleBlock that
+    /// times out leaves no deadline behind for a later round's recompute.
+    #[test]
+    fn assemble_block_clears_its_deadline_on_every_return() {
+        let (pool, _log, _s, _l) = gen_pool(None);
+        recompute(&pool, false);
+        let r = pool.assemble_block(Round(2), Instant::now());
+        assert!(r.is_ok(), "{r:?}");
+        assert!(pool.assembly_mu.lock().deadline.is_none());
+        // a stale request returns an error and also leaves no deadline
+        let r = pool.assemble_block(Round(1), Instant::now() + Duration::from_secs(1));
+        assert!(matches!(r, Err(PoolError::StaleBlockAssemblyRequest)));
+        assert!(pool.assembly_mu.lock().deadline.is_none());
+    }
+
+    /// Supplier whose answer depends on the round (keys expire before round 3).
+    struct ExpiringSupplier {
+        proposer: Address,
+    }
+
+    impl crate::traits::VotingAccountSupplier for ExpiringSupplier {
+        fn voting_accounts_for_round(&self, round: Round) -> Vec<Address> {
+            if round.0 <= 2 {
+                vec![self.proposer]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    /// go `TestPoolParticipationChanges` (the supplier-driven half): a round
+    /// skipped for lack of keys still yields a usable block for the proposer
+    /// whose key was installed meanwhile, and a round after the keys expire
+    /// is skipped again.
+    #[test]
+    fn participation_changes_between_rounds() {
+        let proposer = Address([6; 32]);
+        let log = Arc::new(GenLog::default());
+        let ledger = Arc::new(GenLedger {
+            round: std::sync::atomic::AtomicU64::new(1),
+            log: log.clone(),
+        });
+        let pool = TransactionPool::new(PoolConfig::default(), ledger.clone())
+            .with_voting_accounts(Arc::new(CountingSupplier {
+                queries: AtomicU64::new(0),
+                accounts: Vec::new(),
+            }));
+        recompute(&pool, false);
+        assert!(pool.assembly_mu.lock().results.skipped);
+
+        // keys are installed after the round was skipped
+        let pool = TransactionPool {
+            voting_accounts: Some(Arc::new(ExpiringSupplier { proposer })),
+            ..pool
+        };
+        let blk = pool
+            .assemble_block(Round(2), Instant::now() + Duration::from_secs(1))
+            .expect("an explicit request returns a usable block");
+        assert_eq!(blk.round, Round(2));
+        assert!(pool.assembly_mu.lock().deadline.is_none());
+        assert_eq!(log.calls.lock().unwrap().clone(), vec![vec![proposer]]);
+
+        // round 2 commits; the keys are gone for round 3, so the pool skips
+        // it (but still evaluates)
+        ledger.round.store(2, Ordering::SeqCst);
+        pool.on_new_block(&block_at(2), &HashSet::new());
+        assert!(pool.has_evaluator());
+        assert!(pool.assembly_mu.lock().results.skipped);
+        assert_eq!(log.calls.lock().unwrap().len(), 1, "nothing generated");
     }
 }
