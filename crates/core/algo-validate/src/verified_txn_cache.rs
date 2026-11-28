@@ -294,10 +294,13 @@ struct Inner {
     entries_per_bucket: usize,
     /// Limit on the `retained_size` total of one bucket (Go:
     /// `bytesPerBucket`).
-    bytes_per_bucket: usize,
+    bytes_per_bucket: isize,
     /// The `retained_size` total of the entries in `buckets[base]` (Go:
     /// `retainedBytes`).
-    retained_bytes: usize,
+    /// Signed like go's `int`: a group that repeats a transaction ID replaces
+    /// its own earlier entry before the group's bytes are added, so the count
+    /// can dip below zero for a moment (and, as in go, stay under-counted).
+    retained_bytes: isize,
     /// The circular cache buckets buffer (Go: `buckets`).
     buckets: Vec<HashMap<Digest, Arc<Entry>>>,
     /// The pinned transactions tier (Go: `pinned`).
@@ -331,14 +334,14 @@ fn find_in_buckets(
 /// bucket first if it doesn't have room (Go: `verifiedTransactionCache.add`).
 fn add_locked(inner: &mut Inner, group_ctx: &GroupContext) {
     let txns = &group_ctx.signed_group_txns;
-    let mut group_bytes: usize = txns
+    let mut group_bytes: isize = txns
         .iter()
         .map(|t| {
             retained_size(
                 out_of_line_lsig(&t.lsig),
                 t.msig.as_ref(),
                 out_of_line_pqsig(&t.pqsig),
-            )
+            ) as isize
         })
         .sum();
     // A group that exceeds the byte limit by itself still goes into the
@@ -363,13 +366,13 @@ fn add_locked(inner: &mut Inner, group_ctx: &GroupContext) {
         // LogicSig's args are not part of its ID), the new entry must replace
         // the pinned one, or the pool's copy would never be found verified.
         if let std::collections::hash_map::Entry::Occupied(mut pinned) = inner.pinned.entry(id) {
-            group_bytes -= entry.retained_size();
+            group_bytes -= entry.retained_size() as isize;
             pinned.insert(entry);
             continue;
         }
         let base = inner.base;
         if let Some(old) = inner.buckets[base].insert(id, entry) {
-            inner.retained_bytes -= old.retained_size();
+            inner.retained_bytes -= old.retained_size() as isize;
         }
     }
     inner.retained_bytes += group_bytes;
@@ -394,7 +397,7 @@ impl VerifiedTransactionCache {
         VerifiedTransactionCache {
             inner: Mutex::new(Inner {
                 entries_per_bucket,
-                bytes_per_bucket: MAX_BUCKET_RETAINED_BYTES,
+                bytes_per_bucket: MAX_BUCKET_RETAINED_BYTES as isize,
                 retained_bytes: 0,
                 buckets,
                 pinned: HashMap::with_capacity(cache_size),
@@ -544,7 +547,7 @@ impl VerifiedTransactionCache {
             if let Some((bucket_idx, entry)) = find_in_buckets(&inner.buckets, base_bucket, &id) {
                 inner.buckets[bucket_idx].remove(&id);
                 if bucket_idx == inner.base {
-                    inner.retained_bytes -= entry.retained_size();
+                    inner.retained_bytes -= entry.retained_size() as isize;
                 }
                 inner.pinned.insert(id, entry);
                 base_bucket = bucket_idx;
@@ -1583,7 +1586,7 @@ mod tests {
         {
             let inner = cache.inner.lock().unwrap();
             assert_eq!(inner.base, 1, "second group overflows the byte limit");
-            assert_eq!(inner.retained_bytes, size);
+            assert_eq!(inner.retained_bytes, size as isize);
         }
         // pinning from the current bucket releases its bytes
         cache.pin(&[big(21)]).unwrap();
@@ -1593,7 +1596,7 @@ mod tests {
         cache.add(group_ctx(huge));
         let inner = cache.inner.lock().unwrap();
         assert_eq!(inner.base, 1);
-        assert_eq!(inner.retained_bytes, 2 * size);
+        assert_eq!(inner.retained_bytes, 2 * size as isize);
     }
 
     /// go `TestAddingToCacheOutOfLineSigs`: the entry keeps `lsig`, `msig`
@@ -1641,5 +1644,22 @@ mod tests {
                 group[0].lsig.as_ref().filter(|_| has_lsig)
             );
         }
+    }
+
+    /// A group that repeats a transaction ID replaces its own earlier entry
+    /// before the group's bytes are counted; go's signed counter just dips,
+    /// an unsigned one would panic with the cache mutex held.
+    #[test]
+    fn repeated_txid_in_one_group_does_not_underflow_the_byte_count() {
+        let cache = VerifiedTransactionCache::new(50);
+        let twice = vec![lsig_txn(40), lsig_txn(40)];
+        cache.add(group_ctx(twice));
+        let size = Entry::new(Arc::new(test_context()), &lsig_txn(40)).retained_size();
+        assert_eq!(
+            cache.inner.lock().unwrap().retained_bytes,
+            size as isize,
+            "two counted, one replaced"
+        );
+        assert!(hit(&cache, &lsig_txn(40)));
     }
 }
