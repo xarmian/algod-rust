@@ -326,6 +326,12 @@ impl TransactionPool {
         pending.tx_groups.iter().map(|g| g.len()).sum()
     }
 
+    /// Whether `txid` is a transaction currently pending in the pool (as
+    /// opposed to one only remembered in the status cache).
+    pub fn is_pending(&self, txid: &Digest) -> bool {
+        self.pending_mu.read().txids.contains_key(txid)
+    }
+
     /// Return the number of pending transaction IDs.
     ///
     /// Mirrors `pendingTxIDsCount()` in go-algorand. Uses the txids map
